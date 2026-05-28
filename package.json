@@ -1,0 +1,28 @@
+{
+  "name": "roy",
+  "version": "0.1.0",
+  "description": "Theory of Mind based autonomous derived MAS",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx src/server/index.ts",
+    "build": "tsc",
+    "start": "node dist/server/index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.52.0",
+    "openai": "^4.82.0",
+    "dotenv": "^16.4.7",
+    "socket.io": "^4.8.1",
+    "express": "^4.21.2",
+    "zod": "^3.24.1",
+    "uuid": "^11.0.5"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3",
+    "@types/node": "^22.10.6",
+    "@types/express": "^5.0.0",
+    "@types/uuid": "^10.0.0",
+    "tsx": "^4.19.2"
+  }
+}
