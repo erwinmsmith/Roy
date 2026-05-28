@@ -4,8 +4,8 @@ import type { LLMProvider, LLMMessage } from '../llm/types.js';
 import type { MessageQueue } from '../message/MessageQueue.js';
 import type { FSM } from '../executor/FSM.js';
 import { BaseAgent, type AgentConfig } from './BaseAgent.js';
-import type { Plan, Planner } from '../../actions/Planner.js';
-import { actionRegistry } from '../../actions/index.js';
+import type { Plan, Planner } from '../actions/Planner.js';
+import { actionRegistry } from '../actions/index.js';
 import { logger } from '../utils/logger.js';
 
 export interface ActionAgentConfig extends Omit<AgentConfig, 'goal'> {
@@ -57,6 +57,11 @@ export class ActionAgent extends BaseAgent {
    * Decide which action to take using LLM
    */
   private async decideWithLLM(observation: string): Promise<ActionDecision | null> {
+    if (!this.llm) {
+      logger.warn(`Agent ${this.name} has no LLM configured`);
+      return null;
+    }
+
     const messages: LLMMessage[] = [
       {
         role: 'system',

@@ -5,9 +5,12 @@
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
-    "dev": "tsx src/server/index.ts",
+    "dev": "npm run dev:server",
+    "dev:server": "tsx src/server/index.ts",
+    "dev:cli": "tsx src/cli/Roy.ts",
     "build": "tsc",
     "start": "node dist/server/index.js",
+    "start:cli": "node dist/cli/Roy.js",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",

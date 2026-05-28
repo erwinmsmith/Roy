@@ -25,11 +25,40 @@ export class ConversationalAgent extends BaseAgent {
   }
 
   /**
-   * Process a single step
+   * Process a single step with FSM integration
    */
   async step(observation: string): Promise<void> {
     this.state = 'running';
     this.addToMemory('observation', observation);
+
+    // Check if LLM is available
+    if (!this.llm) {
+      logger.warn(`Agent ${this.name} has no LLM configured`);
+      this.addToMemory('result', 'Error: LLM not configured');
+      this.state = 'idle';
+      return;
+    }
+
+    // Update FSM context based on observation
+    if (this.fsm) {
+      // Calculate metrics
+      this.fsm.setUncertainty(this.calculateUncertainty(observation));
+      this.fsm.setConflict(this.analyzeConflict(observation));
+      this.fsm.setEvidence(this.analyzeEvidence(observation));
+
+      // Pre-step transition
+      await this.maybeTransition();
+
+      if (this.fsm.isTerminal()) {
+        logger.info(`Agent ${this.name} reached terminal FSM state`);
+        this.addToMemory('meta', 'FSM reached terminal state');
+        this.state = 'idle';
+        return;
+      }
+
+      // Add current state to trace
+      this.fsm.addToTrace(`[${this.fsm.getStateName()}] Input: ${observation.substring(0, 50)}...`);
+    }
 
     const history = this.getHistory();
     const systemPrompt = this.buildProfile();
@@ -62,7 +91,15 @@ export class ConversationalAgent extends BaseAgent {
       this.addToMemory('result', fullResponse);
 
       // Add to FSM trace
-      this.fsm?.addToTrace(`Agent ${this.name}: ${observation.substring(0, 50)}...`);
+      this.fsm?.addToTrace(`[${this.fsm.getStateName()}] Output: ${fullResponse.substring(0, 50)}...`);
+
+      // Track cost
+      if (this.fsm) {
+        this.fsm.addCost(1);
+
+        // Post-step transition
+        await this.maybeTransition();
+      }
 
       logger.info(`Agent ${this.name} completed step`);
     } catch (error) {
@@ -71,6 +108,41 @@ export class ConversationalAgent extends BaseAgent {
     }
 
     this.state = 'idle';
+  }
+
+  /**
+   * Calculate uncertainty metric for FSM (0-1)
+   */
+  private calculateUncertainty(text: string): number {
+    // Simple heuristic: longer text = more uncertainty
+    const len = text.length;
+    return Math.min(1.0, len / 2000);
+  }
+
+  /**
+   * Analyze conflict in text (0-1)
+   */
+  private analyzeConflict(text: string): number {
+    const conflictIndicators = ['but', 'however', 'although', 'conflict', 'disagree', 'contradict', 'versus'];
+    const lowerText = text.toLowerCase();
+    let conflicts = 0;
+    for (const indicator of conflictIndicators) {
+      if (lowerText.includes(indicator)) conflicts++;
+    }
+    return Math.min(1.0, conflicts * 0.25);
+  }
+
+  /**
+   * Analyze evidence in text (0-1)
+   */
+  private analyzeEvidence(text: string): number {
+    const evidenceIndicators = ['because', 'therefore', 'evidence', 'proves', 'shows', 'since', 'thus'];
+    const lowerText = text.toLowerCase();
+    let evidence = 0;
+    for (const indicator of evidenceIndicators) {
+      if (lowerText.includes(indicator)) evidence++;
+    }
+    return Math.min(1.0, evidence * 0.2);
   }
 
   /**

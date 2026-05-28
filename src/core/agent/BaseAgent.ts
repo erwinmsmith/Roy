@@ -3,11 +3,11 @@
 import type { LLMProvider, LLMMessage } from '../llm/types.js';
 import type { MessageQueue } from '../message/MessageQueue.js';
 import type { FSM } from '../executor/FSM.js';
-import type { Action } from '../../actions/Action.js';
-import type { Tool } from '../../tools/types.js';
-import { memoryRegistry } from '../../memory/index.js';
-import { buildPrompt } from '../../prompts/builder.js';
-import { conversationalTemplate } from '../../prompts/templates/conversational.js';
+import type { Action } from '../actions/Action.js';
+import type { Tool } from '../tools/types.js';
+import { memoryRegistry } from '../memory/index.js';
+import { buildPrompt } from '../prompts/builder.js';
+import { conversationalTemplate } from '../prompts/templates/conversational.js';
 import { logger } from '../utils/logger.js';
 
 export type AgentState = 'idle' | 'running' | 'waiting' | 'stopped';
@@ -33,7 +33,7 @@ export abstract class BaseAgent {
   readonly name: string;
   protected goal: string;
   protected example: string;
-  protected llm: LLMProvider;
+  protected llm?: LLMProvider;
   protected fsm?: FSM;
   protected state: AgentState = 'idle';
   protected messageQueue?: MessageQueue;
@@ -46,10 +46,17 @@ export abstract class BaseAgent {
     this.name = config.name;
     this.goal = config.goal || 'I am an AI agent.';
     this.example = config.example || '';
-    this.llm = config.llm!;
+    this.llm = config.llm;
     this.fsm = config.fsm;
     this.shortTermMemory = memoryRegistry.getShortTerm(this.name, '');
     this.longTermMemory = memoryRegistry.getLongTerm(this.name);
+  }
+
+  /**
+   * Check if agent has LLM configured
+   */
+  hasLLM(): boolean {
+    return this.llm !== undefined && this.llm !== null;
   }
 
   /**
@@ -117,9 +124,80 @@ export abstract class BaseAgent {
   }
 
   /**
-   * Add to short-term memory
+   * Register multiple capabilities at once
    */
-  protected addToMemory(type: 'observation' | 'action' | 'result' | 'meta', content: string): void {
+  registerCapabilities(capabilities: { actions?: Action[]; tools?: Tool[] }): void {
+    if (capabilities.actions) {
+      for (const action of capabilities.actions) {
+        this.actions.set(action.name, action);
+        logger.debug(`${this.name}: registered action ${action.name}`);
+      }
+    }
+    if (capabilities.tools) {
+      for (const tool of capabilities.tools) {
+        this.tools.set(tool.name, tool);
+        logger.debug(`${this.name}: registered tool ${tool.name}`);
+      }
+    }
+  }
+
+  /**
+   * Get all registered capability names
+   */
+  getCapabilities(): { actions: string[]; tools: string[] } {
+    return {
+      actions: Array.from(this.actions.keys()),
+      tools: Array.from(this.tools.keys()),
+    };
+  }
+
+  /**
+   * Get recent messages from memory as LLMMessage[]
+   */
+  getRecentMessages(count: number = 50): LLMMessage[] {
+    const entries = this.shortTermMemory.get(count);
+    return entries.map(entry => ({
+      role: entry.type === 'action' ? 'assistant' as const : 'user' as const,
+      content: entry.content,
+    }));
+  }
+
+  /**
+   * Execute FSM transition if configured
+   */
+  protected async maybeTransition(): Promise<boolean> {
+    if (!this.fsm) return false;
+    if (this.fsm.isTerminal()) return false;
+
+    // Check budget
+    const ctx = this.fsm.getContext();
+    if (ctx.budget > 0 && ctx.cost >= ctx.budget) {
+      await this.fsm.transition('S_final');
+      return true;
+    }
+
+    // Try to transition
+    return await this.fsm.trigger();
+  }
+
+  /**
+   * Get FSM state info for display
+   */
+  getFSMInfo(): { state: string; trace: string[]; budget: number; cost: number } | null {
+    if (!this.fsm) return null;
+    const ctx = this.fsm.getContext();
+    return {
+      state: this.fsm.getStateName(),
+      trace: ctx.trace,
+      budget: ctx.budget,
+      cost: ctx.cost,
+    };
+  }
+
+  /**
+   * Add to short-term memory (public for external access)
+   */
+  addToMemory(type: 'observation' | 'action' | 'result' | 'meta', content: string): void {
     this.shortTermMemory.add({ type, content });
   }
 

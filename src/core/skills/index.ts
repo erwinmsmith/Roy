@@ -9,6 +9,7 @@ import type {
   SkillManifest,
   SkillInstallationResult,
 } from './types.js';
+import { logger } from '../utils/logger.js';
 
 export type SkillInstaller = (source: string) => Promise<Skill>;
 
@@ -22,7 +23,7 @@ class SkillRegistry {
    */
   register(skill: Skill): void {
     if (this.skills.has(skill.name)) {
-      console.warn(`Skill "${skill.name}" already registered, overwriting`);
+      logger.warn(`Skill "${skill.name}" already registered, overwriting`);
     }
     this.skills.set(skill.name, skill);
 

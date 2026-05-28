@@ -16,7 +16,7 @@ import {
   ProgressListener,
   type EventListener,
 } from './listeners.js';
-import { getLoggerConfig } from '../config/index.js';
+import { getLoggerConfig } from '../../config/index.js';
 
 /**
  * Event bus for distributing log events
@@ -311,7 +311,7 @@ export async function asyncEventContext(
  */
 export async function configureLogging(
   options?: {
-    level?: 'debug' | 'info' | 'warning' | 'error';
+    level?: 'debug' | 'info' | 'warn' | 'warning' | 'error';
     transports?: Array<'console' | 'file' | 'http'>;
     batchSize?: number;
     flushInterval?: number;
@@ -322,7 +322,8 @@ export async function configureLogging(
   }
 ): Promise<void> {
   const config = getLoggerConfig();
-  const level = options?.level || config?.level || 'info';
+  const configuredLevel = options?.level || config?.level || 'info';
+  const level = configuredLevel === 'warn' ? 'warning' : configuredLevel;
   const batchSize = options?.batchSize || config?.batchSize || 100;
   const flushInterval = options?.flushInterval || config?.flushInterval || 2.0;
   const progressDisplay = options?.progressDisplay ?? config?.progressDisplay ?? false;

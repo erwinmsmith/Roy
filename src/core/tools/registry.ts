@@ -1,6 +1,7 @@
 // Tool registry implementation
 
 import type { Tool, ToolConfig, ToolResult, ToolMetadata } from './types.js';
+import { logger } from '../utils/logger.js';
 
 class ToolRegistry {
   private tools: Map<string, Tool> = new Map();
@@ -11,7 +12,7 @@ class ToolRegistry {
    */
   register(tool: Tool, category?: string): void {
     if (this.tools.has(tool.name)) {
-      console.warn(`Tool "${tool.name}" already registered, overwriting`);
+      logger.warn(`Tool "${tool.name}" already registered, overwriting`);
     }
     this.tools.set(tool.name, tool);
 

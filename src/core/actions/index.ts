@@ -1,6 +1,7 @@
 // Action Registry - manages action registration and discovery
 
 import type { Action, ActionResult } from './Action.js';
+import { logger } from '../utils/logger.js';
 
 class ActionRegistry {
   private actions: Map<string, Action> = new Map();
@@ -11,7 +12,7 @@ class ActionRegistry {
    */
   register(action: Action, category?: string): void {
     if (this.actions.has(action.name)) {
-      console.warn(`Action "${action.name}" already registered, overwriting`);
+      logger.warn(`Action "${action.name}" already registered, overwriting`);
     }
     this.actions.set(action.name, action);
 

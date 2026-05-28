@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { actionRegistry } from '../src/actions/index.js';
-import { Action, type ActionResult } from '../src/actions/Action.js';
+import { actionRegistry } from '../src/core/actions/index.js';
+import { Action, type ActionResult } from '../src/core/actions/Action.js';
 
 // Create test actions
 class EchoAction extends Action {
@@ -52,7 +52,10 @@ describe('ActionRegistry', () => {
       actionRegistry.register(new EchoAction({ name: 'dup' }));
       actionRegistry.register(new EchoAction({ name: 'dup' }));
 
-      expect(warnSpy).toHaveBeenCalledWith('Action "dup" already registered, overwriting');
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringMatching(/^\[WARN\]/),
+        'Action "dup" already registered, overwriting'
+      );
       warnSpy.mockRestore();
     });
   });

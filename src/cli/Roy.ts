@@ -1,0 +1,607 @@
+// Roy CLI - Terminal Interface for the Agent System
+
+import * as readline from 'readline';
+import * as path from 'path';
+import { bootstrap, cleanup, type BootstrapContext } from '../bootstrap.js';
+import { skillRegistry } from '../core/skills/index.js';
+import { actionRegistry } from '../core/actions/index.js';
+import { toolRegistry } from '../core/tools/index.js';
+import { logger } from '../core/utils/logger.js';
+
+// ASCII Banner - compatible with all terminals
+const BANNER = `
++=====================================================+
+|                                                    |
+|     ██████╗  ██████╗ ██╗   ██╗                     |
+|     ██╔══██╗██╔═══██╗╚██╗ ██╔╝                     |
+|     ██████╔╝██║   ██║ ╚████╔╝                      |
+|     ██╔══██╗██║   ██║  ╚██╔╝                       |
+|     ██║  ██║╚██████╔╝   ██║                        |
+|     ╚═╝  ╚═╝ ╚═════╝    ╚═╝                        |
+|                                                    |
+| Theory of Mind based Autonomous Agent System       |
+|                                                    |
++=====================================================+
+`;
+
+interface DialogOption {
+  key: string;
+  label: string;
+  description: string;
+}
+
+export class Roy {
+  private ctx: BootstrapContext | null = null;
+  private rl: readline.Interface;
+  private autoColor = true;
+  private verboseMode = false;
+  private sessionId = 'cli-session';
+
+  constructor() {
+    this.rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+      completer: this.completer.bind(this),
+    });
+  }
+
+  // Color utilities
+  private green(text: string): string {
+    return this.autoColor ? `\x1b[32m${text}\x1b[0m` : text;
+  }
+
+  private yellow(text: string): string {
+    return this.autoColor ? `\x1b[33m${text}\x1b[0m` : text;
+  }
+
+  private red(text: string): string {
+    return this.autoColor ? `\x1b[31m${text}\x1b[0m` : text;
+  }
+
+  private cyan(text: string): string {
+    return this.autoColor ? `\x1b[36m${text}\x1b[0m` : text;
+  }
+
+  private bold(text: string): string {
+    return this.autoColor ? `\x1b[1m${text}\x1b[0m` : text;
+  }
+
+  private dim(text: string): string {
+    return this.autoColor ? `\x1b[2m${text}\x1b[0m` : text;
+  }
+
+  private async launch(): Promise<void> {
+    this.printBanner();
+    await this.showWelcomeDialog();
+
+    try {
+      this.ctx = await bootstrap({
+        agentName: 'Assistant',
+        agentGoal: 'You are a helpful, knowledgeable assistant. Provide clear and concise responses.',
+        sessionId: this.sessionId,
+        fsmEnabled: true,
+      });
+
+      logger.info('CLI Bootstrap complete');
+      this.printStatus();
+      this.startChat();
+    } catch (error) {
+      console.log('\n  ' + this.red('[ERROR]') + ' Failed to initialize Roy');
+      console.log('  ' + this.dim(String(error)));
+      logger.error('Bootstrap failed:', error);
+      process.exit(1);
+    }
+  }
+
+  private printBanner(): void {
+    console.log(this.green(BANNER));
+    console.log(this.dim('='.repeat(60)));
+  }
+
+  private async showWelcomeDialog(): Promise<void> {
+    return new Promise((resolve) => {
+      console.log('\n' + this.bold('  Welcome to Roy - Your Agent System Terminal') + '\n');
+
+      const options: DialogOption[] = [
+        { key: '1', label: 'Quick Start', description: 'Start with default settings' },
+        { key: '2', label: 'Configure LLM', description: 'Check/configure LLM provider' },
+        { key: '3', label: 'View Capabilities', description: 'Show skills, actions, tools' },
+        { key: '4', label: 'Advanced', description: 'Configure all settings' },
+      ];
+
+      console.log('  ' + this.bold('Choose an option:'));
+      console.log('');
+
+      for (const opt of options) {
+        console.log(`    [${this.cyan(opt.key)}] ${this.bold(opt.label)} - ${opt.description}`);
+      }
+
+      console.log('');
+
+      const question = '\n  Press Enter to start with defaults, or type option number: ';
+      this.rl.question(question, async (answer) => {
+        const choice = answer.trim();
+
+        if (choice === '2') {
+          await this.showLLMConfigDialog();
+        } else if (choice === '3') {
+          await this.showCapabilities();
+          await this.pause('Press Enter to continue...');
+        } else if (choice === '4') {
+          await this.showAdvancedConfigDialog();
+        }
+
+        resolve();
+      });
+    });
+  }
+
+  private async showLLMConfigDialog(): Promise<void> {
+    console.log('\n' + this.bold('  LLM Configuration') + '\n');
+
+    const provider = this.ctx?.config.llm?.provider ?? 'anthropic';
+    const model = this.ctx?.config.llm?.model ?? 'claude-sonnet-4-20250514';
+    const apiKeySet = !!(process.env.ANTHROPIC_API_KEY || process.env.OPENAI_API_KEY || this.ctx?.config.llm?.apiKey);
+
+    console.log(`    Provider: ${this.cyan(provider)}`);
+    console.log(`    Model:    ${this.cyan(model)}`);
+    console.log(`    API Key:  ${apiKeySet ? this.green('Configured') : this.red('Not set')}`);
+    console.log('');
+
+    if (!apiKeySet) {
+      console.log('  ' + this.yellow('No API key detected. Please set:'));
+      console.log('    ANTHROPIC_API_KEY or OPENAI_API_KEY environment variable');
+      console.log('    Or configure in roy.config.yaml');
+    }
+  }
+
+  private async showAdvancedConfigDialog(): Promise<void> {
+    console.log('\n' + this.bold('  Advanced Configuration') + '\n');
+
+    const config = this.ctx?.config;
+    const configInfo = [
+      ['Port', String(config?.server?.port ?? 3000)],
+      ['Log Level', config?.logger?.level ?? 'info'],
+      ['LLM Provider', config?.llm?.provider ?? 'auto'],
+      ['LLM Model', config?.llm?.model ?? 'default'],
+    ];
+
+    for (const [key, value] of configInfo) {
+      console.log(`    ${this.bold(key + ':')} ${this.cyan(value)}`);
+    }
+
+    console.log('\n  ' + this.dim('Configure via roy.config.yaml for persistent settings'));
+  }
+
+  private async showCapabilities(): Promise<void> {
+    console.log('\n' + this.bold('  System Capabilities') + '\n');
+
+    const caps = this.ctx?.capabilities;
+
+    console.log(`    ${this.bold('Skills:')} ${caps?.skills ?? 0}`);
+    const skills = skillRegistry.list();
+    if (skills.length > 0) {
+      for (const skill of skills.slice(0, 5)) {
+        console.log(`      - ${skill.name}`);
+      }
+      if (skills.length > 5) {
+        console.log(`      ${this.dim('... and ' + (skills.length - 5) + ' more')}`);
+      }
+    }
+
+    console.log(`    ${this.bold('Actions:')} ${caps?.actions ?? 0}`);
+    const actions = actionRegistry.list();
+    if (actions.length > 0) {
+      for (const action of actions.slice(0, 5)) {
+        console.log(`      - ${action.name}`);
+      }
+      if (actions.length > 5) {
+        console.log(`      ${this.dim('... and ' + (actions.length - 5) + ' more')}`);
+      }
+    }
+
+    console.log(`    ${this.bold('Tools:')} ${caps?.tools ?? 0}`);
+  }
+
+  private async pause(message: string): Promise<void> {
+    return new Promise((resolve) => {
+      this.rl.question('\n  ' + message + ' ', () => {
+        resolve();
+      });
+    });
+  }
+
+  private printStatus(): void {
+    if (!this.ctx) return;
+
+    console.log(this.dim('-'.repeat(60)));
+    console.log('  ' + this.bold('Status'));
+    console.log('    LLM:       ' + (this.ctx.llm ? this.green('Connected') : this.red('Not configured')));
+    console.log('    Agent:     ' + this.cyan(this.ctx.agent.name) + ' ' + this.green('[active]'));
+    console.log('    FSM:       ' + this.cyan(this.ctx.fsm.getStateName()));
+    console.log('    Session:   ' + this.cyan(this.sessionId));
+    console.log('    Memory:    ' + this.dim(this.getMemoryStats()));
+
+    const fsmInfo = this.ctx.agent.getFSMInfo();
+    if (fsmInfo) {
+      console.log('    Budget:    ' + fsmInfo.budget + ', Cost: ' + fsmInfo.cost);
+    }
+
+    console.log('    API Mode:  ' + this.dim('http://localhost:' + (this.ctx.config.server?.port ?? 3000)));
+    console.log(this.dim('-'.repeat(60)));
+    console.log('');
+  }
+
+  private getMemoryStats(): string {
+    if (!this.ctx) return 'N/A';
+    const agent = this.ctx.agent;
+    const messages = agent.getRecentMessages(100);
+    return messages.length + ' messages';
+  }
+
+  private startChat(): void {
+    const prompt = () => {
+      this.rl.question(this.cyan('\nroy') + ' > ', async (input) => {
+        const trimmed = input.trim();
+
+        if (!trimmed) {
+          prompt();
+          return;
+        }
+
+        if (trimmed.startsWith('/')) {
+          const shouldContinue = this.handleCommand(trimmed.toLowerCase());
+          if (shouldContinue !== false) {
+            prompt();
+          }
+          return;
+        }
+
+        await this.processMessage(trimmed);
+        prompt();
+      });
+    };
+
+    prompt();
+
+    this.rl.on('close', async () => {
+      console.log('\n\n' + this.yellow('Goodbye! Roy shutting down...') + '\n');
+      if (this.ctx) {
+        await cleanup(this.ctx);
+      }
+      process.exit(0);
+    });
+  }
+
+  private handleCommand(command: string): boolean | undefined {
+    const parts = command.split(/\s+/);
+    const cmd = parts[0];
+    const args = parts.slice(1).join(' ');
+
+    switch (cmd) {
+      case '/help':
+      case '/h':
+        this.printHelp();
+        break;
+
+      case '/clear':
+      case '/cls':
+        console.log('\n  ' + this.green('Note: Memory is managed by the agent. Use /reset to clear.') + '\n');
+        break;
+
+      case '/reset':
+        this.ctx?.fsm.reset();
+        console.log('\n  ' + this.green('FSM reset to initial state') + '\n');
+        break;
+
+      case '/agents':
+        this.printAgents();
+        break;
+
+      case '/exit':
+      case '/quit':
+      case '/q':
+        return false;
+
+      case '/api':
+        this.printApiInfo();
+        break;
+
+      case '/status':
+        this.printStatus();
+        break;
+
+      case '/skills':
+        this.printSkills();
+        break;
+
+      case '/actions':
+        this.printActions();
+        break;
+
+      case '/tools':
+        this.printTools();
+        break;
+
+      case '/memory':
+        this.printMemory();
+        break;
+
+      case '/session':
+        this.printSession();
+        break;
+
+      case '/verbose':
+        this.verboseMode = !this.verboseMode;
+        console.log('\n  Verbose mode: ' + (this.verboseMode ? this.green('on') : this.dim('off')) + '\n');
+        break;
+
+      case '/color':
+        this.autoColor = !this.autoColor;
+        console.log('\n  Colors: ' + (this.autoColor ? this.green('on') : this.dim('off')) + '\n');
+        break;
+
+      case '/system':
+        this.printSystemInfo();
+        break;
+
+      case '/fsm':
+        this.printFSMInfo();
+        break;
+
+      case '/prompt':
+        if (args && this.ctx) {
+          this.ctx.agent.addToMemory('meta', `System prompt: ${args}`);
+          console.log('\n  ' + this.green('System prompt added to agent memory') + '\n');
+        } else {
+          console.log('\n  Usage: /prompt <system instructions>' + '\n');
+        }
+        break;
+
+      case '/context':
+        this.printContext();
+        break;
+
+      default:
+        console.log('\n  ' + this.red('Unknown command:') + ' ' + command);
+        console.log('  Type ' + this.cyan('/help') + ' for available commands\n');
+    }
+  }
+
+  private printHelp(): void {
+    console.log(`
+  ${this.bold('Available Commands:')}
+
+    ${this.bold('Chat & History')}
+      /clear, /cls        Clear (note: history managed by agent)
+      /context            Show conversation context from memory
+
+    ${this.bold('System Information')}
+      /help, /h           Show this help message
+      /status             Show connection status with FSM state
+      /system             Show system information
+      /fsm                Show FSM state and trace
+      /verbose            Toggle verbose mode
+
+    ${this.bold('Agent Management')}
+      /agents             List available agents
+      /session            Show current session info
+      /reset              Reset FSM to initial state
+
+    ${this.bold('Capabilities')}
+      /skills             List registered skills
+      /actions            List available actions
+      /tools              List available tools
+      /memory             Show memory statistics
+
+    ${this.bold('Configuration')}
+      /api                Show API information
+      /prompt <text>      Add system prompt to agent memory
+      /color              Toggle color output
+
+    ${this.bold('Exit')}
+      /exit, /quit, /q    Exit Roy
+`);
+  }
+
+  private printAgents(): void {
+    if (!this.ctx) return;
+
+    const agents = this.ctx.manager.listAgents();
+    console.log('\n  ' + this.bold('Available Agents:'));
+    if (agents.length === 0) {
+      console.log('    ' + this.dim('No agents registered'));
+    } else {
+      for (const name of agents) {
+        const isActive = name === this.ctx.agent.name;
+        console.log(`    - ${this.cyan(name)} ${isActive ? this.green('[active]') : ''}`);
+      }
+    }
+    console.log('');
+  }
+
+  private printApiInfo(): void {
+    console.log('\n  ' + this.bold('API Endpoints:'));
+    console.log('    GET  /           - Server info');
+    console.log('    GET  /health     - Health check');
+    console.log('    WS   /           - Socket.IO for real-time chat');
+    console.log('    Port: ' + this.cyan(String(this.ctx?.config.server?.port ?? 3000)));
+    console.log('');
+  }
+
+  private printSkills(): void {
+    const skills = skillRegistry.list();
+    console.log('\n  ' + this.bold('Registered Skills:'));
+    if (skills.length === 0) {
+      console.log('    ' + this.dim('No skills registered'));
+    } else {
+      for (const skill of skills) {
+        const manifest = skillRegistry.getManifest(skill.name);
+        console.log(`    - ${this.cyan(skill.name)}`);
+        if (manifest?.description) {
+          console.log(`      ${this.dim(manifest.description)}`);
+        }
+        if (manifest?.tags?.length) {
+          console.log(`      Tags: ${manifest.tags.join(', ')}`);
+        }
+      }
+    }
+    console.log('');
+  }
+
+  private printActions(): void {
+    const actions = actionRegistry.list();
+    console.log('\n  ' + this.bold('Available Actions:'));
+    if (actions.length === 0) {
+      console.log('    ' + this.dim('No actions registered'));
+    } else {
+      for (const action of actions) {
+        console.log(`    - ${this.cyan(action.name)}: ${action.description}`);
+        if (action.parameters?.length) {
+          console.log(`      Parameters: ${action.parameters.map(p => p.name).join(', ')}`);
+        }
+      }
+    }
+    console.log('');
+  }
+
+  private printTools(): void {
+    const tools = toolRegistry.list();
+    console.log('\n  ' + this.bold('Available Tools:'));
+    if (tools.length === 0) {
+      console.log('    ' + this.dim('No tools registered'));
+    } else {
+      for (const tool of tools) {
+        console.log(`    - ${this.cyan(tool.name)}: ${tool.description}`);
+      }
+    }
+    console.log('');
+  }
+
+  private printMemory(): void {
+    if (!this.ctx) return;
+
+    console.log('\n  ' + this.bold('Agent Memory:'));
+    const messages = this.ctx.agent.getRecentMessages(100);
+    console.log(`    Entries: ${this.dim(String(messages.length))}`);
+
+    const caps = this.ctx.agent.getCapabilities();
+    console.log(`    Actions: ${caps.actions.length}`);
+    console.log(`    Tools:   ${caps.tools.length}`);
+    console.log('');
+  }
+
+  private printSession(): void {
+    if (!this.ctx) return;
+
+    const sessions = this.ctx.manager.listSessions();
+    const agents = this.ctx.manager.listAgents();
+    const messages = this.ctx.agent.getRecentMessages(100);
+
+    console.log('\n  ' + this.bold('Session Information:'));
+    console.log(`    Current Session: ${this.cyan(this.sessionId)}`);
+    console.log(`    Total Sessions: ${sessions.length}`);
+    console.log(`    Active Agents: ${agents.length}`);
+    console.log(`    Memory Entries: ${messages.length}`);
+    console.log('');
+  }
+
+  private printSystemInfo(): void {
+    console.log('\n  ' + this.bold('System Information:'));
+    console.log(`    Roy Version: ${this.cyan('0.1.0')}`);
+    console.log(`    Node.js: ${process.version}`);
+    console.log(`    Platform: ${process.platform}`);
+    console.log(`    Config: ${path.resolve(process.cwd(), 'roy.config.yaml')}`);
+    console.log('');
+  }
+
+  private printFSMInfo(): void {
+    if (!this.ctx) return;
+
+    const fsm = this.ctx.fsm;
+    const ctx = fsm.getContext();
+
+    console.log('\n  ' + this.bold('FSM State:'));
+    console.log(`    Current: ${this.cyan(fsm.getStateName())}`);
+    console.log(`    Budget: ${ctx.budget}`);
+    console.log(`    Cost: ${ctx.cost}`);
+    console.log(`    Uncertainty: ${ctx.uncertainty.toFixed(2)}`);
+    console.log(`    Conflict: ${ctx.conflict.toFixed(2)}`);
+    console.log(`    Evidence: ${ctx.evidence.toFixed(2)}`);
+
+    if (ctx.trace.length > 0) {
+      console.log('\n  ' + this.bold('Trace:'));
+      for (const entry of ctx.trace.slice(-5)) {
+        console.log(`    ${this.dim(entry.substring(0, 70) + (entry.length > 70 ? '...' : ''))}`);
+      }
+    }
+    console.log('');
+  }
+
+  private printContext(): void {
+    if (!this.ctx) return;
+
+    console.log('\n  ' + this.bold('Conversation Context:'));
+    const messages = this.ctx.agent.getRecentMessages(10);
+
+    if (messages.length === 0) {
+      console.log('    ' + this.dim('No messages in agent memory'));
+    } else {
+      for (const msg of messages) {
+        const role = msg.role === 'system' ? this.yellow('[system]') : this.cyan('[' + msg.role + ']');
+        const preview = msg.content.substring(0, 80) + (msg.content.length > 80 ? '...' : '');
+        console.log(`    ${role} ${this.dim(preview)}`);
+      }
+      if (messages.length >= 10) {
+        console.log(`    ${this.dim('... showing last 10 of ${messages.length} messages')}`);
+      }
+    }
+    console.log('');
+  }
+
+  private completer(line: string): [string[], string] {
+    const commands = [
+      '/help', '/h', '/clear', '/cls', '/reset', '/agents', '/exit', '/quit', '/q',
+      '/api', '/status', '/skills', '/actions', '/tools', '/memory', '/session',
+      '/system', '/fsm', '/prompt', '/context', '/verbose', '/color'
+    ];
+
+    if (line.startsWith('/')) {
+      const hits = commands.filter(c => c.startsWith(line.toLowerCase()));
+      return [hits.length ? hits : commands, line];
+    }
+
+    return [[], line];
+  }
+
+  private async processMessage(userInput: string): Promise<void> {
+    if (!this.ctx) {
+      console.log('\n  ' + this.red('Not ready.') + '\n');
+      return;
+    }
+
+    console.log('\n  ' + this.yellow('Thinking...') + '\n');
+
+    try {
+      // Use agent's step method which integrates FSM and memory
+      await this.ctx.agent.step(userInput);
+
+      // Show updated FSM state
+      if (this.verboseMode) {
+        const fsm = this.ctx.fsm;
+        console.log('\n  ' + this.dim(`[FSM: ${fsm.getStateName()}, Cost: ${fsm.getContext().cost}]`));
+      }
+    } catch (error) {
+      console.log('\n  ' + this.red('Error:') + ' ' + (error instanceof Error ? error.message : String(error)) + '\n');
+      logger.error('Process message error:', error);
+    }
+  }
+}
+
+// CLI entry point
+async function main(): Promise<void> {
+  const roy = new Roy();
+  await (roy as any).launch();
+}
+
+main().catch(console.error);

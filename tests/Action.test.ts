@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { Action, type ActionConfig, type ActionResult } from '../src/actions/Action.js';
+import { Action, type ActionConfig, type ActionResult } from '../src/core/actions/Action.js';
 
 // Test action implementation
 class TestAction extends Action {

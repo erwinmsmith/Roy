@@ -253,6 +253,73 @@ export class FSM {
   }
 
   /**
+   * Check if FSM should transition (for external use)
+   */
+  shouldTransition(): boolean {
+    return this.determineNextState() !== null;
+  }
+
+  /**
+   * Trigger FSM processing - call this after agent steps
+   */
+  async trigger(): Promise<boolean> {
+    const nextState = this.determineNextState();
+    if (nextState) {
+      return await this.transition(nextState);
+    }
+    return false;
+  }
+
+  /**
+   * Update uncertainty metric (0-1)
+   */
+  setUncertainty(value: number): void {
+    this.context.uncertainty = Math.max(0, Math.min(1, value));
+  }
+
+  /**
+   * Update conflict metric (0-1)
+   */
+  setConflict(value: number): void {
+    this.context.conflict = Math.max(0, Math.min(1, value));
+  }
+
+  /**
+   * Update evidence metric (0-1)
+   */
+  setEvidence(value: number): void {
+    this.context.evidence = Math.max(0, Math.min(1, value));
+  }
+
+  /**
+   * Update cost (accumulates over time)
+   */
+  addCost(amount: number): void {
+    this.context.cost += amount;
+  }
+
+  /**
+   * Set budget
+   */
+  setBudget(budget: number): void {
+    this.context.budget = budget;
+  }
+
+  /**
+   * Check if FSM is in terminal state
+   */
+  isTerminal(): boolean {
+    return this.state === 'S_final';
+  }
+
+  /**
+   * Get current state name
+   */
+  getStateName(): string {
+    return this.state;
+  }
+
+  /**
    * Reset FSM to initial state
    */
   reset(): void {
@@ -268,13 +335,6 @@ export class FSM {
       metadata: {},
     };
     this.onStateChange?.(this.state, this.context);
-  }
-
-  /**
-   * Check if FSM is in terminal state
-   */
-  isTerminal(): boolean {
-    return this.state === 'S_final';
   }
 }
 
