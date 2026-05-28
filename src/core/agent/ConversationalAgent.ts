@@ -28,7 +28,11 @@ export class ConversationalAgent extends BaseAgent {
    * Process a single step with FSM integration
    */
   async step(observation: string): Promise<void> {
-    this.state = 'running';
+    if (this.fsm?.isTerminal()) {
+      this.fsm.reset();
+    }
+
+    this.state = 'thinking';
     this.addToMemory('observation', observation);
 
     // Check if LLM is available
@@ -48,13 +52,6 @@ export class ConversationalAgent extends BaseAgent {
 
       // Pre-step transition
       await this.maybeTransition();
-
-      if (this.fsm.isTerminal()) {
-        logger.info(`Agent ${this.name} reached terminal FSM state`);
-        this.addToMemory('meta', 'FSM reached terminal state');
-        this.state = 'idle';
-        return;
-      }
 
       // Add current state to trace
       this.fsm.addToTrace(`[${this.fsm.getStateName()}] Input: ${observation.substring(0, 50)}...`);

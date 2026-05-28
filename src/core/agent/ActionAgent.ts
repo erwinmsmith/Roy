@@ -187,7 +187,7 @@ Return a JSON object with:
    * Process a single step
    */
   async step(observation: string): Promise<void> {
-    this.state = 'running';
+    this.state = 'thinking';
     this.addToMemory('observation', observation);
 
     // Decide action
@@ -204,6 +204,7 @@ Return a JSON object with:
     const receivers = this.route.get(action) || ['env'];
 
     try {
+      this.state = 'calling_tool';
       // Check if action is streaming
       const isStreaming =
         actionRegistry.has(action) ||

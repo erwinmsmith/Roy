@@ -5,6 +5,7 @@ import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 import { bootstrap, cleanup, type BootstrapContext } from '../bootstrap.js';
+import { runtime } from '../core/runtime/Runtime.js';
 import { logger } from '../core/utils/logger.js';
 import type { QueueMessage } from '../core/message/MessageQueue.js';
 
@@ -101,6 +102,7 @@ async function main(): Promise<void> {
 
   const app = express();
   const httpServer = createServer(app);
+  app.use(express.json());
 
   // Socket.IO connection handling
   const io = new Server(httpServer, {
@@ -133,6 +135,8 @@ async function main(): Promise<void> {
 
         let stepDone = false;
         let stepErrorMessage: string | null = null;
+        const usageBefore = agent.getUsage();
+        runtime.emit({ type: 'agent.status.changed', agentId: 'root', data: { to: 'thinking', source: 'api' } });
 
         const stepPromise = agent.step(message)
           .catch(err => {
@@ -161,6 +165,14 @@ async function main(): Promise<void> {
         }
 
         await stepPromise;
+        const usageAfter = agent.getUsage();
+        runtime.recordTurnUsage({
+          llmCalls: usageAfter.llmCalls - usageBefore.llmCalls,
+          promptTokens: usageAfter.promptTokens - usageBefore.promptTokens,
+          completionTokens: usageAfter.completionTokens - usageBefore.completionTokens,
+          totalTokens: usageAfter.totalTokens - usageBefore.totalTokens,
+        });
+        runtime.emit({ type: 'agent.status.changed', agentId: 'root', data: { to: 'idle', source: 'api' } });
 
         if (stepErrorMessage) {
           socket.emit('bot_response_stream', `Error: ${stepErrorMessage}`);
@@ -179,25 +191,64 @@ async function main(): Promise<void> {
 
   // Health check endpoint
   app.get('/health', (req, res) => {
+    const state = runtime.getState();
     const fsmInfo = ctx.agent.getFSMInfo();
-    const agentInfo = ctx.agent.getInfo();
     res.json({
       status: 'ok',
       name: 'Roy',
       version: '0.1.0',
       mode: 'api',
-      rootAgent: agentInfo,
+      rootAgent: state.rootAgent,
       fsm: fsmInfo ? {
         state: fsmInfo.state,
         cost: fsmInfo.cost,
         budget: fsmInfo.budget,
         budgetLabel: fsmInfo.budget === null ? 'unlimited' : String(fsmInfo.budget),
       } : null,
-      agents: ctx.manager.listAgentInfo(),
+      agents: state.agents,
       sessions: ctx.manager.listSessions(),
       capabilities: ctx.capabilities,
+      budget: state.budget,
       timestamp: new Date().toISOString(),
     });
+  });
+
+  app.get('/v1/status', (req, res) => {
+    res.json(runtime.getState());
+  });
+
+  app.get('/v1/agents', (req, res) => {
+    res.json(runtime.getState().agents);
+  });
+
+  app.get('/v1/agents/:id', (req, res) => {
+    const agent = runtime.getState().agents.find(item => item.identity.id === req.params.id);
+    if (!agent) {
+      res.status(404).json({ error: `Agent "${req.params.id}" not found` });
+      return;
+    }
+    res.json(agent);
+  });
+
+  app.get('/v1/budget', (req, res) => {
+    res.json(runtime.getBudgetState());
+  });
+
+  app.post('/v1/budget', (req, res) => {
+    const limitTokens = req.body?.limitTokens;
+    if (limitTokens === null) {
+      res.json(runtime.setBudget(null));
+      return;
+    }
+    if (typeof limitTokens !== 'number' || !Number.isFinite(limitTokens) || limitTokens <= 0) {
+      res.status(400).json({ error: 'Expected body { "limitTokens": positive number | null }' });
+      return;
+    }
+    res.json(runtime.setBudget(limitTokens));
+  });
+
+  app.get('/v1/events', (req, res) => {
+    res.json(runtime.getEvents());
   });
 
   // Root endpoint

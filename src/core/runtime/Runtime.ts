@@ -9,6 +9,7 @@ import { AgentManager } from './AgentManager.js';
 import { FSM } from '../executor/FSM.js';
 import { signalBus } from '../executor/SignalBus.js';
 import { UnifiedAgent } from '../agent/UnifiedAgent.js';
+import type { AgentInfo, AgentUsage } from '../agent/BaseAgent.js';
 import { actionRegistry } from '../actions/index.js';
 import { toolRegistry } from '../tools/index.js';
 import { skillRegistry } from '../skills/index.js';
@@ -37,11 +38,43 @@ export interface RuntimeContext {
   };
 }
 
+export interface TokenUsage extends AgentUsage {
+  thinkingTokens: number | null;
+  estimatedCostUsd?: number;
+}
+
+export interface BudgetState {
+  mode: 'unlimited' | 'limited';
+  limitTokens?: number;
+  usedTokens: number;
+  remainingTokens?: number;
+  perAgent: Record<string, TokenUsage>;
+  perTurn: TokenUsage[];
+}
+
+export interface RuntimeEvent {
+  type: string;
+  timestamp: number;
+  agentId?: string;
+  data?: Record<string, unknown>;
+}
+
+export interface RuntimeState {
+  sessionId: string;
+  rootAgentId: string;
+  rootAgent: AgentInfo;
+  agents: AgentInfo[];
+  events: RuntimeEvent[];
+  budget: BudgetState;
+}
+
 export class Runtime {
   private static instance: Runtime | null = null;
 
   private ctx: RuntimeContext | null = null;
   private initialized = false;
+  private events: RuntimeEvent[] = [];
+  private perTurnUsage: TokenUsage[] = [];
 
   static getInstance(): Runtime {
     if (!Runtime.instance) {
@@ -78,10 +111,12 @@ export class Runtime {
       onTransition: (from, to) => {
         logger.debug(`FSM transition: ${from} -> ${to}`);
         signalBus.emit('fsm:transition', { from, to });
+        this.emit({ type: 'fsm.transition', agentId: 'root', data: { from, to } });
       },
       onStateChange: (state) => {
         logger.debug(`FSM state: ${state}`);
         signalBus.emit('fsm:stateChange', { state });
+        this.emit({ type: 'fsm.state.changed', agentId: 'root', data: { state } });
       },
     });
 
@@ -101,7 +136,11 @@ export class Runtime {
       goal: agentGoal,
       llm: llm ?? undefined,  // Convert null to undefined for agent
       fsm: options.fsmEnabled !== false ? fsm : undefined,
+      id: 'root',
       role: 'root',
+      generation: 0,
+      tomLevel: 1,
+      description: 'Root agent of the Roy autonomous agent system',
       mode: options.mode ?? 'hybrid',
     });
 
@@ -133,6 +172,7 @@ export class Runtime {
     };
 
     this.initialized = true;
+    this.emit({ type: 'runtime.initialized', agentId: 'root', data: { sessionId, provider: llm?.name ?? null } });
     return this.ctx;
   }
 
@@ -222,6 +262,82 @@ export class Runtime {
 
   isInitialized(): boolean {
     return this.initialized;
+  }
+
+  emit(event: Omit<RuntimeEvent, 'timestamp'>): RuntimeEvent {
+    const runtimeEvent: RuntimeEvent = {
+      ...event,
+      timestamp: Date.now(),
+    };
+    this.events.push(runtimeEvent);
+    if (this.events.length > 500) {
+      this.events = this.events.slice(-500);
+    }
+    return runtimeEvent;
+  }
+
+  recordTurnUsage(usage: AgentUsage): void {
+    this.perTurnUsage.push(this.toTokenUsage(usage));
+  }
+
+  getState(): RuntimeState {
+    const ctx = this.getContext();
+    const agents = ctx.manager.listAgentInfo();
+    const rootAgent = ctx.agent.getInfo();
+    return {
+      sessionId: ctx.sessionId,
+      rootAgentId: rootAgent.identity.id,
+      rootAgent,
+      agents,
+      events: this.getEvents(),
+      budget: this.getBudgetState(),
+    };
+  }
+
+  getEvents(): RuntimeEvent[] {
+    return [...this.events];
+  }
+
+  getBudgetState(): BudgetState {
+    const ctx = this.getContext();
+    const fsmCtx = ctx.fsm.getContext();
+    const agents = ctx.manager.listAgentInfo();
+    const perAgent: Record<string, TokenUsage> = {};
+    let usedTokens = 0;
+
+    for (const agent of agents) {
+      const usage = this.toTokenUsage(agent.usage);
+      perAgent[agent.identity.id] = usage;
+      usedTokens += usage.totalTokens;
+    }
+
+    return {
+      mode: fsmCtx.budget === null ? 'unlimited' : 'limited',
+      limitTokens: fsmCtx.budget ?? undefined,
+      usedTokens,
+      remainingTokens: fsmCtx.budget === null ? undefined : Math.max(0, fsmCtx.budget - usedTokens),
+      perAgent,
+      perTurn: [...this.perTurnUsage],
+    };
+  }
+
+  setBudget(limitTokens: number | null): BudgetState {
+    const ctx = this.getContext();
+    if (limitTokens === null) {
+      ctx.fsm.clearBudget();
+      this.emit({ type: 'budget.updated', data: { mode: 'unlimited' } });
+    } else {
+      ctx.fsm.setBudget(limitTokens);
+      this.emit({ type: 'budget.updated', data: { mode: 'limited', limitTokens } });
+    }
+    return this.getBudgetState();
+  }
+
+  private toTokenUsage(usage: AgentUsage): TokenUsage {
+    return {
+      ...usage,
+      thinkingTokens: null,
+    };
   }
 }
 

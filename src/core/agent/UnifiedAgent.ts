@@ -52,7 +52,11 @@ export class UnifiedAgent extends BaseAgent {
    * Main step - orchestrates FSM, prompts, planning, and execution
    */
   async step(observation: string): Promise<void> {
-    this.state = 'running';
+    if (this.fsm?.isTerminal()) {
+      this.fsm.reset();
+    }
+
+    this.state = 'thinking';
     this.addToMemory('observation', observation);
 
     if (!this.llm) {
@@ -71,13 +75,6 @@ export class UnifiedAgent extends BaseAgent {
 
     // Pre-step transition
     await this.maybeTransition();
-
-    if (this.fsm?.isTerminal()) {
-      logger.info(`Agent ${this.name} reached terminal FSM state`);
-      this.addToMemory('meta', 'FSM reached terminal state');
-      this.state = 'idle';
-      return;
-    }
 
     // === FSM State-Based Prompt Selection ===
     const systemPrompt = this.buildFSMPrompt(observation);
@@ -100,6 +97,7 @@ export class UnifiedAgent extends BaseAgent {
       await this.maybeTransition();
     }
 
+    logger.info(`Turn completed for agent ${this.name}`);
     this.state = 'idle';
   }
 
@@ -131,6 +129,7 @@ export class UnifiedAgent extends BaseAgent {
 
     if (!this.fsm) {
       return buildPrompt(conversationalTemplate.template, {
+        agent_identity: this.buildIdentityPrompt(),
         agent_goal: baseGoal,
         agent_example: examplePart,
       });
@@ -143,6 +142,7 @@ export class UnifiedAgent extends BaseAgent {
     switch (state) {
       case 'S_solo':
         return buildPrompt(conversationalTemplate.template, {
+          agent_identity: this.buildIdentityPrompt(),
           agent_goal: baseGoal,
           agent_example: examplePart,
         });
@@ -193,6 +193,7 @@ export class UnifiedAgent extends BaseAgent {
 
       case 'S_final':
         return buildPrompt(conversationalTemplate.template, {
+          agent_identity: this.buildIdentityPrompt(),
           agent_goal: baseGoal,
           agent_example: 'Provide a clear, final answer summarizing all reasoning.',
         });
@@ -207,6 +208,7 @@ export class UnifiedAgent extends BaseAgent {
 
       default:
         return buildPrompt(conversationalTemplate.template, {
+          agent_identity: this.buildIdentityPrompt(),
           agent_goal: baseGoal,
           agent_example: examplePart,
         });

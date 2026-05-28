@@ -10,8 +10,19 @@ import { buildPrompt } from '../prompts/builder.js';
 import { conversationalTemplate } from '../prompts/templates/conversational.js';
 import { logger } from '../utils/logger.js';
 
-export type AgentState = 'idle' | 'running' | 'waiting' | 'stopped';
+export type AgentState = 'idle' | 'thinking' | 'calling_tool' | 'waiting' | 'done' | 'failed' | 'stopped';
 export type AgentRole = 'root' | 'subagent' | 'subteam';
+
+export interface AgentIdentity {
+  id: string;
+  name: string;
+  role: AgentRole;
+  parentId?: string;
+  teamId?: string;
+  generation: number;
+  tomLevel: number;
+  description?: string;
+}
 
 export interface AgentUsage {
   llmCalls: number;
@@ -21,6 +32,7 @@ export interface AgentUsage {
 }
 
 export interface AgentConfig {
+  id?: string;
   name: string;
   goal?: string;
   example?: string;
@@ -28,12 +40,17 @@ export interface AgentConfig {
   fsm?: FSM;
   role?: AgentRole;
   parentId?: string;
+  teamId?: string;
+  generation?: number;
+  tomLevel?: number;
+  description?: string;
 }
 
 export interface AgentInfo {
   name: string;
   goal?: string;
   state: AgentState;
+  identity: AgentIdentity;
   role: AgentRole;
   parentId?: string;
   usage: AgentUsage;
@@ -43,6 +60,7 @@ export interface AgentInfo {
  * Base Agent class - all agents should extend this
  */
 export abstract class BaseAgent {
+  readonly id: string;
   readonly name: string;
   protected goal: string;
   protected example: string;
@@ -50,6 +68,10 @@ export abstract class BaseAgent {
   protected fsm?: FSM;
   protected role: AgentRole;
   protected parentId?: string;
+  protected teamId?: string;
+  protected generation: number;
+  protected tomLevel: number;
+  protected description?: string;
   protected state: AgentState = 'idle';
   protected usage: AgentUsage = {
     llmCalls: 0,
@@ -64,6 +86,7 @@ export abstract class BaseAgent {
   protected tools: Map<string, Tool> = new Map();
 
   constructor(config: AgentConfig) {
+    this.id = config.id ?? (config.role === 'root' || !config.role ? 'root' : config.name);
     this.name = config.name;
     this.goal = config.goal || 'I am an AI agent.';
     this.example = config.example || '';
@@ -71,6 +94,10 @@ export abstract class BaseAgent {
     this.fsm = config.fsm;
     this.role = config.role ?? 'root';
     this.parentId = config.parentId;
+    this.teamId = config.teamId;
+    this.generation = config.generation ?? (this.role === 'root' ? 0 : 1);
+    this.tomLevel = config.tomLevel ?? (this.role === 'root' ? 1 : 1);
+    this.description = config.description;
     this.shortTermMemory = memoryRegistry.getShortTerm(this.name, '');
     this.longTermMemory = memoryRegistry.getLongTerm(this.name);
   }
@@ -90,9 +117,26 @@ export abstract class BaseAgent {
       name: this.name,
       goal: this.goal,
       state: this.state,
+      identity: this.getIdentity(),
       role: this.role,
       parentId: this.parentId,
       usage: this.getUsage(),
+    };
+  }
+
+  /**
+   * Get stable identity metadata for runtime registries and UI.
+   */
+  getIdentity(): AgentIdentity {
+    return {
+      id: this.id,
+      name: this.name,
+      role: this.role,
+      parentId: this.parentId,
+      teamId: this.teamId,
+      generation: this.generation,
+      tomLevel: this.tomLevel,
+      description: this.description,
     };
   }
 
@@ -163,9 +207,25 @@ export abstract class BaseAgent {
   protected buildProfile(): string {
     const examplePart = this.example ? `\nExamples:\n${this.example}` : '';
     return buildPrompt(conversationalTemplate.template, {
+      agent_identity: this.buildIdentityPrompt(),
       agent_goal: this.goal,
       agent_example: examplePart,
     });
+  }
+
+  protected buildIdentityPrompt(): string {
+    if (this.role === 'root') {
+      return [
+        `You are ${this.name}, the root agent of a Theory-of-Mind based autonomous agent system.`,
+        'You are not DeepSeek, Claude, OpenAI, Anthropic, or any model provider.',
+        `Identity: id=${this.id}, role=${this.role}, generation=${this.generation}, ToM level=${this.tomLevel}.`,
+      ].join('\n');
+    }
+
+    return [
+      `You are ${this.name}, a ${this.role} in the Roy autonomous agent runtime.`,
+      `Identity: id=${this.id}, parent=${this.parentId ?? 'none'}, generation=${this.generation}, ToM level=${this.tomLevel}.`,
+    ].join('\n');
   }
 
   /**

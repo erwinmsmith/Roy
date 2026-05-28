@@ -3,6 +3,7 @@
 import * as readline from 'readline';
 import * as path from 'path';
 import { bootstrap, cleanup, type BootstrapContext } from '../bootstrap.js';
+import { runtime } from '../core/runtime/Runtime.js';
 import { skillRegistry } from '../core/skills/index.js';
 import { actionRegistry } from '../core/actions/index.js';
 import { toolRegistry } from '../core/tools/index.js';
@@ -72,7 +73,6 @@ export class Roy {
 
   private async launch(): Promise<void> {
     this.printBanner();
-    await this.showWelcomeDialog();
 
     try {
       this.ctx = await bootstrap({
@@ -83,7 +83,7 @@ export class Roy {
       });
 
       logger.info('CLI Bootstrap complete');
-      this.printStatus();
+      this.printReady();
       this.startChat();
     } catch (error) {
       console.log('\n  ' + this.red('[ERROR]') + ' Failed to initialize Roy');
@@ -96,6 +96,28 @@ export class Roy {
   private printBanner(): void {
     console.log(this.green(BANNER));
     console.log(this.dim('='.repeat(60)));
+  }
+
+  private printReady(): void {
+    if (!this.ctx) return;
+
+    const state = runtime.getState();
+    const provider = this.ctx.llm?.name ?? 'not configured';
+    const model = this.ctx.llm?.defaultModel ?? this.ctx.config.llm?.model ?? 'unknown';
+    const budget = state.budget.mode === 'unlimited'
+      ? 'unlimited'
+      : `${state.budget.usedTokens} / ${state.budget.limitTokens} tokens used`;
+
+    console.log(this.green('Roy Runtime initialized'));
+    console.log('Provider: ' + this.cyan(provider));
+    console.log('Model: ' + this.cyan(model));
+    console.log('Root Agent: ' + this.cyan(`${state.rootAgent.identity.name} [${state.rootAgent.identity.role}, ToM-${state.rootAgent.identity.tomLevel}]`));
+    console.log('Session: ' + this.cyan(state.sessionId));
+    console.log('FSM: ' + this.cyan(this.ctx.fsm.getStateName()));
+    console.log('Budget: ' + this.cyan(budget));
+    console.log('Tokens: ' + this.cyan(`${state.budget.usedTokens} total`));
+    console.log('API: ' + this.dim('http://localhost:' + (this.ctx.config.server?.port ?? 3000)));
+    console.log('Type ' + this.cyan('/help') + ' for commands.');
   }
 
   private async showWelcomeDialog(): Promise<void> {
@@ -245,7 +267,7 @@ export class Roy {
 
   private startChat(): void {
     const prompt = () => {
-      this.rl.question(this.cyan('\nroy') + ' > ', async (input) => {
+      this.rl.question(this.cyan('\nyou') + ' > ', async (input) => {
         const trimmed = input.trim();
 
         if (!trimmed) {
@@ -254,7 +276,7 @@ export class Roy {
         }
 
         if (trimmed.startsWith('/')) {
-          const shouldContinue = this.handleCommand(trimmed.toLowerCase());
+          const shouldContinue = await this.handleCommand(trimmed.toLowerCase());
           if (shouldContinue !== false) {
             prompt();
           }
@@ -277,7 +299,7 @@ export class Roy {
     });
   }
 
-  private handleCommand(command: string): boolean | undefined {
+  private async handleCommand(command: string): Promise<boolean | undefined> {
     const parts = command.split(/\s+/);
     const cmd = parts[0];
     const args = parts.slice(1).join(' ');
@@ -309,6 +331,18 @@ export class Roy {
 
       case '/api':
         this.printApiInfo();
+        break;
+
+      case '/budget':
+        this.handleBudget(args);
+        break;
+
+      case '/events':
+        this.printEvents();
+        break;
+
+      case '/config':
+        await this.showAdvancedConfigDialog();
         break;
 
       case '/status':
@@ -385,6 +419,10 @@ export class Roy {
       /status             Show connection status with FSM state
       /system             Show system information
       /fsm                Show FSM state and trace
+      /budget             Show token budget and usage
+      /budget set <n>     Set token budget
+      /budget unlimited   Remove token budget limit
+      /events             Show recent runtime events
       /verbose            Toggle verbose mode
 
     ${this.bold('Agent Management')}
@@ -400,6 +438,7 @@ export class Roy {
 
     ${this.bold('Configuration')}
       /api                Show API information
+      /config             Show runtime configuration
       /prompt <text>      Add system prompt to agent memory
       /color              Toggle color output
 
@@ -430,8 +469,63 @@ export class Roy {
     console.log('\n  ' + this.bold('API Endpoints:'));
     console.log('    GET  /           - Server info');
     console.log('    GET  /health     - Health check');
+    console.log('    GET  /v1/status  - Runtime status');
+    console.log('    GET  /v1/agents  - Agent states');
+    console.log('    GET  /v1/budget  - Token budget');
+    console.log('    GET  /v1/events  - Runtime events');
     console.log('    WS   /           - Socket.IO for real-time chat');
     console.log('    Port: ' + this.cyan(String(this.ctx?.config.server?.port ?? 3000)));
+    console.log('');
+  }
+
+  private printBudget(): void {
+    if (!this.ctx) return;
+
+    const budget = runtime.getBudgetState();
+    console.log('\n  ' + this.bold('Budget'));
+    if (budget.mode === 'unlimited') {
+      console.log('    Mode: unlimited');
+      console.log(`    Used: ${budget.usedTokens} tokens`);
+    } else {
+      console.log(`    Used: ${budget.usedTokens} / ${budget.limitTokens} tokens`);
+      console.log(`    Remaining: ${budget.remainingTokens ?? 0} tokens`);
+    }
+    console.log('    Thinking Tokens: unavailable');
+    console.log('');
+  }
+
+  private handleBudget(args: string): void {
+    const [subcommand, value] = args.split(/\s+/);
+    if (subcommand === 'set') {
+      const parsed = Number(value);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        console.log('\n  Usage: /budget set <positive-token-limit>\n');
+        return;
+      }
+      runtime.setBudget(parsed);
+      console.log('\n  ' + this.green(`Budget set to ${parsed} tokens`) + '\n');
+      return;
+    }
+
+    if (subcommand === 'unlimited' || subcommand === 'clear') {
+      runtime.setBudget(null);
+      console.log('\n  ' + this.green('Budget set to unlimited') + '\n');
+      return;
+    }
+
+    this.printBudget();
+  }
+
+  private printEvents(): void {
+    const events = runtime.getEvents().slice(-10);
+    console.log('\n  ' + this.bold('Recent Events'));
+    if (events.length === 0) {
+      console.log('    ' + this.dim('No events'));
+    } else {
+      for (const event of events) {
+        console.log(`    - ${this.dim(new Date(event.timestamp).toISOString())} ${this.cyan(event.type)}${event.agentId ? ' ' + event.agentId : ''}`);
+      }
+    }
     console.log('');
   }
 
@@ -569,7 +663,7 @@ export class Roy {
     const commands = [
       '/help', '/h', '/clear', '/cls', '/reset', '/agents', '/exit', '/quit', '/q',
       '/api', '/status', '/skills', '/actions', '/tools', '/memory', '/session',
-      '/system', '/fsm', '/prompt', '/context', '/verbose', '/color'
+      '/system', '/fsm', '/budget', '/events', '/config', '/prompt', '/context', '/verbose', '/color'
     ];
 
     if (line.startsWith('/')) {
@@ -586,11 +680,22 @@ export class Roy {
       return;
     }
 
-    console.log('\n  ' + this.yellow('Thinking...') + '\n');
+    console.log('\n  ' + this.yellow('roy[root] thinking...') + '\n');
 
     try {
       // Use agent's step method which integrates FSM and memory
+      this.ctx.agent.addToMemory('meta', 'user turn started');
+      const usageBefore = this.ctx.agent.getUsage();
+      runtime.emit({ type: 'agent.status.changed', agentId: 'root', data: { to: 'thinking' } });
       await this.ctx.agent.step(userInput);
+      const usageAfter = this.ctx.agent.getUsage();
+      runtime.recordTurnUsage({
+        llmCalls: usageAfter.llmCalls - usageBefore.llmCalls,
+        promptTokens: usageAfter.promptTokens - usageBefore.promptTokens,
+        completionTokens: usageAfter.completionTokens - usageBefore.completionTokens,
+        totalTokens: usageAfter.totalTokens - usageBefore.totalTokens,
+      });
+      runtime.emit({ type: 'agent.status.changed', agentId: 'root', data: { to: 'idle' } });
       await this.printAgentOutput();
 
       // Show updated FSM state
@@ -618,7 +723,7 @@ export class Roy {
       const content = String(message.content);
       if (content.length > 0) {
         if (!printed) {
-          process.stdout.write('  ' + this.green(this.ctx.agent.name + ' > '));
+          process.stdout.write('  ' + this.green(`${this.ctx.agent.name.toLowerCase()}[root] > `));
         }
         process.stdout.write(content);
         printed = true;
