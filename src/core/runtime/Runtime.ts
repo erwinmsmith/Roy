@@ -174,6 +174,8 @@ export class Runtime {
         provider = llmFactory.get('anthropic')!;
       } else if (llmConfig?.provider === 'openai') {
         provider = llmFactory.get('openai')!;
+      } else if (llmConfig?.provider === 'deepseek') {
+        provider = llmFactory.get('deepseek')!;
       } else {
         provider = llmFactory.getDefault();
       }

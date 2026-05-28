@@ -11,12 +11,14 @@ import type {
 } from '../types.js';
 
 export class OpenAIProvider implements LLMProvider {
-  readonly name = 'openai';
-  readonly defaultModel = 'gpt-4o';
+  readonly name: string;
+  readonly defaultModel: string;
   private client: OpenAI | null = null;
   private config: ProviderConfig;
 
-  constructor(config?: ProviderConfig) {
+  constructor(config?: ProviderConfig, name = 'openai', defaultModel = 'gpt-4o') {
+    this.name = name;
+    this.defaultModel = defaultModel;
     this.config = config || {};
     this.initialize();
   }
@@ -151,6 +153,12 @@ export class OpenAIProvider implements LLMProvider {
   }
 }
 
+export class DeepSeekProvider extends OpenAIProvider {
+  constructor(config?: ProviderConfig) {
+    super(config, 'deepseek', 'deepseek-v4-flash');
+  }
+}
+
 /**
  * Create OpenAI provider from environment
  */
@@ -163,5 +171,16 @@ export function createOpenAIProvider(): LLMProvider {
     apiKey: apiKey || undefined,
     baseUrl: baseUrl || undefined,
     model: model || undefined,
+  });
+}
+
+/**
+ * Create DeepSeek provider using the OpenAI-compatible API.
+ */
+export function createDeepSeekProvider(): LLMProvider {
+  return new DeepSeekProvider({
+    apiKey: process.env.DEEPSEEK_API_KEY || undefined,
+    baseUrl: process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com',
+    model: process.env.DEFAULT_MODEL || 'deepseek-v4-flash',
   });
 }

@@ -11,6 +11,9 @@ export const EnvSchema = z.object({
   ANTHROPIC_API_KEY: z.string().optional(),
   OPENAI_API_KEY: z.string().optional(),
   OPENAI_BASE_URL: z.string().optional(),
+  DEEPSEEK_API_KEY: z.string().optional(),
+  DEEPSEEK_BASE_URL: z.string().default('https://api.deepseek.com'),
+  DEEPSEEK_ANTHROPIC_BASE_URL: z.string().default('https://api.deepseek.com/anthropic'),
 
   // Default Model
   DEFAULT_MODEL: z.string().default('claude-sonnet-4-20250514'),
@@ -44,7 +47,7 @@ export const ServerConfigSchema = z.object({
 
 // LLM config schema
 export const LLMConfigSchema = z.object({
-  provider: z.enum(['anthropic', 'openai']).default('anthropic'),
+  provider: z.enum(['anthropic', 'openai', 'deepseek']).default('anthropic'),
   model: z.string().default('claude-sonnet-4-20250514'),
   apiKey: z.string().optional(),
   baseUrl: z.string().optional(),
@@ -113,7 +116,7 @@ export class ConfigLoader {
       llm: {
         provider: 'anthropic',
         model: process.env.DEFAULT_MODEL || 'claude-sonnet-4-20250514',
-        apiKey: process.env.ANTHROPIC_API_KEY || process.env.OPENAI_API_KEY,
+        apiKey: process.env.ANTHROPIC_API_KEY || process.env.OPENAI_API_KEY || process.env.DEEPSEEK_API_KEY,
         baseUrl: process.env.OPENAI_BASE_URL,
         temperature: 0.7,
         maxTokens: 4096,
@@ -257,6 +260,29 @@ export class ConfigLoader {
    */
   private loadFromEnv(): Partial<AppConfig> {
     const config: Partial<AppConfig> = {};
+
+    // LLM provider from env
+    if (process.env.DEEPSEEK_API_KEY) {
+      config.llm = {
+        provider: 'deepseek',
+        model: process.env.DEFAULT_MODEL || 'deepseek-v4-flash',
+        apiKey: process.env.DEEPSEEK_API_KEY,
+        baseUrl: process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com',
+        temperature: 0.7,
+        maxTokens: 4096,
+        timeout: 60000,
+      };
+    } else if (process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY) {
+      config.llm = {
+        provider: process.env.OPENAI_API_KEY ? 'openai' : 'anthropic',
+        model: process.env.DEFAULT_MODEL || 'claude-sonnet-4-20250514',
+        apiKey: process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY,
+        baseUrl: process.env.OPENAI_BASE_URL,
+        temperature: 0.7,
+        maxTokens: 4096,
+        timeout: 60000,
+      };
+    }
 
     // Server from env
     if (process.env.PORT) {

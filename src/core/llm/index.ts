@@ -10,11 +10,11 @@ export type {
 } from './types.js';
 
 export { AnthropicProvider, createAnthropicProvider } from './providers/anthropic.js';
-export { OpenAIProvider, createOpenAIProvider } from './providers/openai.js';
+export { OpenAIProvider, DeepSeekProvider, createOpenAIProvider, createDeepSeekProvider } from './providers/openai.js';
 
 import type { LLMProvider } from './types.js';
 import { createAnthropicProvider } from './providers/anthropic.js';
-import { createOpenAIProvider } from './providers/openai.js';
+import { createOpenAIProvider, createDeepSeekProvider } from './providers/openai.js';
 
 /**
  * LLM Provider factory - creates provider based on model name
@@ -26,6 +26,7 @@ export class LLMFactory {
     // Register default providers
     this.providers.set('anthropic', createAnthropicProvider());
     this.providers.set('openai', createOpenAIProvider());
+    this.providers.set('deepseek', createDeepSeekProvider());
   }
 
   /**
@@ -56,6 +57,11 @@ export class LLMFactory {
     const openai = this.providers.get('openai');
     if (openai?.isConfigured()) {
       return openai;
+    }
+
+    const deepseek = this.providers.get('deepseek');
+    if (deepseek?.isConfigured()) {
+      return deepseek;
     }
 
     // Return first available provider (may not be configured)
