@@ -1,9 +1,9 @@
 // Base Agent interface and implementation
 
 import type { LLMProvider, LLMMessage } from '../llm/types.js';
-import type { MessageQueue, QueueMessage } from '../message/MessageQueue.js';
-import type { FSM, FSMContext } from '../executor/FSM.js';
-import type { Skill } from '../../skills/types.js';
+import type { MessageQueue } from '../message/MessageQueue.js';
+import type { FSM } from '../executor/FSM.js';
+import type { Action } from '../../actions/Action.js';
 import type { Tool } from '../../tools/types.js';
 import { memoryRegistry } from '../../memory/index.js';
 import { buildPrompt } from '../../prompts/builder.js';
@@ -39,7 +39,7 @@ export abstract class BaseAgent {
   protected messageQueue?: MessageQueue;
   protected shortTermMemory!: ReturnType<typeof memoryRegistry.getShortTerm>;
   protected longTermMemory!: ReturnType<typeof memoryRegistry.getLongTerm>;
-  protected skills: Map<string, Skill> = new Map();
+  protected actions: Map<string, Action> = new Map();
   protected tools: Map<string, Tool> = new Map();
 
   constructor(config: AgentConfig) {
@@ -78,17 +78,17 @@ export abstract class BaseAgent {
   }
 
   /**
-   * Register a skill
+   * Register an action
    */
-  registerSkill(skill: Skill): void {
-    this.skills.set(skill.name, skill);
+  registerAction(action: Action): void {
+    this.actions.set(action.name, action);
   }
 
   /**
-   * Get a skill
+   * Get an action
    */
-  getSkill(name: string): Skill | undefined {
-    return this.skills.get(name);
+  getAction(name: string): Action | undefined {
+    return this.actions.get(name);
   }
 
   /**
