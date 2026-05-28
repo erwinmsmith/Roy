@@ -7,16 +7,19 @@ import { Server } from 'socket.io';
 import { AgentManager } from '../core/manager/AgentManager.js';
 import { ConversationalAgent } from '../core/agent/ConversationalAgent.js';
 import { llmFactory } from '../core/llm/index.js';
+import { config } from '../config/index.js';
 import { logger } from '../core/utils/logger.js';
 
-const PORT = parseInt(process.env.PORT || '3000', 10);
-const LOG_LEVEL = (process.env.LOG_LEVEL || 'info') as 'debug' | 'info' | 'warn' | 'error';
+// Use config for server settings
+const PORT = config.server?.port ?? 3000;
+const HOST = config.server?.host ?? '0.0.0.0';
+const LOG_LEVEL = config.logger?.level ?? 'info';
 logger.setLevel(LOG_LEVEL);
 
 const app = express();
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
-  cors: {
+  cors: config.server?.cors ?? {
     origin: '*',
     methods: ['GET', 'POST'],
   },
@@ -25,13 +28,30 @@ const io = new Server(httpServer, {
 // Initialize AgentManager
 const manager = new AgentManager();
 
-// Create default LLM provider
+// Create default LLM provider from config
 let defaultLlm;
-try {
-  defaultLlm = llmFactory.getDefault();
-  logger.info(`Default LLM provider: ${defaultLlm.name}`);
-} catch (error) {
-  logger.warn('No LLM providers configured - agent functionality limited');
+const llmConfig = config.llm;
+if (llmConfig?.apiKey) {
+  try {
+    if (llmConfig.provider === 'anthropic') {
+      defaultLlm = llmFactory.get('anthropic');
+    } else {
+      defaultLlm = llmFactory.get('openai');
+    }
+    if (!defaultLlm?.isConfigured()) {
+      defaultLlm = llmFactory.getDefault();
+    }
+    logger.info(`Default LLM provider: ${defaultLlm.name}`);
+  } catch {
+    defaultLlm = llmFactory.getDefault();
+  }
+} else {
+  try {
+    defaultLlm = llmFactory.getDefault();
+    logger.info(`Default LLM provider: ${defaultLlm.name}`);
+  } catch {
+    logger.warn('No LLM providers configured - agent functionality limited');
+  }
 }
 
 // Create and add default agent
