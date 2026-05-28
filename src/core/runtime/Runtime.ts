@@ -85,7 +85,7 @@ export class Runtime {
       },
     });
 
-    if (options.budget) {
+    if (options.budget !== undefined) {
       fsm.setBudget(options.budget);
     }
 
@@ -93,14 +93,15 @@ export class Runtime {
     const manager = new AgentManager();
 
     // Create unified agent
-    const agentName = options.agentName ?? 'Assistant';
-    const agentGoal = options.agentGoal ?? 'You are a helpful AI assistant.';
+    const agentName = options.agentName ?? 'Roy';
+    const agentGoal = options.agentGoal ?? 'You are Roy, the root agent of a Theory-of-Mind based autonomous agent system.';
 
     const agent = new UnifiedAgent({
       name: agentName,
       goal: agentGoal,
       llm: llm ?? undefined,  // Convert null to undefined for agent
       fsm: options.fsmEnabled !== false ? fsm : undefined,
+      role: 'root',
       mode: options.mode ?? 'hybrid',
     });
 

@@ -200,6 +200,13 @@ export class AgentManager {
   }
 
   /**
+   * List agent state and usage snapshots.
+   */
+  listAgentInfo(): ReturnType<BaseAgent['getInfo']>[] {
+    return Array.from(this.agents.values()).map(agent => agent.getInfo());
+  }
+
+  /**
    * Cleanup manager
    */
   async cleanup(): Promise<void> {

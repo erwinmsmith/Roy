@@ -84,8 +84,8 @@ async function main(): Promise<void> {
 
   try {
     ctx = await bootstrap({
-      agentName: 'ServerAgent',
-      agentGoal: 'I am a server-side conversational agent. Help users with their questions.',
+      agentName: 'Roy',
+      agentGoal: 'You are Roy, the root agent of a Theory-of-Mind based autonomous agent system.',
       sessionId: 'server-main',
       fsmEnabled: true,
     });
@@ -180,18 +180,20 @@ async function main(): Promise<void> {
   // Health check endpoint
   app.get('/health', (req, res) => {
     const fsmInfo = ctx.agent.getFSMInfo();
+    const agentInfo = ctx.agent.getInfo();
     res.json({
       status: 'ok',
       name: 'Roy',
       version: '0.1.0',
       mode: 'api',
-      agent: ctx.agent.name,
+      rootAgent: agentInfo,
       fsm: fsmInfo ? {
         state: fsmInfo.state,
         cost: fsmInfo.cost,
         budget: fsmInfo.budget,
+        budgetLabel: fsmInfo.budget === null ? 'unlimited' : String(fsmInfo.budget),
       } : null,
-      agents: ctx.manager.listAgents(),
+      agents: ctx.manager.listAgentInfo(),
       sessions: ctx.manager.listSessions(),
       capabilities: ctx.capabilities,
       timestamp: new Date().toISOString(),

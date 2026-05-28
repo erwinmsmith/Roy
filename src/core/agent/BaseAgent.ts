@@ -1,6 +1,6 @@
 // Base Agent interface and implementation
 
-import type { LLMProvider, LLMMessage } from '../llm/types.js';
+import type { LLMProvider, LLMMessage, LLMCompletionResult, LLMStreamChunk } from '../llm/types.js';
 import type { MessageQueue } from '../message/MessageQueue.js';
 import type { FSM } from '../executor/FSM.js';
 import type { Action } from '../actions/Action.js';
@@ -11,6 +11,14 @@ import { conversationalTemplate } from '../prompts/templates/conversational.js';
 import { logger } from '../utils/logger.js';
 
 export type AgentState = 'idle' | 'running' | 'waiting' | 'stopped';
+export type AgentRole = 'root' | 'subagent' | 'subteam';
+
+export interface AgentUsage {
+  llmCalls: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+}
 
 export interface AgentConfig {
   name: string;
@@ -18,12 +26,17 @@ export interface AgentConfig {
   example?: string;
   llm?: LLMProvider;
   fsm?: FSM;
+  role?: AgentRole;
+  parentId?: string;
 }
 
 export interface AgentInfo {
   name: string;
   goal?: string;
   state: AgentState;
+  role: AgentRole;
+  parentId?: string;
+  usage: AgentUsage;
 }
 
 /**
@@ -35,7 +48,15 @@ export abstract class BaseAgent {
   protected example: string;
   protected llm?: LLMProvider;
   protected fsm?: FSM;
+  protected role: AgentRole;
+  protected parentId?: string;
   protected state: AgentState = 'idle';
+  protected usage: AgentUsage = {
+    llmCalls: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+  };
   protected messageQueue?: MessageQueue;
   protected shortTermMemory!: ReturnType<typeof memoryRegistry.getShortTerm>;
   protected longTermMemory!: ReturnType<typeof memoryRegistry.getLongTerm>;
@@ -48,6 +69,8 @@ export abstract class BaseAgent {
     this.example = config.example || '';
     this.llm = config.llm;
     this.fsm = config.fsm;
+    this.role = config.role ?? 'root';
+    this.parentId = config.parentId;
     this.shortTermMemory = memoryRegistry.getShortTerm(this.name, '');
     this.longTermMemory = memoryRegistry.getLongTerm(this.name);
   }
@@ -67,6 +90,9 @@ export abstract class BaseAgent {
       name: this.name,
       goal: this.goal,
       state: this.state,
+      role: this.role,
+      parentId: this.parentId,
+      usage: this.getUsage(),
     };
   }
 
@@ -75,6 +101,25 @@ export abstract class BaseAgent {
    */
   getState(): AgentState {
     return this.state;
+  }
+
+  /**
+   * Get accumulated LLM usage for this agent.
+   */
+  getUsage(): AgentUsage {
+    return { ...this.usage };
+  }
+
+  /**
+   * Track LLM token usage reported by providers.
+   */
+  protected recordUsage(result: LLMCompletionResult | LLMStreamChunk): void {
+    if (!result.usage) return;
+
+    this.usage.llmCalls += 1;
+    this.usage.promptTokens += result.usage.promptTokens;
+    this.usage.completionTokens += result.usage.completionTokens;
+    this.usage.totalTokens += result.usage.totalTokens;
   }
 
   /**
@@ -171,7 +216,7 @@ export abstract class BaseAgent {
 
     // Check budget
     const ctx = this.fsm.getContext();
-    if (ctx.budget > 0 && ctx.cost >= ctx.budget) {
+    if (ctx.budget !== null && ctx.cost >= ctx.budget) {
       await this.fsm.transition('S_final');
       return true;
     }
@@ -183,7 +228,7 @@ export abstract class BaseAgent {
   /**
    * Get FSM state info for display
    */
-  getFSMInfo(): { state: string; trace: string[]; budget: number; cost: number } | null {
+  getFSMInfo(): { state: string; trace: string[]; budget: number | null; cost: number } | null {
     if (!this.fsm) return null;
     const ctx = this.fsm.getContext();
     return {

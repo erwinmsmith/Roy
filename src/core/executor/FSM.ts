@@ -25,7 +25,7 @@ export interface FSMTransition {
 export interface FSMContext {
   state: FSMState;
   trace: string[];
-  budget: number;
+  budget: number | null;
   cost: number;
   uncertainty: number;
   conflict: number;
@@ -61,7 +61,7 @@ export class FSM {
     this.context = {
       state: this.state,
       trace: [],
-      budget: 1.0,
+      budget: null,
       cost: 0,
       uncertainty: 0,
       conflict: 0,
@@ -166,7 +166,7 @@ export class FSM {
 
       case 'S_decide':
         // Check if expansion is worth the cost
-        if (ctx.budget - ctx.cost < 0) {
+        if (ctx.budget !== null && ctx.budget - ctx.cost < 0) {
           return 'S_final'; // Not enough budget
         }
         if (ctx.uncertainty > 0.7 || ctx.conflict > 0.5) {
@@ -239,7 +239,7 @@ export class FSM {
       this.registerTransition({
         from: state,
         to: 'S_solo',
-        condition: () => this.context.cost > this.context.budget * 0.8,
+        condition: () => this.context.budget !== null && this.context.cost > this.context.budget * 0.8,
       });
     }
   }
@@ -303,6 +303,13 @@ export class FSM {
    */
   setBudget(budget: number): void {
     this.context.budget = budget;
+  }
+
+  /**
+   * Remove budget limit.
+   */
+  clearBudget(): void {
+    this.context.budget = null;
   }
 
   /**

@@ -68,12 +68,17 @@ export class ConversationalAgent extends BaseAgent {
       ...history,
       { role: 'user', content: observation },
     ];
+    const tokensBefore = this.usage.totalTokens;
 
     try {
       let fullResponse = '';
 
       // Stream response
       for await (const chunk of this.llm.stream(messages)) {
+        if (chunk.usage) {
+          this.recordUsage(chunk);
+        }
+
         fullResponse += chunk.content;
 
         // Send to message queue if available
@@ -95,7 +100,7 @@ export class ConversationalAgent extends BaseAgent {
 
       // Track cost
       if (this.fsm) {
-        this.fsm.addCost(1);
+        this.fsm.addCost(this.usage.totalTokens - tokensBefore);
 
         // Post-step transition
         await this.maybeTransition();

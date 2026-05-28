@@ -40,6 +40,8 @@ export class UnifiedAgent extends BaseAgent {
       example: config.example,
       llm: config.llm,
       fsm: config.fsm,
+      role: config.role,
+      parentId: config.parentId,
     });
     this.mode = config.mode ?? 'hybrid';
     this.planner = config.planner;
@@ -80,6 +82,7 @@ export class UnifiedAgent extends BaseAgent {
     // === FSM State-Based Prompt Selection ===
     const systemPrompt = this.buildFSMPrompt(observation);
     const messages = this.buildMessages(systemPrompt, observation);
+    const tokensBefore = this.usage.totalTokens;
 
     // === Determine Action Mode ===
     const shouldAct = await this.shouldExecuteAction(observation);
@@ -92,7 +95,7 @@ export class UnifiedAgent extends BaseAgent {
 
     // Track cost
     if (this.fsm) {
-      this.fsm.addCost(1);
+      this.fsm.addCost(this.usage.totalTokens - tokensBefore);
       this.fsm.addToTrace(`[${this.fsm.getStateName()}] Output complete`);
       await this.maybeTransition();
     }
@@ -135,6 +138,7 @@ export class UnifiedAgent extends BaseAgent {
 
     const state = this.fsm.getState();
     const ctx = this.fsm.getContext();
+    const remainingBudget = ctx.budget === null ? 'unlimited' : String(ctx.budget - ctx.cost);
 
     switch (state) {
       case 'S_solo':
@@ -153,7 +157,7 @@ export class UnifiedAgent extends BaseAgent {
         const candidates = this.formatCapabilitiesForPrompt();
         return buildPrompt(fsmDecideTemplate.template, {
           current_state: state,
-          budget: String(ctx.budget - ctx.cost),
+          budget: remainingBudget,
           candidates: candidates || 'No candidate actions available',
           uncertainty: String(ctx.uncertainty),
           conflict: String(ctx.conflict),
@@ -164,7 +168,7 @@ export class UnifiedAgent extends BaseAgent {
         return buildPrompt(fsmDeriveTemplate.template, {
           parent_unit: this.name,
           trace: ctx.trace.join('\n'),
-          budget: String(ctx.budget - ctx.cost),
+          budget: remainingBudget,
           state,
         });
 
@@ -197,7 +201,7 @@ export class UnifiedAgent extends BaseAgent {
         return buildPrompt(fsmDeriveTemplate.template, {
           parent_unit: this.name,
           trace: ctx.trace.join('\n'),
-          budget: String(ctx.budget - ctx.cost),
+          budget: remainingBudget,
           state: 'S_backtrack',
         });
 
@@ -449,6 +453,10 @@ Return a JSON object with:
       let fullResponse = '';
 
       for await (const chunk of this.llm!.stream(messages)) {
+        if (chunk.usage) {
+          this.recordUsage(chunk);
+        }
+
         fullResponse += chunk.content;
 
         if (this.messageQueue) {

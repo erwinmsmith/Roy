@@ -76,8 +76,8 @@ export class Roy {
 
     try {
       this.ctx = await bootstrap({
-        agentName: 'Assistant',
-        agentGoal: 'You are a helpful, knowledgeable assistant. Provide clear and concise responses.',
+        agentName: 'Roy',
+        agentGoal: 'You are Roy, the root agent of a Theory-of-Mind based autonomous agent system.',
         sessionId: this.sessionId,
         fsmEnabled: true,
       });
@@ -217,15 +217,19 @@ export class Roy {
     console.log(this.dim('-'.repeat(60)));
     console.log('  ' + this.bold('Status'));
     console.log('    LLM:       ' + (this.ctx.llm ? this.green('Connected') : this.red('Not configured')));
-    console.log('    Agent:     ' + this.cyan(this.ctx.agent.name) + ' ' + this.green('[active]'));
+    const agentInfo = this.ctx.agent.getInfo();
+    const usage = agentInfo.usage;
+    console.log('    Agent:     ' + this.cyan(agentInfo.name) + ' ' + this.green(`[${agentInfo.role}]`) + ' ' + this.green('[active]'));
     console.log('    FSM:       ' + this.cyan(this.ctx.fsm.getStateName()));
     console.log('    Session:   ' + this.cyan(this.sessionId));
     console.log('    Memory:    ' + this.dim(this.getMemoryStats()));
 
     const fsmInfo = this.ctx.agent.getFSMInfo();
     if (fsmInfo) {
-      console.log('    Budget:    ' + fsmInfo.budget + ', Cost: ' + fsmInfo.cost);
+      const budget = fsmInfo.budget === null ? 'unlimited' : String(fsmInfo.budget);
+      console.log('    Budget:    ' + budget + ', Cost: ' + fsmInfo.cost);
     }
+    console.log('    Tokens:    ' + `${usage.totalTokens} total (${usage.promptTokens} prompt, ${usage.completionTokens} completion), ${usage.llmCalls} calls`);
 
     console.log('    API Mode:  ' + this.dim('http://localhost:' + (this.ctx.config.server?.port ?? 3000)));
     console.log(this.dim('-'.repeat(60)));
@@ -407,14 +411,16 @@ export class Roy {
   private printAgents(): void {
     if (!this.ctx) return;
 
-    const agents = this.ctx.manager.listAgents();
+    const agents = this.ctx.manager.listAgentInfo();
     console.log('\n  ' + this.bold('Available Agents:'));
     if (agents.length === 0) {
       console.log('    ' + this.dim('No agents registered'));
     } else {
-      for (const name of agents) {
-        const isActive = name === this.ctx.agent.name;
-        console.log(`    - ${this.cyan(name)} ${isActive ? this.green('[active]') : ''}`);
+      for (const agent of agents) {
+        const isActive = agent.name === this.ctx.agent.name;
+        const usage = agent.usage;
+        console.log(`    - ${this.cyan(agent.name)} ${this.dim(agent.role)} ${isActive ? this.green('[active]') : ''}`);
+        console.log(`      state=${agent.state}, tokens=${usage.totalTokens}, calls=${usage.llmCalls}`);
       }
     }
     console.log('');
@@ -523,7 +529,7 @@ export class Roy {
 
     console.log('\n  ' + this.bold('FSM State:'));
     console.log(`    Current: ${this.cyan(fsm.getStateName())}`);
-    console.log(`    Budget: ${ctx.budget}`);
+    console.log(`    Budget: ${ctx.budget === null ? 'unlimited' : ctx.budget}`);
     console.log(`    Cost: ${ctx.cost}`);
     console.log(`    Uncertainty: ${ctx.uncertainty.toFixed(2)}`);
     console.log(`    Conflict: ${ctx.conflict.toFixed(2)}`);
@@ -611,6 +617,9 @@ export class Roy {
 
       const content = String(message.content);
       if (content.length > 0) {
+        if (!printed) {
+          process.stdout.write('  ' + this.green(this.ctx.agent.name + ' > '));
+        }
         process.stdout.write(content);
         printed = true;
       }
