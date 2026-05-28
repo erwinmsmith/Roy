@@ -1,6 +1,6 @@
 // Conversational Agent implementation
 
-import type { LLMProvider } from '../llm/types.js';
+import type { LLMMessage } from '../llm/types.js';
 import type { MessageQueue } from '../message/MessageQueue.js';
 import { BaseAgent } from './BaseAgent.js';
 import type { AgentConfig } from './BaseAgent.js';

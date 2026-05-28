@@ -1,6 +1,6 @@
 // Action Registry - manages action registration and discovery
 
-import type { Action, ActionConfig, ActionResult } from './Action.js';
+import type { Action, ActionResult } from './Action.js';
 
 class ActionRegistry {
   private actions: Map<string, Action> = new Map();

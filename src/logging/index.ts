@@ -1,21 +1,20 @@
 // Logger - event-based logging system with async event bus
 
 import { v4 as uuidv4 } from 'uuid';
-import type { LogEvent, EventType, EventContext, EventFilter } from './events.js';
-import { createEventFilter, eventMatchesFilter } from './events.js';
+import type { LogEvent, EventType, EventContext } from './events.js';
+import { createEventFilter } from './events.js';
+import type { EventTransport } from './transport.js';
 import {
-  EventTransport,
   ConsoleTransport,
   FileTransport,
   HttpTransport,
   NullTransport,
 } from './transport.js';
 import {
-  EventListener,
   LoggingListener,
   BatchingListener,
   ProgressListener,
-  CompositeListener,
+  type EventListener,
 } from './listeners.js';
 import { getLoggerConfig } from '../config/index.js';
 
@@ -111,7 +110,7 @@ class AsyncEventBus {
     if (this.transport) {
       try {
         await this.transport.send(events);
-      } catch (err) {
+      } catch (err: unknown) {
         console.error('Transport error:', err);
       }
     }
@@ -131,7 +130,7 @@ class AsyncEventBus {
       if (this.transport) {
         try {
           await this.transport.send(events);
-        } catch (err) {
+        } catch (err: unknown) {
           console.error('Transport error:', err);
         }
       }
@@ -185,7 +184,7 @@ export class Logger {
    * Create a child logger with additional context
    */
   child(namespace: string): Logger {
-    return new Logger(`${this.namespace}.${namespace}`, this.sessionId);
+    return new Logger(`${this.namespace}.${namespace}`, this.sessionId ?? undefined);
   }
 
   /**
@@ -342,25 +341,21 @@ export async function configureLogging(
   // Configure transport
   const transports = options?.transports || config?.transports || ['console'];
   for (const transportType of transports) {
-    switch (transportType) {
-      case 'console':
-        bus.setTransport(new ConsoleTransport());
-        break;
-      case 'file':
-        const filePath = options?.filePath || config?.path || 'roy.jsonl';
-        bus.setTransport(new FileTransport(filePath));
-        break;
-      case 'http':
-        if (options?.httpEndpoint || config?.httpEndpoint) {
-          bus.setTransport(
-            new HttpTransport(
-              options!.httpEndpoint || config!.httpEndpoint!,
-              options?.httpHeaders || config?.httpHeaders,
-              config?.httpTimeout || 5.0
-            )
-          );
-        }
-        break;
+    if (transportType === 'console') {
+      bus.setTransport(new ConsoleTransport());
+    } else if (transportType === 'file') {
+      const filePath = options?.filePath || config?.path || 'roy.jsonl';
+      bus.setTransport(new FileTransport(filePath));
+    } else if (transportType === 'http') {
+      if (options?.httpEndpoint || config?.httpEndpoint) {
+        bus.setTransport(
+          new HttpTransport(
+            options!.httpEndpoint || config!.httpEndpoint!,
+            options?.httpHeaders || config?.httpHeaders,
+            config?.httpTimeout || 5.0
+          )
+        );
+      }
     }
   }
 
@@ -368,7 +363,7 @@ export async function configureLogging(
   bus.addListener(
     'batching',
     new BatchingListener(
-      async (events) => {
+      async (_events) => {
         // Batch transport implementation
       },
       {
@@ -394,7 +389,7 @@ export async function shutdownLogging(): Promise<void> {
 /**
  * Get or create a logger
  */
-let _loggers: Map<string, Logger> = new Map();
+const _loggers: Map<string, Logger> = new Map();
 
 export function getLogger(namespace: string, sessionId?: string): Logger {
   const key = sessionId ? `${namespace}:${sessionId}` : namespace;

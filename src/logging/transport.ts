@@ -1,7 +1,7 @@
 // Event Transport - abstract interface for sending events to external systems
 
-import type { LogEvent, EventFilter } from './events.js';
-import { EventType } from './events.js';
+import type { LogEvent } from './events.js';
+import type { EventType } from './events.js';
 
 /**
  * Transport interface for sending events

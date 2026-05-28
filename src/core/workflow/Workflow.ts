@@ -2,18 +2,16 @@
 
 import type { Executor } from '../executor/Executor.js';
 import {
-  WorkflowState,
-  WorkflowResult,
   createWorkflowState,
   updateWorkflowState,
   recordWorkflowError,
 } from './WorkflowState.js';
-import { signalBus } from '../executor/SignalBus.js';
+import type { WorkflowState, WorkflowResult } from './WorkflowState.js';
 
 export interface WorkflowConfig {
   name?: string;
   metadata?: Record<string, unknown>;
-  signalBus?: typeof signalBus;
+  signalBus?: unknown;
 }
 
 export abstract class Workflow<T = unknown> {

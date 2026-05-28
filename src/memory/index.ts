@@ -2,8 +2,8 @@
 
 import { ShortTermMemory } from './shortTerm.js';
 import { LongTermMemory } from './longTerm.js';
-import { contextManager, ContextManager } from './context.js';
-import type { Memory, MemoryEntry, ContextDoc } from './types.js';
+import { contextManager } from './context.js';
+import type { ContextManager } from './context.js';
 
 /**
  * Memory registry - manages multiple memory instances per agent/session

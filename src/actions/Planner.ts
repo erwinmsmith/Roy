@@ -1,6 +1,18 @@
 // Planner interface - decision making for agents
 
-import type { LLMProvider, LLMMessage } from '../llm/types.js';
+export interface LLMMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+}
+
+export interface LLMProvider {
+  readonly name: string;
+  readonly defaultModel: string;
+  complete(messages: LLMMessage[], options?: unknown): Promise<unknown>;
+  stream(messages: LLMMessage[], options?: unknown): AsyncGenerator<{ content: string; done: boolean }, void, unknown>;
+  completeJSON<T>(messages: LLMMessage[], options?: unknown): Promise<T>;
+  isConfigured(): boolean;
+}
 
 export interface Plan {
   action: string;

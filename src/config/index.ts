@@ -19,7 +19,7 @@ export const EnvSchema = z.object({
   PORT: z.string().default('3000'),
 
   // Logging
-  LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+  LOG_LEVEL: z.enum(['debug', 'info', 'warning', 'error']).default('info'),
   LOG_FILE: z.string().optional(),
   LOG_BATCH_SIZE: z.string().transform(v => parseInt(v, 10)).default('100'),
   LOG_FLUSH_INTERVAL: z.string().transform(v => parseFloat(v)).default('2.0'),
@@ -55,7 +55,7 @@ export const LLMConfigSchema = z.object({
 
 // Logger config schema
 export const LoggerConfigSchema = z.object({
-  level: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+  level: z.enum(['debug', 'info', 'warning', 'error']).default('info'),
   transports: z.array(z.enum(['none', 'console', 'file', 'http'])).default(['console']),
   path: z.string().default('roy.jsonl'),
   batchSize: z.number().default(100),
@@ -120,13 +120,14 @@ export class ConfigLoader {
         timeout: 60000,
       },
       logger: {
-        level: (process.env.LOG_LEVEL as 'debug' | 'info' | 'warn' | 'error') || 'info',
+        level: (process.env.LOG_LEVEL as 'debug' | 'info' | 'warning' | 'error') || 'info',
         transports: ['console'],
         path: 'roy.jsonl',
         batchSize: 100,
         flushInterval: 2.0,
         maxQueueSize: 2048,
         progressDisplay: false,
+        httpTimeout: 5.0,
       },
     };
 
@@ -268,13 +269,14 @@ export class ConfigLoader {
     // Logger from env
     if (process.env.LOG_LEVEL) {
       config.logger = {
-        level: process.env.LOG_LEVEL as 'debug' | 'info' | 'warn' | 'error',
+        level: process.env.LOG_LEVEL as 'debug' | 'info' | 'warning' | 'error',
         transports: ['console'],
         path: 'roy.jsonl',
         batchSize: 100,
         flushInterval: 2.0,
         maxQueueSize: 2048,
         progressDisplay: false,
+        httpTimeout: 5.0,
       };
     }
 
