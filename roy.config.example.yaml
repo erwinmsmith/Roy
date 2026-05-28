@@ -1,0 +1,35 @@
+# Roy Default Configuration
+# Copy this to roy.config.yaml and customize as needed
+
+# Server configuration
+server:
+  port: 3000
+  host: "0.0.0.0"
+  cors:
+    origin: "*"
+    methods:
+      - GET
+      - POST
+
+# LLM provider configuration
+llm:
+  provider: "anthropic"  # or "openai"
+  model: "claude-sonnet-4-20250514"
+  temperature: 0.7
+  maxTokens: 4096
+  timeout: 60000
+  # apiKey: "your-api-key"  # Use roy.secrets.yaml for secrets
+
+# Logging configuration
+logger:
+  level: "info"  # debug, info, warning, error
+  transports:
+    - "console"  # console, file, http
+  path: "roy.jsonl"
+  batchSize: 100
+  flushInterval: 2.0
+  maxQueueSize: 2048
+  progressDisplay: false
+  # httpEndpoint: "https://your-logging-endpoint.com"  # For HTTP transport
+  # httpHeaders:  # Custom headers for HTTP transport
+  #   Authorization: "Bearer token"

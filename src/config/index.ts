@@ -350,6 +350,9 @@ export class ConfigLoader {
 // Singleton instance
 export const configLoader = new ConfigLoader();
 
+// Global config - initialized with defaults
+export const config: AppConfig = configLoader.getConfig();
+
 // Convenience exports
 export function getConfig(): AppConfig {
   return configLoader.getConfig();
@@ -367,4 +370,4 @@ export function getLoggerConfig() {
   return configLoader.getLoggerConfig();
 }
 
-export default ConfigLoader;
+export default configLoader;

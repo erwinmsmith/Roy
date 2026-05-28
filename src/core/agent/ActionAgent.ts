@@ -1,21 +1,17 @@
-// Action Agent implementation
+// Action Agent - Agent that decides and executes actions using Planner
 
 import type { LLMProvider, LLMMessage } from '../llm/types.js';
 import type { MessageQueue } from '../message/MessageQueue.js';
 import type { FSM } from '../executor/FSM.js';
-import { BaseAgent, AgentConfig } from './BaseAgent.js';
-import { buildPrompt } from '../../prompts/builder.js';
-import { actionTemplate, actionCallTemplate } from '../../prompts/templates/action.js';
-import { toolRegistry } from '../../tools/index.js';
+import { BaseAgent, type AgentConfig } from './BaseAgent.js';
+import type { Plan, Planner } from '../../actions/Planner.js';
+import { actionRegistry } from '../../actions/index.js';
 import { logger } from '../utils/logger.js';
 
-export interface ActionConfig {
-  name: string;
+export interface ActionAgentConfig extends Omit<AgentConfig, 'goal'> {
   actions: string; // Description of available actions
   goal?: string;
-  example?: string;
-  llm?: LLMProvider;
-  fsm?: FSM;
+  planner?: Planner;
 }
 
 export interface ActionDecision {
@@ -23,11 +19,15 @@ export interface ActionDecision {
   params: Record<string, unknown>;
 }
 
+/**
+ * Action Agent - Uses Planner to decide and execute actions
+ */
 export class ActionAgent extends BaseAgent {
   private actionsDescription: string;
+  private planner?: Planner;
   private route: Map<string, string[]> = new Map();
 
-  constructor(config: ActionConfig) {
+  constructor(config: ActionAgentConfig) {
     super({
       name: config.name,
       goal: config.goal,
@@ -36,6 +36,7 @@ export class ActionAgent extends BaseAgent {
       fsm: config.fsm,
     });
     this.actionsDescription = config.actions;
+    this.planner = config.planner;
   }
 
   /**
@@ -46,17 +47,28 @@ export class ActionAgent extends BaseAgent {
   }
 
   /**
-   * Decide which action to take
+   * Set planner
    */
-  private async decide(observation: string): Promise<ActionDecision | null> {
-    const systemPrompt = buildPrompt(actionTemplate.template, {
-      agent_goal: this.goal,
-      agent_actions: this.actionsDescription,
-      agent_example: this.example,
-    });
+  setPlanner(planner: Planner): void {
+    this.planner = planner;
+  }
 
+  /**
+   * Decide which action to take using LLM
+   */
+  private async decideWithLLM(observation: string): Promise<ActionDecision | null> {
     const messages: LLMMessage[] = [
-      { role: 'system', content: systemPrompt },
+      {
+        role: 'system',
+        content: `You are an action planner. Choose the best action based on the observation.
+
+Available actions:
+${this.actionsDescription}
+
+Return a JSON object with:
+- action: the name of the action
+- params: the parameters for the action`,
+      },
       { role: 'user', content: `Observation: ${observation}` },
     ];
 
@@ -71,26 +83,64 @@ export class ActionAgent extends BaseAgent {
         params: response.params || {},
       };
     } catch (error) {
-      logger.error(`Agent ${this.name} decision error:`, error);
+      logger.error(`Agent ${this.name} LLM decision error:`, error);
       return null;
     }
   }
 
   /**
-   * Execute an action
+   * Decide action using Planner
    */
-  private async executeAction(action: string, params: Record<string, unknown>): Promise<unknown> {
-    const tool = toolRegistry.get(action);
-
-    if (tool) {
-      const result = await toolRegistry.execute(action, params);
-      return result;
+  private async decideWithPlanner(observation: string): Promise<ActionDecision | null> {
+    if (!this.planner) {
+      return this.decideWithLLM(observation);
     }
 
-    // Try registered tools
-    const registeredTool = this.getTool(action);
-    if (registeredTool) {
-      return await registeredTool.execute(params);
+    try {
+      const plan = await this.planner.plan({
+        agentInfo: {
+          name: this.name,
+          goal: this.goal,
+          actions: this.actionsDescription,
+        },
+        observation,
+        availableActions: actionRegistry.keys(),
+      });
+
+      if (plan) {
+        return {
+          action: plan.action,
+          params: plan.params,
+        };
+      }
+    } catch (error) {
+      logger.error(`Agent ${this.name} planner error:`, error);
+    }
+
+    // Fallback to LLM
+    return this.decideWithLLM(observation);
+  }
+
+  /**
+   * Execute an action using actionRegistry
+   */
+  private async executeAction(
+    action: string,
+    params: Record<string, unknown>
+  ): Promise<unknown> {
+    // Try actionRegistry first
+    if (actionRegistry.has(action)) {
+      const result = await actionRegistry.execute(action, params);
+      if (result.success) {
+        return result.result;
+      }
+      throw new Error(result.error);
+    }
+
+    // Fallback to registered tools
+    const tool = this.getTool(action);
+    if (tool) {
+      return await tool.execute(params);
     }
 
     throw new Error(`Action "${action}" not found`);
@@ -103,15 +153,29 @@ export class ActionAgent extends BaseAgent {
     action: string,
     params: Record<string, unknown>
   ): AsyncGenerator<string, void, unknown> {
-    const tool = toolRegistry.get(action);
-
-    if (tool && 'executeStream' in tool && typeof tool.executeStream === 'function') {
-      const streamingTool = tool as { executeStream: (params: Record<string, unknown>) => AsyncGenerator<string, void, unknown> };
-      yield* streamingTool.executeStream(params);
-    } else {
-      const result = await this.executeAction(action, params);
-      yield String(result);
+    // Try actionRegistry first
+    if (actionRegistry.has(action)) {
+      yield* actionRegistry.executeStream(action, params);
+      return;
     }
+
+    // Fallback to registered tools
+    const tool = this.getTool(action);
+    if (tool) {
+      if ('executeStream' in tool && typeof tool.executeStream === 'function') {
+        const streamingTool = tool as {
+          executeStream: (params: Record<string, unknown>) => AsyncGenerator<string, void, unknown>;
+        };
+        yield* streamingTool.executeStream(params);
+        return;
+      }
+
+      const result = await tool.execute(params);
+      yield String(result);
+      return;
+    }
+
+    throw new Error(`Action "${action}" not found`);
   }
 
   /**
@@ -122,7 +186,9 @@ export class ActionAgent extends BaseAgent {
     this.addToMemory('observation', observation);
 
     // Decide action
-    const decision = await this.decide(observation);
+    const decision = this.planner
+      ? await this.decideWithPlanner(observation)
+      : await this.decideWithLLM(observation);
 
     if (!decision) {
       this.state = 'idle';
@@ -132,18 +198,21 @@ export class ActionAgent extends BaseAgent {
     const { action, params } = decision;
     const receivers = this.route.get(action) || ['env'];
 
-    // Check if tool is streaming
-    const tool = toolRegistry.get(action);
-    const isStreaming = tool?.isStream || false;
-
     try {
+      // Check if action is streaming
+      const isStreaming =
+        actionRegistry.has(action) ||
+        (this.getTool(action)?.isStream ?? false);
+
       if (isStreaming) {
         let fullResult = '';
         for await (const chunk of this.executeActionStream(action, params)) {
           fullResult += chunk;
 
           if (this.messageQueue) {
-            await this.messageQueue.send(this.name, receivers[0], chunk, { stream: true });
+            await this.messageQueue.send(this.name, receivers[0], chunk, {
+              stream: true,
+            });
           }
         }
 
@@ -160,6 +229,7 @@ export class ActionAgent extends BaseAgent {
 
       // Add to FSM trace
       this.fsm?.addToTrace(`Agent ${this.name} executed ${action}`);
+      logger.info(`Agent ${this.name} completed action: ${action}`);
     } catch (error) {
       logger.error(`Agent ${this.name} action error:`, error);
       this.addToMemory('result', `Error: ${error}`);
@@ -178,7 +248,7 @@ export class ActionAgent extends BaseAgent {
 
     logger.info(`ActionAgent ${this.name} started running`);
 
-    while (true) {
+    while (this.state !== 'stopped') {
       try {
         const message = await this.messageQueue.receive(this.name);
 
@@ -189,8 +259,11 @@ export class ActionAgent extends BaseAgent {
         await new Promise(resolve => setTimeout(resolve, 10));
       } catch (error) {
         logger.error(`ActionAgent ${this.name} run error:`, error);
+        this.state = 'idle';
       }
     }
+
+    logger.info(`ActionAgent ${this.name} stopped`);
   }
 }
 
