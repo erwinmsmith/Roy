@@ -1,4 +1,5 @@
 // Skill types and interfaces
+// Skills are installable extensions that can be discovered, installed, and managed
 
 export interface SkillContext {
   agentId: string;
@@ -22,23 +23,44 @@ export interface SkillConfig {
   name: string;
   description?: string;
   version?: string;
+  author?: string;
+  tags?: string[];
   parameters?: Record<string, {
-    type: 'string' | 'number' | 'boolean' | 'object';
+    type: 'string' | 'number' | 'boolean' | 'object' | 'array';
     required?: boolean;
     default?: unknown;
     description?: string;
   }>;
   timeout?: number;
+  dependencies?: string[];
+}
+
+/**
+ * Skill metadata for discovery and installation
+ */
+export interface SkillManifest {
+  name: string;
+  version: string;
+  author?: string;
+  description: string;
+  tags: string[];
+  source?: string;
+  installedAt?: number;
 }
 
 /**
  * Base interface for all Skills
- * A Skill is a composable unit of capability that can be registered and discovered
+ * Skills are installable extensions that agents can use
  */
 export interface Skill {
   readonly name: string;
   readonly description?: string;
   readonly version?: string;
+
+  /**
+   * Get skill manifest for installation tracking
+   */
+  getManifest(): SkillManifest;
 
   /**
    * Initialize the skill with configuration
@@ -54,6 +76,11 @@ export interface Skill {
    * Validate input parameters
    */
   validate?(input: SkillInput): { valid: boolean; errors?: string[] };
+
+  /**
+   * Check if skill is ready to use
+   */
+  isReady?(): boolean;
 }
 
 /**
@@ -72,4 +99,22 @@ export interface StreamingSkill extends Skill {
 export interface ComposableSkill extends Skill {
   getDependencies(): string[];
   getOutputSchema(): Record<string, unknown>;
+}
+
+/**
+ * Remote skill that can be installed from a source
+ */
+export interface RemoteSkill extends Skill {
+  getSource(): string;
+  getChecksum?(): string;
+}
+
+/**
+ * Skill installation result
+ */
+export interface SkillInstallationResult {
+  success: boolean;
+  skill?: Skill;
+  error?: string;
+  warning?: string;
 }
