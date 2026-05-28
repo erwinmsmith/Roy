@@ -1,14 +1,11 @@
 // Capability System - unified abstraction for tools, actions, and skills
-// This module provides a unified interface that combines:
-// - Tool (legacy, alias for Capability)
-// - Action (core abstraction with validation)
-// - Skill (Capability with execution context)
+// This module re-exports from specialized modules for convenience.
 
-// Re-export Action as the primary abstraction
+// Re-export from actions module
 export {
-  Action,
-  StreamingAction,
-} from '../actions/Action.js';
+  actionRegistry,
+  registerAction,
+} from '../actions/index.js';
 export type {
   ActionConfig,
   ActionParameter,
@@ -16,19 +13,12 @@ export type {
   ActionResult,
   ActionSchema,
   ActionContext,
-  ActionFactory,
-} from '../actions/Action.js';
+} from '../actions/index.js';
 
-// Re-export ActionRegistry
-export { actionRegistry, registerAction } from '../actions/index.js';
-export { ActionRegistry } from '../actions/index.js';
-
-// Legacy Tool types (alias to Action types for backward compatibility)
-export type { Tool as Tool, ToolConfig as ToolConfig, ToolResult as ToolResult } from '../tools/types.js';
-export type { ToolMetadata } from '../tools/types.js';
-
-// Legacy Skill types (Action with context)
-export type { SkillConfig, SkillInput, SkillContext, SkillOutput, Skill } from '../skills/types.js';
+// Re-export Action class
+export { Action } from '../actions/Action.js';
+export { StreamingAction } from '../actions/Action.js';
+export type { ActionFactory } from '../actions/Action.js';
 
 // Re-export Planner
 export {
@@ -44,4 +34,13 @@ export type {
   PlannerConfig,
 } from '../actions/Planner.js';
 
-export { default as Action } from '../actions/Action.js';
+// Re-export Tool types
+export type { Tool, ToolConfig, ToolResult, ToolMetadata } from '../tools/types.js';
+export { toolRegistry, registerTool } from '../tools/index.js';
+
+// Re-export Skill types
+export type { Skill, SkillConfig, SkillInput, SkillContext, SkillOutput } from '../skills/types.js';
+export { skillRegistry, registerSkill } from '../skills/index.js';
+
+// Re-export ActionRegistry
+export { ActionRegistry } from '../actions/index.js';
