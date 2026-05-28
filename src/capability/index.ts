@@ -8,7 +8,7 @@
 export {
   Action,
   StreamingAction,
-} from './Action.js';
+} from '../actions/Action.js';
 export type {
   ActionConfig,
   ActionParameter,
@@ -17,29 +17,18 @@ export type {
   ActionSchema,
   ActionContext,
   ActionFactory,
-} from './Action.js';
+} from '../actions/Action.js';
 
 // Re-export ActionRegistry
-export { actionRegistry, registerAction } from './index.js';
-export { ActionRegistry } from './index.js';
+export { actionRegistry, registerAction } from '../actions/index.js';
+export { ActionRegistry } from '../actions/index.js';
 
 // Legacy Tool types (alias to Action types for backward compatibility)
-import type { Action, ActionConfig, ActionResult, ActionContext } from './Action.js';
-
-export type Tool = Action;
-export type ToolConfig = ActionConfig;
-export type ToolResult = ActionResult;
-export type ToolContext = ActionContext;
+export type { Tool as Tool, ToolConfig as ToolConfig, ToolResult as ToolResult } from '../tools/types.js';
+export type { ToolMetadata } from '../tools/types.js';
 
 // Legacy Skill types (Action with context)
-import type { Skill as SkillInterface } from '../skills/types.js';
-
-// Capability interface - the unified abstraction
-export interface Capability extends Action {
-  // Additional metadata
-  category?: string;
-  tags?: string[];
-}
+export type { SkillConfig, SkillInput, SkillContext, SkillOutput, Skill } from '../skills/types.js';
 
 // Re-export Planner
 export {
@@ -47,12 +36,12 @@ export {
   LLMPlanner,
   RuleBasedPlanner,
   CompositePlanner,
-} from './Planner.js';
+} from '../actions/Planner.js';
 export type {
   Plan,
   PlanContext,
   AgentInfo,
   PlannerConfig,
-} from './Planner.js';
+} from '../actions/Planner.js';
 
-export default Action;
+export { default as Action } from '../actions/Action.js';
