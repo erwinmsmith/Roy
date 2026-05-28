@@ -1,7 +1,5 @@
 // Action base class - all agent actions should extend this
 
-import type { LLMProvider, LLMMessage } from '../llm/types.js';
-
 export interface ActionConfig {
   name: string;
   description?: string;
@@ -156,7 +154,6 @@ export abstract class StreamingAction extends Action {
 export interface ActionContext {
   agentName: string;
   sessionId: string;
-  llm?: LLMProvider;
   metadata?: Record<string, unknown>;
 }
 

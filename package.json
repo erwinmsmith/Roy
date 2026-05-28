@@ -7,22 +7,38 @@
   "scripts": {
     "dev": "tsx src/server/index.ts",
     "build": "tsc",
-    "start": "node dist/server/index.js"
+    "start": "node dist/server/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "lint": "eslint src --ext .ts",
+    "lint:fix": "eslint src --ext .ts --fix",
+    "format": "prettier --write \"src/**/*.ts\"",
+    "check": "tsc --noEmit && eslint src --ext .ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.52.0",
-    "openai": "^4.82.0",
     "dotenv": "^16.4.7",
-    "socket.io": "^4.8.1",
     "express": "^4.21.2",
-    "zod": "^3.24.1",
-    "uuid": "^11.0.5"
+    "js-yaml": "^4.1.1",
+    "openai": "^4.82.0",
+    "socket.io": "^4.8.1",
+    "uuid": "^11.0.5",
+    "zod": "^3.24.1"
   },
   "devDependencies": {
-    "typescript": "^5.7.3",
-    "@types/node": "^22.10.6",
+    "@eslint/js": "^10.0.1",
     "@types/express": "^5.0.0",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.10.6",
     "@types/uuid": "^10.0.0",
-    "tsx": "^4.19.2"
+    "@vitest/coverage-v8": "^4.1.7",
+    "eslint": "^10.4.0",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.8.3",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3",
+    "typescript-eslint": "^8.60.0",
+    "vitest": "^4.1.7"
   }
 }

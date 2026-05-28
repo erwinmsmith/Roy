@@ -1,11 +1,9 @@
 // Conversational Agent implementation
 
-import type { LLMProvider, LLMMessage } from '../llm/types.js';
-import type { MessageQueue, QueueMessage } from '../message/MessageQueue.js';
-import type { FSM } from '../executor/FSM.js';
-import { BaseAgent, AgentConfig } from './BaseAgent.js';
-import { buildPrompt } from '../../prompts/builder.js';
-import { conversationalTemplate } from '../../prompts/templates/conversational.js';
+import type { LLMProvider } from '../llm/types.js';
+import type { MessageQueue } from '../message/MessageQueue.js';
+import { BaseAgent } from './BaseAgent.js';
+import type { AgentConfig } from './BaseAgent.js';
 import { logger } from '../utils/logger.js';
 
 export interface ConversationalAgentConfig extends AgentConfig {
