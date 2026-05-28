@@ -81,6 +81,10 @@ Run the development server:
 ```bash
 npm run dev
 ```
+or
+```bash
+npm run dev:cli
+```
 
 Build the TypeScript project:
 
@@ -99,17 +103,3 @@ The server exposes:
 - `GET /` for project metadata
 - `GET /health` for agent and session status
 - Socket.IO `user_message` events for streaming agent responses
-
-## Roadmap
-
-- implement structured ToM/MIA diagnosis outputs
-- add market scoring for candidate thinking investments
-- connect FSM transitions to diagnosis and budget decisions
-- add Evo-style mutation, crossover, and selection operators
-- persist reusable agent, subteam, and diagnosis cache entries
-- version prompt contracts and record prompt versions per run
-- expand verification and backtracking tests
-
-## License
-
-No license has been declared yet.
