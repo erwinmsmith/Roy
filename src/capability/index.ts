@@ -42,5 +42,5 @@ export { toolRegistry, registerTool } from '../tools/index.js';
 export type { Skill, SkillConfig, SkillInput, SkillContext, SkillOutput } from '../skills/types.js';
 export { skillRegistry, registerSkill } from '../skills/index.js';
 
-// Re-export ActionRegistry
-export { ActionRegistry } from '../actions/index.js';
+// Re-export ActionRegistry (default export)
+export { default as ActionRegistry } from '../actions/index.js';
