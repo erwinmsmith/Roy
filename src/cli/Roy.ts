@@ -585,6 +585,7 @@ export class Roy {
     try {
       // Use agent's step method which integrates FSM and memory
       await this.ctx.agent.step(userInput);
+      await this.printAgentOutput();
 
       // Show updated FSM state
       if (this.verboseMode) {
@@ -594,6 +595,29 @@ export class Roy {
     } catch (error) {
       console.log('\n  ' + this.red('Error:') + ' ' + (error instanceof Error ? error.message : String(error)) + '\n');
       logger.error('Process message error:', error);
+    }
+  }
+
+  private async printAgentOutput(): Promise<void> {
+    if (!this.ctx) return;
+
+    const session = this.ctx.manager.getSession(this.sessionId);
+    if (!session) return;
+
+    let printed = false;
+    while (!session.messageQueue.isEmpty('env')) {
+      const message = await session.messageQueue.receive('env');
+      if (!message) break;
+
+      const content = String(message.content);
+      if (content.length > 0) {
+        process.stdout.write(content);
+        printed = true;
+      }
+    }
+
+    if (printed) {
+      process.stdout.write('\n');
     }
   }
 }
