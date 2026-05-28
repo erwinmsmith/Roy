@@ -1,10 +1,11 @@
 // Logger utility
-export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+export type LogLevel = 'debug' | 'info' | 'warn' | 'warning' | 'error';
 
 const LOG_LEVELS: Record<LogLevel, number> = {
   debug: 0,
   info: 1,
   warn: 2,
+  warning: 2,
   error: 3,
 };
 
