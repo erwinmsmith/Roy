@@ -31,8 +31,6 @@ Roy combines several layers:
 - **Cache reuse**: previously useful agents, subteams, bottleneck mappings, team-generation directions, and ToM inference traces can be reused when cheaper than recomputation.
 - **Modular prompt management**: prompts are treated as versioned contracts with structured inputs and outputs rather than inline strings hidden inside agent logic.
 
-The design document behind this implementation lives in [docs/introduction.md](docs/introduction.md).
-
 ## Current Implementation
 
 The repository currently includes:
