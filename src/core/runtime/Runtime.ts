@@ -24,7 +24,7 @@ import {
   type QueueTransition,
   type RuntimeMessage,
 } from '../queue/index.js';
-import { WorkspaceMemoryManager, type ConversationEntry, type WorkspaceMemoryState, type RootMemoryContext } from '../memory/index.js';
+import { WorkspaceMemoryManager, type ConversationEntry, type ConversationSessionState, type WorkspaceMemoryState, type RootMemoryContext } from '../memory/index.js';
 
 export interface RuntimeConfig {
   agentName?: string;
@@ -475,6 +475,11 @@ export class Runtime {
   async getConversation(sessionId?: string, limit = 50): Promise<ConversationEntry[]> {
     const ctx = this.getContext();
     return ctx.memory.readConversation(sessionId ?? ctx.sessionId, limit);
+  }
+
+  async listConversationSessions(): Promise<ConversationSessionState[]> {
+    const ctx = this.getContext();
+    return ctx.memory.listConversationSessions();
   }
 
   async importConversation(filePath: string, sessionId?: string): Promise<{ imported: number; path: string }> {

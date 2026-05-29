@@ -73,6 +73,10 @@ describe('Workspace memory initialization', () => {
     const imported = await runtime.importConversation(importPath);
     expect(imported.imported).toBe(2);
 
+    const sessions = await runtime.listConversationSessions();
+    expect(sessions.map(session => session.sessionId)).toContain('conversation-test');
+    expect(sessions.find(session => session.sessionId === 'conversation-test')?.entries).toBe(4);
+
     const afterImport = await runtime.getConversation(undefined, 10);
     expect(afterImport.map(entry => entry.content)).toContain('old question');
     expect(afterImport.map(entry => entry.content)).toContain('old answer');

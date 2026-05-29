@@ -36,7 +36,7 @@ export class Roy {
   private rl: readline.Interface;
   private autoColor = true;
   private verboseMode = false;
-  private sessionId = 'cli-session';
+  private sessionId = process.env.ROY_SESSION_ID ?? `cli-${new Date().toISOString().replace(/[:.]/g, '-')}`;
 
   constructor() {
     this.rl = readline.createInterface({
@@ -452,6 +452,8 @@ export class Roy {
       /memory             Show workspace memory state
       /memory <doc>       Show root, project, decisions, constraints, or glossary
       /conversation       Show persisted conversation log
+      /conversation sessions List persisted conversation sessions
+      /conversation --session <id> Show a specific session
       /conversation import <path> Import JSON/JSONL conversation
       /verbose            Toggle verbose mode
 
@@ -879,6 +881,21 @@ export class Roy {
   }
 
   private async printConversation(parts: string[]): Promise<void> {
+    if (parts[1] === 'sessions') {
+      const sessions = await runtime.listConversationSessions();
+      console.log('\n  ' + this.bold('Conversation Sessions'));
+      if (sessions.length === 0) {
+        console.log('    ' + this.dim('No persisted sessions'));
+      } else {
+        for (const session of sessions) {
+          console.log(`    ${this.cyan(session.sessionId)} ${this.dim(`${session.entries} entries`)} ${this.dim(new Date(session.updatedAt).toISOString())}`);
+          console.log(`      ${path.relative(process.cwd(), session.path) || session.path}`);
+        }
+      }
+      console.log('');
+      return;
+    }
+
     if (parts[1] === 'import') {
       const filePath = parts.slice(2).join(' ');
       if (!filePath) {
@@ -894,10 +911,13 @@ export class Roy {
       return;
     }
 
-    const limit = Number(parts[1] ?? 20);
-    const entries = await runtime.getConversation(undefined, Number.isFinite(limit) && limit > 0 ? limit : 20);
+    const sessionFlagIndex = parts.indexOf('--session');
+    const sessionId = sessionFlagIndex >= 0 ? parts[sessionFlagIndex + 1] : undefined;
+    const limitArg = parts.find((part, index) => index > 0 && part !== '--session' && parts[index - 1] !== '--session');
+    const limit = Number(limitArg ?? 20);
+    const entries = await runtime.getConversation(sessionId, Number.isFinite(limit) && limit > 0 ? limit : 20);
 
-    console.log('\n  ' + this.bold('Persisted Conversation'));
+    console.log('\n  ' + this.bold(sessionId ? `Persisted Conversation: ${sessionId}` : 'Persisted Conversation'));
     if (entries.length === 0) {
       console.log('    ' + this.dim('No persisted conversation entries'));
     } else {

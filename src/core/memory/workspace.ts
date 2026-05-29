@@ -46,6 +46,13 @@ export interface ConversationEntry {
   metadata?: Record<string, unknown>;
 }
 
+export interface ConversationSessionState {
+  sessionId: string;
+  path: string;
+  entries: number;
+  updatedAt: number;
+}
+
 interface PatternFile {
   patterns: unknown[];
 }
@@ -282,6 +289,26 @@ Roy is the root agent of the local autonomous agent runtime.
       .filter((entry): entry is ConversationEntry => entry !== undefined);
 
     return limit > 0 ? entries.slice(-limit) : entries;
+  }
+
+  async listConversationSessions(): Promise<ConversationSessionState[]> {
+    const sessionsPath = path.join(this.rootPath, 'sessions');
+    const files = await readdir(sessionsPath);
+    const sessions: ConversationSessionState[] = [];
+
+    for (const file of files.filter(item => item.endsWith('.jsonl')).sort()) {
+      const fullPath = path.join(sessionsPath, file);
+      const fileStat = await stat(fullPath);
+      const raw = await this.readOptional(fullPath);
+      sessions.push({
+        sessionId: file.replace(/\.jsonl$/, ''),
+        path: fullPath,
+        entries: raw.trim() ? raw.trim().split('\n').length : 0,
+        updatedAt: fileStat.mtimeMs,
+      });
+    }
+
+    return sessions.sort((a, b) => b.updatedAt - a.updatedAt);
   }
 
   async importConversation(filePath: string, sessionId = this.sessionId): Promise<{ imported: number; path: string }> {

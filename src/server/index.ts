@@ -325,6 +325,10 @@ async function main(): Promise<void> {
     res.json(await runtime.getConversation(sessionId, Number.isFinite(limit) && limit > 0 ? limit : 50));
   });
 
+  app.get('/v1/conversation/sessions', async (req, res) => {
+    res.json(await runtime.listConversationSessions());
+  });
+
   app.post('/v1/conversation/import', async (req, res) => {
     const filePath = req.body?.path;
     const sessionId = req.body?.sessionId;
