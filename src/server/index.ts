@@ -288,6 +288,11 @@ async function main(): Promise<void> {
     res.json(runtime.getEvents());
   });
 
+  app.get('/v1/queue', async (req, res) => {
+    const limit = req.query.limit ? Number(req.query.limit) : 20;
+    res.json(await runtime.getQueueState(Number.isFinite(limit) && limit > 0 ? limit : 20));
+  });
+
   // Root endpoint
   app.get('/', (req, res) => {
     res.json({

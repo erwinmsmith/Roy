@@ -349,6 +349,10 @@ export class Roy {
         this.printEvents();
         break;
 
+      case '/queue':
+        await this.printQueue();
+        break;
+
       case '/config':
         await this.showAdvancedConfigDialog();
         break;
@@ -431,6 +435,7 @@ export class Roy {
       /budget set <n>     Set token budget
       /budget unlimited   Remove token budget limit
       /events             Show recent runtime events
+      /queue              Show runtime message queue state
       /verbose            Toggle verbose mode
 
     ${this.bold('Agent Management')}
@@ -506,6 +511,7 @@ export class Roy {
     console.log('    POST /v1/agents/:id/run - Run subagent');
     console.log('    GET  /v1/budget  - Token budget');
     console.log('    GET  /v1/events  - Runtime events');
+    console.log('    GET  /v1/queue   - Runtime message queue');
     console.log('    WS   /           - Socket.IO for real-time chat');
     console.log('    Port: ' + this.cyan(String(this.ctx?.config.server?.port ?? 3000)));
     console.log('');
@@ -562,6 +568,26 @@ export class Roy {
     } else {
       for (const event of events) {
         console.log(`    - ${this.dim(new Date(event.timestamp).toISOString())} ${this.cyan(event.type)}${event.agentId ? ' ' + event.agentId : ''}`);
+      }
+    }
+    console.log('');
+  }
+
+  private async printQueue(): Promise<void> {
+    const state = await runtime.getQueueState(10);
+    console.log('\n  ' + this.bold('Queue'));
+    console.log(`    Pending:     ${state.stats.pending}`);
+    console.log(`    Processing:  ${state.stats.processing}`);
+    console.log(`    Completed:   ${state.stats.completed}`);
+    console.log(`    Failed:      ${state.stats.failed}`);
+    console.log(`    Cancelled:   ${state.stats.cancelled}`);
+
+    console.log('\n  ' + this.bold('Recent:'));
+    if (state.recent.length === 0) {
+      console.log('    ' + this.dim('No messages'));
+    } else {
+      for (const message of state.recent) {
+        console.log(`    ${message.id.slice(0, 8)} ${message.kind.padEnd(14)} ${message.from} -> ${message.to} ${this.dim(message.status)}`);
       }
     }
     console.log('');
@@ -701,7 +727,7 @@ export class Roy {
     const commands = [
       '/help', '/h', '/clear', '/cls', '/reset', '/agents', '/spawn', '/run', '/exit', '/quit', '/q',
       '/api', '/status', '/skills', '/actions', '/tools', '/memory', '/session',
-      '/system', '/fsm', '/budget', '/events', '/config', '/prompt', '/context', '/verbose', '/color'
+      '/system', '/fsm', '/budget', '/events', '/queue', '/config', '/prompt', '/context', '/verbose', '/color'
     ];
 
     if (line.startsWith('/')) {

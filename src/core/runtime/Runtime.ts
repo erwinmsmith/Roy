@@ -13,6 +13,15 @@ import type { AgentInfo, AgentUsage } from '../agent/BaseAgent.js';
 import { actionRegistry } from '../actions/index.js';
 import { toolRegistry } from '../tools/index.js';
 import { skillRegistry } from '../skills/index.js';
+import {
+  InMemoryMessageQueue,
+  MessageScheduler,
+  type EnqueueMessageInput,
+  type MessageQueue,
+  type QueueState,
+  type QueueTransition,
+  type RuntimeMessage,
+} from '../queue/index.js';
 
 export interface RuntimeConfig {
   agentName?: string;
@@ -32,6 +41,8 @@ export interface RuntimeContext {
   manager: AgentManager;
   agent: UnifiedAgent;
   sessionId: string;
+  queue: MessageQueue;
+  scheduler: MessageScheduler;
   capabilities: {
     skills: number;
     actions: number;
@@ -109,6 +120,8 @@ export class Runtime {
   private events: RuntimeEvent[] = [];
   private perTurnUsage: TokenUsage[] = [];
   private agentSequence = 0;
+  private queue: MessageQueue | null = null;
+  private scheduler: MessageScheduler | null = null;
 
   static getInstance(): Runtime {
     if (!Runtime.instance) {
@@ -160,6 +173,8 @@ export class Runtime {
 
     // Create AgentManager
     const manager = new AgentManager();
+    const queue = new InMemoryMessageQueue(transition => this.handleQueueTransition(transition));
+    const scheduler = new MessageScheduler(queue);
 
     // Create unified agent
     const agentName = options.agentName ?? 'Roy';
@@ -202,8 +217,12 @@ export class Runtime {
       manager,
       agent,
       sessionId,
+      queue,
+      scheduler,
       capabilities,
     };
+    this.queue = queue;
+    this.scheduler = scheduler;
 
     this.initialized = true;
     this.emit({ type: 'runtime.initialized', agentId: 'root', data: { sessionId, provider: llm?.name ?? null } });
@@ -236,6 +255,8 @@ export class Runtime {
     await shutdownLogging();
 
     this.ctx = null;
+    this.queue = null;
+    this.scheduler = null;
     this.initialized = false;
     logger.info('Runtime shutdown complete');
   }
@@ -365,6 +386,21 @@ export class Runtime {
       this.emit({ type: 'budget.updated', data: { mode: 'limited', limitTokens } });
     }
     return this.getBudgetState();
+  }
+
+  async enqueueMessage<TPayload>(message: EnqueueMessageInput<TPayload>): Promise<RuntimeMessage<TPayload>> {
+    const ctx = this.getContext();
+    return ctx.queue.enqueue(message);
+  }
+
+  async getQueueState(limit = 20): Promise<QueueState> {
+    const ctx = this.getContext();
+    const [stats, recent] = await Promise.all([
+      ctx.queue.getStats(),
+      ctx.queue.listMessages({ limit }),
+    ]);
+
+    return { stats, recent };
   }
 
   async spawnAgent(spec: SpawnAgentSpec): Promise<AgentInfo> {
@@ -540,6 +576,28 @@ export class Runtime {
 
   private isValidArchetype(value: string): value is SubAgentArchetype {
     return ['researcher', 'critic', 'planner', 'coder', 'summarizer', 'tester', 'custom'].includes(value);
+  }
+
+  private handleQueueTransition(transition: QueueTransition): void {
+    const message = transition.message;
+    this.emit({
+      type: transition.type,
+      agentId: message.metadata?.agentId,
+      data: {
+        messageId: message.id,
+        kind: message.kind,
+        from: message.from,
+        to: message.to,
+        status: message.status,
+        sessionId: message.sessionId,
+        turnId: message.turnId,
+        traceId: message.traceId,
+        correlationId: message.correlationId,
+        parentMessageId: message.parentMessageId,
+        error: transition.error,
+        reason: transition.reason,
+      },
+    });
   }
 
   private capitalize(value: string): string {

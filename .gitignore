@@ -11,6 +11,7 @@ roy.config.yaml
 roy.config.yml
 roy.secrets.yaml
 roy.secrets.yml
+.roy/
 
 # Logs
 *.log
