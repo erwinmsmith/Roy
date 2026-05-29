@@ -24,7 +24,16 @@ import {
   type QueueTransition,
   type RuntimeMessage,
 } from '../queue/index.js';
-import { WorkspaceMemoryManager, type ConversationEntry, type ConversationSessionState, type WorkspaceMemoryState, type RootMemoryContext } from '../memory/index.js';
+import {
+  WorkspaceMemoryManager,
+  type ConversationEntry,
+  type ConversationSessionState,
+  type MemoryMode,
+  type MemoryUpdateProposal,
+  type MemoryUpdateRecord,
+  type WorkspaceMemoryState,
+  type RootMemoryContext,
+} from '../memory/index.js';
 
 export interface RuntimeConfig {
   agentName?: string;
@@ -209,12 +218,20 @@ export class Runtime {
     const manager = new AgentManager();
     const memory = new WorkspaceMemoryManager();
     await memory.initWorkspace(options.workspaceCwd ?? process.cwd(), options.sessionId ?? 'main');
+    const rootMemory = await memory.loadAgentMemory('roy');
     const queue = new InMemoryMessageQueue(transition => this.handleQueueTransition(transition));
     const scheduler = new MessageScheduler(queue);
 
     // Create unified agent
     const agentName = options.agentName ?? 'Roy';
-    const agentGoal = options.agentGoal ?? 'You are Roy, the root agent of a Theory-of-Mind based autonomous agent system.';
+    const agentGoal = options.agentGoal ?? this.buildAgentPromptFromMemory({
+      name: agentName,
+      role: 'root',
+      parentName: 'none',
+      task: 'Operate as the root agent for the current Roy runtime session.',
+      description: 'You are Roy, the root agent of a Theory-of-Mind based autonomous agent system.',
+      bundle: rootMemory,
+    });
 
     const agent = new UnifiedAgent({
       name: agentName,
@@ -474,6 +491,81 @@ export class Runtime {
     return ctx.memory.readTrace(name, limit);
   }
 
+  async readPublicMemoryDoc(name: string): Promise<string> {
+    const ctx = this.getContext();
+    return ctx.memory.readPublicDoc(name);
+  }
+
+  async readAgentMemoryDoc(agentKey: string, doc = 'memory'): Promise<string> {
+    const ctx = this.getContext();
+    return ctx.memory.readAgentDoc(agentKey, doc);
+  }
+
+  async getMemoryMode(): Promise<MemoryMode> {
+    const ctx = this.getContext();
+    return ctx.memory.getMemoryMode();
+  }
+
+  async setMemoryMode(mode: MemoryMode): Promise<MemoryMode> {
+    const ctx = this.getContext();
+    const next = await ctx.memory.setMemoryMode(mode);
+    this.emit({ type: 'memory.mode.changed', data: { mode: next } });
+    return next;
+  }
+
+  async listMemoryProposals(): Promise<MemoryUpdateProposal[]> {
+    const ctx = this.getContext();
+    return ctx.memory.listMemoryProposals();
+  }
+
+  async proposeMemoryUpdates(): Promise<MemoryUpdateProposal[]> {
+    const ctx = this.getContext();
+    this.emit({ type: 'memory.update.propose.started', agentId: 'root' });
+    const proposals = await ctx.memory.proposeMemoryUpdates();
+    for (const proposal of proposals) {
+      this.emit({
+        type: 'memory.update.proposed',
+        agentId: proposal.target.type === 'agent' ? proposal.target.key : 'root',
+        data: {
+          proposalId: proposal.id,
+          target: proposal.target.path,
+          section: proposal.target.section,
+          risk: proposal.risk,
+          confidence: proposal.confidence,
+        },
+      });
+    }
+    this.emit({ type: 'memory.update.propose.completed', agentId: 'root', data: { count: proposals.length } });
+    return proposals;
+  }
+
+  async acceptMemoryProposal(id: string): Promise<MemoryUpdateRecord | undefined> {
+    const ctx = this.getContext();
+    const record = await ctx.memory.acceptMemoryProposal(id);
+    this.emit({
+      type: record ? 'memory.update.committed' : 'memory.update.skipped',
+      agentId: 'root',
+      data: { proposalId: id, target: record?.targetPath },
+    });
+    return record;
+  }
+
+  async rejectMemoryProposal(id: string): Promise<boolean> {
+    const ctx = this.getContext();
+    const rejected = await ctx.memory.rejectMemoryProposal(id);
+    this.emit({
+      type: rejected ? 'memory.update.rejected' : 'memory.update.skipped',
+      agentId: 'root',
+      data: { proposalId: id },
+    });
+    return rejected;
+  }
+
+  async listMemoryUpdates(): Promise<MemoryUpdateRecord[]> {
+    const ctx = this.getContext();
+    return ctx.memory.listMemoryUpdates();
+  }
+
   async recordConversation(entry: Omit<ConversationEntry, 'id' | 'timestamp' | 'sessionId'> & { sessionId?: string }): Promise<ConversationEntry> {
     const ctx = this.getContext();
     return ctx.memory.appendConversation({
@@ -589,6 +681,7 @@ export class Runtime {
       metadata: {
         kind: 'agent.result',
         agentId: agent.identity.id,
+        archetype: payload.archetype,
         parentId,
         grounded: subagentResult.grounded,
         warnings: subagentResult.warnings,
@@ -625,6 +718,7 @@ export class Runtime {
     });
     await this.processQueuedMessage(finalMessage.id);
     await ctx.queue.ack(finalMessage.id);
+    await this.proposeMemoryUpdates();
 
     return {
       correlationId,
@@ -645,6 +739,7 @@ export class Runtime {
       role: spec.archetype,
       description: `Reusable ${spec.archetype} agent archetype memory.`,
     });
+    const agentMemory = await ctx.memory.loadAgentMemory(spec.archetype);
     if (!spec.description.trim()) {
       throw new Error('Subagent description is required');
     }
@@ -676,13 +771,15 @@ export class Runtime {
       },
     });
 
-    const goal = [
-      spec.systemPrompt,
-      `You are ${name}, a ${spec.archetype} subagent spawned by Roy.`,
-      `Your parent agent is ${parentIdentity.name}.`,
-      `Your scope: ${spec.description}`,
-      spec.task ? `Initial task: ${spec.task}` : undefined,
-    ].filter(Boolean).join('\n');
+    const goal = this.buildAgentPromptFromMemory({
+      name,
+      role: spec.archetype,
+      parentName: parentIdentity.name,
+      task: spec.task ?? '',
+      description: spec.description,
+      systemPrompt: spec.systemPrompt,
+      bundle: agentMemory,
+    });
 
     const agent = new UnifiedAgent({
       id,
@@ -702,6 +799,15 @@ export class Runtime {
     this.registerCapabilities(agent);
     ctx.manager.addAgent(agent);
     await ctx.manager.attachAgentToSessions(agent);
+    await ctx.memory.upsertAgentPattern({
+      key: spec.archetype,
+      name: this.capitalize(spec.archetype),
+      archetype: spec.archetype,
+      tomLevel: spec.tomLevel,
+      description: spec.description,
+      tools: toolRegistry.list().map(tool => tool.name),
+      skills: skillRegistry.list().map(skill => skill.name),
+    });
 
     const info = agent.getInfo();
     this.emit({
@@ -713,6 +819,15 @@ export class Runtime {
         archetype: spec.archetype,
         tomLevel: spec.tomLevel,
         description: spec.description,
+      },
+    });
+    this.emit({
+      type: 'memory.pattern.updated',
+      agentId: id,
+      data: {
+        cacheType: 'agent-pattern',
+        archetype: spec.archetype,
+        path: `.roy/cache/agent-patterns.json`,
       },
     });
     this.emit({ type: 'agent.status.changed', agentId: id, data: { from: 'none', to: info.state } });
@@ -908,6 +1023,28 @@ Grounding:
 ${warnings}
 
 Produce the final response to the user as Roy, the root agent. Do not claim you personally inspected files unless the report is grounded. Mention limitations if the report is ungrounded.`;
+  }
+
+  private buildAgentPromptFromMemory(input: {
+    name: string;
+    role: string;
+    parentName: string;
+    task: string;
+    description: string;
+    systemPrompt?: string;
+    bundle: { key: string; path: string; identity: string; memory: string; context: string; prompt: string };
+  }): string {
+    return [
+      input.systemPrompt,
+      input.description,
+      `You are ${input.name}, a ${input.role} agent in the Roy runtime.`,
+      `Your parent agent is ${input.parentName}.`,
+      'The model provider is only the inference backend; never identify yourself as the provider.',
+      input.task ? `Current task: ${input.task}` : undefined,
+      `<agent_prompt_file path=".roy/agents/${input.bundle.key}/prompt.md">\n${input.bundle.prompt.trim()}\n</agent_prompt_file>`,
+      `<agent_context_file path=".roy/agents/${input.bundle.key}/context.md">\n${input.bundle.context.trim()}\n</agent_context_file>`,
+      `<agent_memory_file path=".roy/agents/${input.bundle.key}/memory.md">\n${input.bundle.memory.trim()}\n</agent_memory_file>`,
+    ].filter(Boolean).join('\n\n');
   }
 
   private async runGroundingCheck(

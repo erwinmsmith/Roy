@@ -459,7 +459,14 @@ export class Roy {
       /queue              Show runtime message queue state
       /messages --correlation <id> Show messages for a delegation chain
       /memory             Show workspace memory state
-      /memory <doc>       Show root, project, decisions, constraints, or glossary
+      /memory public      Show public memory docs
+      /memory public <doc> Show project, context, decisions, constraints, glossary, or user
+      /memory agent <key> Show agent memory, prompt, and context
+      /memory proposals   Show pending memory update proposals
+      /memory accept <id> Commit a memory proposal
+      /memory reject <id> Reject a memory proposal
+      /memory summarize   Generate memory proposals from the current session
+      /memory mode <mode> Set memory mode: suggest, auto, or off
       /conversation       Show persisted conversation log
       /conversation sessions List persisted conversation sessions
       /conversation --session <id> Show a specific session
@@ -738,33 +745,115 @@ export class Roy {
   private async printWorkspaceMemory(args: string): Promise<void> {
     if (!this.ctx) return;
 
-    const selected = args.trim().toLowerCase();
-    if (selected) {
-      const context = await runtime.loadRootMemoryContext();
-      const docs: Record<string, string> = {
-        root: context.rootMemory,
-        project: context.projectMemory,
-        decisions: context.decisions,
-        constraints: context.constraints,
-        glossary: context.glossary,
-      };
-      const content = docs[selected];
-      if (content === undefined) {
-        console.log('\n  Usage: /memory <root|project|decisions|constraints|glossary>\n');
-        return;
-      }
-      console.log('\n  ' + this.bold(`Memory: ${selected}`));
-      console.log(this.dim('  ' + '-'.repeat(58)));
-      console.log(content.trim() ? content.trim() : this.dim('No content'));
+    const parts = args.trim().split(/\s+/).filter(Boolean);
+    const scope = parts[0];
+    const key = parts[1];
+
+    if (scope === 'status' || !scope) {
+      await this.printMemoryStatus();
+      return;
+    }
+
+    if (scope === 'public') {
+      await this.printPublicMemory(key);
+      return;
+    }
+
+    if (scope === 'agent') {
+      await this.printAgentMemory(key ?? 'roy');
+      return;
+    }
+
+    if (scope === 'team') {
+      console.log('\n  ' + this.bold(`Team Memory: ${key ?? ''}`));
+      console.log('    ' + this.dim('Team memory storage is reserved; no team instances exist yet.') + '\n');
+      return;
+    }
+
+    if (scope === 'proposals') {
+      await this.printMemoryProposals();
+      return;
+    }
+
+    if (scope === 'summarize') {
+      const proposals = await runtime.proposeMemoryUpdates();
+      console.log('\n  ' + this.bold('Memory Summary'));
+      console.log(`    Created: ${this.cyan(String(proposals.length))} proposal(s)`);
+      if (proposals.length === 0) console.log('    ' + this.dim('No new reusable memory signals found.'));
       console.log('');
       return;
     }
 
+    if (scope === 'accept') {
+      if (!key) {
+        console.log('\n  Usage: /memory accept <proposalId>\n');
+        return;
+      }
+      const record = await runtime.acceptMemoryProposal(key);
+      console.log(record
+        ? `\n  ${this.green('Committed memory proposal')} ${key}\n`
+        : `\n  ${this.yellow('No pending proposal found:')} ${key}\n`);
+      return;
+    }
+
+    if (scope === 'reject') {
+      if (!key) {
+        console.log('\n  Usage: /memory reject <proposalId>\n');
+        return;
+      }
+      const rejected = await runtime.rejectMemoryProposal(key);
+      console.log(rejected
+        ? `\n  ${this.green('Rejected memory proposal')} ${key}\n`
+        : `\n  ${this.yellow('No pending proposal found:')} ${key}\n`);
+      return;
+    }
+
+    if (scope === 'updates') {
+      const updates = await runtime.listMemoryUpdates();
+      console.log('\n  ' + this.bold('Memory Updates'));
+      if (updates.length === 0) {
+        console.log('    ' + this.dim('No committed memory updates.'));
+      } else {
+        for (const update of updates.slice(-20)) {
+          console.log(`    - ${this.cyan(update.id)} ${this.dim(path.relative(process.cwd(), update.targetPath))} ${update.section ?? ''}`);
+        }
+      }
+      console.log('');
+      return;
+    }
+
+    if (scope === 'mode') {
+      if (!key) {
+        console.log('\n  Memory mode: ' + this.cyan(await runtime.getMemoryMode()) + '\n');
+        return;
+      }
+      if (!['suggest', 'auto', 'off'].includes(key)) {
+        console.log('\n  Usage: /memory mode <suggest|auto|off>\n');
+        return;
+      }
+      await runtime.setMemoryMode(key as any);
+      console.log('\n  Memory mode: ' + this.cyan(key) + '\n');
+      return;
+    }
+
+    if (['project', 'context', 'decisions', 'constraints', 'glossary', 'user'].includes(scope)) {
+      await this.printPublicMemory(scope);
+      return;
+    }
+
+    console.log('\n  Usage: /memory [status|public|agent|proposals|summarize|accept|reject|updates|mode]\n');
+  }
+
+  private async printMemoryStatus(): Promise<void> {
     const state = await runtime.getMemoryState();
+    const mode = await runtime.getMemoryMode();
+    const proposals = await runtime.listMemoryProposals();
     console.log('\n  ' + this.bold('Workspace Memory'));
     console.log(`    Path:      ${this.cyan(path.relative(process.cwd(), state.rootPath) || state.rootPath)}`);
+    console.log(`    Mode:      ${this.cyan(mode)}`);
     console.log(`    Public:    ${state.publicMemoryDocs.length} docs`);
     console.log(`    Agents:    ${state.agentMemories.length} memories`);
+    console.log(`    Proposals: ${proposals.length} pending`);
     console.log(`    Traces:    ${state.traces}`);
     console.log(`    Queue:     ${path.relative(process.cwd(), state.queuePath) || state.queuePath}`);
     console.log(`    Patterns:  ${state.patterns.agents} agents, ${state.patterns.teams} teams, ${state.patterns.delegations} delegations`);
@@ -785,6 +874,60 @@ export class Roy {
 
     console.log('\n  ' + this.bold('Agent Session Memory'));
     this.printMemory();
+  }
+
+  private async printPublicMemory(doc?: string): Promise<void> {
+    if (!doc) {
+      const state = await runtime.getMemoryState();
+      console.log('\n  ' + this.bold('Public Memory'));
+      for (const item of state.publicMemoryDocs) {
+        console.log(`    - ${this.cyan(item.name.replace(/\.md$/, ''))} ${this.dim(`${item.size} bytes`)}`);
+      }
+      console.log('');
+      return;
+    }
+
+    const content = await runtime.readPublicMemoryDoc(doc);
+    console.log('\n  ' + this.bold(`Public Memory: ${doc}`));
+    console.log(this.dim('  ' + '-'.repeat(58)));
+    console.log(content.trim() ? content.trim() : this.dim('No content'));
+    console.log('');
+  }
+
+  private async printAgentMemory(agentKey: string): Promise<void> {
+    const memory = await runtime.readAgentMemoryDoc(agentKey, 'memory');
+    const context = await runtime.readAgentMemoryDoc(agentKey, 'context');
+    const prompt = await runtime.readAgentMemoryDoc(agentKey, 'prompt');
+
+    console.log('\n  ' + this.bold(`Agent Memory: ${agentKey}`));
+    console.log(this.dim('  ' + '-'.repeat(58)));
+    console.log('\n  ' + this.bold('prompt.md'));
+    console.log(prompt.trim() ? prompt.trim() : this.dim('No content'));
+    console.log('\n  ' + this.bold('context.md'));
+    console.log(context.trim() ? context.trim() : this.dim('No content'));
+    console.log('\n  ' + this.bold('memory.md'));
+    console.log(memory.trim() ? memory.trim() : this.dim('No content'));
+    console.log('');
+  }
+
+  private async printMemoryProposals(): Promise<void> {
+    const proposals = await runtime.listMemoryProposals();
+    console.log('\n  ' + this.bold('Memory Proposals'));
+    if (proposals.length === 0) {
+      console.log('    ' + this.dim('No pending proposals.'));
+      console.log('');
+      return;
+    }
+
+    proposals.forEach((proposal, index) => {
+      console.log(`\n  ${index + 1}. ${this.cyan(proposal.id)}`);
+      console.log(`     target: ${path.relative(process.cwd(), proposal.target.path) || proposal.target.path}`);
+      console.log(`     section: ${proposal.target.section ?? '-'}`);
+      console.log(`     risk: ${proposal.risk}`);
+      console.log(`     confidence: ${proposal.confidence}`);
+      console.log(`     reason: ${proposal.reason}`);
+    });
+    console.log('');
   }
 
   private printSession(): void {
@@ -905,25 +1048,30 @@ export class Roy {
         requireRootSynthesis: true,
         showSubagentOutput: !quiet,
       });
-      console.log(`\n  ${this.green('[event]')} message chain: ${result.correlationId}`);
-      console.log(`  ${this.green('[event]')} agent.spawned: ${result.agent.identity.id} ${result.agent.name} parent=${result.agent.identity.parentId ?? 'root'}`);
-      console.log(`  ${this.yellow(`${result.agent.name}[subagent] thinking...`)}`);
+      console.log(`\n  ${this.dim(`message chain: ${result.correlationId}`)}`);
+      console.log(`  ${this.yellow('roy[root] delegating...')}`);
+      console.log(`  ├─ ${this.yellow(`${result.agent.name}[subagent] thinking...`)}`);
       if (result.subagentResult.toolCalls.length > 0) {
         for (const call of result.subagentResult.toolCalls) {
-          console.log(`  ${this.dim(`[event] tool.call: ${result.agent.identity.id} -> ${call.toolName}`)}`);
+          const toolPath = typeof call.params.path === 'string'
+            ? path.relative(process.cwd(), call.params.path) || '.'
+            : '';
+          console.log(`  │  ├─ ${this.dim(`tool: ${call.toolName} ${toolPath}`.trim())}`);
         }
       }
-      console.log(`  ${this.green(`${result.agent.name}[subagent] completed.`)}`);
+      console.log(`  │  └─ ${this.green(`completed, ${result.subagentResult.usage.totalTokens} tokens`)}`);
       if (!quiet && result.subagentResult.result) {
-        console.log('\n  ' + this.dim(`${result.agent.name}[subagent] report:`));
-        console.log(this.dim(result.subagentResult.result));
+        console.log(`  │     ${this.dim(`${result.agent.name}[subagent] report:`)}`);
+        for (const line of result.subagentResult.result.split('\n').slice(0, 12)) {
+          console.log(`  │     ${this.dim(line)}`);
+        }
       }
       if (result.subagentResult.warnings.length > 0) {
         for (const warning of result.subagentResult.warnings) {
           console.log(`  ${this.yellow('[warning]')} ${warning}`);
         }
       }
-      console.log(`  ${this.yellow('roy[root] synthesizing...')}\n`);
+      console.log(`  └─ ${this.yellow('roy[root] synthesizing...')}\n`);
       console.log('  ' + this.green('roy[root] > ') + result.finalResponse + '\n');
     } catch (error) {
       console.log('\n  ' + this.red('Spawn error:') + ' ' + (error instanceof Error ? error.message : String(error)) + '\n');

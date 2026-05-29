@@ -18,16 +18,23 @@ describe('Workspace memory initialization', () => {
     const state = await runtime.getMemoryState();
     expect(state.initialized).toBe(true);
     expect(state.rootPath).toBe(path.join(workspaceCwd, '.roy'));
-    expect(state.publicMemoryDocs.map(doc => doc.name)).toContain('public.md');
     expect(state.publicMemoryDocs.map(doc => doc.name)).toContain('project.md');
+    expect(state.publicMemoryDocs.map(doc => doc.name)).toContain('context.md');
+    expect(state.publicMemoryDocs.map(doc => doc.name)).toContain('decisions.md');
+    expect(state.publicMemoryDocs.map(doc => doc.name)).toContain('constraints.md');
+    expect(state.publicMemoryDocs.map(doc => doc.name)).toContain('glossary.md');
+    expect(state.publicMemoryDocs.map(doc => doc.name)).toContain('user.md');
     expect(state.agentMemories.map(memory => memory.id)).toContain('roy');
     expect(state.agentMemories.find(memory => memory.id === 'roy')?.docs.map(doc => doc.name)).toContain('memory.md');
+    expect(state.agentMemories.find(memory => memory.id === 'roy')?.docs.map(doc => doc.name)).toContain('prompt.md');
     expect(state.patterns).toEqual({ agents: 0, teams: 0, delegations: 0 });
     expect(state.queuePath).toBe(path.join(workspaceCwd, '.roy', 'queue'));
 
     const context = await runtime.loadRootMemoryContext();
     expect(context.rootMemory).toContain('# Agent Memory');
     expect(context.projectMemory).toContain('# Project Context');
+    expect(await runtime.readPublicMemoryDoc('context')).toContain('# Public Context');
+    expect(await runtime.readAgentMemoryDoc('roy', 'prompt')).toContain('# Roy Prompt');
 
     runtime.emit({ type: 'turn.started', agentId: 'root', data: { turnId: 'turn_test' } });
     await new Promise(resolve => setTimeout(resolve, 10));

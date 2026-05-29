@@ -125,8 +125,12 @@ describe('Runtime controlled subagent spawning', () => {
     expect(eventTypes).toContain('root.synthesis.started');
     expect(eventTypes).toContain('root.synthesis.completed');
     expect(eventTypes).toContain('agent.result.sent');
+    expect(eventTypes).toContain('memory.pattern.updated');
     expect((await runtime.getConversation(undefined, 20)).some(entry => entry.role === 'agent')).toBe(true);
-    expect((await runtime.getMemoryState()).agentMemories.map(memory => memory.id)).toContain('researcher');
+    const memoryState = await runtime.getMemoryState();
+    expect(memoryState.agentMemories.map(memory => memory.id)).toContain('researcher');
+    expect(memoryState.patterns.agents).toBe(1);
+    expect((await runtime.listMemoryProposals()).length).toBeGreaterThan(0);
 
     await runtime.shutdown();
   });

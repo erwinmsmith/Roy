@@ -118,4 +118,16 @@ export { LongTermMemory, InMemoryCache } from './longTerm.js';
 export { contextManager, ContextManager } from './context.js';
 export { WorkspaceMemoryManager } from './workspace.js';
 export type { Memory, MemoryEntry, ContextDoc, CacheEntry, MemoryCache } from './types.js';
-export type { ConversationEntry, ConversationSessionState, MemoryDocState, PatternCacheState, RootMemoryContext, WorkspaceMemoryState } from './workspace.js';
+export type {
+  AgentMemoryBundle,
+  AgentPatternInput,
+  ConversationEntry,
+  ConversationSessionState,
+  MemoryDocState,
+  MemoryMode,
+  MemoryUpdateProposal,
+  MemoryUpdateRecord,
+  PatternCacheState,
+  RootMemoryContext,
+  WorkspaceMemoryState,
+} from './workspace.js';
