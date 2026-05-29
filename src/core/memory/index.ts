@@ -126,6 +126,7 @@ export type {
   ConversationSessionState,
   MemoryDocState,
   MemoryMode,
+  MemoryProposalSummary,
   MemorySignals,
   MemoryUpdateProposal,
   MemoryUpdateRecord,

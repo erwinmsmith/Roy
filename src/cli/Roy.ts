@@ -782,10 +782,12 @@ export class Roy {
     }
 
     if (scope === 'summarize') {
-      const proposals = await runtime.proposeMemoryUpdates();
+      const summary = await runtime.summarizeMemoryUpdates();
       console.log('\n  ' + this.bold('Memory Summary'));
-      console.log(`    Created: ${this.cyan(String(proposals.length))} proposal(s)`);
-      if (proposals.length === 0) console.log('    ' + this.dim('No new reusable memory signals found.'));
+      console.log(`    Created this run: ${this.cyan(String(summary.createdThisRun))} proposal(s)`);
+      console.log(`    Skipped duplicates: ${this.cyan(String(summary.skippedDuplicates))}`);
+      console.log(`    Pending proposals: ${this.cyan(String(summary.pendingProposals))}`);
+      console.log(`    Already committed: ${this.cyan(String(summary.alreadyCommitted))}`);
       console.log('');
       return;
     }
@@ -1094,6 +1096,7 @@ export class Roy {
           console.log(`  ${this.green('[event]')} cache.hit ${patternId}`);
         }
       }
+      console.log(`  ${this.dim(`agent creation prompt: ${result.creationUsage.promptDefinitionTokens} estimated tokens (${result.creationUsage.promptDefinitionChars} chars, cache hits: ${result.creationUsage.cacheHits.length})`)}`);
       console.log(`  ${this.yellow('roy[root] delegating...')}`);
       console.log(`  ├─ ${this.yellow(`${result.agent.name}[subagent] thinking...`)}`);
       if (result.subagentResult.toolCalls.length > 0) {

@@ -140,7 +140,7 @@ describe('Runtime controlled subagent spawning', () => {
     expect(proposals.map(proposal => proposal.target.section)).toContain('tool-policy');
     expect(proposals.map(proposal => proposal.target.section)).toContain('failure-cases');
     expect(proposals.map(proposal => proposal.target.section)).toContain('delegation-lessons');
-    expect(proposals[0].id).toBe('mem_prop_001');
+    expect(proposals[0].id).toMatch(/^mem_prop_\d{17}_[a-f0-9]{4}$/);
 
     const prompt = await readFile(path.join(workspaceCwd, '.roy', 'agents', 'researcher', 'prompt.md'), 'utf8');
     expect(prompt).toContain('{{public_context}}');
@@ -151,6 +151,9 @@ describe('Runtime controlled subagent spawning', () => {
     expect(prompt).toContain('{{available_tools}}');
     expect(prompt).toContain('{{parent_context}}');
     expect(prompt).toContain('{{task}}');
+    expect(result.subagentResult.evidence.toolGrounded).toBe(true);
+    expect(result.subagentResult.evidence.outputGrounded).toBe(false);
+    expect(result.creationUsage.promptDefinitionTokens).toBeGreaterThan(0);
 
     await runtime.shutdown();
   });
@@ -179,6 +182,8 @@ describe('Runtime controlled subagent spawning', () => {
       .map(event => event.data?.patternId);
     expect(hits).toContain('agent_pattern_researcher_v1');
     expect(hits).toContain('delegation_project_inspection_researcher_v1');
+    expect(second.creationUsage.cacheHits).toHaveLength(2);
+    expect(second.creationUsage.promptDefinitionTokens).toBeGreaterThan(0);
 
     await runtime.shutdown();
   });

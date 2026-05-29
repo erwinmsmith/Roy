@@ -89,6 +89,13 @@ export interface MemoryUpdateRecord {
   committedAt: number;
 }
 
+export interface MemoryProposalSummary {
+  createdThisRun: number;
+  skippedDuplicates: number;
+  pendingProposals: number;
+  alreadyCommitted: number;
+}
+
 export interface AgentMemoryBundle {
   key: string;
   path: string;
@@ -136,6 +143,10 @@ export interface MemorySignals {
     toolGrounded: boolean;
     outputGrounded: boolean;
     toolCalls: string[];
+    evidence: {
+      observedPaths: string[];
+      toolResultSummary?: string;
+    };
   }>;
   candidateSignals: string[];
 }
@@ -505,12 +516,40 @@ Keep this agent identity separate from the model provider identity.
     return (file.proposals ?? []).filter(proposal => proposal.status === 'pending');
   }
 
+  async listAllMemoryProposalRecords(): Promise<MemoryUpdateProposal[]> {
+    return this.listAllMemoryProposals();
+  }
+
   async listMemoryUpdates(): Promise<MemoryUpdateRecord[]> {
     const file = await this.readJson<{ updates?: MemoryUpdateRecord[] }>(
       path.join(this.rootPath, 'cache', 'memory-updates.json'),
       { updates: [] }
     );
     return file.updates ?? [];
+  }
+
+  async summarizeMemoryUpdates(): Promise<MemoryProposalSummary> {
+    const before = await this.listAllMemoryProposals();
+    const signals = await this.collectMemorySignals();
+    const created = await this.proposeMemoryUpdates();
+    const after = await this.listAllMemoryProposals();
+    const committed = after.filter(proposal => proposal.status === 'committed').length;
+    const pending = after.filter(proposal => proposal.status === 'pending').length;
+    const duplicateCandidates = signals.candidateSignals.filter(signal => {
+      const [key, sectionName] = this.signalToProposalTarget(signal);
+      return key && sectionName && before.some(proposal =>
+        (proposal.status === 'pending' || proposal.status === 'committed')
+        && proposal.target.key === key
+        && proposal.target.section === sectionName
+      );
+    });
+
+    return {
+      createdThisRun: created.length,
+      skippedDuplicates: duplicateCandidates.length,
+      pendingProposals: pending,
+      alreadyCommitted: committed,
+    };
   }
 
   async collectMemorySignals(): Promise<MemorySignals> {
@@ -521,19 +560,24 @@ Keep this agent identity separate from the model provider identity.
     const commandEntries = conversations.filter(entry => entry.metadata?.command === 'spawn' || entry.role === 'user');
     const agents = agentResults.map(entry => {
       const metadata = entry.metadata ?? {};
-      const toolCalls = Array.isArray(metadata.toolCalls) ? metadata.toolCalls.map(String) : [];
+      const evidence = this.normalizeEvidence(metadata.evidence);
       const archetype = typeof metadata.archetype === 'string'
         ? metadata.archetype
         : this.inferArchetype(String(metadata.agentId ?? entry.speaker));
-      const toolGrounded = toolCalls.includes('fs.list');
+      const toolCalls = Array.isArray(metadata.toolCalls) ? metadata.toolCalls.map(String) : [];
+      const toolGrounded = evidence.toolGrounded || toolCalls.includes('fs.list');
       return {
         agentId: String(metadata.agentId ?? entry.speaker),
         archetype,
         parentId: typeof metadata.parentId === 'string' ? metadata.parentId : undefined,
         grounded: metadata.grounded === true,
         toolGrounded,
-        outputGrounded: toolGrounded && this.containsConcreteFileObservations(entry.content),
+        outputGrounded: evidence.outputGrounded,
         toolCalls,
+        evidence: {
+          observedPaths: evidence.observedPaths,
+          toolResultSummary: evidence.toolResultSummary,
+        },
       };
     });
     const candidateSignals = new Set<string>();
@@ -591,8 +635,9 @@ Keep this agent identity separate from the model provider identity.
         : this.inferArchetype(String(metadata.agentId ?? entry.speaker));
       const toolCalls = Array.isArray(metadata.toolCalls) ? metadata.toolCalls.map(String) : [];
       const grounded = metadata.grounded === true;
-      const toolGrounded = toolCalls.includes('fs.list');
-      const outputGrounded = toolGrounded && this.containsConcreteFileObservations(entry.content);
+      const evidence = this.normalizeEvidence(metadata.evidence);
+      const toolGrounded = evidence.toolGrounded || toolCalls.includes('fs.list');
+      const outputGrounded = evidence.outputGrounded;
 
       if (archetype && toolGrounded && !this.hasOpenProposal(existing, 'agent', archetype, 'tool-policy')) {
         created.push(this.createProposal({
@@ -628,7 +673,7 @@ Keep this agent identity separate from the model provider identity.
           key: 'project',
           path: path.join(this.rootPath, 'public', 'project.md'),
           section: 'project-structure',
-          content: this.projectStructureProposalContent(entry.content),
+          content: this.projectStructureProposalContent(evidence),
           reason: 'Grounded filesystem inspection produced concrete project structure observations.',
           confidence: 0.74,
           risk: 'medium',
@@ -656,9 +701,6 @@ Keep this agent identity separate from the model provider identity.
 
     if (created.length === 0) return [];
 
-    created.forEach((proposal, index) => {
-      proposal.id = this.nextProposalId(existing.length + index + 1);
-    });
     const proposals = [...existing, ...created];
     await this.writeProposalFile(proposals);
 
@@ -969,7 +1011,7 @@ Keep this agent identity separate from the model provider identity.
   }): MemoryUpdateProposal {
     const now = Date.now();
     return {
-      id: `mem_prop_${now}_${Math.random().toString(16).slice(2, 8)}`,
+      id: this.createTimestampId(now),
       target: {
         type: input.type,
         key: input.key,
@@ -986,10 +1028,6 @@ Keep this agent identity separate from the model provider identity.
       updatedAt: now,
       source: input.source,
     };
-  }
-
-  private nextProposalId(sequence: number): string {
-    return `mem_prop_${String(sequence).padStart(3, '0')}`;
   }
 
   private hasOpenProposal(proposals: MemoryUpdateProposal[], type: string, key: string, section: string): boolean {
@@ -1115,8 +1153,32 @@ Keep this agent identity separate from the model provider identity.
     return /(^|\n)\s*(-\s*)?(src\/|docs\/|tests\/|package\.json|tsconfig\.json|README\.md|\.\/src|src:|files?:)/i.test(content);
   }
 
-  private projectStructureProposalContent(content: string): string {
-    const lines = content.split('\n')
+  private normalizeEvidence(value: unknown): {
+    toolGrounded: boolean;
+    outputGrounded: boolean;
+    observedPaths: string[];
+    toolResultSummary?: string;
+  } {
+    if (!value || typeof value !== 'object') {
+      return { toolGrounded: false, outputGrounded: false, observedPaths: [] };
+    }
+    const record = value as Record<string, unknown>;
+    return {
+      toolGrounded: record.toolGrounded === true,
+      outputGrounded: record.outputGrounded === true,
+      observedPaths: Array.isArray(record.observedPaths) ? record.observedPaths.map(String) : [],
+      toolResultSummary: typeof record.toolResultSummary === 'string' ? record.toolResultSummary : undefined,
+    };
+  }
+
+  private projectStructureProposalContent(evidence: {
+    observedPaths: string[];
+    toolResultSummary?: string;
+  }): string {
+    const source = evidence.toolResultSummary?.trim()
+      ? evidence.toolResultSummary
+      : evidence.observedPaths.join('\n');
+    const lines = source.split('\n')
       .map(line => line.trim())
       .filter(line => /src\/|docs\/|tests\/|package\.json|tsconfig\.json|README\.md/i.test(line))
       .slice(0, 12);
@@ -1124,6 +1186,27 @@ Keep this agent identity separate from the model provider identity.
       return '- Project structure was inspected with `fs.list`; review the related trace before making this permanent.';
     }
     return lines.map(line => line.startsWith('-') ? line : `- ${line}`).join('\n');
+  }
+
+  private signalToProposalTarget(signal: string): [string | undefined, string | undefined] {
+    switch (signal) {
+      case 'researcher.tool_policy':
+        return ['researcher', 'tool-policy'];
+      case 'researcher.failure_case':
+        return ['researcher', 'failure-cases'];
+      case 'roy.delegation_lesson':
+        return ['roy', 'delegation-lessons'];
+      case 'public.project_structure':
+        return ['project', 'project-structure'];
+      default:
+        return [undefined, undefined];
+    }
+  }
+
+  private createTimestampId(timestamp: number): string {
+    const stamp = new Date(timestamp).toISOString().replace(/[-:.TZ]/g, '').slice(0, 17);
+    const suffix = Math.random().toString(16).slice(2, 6);
+    return `mem_prop_${stamp}_${suffix}`;
   }
 
   private delegationSignature(archetype: string, task: string): string {

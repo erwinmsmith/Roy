@@ -29,6 +29,7 @@ import {
   type ConversationEntry,
   type ConversationSessionState,
   type MemoryMode,
+  type MemoryProposalSummary,
   type MemorySignals,
   type MemoryUpdateProposal,
   type MemoryUpdateRecord,
@@ -126,8 +127,16 @@ export interface RunAgentResult {
   result: string;
   usage: TokenUsage;
   toolCalls: ToolCallRecord[];
+  evidence: RunEvidence;
   grounded: boolean;
   warnings: string[];
+}
+
+export interface RunEvidence {
+  toolGrounded: boolean;
+  outputGrounded: boolean;
+  observedPaths: string[];
+  toolResultSummary?: string;
 }
 
 export interface ToolCallRecord {
@@ -152,6 +161,13 @@ export interface RootMediatedSpawnResult {
   subagentResult: RunAgentResult;
   finalResponse: string;
   messages: RuntimeMessage[];
+  creationUsage: AgentCreationUsage;
+}
+
+export interface AgentCreationUsage {
+  cacheHits: string[];
+  promptDefinitionTokens: number;
+  promptDefinitionChars: number;
 }
 
 export class Runtime {
@@ -557,6 +573,24 @@ export class Runtime {
     return proposals;
   }
 
+  async summarizeMemoryUpdates(): Promise<MemoryProposalSummary> {
+    const ctx = this.getContext();
+    this.emit({ type: 'memory.update.propose.started', agentId: 'root' });
+    const summary = await ctx.memory.summarizeMemoryUpdates();
+    this.emit({
+      type: summary.createdThisRun > 0 ? 'memory.update.propose.completed' : 'memory.update.skipped',
+      agentId: 'root',
+      data: {
+        createdThisRun: summary.createdThisRun,
+        skippedDuplicates: summary.skippedDuplicates,
+        pendingProposals: summary.pendingProposals,
+        alreadyCommitted: summary.alreadyCommitted,
+        reason: summary.createdThisRun === 0 ? 'no_new_proposals' : undefined,
+      },
+    });
+    return summary;
+  }
+
   async collectMemorySignals(): Promise<MemorySignals> {
     const ctx = this.getContext();
     return ctx.memory.collectMemorySignals();
@@ -628,6 +662,10 @@ export class Runtime {
     const requireRootSynthesis = payload.requireRootSynthesis ?? true;
     const cachedAgentPattern = await ctx.memory.findAgentPattern(payload.archetype);
     const cachedDelegationPattern = await ctx.memory.findDelegationPattern(payload.archetype, payload.task);
+    const cacheHits = [
+      typeof cachedAgentPattern?.id === 'string' ? cachedAgentPattern.id : undefined,
+      typeof cachedDelegationPattern?.id === 'string' ? cachedDelegationPattern.id : undefined,
+    ].filter((item): item is string => item !== undefined);
 
     if (cachedAgentPattern) {
       this.emit({
@@ -683,6 +721,7 @@ export class Runtime {
       task: payload.task,
       systemPrompt: undefined,
       tomProfile,
+      cacheHits,
     });
     const delegationPattern = await ctx.memory.upsertDelegationPattern({
       archetype: payload.archetype,
@@ -751,6 +790,7 @@ export class Runtime {
         grounded: subagentResult.grounded,
         warnings: subagentResult.warnings,
         toolCalls: subagentResult.toolCalls.map(call => call.toolName),
+        evidence: subagentResult.evidence,
       },
     });
     await this.processQueuedMessage(resultMessage.id);
@@ -791,10 +831,11 @@ export class Runtime {
       subagentResult,
       finalResponse,
       messages: await this.getMessages({ correlationId }),
+      creationUsage: this.measureAgentCreationUsage(agent.identity.id, cacheHits),
     };
   }
 
-  async spawnAgent(spec: SpawnAgentSpec & { tomProfile?: ToMProfile }): Promise<AgentInfo> {
+  async spawnAgent(spec: SpawnAgentSpec & { tomProfile?: ToMProfile; cacheHits?: string[] }): Promise<AgentInfo> {
     const ctx = this.getContext();
     if (!this.isValidArchetype(spec.archetype)) {
       throw new Error(`Unsupported subagent archetype "${spec.archetype}"`);
@@ -836,6 +877,7 @@ export class Runtime {
       },
     });
 
+    const cacheHits = spec.cacheHits ?? [];
     const goal = this.buildAgentPromptFromMemory({
       name,
       role: spec.archetype,
@@ -844,12 +886,15 @@ export class Runtime {
       description: spec.description,
       systemPrompt: spec.systemPrompt,
       bundle: agentMemory,
-      publicContext: this.formatPublicContext(await ctx.memory.loadRootContext()),
+      publicContext: cacheHits.length > 0
+        ? this.formatCachedPublicContext(cacheHits)
+        : this.formatPublicContext(await ctx.memory.loadRootContext()),
       tomProfile: spec.tomProfile ? { ...spec.tomProfile, subjectAgentId: id } : this.createSubagentToMProfile(spec.archetype, id, spec.task ?? ''),
       availableSkills: skillRegistry.list().map(skill => skill.name),
       availableTools: toolRegistry.list().map(tool => tool.name),
       parentContext: `Parent agent ${parentIdentity.name} (${parentIdentity.id}) spawned this agent for: ${spec.description}`,
     });
+    const creationUsage = this.estimateTextTokens(goal);
 
     const agent = new UnifiedAgent({
       id,
@@ -889,6 +934,18 @@ export class Runtime {
         archetype: spec.archetype,
         tomLevel: spec.tomLevel,
         description: spec.description,
+        promptDefinitionTokens: creationUsage,
+        promptDefinitionChars: goal.length,
+        cacheHits,
+      },
+    });
+    this.emit({
+      type: 'agent.creation.measured',
+      agentId: id,
+      data: {
+        promptDefinitionTokens: creationUsage,
+        promptDefinitionChars: goal.length,
+        cacheHits,
       },
     });
     this.emit({
@@ -948,6 +1005,12 @@ export class Runtime {
       this.emit({ type: 'agent.status.changed', agentId, data: { from: 'thinking', to: 'done' } });
 
       const result = session ? await this.drainAgentOutput(session.messageQueue, agent.name) : agent.getInfo().lastResult ?? '';
+      const evidence: RunEvidence = {
+        ...grounding.evidence,
+        outputGrounded: grounding.evidence.toolGrounded
+          ? this.resultIncludesObservedPath(result || agent.getInfo().lastResult || '', grounding.evidence.observedPaths)
+          : grounding.evidence.outputGrounded,
+      };
       this.emit({
         type: 'agent.run.completed',
         agentId,
@@ -955,6 +1018,7 @@ export class Runtime {
           task,
           totalTokens: usageDelta.totalTokens,
           grounded: grounding.grounded,
+          evidence,
           warnings: grounding.warnings,
         },
       });
@@ -964,6 +1028,7 @@ export class Runtime {
         result: result || agent.getInfo().lastResult || '',
         usage: usageDelta,
         toolCalls: grounding.toolCalls,
+        evidence,
         grounded: grounding.grounded,
         warnings: grounding.warnings,
       };
@@ -1088,7 +1153,11 @@ ${subagentResult.result}
 
 Grounding:
 - grounded: ${subagentResult.grounded}
+- tool grounded: ${subagentResult.evidence.toolGrounded}
+- output grounded: ${subagentResult.evidence.outputGrounded}
 - tool calls: ${subagentResult.toolCalls.map(call => call.toolName).join(', ') || 'none'}
+- observed paths:
+${subagentResult.evidence.observedPaths.slice(0, 30).map(item => `  - ${item}`).join('\n') || '  none'}
 - warnings:
 ${warnings}
 
@@ -1161,14 +1230,45 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
     ].join('\n');
   }
 
+  private formatCachedPublicContext(cacheHits: string[]): string {
+    return [
+      '<cache_context>',
+      `Cache hits: ${cacheHits.join(', ')}`,
+      'Use cached agent/delegation patterns as reusable structure, then adapt only the task-specific details.',
+      '</cache_context>',
+    ].join('\n');
+  }
+
+  private estimateTextTokens(text: string): number {
+    return Math.max(1, Math.ceil(text.length / 4));
+  }
+
+  private measureAgentCreationUsage(agentId: string, cacheHits: string[]): AgentCreationUsage {
+    const event = [...this.events].reverse()
+      .find(item => item.type === 'agent.creation.measured' && item.agentId === agentId);
+    const promptDefinitionTokens = Number(event?.data?.promptDefinitionTokens ?? 0);
+    const promptDefinitionChars = Number(event?.data?.promptDefinitionChars ?? 0);
+    return {
+      cacheHits,
+      promptDefinitionTokens,
+      promptDefinitionChars,
+    };
+  }
+
   private async runGroundingCheck(
     agentId: string,
     task: string,
     options: { correlationId?: string; parentMessageId?: string; archetype?: SubAgentArchetype }
-  ): Promise<{ toolCalls: ToolCallRecord[]; grounded: boolean; warnings: string[]; context: string }> {
+  ): Promise<{ toolCalls: ToolCallRecord[]; grounded: boolean; warnings: string[]; context: string; evidence: RunEvidence }> {
     const required = this.requiresProjectInspection(options.archetype, task);
     if (!required) {
-      return { toolCalls: [], grounded: true, warnings: [], context: '' };
+      return {
+        toolCalls: [],
+        grounded: true,
+        warnings: [],
+        context: '',
+        evidence: { toolGrounded: false, outputGrounded: true, observedPaths: [] },
+      };
     }
 
     const ctx = this.getContext();
@@ -1186,6 +1286,8 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
 
     try {
       const files = await this.listProjectFiles(process.cwd(), 2);
+      const observedPaths = files.slice(0, 80);
+      const toolResultSummary = observedPaths.join('\n');
       const record: ToolCallRecord = {
         toolName: 'fs.list',
         params: { path: process.cwd(), maxDepth: 2 },
@@ -1213,6 +1315,12 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
         toolCalls: [record],
         grounded: true,
         warnings: [],
+        evidence: {
+          toolGrounded: true,
+          outputGrounded: false,
+          observedPaths,
+          toolResultSummary,
+        },
         context: `Project file listing from fs.list:\n${files.join('\n')}`,
       };
     } catch (error) {
@@ -1229,6 +1337,12 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
         }],
         grounded: false,
         warnings: [warning],
+        evidence: {
+          toolGrounded: false,
+          outputGrounded: false,
+          observedPaths: [],
+          toolResultSummary: '',
+        },
         context: '',
       };
     }
@@ -1241,6 +1355,12 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
       grounding.context ? `\nGrounding context:\n${grounding.context}` : '',
       grounding.warnings.length > 0 ? `\nGrounding warnings:\n${grounding.warnings.join('\n')}` : '',
     ].filter(Boolean).join('\n');
+  }
+
+  private resultIncludesObservedPath(result: string, observedPaths: string[]): boolean {
+    if (!result.trim() || observedPaths.length === 0) return false;
+    const normalized = result.toLowerCase();
+    return observedPaths.slice(0, 80).some(item => normalized.includes(item.toLowerCase()));
   }
 
   private requiresProjectInspection(archetype: SubAgentArchetype | undefined, task: string): boolean {
