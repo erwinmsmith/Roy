@@ -153,7 +153,9 @@ describe('Runtime controlled subagent spawning', () => {
     expect(prompt).toContain('{{task}}');
     expect(result.subagentResult.evidence.toolGrounded).toBe(true);
     expect(result.subagentResult.evidence.outputGrounded).toBe(false);
-    expect(result.creationUsage.promptDefinitionTokens).toBeGreaterThan(0);
+    expect(result.creationUsage.mode).toBe('generated');
+    expect(result.creationUsage.definitionTokens).toBeGreaterThan(0);
+    expect(result.creationUsage.renderedPromptTokens).toBeGreaterThan(0);
 
     await runtime.shutdown();
   });
@@ -183,7 +185,34 @@ describe('Runtime controlled subagent spawning', () => {
     expect(hits).toContain('agent_pattern_researcher_v1');
     expect(hits).toContain('delegation_project_inspection_researcher_v1');
     expect(second.creationUsage.cacheHits).toHaveLength(2);
-    expect(second.creationUsage.promptDefinitionTokens).toBeGreaterThan(0);
+    expect(second.creationUsage.mode).toBe('cache_hit');
+    expect(second.creationUsage.definitionTokens).toBe(0);
+    expect(second.creationUsage.renderedPromptTokens).toBeGreaterThan(0);
+
+    await runtime.shutdown();
+  });
+
+  it('injects custom agent name and role into rendered prompts', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-custom-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'custom-agent-test',
+      llmProvider: new EchoLLM(),
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+
+    const rendered = await runtime.renderAgentPrompt({
+      agentKey: 'custom',
+      name: 'Singer-1',
+      role: 'performer',
+      task: 'Introduce yourself briefly.',
+      archetype: 'custom',
+    });
+
+    expect(rendered.prompt).toContain('Singer-1');
+    expect(rendered.prompt).toContain('performer');
+    expect(rendered.prompt).toContain('Introduce yourself briefly.');
 
     await runtime.shutdown();
   });

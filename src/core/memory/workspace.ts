@@ -59,7 +59,7 @@ export interface ConversationSessionState {
   updatedAt: number;
 }
 
-export type MemoryMode = 'off' | 'suggest' | 'auto';
+export type MemoryMode = 'off' | 'suggest' | 'auto-safe';
 
 export interface MemoryUpdateProposal {
   id: string;
@@ -92,6 +92,7 @@ export interface MemoryUpdateRecord {
 export interface MemoryProposalSummary {
   createdThisRun: number;
   skippedDuplicates: number;
+  updatedPendingProposals: number;
   pendingProposals: number;
   alreadyCommitted: number;
 }
@@ -429,6 +430,9 @@ ${options.description ?? 'Reusable agent archetype memory.'}
     for (const [fileName, content] of Object.entries(AGENT_MEMORY_TEMPLATES)) {
       await this.writeIfMissing(path.join(agentPath, fileName), content);
     }
+    if (safeKey === 'researcher') {
+      await this.ensureResearcherPolicy(path.join(agentPath, 'memory.md'));
+    }
 
     await this.writeIfMissing(
       path.join(agentPath, 'prompt.md'),
@@ -497,7 +501,7 @@ Keep this agent identity separate from the model provider identity.
   async getMemoryMode(): Promise<MemoryMode> {
     const config = await this.readJson<Record<string, unknown>>(path.join(this.rootPath, 'config.json'), {});
     const mode = config.memoryUpdates;
-    return mode === 'off' || mode === 'auto' || mode === 'suggest' ? mode : 'suggest';
+    return mode === 'off' || mode === 'auto-safe' || mode === 'suggest' ? mode : 'suggest';
   }
 
   async setMemoryMode(mode: MemoryMode): Promise<MemoryMode> {
@@ -520,6 +524,11 @@ Keep this agent identity separate from the model provider identity.
     return this.listAllMemoryProposals();
   }
 
+  async getMemoryProposal(id: string): Promise<MemoryUpdateProposal | undefined> {
+    const proposals = await this.listAllMemoryProposals();
+    return proposals.find(proposal => proposal.id === id);
+  }
+
   async listMemoryUpdates(): Promise<MemoryUpdateRecord[]> {
     const file = await this.readJson<{ updates?: MemoryUpdateRecord[] }>(
       path.join(this.rootPath, 'cache', 'memory-updates.json'),
@@ -529,7 +538,7 @@ Keep this agent identity separate from the model provider identity.
   }
 
   async summarizeMemoryUpdates(): Promise<MemoryProposalSummary> {
-    const before = await this.listAllMemoryProposals();
+    const before = (await this.listAllMemoryProposals()).map(proposal => ({ ...proposal, target: { ...proposal.target }, source: { ...(proposal.source ?? {}) } }));
     const signals = await this.collectMemorySignals();
     const created = await this.proposeMemoryUpdates();
     const after = await this.listAllMemoryProposals();
@@ -547,6 +556,10 @@ Keep this agent identity separate from the model provider identity.
     return {
       createdThisRun: created.length,
       skippedDuplicates: duplicateCandidates.length,
+      updatedPendingProposals: after.filter(proposal => {
+        const previous = before.find(item => item.id === proposal.id);
+        return previous && proposal.status === 'pending' && proposal.updatedAt > previous.updatedAt;
+      }).length,
       pendingProposals: pending,
       alreadyCommitted: committed,
     };
@@ -667,6 +680,19 @@ Keep this agent identity separate from the model provider identity.
         }));
       }
 
+      if (grounded && outputGrounded) {
+        const updated = this.updatePendingProposal(existing, {
+          type: 'public',
+          key: 'project',
+          section: 'project-structure',
+          content: this.projectStructureProposalContent(evidence),
+          confidence: 0.78,
+          reason: 'A newer grounded run produced stronger concrete project structure evidence.',
+          source: { sessionId: this.sessionId, conversationEntryId: entry.id, agentId: metadata.agentId, signalCounts: signals.counts, updatedFromSignal: true },
+        });
+        if (updated) continue;
+      }
+
       if (grounded && outputGrounded && !this.hasOpenProposal(existing, 'public', 'project', 'project-structure')) {
         created.push(this.createProposal({
           type: 'public',
@@ -699,12 +725,15 @@ Keep this agent identity separate from the model provider identity.
       }));
     }
 
-    if (created.length === 0) return [];
+    if (created.length === 0) {
+      await this.writeProposalFile(existing);
+      return [];
+    }
 
     const proposals = [...existing, ...created];
     await this.writeProposalFile(proposals);
 
-    if (mode === 'auto') {
+    if (mode === 'auto-safe') {
       for (const proposal of created.filter(item => item.risk === 'low')) {
         await this.acceptMemoryProposal(proposal.id);
       }
@@ -827,6 +856,13 @@ Keep this agent identity separate from the model provider identity.
     }
     await writeFile(cachePath, JSON.stringify({ patterns }, null, 2) + '\n', 'utf8');
     return pattern;
+  }
+
+  async updateCacheUsageMetrics(patternIds: string[], metrics: { definitionTokensSaved?: number; renderedPromptTokens?: number }): Promise<void> {
+    await Promise.all([
+      this.updatePatternUsageMetrics('agent-patterns.json', patternIds, metrics),
+      this.updatePatternUsageMetrics('delegation-patterns.json', patternIds, metrics),
+    ]);
   }
 
   async listTraces(): Promise<Array<{ name: string; path: string; size: number; updatedAt: number }>> {
@@ -998,6 +1034,31 @@ Keep this agent identity separate from the model provider identity.
     );
   }
 
+  private updatePendingProposal(proposals: MemoryUpdateProposal[], input: {
+    type: MemoryUpdateProposal['target']['type'];
+    key: string;
+    section: string;
+    content: string;
+    confidence: number;
+    reason: string;
+    source?: Record<string, unknown>;
+  }): boolean {
+    const proposal = proposals.find(item =>
+      item.status === 'pending'
+      && item.target.type === input.type
+      && item.target.key === input.key
+      && item.target.section === input.section
+    );
+    if (!proposal || typeof proposal.content !== 'string') return false;
+    if (proposal.content === input.content && proposal.confidence >= input.confidence) return false;
+    proposal.content = input.content;
+    proposal.confidence = Math.max(proposal.confidence, input.confidence);
+    proposal.reason = input.reason;
+    proposal.updatedAt = Date.now();
+    proposal.source = { ...(proposal.source ?? {}), ...(input.source ?? {}) };
+    return true;
+  }
+
   private createProposal(input: {
     type: MemoryUpdateProposal['target']['type'];
     key: string;
@@ -1082,6 +1143,33 @@ Keep this agent identity separate from the model provider identity.
     }
   }
 
+  private async updatePatternUsageMetrics(
+    fileName: string,
+    patternIds: string[],
+    metrics: { definitionTokensSaved?: number; renderedPromptTokens?: number }
+  ): Promise<void> {
+    if (patternIds.length === 0) return;
+    const filePath = path.join(this.rootPath, 'cache', fileName);
+    const file = await this.readJson<{ patterns?: Array<Record<string, unknown>> }>(filePath, { patterns: [] });
+    let changed = false;
+    const patterns = (file.patterns ?? []).map(pattern => {
+      if (!patternIds.includes(String(pattern.id))) return pattern;
+      const usage = typeof pattern.usage === 'object' && pattern.usage !== null
+        ? pattern.usage as Record<string, unknown>
+        : {};
+      pattern.usage = {
+        ...usage,
+        definitionTokensSaved: Number(usage.definitionTokensSaved ?? 0) + Number(metrics.definitionTokensSaved ?? 0),
+        lastRenderedPromptTokens: metrics.renderedPromptTokens ?? usage.lastRenderedPromptTokens,
+      };
+      changed = true;
+      return pattern;
+    });
+    if (changed) {
+      await writeFile(filePath, JSON.stringify({ patterns }, null, 2) + '\n', 'utf8');
+    }
+  }
+
   private async ensurePromptSlots(filePath: string): Promise<void> {
     const requiredSlots = [
       '{{public_context}}',
@@ -1101,6 +1189,29 @@ Keep this agent identity separate from the model provider identity.
       `\n\n## Runtime Slots\n\n\`\`\`txt\n${missing.join('\n\n')}\n\`\`\`\n`,
       'utf8'
     );
+  }
+
+  private async ensureResearcherPolicy(filePath: string): Promise<void> {
+    const existing = await this.readOptional(filePath);
+    const required = [
+      '- For project inspection tasks, call `fs.list` and include concrete file or directory names observed from the tool result.',
+      '- If the user asks to list files/directories, do not produce a reasoning-trace diagnosis, bottleneck analysis, or meta-evaluation.',
+      '- The final report must contain concrete observed paths.',
+    ];
+    const missing = required.filter(line => !existing.includes(line));
+    if (missing.length === 0) return;
+    const begin = '<!-- ROY:BEGIN:tool-policy -->';
+    const end = '<!-- ROY:END:tool-policy -->';
+    if (!existing.includes(begin) || !existing.includes(end)) {
+      await appendFile(filePath, `\n\n## Tool Policy\n\n${missing.join('\n')}\n`, 'utf8');
+      return;
+    }
+    const pattern = new RegExp(`${this.escapeRegExp(begin)}([\\s\\S]*?)${this.escapeRegExp(end)}`);
+    const updated = existing.replace(pattern, (_match, body: string) => {
+      const nextBody = `${body.trim() ? `${body.trim()}\n` : ''}${missing.join('\n')}`;
+      return `${begin}\n${nextBody}\n${end}`;
+    });
+    await writeFile(filePath, updated, 'utf8');
   }
 
   private async readJson<T>(filePath: string, fallback: T): Promise<T> {

@@ -108,6 +108,8 @@ export type SubAgentArchetype =
 export interface SpawnAgentSpec {
   parentId: string;
   name?: string;
+  customRole?: string;
+  customStyle?: string;
   archetype: SubAgentArchetype;
   tomLevel: number;
   description: string;
@@ -151,6 +153,8 @@ export interface SpawnCommandPayload {
   task: string;
   parentId?: string;
   name?: string;
+  customRole?: string;
+  customStyle?: string;
   requireRootSynthesis?: boolean;
   showSubagentOutput?: boolean;
 }
@@ -165,9 +169,12 @@ export interface RootMediatedSpawnResult {
 }
 
 export interface AgentCreationUsage {
+  mode: 'generated' | 'cache_hit';
+  patternIds: string[];
   cacheHits: string[];
-  promptDefinitionTokens: number;
-  promptDefinitionChars: number;
+  definitionTokens: number;
+  renderedPromptTokens: number;
+  renderedPromptChars: number;
 }
 
 export class Runtime {
@@ -540,6 +547,11 @@ export class Runtime {
     return ctx.memory.listMemoryProposals();
   }
 
+  async getMemoryProposal(id: string): Promise<MemoryUpdateProposal | undefined> {
+    const ctx = this.getContext();
+    return ctx.memory.getMemoryProposal(id);
+  }
+
   async proposeMemoryUpdates(): Promise<MemoryUpdateProposal[]> {
     const ctx = this.getContext();
     this.emit({ type: 'memory.update.propose.started', agentId: 'root' });
@@ -583,6 +595,7 @@ export class Runtime {
       data: {
         createdThisRun: summary.createdThisRun,
         skippedDuplicates: summary.skippedDuplicates,
+        updatedPendingProposals: summary.updatedPendingProposals,
         pendingProposals: summary.pendingProposals,
         alreadyCommitted: summary.alreadyCommitted,
         reason: summary.createdThisRun === 0 ? 'no_new_proposals' : undefined,
@@ -715,6 +728,8 @@ export class Runtime {
     const agent = await this.spawnAgent({
       parentId,
       name: payload.name,
+      customRole: payload.customRole,
+      customStyle: payload.customStyle,
       archetype: payload.archetype,
       tomLevel: tomProfile.level,
       description: payload.task,
@@ -842,7 +857,7 @@ export class Runtime {
     }
     await ctx.memory.ensureAgentMemory(spec.archetype, {
       name: this.capitalize(spec.archetype),
-      role: spec.archetype,
+      role: spec.customRole ?? spec.archetype,
       description: `Reusable ${spec.archetype} agent archetype memory.`,
     });
     const agentMemory = await ctx.memory.loadAgentMemory(spec.archetype);
@@ -880,10 +895,14 @@ export class Runtime {
     const cacheHits = spec.cacheHits ?? [];
     const goal = this.buildAgentPromptFromMemory({
       name,
-      role: spec.archetype,
+      role: spec.customRole ?? spec.archetype,
       parentName: parentIdentity.name,
       task: spec.task ?? '',
-      description: spec.description,
+      description: [
+        spec.description,
+        spec.customRole ? `Custom role: ${spec.customRole}` : undefined,
+        spec.customStyle ? `Custom style: ${spec.customStyle}` : undefined,
+      ].filter(Boolean).join('\n'),
       systemPrompt: spec.systemPrompt,
       bundle: agentMemory,
       publicContext: cacheHits.length > 0
@@ -894,7 +913,18 @@ export class Runtime {
       availableTools: toolRegistry.list().map(tool => tool.name),
       parentContext: `Parent agent ${parentIdentity.name} (${parentIdentity.id}) spawned this agent for: ${spec.description}`,
     });
-    const creationUsage = this.estimateTextTokens(goal);
+    const renderedPromptTokens = this.estimateTextTokens(goal);
+    const definitionText = [
+      name,
+      spec.archetype,
+      spec.customRole,
+      spec.customStyle,
+      spec.description,
+      spec.tomProfile ? JSON.stringify(spec.tomProfile) : '',
+      toolRegistry.list().map(tool => tool.name).join(','),
+      skillRegistry.list().map(skill => skill.name).join(','),
+    ].filter(Boolean).join('\n');
+    const definitionTokens = cacheHits.length > 0 ? 0 : this.estimateTextTokens(definitionText);
 
     const agent = new UnifiedAgent({
       id,
@@ -934,8 +964,10 @@ export class Runtime {
         archetype: spec.archetype,
         tomLevel: spec.tomLevel,
         description: spec.description,
-        promptDefinitionTokens: creationUsage,
-        promptDefinitionChars: goal.length,
+        mode: cacheHits.length > 0 ? 'cache_hit' : 'generated',
+        definitionTokens,
+        renderedPromptTokens,
+        renderedPromptChars: goal.length,
         cacheHits,
       },
     });
@@ -943,10 +975,16 @@ export class Runtime {
       type: 'agent.creation.measured',
       agentId: id,
       data: {
-        promptDefinitionTokens: creationUsage,
-        promptDefinitionChars: goal.length,
+        mode: cacheHits.length > 0 ? 'cache_hit' : 'generated',
+        definitionTokens,
+        renderedPromptTokens,
+        renderedPromptChars: goal.length,
         cacheHits,
       },
+    });
+    await ctx.memory.updateCacheUsageMetrics(cacheHits, {
+      definitionTokensSaved: cacheHits.length > 0 ? this.estimateTextTokens(definitionText) : 0,
+      renderedPromptTokens,
     });
     this.emit({
       type: 'memory.pattern.updated',
@@ -1011,6 +1049,18 @@ export class Runtime {
           ? this.resultIncludesObservedPath(result || agent.getInfo().lastResult || '', grounding.evidence.observedPaths)
           : grounding.evidence.outputGrounded,
       };
+      const warnings = [...grounding.warnings];
+      if (grounding.evidence.toolGrounded && !evidence.outputGrounded) {
+        warnings.push('Agent used fs.list but did not include concrete observed paths in its final report.');
+        this.emit({
+          type: 'agent.grounding.warning',
+          agentId,
+          data: {
+            warning: warnings[warnings.length - 1],
+            correlationId: options.correlationId,
+          },
+        });
+      }
       this.emit({
         type: 'agent.run.completed',
         agentId,
@@ -1019,7 +1069,7 @@ export class Runtime {
           totalTokens: usageDelta.totalTokens,
           grounded: grounding.grounded,
           evidence,
-          warnings: grounding.warnings,
+          warnings,
         },
       });
 
@@ -1030,7 +1080,7 @@ export class Runtime {
         toolCalls: grounding.toolCalls,
         evidence,
         grounded: grounding.grounded,
-        warnings: grounding.warnings,
+        warnings,
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -1203,6 +1253,46 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
     ].filter(Boolean).join('\n\n');
   }
 
+  async renderAgentPrompt(options: {
+    agentKey: string;
+    name?: string;
+    role?: string;
+    parentId?: string;
+    task?: string;
+    archetype?: SubAgentArchetype;
+  }): Promise<{ prompt: string; estimatedTokens: number; sources: Record<string, unknown> }> {
+    const ctx = this.getContext();
+    const agentKey = options.agentKey;
+    const bundle = await ctx.memory.loadAgentMemory(agentKey);
+    const parent = options.parentId ? ctx.manager.getAgentById(options.parentId)?.getIdentity() : ctx.agent.getIdentity();
+    const role = options.role ?? options.archetype ?? agentKey;
+    const tomProfile = options.archetype
+      ? this.createSubagentToMProfile(options.archetype, agentKey, options.task ?? '')
+      : this.createRootToMProfile();
+    const prompt = this.buildAgentPromptFromMemory({
+      name: options.name ?? this.capitalize(agentKey),
+      role,
+      parentName: parent?.name ?? 'Roy',
+      task: options.task ?? '',
+      description: `Rendered prompt preview for ${agentKey}.`,
+      bundle,
+      publicContext: this.formatPublicContext(await ctx.memory.loadRootContext()),
+      tomProfile,
+      availableSkills: skillRegistry.list().map(skill => skill.name),
+      availableTools: toolRegistry.list().map(tool => tool.name),
+      parentContext: `Parent agent: ${parent?.name ?? 'Roy'} (${parent?.id ?? 'root'})`,
+    });
+    return {
+      prompt,
+      estimatedTokens: this.estimateTextTokens(prompt),
+      sources: {
+        public: ['.roy/public/project.md', '.roy/public/constraints.md', '.roy/public/decisions.md'],
+        private: [`.roy/agents/${bundle.key}/prompt.md`, `.roy/agents/${bundle.key}/memory.md`, `.roy/agents/${bundle.key}/context.md`],
+        session: 'compact recent session context is reserved for ContextWindowManager',
+      },
+    };
+  }
+
   private renderPromptSlots(template: string, slots: Record<string, string>): string {
     return Object.entries(slots).reduce(
       (rendered, [slot, value]) => rendered.replaceAll(`{{${slot}}}`, value),
@@ -1246,12 +1336,16 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
   private measureAgentCreationUsage(agentId: string, cacheHits: string[]): AgentCreationUsage {
     const event = [...this.events].reverse()
       .find(item => item.type === 'agent.creation.measured' && item.agentId === agentId);
-    const promptDefinitionTokens = Number(event?.data?.promptDefinitionTokens ?? 0);
-    const promptDefinitionChars = Number(event?.data?.promptDefinitionChars ?? 0);
+    const definitionTokens = Number(event?.data?.definitionTokens ?? 0);
+    const renderedPromptTokens = Number(event?.data?.renderedPromptTokens ?? 0);
+    const renderedPromptChars = Number(event?.data?.renderedPromptChars ?? 0);
     return {
+      mode: cacheHits.length > 0 ? 'cache_hit' : 'generated',
+      patternIds: cacheHits,
       cacheHits,
-      promptDefinitionTokens,
-      promptDefinitionChars,
+      definitionTokens,
+      renderedPromptTokens,
+      renderedPromptChars,
     };
   }
 

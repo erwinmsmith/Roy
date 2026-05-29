@@ -412,11 +412,15 @@ export class Roy {
         break;
 
       case '/prompt':
-        if (args && this.ctx) {
+        if (parts[1] === 'render') {
+          await this.renderPrompt(parts);
+        } else if (parts[1] === 'agent') {
+          await this.printAgentPrompt(parts[2] ?? 'roy');
+        } else if (args && this.ctx) {
           this.ctx.agent.addToMemory('meta', `System prompt: ${args}`);
           console.log('\n  ' + this.green('System prompt added to agent memory') + '\n');
         } else {
-          console.log('\n  Usage: /prompt <system instructions>' + '\n');
+          console.log('\n  Usage: /prompt agent <agentKey> | /prompt render <agentKey> --task "..." | /prompt <system instructions>' + '\n');
         }
         break;
 
@@ -463,11 +467,12 @@ export class Roy {
       /memory public <doc> Show project, context, decisions, constraints, glossary, or user
       /memory agent <key> Show agent memory, prompt, and context
       /memory proposals   Show pending memory update proposals
+      /memory show <id>   Show proposal content before accepting
       /memory signals     Show parsed memory signals from the current session
       /memory accept <id> Commit a memory proposal
       /memory reject <id> Reject a memory proposal
       /memory summarize   Generate memory proposals from the current session
-      /memory mode <mode> Set memory mode: suggest, auto, or off
+      /memory mode <mode> Set memory mode: suggest, auto-safe, or off
       /conversation       Show persisted conversation log
       /conversation sessions List persisted conversation sessions
       /conversation --session <id> Show a specific session
@@ -480,6 +485,7 @@ export class Roy {
       /agents --tree --tom Show agent tree with ToM profiles
       /spawn <type> "task" Spawn and run a controlled subagent
       /spawn <type> --parent <id> "task" Spawn below another agent
+      /spawn custom --name <name> [--role <role>] [--style <style>] "task"
       /run <agent-id> "task" Run an existing subagent
       /session            Show current session info
       /reset              Reset FSM to initial state
@@ -493,7 +499,8 @@ export class Roy {
     ${this.bold('Configuration')}
       /api                Show API information
       /config             Show runtime configuration
-      /prompt <text>      Add system prompt to agent memory
+      /prompt agent <key> Show raw agent prompt.md
+      /prompt render <key> --task "..." Render final system prompt preview
       /color              Toggle color output
 
     ${this.bold('Exit')}
@@ -776,6 +783,11 @@ export class Roy {
       return;
     }
 
+    if (scope === 'show') {
+      await this.printMemoryProposal(key);
+      return;
+    }
+
     if (scope === 'signals') {
       await this.printMemorySignals();
       return;
@@ -788,6 +800,7 @@ export class Roy {
       console.log(`    Skipped duplicates: ${this.cyan(String(summary.skippedDuplicates))}`);
       console.log(`    Pending proposals: ${this.cyan(String(summary.pendingProposals))}`);
       console.log(`    Already committed: ${this.cyan(String(summary.alreadyCommitted))}`);
+      console.log(`    Updated pending proposals: ${this.cyan(String(summary.updatedPendingProposals))}`);
       console.log('');
       return;
     }
@@ -835,8 +848,8 @@ export class Roy {
         console.log('\n  Memory mode: ' + this.cyan(await runtime.getMemoryMode()) + '\n');
         return;
       }
-      if (!['suggest', 'auto', 'off'].includes(key)) {
-        console.log('\n  Usage: /memory mode <suggest|auto|off>\n');
+      if (!['suggest', 'auto-safe', 'off'].includes(key)) {
+        console.log('\n  Usage: /memory mode <suggest|auto-safe|off>\n');
         return;
       }
       await runtime.setMemoryMode(key as any);
@@ -849,7 +862,7 @@ export class Roy {
       return;
     }
 
-    console.log('\n  Usage: /memory [status|public|agent|proposals|signals|summarize|accept|reject|updates|mode]\n');
+    console.log('\n  Usage: /memory [status|public|agent|proposals|show|signals|summarize|accept|reject|updates|mode]\n');
   }
 
   private async printMemoryStatus(): Promise<void> {
@@ -935,6 +948,30 @@ export class Roy {
       console.log(`     confidence: ${proposal.confidence}`);
       console.log(`     reason: ${proposal.reason}`);
     });
+    console.log('');
+  }
+
+  private async printMemoryProposal(id?: string): Promise<void> {
+    if (!id) {
+      console.log('\n  Usage: /memory show <proposalId>\n');
+      return;
+    }
+    const proposal = await runtime.getMemoryProposal(id);
+    console.log('\n  ' + this.bold(`Memory Proposal: ${id}`));
+    if (!proposal) {
+      console.log('    ' + this.dim('No proposal found.'));
+      console.log('');
+      return;
+    }
+    console.log(`    status:     ${proposal.status}`);
+    console.log(`    target:     ${path.relative(process.cwd(), proposal.target.path) || proposal.target.path}`);
+    console.log(`    section:    ${proposal.target.section ?? '-'}`);
+    console.log(`    operation:  ${proposal.operation}`);
+    console.log(`    risk:       ${proposal.risk}`);
+    console.log(`    confidence: ${proposal.confidence}`);
+    console.log(`    reason:     ${proposal.reason}`);
+    console.log('\n  ' + this.bold('Content:'));
+    console.log(String(proposal.content).trim() ? String(proposal.content).trim() : this.dim('No content'));
     console.log('');
   }
 
@@ -1038,6 +1075,38 @@ export class Roy {
     console.log('');
   }
 
+  private async printAgentPrompt(agentKey: string): Promise<void> {
+    const prompt = await runtime.readAgentMemoryDoc(agentKey, 'prompt');
+    console.log('\n  ' + this.bold(`Prompt: ${agentKey}`));
+    console.log(this.dim('  ' + '-'.repeat(58)));
+    console.log(prompt.trim() ? prompt.trim() : this.dim('No prompt.md content'));
+    console.log('');
+  }
+
+  private async renderPrompt(parts: string[]): Promise<void> {
+    const agentKey = parts[2] ?? 'roy';
+    const name = this.optionValue(parts, '--name');
+    const role = this.optionValue(parts, '--role');
+    const parentId = this.optionValue(parts, '--parent');
+    const task = this.optionValue(parts, '--task') ?? this.trailingTask(parts, 3);
+    const rendered = await runtime.renderAgentPrompt({
+      agentKey,
+      name,
+      role,
+      parentId,
+      task,
+      archetype: ['researcher', 'critic', 'planner', 'coder', 'summarizer', 'tester', 'custom'].includes(agentKey)
+        ? agentKey as any
+        : undefined,
+    });
+    console.log('\n  ' + this.bold(`Rendered Prompt: ${agentKey}`));
+    console.log(`    estimated tokens: ${this.cyan(String(rendered.estimatedTokens))}`);
+    console.log('    sources: ' + this.dim(JSON.stringify(rendered.sources)));
+    console.log(this.dim('  ' + '-'.repeat(58)));
+    console.log(rendered.prompt.trim());
+    console.log('');
+  }
+
   private completer(line: string): [string[], string] {
     const commands = [
       '/help', '/h', '/clear', '/cls', '/reset', '/agents', '/spawn', '/run', '/exit', '/quit', '/q',
@@ -1065,18 +1134,16 @@ export class Roy {
 
   private async spawnAgent(parts: string[]): Promise<void> {
     const archetype = parts[1] as any;
-    const parentIndex = parts.indexOf('--parent');
     const quiet = parts.includes('--quiet');
-    const parentId = parentIndex >= 0 ? parts[parentIndex + 1] : undefined;
-    const taskParts = parts.slice(2).filter((part, index, list) => {
-      const originalIndex = index + 2;
-      return part !== '--quiet' && part !== '--parent' && parts[originalIndex - 1] !== '--parent';
-    });
-    const task = taskParts.join(' ');
+    const parentId = this.optionValue(parts, '--parent');
+    const name = this.optionValue(parts, '--name');
+    const customRole = this.optionValue(parts, '--role');
+    const customStyle = this.optionValue(parts, '--style');
+    const task = this.trailingTask(parts, 2);
     const allowed = ['researcher', 'critic', 'planner', 'coder', 'summarizer', 'tester', 'custom'];
 
-    if (!allowed.includes(archetype) || !task) {
-      console.log('\n  Usage: /spawn <researcher|critic|planner|coder|summarizer|tester|custom> "task"\n');
+    if (parts.includes('--help') || !allowed.includes(archetype) || !task) {
+      this.printSpawnUsage();
       return;
     }
 
@@ -1085,6 +1152,9 @@ export class Roy {
         archetype,
         task,
         parentId,
+        name,
+        customRole,
+        customStyle,
         requireRootSynthesis: true,
         showSubagentOutput: !quiet,
       });
@@ -1096,7 +1166,7 @@ export class Roy {
           console.log(`  ${this.green('[event]')} cache.hit ${patternId}`);
         }
       }
-      console.log(`  ${this.dim(`agent creation prompt: ${result.creationUsage.promptDefinitionTokens} estimated tokens (${result.creationUsage.promptDefinitionChars} chars, cache hits: ${result.creationUsage.cacheHits.length})`)}`);
+      console.log(`  ${this.dim(`agent creation: mode=${result.creationUsage.mode}, definition=${result.creationUsage.definitionTokens} tokens, rendered=${result.creationUsage.renderedPromptTokens} tokens (${result.creationUsage.renderedPromptChars} chars), cache hits=${result.creationUsage.cacheHits.length}`)}`);
       console.log(`  ${this.yellow('roy[root] delegating...')}`);
       console.log(`  ├─ ${this.yellow(`${result.agent.name}[subagent] thinking...`)}`);
       if (result.subagentResult.toolCalls.length > 0) {
@@ -1124,6 +1194,45 @@ export class Roy {
     } catch (error) {
       console.log('\n  ' + this.red('Spawn error:') + ' ' + (error instanceof Error ? error.message : String(error)) + '\n');
     }
+  }
+
+  private printSpawnUsage(): void {
+    console.log(`
+  Usage:
+    /spawn <researcher|critic|planner|coder|summarizer|tester> "task"
+    /spawn custom --name <agentName> [--role <role>] [--style <style>] "task"
+    /spawn <archetype> --parent <agentId> "task"
+
+  Examples:
+    /spawn researcher "Inspect the project structure"
+    /spawn critic --parent agent_researcher_001 "Review Researcher-1's report"
+    /spawn custom --name "Singer-1" --role "performer" "Write a short original song"
+
+  Notes:
+    - The first argument is an agent archetype, not an agent name.
+    - Custom names must be passed with --name.
+    - A cache hit reuses agent pattern/config, but still creates a new runtime agent instance.
+`);
+  }
+
+  private optionValue(parts: string[], option: string): string | undefined {
+    const index = parts.indexOf(option);
+    return index >= 0 ? parts[index + 1] : undefined;
+  }
+
+  private trailingTask(parts: string[], startIndex: number): string {
+    const optionsWithValues = new Set(['--parent', '--name', '--role', '--style', '--task']);
+    const taskParts: string[] = [];
+    for (let index = startIndex; index < parts.length; index += 1) {
+      const part = parts[index];
+      if (part === '--quiet' || part === '--help') continue;
+      if (optionsWithValues.has(part)) {
+        index += 1;
+        continue;
+      }
+      taskParts.push(part);
+    }
+    return taskParts.join(' ');
   }
 
   private async printMessages(parts: string[]): Promise<void> {
