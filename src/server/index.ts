@@ -303,7 +303,20 @@ async function main(): Promise<void> {
   });
 
   app.get('/v1/events', (req, res) => {
-    res.json(runtime.getEvents());
+    const agentId = typeof req.query.agentId === 'string' ? req.query.agentId : undefined;
+    const type = typeof req.query.type === 'string' ? req.query.type : undefined;
+    const limit = req.query.limit ? Number(req.query.limit) : 50;
+    const events = runtime.getEvents()
+      .filter(event => !agentId || event.agentId === agentId)
+      .filter(event => !type || event.type === type)
+      .slice(-(Number.isFinite(limit) && limit > 0 ? limit : 50));
+    res.json(events);
+  });
+
+  app.get('/v1/messages', async (req, res) => {
+    const correlationId = typeof req.query.correlationId === 'string' ? req.query.correlationId : undefined;
+    const limit = req.query.limit ? Number(req.query.limit) : 50;
+    res.json(await runtime.getMessages({ correlationId, limit: Number.isFinite(limit) && limit > 0 ? limit : 50 }));
   });
 
   app.get('/v1/queue', async (req, res) => {
@@ -317,6 +330,15 @@ async function main(): Promise<void> {
 
   app.get('/v1/memory/root', async (req, res) => {
     res.json(await runtime.loadRootMemoryContext());
+  });
+
+  app.get('/v1/traces', async (req, res) => {
+    res.json(await runtime.listTraces());
+  });
+
+  app.get('/v1/traces/latest', async (req, res) => {
+    const limit = req.query.limit ? Number(req.query.limit) : 50;
+    res.json(await runtime.readTrace('latest', Number.isFinite(limit) && limit > 0 ? limit : 50));
   });
 
   app.get('/v1/conversation', async (req, res) => {

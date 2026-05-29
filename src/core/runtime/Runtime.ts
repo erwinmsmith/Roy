@@ -464,6 +464,16 @@ export class Runtime {
     return ctx.memory.loadRootContext();
   }
 
+  async listTraces(): Promise<Array<{ name: string; path: string; size: number; updatedAt: number }>> {
+    const ctx = this.getContext();
+    return ctx.memory.listTraces();
+  }
+
+  async readTrace(name = 'latest', limit = 50): Promise<RuntimeEvent[]> {
+    const ctx = this.getContext();
+    return ctx.memory.readTrace(name, limit);
+  }
+
   async recordConversation(entry: Omit<ConversationEntry, 'id' | 'timestamp' | 'sessionId'> & { sessionId?: string }): Promise<ConversationEntry> {
     const ctx = this.getContext();
     return ctx.memory.appendConversation({
@@ -506,7 +516,7 @@ export class Runtime {
       kind: 'user.command.spawn',
       sessionId: ctx.sessionId,
       from: 'cli',
-      to: 'root',
+      to: parentId,
       correlationId,
       payload,
       metadata: { agentId: 'root' },
@@ -536,7 +546,7 @@ export class Runtime {
     const taskMessage = await this.enqueueMessage({
       kind: 'agent.task',
       sessionId: ctx.sessionId,
-      from: 'root',
+      from: parentId,
       to: agent.identity.id,
       correlationId,
       parentMessageId: command.id,
@@ -562,7 +572,7 @@ export class Runtime {
       kind: 'agent.result',
       sessionId: ctx.sessionId,
       from: agent.identity.id,
-      to: 'root',
+      to: parentId,
       correlationId,
       parentMessageId: taskMessage.id,
       payload: subagentResult,
@@ -571,9 +581,23 @@ export class Runtime {
         tomLevel: agent.identity.tomProfile.level,
       },
     });
+    await this.recordConversation({
+      role: 'agent',
+      speaker: agent.identity.name,
+      content: subagentResult.result,
+      correlationId,
+      metadata: {
+        kind: 'agent.result',
+        agentId: agent.identity.id,
+        parentId,
+        grounded: subagentResult.grounded,
+        warnings: subagentResult.warnings,
+        toolCalls: subagentResult.toolCalls.map(call => call.toolName),
+      },
+    });
     await this.processQueuedMessage(resultMessage.id);
     await ctx.queue.ack(resultMessage.id);
-    this.emit({ type: 'agent.result.sent', agentId: agent.identity.id, data: { correlationId, to: 'root' } });
+    this.emit({ type: 'agent.result.sent', agentId: agent.identity.id, data: { correlationId, to: parentId } });
 
     const finalResponse = requireRootSynthesis
       ? await this.synthesizeSubagentResult(payload.task, agent, subagentResult, correlationId, resultMessage.id)
@@ -616,6 +640,11 @@ export class Runtime {
     if (!this.isValidArchetype(spec.archetype)) {
       throw new Error(`Unsupported subagent archetype "${spec.archetype}"`);
     }
+    await ctx.memory.ensureAgentMemory(spec.archetype, {
+      name: this.capitalize(spec.archetype),
+      role: spec.archetype,
+      description: `Reusable ${spec.archetype} agent archetype memory.`,
+    });
     if (!spec.description.trim()) {
       throw new Error('Subagent description is required');
     }

@@ -18,13 +18,15 @@ describe('Workspace memory initialization', () => {
     const state = await runtime.getMemoryState();
     expect(state.initialized).toBe(true);
     expect(state.rootPath).toBe(path.join(workspaceCwd, '.roy'));
-    expect(state.memoryDocs.map(doc => doc.name)).toContain('root.md');
-    expect(state.memoryDocs.map(doc => doc.name)).toContain('project.md');
+    expect(state.publicMemoryDocs.map(doc => doc.name)).toContain('public.md');
+    expect(state.publicMemoryDocs.map(doc => doc.name)).toContain('project.md');
+    expect(state.agentMemories.map(memory => memory.id)).toContain('roy');
+    expect(state.agentMemories.find(memory => memory.id === 'roy')?.docs.map(doc => doc.name)).toContain('memory.md');
     expect(state.patterns).toEqual({ agents: 0, teams: 0, delegations: 0 });
     expect(state.queuePath).toBe(path.join(workspaceCwd, '.roy', 'queue'));
 
     const context = await runtime.loadRootMemoryContext();
-    expect(context.rootMemory).toContain('# Roy Root Memory');
+    expect(context.rootMemory).toContain('# Agent Memory');
     expect(context.projectMemory).toContain('# Project Context');
 
     runtime.emit({ type: 'turn.started', agentId: 'root', data: { turnId: 'turn_test' } });
@@ -36,6 +38,8 @@ describe('Workspace memory initialization', () => {
     const traceFile = traceFiles.find(file => file.endsWith('.memory-test.jsonl'))!;
     const traceContent = await readFile(path.join(workspaceCwd, '.roy', 'traces', traceFile), 'utf8');
     expect(traceContent).toContain('turn.started');
+    expect((await runtime.listTraces()).length).toBe(1);
+    expect((await runtime.readTrace('latest')).map(event => event.type)).toContain('turn.started');
 
     await runtime.shutdown();
   });

@@ -350,7 +350,7 @@ export class Roy {
         break;
 
       case '/events':
-        this.printEvents();
+        this.printEvents(parts);
         break;
 
       case '/queue':
@@ -359,6 +359,10 @@ export class Roy {
 
       case '/messages':
         await this.printMessages(parts);
+        break;
+
+      case '/traces':
+        await this.printTraces(parts);
         break;
 
       case '/config':
@@ -437,6 +441,8 @@ export class Roy {
     ${this.bold('Chat & History')}
       /clear, /cls        Clear (note: history managed by agent)
       /context            Show conversation context from memory
+      /traces             Show persisted trace files
+      /traces latest      Show latest persisted trace events
 
     ${this.bold('System Information')}
       /help, /h           Show this help message
@@ -447,6 +453,9 @@ export class Roy {
       /budget set <n>     Set token budget
       /budget unlimited   Remove token budget limit
       /events             Show recent runtime events
+      /events --agent <id> Filter events by agent
+      /events --type <type> Filter events by event type
+      /events --latest <n> Show latest N events
       /queue              Show runtime message queue state
       /messages --correlation <id> Show messages for a delegation chain
       /memory             Show workspace memory state
@@ -462,6 +471,7 @@ export class Roy {
       /agents --tree      Show agent parent-child tree
       /agents --tree --tom Show agent tree with ToM profiles
       /spawn <type> "task" Spawn and run a controlled subagent
+      /spawn <type> --parent <id> "task" Spawn below another agent
       /run <agent-id> "task" Run an existing subagent
       /session            Show current session info
       /reset              Reset FSM to initial state
@@ -590,14 +600,54 @@ export class Roy {
     this.printBudget();
   }
 
-  private printEvents(): void {
-    const events = runtime.getEvents().slice(-10);
-    console.log('\n  ' + this.bold('Recent Events'));
+  private printEvents(parts: string[] = []): void {
+    const agentIndex = parts.indexOf('--agent');
+    const typeIndex = parts.indexOf('--type');
+    const latestIndex = parts.indexOf('--latest');
+    const agentId = agentIndex >= 0 ? parts[agentIndex + 1] : undefined;
+    const eventType = typeIndex >= 0 ? parts[typeIndex + 1] : undefined;
+    const latest = latestIndex >= 0 ? Number(parts[latestIndex + 1]) : 10;
+    const limit = Number.isFinite(latest) && latest > 0 ? latest : 10;
+    const events = runtime.getEvents()
+      .filter(event => !agentId || event.agentId === agentId)
+      .filter(event => !eventType || event.type === eventType)
+      .slice(-limit);
+    const label = agentId ? `Events for ${agentId}` : eventType ? `Events: ${eventType}` : 'Recent Events';
+    console.log('\n  ' + this.bold(label));
     if (events.length === 0) {
       console.log('    ' + this.dim('No events'));
     } else {
       for (const event of events) {
         console.log(`    - ${this.dim(new Date(event.timestamp).toISOString())} ${this.cyan(event.type)}${event.agentId ? ' ' + event.agentId : ''}`);
+      }
+    }
+    console.log('');
+  }
+
+  private async printTraces(parts: string[]): Promise<void> {
+    if (parts[1] === 'latest' || parts[1] === 'show') {
+      const name = parts[1] === 'show' ? parts[2] ?? 'latest' : 'latest';
+      const limit = Number(parts[3] ?? 30);
+      const events = await runtime.readTrace(name, Number.isFinite(limit) && limit > 0 ? limit : 30);
+      console.log('\n  ' + this.bold(`Trace: ${name}`));
+      if (events.length === 0) {
+        console.log('    ' + this.dim('No trace events'));
+      } else {
+        for (const event of events) {
+          console.log(`    - ${this.dim(new Date(event.timestamp).toISOString())} ${this.cyan(event.type)}${event.agentId ? ' ' + event.agentId : ''}`);
+        }
+      }
+      console.log('');
+      return;
+    }
+
+    const traces = await runtime.listTraces();
+    console.log('\n  ' + this.bold('Traces'));
+    if (traces.length === 0) {
+      console.log('    ' + this.dim('No persisted traces'));
+    } else {
+      for (const trace of traces) {
+        console.log(`    - ${this.cyan(trace.name)} ${this.dim(`${trace.size} bytes`)} ${this.dim(new Date(trace.updatedAt).toISOString())}`);
       }
     }
     console.log('');
@@ -713,15 +763,23 @@ export class Roy {
     const state = await runtime.getMemoryState();
     console.log('\n  ' + this.bold('Workspace Memory'));
     console.log(`    Path:      ${this.cyan(path.relative(process.cwd(), state.rootPath) || state.rootPath)}`);
-    console.log(`    Docs:      ${state.memoryDocs.length}`);
+    console.log(`    Public:    ${state.publicMemoryDocs.length} docs`);
+    console.log(`    Agents:    ${state.agentMemories.length} memories`);
     console.log(`    Traces:    ${state.traces}`);
     console.log(`    Queue:     ${path.relative(process.cwd(), state.queuePath) || state.queuePath}`);
     console.log(`    Patterns:  ${state.patterns.agents} agents, ${state.patterns.teams} teams, ${state.patterns.delegations} delegations`);
 
-    if (state.memoryDocs.length > 0) {
-      console.log('\n  ' + this.bold('Docs:'));
-      for (const doc of state.memoryDocs) {
+    if (state.publicMemoryDocs.length > 0) {
+      console.log('\n  ' + this.bold('Public Memory:'));
+      for (const doc of state.publicMemoryDocs) {
         console.log(`    - ${doc.name.padEnd(16)} ${doc.size} bytes`);
+      }
+    }
+
+    if (state.agentMemories.length > 0) {
+      console.log('\n  ' + this.bold('Agent Memories:'));
+      for (const agent of state.agentMemories) {
+        console.log(`    - ${this.cyan(agent.id)} ${this.dim(`${agent.docs.length} docs`)}`);
       }
     }
 
@@ -801,7 +859,7 @@ export class Roy {
     const commands = [
       '/help', '/h', '/clear', '/cls', '/reset', '/agents', '/spawn', '/run', '/exit', '/quit', '/q',
       '/api', '/status', '/skills', '/actions', '/tools', '/memory', '/session',
-      '/system', '/fsm', '/budget', '/events', '/queue', '/messages', '/config', '/prompt', '/context', '/conversation', '/verbose', '/color'
+      '/system', '/fsm', '/budget', '/events', '/queue', '/messages', '/traces', '/config', '/prompt', '/context', '/conversation', '/verbose', '/color'
     ];
 
     if (line.startsWith('/')) {
@@ -824,7 +882,14 @@ export class Roy {
 
   private async spawnAgent(parts: string[]): Promise<void> {
     const archetype = parts[1] as any;
-    const task = parts.slice(2).join(' ');
+    const parentIndex = parts.indexOf('--parent');
+    const quiet = parts.includes('--quiet');
+    const parentId = parentIndex >= 0 ? parts[parentIndex + 1] : undefined;
+    const taskParts = parts.slice(2).filter((part, index, list) => {
+      const originalIndex = index + 2;
+      return part !== '--quiet' && part !== '--parent' && parts[originalIndex - 1] !== '--parent';
+    });
+    const task = taskParts.join(' ');
     const allowed = ['researcher', 'critic', 'planner', 'coder', 'summarizer', 'tester', 'custom'];
 
     if (!allowed.includes(archetype) || !task) {
@@ -836,11 +901,12 @@ export class Roy {
       const result = await runtime.handleSpawnCommand({
         archetype,
         task,
+        parentId,
         requireRootSynthesis: true,
-        showSubagentOutput: this.verboseMode,
+        showSubagentOutput: !quiet,
       });
       console.log(`\n  ${this.green('[event]')} message chain: ${result.correlationId}`);
-      console.log(`  ${this.green('[event]')} agent.spawned: ${result.agent.identity.id} ${result.agent.name} parent=root`);
+      console.log(`  ${this.green('[event]')} agent.spawned: ${result.agent.identity.id} ${result.agent.name} parent=${result.agent.identity.parentId ?? 'root'}`);
       console.log(`  ${this.yellow(`${result.agent.name}[subagent] thinking...`)}`);
       if (result.subagentResult.toolCalls.length > 0) {
         for (const call of result.subagentResult.toolCalls) {
@@ -848,7 +914,7 @@ export class Roy {
         }
       }
       console.log(`  ${this.green(`${result.agent.name}[subagent] completed.`)}`);
-      if (this.verboseMode && result.subagentResult.result) {
+      if (!quiet && result.subagentResult.result) {
         console.log('\n  ' + this.dim(`${result.agent.name}[subagent] report:`));
         console.log(this.dim(result.subagentResult.result));
       }

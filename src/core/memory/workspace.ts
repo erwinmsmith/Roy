@@ -18,6 +18,12 @@ export interface WorkspaceMemoryState {
   rootPath: string;
   initialized: boolean;
   memoryDocs: MemoryDocState[];
+  publicMemoryDocs: MemoryDocState[];
+  agentMemories: Array<{
+    id: string;
+    path: string;
+    docs: MemoryDocState[];
+  }>;
   patterns: PatternCacheState;
   traces: number;
   queuePath: string;
@@ -58,25 +64,13 @@ interface PatternFile {
 }
 
 const MEMORY_TEMPLATES: Record<string, string> = {
-  'root.md': `# Roy Root Memory
+  'public.md': `# Public Workspace Memory
 
-This document stores persistent context for Roy, the root agent.
+This document stores shared context visible to Roy, subagents, teams, and the user.
 
-## Current Project
+## Shared Facts
 
-<!-- Roy may summarize the project here. -->
-
-## Long-term Goals
-
-<!-- Persistent goals go here. -->
-
-## Important Constraints
-
-<!-- Constraints that should affect future reasoning. -->
-
-## Recent Stable Decisions
-
-<!-- Decisions that should be reused across sessions. -->
+## Shared Constraints
 `,
   'project.md': `# Project Context
 
@@ -93,6 +87,32 @@ This document stores persistent context for Roy, the root agent.
 ## Known Issues
 
 ## Open Questions
+`,
+};
+
+const AGENT_MEMORY_TEMPLATES: Record<string, string> = {
+  'memory.md': `# Agent Memory
+
+## Stable Lessons
+
+<!-- ROY:BEGIN:stable-lessons -->
+<!-- ROY:END:stable-lessons -->
+
+## Failure Cases
+
+<!-- ROY:BEGIN:failure-cases -->
+<!-- ROY:END:failure-cases -->
+
+## Tool Policy
+
+<!-- ROY:BEGIN:tool-policy -->
+<!-- ROY:END:tool-policy -->
+`,
+  'context.md': `# Agent Context
+
+## Current Role
+
+## Reusable Context
 `,
   'user.md': `# User Context
 
@@ -133,7 +153,7 @@ export class WorkspaceMemoryManager {
   async initWorkspace(cwd: string, sessionId: string): Promise<WorkspaceMemoryState> {
     this.rootPath = path.join(cwd, '.roy');
     const memoryPath = path.join(this.rootPath, 'memory');
-    const agentsRootPath = path.join(this.rootPath, 'agents', 'root');
+    const agentsRoyPath = path.join(this.rootPath, 'agents', 'roy');
     const teamsPath = path.join(this.rootPath, 'teams');
     const tracesPath = path.join(this.rootPath, 'traces');
     const cachePath = path.join(this.rootPath, 'cache');
@@ -143,7 +163,7 @@ export class WorkspaceMemoryManager {
 
     await Promise.all([
       mkdir(memoryPath, { recursive: true }),
-      mkdir(agentsRootPath, { recursive: true }),
+      mkdir(agentsRoyPath, { recursive: true }),
       mkdir(teamsPath, { recursive: true }),
       mkdir(tracesPath, { recursive: true }),
       mkdir(cachePath, { recursive: true }),
@@ -155,25 +175,11 @@ export class WorkspaceMemoryManager {
       await this.writeIfMissing(path.join(memoryPath, fileName), content);
     }
 
-    await this.writeIfMissing(
-      path.join(agentsRootPath, 'identity.md'),
-      `# Roy Root Agent
-
-Roy is the root agent of the local autonomous agent runtime.
-`
-    );
-    await this.writeIfMissing(
-      path.join(agentsRootPath, 'memory.md'),
-      `# Roy Agent Memory
-
-<!-- ROY:BEGIN:auto-memory -->
-<!-- ROY:END:auto-memory -->
-`
-    );
-    await this.writeIfMissing(
-      path.join(agentsRootPath, 'state.json'),
-      JSON.stringify({ id: 'root', name: 'Roy', role: 'root', updatedAt: null }, null, 2) + '\n'
-    );
+    await this.ensureAgentMemory('roy', {
+      name: 'Roy',
+      role: 'root',
+      description: 'Root agent of the local autonomous agent runtime.',
+    });
 
     await this.writeIfMissing(path.join(cachePath, 'agent-patterns.json'), JSON.stringify({ patterns: [] }, null, 2) + '\n');
     await this.writeIfMissing(path.join(cachePath, 'team-patterns.json'), JSON.stringify({ patterns: [] }, null, 2) + '\n');
@@ -209,20 +215,25 @@ Roy is the root agent of the local autonomous agent runtime.
         rootPath: this.rootPath,
         initialized: false,
         memoryDocs: [],
+        publicMemoryDocs: [],
+        agentMemories: [],
         patterns: { agents: 0, teams: 0, delegations: 0 },
         traces: 0,
         queuePath: this.rootPath ? path.join(this.rootPath, 'queue') : '',
       };
     }
 
-    const memoryDocs = await this.listMemoryDocs();
+    const publicMemoryDocs = await this.listDocs(path.join(this.rootPath, 'memory'));
+    const agentMemories = await this.listAgentMemories();
     const patterns = await this.getPatternState();
     const traces = await this.countFiles(path.join(this.rootPath, 'traces'), '.jsonl');
 
     return {
       rootPath: this.rootPath,
       initialized: true,
-      memoryDocs,
+      memoryDocs: publicMemoryDocs,
+      publicMemoryDocs,
+      agentMemories,
       patterns,
       traces,
       queuePath: path.join(this.rootPath, 'queue'),
@@ -231,12 +242,13 @@ Roy is the root agent of the local autonomous agent runtime.
 
   async loadRootContext(): Promise<RootMemoryContext> {
     const memoryPath = path.join(this.rootPath, 'memory');
+    const royPath = path.join(this.rootPath, 'agents', 'roy');
     return {
-      rootMemory: await this.readOptional(path.join(memoryPath, 'root.md')),
+      rootMemory: await this.readOptional(path.join(royPath, 'memory.md')),
       projectMemory: await this.readOptional(path.join(memoryPath, 'project.md')),
-      constraints: await this.readOptional(path.join(memoryPath, 'constraints.md')),
-      decisions: await this.readOptional(path.join(memoryPath, 'decisions.md')),
-      glossary: await this.readOptional(path.join(memoryPath, 'glossary.md')),
+      constraints: await this.readOptional(path.join(royPath, 'constraints.md')),
+      decisions: await this.readOptional(path.join(royPath, 'decisions.md')),
+      glossary: await this.readOptional(path.join(royPath, 'glossary.md')),
       agentPatterns: await this.readPatterns('agent-patterns.json'),
       teamPatterns: await this.readPatterns('team-patterns.json'),
       delegationPatterns: await this.readPatterns('delegation-patterns.json'),
@@ -246,6 +258,72 @@ Roy is the root agent of the local autonomous agent runtime.
   async writeTrace(event: RuntimeEvent): Promise<void> {
     if (!this.initialized || !this.tracePath) return;
     await appendFile(this.tracePath, JSON.stringify(event) + '\n', 'utf8');
+  }
+
+  async ensureAgentMemory(agentKey: string, options: { name?: string; role?: string; description?: string } = {}): Promise<void> {
+    const safeKey = this.safeKey(agentKey);
+    const agentPath = path.join(this.rootPath, 'agents', safeKey);
+    await mkdir(agentPath, { recursive: true });
+
+    await this.writeIfMissing(
+      path.join(agentPath, 'identity.md'),
+      `# ${options.name ?? safeKey} Agent
+
+Role: ${options.role ?? safeKey}
+
+${options.description ?? 'Reusable agent archetype memory.'}
+`
+    );
+
+    for (const [fileName, content] of Object.entries(AGENT_MEMORY_TEMPLATES)) {
+      await this.writeIfMissing(path.join(agentPath, fileName), content);
+    }
+
+    await this.writeIfMissing(
+      path.join(agentPath, 'prompt.md'),
+      `# ${options.name ?? safeKey} Prompt Notes
+
+## System Prompt Guidance
+`
+    );
+    await this.writeIfMissing(
+      path.join(agentPath, 'state.json'),
+      JSON.stringify({ id: safeKey, name: options.name ?? safeKey, role: options.role ?? safeKey, updatedAt: null }, null, 2) + '\n'
+    );
+  }
+
+  async listTraces(): Promise<Array<{ name: string; path: string; size: number; updatedAt: number }>> {
+    const tracesPath = path.join(this.rootPath, 'traces');
+    const files = await readdir(tracesPath);
+    const traces = [];
+    for (const file of files.filter(item => item.endsWith('.jsonl')).sort()) {
+      const fullPath = path.join(tracesPath, file);
+      const fileStat = await stat(fullPath);
+      traces.push({ name: file, path: fullPath, size: fileStat.size, updatedAt: fileStat.mtimeMs });
+    }
+    return traces.sort((a, b) => b.updatedAt - a.updatedAt);
+  }
+
+  async readTrace(name: string, limit = 50): Promise<RuntimeEvent[]> {
+    const traces = await this.listTraces();
+    const selected = name === 'latest'
+      ? traces[0]
+      : traces.find(trace => trace.name === name);
+    if (!selected) return [];
+
+    const raw = await this.readOptional(selected.path);
+    if (!raw.trim()) return [];
+    const events = raw.trim().split('\n')
+      .map(line => {
+        try {
+          return JSON.parse(line) as RuntimeEvent;
+        } catch {
+          return undefined;
+        }
+      })
+      .filter((event): event is RuntimeEvent => event !== undefined);
+
+    return limit > 0 ? events.slice(-limit) : events;
   }
 
   async appendConversation(entry: Omit<ConversationEntry, 'id' | 'timestamp'>): Promise<ConversationEntry> {
@@ -340,16 +418,30 @@ Roy is the root agent of the local autonomous agent runtime.
     };
   }
 
-  private async listMemoryDocs(): Promise<MemoryDocState[]> {
-    const memoryPath = path.join(this.rootPath, 'memory');
-    const files = await readdir(memoryPath);
+  private async listDocs(directory: string): Promise<MemoryDocState[]> {
+    const files = await readdir(directory);
     const docs: MemoryDocState[] = [];
     for (const file of files.filter(item => item.endsWith('.md')).sort()) {
-      const fullPath = path.join(memoryPath, file);
+      const fullPath = path.join(directory, file);
       const fileStat = await stat(fullPath);
       docs.push({ name: file, path: fullPath, size: fileStat.size });
     }
     return docs;
+  }
+
+  private async listAgentMemories(): Promise<WorkspaceMemoryState['agentMemories']> {
+    const agentsPath = path.join(this.rootPath, 'agents');
+    const entries = await readdir(agentsPath, { withFileTypes: true });
+    const memories = [];
+    for (const entry of entries.filter(item => item.isDirectory()).sort((a, b) => a.name.localeCompare(b.name))) {
+      const agentPath = path.join(agentsPath, entry.name);
+      memories.push({
+        id: entry.name,
+        path: agentPath,
+        docs: await this.listDocs(agentPath),
+      });
+    }
+    return memories;
   }
 
   private async getPatternState(): Promise<PatternCacheState> {
@@ -449,6 +541,10 @@ Roy is the root agent of the local autonomous agent runtime.
 
   private safeTimestamp(date: Date): string {
     return date.toISOString().replace(/:/g, '-');
+  }
+
+  private safeKey(value: string): string {
+    return value.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'agent';
   }
 }
 
