@@ -221,6 +221,27 @@ async function main(): Promise<void> {
     res.json(runtime.getState().agents);
   });
 
+  app.get('/v1/agents/tree', (req, res) => {
+    res.json(runtime.getAgentTree());
+  });
+
+  app.post('/v1/agents', async (req, res) => {
+    try {
+      const body = req.body ?? {};
+      if (!body.parentId || !body.archetype || !body.description || typeof body.tomLevel !== 'number') {
+        res.status(400).json({
+          error: 'Expected body { parentId, archetype, tomLevel, description, name?, task?, tools?, budgetTokens?, systemPrompt? }',
+        });
+        return;
+      }
+
+      const agent = await runtime.spawnAgent(body);
+      res.status(201).json(agent);
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
   app.get('/v1/agents/:id', (req, res) => {
     const agent = runtime.getState().agents.find(item => item.identity.id === req.params.id);
     if (!agent) {
@@ -228,6 +249,22 @@ async function main(): Promise<void> {
       return;
     }
     res.json(agent);
+  });
+
+  app.post('/v1/agents/:id/run', async (req, res) => {
+    const task = req.body?.task;
+    if (typeof task !== 'string' || task.trim().length === 0) {
+      res.status(400).json({ error: 'Expected body { "task": non-empty string }' });
+      return;
+    }
+
+    try {
+      res.json(await runtime.runAgent(req.params.id, task));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const status = message.includes('not found') ? 404 : 400;
+      res.status(status).json({ error: message });
+    }
   });
 
   app.get('/v1/budget', (req, res) => {

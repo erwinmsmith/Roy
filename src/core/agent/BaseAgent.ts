@@ -10,7 +10,7 @@ import { buildPrompt } from '../prompts/builder.js';
 import { conversationalTemplate } from '../prompts/templates/conversational.js';
 import { logger } from '../utils/logger.js';
 
-export type AgentState = 'idle' | 'thinking' | 'calling_tool' | 'waiting' | 'done' | 'failed' | 'stopped';
+export type AgentState = 'idle' | 'thinking' | 'calling_tool' | 'synthesizing' | 'waiting' | 'done' | 'failed' | 'stopped';
 export type AgentRole = 'root' | 'subagent' | 'subteam';
 
 export interface AgentIdentity {
@@ -54,6 +54,12 @@ export interface AgentInfo {
   role: AgentRole;
   parentId?: string;
   usage: AgentUsage;
+  memoryMessages: number;
+  createdAt: number;
+  updatedAt: number;
+  lastTask?: string;
+  lastResult?: string;
+  error?: string;
 }
 
 /**
@@ -84,6 +90,11 @@ export abstract class BaseAgent {
   protected longTermMemory!: ReturnType<typeof memoryRegistry.getLongTerm>;
   protected actions: Map<string, Action> = new Map();
   protected tools: Map<string, Tool> = new Map();
+  protected createdAt: number = Date.now();
+  protected updatedAt: number = Date.now();
+  protected lastTask?: string;
+  protected lastResult?: string;
+  protected error?: string;
 
   constructor(config: AgentConfig) {
     this.id = config.id ?? (config.role === 'root' || !config.role ? 'root' : config.name);
@@ -121,6 +132,12 @@ export abstract class BaseAgent {
       role: this.role,
       parentId: this.parentId,
       usage: this.getUsage(),
+      memoryMessages: this.shortTermMemory.get(1000).length,
+      createdAt: this.createdAt,
+      updatedAt: this.updatedAt,
+      lastTask: this.lastTask,
+      lastResult: this.lastResult,
+      error: this.error,
     };
   }
 
@@ -148,6 +165,14 @@ export abstract class BaseAgent {
   }
 
   /**
+   * Update runtime-observable state from orchestration layers.
+   */
+  setRuntimeState(state: AgentState): void {
+    this.state = state;
+    this.updatedAt = Date.now();
+  }
+
+  /**
    * Get accumulated LLM usage for this agent.
    */
   getUsage(): AgentUsage {
@@ -164,6 +189,7 @@ export abstract class BaseAgent {
     this.usage.promptTokens += result.usage.promptTokens;
     this.usage.completionTokens += result.usage.completionTokens;
     this.usage.totalTokens += result.usage.totalTokens;
+    this.updatedAt = Date.now();
   }
 
   /**
@@ -224,6 +250,9 @@ export abstract class BaseAgent {
 
     return [
       `You are ${this.name}, a ${this.role} in the Roy autonomous agent runtime.`,
+      'You are not DeepSeek, Claude, OpenAI, Anthropic, or any model provider.',
+      'The model provider is only your inference backend.',
+      `Your parent agent is ${this.parentId ?? 'none'}.`,
       `Identity: id=${this.id}, parent=${this.parentId ?? 'none'}, generation=${this.generation}, ToM level=${this.tomLevel}.`,
     ].join('\n');
   }
@@ -304,6 +333,15 @@ export abstract class BaseAgent {
    */
   addToMemory(type: 'observation' | 'action' | 'result' | 'meta', content: string): void {
     this.shortTermMemory.add({ type, content });
+    this.updatedAt = Date.now();
+
+    if (type === 'observation') {
+      this.lastTask = content;
+    }
+    if (type === 'action' || type === 'result') {
+      this.lastResult = content;
+      this.error = content.startsWith('Error:') || content.startsWith('Action error:') ? content : undefined;
+    }
   }
 
   /**
@@ -333,6 +371,7 @@ export abstract class BaseAgent {
   async initialize(sessionId: string): Promise<void> {
     this.shortTermMemory = memoryRegistry.getShortTerm(this.name, sessionId);
     this.state = 'idle';
+    this.updatedAt = Date.now();
     logger.info(`Agent ${this.name} initialized for session ${sessionId}`);
   }
 
@@ -341,6 +380,7 @@ export abstract class BaseAgent {
    */
   async cleanup(): Promise<void> {
     this.state = 'stopped';
+    this.updatedAt = Date.now();
     logger.info(`Agent ${this.name} cleaned up`);
   }
 }

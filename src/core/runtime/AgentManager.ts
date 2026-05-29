@@ -16,6 +16,7 @@ interface Session {
 
 export class AgentManager {
   private agents: Map<string, BaseAgent> = new Map();
+  private agentIds: Map<string, string> = new Map();
   private sessions: Map<string, Session> = new Map();
   private defaultLlm?: LLMProvider;
   private interactWithEnv: string | null = null;
@@ -37,12 +38,22 @@ export class AgentManager {
       logger.warn(`Agent ${agent.name} already exists, overwriting`);
     }
     this.agents.set(agent.name, agent);
+    this.agentIds.set(agent.id, agent.name);
   }
 
   /**
    * Remove an agent
    */
   removeAgent(name: string): boolean {
+    const agent = this.agents.get(name);
+    if (!agent) return false;
+
+    for (const session of this.sessions.values()) {
+      session.messageQueue.removeReceiver(agent.name);
+      session.agents = session.agents.filter(item => item.name !== agent.name);
+    }
+
+    this.agentIds.delete(agent.id);
     return this.agents.delete(name);
   }
 
@@ -51,6 +62,28 @@ export class AgentManager {
    */
   getAgent(name: string): BaseAgent | undefined {
     return this.agents.get(name);
+  }
+
+  /**
+   * Get an agent by stable identity id.
+   */
+  getAgentById(id: string): BaseAgent | undefined {
+    const name = this.agentIds.get(id);
+    return name ? this.agents.get(name) : undefined;
+  }
+
+  /**
+   * Attach an agent to all existing sessions.
+   */
+  async attachAgentToSessions(agent: BaseAgent): Promise<void> {
+    for (const session of this.sessions.values()) {
+      session.messageQueue.addReceiver(agent.name);
+      agent.setMessageQueue(session.messageQueue);
+      await agent.initialize(session.id);
+      if (!session.agents.some(item => item.name === agent.name)) {
+        session.agents.push(agent);
+      }
+    }
   }
 
   /**
@@ -214,6 +247,7 @@ export class AgentManager {
       await this.closeSession(sessionId);
     }
     this.agents.clear();
+    this.agentIds.clear();
     logger.info('AgentManager cleaned up');
   }
 }

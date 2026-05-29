@@ -276,7 +276,7 @@ export class Roy {
         }
 
         if (trimmed.startsWith('/')) {
-          const shouldContinue = await this.handleCommand(trimmed.toLowerCase());
+          const shouldContinue = await this.handleCommand(trimmed);
           if (shouldContinue !== false) {
             prompt();
           }
@@ -300,8 +300,8 @@ export class Roy {
   }
 
   private async handleCommand(command: string): Promise<boolean | undefined> {
-    const parts = command.split(/\s+/);
-    const cmd = parts[0];
+    const parts = this.parseCommand(command);
+    const cmd = parts[0]?.toLowerCase();
     const args = parts.slice(1).join(' ');
 
     switch (cmd) {
@@ -321,7 +321,15 @@ export class Roy {
         break;
 
       case '/agents':
-        this.printAgents();
+        this.printAgents(parts.includes('--tree'));
+        break;
+
+      case '/spawn':
+        await this.spawnAgent(parts);
+        break;
+
+      case '/run':
+        await this.runAgent(parts);
         break;
 
       case '/exit':
@@ -427,6 +435,9 @@ export class Roy {
 
     ${this.bold('Agent Management')}
       /agents             List available agents
+      /agents --tree      Show agent parent-child tree
+      /spawn <type> "task" Spawn and run a controlled subagent
+      /run <agent-id> "task" Run an existing subagent
       /session            Show current session info
       /reset              Reset FSM to initial state
 
@@ -447,22 +458,41 @@ export class Roy {
 `);
   }
 
-  private printAgents(): void {
+  private printAgents(tree = false): void {
     if (!this.ctx) return;
 
+    if (tree) {
+      console.log('\n  ' + this.bold('Agent Tree:'));
+      this.printAgentTree(runtime.getAgentTree(), '    ', true);
+      console.log('');
+      return;
+    }
+
     const agents = this.ctx.manager.listAgentInfo();
-    console.log('\n  ' + this.bold('Available Agents:'));
+    console.log('\n  ' + this.bold('Agents:'));
     if (agents.length === 0) {
       console.log('    ' + this.dim('No agents registered'));
     } else {
       for (const agent of agents) {
         const isActive = agent.name === this.ctx.agent.name;
         const usage = agent.usage;
-        console.log(`    - ${this.cyan(agent.name)} ${this.dim(agent.role)} ${isActive ? this.green('[active]') : ''}`);
-        console.log(`      state=${agent.state}, tokens=${usage.totalTokens}, calls=${usage.llmCalls}`);
+        const parent = agent.identity.parentId ?? '-';
+        console.log(`    - ${this.cyan(agent.identity.id)} ${agent.name} ${this.dim(agent.role)} ${isActive ? this.green('[active]') : ''}`);
+        console.log(`      state=${agent.state}, tom=${agent.identity.tomLevel}, tokens=${usage.totalTokens}, calls=${usage.llmCalls}, parent=${parent}`);
       }
     }
     console.log('');
+  }
+
+  private printAgentTree(node: ReturnType<typeof runtime.getAgentTree>, prefix: string, isRoot = false): void {
+    const agent = node.agent;
+    const usage = agent.usage;
+    const label = `${agent.name} [${agent.role}, ToM-${agent.identity.tomLevel}, ${agent.state}, ${usage.totalTokens} tokens]`;
+    console.log(prefix + (isRoot ? '' : '└── ') + this.cyan(label));
+    const childPrefix = prefix + (isRoot ? '' : '    ');
+    for (let i = 0; i < node.children.length; i++) {
+      this.printAgentTree(node.children[i], childPrefix, false);
+    }
   }
 
   private printApiInfo(): void {
@@ -471,6 +501,9 @@ export class Roy {
     console.log('    GET  /health     - Health check');
     console.log('    GET  /v1/status  - Runtime status');
     console.log('    GET  /v1/agents  - Agent states');
+    console.log('    GET  /v1/agents/tree - Agent tree');
+    console.log('    POST /v1/agents  - Spawn subagent');
+    console.log('    POST /v1/agents/:id/run - Run subagent');
     console.log('    GET  /v1/budget  - Token budget');
     console.log('    GET  /v1/events  - Runtime events');
     console.log('    WS   /           - Socket.IO for real-time chat');
@@ -484,13 +517,18 @@ export class Roy {
     const budget = runtime.getBudgetState();
     console.log('\n  ' + this.bold('Budget'));
     if (budget.mode === 'unlimited') {
-      console.log('    Mode: unlimited');
-      console.log(`    Used: ${budget.usedTokens} tokens`);
+      console.log('    Budget: unlimited');
+      console.log(`    Session used: ${budget.usedTokens} tokens`);
     } else {
-      console.log(`    Used: ${budget.usedTokens} / ${budget.limitTokens} tokens`);
+      console.log(`    Budget: ${budget.usedTokens} / ${budget.limitTokens} tokens`);
       console.log(`    Remaining: ${budget.remainingTokens ?? 0} tokens`);
     }
     console.log('    Thinking Tokens: unavailable');
+    console.log('\n  ' + this.bold('Per Agent:'));
+    for (const agent of runtime.getState().agents) {
+      const total = budget.perAgent[agent.identity.id]?.totalTokens ?? 0;
+      console.log(`    ${agent.name.padEnd(18)} ${String(total).padStart(8)} tokens`);
+    }
     console.log('');
   }
 
@@ -661,7 +699,7 @@ export class Roy {
 
   private completer(line: string): [string[], string] {
     const commands = [
-      '/help', '/h', '/clear', '/cls', '/reset', '/agents', '/exit', '/quit', '/q',
+      '/help', '/h', '/clear', '/cls', '/reset', '/agents', '/spawn', '/run', '/exit', '/quit', '/q',
       '/api', '/status', '/skills', '/actions', '/tools', '/memory', '/session',
       '/system', '/fsm', '/budget', '/events', '/config', '/prompt', '/context', '/verbose', '/color'
     ];
@@ -672,6 +710,67 @@ export class Roy {
     }
 
     return [[], line];
+  }
+
+  private parseCommand(input: string): string[] {
+    const matches = input.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+    return matches.map(part => {
+      if ((part.startsWith('"') && part.endsWith('"')) || (part.startsWith("'") && part.endsWith("'"))) {
+        return part.slice(1, -1);
+      }
+      return part;
+    });
+  }
+
+  private async spawnAgent(parts: string[]): Promise<void> {
+    const archetype = parts[1] as any;
+    const task = parts.slice(2).join(' ');
+    const allowed = ['researcher', 'critic', 'planner', 'coder', 'summarizer', 'tester', 'custom'];
+
+    if (!allowed.includes(archetype) || !task) {
+      console.log('\n  Usage: /spawn <researcher|critic|planner|coder|summarizer|tester|custom> "task"\n');
+      return;
+    }
+
+    try {
+      const agent = await runtime.spawnAgent({
+        parentId: 'root',
+        archetype,
+        tomLevel: 2,
+        description: task,
+        task,
+      });
+      console.log(`\n  ${this.green('[event]')} agent.spawned: ${agent.identity.id} ${agent.name} parent=root`);
+      console.log(`  ${this.yellow(`${agent.name}[subagent] thinking...`)}\n`);
+      const result = await runtime.runAgent(agent.identity.id, task);
+      if (result.result) {
+        console.log('  ' + this.green(`${agent.name}[subagent] > `) + result.result);
+      }
+      console.log(`\n  ${this.green('roy[root] >')} Spawned ${agent.name} and completed the controlled subagent run.\n`);
+    } catch (error) {
+      console.log('\n  ' + this.red('Spawn error:') + ' ' + (error instanceof Error ? error.message : String(error)) + '\n');
+    }
+  }
+
+  private async runAgent(parts: string[]): Promise<void> {
+    const agentId = parts[1];
+    const task = parts.slice(2).join(' ');
+
+    if (!agentId || !task) {
+      console.log('\n  Usage: /run <agent-id> "task"\n');
+      return;
+    }
+
+    try {
+      console.log(`\n  ${this.yellow(`${agentId} thinking...`)}\n`);
+      const result = await runtime.runAgent(agentId, task);
+      if (result.result) {
+        console.log('  ' + this.green(`${result.agent.name}[subagent] > `) + result.result);
+      }
+      console.log(`\n  ${this.green('[event]')} agent.run.completed: ${agentId}, tokens=${result.usage.totalTokens}\n`);
+    } catch (error) {
+      console.log('\n  ' + this.red('Run error:') + ' ' + (error instanceof Error ? error.message : String(error)) + '\n');
+    }
   }
 
   private async processMessage(userInput: string): Promise<void> {

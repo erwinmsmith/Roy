@@ -21,6 +21,7 @@ export interface RuntimeConfig {
   fsmEnabled?: boolean;
   budget?: number;
   mode?: 'conversational' | 'action' | 'hybrid';
+  llmProvider?: LLMProvider;
 }
 
 export interface RuntimeContext {
@@ -68,6 +69,38 @@ export interface RuntimeState {
   budget: BudgetState;
 }
 
+export type SubAgentArchetype =
+  | 'researcher'
+  | 'critic'
+  | 'planner'
+  | 'coder'
+  | 'summarizer'
+  | 'tester'
+  | 'custom';
+
+export interface SpawnAgentSpec {
+  parentId: string;
+  name?: string;
+  archetype: SubAgentArchetype;
+  tomLevel: number;
+  description: string;
+  task?: string;
+  tools?: string[];
+  budgetTokens?: number;
+  systemPrompt?: string;
+}
+
+export interface AgentTreeNode {
+  agent: AgentInfo;
+  children: AgentTreeNode[];
+}
+
+export interface RunAgentResult {
+  agent: AgentInfo;
+  result: string;
+  usage: TokenUsage;
+}
+
 export class Runtime {
   private static instance: Runtime | null = null;
 
@@ -75,6 +108,7 @@ export class Runtime {
   private initialized = false;
   private events: RuntimeEvent[] = [];
   private perTurnUsage: TokenUsage[] = [];
+  private agentSequence = 0;
 
   static getInstance(): Runtime {
     if (!Runtime.instance) {
@@ -97,7 +131,7 @@ export class Runtime {
     logger.info('Runtime initializing...');
 
     // Create LLM provider
-    const llm = this.createLLMProvider();
+    const llm = options.llmProvider ?? this.createLLMProvider();
     if (llm) {
       logger.info(`LLM provider: ${llm.name}, model: ${llm.defaultModel}`);
     } else {
@@ -333,11 +367,198 @@ export class Runtime {
     return this.getBudgetState();
   }
 
+  async spawnAgent(spec: SpawnAgentSpec): Promise<AgentInfo> {
+    const ctx = this.getContext();
+    if (!this.isValidArchetype(spec.archetype)) {
+      throw new Error(`Unsupported subagent archetype "${spec.archetype}"`);
+    }
+    if (!spec.description.trim()) {
+      throw new Error('Subagent description is required');
+    }
+
+    const parent = ctx.manager.getAgentById(spec.parentId);
+    if (!parent) {
+      throw new Error(`Parent agent "${spec.parentId}" not found`);
+    }
+
+    const sequence = ++this.agentSequence;
+    const id = this.createAgentId(spec.archetype, sequence);
+    const name = spec.name ?? `${this.capitalize(spec.archetype)}-${sequence}`;
+    if (ctx.manager.getAgent(name)) {
+      throw new Error(`Agent name "${name}" already exists`);
+    }
+    const parentIdentity = parent.getIdentity();
+    const generation = parentIdentity.generation + 1;
+
+    const fsm = new FSM({
+      initialState: 'S_solo',
+      signalBus,
+      onTransition: (from, to) => {
+        logger.debug(`FSM transition for ${id}: ${from} -> ${to}`);
+        this.emit({ type: 'fsm.transition', agentId: id, data: { from, to } });
+      },
+      onStateChange: (state) => {
+        logger.debug(`FSM state for ${id}: ${state}`);
+        this.emit({ type: 'fsm.state.changed', agentId: id, data: { state } });
+      },
+    });
+
+    const goal = [
+      spec.systemPrompt,
+      `You are ${name}, a ${spec.archetype} subagent spawned by Roy.`,
+      `Your parent agent is ${parentIdentity.name}.`,
+      `Your scope: ${spec.description}`,
+      spec.task ? `Initial task: ${spec.task}` : undefined,
+    ].filter(Boolean).join('\n');
+
+    const agent = new UnifiedAgent({
+      id,
+      name,
+      role: 'subagent',
+      parentId: spec.parentId,
+      generation,
+      tomLevel: spec.tomLevel,
+      description: spec.description,
+      goal,
+      llm: ctx.llm ?? undefined,
+      fsm,
+      mode: 'hybrid',
+    });
+
+    this.registerCapabilities(agent);
+    ctx.manager.addAgent(agent);
+    await ctx.manager.attachAgentToSessions(agent);
+
+    const info = agent.getInfo();
+    this.emit({
+      type: 'agent.spawned',
+      agentId: id,
+      data: {
+        parentId: spec.parentId,
+        name,
+        archetype: spec.archetype,
+        tomLevel: spec.tomLevel,
+        description: spec.description,
+      },
+    });
+    this.emit({ type: 'agent.status.changed', agentId: id, data: { from: 'none', to: info.state } });
+    if (spec.budgetTokens !== undefined) {
+      this.emit({ type: 'budget.allocated', agentId: id, data: { budgetTokens: spec.budgetTokens } });
+    }
+
+    return info;
+  }
+
+  async runAgent(agentId: string, task: string): Promise<RunAgentResult> {
+    const ctx = this.getContext();
+    const agent = ctx.manager.getAgentById(agentId);
+    if (!agent) {
+      throw new Error(`Agent "${agentId}" not found`);
+    }
+
+    const session = ctx.manager.getSession(ctx.sessionId);
+    if (session) {
+      session.messageQueue.clear('env');
+    }
+
+    const usageBefore = agent.getUsage();
+    const from = agent.getState();
+    agent.setRuntimeState('thinking');
+    this.emit({ type: 'agent.run.started', agentId, data: { task } });
+    this.emit({ type: 'agent.status.changed', agentId, data: { from, to: 'thinking' } });
+
+    try {
+      this.emit({ type: 'agent.llm.called', agentId, data: { task } });
+      await agent.step(task);
+      agent.setRuntimeState('done');
+
+      const usageAfter = agent.getUsage();
+      const usageDelta = this.toTokenUsage({
+        llmCalls: usageAfter.llmCalls - usageBefore.llmCalls,
+        promptTokens: usageAfter.promptTokens - usageBefore.promptTokens,
+        completionTokens: usageAfter.completionTokens - usageBefore.completionTokens,
+        totalTokens: usageAfter.totalTokens - usageBefore.totalTokens,
+      });
+      this.recordTurnUsage(usageDelta);
+      this.emit({ type: 'budget.updated', agentId, data: { ...usageDelta } });
+      this.emit({ type: 'agent.status.changed', agentId, data: { from: 'thinking', to: 'done' } });
+
+      const result = session ? await this.drainAgentOutput(session.messageQueue, agent.name) : agent.getInfo().lastResult ?? '';
+      this.emit({ type: 'agent.run.completed', agentId, data: { task, totalTokens: usageDelta.totalTokens } });
+
+      return {
+        agent: agent.getInfo(),
+        result: result || agent.getInfo().lastResult || '',
+        usage: usageDelta,
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      agent.addToMemory('result', `Error: ${message}`);
+      agent.setRuntimeState('failed');
+      this.emit({ type: 'agent.status.changed', agentId, data: { from: 'thinking', to: 'failed' } });
+      this.emit({ type: 'agent.run.failed', agentId, data: { task, error: message } });
+      throw error;
+    }
+  }
+
+  getChildren(agentId: string): AgentInfo[] {
+    const ctx = this.getContext();
+    return ctx.manager.listAgentInfo()
+      .filter(agent => agent.identity.parentId === agentId);
+  }
+
+  getParent(agentId: string): AgentInfo | undefined {
+    const ctx = this.getContext();
+    const agent = ctx.manager.getAgentById(agentId);
+    const parentId = agent?.getIdentity().parentId;
+    return parentId ? ctx.manager.getAgentById(parentId)?.getInfo() : undefined;
+  }
+
+  getAgentTree(): AgentTreeNode {
+    const ctx = this.getContext();
+    const root = ctx.agent.getInfo();
+    return this.buildAgentTree(root);
+  }
+
   private toTokenUsage(usage: AgentUsage): TokenUsage {
     return {
       ...usage,
       thinkingTokens: null,
     };
+  }
+
+  private buildAgentTree(agent: AgentInfo): AgentTreeNode {
+    return {
+      agent,
+      children: this.getChildren(agent.identity.id).map(child => this.buildAgentTree(child)),
+    };
+  }
+
+  private createAgentId(archetype: SubAgentArchetype, sequence: number): string {
+    return `agent_${archetype}_${String(sequence).padStart(3, '0')}`;
+  }
+
+  private isValidArchetype(value: string): value is SubAgentArchetype {
+    return ['researcher', 'critic', 'planner', 'coder', 'summarizer', 'tester', 'custom'].includes(value);
+  }
+
+  private capitalize(value: string): string {
+    return value.charAt(0).toUpperCase() + value.slice(1);
+  }
+
+  private async drainAgentOutput(
+    queue: { isEmpty(recipient: string): boolean; receive(recipient: string): Promise<{ sender: string; content: unknown } | undefined> },
+    sender: string
+  ): Promise<string> {
+    const chunks: string[] = [];
+    while (!queue.isEmpty('env')) {
+      const message = await queue.receive('env');
+      if (!message) break;
+      if (message.sender === sender) {
+        chunks.push(String(message.content));
+      }
+    }
+    return chunks.join('');
   }
 }
 

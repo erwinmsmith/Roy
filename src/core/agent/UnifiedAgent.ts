@@ -35,6 +35,7 @@ export class UnifiedAgent extends BaseAgent {
 
   constructor(config: UnifiedAgentConfig) {
     super({
+      id: config.id,
       name: config.name,
       goal: config.goal,
       example: config.example,
@@ -42,6 +43,10 @@ export class UnifiedAgent extends BaseAgent {
       fsm: config.fsm,
       role: config.role,
       parentId: config.parentId,
+      teamId: config.teamId,
+      generation: config.generation,
+      tomLevel: config.tomLevel,
+      description: config.description,
     });
     this.mode = config.mode ?? 'hybrid';
     this.planner = config.planner;
@@ -453,6 +458,7 @@ Return a JSON object with:
   private async executeConversationalMode(messages: LLMMessage[]): Promise<void> {
     try {
       let fullResponse = '';
+      this.state = 'synthesizing';
 
       for await (const chunk of this.llm!.stream(messages)) {
         if (chunk.usage) {
