@@ -1,9 +1,12 @@
 export type MessageKind =
   | 'user.input'
+  | 'user.command.spawn'
   | 'agent.task'
   | 'agent.result'
   | 'agent.error'
   | 'agent.control'
+  | 'root.synthesis'
+  | 'root.final_response'
   | 'team.task'
   | 'team.result'
   | 'tool.call'
@@ -117,4 +120,3 @@ export interface MessageQueue {
   listMessages(filter?: MessageFilter): Promise<RuntimeMessage[]>;
   getStats(): Promise<QueueStats>;
 }
-

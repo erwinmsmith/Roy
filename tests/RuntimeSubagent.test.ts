@@ -84,4 +84,48 @@ describe('Runtime controlled subagent spawning', () => {
 
     await runtime.shutdown();
   });
+
+  it('runs controlled spawn through root-mediated messages and synthesis', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-mediated-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'mediated-spawn-test',
+      llmProvider: new EchoLLM(),
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+
+    const result = await runtime.handleSpawnCommand({
+      archetype: 'researcher',
+      task: 'Inspect the project structure',
+    });
+
+    expect(result.correlationId).toMatch(/^del_/);
+    expect(result.agent.identity.tomProfile.level).toBe(0);
+    expect(result.subagentResult.grounded).toBe(true);
+    expect(result.subagentResult.toolCalls.map(call => call.toolName)).toContain('fs.list');
+    expect(result.finalResponse).toBe('subagent result');
+
+    const messages = await runtime.getMessages({ correlationId: result.correlationId });
+    expect(messages.map(message => message.kind)).toEqual([
+      'user.command.spawn',
+      'agent.task',
+      'tool.call',
+      'tool.result',
+      'agent.result',
+      'root.synthesis',
+      'root.final_response',
+    ]);
+
+    const budget = runtime.getBudgetState();
+    expect(budget.perAgent.root.totalTokens).toBe(9);
+    expect(budget.perAgent[result.agent.identity.id].totalTokens).toBe(9);
+
+    const eventTypes = runtime.getEvents().map(event => event.type);
+    expect(eventTypes).toContain('root.synthesis.started');
+    expect(eventTypes).toContain('root.synthesis.completed');
+    expect(eventTypes).toContain('agent.result.sent');
+
+    await runtime.shutdown();
+  });
 });

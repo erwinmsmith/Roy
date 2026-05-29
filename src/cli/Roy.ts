@@ -325,7 +325,7 @@ export class Roy {
         break;
 
       case '/agents':
-        this.printAgents(parts.includes('--tree'));
+        this.printAgents(parts.includes('--tree'), parts.includes('--tom'));
         break;
 
       case '/spawn':
@@ -355,6 +355,10 @@ export class Roy {
 
       case '/queue':
         await this.printQueue();
+        break;
+
+      case '/messages':
+        await this.printMessages(parts);
         break;
 
       case '/config':
@@ -440,6 +444,7 @@ export class Roy {
       /budget unlimited   Remove token budget limit
       /events             Show recent runtime events
       /queue              Show runtime message queue state
+      /messages --correlation <id> Show messages for a delegation chain
       /memory             Show workspace memory state
       /memory <doc>       Show root, project, decisions, constraints, or glossary
       /verbose            Toggle verbose mode
@@ -447,6 +452,7 @@ export class Roy {
     ${this.bold('Agent Management')}
       /agents             List available agents
       /agents --tree      Show agent parent-child tree
+      /agents --tree --tom Show agent tree with ToM profiles
       /spawn <type> "task" Spawn and run a controlled subagent
       /run <agent-id> "task" Run an existing subagent
       /session            Show current session info
@@ -469,12 +475,12 @@ export class Roy {
 `);
   }
 
-  private printAgents(tree = false): void {
+  private printAgents(tree = false, showTom = false): void {
     if (!this.ctx) return;
 
     if (tree) {
       console.log('\n  ' + this.bold('Agent Tree:'));
-      this.printAgentTree(runtime.getAgentTree(), '    ', true);
+      this.printAgentTree(runtime.getAgentTree(), '    ', true, showTom);
       console.log('');
       return;
     }
@@ -490,19 +496,27 @@ export class Roy {
         const parent = agent.identity.parentId ?? '-';
         console.log(`    - ${this.cyan(agent.identity.id)} ${agent.name} ${this.dim(agent.role)} ${isActive ? this.green('[active]') : ''}`);
         console.log(`      state=${agent.state}, tom=${agent.identity.tomLevel}, tokens=${usage.totalTokens}, calls=${usage.llmCalls}, parent=${parent}`);
+        if (showTom) {
+          console.log(`      tomPurpose=${agent.identity.tomProfile.purpose}`);
+        }
       }
     }
     console.log('');
   }
 
-  private printAgentTree(node: ReturnType<typeof runtime.getAgentTree>, prefix: string, isRoot = false): void {
+  private printAgentTree(node: ReturnType<typeof runtime.getAgentTree>, prefix: string, isRoot = false, showTom = false): void {
     const agent = node.agent;
     const usage = agent.usage;
-    const label = `${agent.name} [${agent.role}, ToM-${agent.identity.tomLevel}, ${agent.state}, ${usage.totalTokens} tokens]`;
+    const label = `${agent.name} [${agent.role}, ToM-${agent.identity.tomProfile.level}, ${agent.state}, ${usage.totalTokens} tokens]`;
     console.log(prefix + (isRoot ? '' : '└── ') + this.cyan(label));
+    if (showTom) {
+      const modelTargets = agent.identity.tomProfile.models.map(model => model.targetId).join(', ') || 'none';
+      console.log(prefix + (isRoot ? '  ' : '    ') + this.dim(`purpose: ${agent.identity.tomProfile.purpose}`));
+      console.log(prefix + (isRoot ? '  ' : '    ') + this.dim(`models: ${modelTargets}`));
+    }
     const childPrefix = prefix + (isRoot ? '' : '    ');
     for (let i = 0; i < node.children.length; i++) {
-      this.printAgentTree(node.children[i], childPrefix, false);
+      this.printAgentTree(node.children[i], childPrefix, false, showTom);
     }
   }
 
@@ -779,7 +793,7 @@ export class Roy {
     const commands = [
       '/help', '/h', '/clear', '/cls', '/reset', '/agents', '/spawn', '/run', '/exit', '/quit', '/q',
       '/api', '/status', '/skills', '/actions', '/tools', '/memory', '/session',
-      '/system', '/fsm', '/budget', '/events', '/queue', '/config', '/prompt', '/context', '/verbose', '/color'
+      '/system', '/fsm', '/budget', '/events', '/queue', '/messages', '/config', '/prompt', '/context', '/verbose', '/color'
     ];
 
     if (line.startsWith('/')) {
@@ -811,23 +825,51 @@ export class Roy {
     }
 
     try {
-      const agent = await runtime.spawnAgent({
-        parentId: 'root',
+      const result = await runtime.handleSpawnCommand({
         archetype,
-        tomLevel: 2,
-        description: task,
         task,
+        requireRootSynthesis: true,
+        showSubagentOutput: this.verboseMode,
       });
-      console.log(`\n  ${this.green('[event]')} agent.spawned: ${agent.identity.id} ${agent.name} parent=root`);
-      console.log(`  ${this.yellow(`${agent.name}[subagent] thinking...`)}\n`);
-      const result = await runtime.runAgent(agent.identity.id, task);
-      if (result.result) {
-        console.log('  ' + this.green(`${agent.name}[subagent] > `) + result.result);
+      console.log(`\n  ${this.green('[event]')} message chain: ${result.correlationId}`);
+      console.log(`  ${this.green('[event]')} agent.spawned: ${result.agent.identity.id} ${result.agent.name} parent=root`);
+      console.log(`  ${this.yellow(`${result.agent.name}[subagent] thinking...`)}`);
+      if (result.subagentResult.toolCalls.length > 0) {
+        for (const call of result.subagentResult.toolCalls) {
+          console.log(`  ${this.dim(`[event] tool.call: ${result.agent.identity.id} -> ${call.toolName}`)}`);
+        }
       }
-      console.log(`\n  ${this.green('roy[root] >')} Spawned ${agent.name} and completed the controlled subagent run.\n`);
+      console.log(`  ${this.green(`${result.agent.name}[subagent] completed.`)}`);
+      if (this.verboseMode && result.subagentResult.result) {
+        console.log('\n  ' + this.dim(`${result.agent.name}[subagent] report:`));
+        console.log(this.dim(result.subagentResult.result));
+      }
+      if (result.subagentResult.warnings.length > 0) {
+        for (const warning of result.subagentResult.warnings) {
+          console.log(`  ${this.yellow('[warning]')} ${warning}`);
+        }
+      }
+      console.log(`  ${this.yellow('roy[root] synthesizing...')}\n`);
+      console.log('  ' + this.green('roy[root] > ') + result.finalResponse + '\n');
     } catch (error) {
       console.log('\n  ' + this.red('Spawn error:') + ' ' + (error instanceof Error ? error.message : String(error)) + '\n');
     }
+  }
+
+  private async printMessages(parts: string[]): Promise<void> {
+    const correlationIndex = parts.indexOf('--correlation');
+    const correlationId = correlationIndex >= 0 ? parts[correlationIndex + 1] : undefined;
+    const messages = await runtime.getMessages({ correlationId, limit: correlationId ? undefined : 20 });
+
+    console.log('\n  ' + this.bold(correlationId ? `Messages: ${correlationId}` : 'Recent Messages'));
+    if (messages.length === 0) {
+      console.log('    ' + this.dim('No messages'));
+    } else {
+      for (const message of messages) {
+        console.log(`    ${message.from} -> ${message.to}: ${this.cyan(message.kind)} ${this.dim(message.status)}`);
+      }
+    }
+    console.log('');
   }
 
   private async runAgent(parts: string[]): Promise<void> {

@@ -22,6 +22,27 @@ export interface AgentIdentity {
   generation: number;
   tomLevel: number;
   description?: string;
+  tomProfile: ToMProfile;
+}
+
+export interface ToMProfile {
+  level: 0 | 1 | 2 | 3;
+  subjectAgentId: string;
+  models: Array<{
+    targetId: string;
+    targetType: 'user' | 'agent' | 'team' | 'environment';
+    beliefModel?: string[];
+    goalModel?: string[];
+    intentModel?: string[];
+    uncertaintyModel?: string[];
+  }>;
+  recursiveModels?: Array<{
+    observerId: string;
+    targetId: string;
+    relation: string;
+    description: string;
+  }>;
+  purpose: string;
 }
 
 export interface AgentUsage {
@@ -44,6 +65,7 @@ export interface AgentConfig {
   generation?: number;
   tomLevel?: number;
   description?: string;
+  tomProfile?: ToMProfile;
 }
 
 export interface AgentInfo {
@@ -78,6 +100,7 @@ export abstract class BaseAgent {
   protected generation: number;
   protected tomLevel: number;
   protected description?: string;
+  protected tomProfile: ToMProfile;
   protected state: AgentState = 'idle';
   protected usage: AgentUsage = {
     llmCalls: 0,
@@ -109,6 +132,7 @@ export abstract class BaseAgent {
     this.generation = config.generation ?? (this.role === 'root' ? 0 : 1);
     this.tomLevel = config.tomLevel ?? (this.role === 'root' ? 1 : 1);
     this.description = config.description;
+    this.tomProfile = config.tomProfile ?? this.createDefaultToMProfile();
     this.shortTermMemory = memoryRegistry.getShortTerm(this.name, '');
     this.longTermMemory = memoryRegistry.getLongTerm(this.name);
   }
@@ -154,6 +178,32 @@ export abstract class BaseAgent {
       generation: this.generation,
       tomLevel: this.tomLevel,
       description: this.description,
+      tomProfile: this.tomProfile,
+    };
+  }
+
+  private createDefaultToMProfile(): ToMProfile {
+    if (this.role === 'root') {
+      return {
+        level: 1,
+        subjectAgentId: this.id,
+        models: [
+          {
+            targetId: 'user',
+            targetType: 'user',
+            goalModel: ['develop Roy into a Theory-of-Mind based multi-agent runtime'],
+            intentModel: ['validate controlled subagent spawning and message-mediated execution'],
+          },
+        ],
+        purpose: 'Understand user intent and decide how to answer or delegate.',
+      };
+    }
+
+    return {
+      level: 0,
+      subjectAgentId: this.id,
+      models: [],
+      purpose: this.description ?? 'Complete the assigned task within its local scope.',
     };
   }
 

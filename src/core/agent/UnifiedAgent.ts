@@ -47,6 +47,7 @@ export class UnifiedAgent extends BaseAgent {
       generation: config.generation,
       tomLevel: config.tomLevel,
       description: config.description,
+      tomProfile: config.tomProfile,
     });
     this.mode = config.mode ?? 'hybrid';
     this.planner = config.planner;

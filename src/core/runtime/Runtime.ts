@@ -1,6 +1,8 @@
 // Runtime - Lifecycle management and orchestration for Roy Agent System
 
 import 'dotenv/config';
+import { readdir, stat } from 'node:fs/promises';
+import path from 'node:path';
 import { config } from '../../config/index.js';
 import { logger } from '../utils/logger.js';
 import { configureLogging, shutdownLogging } from '../logging/index.js';
@@ -9,7 +11,7 @@ import { AgentManager } from './AgentManager.js';
 import { FSM } from '../executor/FSM.js';
 import { signalBus } from '../executor/SignalBus.js';
 import { UnifiedAgent } from '../agent/UnifiedAgent.js';
-import type { AgentInfo, AgentUsage } from '../agent/BaseAgent.js';
+import type { AgentInfo, AgentUsage, ToMProfile } from '../agent/BaseAgent.js';
 import { actionRegistry } from '../actions/index.js';
 import { toolRegistry } from '../tools/index.js';
 import { skillRegistry } from '../skills/index.js';
@@ -113,6 +115,33 @@ export interface RunAgentResult {
   agent: AgentInfo;
   result: string;
   usage: TokenUsage;
+  toolCalls: ToolCallRecord[];
+  grounded: boolean;
+  warnings: string[];
+}
+
+export interface ToolCallRecord {
+  toolName: string;
+  params: Record<string, unknown>;
+  result?: unknown;
+  success: boolean;
+}
+
+export interface SpawnCommandPayload {
+  archetype: SubAgentArchetype;
+  task: string;
+  parentId?: string;
+  name?: string;
+  requireRootSynthesis?: boolean;
+  showSubagentOutput?: boolean;
+}
+
+export interface RootMediatedSpawnResult {
+  correlationId: string;
+  agent: AgentInfo;
+  subagentResult: RunAgentResult;
+  finalResponse: string;
+  messages: RuntimeMessage[];
 }
 
 export class Runtime {
@@ -123,6 +152,7 @@ export class Runtime {
   private events: RuntimeEvent[] = [];
   private perTurnUsage: TokenUsage[] = [];
   private agentSequence = 0;
+  private delegationSequence = 0;
   private queue: MessageQueue | null = null;
   private scheduler: MessageScheduler | null = null;
   private memory: WorkspaceMemoryManager | null = null;
@@ -195,6 +225,7 @@ export class Runtime {
       role: 'root',
       generation: 0,
       tomLevel: 1,
+      tomProfile: this.createRootToMProfile(),
       description: 'Root agent of the Roy autonomous agent system',
       mode: options.mode ?? 'hybrid',
     });
@@ -415,6 +446,14 @@ export class Runtime {
     return { stats, recent };
   }
 
+  async getMessages(filter: { correlationId?: string; limit?: number } = {}): Promise<RuntimeMessage[]> {
+    const ctx = this.getContext();
+    const messages = await ctx.queue.listMessages({ limit: filter.limit });
+    return filter.correlationId
+      ? messages.filter(message => message.correlationId === filter.correlationId)
+      : messages;
+  }
+
   async getMemoryState(): Promise<WorkspaceMemoryState> {
     const ctx = this.getContext();
     return ctx.memory.getState();
@@ -425,7 +464,104 @@ export class Runtime {
     return ctx.memory.loadRootContext();
   }
 
-  async spawnAgent(spec: SpawnAgentSpec): Promise<AgentInfo> {
+  async handleSpawnCommand(payload: SpawnCommandPayload): Promise<RootMediatedSpawnResult> {
+    const ctx = this.getContext();
+    const correlationId = this.createCorrelationId();
+    const parentId = payload.parentId ?? 'root';
+    const requireRootSynthesis = payload.requireRootSynthesis ?? true;
+
+    const command = await this.enqueueMessage({
+      kind: 'user.command.spawn',
+      sessionId: ctx.sessionId,
+      from: 'cli',
+      to: 'root',
+      correlationId,
+      payload,
+      metadata: { agentId: 'root' },
+    });
+    await this.processQueuedMessage(command.id);
+    await ctx.queue.ack(command.id);
+
+    const tomProfile = this.createSubagentToMProfile(payload.archetype, '', payload.task);
+    const agent = await this.spawnAgent({
+      parentId,
+      name: payload.name,
+      archetype: payload.archetype,
+      tomLevel: tomProfile.level,
+      description: payload.task,
+      task: payload.task,
+      systemPrompt: undefined,
+      tomProfile,
+    });
+
+    const taskMessage = await this.enqueueMessage({
+      kind: 'agent.task',
+      sessionId: ctx.sessionId,
+      from: 'root',
+      to: agent.identity.id,
+      correlationId,
+      parentMessageId: command.id,
+      payload: {
+        task: payload.task,
+        archetype: payload.archetype,
+      },
+      metadata: {
+        agentId: agent.identity.id,
+        tomLevel: agent.identity.tomProfile.level,
+      },
+    });
+    await this.processQueuedMessage(taskMessage.id);
+
+    const subagentResult = await this.runAgent(agent.identity.id, payload.task, {
+      correlationId,
+      parentMessageId: taskMessage.id,
+      archetype: payload.archetype,
+    });
+    await ctx.queue.ack(taskMessage.id);
+
+    const resultMessage = await this.enqueueMessage({
+      kind: 'agent.result',
+      sessionId: ctx.sessionId,
+      from: agent.identity.id,
+      to: 'root',
+      correlationId,
+      parentMessageId: taskMessage.id,
+      payload: subagentResult,
+      metadata: {
+        agentId: agent.identity.id,
+        tomLevel: agent.identity.tomProfile.level,
+      },
+    });
+    await this.processQueuedMessage(resultMessage.id);
+    await ctx.queue.ack(resultMessage.id);
+    this.emit({ type: 'agent.result.sent', agentId: agent.identity.id, data: { correlationId, to: 'root' } });
+
+    const finalResponse = requireRootSynthesis
+      ? await this.synthesizeSubagentResult(payload.task, agent, subagentResult, correlationId, resultMessage.id)
+      : '[system] Subagent completed without root synthesis.';
+
+    const finalMessage = await this.enqueueMessage({
+      kind: 'root.final_response',
+      sessionId: ctx.sessionId,
+      from: 'root',
+      to: 'cli',
+      correlationId,
+      payload: { content: finalResponse },
+      metadata: { agentId: 'root' },
+    });
+    await this.processQueuedMessage(finalMessage.id);
+    await ctx.queue.ack(finalMessage.id);
+
+    return {
+      correlationId,
+      agent,
+      subagentResult,
+      finalResponse,
+      messages: await this.getMessages({ correlationId }),
+    };
+  }
+
+  async spawnAgent(spec: SpawnAgentSpec & { tomProfile?: ToMProfile }): Promise<AgentInfo> {
     const ctx = this.getContext();
     if (!this.isValidArchetype(spec.archetype)) {
       throw new Error(`Unsupported subagent archetype "${spec.archetype}"`);
@@ -476,6 +612,7 @@ export class Runtime {
       parentId: spec.parentId,
       generation,
       tomLevel: spec.tomLevel,
+      tomProfile: spec.tomProfile ? { ...spec.tomProfile, subjectAgentId: id } : undefined,
       description: spec.description,
       goal,
       llm: ctx.llm ?? undefined,
@@ -507,7 +644,11 @@ export class Runtime {
     return info;
   }
 
-  async runAgent(agentId: string, task: string): Promise<RunAgentResult> {
+  async runAgent(
+    agentId: string,
+    task: string,
+    options: { correlationId?: string; parentMessageId?: string; archetype?: SubAgentArchetype } = {}
+  ): Promise<RunAgentResult> {
     const ctx = this.getContext();
     const agent = ctx.manager.getAgentById(agentId);
     if (!agent) {
@@ -522,12 +663,13 @@ export class Runtime {
     const usageBefore = agent.getUsage();
     const from = agent.getState();
     agent.setRuntimeState('thinking');
-    this.emit({ type: 'agent.run.started', agentId, data: { task } });
+    this.emit({ type: 'agent.run.started', agentId, data: { task, correlationId: options.correlationId } });
     this.emit({ type: 'agent.status.changed', agentId, data: { from, to: 'thinking' } });
 
     try {
+      const grounding = await this.runGroundingCheck(agentId, task, options);
       this.emit({ type: 'agent.llm.called', agentId, data: { task } });
-      await agent.step(task);
+      await agent.step(this.buildGroundedTask(task, grounding));
       agent.setRuntimeState('done');
 
       const usageAfter = agent.getUsage();
@@ -542,12 +684,24 @@ export class Runtime {
       this.emit({ type: 'agent.status.changed', agentId, data: { from: 'thinking', to: 'done' } });
 
       const result = session ? await this.drainAgentOutput(session.messageQueue, agent.name) : agent.getInfo().lastResult ?? '';
-      this.emit({ type: 'agent.run.completed', agentId, data: { task, totalTokens: usageDelta.totalTokens } });
+      this.emit({
+        type: 'agent.run.completed',
+        agentId,
+        data: {
+          task,
+          totalTokens: usageDelta.totalTokens,
+          grounded: grounding.grounded,
+          warnings: grounding.warnings,
+        },
+      });
 
       return {
         agent: agent.getInfo(),
         result: result || agent.getInfo().lastResult || '',
         usage: usageDelta,
+        toolCalls: grounding.toolCalls,
+        grounded: grounding.grounded,
+        warnings: grounding.warnings,
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -585,6 +739,210 @@ export class Runtime {
     };
   }
 
+  private async processQueuedMessage(messageId: string): Promise<RuntimeMessage | undefined> {
+    const ctx = this.getContext();
+    const message = await ctx.queue.getMessage(messageId);
+    if (!message) return undefined;
+    return ctx.queue.dequeue({ to: message.to, kind: [message.kind], readyOnly: true });
+  }
+
+  private async synthesizeSubagentResult(
+    userTask: string,
+    agent: AgentInfo,
+    subagentResult: RunAgentResult,
+    correlationId: string,
+    parentMessageId: string
+  ): Promise<string> {
+    const ctx = this.getContext();
+    const synthesisMessage = await this.enqueueMessage({
+      kind: 'root.synthesis',
+      sessionId: ctx.sessionId,
+      from: 'root',
+      to: 'root',
+      correlationId,
+      parentMessageId,
+      payload: {
+        userTask,
+        subagentId: agent.identity.id,
+      },
+      metadata: { agentId: 'root', tomLevel: ctx.agent.getIdentity().tomProfile.level },
+    });
+    await this.processQueuedMessage(synthesisMessage.id);
+
+    const session = ctx.manager.getSession(ctx.sessionId);
+    session?.messageQueue.clear('env');
+
+    const usageBefore = ctx.agent.getUsage();
+    ctx.agent.setRuntimeState('synthesizing');
+    this.emit({ type: 'root.synthesis.started', agentId: 'root', data: { correlationId, subagentId: agent.identity.id } });
+    this.emit({ type: 'agent.status.changed', agentId: 'root', data: { to: 'synthesizing' } });
+    this.emit({ type: 'agent.llm.called', agentId: 'root', data: { purpose: 'root.synthesis', correlationId } });
+
+    await ctx.agent.step(this.buildRootSynthesisPrompt(userTask, agent, subagentResult));
+
+    const usageAfter = ctx.agent.getUsage();
+    const usageDelta = this.toTokenUsage({
+      llmCalls: usageAfter.llmCalls - usageBefore.llmCalls,
+      promptTokens: usageAfter.promptTokens - usageBefore.promptTokens,
+      completionTokens: usageAfter.completionTokens - usageBefore.completionTokens,
+      totalTokens: usageAfter.totalTokens - usageBefore.totalTokens,
+    });
+    this.recordTurnUsage(usageDelta);
+    this.emit({ type: 'budget.updated', agentId: 'root', data: { ...usageDelta } });
+
+    const response = session ? await this.drainAgentOutput(session.messageQueue, ctx.agent.name) : ctx.agent.getInfo().lastResult ?? '';
+    ctx.agent.setRuntimeState('idle');
+    this.emit({ type: 'agent.status.changed', agentId: 'root', data: { to: 'idle' } });
+    this.emit({ type: 'root.synthesis.completed', agentId: 'root', data: { correlationId, totalTokens: usageDelta.totalTokens } });
+    await ctx.queue.ack(synthesisMessage.id);
+    return response || ctx.agent.getInfo().lastResult || '';
+  }
+
+  private buildRootSynthesisPrompt(userTask: string, agent: AgentInfo, subagentResult: RunAgentResult): string {
+    const warnings = agent.identity.role === 'subagent' && subagentResult.warnings.length > 0
+      ? subagentResult.warnings.map(item => `- ${item}`).join('\n')
+      : 'None';
+
+    return `The user requested:
+<user_task>
+${userTask}
+</user_task>
+
+You spawned this subagent:
+<subagent>
+id: ${agent.identity.id}
+name: ${agent.identity.name}
+role: ${agent.identity.role}
+tom: ToM-${agent.identity.tomProfile.level}
+purpose: ${agent.identity.tomProfile.purpose}
+</subagent>
+
+The subagent returned this report:
+<subagent_report>
+${subagentResult.result}
+</subagent_report>
+
+Grounding:
+- grounded: ${subagentResult.grounded}
+- tool calls: ${subagentResult.toolCalls.map(call => call.toolName).join(', ') || 'none'}
+- warnings:
+${warnings}
+
+Produce the final response to the user as Roy, the root agent. Do not claim you personally inspected files unless the report is grounded. Mention limitations if the report is ungrounded.`;
+  }
+
+  private async runGroundingCheck(
+    agentId: string,
+    task: string,
+    options: { correlationId?: string; parentMessageId?: string; archetype?: SubAgentArchetype }
+  ): Promise<{ toolCalls: ToolCallRecord[]; grounded: boolean; warnings: string[]; context: string }> {
+    const required = this.requiresProjectInspection(options.archetype, task);
+    if (!required) {
+      return { toolCalls: [], grounded: true, warnings: [], context: '' };
+    }
+
+    const ctx = this.getContext();
+    const toolCall = await this.enqueueMessage({
+      kind: 'tool.call',
+      sessionId: ctx.sessionId,
+      from: agentId,
+      to: 'tool.fs.list',
+      correlationId: options.correlationId,
+      parentMessageId: options.parentMessageId,
+      payload: { path: process.cwd(), maxDepth: 2 },
+      metadata: { agentId },
+    });
+    await this.processQueuedMessage(toolCall.id);
+
+    try {
+      const files = await this.listProjectFiles(process.cwd(), 2);
+      const record: ToolCallRecord = {
+        toolName: 'fs.list',
+        params: { path: process.cwd(), maxDepth: 2 },
+        result: files,
+        success: true,
+      };
+
+      const toolResult = await this.enqueueMessage({
+        kind: 'tool.result',
+        sessionId: ctx.sessionId,
+        from: 'tool.fs.list',
+        to: agentId,
+        correlationId: options.correlationId,
+        parentMessageId: toolCall.id,
+        payload: record,
+        metadata: { agentId },
+      });
+      await this.processQueuedMessage(toolResult.id);
+      await ctx.queue.ack(toolCall.id);
+      await ctx.queue.ack(toolResult.id);
+      this.emit({ type: 'tool.call', agentId, data: { toolName: 'fs.list', correlationId: options.correlationId } });
+      this.emit({ type: 'tool.result', agentId, data: { toolName: 'fs.list', count: files.length, correlationId: options.correlationId } });
+
+      return {
+        toolCalls: [record],
+        grounded: true,
+        warnings: [],
+        context: `Project file listing from fs.list:\n${files.join('\n')}`,
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await ctx.queue.fail(toolCall.id, new Error(message));
+      const warning = `Researcher produced a report without using project inspection tools: ${message}`;
+      this.emit({ type: 'agent.grounding.warning', agentId, data: { warning, correlationId: options.correlationId } });
+      return {
+        toolCalls: [{
+          toolName: 'fs.list',
+          params: { path: process.cwd(), maxDepth: 2 },
+          success: false,
+          result: message,
+        }],
+        grounded: false,
+        warnings: [warning],
+        context: '',
+      };
+    }
+  }
+
+  private buildGroundedTask(task: string, grounding: { context: string; warnings: string[] }): string {
+    if (!grounding.context && grounding.warnings.length === 0) return task;
+    return [
+      task,
+      grounding.context ? `\nGrounding context:\n${grounding.context}` : '',
+      grounding.warnings.length > 0 ? `\nGrounding warnings:\n${grounding.warnings.join('\n')}` : '',
+    ].filter(Boolean).join('\n');
+  }
+
+  private requiresProjectInspection(archetype: SubAgentArchetype | undefined, task: string): boolean {
+    if (archetype !== 'researcher') return false;
+    return /\b(inspect|analy[sz]e|review|read|list|structure|project|codebase|file|repo|repository)\b/i.test(task);
+  }
+
+  private async listProjectFiles(root: string, maxDepth: number): Promise<string[]> {
+    const ignored = new Set(['.git', 'node_modules', 'dist', '.roy', '.cache', 'coverage']);
+    const results: string[] = [];
+
+    const walk = async (dir: string, depth: number): Promise<void> => {
+      if (depth > maxDepth || results.length >= 200) return;
+      const entries = await readdir(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (ignored.has(entry.name) || results.length >= 200) continue;
+        const fullPath = path.join(dir, entry.name);
+        const relativePath = path.relative(root, fullPath);
+        results.push(entry.isDirectory() ? `${relativePath}/` : relativePath);
+        if (entry.isDirectory()) {
+          const entryStat = await stat(fullPath);
+          if (entryStat.isDirectory()) {
+            await walk(fullPath, depth + 1);
+          }
+        }
+      }
+    };
+
+    await walk(root, 0);
+    return results.sort();
+  }
+
   private buildAgentTree(agent: AgentInfo): AgentTreeNode {
     return {
       agent,
@@ -594,6 +952,75 @@ export class Runtime {
 
   private createAgentId(archetype: SubAgentArchetype, sequence: number): string {
     return `agent_${archetype}_${String(sequence).padStart(3, '0')}`;
+  }
+
+  private createCorrelationId(): string {
+    const sequence = ++this.delegationSequence;
+    const date = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    return `del_${date}_${String(sequence).padStart(3, '0')}`;
+  }
+
+  private createRootToMProfile(): ToMProfile {
+    return {
+      level: 1,
+      subjectAgentId: 'root',
+      models: [
+        {
+          targetId: 'user',
+          targetType: 'user',
+          goalModel: ['develop Roy into a Theory-of-Mind based multi-agent runtime'],
+          intentModel: ['validate controlled subagent spawning and message-mediated execution'],
+        },
+      ],
+      purpose: 'Understand user intent and decide how to answer or delegate.',
+    };
+  }
+
+  private createSubagentToMProfile(archetype: SubAgentArchetype, subjectAgentId: string, task: string): ToMProfile {
+    const level = this.defaultToMLevel(archetype);
+    return {
+      level,
+      subjectAgentId,
+      models: [],
+      purpose: this.defaultToMPurpose(archetype, task),
+    };
+  }
+
+  private defaultToMLevel(archetype: SubAgentArchetype): ToMProfile['level'] {
+    switch (archetype) {
+      case 'critic':
+        return 2;
+      case 'planner':
+        return 1;
+      case 'summarizer':
+        return 0;
+      case 'researcher':
+      case 'coder':
+      case 'tester':
+      case 'custom':
+      default:
+        return 0;
+    }
+  }
+
+  private defaultToMPurpose(archetype: SubAgentArchetype, task: string): string {
+    switch (archetype) {
+      case 'researcher':
+        return 'Collect grounded facts from the project context.';
+      case 'critic':
+        return "Evaluate another agent or design result against Roy's goal and user intent.";
+      case 'planner':
+        return 'Turn context into a sequence of actionable steps.';
+      case 'coder':
+        return 'Implement scoped code changes.';
+      case 'summarizer':
+        return 'Condense results into a clear summary.';
+      case 'tester':
+        return 'Validate behavior and identify regressions.';
+      case 'custom':
+      default:
+        return `Complete the assigned task: ${task}`;
+    }
   }
 
   private isValidArchetype(value: string): value is SubAgentArchetype {
