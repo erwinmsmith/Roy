@@ -83,7 +83,7 @@ export class Roy {
       });
 
       logger.info('CLI Bootstrap complete');
-      this.printReady();
+      await this.printReady();
       this.startChat();
     } catch (error) {
       console.log('\n  ' + this.red('[ERROR]') + ' Failed to initialize Roy');
@@ -98,10 +98,11 @@ export class Roy {
     console.log(this.dim('='.repeat(60)));
   }
 
-  private printReady(): void {
+  private async printReady(): Promise<void> {
     if (!this.ctx) return;
 
     const state = runtime.getState();
+    const memory = await runtime.getMemoryState();
     const provider = this.ctx.llm?.name ?? 'not configured';
     const model = this.ctx.llm?.defaultModel ?? this.ctx.config.llm?.model ?? 'unknown';
     const budget = state.budget.mode === 'unlimited'
@@ -116,6 +117,9 @@ export class Roy {
     console.log('FSM: ' + this.cyan(this.ctx.fsm.getStateName()));
     console.log('Budget: ' + this.cyan(budget));
     console.log('Tokens: ' + this.cyan(`${state.budget.usedTokens} total`));
+    console.log('Workspace: ' + this.cyan(path.relative(process.cwd(), memory.rootPath) || memory.rootPath));
+    console.log('Memory: ' + this.cyan(`${memory.memoryDocs.length} docs loaded`));
+    console.log('Patterns: ' + this.cyan(`${memory.patterns.agents} agents, ${memory.patterns.teams} teams`));
     console.log('API: ' + this.dim('http://localhost:' + (this.ctx.config.server?.port ?? 3000)));
     console.log('Type ' + this.cyan('/help') + ' for commands.');
   }
@@ -374,7 +378,7 @@ export class Roy {
         break;
 
       case '/memory':
-        this.printMemory();
+        await this.printWorkspaceMemory(args);
         break;
 
       case '/session':
@@ -436,6 +440,8 @@ export class Roy {
       /budget unlimited   Remove token budget limit
       /events             Show recent runtime events
       /queue              Show runtime message queue state
+      /memory             Show workspace memory state
+      /memory <doc>       Show root, project, decisions, constraints, or glossary
       /verbose            Toggle verbose mode
 
     ${this.bold('Agent Management')}
@@ -450,7 +456,7 @@ export class Roy {
       /skills             List registered skills
       /actions            List available actions
       /tools              List available tools
-      /memory             Show memory statistics
+      /memory             Show workspace memory and agent memory statistics
 
     ${this.bold('Configuration')}
       /api                Show API information
@@ -512,6 +518,8 @@ export class Roy {
     console.log('    GET  /v1/budget  - Token budget');
     console.log('    GET  /v1/events  - Runtime events');
     console.log('    GET  /v1/queue   - Runtime message queue');
+    console.log('    GET  /v1/memory  - Workspace memory state');
+    console.log('    GET  /v1/memory/root - Root memory context');
     console.log('    WS   /           - Socket.IO for real-time chat');
     console.log('    Port: ' + this.cyan(String(this.ctx?.config.server?.port ?? 3000)));
     console.log('');
@@ -653,6 +661,50 @@ export class Roy {
     console.log(`    Actions: ${caps.actions.length}`);
     console.log(`    Tools:   ${caps.tools.length}`);
     console.log('');
+  }
+
+  private async printWorkspaceMemory(args: string): Promise<void> {
+    if (!this.ctx) return;
+
+    const selected = args.trim().toLowerCase();
+    if (selected) {
+      const context = await runtime.loadRootMemoryContext();
+      const docs: Record<string, string> = {
+        root: context.rootMemory,
+        project: context.projectMemory,
+        decisions: context.decisions,
+        constraints: context.constraints,
+        glossary: context.glossary,
+      };
+      const content = docs[selected];
+      if (content === undefined) {
+        console.log('\n  Usage: /memory <root|project|decisions|constraints|glossary>\n');
+        return;
+      }
+      console.log('\n  ' + this.bold(`Memory: ${selected}`));
+      console.log(this.dim('  ' + '-'.repeat(58)));
+      console.log(content.trim() ? content.trim() : this.dim('No content'));
+      console.log('');
+      return;
+    }
+
+    const state = await runtime.getMemoryState();
+    console.log('\n  ' + this.bold('Workspace Memory'));
+    console.log(`    Path:      ${this.cyan(path.relative(process.cwd(), state.rootPath) || state.rootPath)}`);
+    console.log(`    Docs:      ${state.memoryDocs.length}`);
+    console.log(`    Traces:    ${state.traces}`);
+    console.log(`    Queue:     ${path.relative(process.cwd(), state.queuePath) || state.queuePath}`);
+    console.log(`    Patterns:  ${state.patterns.agents} agents, ${state.patterns.teams} teams, ${state.patterns.delegations} delegations`);
+
+    if (state.memoryDocs.length > 0) {
+      console.log('\n  ' + this.bold('Docs:'));
+      for (const doc of state.memoryDocs) {
+        console.log(`    - ${doc.name.padEnd(16)} ${doc.size} bytes`);
+      }
+    }
+
+    console.log('\n  ' + this.bold('Agent Session Memory'));
+    this.printMemory();
   }
 
   private printSession(): void {

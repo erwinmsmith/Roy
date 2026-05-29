@@ -116,4 +116,6 @@ export const memoryRegistry = new MemoryRegistry();
 export { ShortTermMemory } from './shortTerm.js';
 export { LongTermMemory, InMemoryCache } from './longTerm.js';
 export { contextManager, ContextManager } from './context.js';
+export { WorkspaceMemoryManager } from './workspace.js';
 export type { Memory, MemoryEntry, ContextDoc, CacheEntry, MemoryCache } from './types.js';
+export type { MemoryDocState, PatternCacheState, RootMemoryContext, WorkspaceMemoryState } from './workspace.js';

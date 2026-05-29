@@ -293,6 +293,14 @@ async function main(): Promise<void> {
     res.json(await runtime.getQueueState(Number.isFinite(limit) && limit > 0 ? limit : 20));
   });
 
+  app.get('/v1/memory', async (req, res) => {
+    res.json(await runtime.getMemoryState());
+  });
+
+  app.get('/v1/memory/root', async (req, res) => {
+    res.json(await runtime.loadRootMemoryContext());
+  });
+
   // Root endpoint
   app.get('/', (req, res) => {
     res.json({

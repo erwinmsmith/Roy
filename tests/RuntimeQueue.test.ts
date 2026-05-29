@@ -1,4 +1,7 @@
 import { describe, it, expect } from 'vitest';
+import { mkdtemp } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import Runtime from '../src/core/runtime/Runtime.js';
 import { InMemoryMessageQueue } from '../src/core/queue/index.js';
 
@@ -32,10 +35,12 @@ describe('InMemoryMessageQueue', () => {
 
 describe('Runtime queue state', () => {
   it('emits queue transition events and exposes queue state', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-queue-'));
     const runtime = new Runtime();
     await runtime.initialize({
       sessionId: 'runtime-queue-test',
       fsmEnabled: false,
+      workspaceCwd,
     });
 
     const message = await runtime.enqueueMessage({
@@ -52,8 +57,8 @@ describe('Runtime queue state', () => {
 
     const events = runtime.getEvents().map(event => event.type);
     expect(events).toContain('message.enqueued');
+    expect((await runtime.getMemoryState()).queuePath).toContain('.roy/queue');
 
     await runtime.shutdown();
   });
 });
-

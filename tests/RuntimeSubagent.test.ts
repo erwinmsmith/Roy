@@ -1,4 +1,7 @@
 import { describe, it, expect } from 'vitest';
+import { mkdtemp } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import Runtime from '../src/core/runtime/Runtime.js';
 import type { LLMProvider, LLMMessage, LLMCompletionOptions, LLMCompletionResult, LLMStreamChunk } from '../src/core/llm/types.js';
 
@@ -41,11 +44,13 @@ class EchoLLM implements LLMProvider {
 
 describe('Runtime controlled subagent spawning', () => {
   it('spawns, registers, runs, and tracks a subagent', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-subagent-'));
     const runtime = new Runtime();
     await runtime.initialize({
       sessionId: 'subagent-test',
       llmProvider: new EchoLLM(),
       fsmEnabled: false,
+      workspaceCwd,
     });
 
     const spawned = await runtime.spawnAgent({

@@ -22,6 +22,7 @@ import {
   type QueueTransition,
   type RuntimeMessage,
 } from '../queue/index.js';
+import { WorkspaceMemoryManager, type WorkspaceMemoryState, type RootMemoryContext } from '../memory/index.js';
 
 export interface RuntimeConfig {
   agentName?: string;
@@ -31,6 +32,7 @@ export interface RuntimeConfig {
   budget?: number;
   mode?: 'conversational' | 'action' | 'hybrid';
   llmProvider?: LLMProvider;
+  workspaceCwd?: string;
 }
 
 export interface RuntimeContext {
@@ -43,6 +45,7 @@ export interface RuntimeContext {
   sessionId: string;
   queue: MessageQueue;
   scheduler: MessageScheduler;
+  memory: WorkspaceMemoryManager;
   capabilities: {
     skills: number;
     actions: number;
@@ -122,6 +125,7 @@ export class Runtime {
   private agentSequence = 0;
   private queue: MessageQueue | null = null;
   private scheduler: MessageScheduler | null = null;
+  private memory: WorkspaceMemoryManager | null = null;
 
   static getInstance(): Runtime {
     if (!Runtime.instance) {
@@ -173,6 +177,8 @@ export class Runtime {
 
     // Create AgentManager
     const manager = new AgentManager();
+    const memory = new WorkspaceMemoryManager();
+    await memory.initWorkspace(options.workspaceCwd ?? process.cwd(), options.sessionId ?? 'main');
     const queue = new InMemoryMessageQueue(transition => this.handleQueueTransition(transition));
     const scheduler = new MessageScheduler(queue);
 
@@ -219,10 +225,12 @@ export class Runtime {
       sessionId,
       queue,
       scheduler,
+      memory,
       capabilities,
     };
     this.queue = queue;
     this.scheduler = scheduler;
+    this.memory = memory;
 
     this.initialized = true;
     this.emit({ type: 'runtime.initialized', agentId: 'root', data: { sessionId, provider: llm?.name ?? null } });
@@ -257,6 +265,7 @@ export class Runtime {
     this.ctx = null;
     this.queue = null;
     this.scheduler = null;
+    this.memory = null;
     this.initialized = false;
     logger.info('Runtime shutdown complete');
   }
@@ -328,6 +337,9 @@ export class Runtime {
     if (this.events.length > 500) {
       this.events = this.events.slice(-500);
     }
+    void this.memory?.writeTrace(runtimeEvent).catch(error => {
+      logger.warn(`Failed to write runtime trace: ${error instanceof Error ? error.message : String(error)}`);
+    });
     return runtimeEvent;
   }
 
@@ -401,6 +413,16 @@ export class Runtime {
     ]);
 
     return { stats, recent };
+  }
+
+  async getMemoryState(): Promise<WorkspaceMemoryState> {
+    const ctx = this.getContext();
+    return ctx.memory.getState();
+  }
+
+  async loadRootMemoryContext(): Promise<RootMemoryContext> {
+    const ctx = this.getContext();
+    return ctx.memory.loadRootContext();
   }
 
   async spawnAgent(spec: SpawnAgentSpec): Promise<AgentInfo> {
