@@ -463,6 +463,7 @@ export class Roy {
       /memory public <doc> Show project, context, decisions, constraints, glossary, or user
       /memory agent <key> Show agent memory, prompt, and context
       /memory proposals   Show pending memory update proposals
+      /memory signals     Show parsed memory signals from the current session
       /memory accept <id> Commit a memory proposal
       /memory reject <id> Reject a memory proposal
       /memory summarize   Generate memory proposals from the current session
@@ -775,6 +776,11 @@ export class Roy {
       return;
     }
 
+    if (scope === 'signals') {
+      await this.printMemorySignals();
+      return;
+    }
+
     if (scope === 'summarize') {
       const proposals = await runtime.proposeMemoryUpdates();
       console.log('\n  ' + this.bold('Memory Summary'));
@@ -841,7 +847,7 @@ export class Roy {
       return;
     }
 
-    console.log('\n  Usage: /memory [status|public|agent|proposals|summarize|accept|reject|updates|mode]\n');
+    console.log('\n  Usage: /memory [status|public|agent|proposals|signals|summarize|accept|reject|updates|mode]\n');
   }
 
   private async printMemoryStatus(): Promise<void> {
@@ -927,6 +933,38 @@ export class Roy {
       console.log(`     confidence: ${proposal.confidence}`);
       console.log(`     reason: ${proposal.reason}`);
     });
+    console.log('');
+  }
+
+  private async printMemorySignals(): Promise<void> {
+    const signals = await runtime.collectMemorySignals();
+    console.log('\n  ' + this.bold('Memory Signals'));
+    console.log('  ' + this.bold('Source:'));
+    console.log(`    session: ${this.cyan(signals.source.sessionId)}`);
+    console.log(`    path:    ${this.dim(path.relative(process.cwd(), signals.source.sessionPath) || signals.source.sessionPath)}`);
+    console.log(`    trace:   ${signals.source.traceName ?? 'none'}`);
+    console.log('\n  ' + this.bold('Detected session records:'));
+    console.log(`    user commands:         ${signals.counts.userCommands}`);
+    console.log(`    agent results:         ${signals.counts.agentResults}`);
+    console.log(`    root final responses:  ${signals.counts.rootFinalResponses}`);
+    console.log(`    grounded results:      ${signals.counts.groundedAgentResults}`);
+    console.log(`    tool calls:            ${signals.toolCalls.join(', ') || 'none'}`);
+    console.log('\n  ' + this.bold('Agents:'));
+    if (signals.agents.length === 0) {
+      console.log('    ' + this.dim('No agent result records.'));
+    } else {
+      for (const agent of signals.agents) {
+        console.log(`    - ${this.cyan(agent.agentId)} archetype=${agent.archetype} parent=${agent.parentId ?? '-'} grounded=${agent.grounded} outputGrounded=${agent.outputGrounded} tools=${agent.toolCalls.join(',') || 'none'}`);
+      }
+    }
+    console.log('\n  ' + this.bold('Candidate memory signals:'));
+    if (signals.candidateSignals.length === 0) {
+      console.log('    ' + this.dim('No candidate signals.'));
+    } else {
+      for (const signal of signals.candidateSignals) {
+        console.log(`    - ${signal}`);
+      }
+    }
     console.log('');
   }
 
@@ -1049,6 +1087,13 @@ export class Roy {
         showSubagentOutput: !quiet,
       });
       console.log(`\n  ${this.dim(`message chain: ${result.correlationId}`)}`);
+      const events = runtime.getEvents().filter(event => event.type === 'cache.hit' && event.data?.correlationId === result.correlationId);
+      for (const event of events.slice(-4)) {
+        const patternId = event.data?.patternId;
+        if (typeof patternId === 'string') {
+          console.log(`  ${this.green('[event]')} cache.hit ${patternId}`);
+        }
+      }
       console.log(`  ${this.yellow('roy[root] delegating...')}`);
       console.log(`  ├─ ${this.yellow(`${result.agent.name}[subagent] thinking...`)}`);
       if (result.subagentResult.toolCalls.length > 0) {

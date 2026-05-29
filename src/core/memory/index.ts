@@ -121,10 +121,12 @@ export type { Memory, MemoryEntry, ContextDoc, CacheEntry, MemoryCache } from '.
 export type {
   AgentMemoryBundle,
   AgentPatternInput,
+  DelegationPatternInput,
   ConversationEntry,
   ConversationSessionState,
   MemoryDocState,
   MemoryMode,
+  MemorySignals,
   MemoryUpdateProposal,
   MemoryUpdateRecord,
   PatternCacheState,

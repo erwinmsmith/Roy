@@ -29,6 +29,7 @@ import {
   type ConversationEntry,
   type ConversationSessionState,
   type MemoryMode,
+  type MemorySignals,
   type MemoryUpdateProposal,
   type MemoryUpdateRecord,
   type WorkspaceMemoryState,
@@ -219,6 +220,7 @@ export class Runtime {
     const memory = new WorkspaceMemoryManager();
     await memory.initWorkspace(options.workspaceCwd ?? process.cwd(), options.sessionId ?? 'main');
     const rootMemory = await memory.loadAgentMemory('roy');
+    const rootContext = await memory.loadRootContext();
     const queue = new InMemoryMessageQueue(transition => this.handleQueueTransition(transition));
     const scheduler = new MessageScheduler(queue);
 
@@ -231,6 +233,10 @@ export class Runtime {
       task: 'Operate as the root agent for the current Roy runtime session.',
       description: 'You are Roy, the root agent of a Theory-of-Mind based autonomous agent system.',
       bundle: rootMemory,
+      publicContext: this.formatPublicContext(rootContext),
+      tomProfile: this.createRootToMProfile(),
+      availableSkills: skillRegistry.list().map(skill => skill.name),
+      availableTools: toolRegistry.list().map(tool => tool.name),
     });
 
     const agent = new UnifiedAgent({
@@ -521,6 +527,7 @@ export class Runtime {
   async proposeMemoryUpdates(): Promise<MemoryUpdateProposal[]> {
     const ctx = this.getContext();
     this.emit({ type: 'memory.update.propose.started', agentId: 'root' });
+    const signals = await ctx.memory.collectMemorySignals();
     const proposals = await ctx.memory.proposeMemoryUpdates();
     for (const proposal of proposals) {
       this.emit({
@@ -535,8 +542,24 @@ export class Runtime {
         },
       });
     }
+    if (proposals.length === 0) {
+      this.emit({
+        type: 'memory.update.skipped',
+        agentId: 'root',
+        data: {
+          reason: signals.candidateSignals.length === 0 ? 'no_signals' : 'no_new_proposals',
+          signalCounts: signals.counts,
+          candidateSignals: signals.candidateSignals,
+        },
+      });
+    }
     this.emit({ type: 'memory.update.propose.completed', agentId: 'root', data: { count: proposals.length } });
     return proposals;
+  }
+
+  async collectMemorySignals(): Promise<MemorySignals> {
+    const ctx = this.getContext();
+    return ctx.memory.collectMemorySignals();
   }
 
   async acceptMemoryProposal(id: string): Promise<MemoryUpdateRecord | undefined> {
@@ -603,6 +626,33 @@ export class Runtime {
     const correlationId = this.createCorrelationId();
     const parentId = payload.parentId ?? 'root';
     const requireRootSynthesis = payload.requireRootSynthesis ?? true;
+    const cachedAgentPattern = await ctx.memory.findAgentPattern(payload.archetype);
+    const cachedDelegationPattern = await ctx.memory.findDelegationPattern(payload.archetype, payload.task);
+
+    if (cachedAgentPattern) {
+      this.emit({
+        type: 'cache.hit',
+        agentId: parentId,
+        data: {
+          cacheType: 'agent-pattern',
+          patternId: cachedAgentPattern.id,
+          archetype: payload.archetype,
+          correlationId,
+        },
+      });
+    }
+    if (cachedDelegationPattern) {
+      this.emit({
+        type: 'cache.hit',
+        agentId: parentId,
+        data: {
+          cacheType: 'delegation-pattern',
+          patternId: cachedDelegationPattern.id,
+          archetype: payload.archetype,
+          correlationId,
+        },
+      });
+    }
 
     const command = await this.enqueueMessage({
       kind: 'user.command.spawn',
@@ -633,6 +683,21 @@ export class Runtime {
       task: payload.task,
       systemPrompt: undefined,
       tomProfile,
+    });
+    const delegationPattern = await ctx.memory.upsertDelegationPattern({
+      archetype: payload.archetype,
+      task: payload.task,
+      parentId,
+      agentPatternId: String(cachedAgentPattern?.id ?? `agent_pattern_${payload.archetype}_v1`),
+    });
+    this.emit({
+      type: 'memory.pattern.updated',
+      agentId: parentId,
+      data: {
+        cacheType: 'delegation-pattern',
+        patternId: delegationPattern.id,
+        path: '.roy/cache/delegation-patterns.json',
+      },
     });
 
     const taskMessage = await this.enqueueMessage({
@@ -779,6 +844,11 @@ export class Runtime {
       description: spec.description,
       systemPrompt: spec.systemPrompt,
       bundle: agentMemory,
+      publicContext: this.formatPublicContext(await ctx.memory.loadRootContext()),
+      tomProfile: spec.tomProfile ? { ...spec.tomProfile, subjectAgentId: id } : this.createSubagentToMProfile(spec.archetype, id, spec.task ?? ''),
+      availableSkills: skillRegistry.list().map(skill => skill.name),
+      availableTools: toolRegistry.list().map(tool => tool.name),
+      parentContext: `Parent agent ${parentIdentity.name} (${parentIdentity.id}) spawned this agent for: ${spec.description}`,
     });
 
     const agent = new UnifiedAgent({
@@ -1033,7 +1103,23 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
     description: string;
     systemPrompt?: string;
     bundle: { key: string; path: string; identity: string; memory: string; context: string; prompt: string };
+    publicContext?: string;
+    tomProfile?: ToMProfile;
+    availableSkills?: string[];
+    availableTools?: string[];
+    parentContext?: string;
   }): string {
+    const slots: Record<string, string> = {
+      public_context: input.publicContext ?? '',
+      agent_private_memory: input.bundle.memory.trim(),
+      agent_identity: input.bundle.identity.trim() || `You are ${input.name}, a ${input.role} agent in the Roy runtime.`,
+      tom_profile: input.tomProfile ? JSON.stringify(input.tomProfile, null, 2) : '',
+      available_skills: (input.availableSkills ?? []).map(skill => `- ${skill}`).join('\n') || '- none',
+      available_tools: (input.availableTools ?? []).map(tool => `- ${tool}`).join('\n') || '- none',
+      parent_context: input.parentContext ?? `Parent agent: ${input.parentName}`,
+      task: input.task || 'No task assigned yet.',
+    };
+    const renderedPromptFile = this.renderPromptSlots(input.bundle.prompt, slots);
     return [
       input.systemPrompt,
       input.description,
@@ -1041,10 +1127,38 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
       `Your parent agent is ${input.parentName}.`,
       'The model provider is only the inference backend; never identify yourself as the provider.',
       input.task ? `Current task: ${input.task}` : undefined,
-      `<agent_prompt_file path=".roy/agents/${input.bundle.key}/prompt.md">\n${input.bundle.prompt.trim()}\n</agent_prompt_file>`,
+      `<agent_prompt_file path=".roy/agents/${input.bundle.key}/prompt.md">\n${renderedPromptFile.trim()}\n</agent_prompt_file>`,
+      `<public_context>\n${slots.public_context}\n</public_context>`,
       `<agent_context_file path=".roy/agents/${input.bundle.key}/context.md">\n${input.bundle.context.trim()}\n</agent_context_file>`,
       `<agent_memory_file path=".roy/agents/${input.bundle.key}/memory.md">\n${input.bundle.memory.trim()}\n</agent_memory_file>`,
     ].filter(Boolean).join('\n\n');
+  }
+
+  private renderPromptSlots(template: string, slots: Record<string, string>): string {
+    return Object.entries(slots).reduce(
+      (rendered, [slot, value]) => rendered.replaceAll(`{{${slot}}}`, value),
+      template
+    );
+  }
+
+  private formatPublicContext(context: RootMemoryContext): string {
+    return [
+      '<project_memory>',
+      context.projectMemory.trim(),
+      '</project_memory>',
+      '<constraints>',
+      context.constraints.trim(),
+      '</constraints>',
+      '<decisions>',
+      context.decisions.trim(),
+      '</decisions>',
+      '<glossary>',
+      context.glossary.trim(),
+      '</glossary>',
+      `<agent_patterns>${JSON.stringify(context.agentPatterns, null, 2)}</agent_patterns>`,
+      `<team_patterns>${JSON.stringify(context.teamPatterns, null, 2)}</team_patterns>`,
+      `<delegation_patterns>${JSON.stringify(context.delegationPatterns, null, 2)}</delegation_patterns>`,
+    ].join('\n');
   }
 
   private async runGroundingCheck(

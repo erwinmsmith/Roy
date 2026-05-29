@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Runtime from '../src/core/runtime/Runtime.js';
@@ -130,7 +130,55 @@ describe('Runtime controlled subagent spawning', () => {
     const memoryState = await runtime.getMemoryState();
     expect(memoryState.agentMemories.map(memory => memory.id)).toContain('researcher');
     expect(memoryState.patterns.agents).toBe(1);
-    expect((await runtime.listMemoryProposals()).length).toBeGreaterThan(0);
+    expect(memoryState.patterns.delegations).toBe(1);
+    const signals = await runtime.collectMemorySignals();
+    expect(signals.counts.agentResults).toBe(1);
+    expect(signals.candidateSignals).toContain('researcher.tool_policy');
+    expect(signals.candidateSignals).toContain('researcher.failure_case');
+    expect(signals.candidateSignals).toContain('roy.delegation_lesson');
+    const proposals = await runtime.listMemoryProposals();
+    expect(proposals.map(proposal => proposal.target.section)).toContain('tool-policy');
+    expect(proposals.map(proposal => proposal.target.section)).toContain('failure-cases');
+    expect(proposals.map(proposal => proposal.target.section)).toContain('delegation-lessons');
+    expect(proposals[0].id).toBe('mem_prop_001');
+
+    const prompt = await readFile(path.join(workspaceCwd, '.roy', 'agents', 'researcher', 'prompt.md'), 'utf8');
+    expect(prompt).toContain('{{public_context}}');
+    expect(prompt).toContain('{{agent_private_memory}}');
+    expect(prompt).toContain('{{agent_identity}}');
+    expect(prompt).toContain('{{tom_profile}}');
+    expect(prompt).toContain('{{available_skills}}');
+    expect(prompt).toContain('{{available_tools}}');
+    expect(prompt).toContain('{{parent_context}}');
+    expect(prompt).toContain('{{task}}');
+
+    await runtime.shutdown();
+  });
+
+  it('emits cache hits on repeated controlled spawn', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-cache-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'cache-hit-test',
+      llmProvider: new EchoLLM(),
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+
+    await runtime.handleSpawnCommand({
+      archetype: 'researcher',
+      task: 'Inspect the project structure',
+    });
+    const second = await runtime.handleSpawnCommand({
+      archetype: 'researcher',
+      task: 'Inspect the project structure again',
+    });
+
+    const hits = runtime.getEvents()
+      .filter(event => event.type === 'cache.hit' && event.data?.correlationId === second.correlationId)
+      .map(event => event.data?.patternId);
+    expect(hits).toContain('agent_pattern_researcher_v1');
+    expect(hits).toContain('delegation_project_inspection_researcher_v1');
 
     await runtime.shutdown();
   });

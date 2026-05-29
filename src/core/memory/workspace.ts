@@ -108,6 +108,38 @@ export interface AgentPatternInput {
   skills?: string[];
 }
 
+export interface DelegationPatternInput {
+  archetype: string;
+  task: string;
+  parentId: string;
+  agentPatternId: string;
+}
+
+export interface MemorySignals {
+  source: {
+    sessionId: string;
+    sessionPath: string;
+    traceName?: string;
+  };
+  counts: {
+    userCommands: number;
+    agentResults: number;
+    rootFinalResponses: number;
+    groundedAgentResults: number;
+  };
+  toolCalls: string[];
+  agents: Array<{
+    agentId: string;
+    archetype: string;
+    parentId?: string;
+    grounded: boolean;
+    toolGrounded: boolean;
+    outputGrounded: boolean;
+    toolCalls: string[];
+  }>;
+  candidateSignals: string[];
+}
+
 interface PatternFile {
   patterns: unknown[];
 }
@@ -195,6 +227,11 @@ const AGENT_MEMORY_TEMPLATES: Record<string, string> = {
 
 <!-- ROY:BEGIN:stable-lessons -->
 <!-- ROY:END:stable-lessons -->
+
+## Delegation Lessons
+
+<!-- ROY:BEGIN:delegation-lessons -->
+<!-- ROY:END:delegation-lessons -->
 
 ## Failure Cases
 
@@ -395,20 +432,25 @@ Keep this agent identity separate from the model provider identity.
 ## Runtime Template
 
 \`\`\`txt
-You are {agent_name}, a {agent_role} agent in the Roy runtime.
-Parent: {parent_agent}
-Task: {task}
+{{agent_identity}}
 
-<agent_prompt_file path=".roy/agents/${safeKey}/prompt.md">
-{agent_prompt_notes}
-</agent_prompt_file>
+{{tom_profile}}
 
-<agent_context_file path=".roy/agents/${safeKey}/context.md">
-{agent_context}
-</agent_context_file>
+{{public_context}}
+
+{{agent_private_memory}}
+
+{{available_skills}}
+
+{{available_tools}}
+
+{{parent_context}}
+
+{{task}}
 \`\`\`
 `
     );
+    await this.ensurePromptSlots(path.join(agentPath, 'prompt.md'));
     await this.writeIfMissing(
       path.join(agentPath, 'state.json'),
       JSON.stringify({ id: safeKey, name: options.name ?? safeKey, role: options.role ?? safeKey, updatedAt: null }, null, 2) + '\n'
@@ -471,14 +513,76 @@ Task: {task}
     return file.updates ?? [];
   }
 
+  async collectMemorySignals(): Promise<MemorySignals> {
+    const conversations = await this.readConversation(this.sessionId, 500);
+    const traces = await this.listTraces();
+    const agentResults = conversations.filter(entry => entry.role === 'agent' && entry.metadata?.kind === 'agent.result');
+    const rootFinalResponses = conversations.filter(entry => entry.role === 'assistant' && entry.metadata?.kind === 'root.final_response');
+    const commandEntries = conversations.filter(entry => entry.metadata?.command === 'spawn' || entry.role === 'user');
+    const agents = agentResults.map(entry => {
+      const metadata = entry.metadata ?? {};
+      const toolCalls = Array.isArray(metadata.toolCalls) ? metadata.toolCalls.map(String) : [];
+      const archetype = typeof metadata.archetype === 'string'
+        ? metadata.archetype
+        : this.inferArchetype(String(metadata.agentId ?? entry.speaker));
+      const toolGrounded = toolCalls.includes('fs.list');
+      return {
+        agentId: String(metadata.agentId ?? entry.speaker),
+        archetype,
+        parentId: typeof metadata.parentId === 'string' ? metadata.parentId : undefined,
+        grounded: metadata.grounded === true,
+        toolGrounded,
+        outputGrounded: toolGrounded && this.containsConcreteFileObservations(entry.content),
+        toolCalls,
+      };
+    });
+    const candidateSignals = new Set<string>();
+    for (const agent of agents) {
+      if (agent.archetype === 'researcher' && agent.toolGrounded) {
+        candidateSignals.add('researcher.tool_policy');
+      }
+      if (agent.archetype === 'researcher' && agent.toolGrounded && !agent.outputGrounded) {
+        candidateSignals.add('researcher.failure_case');
+      }
+      if (agent.archetype === 'researcher' && agent.outputGrounded) {
+        candidateSignals.add('public.project_structure');
+      }
+    }
+    for (const rootResponse of rootFinalResponses) {
+      const subagentId = rootResponse.metadata?.subagentId;
+      if (typeof subagentId === 'string' && agents.some(agent => agent.agentId === subagentId)) {
+        candidateSignals.add('roy.delegation_lesson');
+      }
+    }
+
+    return {
+      source: {
+        sessionId: this.sessionId,
+        sessionPath: this.getConversationPath(this.sessionId),
+        traceName: traces[0]?.name,
+      },
+      counts: {
+        userCommands: commandEntries.length,
+        agentResults: agentResults.length,
+        rootFinalResponses: rootFinalResponses.length,
+        groundedAgentResults: agents.filter(agent => agent.grounded).length,
+      },
+      toolCalls: [...new Set(agents.flatMap(agent => agent.toolCalls))],
+      agents,
+      candidateSignals: [...candidateSignals],
+    };
+  }
+
   async proposeMemoryUpdates(): Promise<MemoryUpdateProposal[]> {
     const mode = await this.getMemoryMode();
     if (mode === 'off') return [];
 
     const conversations = await this.readConversation(this.sessionId, 200);
+    const signals = await this.collectMemorySignals();
     const existing = await this.listAllMemoryProposals();
     const created: MemoryUpdateProposal[] = [];
     const agentResults = conversations.filter(entry => entry.role === 'agent' && entry.metadata?.kind === 'agent.result');
+    const rootResponses = conversations.filter(entry => entry.role === 'assistant' && entry.metadata?.kind === 'root.final_response');
 
     for (const entry of agentResults) {
       const metadata = entry.metadata ?? {};
@@ -487,38 +591,74 @@ Task: {task}
         : this.inferArchetype(String(metadata.agentId ?? entry.speaker));
       const toolCalls = Array.isArray(metadata.toolCalls) ? metadata.toolCalls.map(String) : [];
       const grounded = metadata.grounded === true;
+      const toolGrounded = toolCalls.includes('fs.list');
+      const outputGrounded = toolGrounded && this.containsConcreteFileObservations(entry.content);
 
-      if (archetype && toolCalls.includes('fs.list') && !this.hasPendingProposal(existing, 'agent', archetype, 'tool-policy')) {
+      if (archetype && toolGrounded && !this.hasOpenProposal(existing, 'agent', archetype, 'tool-policy')) {
         created.push(this.createProposal({
           type: 'agent',
           key: archetype,
           path: path.join(this.rootPath, 'agents', this.safeKey(archetype), 'memory.md'),
           section: 'tool-policy',
-          content: `- For project inspection tasks, ${this.capitalize(archetype)} agents should call \`fs.list\` before summarizing repository structure.`,
-          reason: `${this.capitalize(archetype)} learned reusable project inspection behavior from a grounded run.`,
+          content: `- For project inspection tasks, call \`fs.list\` and include the resulting file tree or directory summary in the report.`,
+          reason: `${this.capitalize(archetype)} used filesystem listing during project inspection, so this is reusable tool policy.`,
           confidence: 0.87,
           risk: 'low',
-          source: { conversationEntryId: entry.id, agentId: metadata.agentId },
+          source: { sessionId: this.sessionId, conversationEntryId: entry.id, agentId: metadata.agentId, signalCounts: signals.counts },
         }));
       }
 
-      if (grounded && toolCalls.includes('fs.list') && !this.hasPendingProposal(existing, 'public', 'project', 'project-structure')) {
+      if (archetype === 'researcher' && toolGrounded && !outputGrounded && !this.hasOpenProposal(existing, 'agent', archetype, 'failure-cases')) {
+        created.push(this.createProposal({
+          type: 'agent',
+          key: archetype,
+          path: path.join(this.rootPath, 'agents', this.safeKey(archetype), 'memory.md'),
+          section: 'failure-cases',
+          content: `- For project inspection tasks, do not only diagnose reasoning traces. Include concrete filesystem observations from \`fs.list\`, such as top-level directories and relevant source subdirectories.`,
+          reason: `${this.capitalize(archetype)} used fs.list but did not include concrete filesystem observations in the final report.`,
+          confidence: 0.84,
+          risk: 'low',
+          source: { sessionId: this.sessionId, conversationEntryId: entry.id, agentId: metadata.agentId, signalCounts: signals.counts },
+        }));
+      }
+
+      if (grounded && outputGrounded && !this.hasOpenProposal(existing, 'public', 'project', 'project-structure')) {
         created.push(this.createProposal({
           type: 'public',
           key: 'project',
           path: path.join(this.rootPath, 'public', 'project.md'),
           section: 'project-structure',
-          content: `- Project structure was inspected by ${entry.speaker} using \`fs.list\`. Review the latest trace before treating this as permanent architecture documentation.`,
-          reason: 'Grounded filesystem inspection found project structure context that may be useful in future sessions.',
+          content: this.projectStructureProposalContent(entry.content),
+          reason: 'Grounded filesystem inspection produced concrete project structure observations.',
           confidence: 0.74,
           risk: 'medium',
-          source: { conversationEntryId: entry.id, agentId: metadata.agentId },
+          source: { sessionId: this.sessionId, conversationEntryId: entry.id, agentId: metadata.agentId, signalCounts: signals.counts },
         }));
       }
     }
 
+    for (const response of rootResponses) {
+      const subagentId = response.metadata?.subagentId;
+      const matchedAgent = agentResults.find(entry => entry.metadata?.agentId === subagentId);
+      if (!matchedAgent || this.hasOpenProposal(existing, 'agent', 'roy', 'delegation-lessons')) continue;
+      created.push(this.createProposal({
+        type: 'agent',
+        key: 'roy',
+        path: path.join(this.rootPath, 'agents', 'roy', 'memory.md'),
+        section: 'delegation-lessons',
+        content: `- When synthesizing subagent reports, Roy should check whether the subagent output contains concrete tool results, not only whether a tool was called.`,
+        reason: 'Roy consumed a researcher result and had enough context to preserve a reusable delegation lesson.',
+        confidence: 0.82,
+        risk: 'low',
+        source: { sessionId: this.sessionId, conversationEntryId: response.id, subagentId, signalCounts: signals.counts },
+      }));
+    }
+
     if (created.length === 0) return [];
 
+    created.forEach((proposal, index) => {
+      proposal.id = this.nextProposalId(existing.length + index + 1);
+    });
     const proposals = [...existing, ...created];
     await this.writeProposalFile(proposals);
 
@@ -577,9 +717,9 @@ Task: {task}
     const file = await this.readJson<{ patterns?: Array<Record<string, unknown>> }>(cachePath, { patterns: [] });
     const patterns = file.patterns ?? [];
     const now = new Date().toISOString();
-    const existing = patterns.find(pattern => pattern.key === key || pattern.id === `agent_pattern_${key}`);
+    const existing = patterns.find(pattern => pattern.key === key || pattern.id === `agent_pattern_${key}` || pattern.id === `agent_pattern_${key}_v1`);
     const pattern = {
-      id: `agent_pattern_${key}`,
+      id: `agent_pattern_${key}_v1`,
       key,
       name: input.name,
       archetype: input.archetype,
@@ -603,6 +743,48 @@ Task: {task}
       patterns.push(pattern);
     }
     await writeFile(cachePath, JSON.stringify({ patterns }, null, 2) + '\n', 'utf8');
+  }
+
+  async findAgentPattern(archetype: string): Promise<Record<string, unknown> | undefined> {
+    const key = this.safeKey(archetype);
+    const patterns = await this.readPatterns('agent-patterns.json') as Array<Record<string, unknown>>;
+    return patterns.find(pattern => pattern.key === key || pattern.archetype === key);
+  }
+
+  async findDelegationPattern(archetype: string, task: string): Promise<Record<string, unknown> | undefined> {
+    const signature = this.delegationSignature(archetype, task);
+    const patterns = await this.readPatterns('delegation-patterns.json') as Array<Record<string, unknown>>;
+    return patterns.find(pattern => pattern.signature === signature || pattern.id === `delegation_${signature}_v1`);
+  }
+
+  async upsertDelegationPattern(input: DelegationPatternInput): Promise<Record<string, unknown>> {
+    const signature = this.delegationSignature(input.archetype, input.task);
+    const cachePath = path.join(this.rootPath, 'cache', 'delegation-patterns.json');
+    const file = await this.readJson<{ patterns?: Array<Record<string, unknown>> }>(cachePath, { patterns: [] });
+    const patterns = file.patterns ?? [];
+    const now = new Date().toISOString();
+    const existing = patterns.find(pattern => pattern.signature === signature || pattern.id === `delegation_${signature}_v1`);
+    const pattern = {
+      id: `delegation_${signature}_v1`,
+      signature,
+      archetype: input.archetype,
+      parentId: input.parentId,
+      agentPatternId: input.agentPatternId,
+      taskSignature: signature.replace(`${this.safeKey(input.archetype)}_`, ''),
+      usage: {
+        count: Number((existing?.usage as Record<string, unknown> | undefined)?.count ?? 0) + 1,
+        lastUsedAt: now,
+      },
+      updatedAt: now,
+    };
+
+    if (existing) {
+      Object.assign(existing, pattern);
+    } else {
+      patterns.push(pattern);
+    }
+    await writeFile(cachePath, JSON.stringify({ patterns }, null, 2) + '\n', 'utf8');
+    return pattern;
   }
 
   async listTraces(): Promise<Array<{ name: string; path: string; size: number; updatedAt: number }>> {
@@ -806,9 +988,13 @@ Task: {task}
     };
   }
 
-  private hasPendingProposal(proposals: MemoryUpdateProposal[], type: string, key: string, section: string): boolean {
+  private nextProposalId(sequence: number): string {
+    return `mem_prop_${String(sequence).padStart(3, '0')}`;
+  }
+
+  private hasOpenProposal(proposals: MemoryUpdateProposal[], type: string, key: string, section: string): boolean {
     return proposals.some(proposal =>
-      proposal.status === 'pending'
+      (proposal.status === 'pending' || proposal.status === 'committed')
       && proposal.target.type === type
       && proposal.target.key === key
       && proposal.target.section === section
@@ -858,6 +1044,27 @@ Task: {task}
     }
   }
 
+  private async ensurePromptSlots(filePath: string): Promise<void> {
+    const requiredSlots = [
+      '{{public_context}}',
+      '{{agent_private_memory}}',
+      '{{agent_identity}}',
+      '{{tom_profile}}',
+      '{{available_skills}}',
+      '{{available_tools}}',
+      '{{parent_context}}',
+      '{{task}}',
+    ];
+    const existing = await this.readOptional(filePath);
+    const missing = requiredSlots.filter(slot => !existing.includes(slot));
+    if (missing.length === 0) return;
+    await appendFile(
+      filePath,
+      `\n\n## Runtime Slots\n\n\`\`\`txt\n${missing.join('\n\n')}\n\`\`\`\n`,
+      'utf8'
+    );
+  }
+
   private async readJson<T>(filePath: string, fallback: T): Promise<T> {
     const raw = await this.readOptional(filePath);
     if (!raw.trim()) return fallback;
@@ -902,6 +1109,28 @@ Task: {task}
 
   private inferArchetype(value: string): string {
     return this.safeKey(value.replace(/-\d+$/, '').replace(/^agent_/, '').replace(/_\d+$/, ''));
+  }
+
+  private containsConcreteFileObservations(content: string): boolean {
+    return /(^|\n)\s*(-\s*)?(src\/|docs\/|tests\/|package\.json|tsconfig\.json|README\.md|\.\/src|src:|files?:)/i.test(content);
+  }
+
+  private projectStructureProposalContent(content: string): string {
+    const lines = content.split('\n')
+      .map(line => line.trim())
+      .filter(line => /src\/|docs\/|tests\/|package\.json|tsconfig\.json|README\.md/i.test(line))
+      .slice(0, 12);
+    if (lines.length === 0) {
+      return '- Project structure was inspected with `fs.list`; review the related trace before making this permanent.';
+    }
+    return lines.map(line => line.startsWith('-') ? line : `- ${line}`).join('\n');
+  }
+
+  private delegationSignature(archetype: string, task: string): string {
+    const taskKind = /\b(project|repo|repository|codebase|structure|files?|directories|inspect|list)\b/i.test(task)
+      ? 'project_inspection'
+      : this.safeKey(task).split('-').slice(0, 4).join('_') || 'task';
+    return `${taskKind}_${this.safeKey(archetype)}`;
   }
 
   private parseConversationImport(raw: string): Array<Omit<ConversationEntry, 'id' | 'timestamp' | 'sessionId'>> {
