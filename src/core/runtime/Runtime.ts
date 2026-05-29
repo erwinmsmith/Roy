@@ -24,7 +24,7 @@ import {
   type QueueTransition,
   type RuntimeMessage,
 } from '../queue/index.js';
-import { WorkspaceMemoryManager, type WorkspaceMemoryState, type RootMemoryContext } from '../memory/index.js';
+import { WorkspaceMemoryManager, type ConversationEntry, type WorkspaceMemoryState, type RootMemoryContext } from '../memory/index.js';
 
 export interface RuntimeConfig {
   agentName?: string;
@@ -464,6 +464,33 @@ export class Runtime {
     return ctx.memory.loadRootContext();
   }
 
+  async recordConversation(entry: Omit<ConversationEntry, 'id' | 'timestamp' | 'sessionId'> & { sessionId?: string }): Promise<ConversationEntry> {
+    const ctx = this.getContext();
+    return ctx.memory.appendConversation({
+      ...entry,
+      sessionId: entry.sessionId ?? ctx.sessionId,
+    });
+  }
+
+  async getConversation(sessionId?: string, limit = 50): Promise<ConversationEntry[]> {
+    const ctx = this.getContext();
+    return ctx.memory.readConversation(sessionId ?? ctx.sessionId, limit);
+  }
+
+  async importConversation(filePath: string, sessionId?: string): Promise<{ imported: number; path: string }> {
+    const ctx = this.getContext();
+    const result = await ctx.memory.importConversation(filePath, sessionId ?? ctx.sessionId);
+    this.emit({
+      type: 'conversation.imported',
+      data: {
+        imported: result.imported,
+        path: result.path,
+        sessionId: sessionId ?? ctx.sessionId,
+      },
+    });
+    return result;
+  }
+
   async handleSpawnCommand(payload: SpawnCommandPayload): Promise<RootMediatedSpawnResult> {
     const ctx = this.getContext();
     const correlationId = this.createCorrelationId();
@@ -478,6 +505,13 @@ export class Runtime {
       correlationId,
       payload,
       metadata: { agentId: 'root' },
+    });
+    await this.recordConversation({
+      role: 'user',
+      speaker: 'cli',
+      content: `/spawn ${payload.archetype} "${payload.task}"`,
+      correlationId,
+      metadata: { command: 'spawn', archetype: payload.archetype },
     });
     await this.processQueuedMessage(command.id);
     await ctx.queue.ack(command.id);
@@ -548,6 +582,17 @@ export class Runtime {
       correlationId,
       payload: { content: finalResponse },
       metadata: { agentId: 'root' },
+    });
+    await this.recordConversation({
+      role: 'assistant',
+      speaker: 'Roy',
+      content: finalResponse,
+      correlationId,
+      metadata: {
+        kind: 'root.final_response',
+        subagentId: agent.identity.id,
+        grounded: subagentResult.grounded,
+      },
     });
     await this.processQueuedMessage(finalMessage.id);
     await ctx.queue.ack(finalMessage.id);

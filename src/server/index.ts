@@ -135,7 +135,15 @@ async function main(): Promise<void> {
 
         let stepDone = false;
         let stepErrorMessage: string | null = null;
+        let response = '';
         const usageBefore = agent.getUsage();
+        await runtime.recordConversation({
+          role: 'user',
+          speaker: 'user',
+          content: message,
+          sessionId: sid,
+          metadata: { source: 'api' },
+        });
         runtime.emit({ type: 'agent.status.changed', agentId: 'root', data: { to: 'thinking', source: 'api' } });
 
         const stepPromise = agent.step(message)
@@ -158,6 +166,7 @@ async function main(): Promise<void> {
           }
 
           socket.emit('bot_response_stream', String(queued.content));
+          response += String(queued.content);
 
           if (queued.metadata?.done === true) {
             break;
@@ -173,6 +182,15 @@ async function main(): Promise<void> {
           totalTokens: usageAfter.totalTokens - usageBefore.totalTokens,
         });
         runtime.emit({ type: 'agent.status.changed', agentId: 'root', data: { to: 'idle', source: 'api' } });
+        if (response) {
+          await runtime.recordConversation({
+            role: 'assistant',
+            speaker: agent.name,
+            content: response,
+            sessionId: sid,
+            metadata: { source: 'api', kind: 'root.chat_response' },
+          });
+        }
 
         if (stepErrorMessage) {
           socket.emit('bot_response_stream', `Error: ${stepErrorMessage}`);
@@ -299,6 +317,26 @@ async function main(): Promise<void> {
 
   app.get('/v1/memory/root', async (req, res) => {
     res.json(await runtime.loadRootMemoryContext());
+  });
+
+  app.get('/v1/conversation', async (req, res) => {
+    const limit = req.query.limit ? Number(req.query.limit) : 50;
+    const sessionId = typeof req.query.sessionId === 'string' ? req.query.sessionId : undefined;
+    res.json(await runtime.getConversation(sessionId, Number.isFinite(limit) && limit > 0 ? limit : 50));
+  });
+
+  app.post('/v1/conversation/import', async (req, res) => {
+    const filePath = req.body?.path;
+    const sessionId = req.body?.sessionId;
+    if (typeof filePath !== 'string' || filePath.trim().length === 0) {
+      res.status(400).json({ error: 'Expected body { "path": string, "sessionId"?: string }' });
+      return;
+    }
+    try {
+      res.json(await runtime.importConversation(filePath, typeof sessionId === 'string' ? sessionId : undefined));
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
   });
 
   // Root endpoint

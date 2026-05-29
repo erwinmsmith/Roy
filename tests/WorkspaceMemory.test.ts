@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtemp, readFile, readdir } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Runtime from '../src/core/runtime/Runtime.js';
@@ -39,5 +39,47 @@ describe('Workspace memory initialization', () => {
 
     await runtime.shutdown();
   });
-});
 
+  it('persists and imports conversation entries', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-conversation-'));
+    const runtime = new Runtime();
+
+    await runtime.initialize({
+      sessionId: 'conversation-test',
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+
+    await runtime.recordConversation({
+      role: 'user',
+      speaker: 'user',
+      content: 'hello Roy',
+    });
+    await runtime.recordConversation({
+      role: 'assistant',
+      speaker: 'Roy',
+      content: 'hello user',
+    });
+
+    const entries = await runtime.getConversation(undefined, 10);
+    expect(entries.map(entry => entry.content)).toEqual(['hello Roy', 'hello user']);
+
+    const importPath = path.join(workspaceCwd, 'import.jsonl');
+    await writeFile(importPath, [
+      JSON.stringify({ role: 'user', speaker: 'imported-user', content: 'old question' }),
+      JSON.stringify({ role: 'assistant', speaker: 'imported-assistant', content: 'old answer' }),
+    ].join('\n'), 'utf8');
+
+    const imported = await runtime.importConversation(importPath);
+    expect(imported.imported).toBe(2);
+
+    const afterImport = await runtime.getConversation(undefined, 10);
+    expect(afterImport.map(entry => entry.content)).toContain('old question');
+    expect(afterImport.map(entry => entry.content)).toContain('old answer');
+
+    const latest = await readFile(path.join(workspaceCwd, '.roy', 'sessions', 'latest.json'), 'utf8');
+    expect(latest).toContain('conversation-test');
+
+    await runtime.shutdown();
+  });
+});

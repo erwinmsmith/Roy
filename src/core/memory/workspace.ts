@@ -34,6 +34,18 @@ export interface RootMemoryContext {
   delegationPatterns: unknown[];
 }
 
+export interface ConversationEntry {
+  id: string;
+  sessionId: string;
+  turnId?: string;
+  correlationId?: string;
+  role: 'user' | 'assistant' | 'system' | 'agent' | 'tool';
+  speaker: string;
+  content: string;
+  timestamp: number;
+  metadata?: Record<string, unknown>;
+}
+
 interface PatternFile {
   patterns: unknown[];
 }
@@ -108,6 +120,7 @@ This document stores persistent context for Roy, the root agent.
 export class WorkspaceMemoryManager {
   private rootPath = '';
   private tracePath = '';
+  private sessionId = '';
   private initialized = false;
 
   async initWorkspace(cwd: string, sessionId: string): Promise<WorkspaceMemoryState> {
@@ -119,6 +132,7 @@ export class WorkspaceMemoryManager {
     const cachePath = path.join(this.rootPath, 'cache');
     const sessionsPath = path.join(this.rootPath, 'sessions');
     const queuePath = path.join(this.rootPath, 'queue');
+    this.sessionId = sessionId;
 
     await Promise.all([
       mkdir(memoryPath, { recursive: true }),
@@ -227,6 +241,78 @@ Roy is the root agent of the local autonomous agent runtime.
     await appendFile(this.tracePath, JSON.stringify(event) + '\n', 'utf8');
   }
 
+  async appendConversation(entry: Omit<ConversationEntry, 'id' | 'timestamp'>): Promise<ConversationEntry> {
+    if (!this.initialized) {
+      throw new Error('Workspace memory is not initialized');
+    }
+
+    const fullEntry: ConversationEntry = {
+      ...entry,
+      id: `conv_${Date.now()}_${Math.random().toString(16).slice(2, 10)}`,
+      timestamp: Date.now(),
+    };
+
+    const sessionPath = this.getConversationPath(entry.sessionId);
+    await appendFile(sessionPath, JSON.stringify(fullEntry) + '\n', 'utf8');
+    await writeFile(
+      path.join(this.rootPath, 'sessions', 'latest.json'),
+      JSON.stringify({
+        sessionId: entry.sessionId,
+        path: sessionPath,
+        updatedAt: fullEntry.timestamp,
+      }, null, 2) + '\n',
+      'utf8'
+    );
+
+    return fullEntry;
+  }
+
+  async readConversation(sessionId = this.sessionId, limit = 50): Promise<ConversationEntry[]> {
+    const raw = await this.readOptional(this.getConversationPath(sessionId));
+    if (!raw.trim()) return [];
+
+    const entries = raw.trim().split('\n')
+      .map(line => {
+        try {
+          return JSON.parse(line) as ConversationEntry;
+        } catch {
+          return undefined;
+        }
+      })
+      .filter((entry): entry is ConversationEntry => entry !== undefined);
+
+    return limit > 0 ? entries.slice(-limit) : entries;
+  }
+
+  async importConversation(filePath: string, sessionId = this.sessionId): Promise<{ imported: number; path: string }> {
+    const raw = await readFile(filePath, 'utf8');
+    const parsed = this.parseConversationImport(raw);
+    let imported = 0;
+
+    for (const entry of parsed) {
+      if (!entry.content.trim()) continue;
+      await this.appendConversation({
+        sessionId,
+        role: entry.role,
+        speaker: entry.speaker,
+        content: entry.content,
+        turnId: entry.turnId,
+        correlationId: entry.correlationId,
+        metadata: {
+          ...(entry.metadata ?? {}),
+          importedFrom: filePath,
+          importedAt: new Date().toISOString(),
+        },
+      });
+      imported += 1;
+    }
+
+    return {
+      imported,
+      path: this.getConversationPath(sessionId),
+    };
+  }
+
   private async listMemoryDocs(): Promise<MemoryDocState[]> {
     const memoryPath = path.join(this.rootPath, 'memory');
     const files = await readdir(memoryPath);
@@ -271,6 +357,61 @@ Roy is the root agent of the local autonomous agent runtime.
     }
   }
 
+  private getConversationPath(sessionId: string): string {
+    return path.join(this.rootPath, 'sessions', `${sessionId}.jsonl`);
+  }
+
+  private parseConversationImport(raw: string): Array<Omit<ConversationEntry, 'id' | 'timestamp' | 'sessionId'>> {
+    const trimmed = raw.trim();
+    if (!trimmed) return [];
+
+    const source = trimmed.startsWith('[')
+      ? JSON.parse(trimmed) as unknown[]
+      : trimmed.split('\n').map(line => JSON.parse(line) as unknown);
+
+    return source
+      .map(item => this.normalizeImportedConversationEntry(item))
+      .filter((entry): entry is Omit<ConversationEntry, 'id' | 'timestamp' | 'sessionId'> => entry !== undefined);
+  }
+
+  private normalizeImportedConversationEntry(item: unknown): Omit<ConversationEntry, 'id' | 'timestamp' | 'sessionId'> | undefined {
+    if (!item || typeof item !== 'object') return undefined;
+    const record = item as Record<string, unknown>;
+    const content = typeof record.content === 'string'
+      ? record.content
+      : typeof record.text === 'string'
+        ? record.text
+        : typeof record.message === 'string'
+          ? record.message
+          : '';
+    if (!content.trim()) return undefined;
+
+    const role = this.normalizeRole(record.role);
+    const speaker = typeof record.speaker === 'string'
+      ? record.speaker
+      : role === 'assistant'
+        ? 'assistant'
+        : role;
+
+    return {
+      role,
+      speaker,
+      content,
+      turnId: typeof record.turnId === 'string' ? record.turnId : undefined,
+      correlationId: typeof record.correlationId === 'string' ? record.correlationId : undefined,
+      metadata: typeof record.metadata === 'object' && record.metadata !== null
+        ? record.metadata as Record<string, unknown>
+        : undefined,
+    };
+  }
+
+  private normalizeRole(role: unknown): ConversationEntry['role'] {
+    if (role === 'assistant' || role === 'system' || role === 'agent' || role === 'tool') {
+      return role;
+    }
+    return 'user';
+  }
+
   private async writeIfMissing(filePath: string, content: string): Promise<void> {
     try {
       await stat(filePath);
@@ -285,4 +426,3 @@ Roy is the root agent of the local autonomous agent runtime.
 }
 
 export default WorkspaceMemoryManager;
-

@@ -420,6 +420,10 @@ export class Roy {
         this.printContext();
         break;
 
+      case '/conversation':
+        await this.printConversation(parts);
+        break;
+
       default:
         console.log('\n  ' + this.red('Unknown command:') + ' ' + command);
         console.log('  Type ' + this.cyan('/help') + ' for available commands\n');
@@ -447,6 +451,8 @@ export class Roy {
       /messages --correlation <id> Show messages for a delegation chain
       /memory             Show workspace memory state
       /memory <doc>       Show root, project, decisions, constraints, or glossary
+      /conversation       Show persisted conversation log
+      /conversation import <path> Import JSON/JSONL conversation
       /verbose            Toggle verbose mode
 
     ${this.bold('Agent Management')}
@@ -793,7 +799,7 @@ export class Roy {
     const commands = [
       '/help', '/h', '/clear', '/cls', '/reset', '/agents', '/spawn', '/run', '/exit', '/quit', '/q',
       '/api', '/status', '/skills', '/actions', '/tools', '/memory', '/session',
-      '/system', '/fsm', '/budget', '/events', '/queue', '/messages', '/config', '/prompt', '/context', '/verbose', '/color'
+      '/system', '/fsm', '/budget', '/events', '/queue', '/messages', '/config', '/prompt', '/context', '/conversation', '/verbose', '/color'
     ];
 
     if (line.startsWith('/')) {
@@ -872,6 +878,38 @@ export class Roy {
     console.log('');
   }
 
+  private async printConversation(parts: string[]): Promise<void> {
+    if (parts[1] === 'import') {
+      const filePath = parts.slice(2).join(' ');
+      if (!filePath) {
+        console.log('\n  Usage: /conversation import <path-to-json-or-jsonl>\n');
+        return;
+      }
+      try {
+        const result = await runtime.importConversation(path.resolve(process.cwd(), filePath));
+        console.log(`\n  ${this.green('Imported')} ${result.imported} conversation entries into ${this.cyan(path.relative(process.cwd(), result.path) || result.path)}\n`);
+      } catch (error) {
+        console.log('\n  ' + this.red('Import error:') + ' ' + (error instanceof Error ? error.message : String(error)) + '\n');
+      }
+      return;
+    }
+
+    const limit = Number(parts[1] ?? 20);
+    const entries = await runtime.getConversation(undefined, Number.isFinite(limit) && limit > 0 ? limit : 20);
+
+    console.log('\n  ' + this.bold('Persisted Conversation'));
+    if (entries.length === 0) {
+      console.log('    ' + this.dim('No persisted conversation entries'));
+    } else {
+      for (const entry of entries) {
+        const when = new Date(entry.timestamp).toISOString();
+        console.log(`    ${this.dim(when)} ${this.cyan(entry.speaker)} [${entry.role}]`);
+        console.log(`      ${entry.content.substring(0, 140)}${entry.content.length > 140 ? '...' : ''}`);
+      }
+    }
+    console.log('');
+  }
+
   private async runAgent(parts: string[]): Promise<void> {
     const agentId = parts[1];
     const task = parts.slice(2).join(' ');
@@ -904,6 +942,11 @@ export class Roy {
     try {
       // Use agent's step method which integrates FSM and memory
       this.ctx.agent.addToMemory('meta', 'user turn started');
+      await runtime.recordConversation({
+        role: 'user',
+        speaker: 'user',
+        content: userInput,
+      });
       const usageBefore = this.ctx.agent.getUsage();
       runtime.emit({ type: 'agent.status.changed', agentId: 'root', data: { to: 'thinking' } });
       await this.ctx.agent.step(userInput);
@@ -915,7 +958,15 @@ export class Roy {
         totalTokens: usageAfter.totalTokens - usageBefore.totalTokens,
       });
       runtime.emit({ type: 'agent.status.changed', agentId: 'root', data: { to: 'idle' } });
-      await this.printAgentOutput();
+      const output = await this.printAgentOutput();
+      if (output) {
+        await runtime.recordConversation({
+          role: 'assistant',
+          speaker: this.ctx.agent.name,
+          content: output,
+          metadata: { kind: 'root.chat_response' },
+        });
+      }
 
       // Show updated FSM state
       if (this.verboseMode) {
@@ -928,19 +979,21 @@ export class Roy {
     }
   }
 
-  private async printAgentOutput(): Promise<void> {
-    if (!this.ctx) return;
+  private async printAgentOutput(): Promise<string> {
+    if (!this.ctx) return '';
 
     const session = this.ctx.manager.getSession(this.sessionId);
-    if (!session) return;
+    if (!session) return '';
 
     let printed = false;
+    const chunks: string[] = [];
     while (!session.messageQueue.isEmpty('env')) {
       const message = await session.messageQueue.receive('env');
       if (!message) break;
 
       const content = String(message.content);
       if (content.length > 0) {
+        chunks.push(content);
         if (!printed) {
           process.stdout.write('  ' + this.green(`${this.ctx.agent.name.toLowerCase()}[root] > `));
         }
@@ -952,6 +1005,7 @@ export class Roy {
     if (printed) {
       process.stdout.write('\n');
     }
+    return chunks.join('');
   }
 }
 
