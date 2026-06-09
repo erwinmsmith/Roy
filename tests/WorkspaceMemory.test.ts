@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Runtime from '../src/core/runtime/Runtime.js';
@@ -35,6 +35,18 @@ describe('Workspace memory initialization', () => {
     expect(context.projectMemory).toContain('# Project Context');
     expect(await runtime.readPublicMemoryDoc('context')).toContain('# Public Context');
     expect(await runtime.readAgentMemoryDoc('roy', 'prompt')).toContain('# Roy Prompt');
+    const workspaceConfig = JSON.parse(await readFile(path.join(workspaceCwd, '.roy', 'config.json'), 'utf8'));
+    expect(workspaceConfig.delegation).toMatchObject({
+      enabled: true,
+      mode: 'auto',
+      maxChildrenPerParent: 5,
+      maxDepth: 3,
+      maxTotalAgentsPerTurn: 10,
+      allowCustomAgents: true,
+      budgetAware: true,
+    });
+    expect(workspaceConfig.agents.defaultToolsByArchetype.researcher).toEqual(['fs.list', 'fs.read']);
+    expect(workspaceConfig.agents.defaultSkillsByArchetype.researcher).toEqual(['use_tool_when_needed', 'delegate_to_subagent']);
 
     runtime.emit({ type: 'turn.started', agentId: 'root', data: { turnId: 'turn_test' } });
     await new Promise(resolve => setTimeout(resolve, 10));
@@ -94,6 +106,51 @@ describe('Workspace memory initialization', () => {
 
     const latest = await readFile(path.join(workspaceCwd, '.roy', 'sessions', 'latest.json'), 'utf8');
     expect(latest).toContain('conversation-test');
+
+    await runtime.shutdown();
+  });
+
+  it('loads delegation and archetype defaults from workspace config', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-config-'));
+    await mkdir(path.join(workspaceCwd, '.roy'), { recursive: true });
+    await writeFile(
+      path.join(workspaceCwd, '.roy', 'config.json'),
+      JSON.stringify({
+        version: 1,
+        memoryUpdates: 'suggest',
+        delegation: {
+          maxChildrenPerParent: 2,
+          maxDepth: 2,
+          allowCustomAgents: false,
+          budgetAware: false,
+        },
+        agents: {
+          defaultToolsByArchetype: {
+            researcher: ['fs.read'],
+          },
+          defaultSkillsByArchetype: {
+            researcher: ['use_tool_when_needed'],
+          },
+        },
+      }, null, 2) + '\n',
+      'utf8'
+    );
+    const runtime = new Runtime();
+
+    await runtime.initialize({
+      sessionId: 'workspace-config-test',
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+
+    const rootPolicy = runtime.getAgentPolicy('root');
+    const researcher = runtime.getAgentArchetypeProfiles().find(profile => profile.archetype === 'researcher');
+    expect(rootPolicy?.spawnPolicy.maxChildren).toBe(2);
+    expect(rootPolicy?.spawnPolicy.maxDepth).toBe(2);
+    expect(rootPolicy?.spawnPolicy.allowCustomAgents).toBe(false);
+    expect(rootPolicy?.spawnPolicy.budgetAware).toBe(false);
+    expect(researcher?.tools.map(tool => tool.name)).toEqual(['fs.read']);
+    expect(researcher?.skills.map(skill => skill.name)).toEqual(['use_tool_when_needed']);
 
     await runtime.shutdown();
   });

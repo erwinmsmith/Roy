@@ -37,6 +37,7 @@ import {
   type MemoryUpdateProposal,
   type MemoryUpdateRecord,
   type WorkspaceMemoryState,
+  type WorkspaceRuntimeConfig,
   type RootMemoryContext,
 } from '../memory/index.js';
 
@@ -303,6 +304,7 @@ export class Runtime {
   private scheduler: MessageScheduler | null = null;
   private memory: WorkspaceMemoryManager | null = null;
   private agentBindings = new Map<string, AgentBindingState>();
+  private workspaceRuntimeConfig: WorkspaceRuntimeConfig | null = null;
 
   static getInstance(): Runtime {
     if (!Runtime.instance) {
@@ -358,6 +360,7 @@ export class Runtime {
     this.registerCoreSkills();
     const memory = new WorkspaceMemoryManager();
     await memory.initWorkspace(options.workspaceCwd ?? process.cwd(), options.sessionId ?? 'main');
+    this.workspaceRuntimeConfig = await memory.getWorkspaceConfig();
     const rootMemory = await memory.loadAgentMemory('roy');
     const rootContext = await memory.loadRootContext();
     const queue = new InMemoryMessageQueue(transition => this.handleQueueTransition(transition));
@@ -465,6 +468,7 @@ export class Runtime {
     this.queue = null;
     this.scheduler = null;
     this.memory = null;
+    this.workspaceRuntimeConfig = null;
     this.agentBindings.clear();
     this.initialized = false;
     logger.info('Runtime shutdown complete');
@@ -660,7 +664,8 @@ export class Runtime {
       tester: ['fs.read', 'shell.exec'],
       custom: [],
     };
-    return namesByArchetype[archetype].map(name => this.createToolBinding(name));
+    const configured = this.workspaceRuntimeConfig?.agents.defaultToolsByArchetype[archetype];
+    return (configured ?? namesByArchetype[archetype]).map(name => this.createToolBinding(name));
   }
 
   private getDefaultSkillBindings(archetype: SubAgentArchetype): SkillBinding[] {
@@ -673,7 +678,8 @@ export class Runtime {
       tester: ['use_tool_when_needed', 'delegate_to_subagent'],
       custom: [],
     };
-    return namesByArchetype[archetype].map(name => this.createSkillBinding(name));
+    const configured = this.workspaceRuntimeConfig?.agents.defaultSkillsByArchetype[archetype];
+    return (configured ?? namesByArchetype[archetype]).map(name => this.createSkillBinding(name));
   }
 
   private createToolBinding(name: string): ToolBinding {
@@ -719,14 +725,16 @@ export class Runtime {
 
   private getDefaultSpawnPolicy(role: 'root' | 'subagent' | string, archetype?: SubAgentArchetype): AgentSpawnPolicy {
     const isRoot = role === 'root';
-    const canSpawn = isRoot || archetype !== 'summarizer';
+    const delegation = this.workspaceRuntimeConfig?.delegation;
+    const archetypeSkills = archetype ? this.getDefaultSkillBindings(archetype).map(binding => binding.name) : [];
+    const canSpawn = delegation?.enabled !== false && (isRoot || archetypeSkills.includes('delegate_to_subagent'));
     return {
       canSpawn,
-      maxChildren: 5,
-      maxDepth: 3,
-      maxTotalAgentsPerTurn: 10,
-      allowCustomAgents: isRoot,
-      budgetAware: true,
+      maxChildren: delegation?.maxChildrenPerParent ?? 5,
+      maxDepth: delegation?.maxDepth ?? 3,
+      maxTotalAgentsPerTurn: delegation?.maxTotalAgentsPerTurn ?? 10,
+      allowCustomAgents: isRoot && (delegation?.allowCustomAgents ?? true),
+      budgetAware: delegation?.budgetAware ?? true,
       allowedStates: ['idle', 'thinking', 'waiting', 'done'],
     };
   }

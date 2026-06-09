@@ -133,6 +133,25 @@ export interface AgentPatternInput {
   spawnPolicy?: unknown;
 }
 
+export interface WorkspaceRuntimeConfig {
+  version: number;
+  traceEvents: boolean;
+  memoryUpdates: MemoryMode;
+  delegation: {
+    enabled: boolean;
+    mode: 'manual' | 'auto';
+    maxChildrenPerParent: number;
+    maxDepth: number;
+    maxTotalAgentsPerTurn: number;
+    allowCustomAgents: boolean;
+    budgetAware: boolean;
+  };
+  agents: {
+    defaultToolsByArchetype: Record<string, string[]>;
+    defaultSkillsByArchetype: Record<string, string[]>;
+  };
+}
+
 export interface DelegationPatternInput {
   archetype: string;
   task: string;
@@ -311,6 +330,41 @@ const AGENT_MEMORY_TEMPLATES: Record<string, string> = {
 `,
 };
 
+const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
+  version: 1,
+  traceEvents: true,
+  memoryUpdates: 'suggest',
+  delegation: {
+    enabled: true,
+    mode: 'auto',
+    maxChildrenPerParent: 5,
+    maxDepth: 3,
+    maxTotalAgentsPerTurn: 10,
+    allowCustomAgents: true,
+    budgetAware: true,
+  },
+  agents: {
+    defaultToolsByArchetype: {
+      researcher: ['fs.list', 'fs.read'],
+      critic: ['fs.read'],
+      planner: [],
+      coder: ['fs.read', 'shell.exec'],
+      summarizer: [],
+      tester: ['fs.read', 'shell.exec'],
+      custom: [],
+    },
+    defaultSkillsByArchetype: {
+      researcher: ['use_tool_when_needed', 'delegate_to_subagent'],
+      critic: ['use_tool_when_needed', 'delegate_to_subagent'],
+      planner: ['delegate_to_subagent'],
+      coder: ['use_tool_when_needed', 'delegate_to_subagent'],
+      summarizer: [],
+      tester: ['use_tool_when_needed', 'delegate_to_subagent'],
+      custom: [],
+    },
+  },
+};
+
 export class WorkspaceMemoryManager {
   private rootPath = '';
   private tracePath = '';
@@ -356,8 +410,9 @@ export class WorkspaceMemoryManager {
     await this.writeIfMissing(path.join(cachePath, 'memory-updates.json'), JSON.stringify({ updates: [] }, null, 2) + '\n');
     await this.writeIfMissing(
       path.join(this.rootPath, 'config.json'),
-      JSON.stringify({ version: 1, traceEvents: true, memoryUpdates: 'suggest' }, null, 2) + '\n'
+      JSON.stringify(DEFAULT_WORKSPACE_CONFIG, null, 2) + '\n'
     );
+    await this.ensureWorkspaceConfigDefaults();
     await this.writeIfMissing(
       path.join(this.rootPath, 'index.json'),
       JSON.stringify({
@@ -519,6 +574,12 @@ Keep this agent identity separate from the model provider identity.
     const config = await this.readJson<Record<string, unknown>>(path.join(this.rootPath, 'config.json'), {});
     const mode = config.memoryUpdates;
     return mode === 'off' || mode === 'auto-safe' || mode === 'suggest' ? mode : 'suggest';
+  }
+
+  async getWorkspaceConfig(): Promise<WorkspaceRuntimeConfig> {
+    const configPath = path.join(this.rootPath, 'config.json');
+    const current = await this.readJson<Record<string, unknown>>(configPath, {});
+    return this.mergeDefaults(DEFAULT_WORKSPACE_CONFIG, current) as WorkspaceRuntimeConfig;
   }
 
   async setMemoryMode(mode: MemoryMode): Promise<MemoryMode> {
@@ -1441,6 +1502,31 @@ Keep this agent identity separate from the model provider identity.
 
   private safeTimestamp(date: Date): string {
     return date.toISOString().replace(/:/g, '-');
+  }
+
+  private async ensureWorkspaceConfigDefaults(): Promise<void> {
+    const configPath = path.join(this.rootPath, 'config.json');
+    const current = await this.readJson<Record<string, unknown>>(configPath, {});
+    const merged = this.mergeDefaults(DEFAULT_WORKSPACE_CONFIG, current);
+    await writeFile(configPath, JSON.stringify(merged, null, 2) + '\n', 'utf8');
+  }
+
+  private mergeDefaults(defaults: unknown, current: unknown): unknown {
+    if (!this.isPlainObject(defaults)) {
+      return current === undefined ? defaults : current;
+    }
+    const currentObject = this.isPlainObject(current) ? current : {};
+    const merged: Record<string, unknown> = { ...currentObject };
+    for (const [key, value] of Object.entries(defaults)) {
+      merged[key] = key in currentObject
+        ? this.mergeDefaults(value, currentObject[key])
+        : value;
+    }
+    return merged;
+  }
+
+  private isPlainObject(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
   }
 
   private safeKey(value: string): string {
