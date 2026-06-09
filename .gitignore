@@ -18,6 +18,7 @@ roy.secrets.yml
 logs/
 docs/
 docs/manual-test.local.md
+docs/project-guide.local.md
 
 # IDE
 .idea/
