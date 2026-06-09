@@ -154,11 +154,34 @@ export interface SpawnCommandPayload {
   archetype: SubAgentArchetype;
   task: string;
   parentId?: string;
+  correlationId?: string;
+  source?: string;
   name?: string;
   customRole?: string;
   customStyle?: string;
+  tomLevel?: number;
+  budgetTokens?: number;
   requireRootSynthesis?: boolean;
   showSubagentOutput?: boolean;
+}
+
+export type DelegationDecision =
+  | {
+      action: 'solve_directly';
+      reason: string;
+    }
+  | {
+      action: 'spawn_subagents';
+      reason: string;
+      agents: DelegationAgentPlan[];
+    };
+
+export interface DelegationAgentPlan {
+  archetype: SubAgentArchetype;
+  name?: string;
+  task: string;
+  tomLevel?: number;
+  budgetTokens?: number;
 }
 
 export interface RootMediatedSpawnResult {
@@ -168,6 +191,19 @@ export interface RootMediatedSpawnResult {
   finalResponse: string;
   messages: RuntimeMessage[];
   creationUsage: AgentCreationUsage;
+}
+
+export interface RootTurnResult {
+  correlationId: string;
+  decision: DelegationDecision;
+  finalResponse: string;
+  subagents: RootMediatedSpawnResult[];
+  messages: RuntimeMessage[];
+  usage: {
+    root: TokenUsage;
+    subagents: Record<string, TokenUsage>;
+    total: TokenUsage;
+  };
 }
 
 export interface AgentCreationUsage {
@@ -723,9 +759,134 @@ export class Runtime {
     return result;
   }
 
-  async handleSpawnCommand(payload: SpawnCommandPayload): Promise<RootMediatedSpawnResult> {
+  async handleUserTurn(userInput: string): Promise<RootTurnResult> {
     const ctx = this.getContext();
     const correlationId = this.createCorrelationId();
+    const rootUsageBefore = ctx.agent.getUsage();
+
+    const inputMessage = await this.enqueueMessage({
+      kind: 'user.input',
+      sessionId: ctx.sessionId,
+      from: 'cli',
+      to: 'root',
+      correlationId,
+      payload: { input: userInput },
+      metadata: { agentId: 'root' },
+    });
+    await this.processQueuedMessage(inputMessage.id);
+    await ctx.queue.ack(inputMessage.id);
+
+    await this.recordConversation({
+      role: 'user',
+      speaker: 'user',
+      content: userInput,
+      correlationId,
+      metadata: { kind: 'user.input' },
+    });
+
+    await this.transitionRootTurnState('S_input_received', { correlationId });
+    await this.transitionRootTurnState('S_assess_task', { correlationId });
+    const decision = await this.decideDelegation(userInput, correlationId);
+    this.emit({
+      type: 'delegation.decision',
+      agentId: 'root',
+      data: {
+        correlationId,
+        action: decision.action,
+        reason: decision.reason,
+        agents: decision.action === 'spawn_subagents' ? decision.agents : [],
+      },
+    });
+
+    let finalResponse = '';
+    const subagents: RootMediatedSpawnResult[] = [];
+
+    if (decision.action === 'solve_directly') {
+      await this.transitionRootTurnState('S_solo_reasoning', { correlationId, reason: decision.reason });
+      finalResponse = await this.runRootSoloReasoning(userInput, correlationId);
+    } else {
+      await this.transitionRootTurnState('S_delegate_planning', { correlationId, count: decision.agents.length });
+      await this.transitionRootTurnState('S_spawn_subagents', { correlationId, count: decision.agents.length });
+      for (const plan of decision.agents.slice(0, 3)) {
+        const result = await this.handleSpawnCommand({
+          archetype: plan.archetype,
+          task: plan.task,
+          parentId: 'root',
+          name: plan.name,
+          tomLevel: plan.tomLevel,
+          budgetTokens: plan.budgetTokens,
+          correlationId,
+          source: 'root',
+          requireRootSynthesis: false,
+          showSubagentOutput: false,
+        });
+        subagents.push(result);
+      }
+      await this.transitionRootTurnState('S_wait_subagents', {
+        correlationId,
+        completed: subagents.length,
+      });
+      await this.transitionRootTurnState('S_synthesize', { correlationId, completed: subagents.length });
+      finalResponse = await this.synthesizeDelegatedResults(userInput, subagents, correlationId);
+    }
+
+    await this.transitionRootTurnState('S_respond', { correlationId });
+    const finalMessage = await this.enqueueMessage({
+      kind: 'root.final_response',
+      sessionId: ctx.sessionId,
+      from: 'root',
+      to: 'cli',
+      correlationId,
+      payload: { content: finalResponse },
+      metadata: { agentId: 'root' },
+    });
+    await this.recordConversation({
+      role: 'assistant',
+      speaker: 'Roy',
+      content: finalResponse,
+      correlationId,
+      metadata: {
+        kind: subagents.length > 0 ? 'root.delegated_final_response' : 'root.chat_response',
+        decision: decision.action,
+        subagentIds: subagents.map(result => result.agent.identity.id),
+        grounded: subagents.length === 0 ? undefined : subagents.every(result => result.subagentResult.grounded),
+      },
+    });
+    await this.processQueuedMessage(finalMessage.id);
+    await ctx.queue.ack(finalMessage.id);
+    await this.transitionRootTurnState('S_turn_done', { correlationId });
+    await this.transitionRootTurnState('S_solo', { correlationId });
+    await this.proposeMemoryUpdates('turn.completed');
+
+    const rootUsageAfter = ctx.agent.getUsage();
+    const rootUsage = this.toTokenUsage({
+      llmCalls: rootUsageAfter.llmCalls - rootUsageBefore.llmCalls,
+      promptTokens: rootUsageAfter.promptTokens - rootUsageBefore.promptTokens,
+      completionTokens: rootUsageAfter.completionTokens - rootUsageBefore.completionTokens,
+      totalTokens: rootUsageAfter.totalTokens - rootUsageBefore.totalTokens,
+    });
+    const subagentUsage: Record<string, TokenUsage> = {};
+    for (const item of subagents) {
+      subagentUsage[item.agent.identity.id] = item.subagentResult.usage;
+    }
+
+    return {
+      correlationId,
+      decision,
+      finalResponse,
+      subagents,
+      messages: await this.getMessages({ correlationId }),
+      usage: {
+        root: rootUsage,
+        subagents: subagentUsage,
+        total: this.sumUsage([rootUsage, ...Object.values(subagentUsage)]),
+      },
+    };
+  }
+
+  async handleSpawnCommand(payload: SpawnCommandPayload): Promise<RootMediatedSpawnResult> {
+    const ctx = this.getContext();
+    const correlationId = payload.correlationId ?? this.createCorrelationId();
     const parentId = payload.parentId ?? 'root';
     const requireRootSynthesis = payload.requireRootSynthesis ?? true;
     const cachedAgentPattern = await ctx.memory.findAgentPattern(payload.archetype);
@@ -763,7 +924,7 @@ export class Runtime {
     const command = await this.enqueueMessage({
       kind: 'user.command.spawn',
       sessionId: ctx.sessionId,
-      from: 'cli',
+      from: payload.source ?? 'cli',
       to: parentId,
       correlationId,
       payload,
@@ -780,6 +941,9 @@ export class Runtime {
     await ctx.queue.ack(command.id);
 
     const tomProfile = this.createSubagentToMProfile(payload.archetype, '', payload.task);
+    if (payload.tomLevel !== undefined && [0, 1, 2, 3].includes(payload.tomLevel)) {
+      tomProfile.level = payload.tomLevel as ToMProfile['level'];
+    }
     const agent = await this.spawnAgent({
       parentId,
       name: payload.name,
@@ -789,6 +953,7 @@ export class Runtime {
       tomLevel: tomProfile.level,
       description: payload.task,
       task: payload.task,
+      budgetTokens: payload.budgetTokens,
       systemPrompt: undefined,
       tomProfile,
       cacheHits,
@@ -869,31 +1034,33 @@ export class Runtime {
 
     const finalResponse = requireRootSynthesis
       ? await this.synthesizeSubagentResult(payload.task, agent, subagentResult, correlationId, resultMessage.id)
-      : '[system] Subagent completed without root synthesis.';
+      : '';
 
-    const finalMessage = await this.enqueueMessage({
-      kind: 'root.final_response',
-      sessionId: ctx.sessionId,
-      from: 'root',
-      to: 'cli',
-      correlationId,
-      payload: { content: finalResponse },
-      metadata: { agentId: 'root' },
-    });
-    await this.recordConversation({
-      role: 'assistant',
-      speaker: 'Roy',
-      content: finalResponse,
-      correlationId,
-      metadata: {
+    if (requireRootSynthesis) {
+      const finalMessage = await this.enqueueMessage({
         kind: 'root.final_response',
-        subagentId: agent.identity.id,
-        grounded: subagentResult.grounded,
-      },
-    });
-    await this.processQueuedMessage(finalMessage.id);
-    await ctx.queue.ack(finalMessage.id);
-    await this.proposeMemoryUpdates('turn.completed');
+        sessionId: ctx.sessionId,
+        from: 'root',
+        to: 'cli',
+        correlationId,
+        payload: { content: finalResponse },
+        metadata: { agentId: 'root' },
+      });
+      await this.recordConversation({
+        role: 'assistant',
+        speaker: 'Roy',
+        content: finalResponse,
+        correlationId,
+        metadata: {
+          kind: 'root.final_response',
+          subagentId: agent.identity.id,
+          grounded: subagentResult.grounded,
+        },
+      });
+      await this.processQueuedMessage(finalMessage.id);
+      await ctx.queue.ack(finalMessage.id);
+      await this.proposeMemoryUpdates('turn.completed');
+    }
 
     return {
       correlationId,
@@ -1180,6 +1347,339 @@ export class Runtime {
     return ctx.queue.dequeue({ to: message.to, kind: [message.kind], readyOnly: true });
   }
 
+  private async transitionRootTurnState(state: Parameters<FSM['transition']>[0], data: Record<string, unknown> = {}): Promise<void> {
+    const ctx = this.getContext();
+    if (!state) return;
+    await ctx.fsm.transition(state);
+    this.emit({ type: 'turn.fsm.state', agentId: 'root', data: { state, ...data } });
+  }
+
+  private async decideDelegation(userInput: string, correlationId: string): Promise<DelegationDecision> {
+    const ctx = this.getContext();
+    const fallback = this.fallbackDelegationDecision(userInput);
+
+    if (!ctx.llm) {
+      this.emit({
+        type: 'delegation.decision.fallback',
+        agentId: 'root',
+        data: { correlationId, reason: 'llm_not_configured' },
+      });
+      return fallback;
+    }
+
+    try {
+      this.emit({ type: 'delegation.assess.started', agentId: 'root', data: { correlationId } });
+      const rootContext = await ctx.memory.loadRootContext();
+      const decision = await ctx.llm.completeJSON<DelegationDecision>([
+        {
+          role: 'system',
+          content: `You are Roy's root delegation controller.
+Decide whether the user request should be solved directly by Roy or delegated to 1-3 subagents.
+Use delegation only when the task benefits from grounded inspection, critique, planning, coding, testing, or summarization.
+Do not spawn more than 3 subagents. Prefer 1-2 unless the task clearly needs more.
+Return strict JSON matching one of:
+{"action":"solve_directly","reason":"..."}
+{"action":"spawn_subagents","reason":"...","agents":[{"archetype":"researcher","name":"Researcher-1","task":"...","tomLevel":0}]}
+Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, custom.`,
+        },
+        {
+          role: 'user',
+          content: [
+            `<user_task>${userInput}</user_task>`,
+            `<memory_context>${this.formatPublicContext(rootContext).slice(0, 6000)}</memory_context>`,
+            '<runtime_policy>Subagents must be runtime actors with identity, state, budget, messages, and events. If spawning, assign concrete non-overlapping tasks.</runtime_policy>',
+          ].join('\n\n'),
+        },
+      ], { temperature: 0.1, maxTokens: 900 });
+      const normalized = this.normalizeDelegationDecision(decision, userInput);
+      this.emit({
+        type: 'delegation.assess.completed',
+        agentId: 'root',
+        data: { correlationId, action: normalized.action, source: 'llm' },
+      });
+      return normalized;
+    } catch (error) {
+      this.emit({
+        type: 'delegation.decision.fallback',
+        agentId: 'root',
+        data: {
+          correlationId,
+          reason: 'llm_decision_failed',
+          error: error instanceof Error ? error.message : String(error),
+        },
+      });
+      return fallback;
+    }
+  }
+
+  private normalizeDelegationDecision(decision: unknown, userInput: string): DelegationDecision {
+    const item = decision as Partial<DelegationDecision>;
+    if (item.action === 'solve_directly') {
+      return {
+        action: 'solve_directly',
+        reason: typeof item.reason === 'string' && item.reason.trim()
+          ? item.reason.trim()
+          : 'The task appears simple enough for Roy to answer directly.',
+      };
+    }
+
+    if (item.action === 'spawn_subagents' && Array.isArray((item as { agents?: unknown[] }).agents)) {
+      const agents = (item as { agents: Array<Partial<DelegationAgentPlan>> }).agents
+        .filter(plan => this.isValidArchetype(String(plan.archetype)))
+        .slice(0, 3)
+        .map((plan): DelegationAgentPlan => ({
+          archetype: String(plan.archetype) as SubAgentArchetype,
+          name: typeof plan.name === 'string' ? plan.name : undefined,
+          task: typeof plan.task === 'string' && plan.task.trim()
+            ? plan.task.trim()
+            : userInput,
+          tomLevel: typeof plan.tomLevel === 'number' ? plan.tomLevel : undefined,
+          budgetTokens: typeof plan.budgetTokens === 'number' ? plan.budgetTokens : undefined,
+        }));
+
+      if (agents.length > 0) {
+        return {
+          action: 'spawn_subagents',
+          reason: typeof item.reason === 'string' && item.reason.trim()
+            ? item.reason.trim()
+            : 'The task benefits from delegated specialist work.',
+          agents,
+        };
+      }
+    }
+
+    return this.fallbackDelegationDecision(userInput);
+  }
+
+  private fallbackDelegationDecision(userInput: string): DelegationDecision {
+    const lower = userInput.toLowerCase();
+    const asksProjectInspection = /\b(inspect|analy[sz]e|review|audit|check|read|list)\b/.test(lower)
+      && /\b(repo|repository|project|codebase|architecture|structure|src|files?)\b/.test(lower);
+    const asksRisk = /\b(risk|risks|problem|bug|bugs|issue|issues|critique|review|regression|coupling)\b/.test(lower);
+    const asksPlan = /\b(plan|steps|roadmap|refactor|design|phase|implement)\b/.test(lower);
+    const asksCode = /\b(code|implement|fix|modify|change|patch)\b/.test(lower);
+    const agents: DelegationAgentPlan[] = [];
+
+    if (asksProjectInspection) {
+      agents.push({
+        archetype: 'researcher',
+        name: 'Researcher-1',
+        task: `Inspect grounded project structure and collect concrete evidence for: ${userInput}`,
+        tomLevel: 0,
+      });
+    }
+    if (asksRisk) {
+      agents.push({
+        archetype: 'critic',
+        name: `Critic-${agents.length + 1}`,
+        task: `Identify architectural risks, hidden coupling, and failure modes for: ${userInput}`,
+        tomLevel: 2,
+      });
+    }
+    if (agents.length === 0 && asksPlan) {
+      agents.push({
+        archetype: 'planner',
+        name: 'Planner-1',
+        task: `Turn the user request into an actionable implementation plan: ${userInput}`,
+        tomLevel: 1,
+      });
+    }
+    if (agents.length === 0 && asksCode) {
+      agents.push({
+        archetype: 'coder',
+        name: 'Coder-1',
+        task: `Assess the coding change needed for: ${userInput}`,
+        tomLevel: 0,
+      });
+    }
+
+    if (agents.length > 0) {
+      return {
+        action: 'spawn_subagents',
+        reason: 'The request is broad or evidence-seeking, so Roy should delegate specialist subtasks before synthesis.',
+        agents: agents.slice(0, 3),
+      };
+    }
+
+    return {
+      action: 'solve_directly',
+      reason: 'The request appears simple enough for Roy to answer without spawning subagents.',
+    };
+  }
+
+  private async runRootSoloReasoning(userInput: string, correlationId: string): Promise<string> {
+    const ctx = this.getContext();
+    const usageBefore = ctx.agent.getUsage();
+    ctx.agent.setRuntimeState('thinking');
+    this.emit({ type: 'agent.status.changed', agentId: 'root', data: { to: 'thinking', correlationId } });
+    this.emit({ type: 'agent.llm.called', agentId: 'root', data: { purpose: 'root.solo_reasoning', correlationId } });
+    const response = await this.completeAsRoot(userInput, 'root.solo_reasoning', correlationId);
+    const usageAfter = ctx.agent.getUsage();
+    const usageDelta = this.toTokenUsage({
+      llmCalls: usageAfter.llmCalls - usageBefore.llmCalls,
+      promptTokens: usageAfter.promptTokens - usageBefore.promptTokens,
+      completionTokens: usageAfter.completionTokens - usageBefore.completionTokens,
+      totalTokens: usageAfter.totalTokens - usageBefore.totalTokens,
+    });
+    this.recordTurnUsage(usageDelta);
+    this.emit({ type: 'budget.updated', agentId: 'root', data: { ...usageDelta } });
+    ctx.agent.setRuntimeState('idle');
+    this.emit({ type: 'agent.status.changed', agentId: 'root', data: { to: 'idle', correlationId } });
+    this.emit({ type: 'root.solo.completed', agentId: 'root', data: { correlationId, totalTokens: usageDelta.totalTokens } });
+    return response || ctx.agent.getInfo().lastResult || '';
+  }
+
+  private async completeAsRoot(prompt: string, purpose: string, correlationId: string): Promise<string> {
+    const ctx = this.getContext();
+    if (!ctx.llm) {
+      const message = 'Error: LLM not configured';
+      ctx.agent.recordRuntimeCompletion(message, {
+        content: message,
+        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      });
+      return message;
+    }
+
+    const messages = [
+      {
+        role: 'system',
+        content: [
+          'You are Roy, the root agent of a Theory-of-Mind based autonomous agent system.',
+          'You are not DeepSeek, Claude, OpenAI, Anthropic, or any model provider.',
+          'The model provider is only your inference backend.',
+          `Purpose: ${purpose}.`,
+          `Correlation: ${correlationId}.`,
+        ].join('\n'),
+      },
+      { role: 'user', content: prompt },
+    ] as const;
+    const chunks: string[] = [];
+    let usageChunk: { usage?: { promptTokens: number; completionTokens: number; totalTokens: number } } | undefined;
+    for await (const chunk of ctx.llm.stream([...messages], { temperature: 0.2 })) {
+      if (chunk.content) chunks.push(chunk.content);
+      if (chunk.usage) usageChunk = chunk;
+    }
+    const content = chunks.join('');
+    ctx.agent.recordRuntimeCompletion(content, {
+      content,
+      usage: usageChunk?.usage ?? {
+        promptTokens: this.estimateTextTokens(prompt),
+        completionTokens: this.estimateTextTokens(content),
+        totalTokens: this.estimateTextTokens(prompt) + this.estimateTextTokens(content),
+      },
+    });
+    return content;
+  }
+
+  private async synthesizeDelegatedResults(
+    userTask: string,
+    results: RootMediatedSpawnResult[],
+    correlationId: string
+  ): Promise<string> {
+    const ctx = this.getContext();
+    const synthesisMessage = await this.enqueueMessage({
+      kind: 'root.synthesis',
+      sessionId: ctx.sessionId,
+      from: 'root',
+      to: 'root',
+      correlationId,
+      payload: {
+        userTask,
+        subagentIds: results.map(result => result.agent.identity.id),
+      },
+      metadata: { agentId: 'root', tomLevel: ctx.agent.getIdentity().tomProfile.level },
+    });
+    await this.processQueuedMessage(synthesisMessage.id);
+
+    const usageBefore = ctx.agent.getUsage();
+    ctx.agent.setRuntimeState('synthesizing');
+    this.emit({
+      type: 'root.synthesis.started',
+      agentId: 'root',
+      data: { correlationId, subagentIds: results.map(result => result.agent.identity.id) },
+    });
+    this.emit({ type: 'agent.status.changed', agentId: 'root', data: { to: 'synthesizing', correlationId } });
+    this.emit({ type: 'agent.llm.called', agentId: 'root', data: { purpose: 'root.multi_agent_synthesis', correlationId } });
+    const response = await this.completeAsRoot(
+      this.buildMultiAgentSynthesisPrompt(userTask, results),
+      'root.multi_agent_synthesis',
+      correlationId
+    );
+    const usageAfter = ctx.agent.getUsage();
+    const usageDelta = this.toTokenUsage({
+      llmCalls: usageAfter.llmCalls - usageBefore.llmCalls,
+      promptTokens: usageAfter.promptTokens - usageBefore.promptTokens,
+      completionTokens: usageAfter.completionTokens - usageBefore.completionTokens,
+      totalTokens: usageAfter.totalTokens - usageBefore.totalTokens,
+    });
+    this.recordTurnUsage(usageDelta);
+    this.emit({ type: 'budget.updated', agentId: 'root', data: { ...usageDelta } });
+    ctx.agent.setRuntimeState('idle');
+    this.emit({ type: 'agent.status.changed', agentId: 'root', data: { to: 'idle', correlationId } });
+    this.emit({
+      type: 'root.synthesis.completed',
+      agentId: 'root',
+      data: { correlationId, totalTokens: usageDelta.totalTokens, subagentCount: results.length },
+    });
+    await ctx.queue.ack(synthesisMessage.id);
+    return response || ctx.agent.getInfo().lastResult || '';
+  }
+
+  private buildMultiAgentSynthesisPrompt(userTask: string, results: RootMediatedSpawnResult[]): string {
+    const reports = results.map(result => {
+      const warnings = result.subagentResult.warnings.length > 0
+        ? result.subagentResult.warnings.map(item => `- ${item}`).join('\n')
+        : 'None';
+      return `<subagent_report>
+id: ${result.agent.identity.id}
+name: ${result.agent.identity.name}
+archetype: ${result.agent.identity.role}
+tom: ToM-${result.agent.identity.tomProfile.level}
+tokens: ${result.subagentResult.usage.totalTokens}
+grounded: ${result.subagentResult.grounded}
+tool_grounded: ${result.subagentResult.evidence.toolGrounded}
+output_grounded: ${result.subagentResult.evidence.outputGrounded}
+tool_calls: ${result.subagentResult.toolCalls.map(call => call.toolName).join(', ') || 'none'}
+observed_paths:
+${result.subagentResult.evidence.observedPaths.slice(0, 40).map(item => `- ${item}`).join('\n') || '- none'}
+warnings:
+${warnings}
+content:
+${result.subagentResult.result}
+</subagent_report>`;
+    }).join('\n\n');
+
+    return `The user requested:
+<user_task>
+${userTask}
+</user_task>
+
+Roy delegated this task to ${results.length} subagent(s). Synthesize their results into one final user-facing response.
+Use concrete evidence from grounded reports. If a report is ungrounded or missing concrete tool output, say so and avoid overstating it.
+
+${reports}
+
+Produce the final response to the user as Roy, the root agent.`;
+  }
+
+  private sumUsage(items: TokenUsage[]): TokenUsage {
+    return items.reduce<TokenUsage>((total, item) => ({
+      llmCalls: total.llmCalls + item.llmCalls,
+      promptTokens: total.promptTokens + item.promptTokens,
+      completionTokens: total.completionTokens + item.completionTokens,
+      totalTokens: total.totalTokens + item.totalTokens,
+      thinkingTokens: total.thinkingTokens === null && item.thinkingTokens === null
+        ? null
+        : Number(total.thinkingTokens ?? 0) + Number(item.thinkingTokens ?? 0),
+    }), {
+      llmCalls: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      thinkingTokens: null,
+    });
+  }
+
   private async synthesizeSubagentResult(
     userTask: string,
     agent: AgentInfo,
@@ -1203,16 +1703,17 @@ export class Runtime {
     });
     await this.processQueuedMessage(synthesisMessage.id);
 
-    const session = ctx.manager.getSession(ctx.sessionId);
-    session?.messageQueue.clear('env');
-
     const usageBefore = ctx.agent.getUsage();
     ctx.agent.setRuntimeState('synthesizing');
     this.emit({ type: 'root.synthesis.started', agentId: 'root', data: { correlationId, subagentId: agent.identity.id } });
     this.emit({ type: 'agent.status.changed', agentId: 'root', data: { to: 'synthesizing' } });
     this.emit({ type: 'agent.llm.called', agentId: 'root', data: { purpose: 'root.synthesis', correlationId } });
 
-    await ctx.agent.step(this.buildRootSynthesisPrompt(userTask, agent, subagentResult));
+    const response = await this.completeAsRoot(
+      this.buildRootSynthesisPrompt(userTask, agent, subagentResult),
+      'root.synthesis',
+      correlationId
+    );
 
     const usageAfter = ctx.agent.getUsage();
     const usageDelta = this.toTokenUsage({
@@ -1224,7 +1725,6 @@ export class Runtime {
     this.recordTurnUsage(usageDelta);
     this.emit({ type: 'budget.updated', agentId: 'root', data: { ...usageDelta } });
 
-    const response = session ? await this.drainAgentOutput(session.messageQueue, ctx.agent.name) : ctx.agent.getInfo().lastResult ?? '';
     ctx.agent.setRuntimeState('idle');
     this.emit({ type: 'agent.status.changed', agentId: 'root', data: { to: 'idle' } });
     this.emit({ type: 'root.synthesis.completed', agentId: 'root', data: { correlationId, totalTokens: usageDelta.totalTokens } });

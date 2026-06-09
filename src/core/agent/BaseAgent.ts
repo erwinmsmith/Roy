@@ -243,6 +243,14 @@ export abstract class BaseAgent {
   }
 
   /**
+   * Record a completion executed directly by the runtime orchestration layer.
+   */
+  recordRuntimeCompletion(content: string, result: LLMCompletionResult | LLMStreamChunk): void {
+    this.recordUsage(result);
+    this.addToMemory('result', content);
+  }
+
+  /**
    * Set message queue for communication
    */
   setMessageQueue(queue: MessageQueue): void {

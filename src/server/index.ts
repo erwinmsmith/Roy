@@ -7,7 +7,6 @@ import { Server } from 'socket.io';
 import { bootstrap, cleanup, type BootstrapContext } from '../bootstrap.js';
 import { runtime } from '../core/runtime/Runtime.js';
 import { logger } from '../core/utils/logger.js';
-import type { QueueMessage } from '../core/message/MessageQueue.js';
 
 // ASCII Banner - compatible with all terminals
 const SERVER_BANNER = `
@@ -48,16 +47,6 @@ function bold(text: string): string {
 
 function dim(text: string): string {
   return `\x1b[2m${text}\x1b[0m`;
-}
-
-async function receiveWithTimeout(
-  receive: () => Promise<QueueMessage | undefined>,
-  timeoutMs: number
-): Promise<QueueMessage | undefined> {
-  return Promise.race([
-    receive(),
-    new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), timeoutMs)),
-  ]);
 }
 
 // Graceful port handling
@@ -122,9 +111,6 @@ async function main(): Promise<void> {
     socket.on('user_message', async (message: string) => {
       logger.info(`Received message from ${sid}: ${message.substring(0, 100)}...`);
 
-      // Get the agent for this session
-      const agent = ctx.agent;
-
       socket.emit('bot_response_start', 'Bot: Processing your request...');
 
       try {
@@ -133,68 +119,8 @@ async function main(): Promise<void> {
           throw new Error(`Session ${sid} not found`);
         }
 
-        let stepDone = false;
-        let stepErrorMessage: string | null = null;
-        let response = '';
-        const usageBefore = agent.getUsage();
-        await runtime.recordConversation({
-          role: 'user',
-          speaker: 'user',
-          content: message,
-          sessionId: sid,
-          metadata: { source: 'api' },
-        });
-        runtime.emit({ type: 'agent.status.changed', agentId: 'root', data: { to: 'thinking', source: 'api' } });
-
-        const stepPromise = agent.step(message)
-          .catch(err => {
-            stepErrorMessage = err instanceof Error ? err.message : String(err);
-            logger.error('Agent step error:', err);
-          })
-          .finally(() => {
-            stepDone = true;
-          });
-
-        while (!stepDone || !session.messageQueue.isEmpty('env')) {
-          const queued = await receiveWithTimeout(
-            () => session.messageQueue.receive('env'),
-            stepDone ? 25 : 100
-          );
-
-          if (!queued) {
-            continue;
-          }
-
-          socket.emit('bot_response_stream', String(queued.content));
-          response += String(queued.content);
-
-          if (queued.metadata?.done === true) {
-            break;
-          }
-        }
-
-        await stepPromise;
-        const usageAfter = agent.getUsage();
-        runtime.recordTurnUsage({
-          llmCalls: usageAfter.llmCalls - usageBefore.llmCalls,
-          promptTokens: usageAfter.promptTokens - usageBefore.promptTokens,
-          completionTokens: usageAfter.completionTokens - usageBefore.completionTokens,
-          totalTokens: usageAfter.totalTokens - usageBefore.totalTokens,
-        });
-        runtime.emit({ type: 'agent.status.changed', agentId: 'root', data: { to: 'idle', source: 'api' } });
-        if (response) {
-          await runtime.recordConversation({
-            role: 'assistant',
-            speaker: agent.name,
-            content: response,
-            sessionId: sid,
-            metadata: { source: 'api', kind: 'root.chat_response' },
-          });
-        }
-
-        if (stepErrorMessage) {
-          socket.emit('bot_response_stream', `Error: ${stepErrorMessage}`);
-        }
+        const result = await runtime.handleUserTurn(message);
+        socket.emit('bot_response_stream', result.finalResponse);
       } catch (error) {
         logger.error(`Error processing message:`, error);
         socket.emit('bot_response_stream', `Error: ${error}`);
@@ -233,6 +159,20 @@ async function main(): Promise<void> {
 
   app.get('/v1/status', (req, res) => {
     res.json(runtime.getState());
+  });
+
+  app.post('/v1/chat', async (req, res) => {
+    const input = req.body?.input ?? req.body?.message;
+    if (typeof input !== 'string' || input.trim().length === 0) {
+      res.status(400).json({ error: 'Expected body { "input": non-empty string }' });
+      return;
+    }
+
+    try {
+      res.json(await runtime.handleUserTurn(input));
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
   });
 
   app.get('/v1/agents', (req, res) => {

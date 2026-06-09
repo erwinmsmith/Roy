@@ -565,6 +565,7 @@ export class Roy {
     console.log('\n  ' + this.bold('API Endpoints:'));
     console.log('    GET  /           - Server info');
     console.log('    GET  /health     - Health check');
+    console.log('    POST /v1/chat    - Root-controlled chat/delegation turn');
     console.log('    GET  /v1/status  - Runtime status');
     console.log('    GET  /v1/agents  - Agent states');
     console.log('    GET  /v1/agents/tree - Agent tree');
@@ -1407,33 +1408,8 @@ export class Roy {
     console.log('\n  ' + this.yellow('roy[root] thinking...') + '\n');
 
     try {
-      // Use agent's step method which integrates FSM and memory
-      this.ctx.agent.addToMemory('meta', 'user turn started');
-      await runtime.recordConversation({
-        role: 'user',
-        speaker: 'user',
-        content: userInput,
-      });
-      const usageBefore = this.ctx.agent.getUsage();
-      runtime.emit({ type: 'agent.status.changed', agentId: 'root', data: { to: 'thinking' } });
-      await this.ctx.agent.step(userInput);
-      const usageAfter = this.ctx.agent.getUsage();
-      runtime.recordTurnUsage({
-        llmCalls: usageAfter.llmCalls - usageBefore.llmCalls,
-        promptTokens: usageAfter.promptTokens - usageBefore.promptTokens,
-        completionTokens: usageAfter.completionTokens - usageBefore.completionTokens,
-        totalTokens: usageAfter.totalTokens - usageBefore.totalTokens,
-      });
-      runtime.emit({ type: 'agent.status.changed', agentId: 'root', data: { to: 'idle' } });
-      const output = await this.printAgentOutput();
-      if (output) {
-        await runtime.recordConversation({
-          role: 'assistant',
-          speaker: this.ctx.agent.name,
-          content: output,
-          metadata: { kind: 'root.chat_response' },
-        });
-      }
+      const result = await runtime.handleUserTurn(userInput);
+      await this.printRootTurnResult(result);
 
       // Show updated FSM state
       if (this.verboseMode) {
@@ -1444,6 +1420,36 @@ export class Roy {
       console.log('\n  ' + this.red('Error:') + ' ' + (error instanceof Error ? error.message : String(error)) + '\n');
       logger.error('Process message error:', error);
     }
+  }
+
+  private async printRootTurnResult(result: Awaited<ReturnType<typeof runtime.handleUserTurn>>): Promise<void> {
+    if (result.decision.action === 'spawn_subagents') {
+      console.log(`  ${this.green('roy[root] spawned')} ${result.subagents.length} subagent${result.subagents.length === 1 ? '' : 's'}: ${result.subagents.map(item => item.agent.name).join(', ')}`);
+      if (this.verboseMode) {
+        console.log(`  ${this.dim(`decision: ${result.decision.reason}`)}`);
+      }
+      for (let index = 0; index < result.subagents.length; index += 1) {
+        const item = result.subagents[index];
+        const branch = index === result.subagents.length - 1 ? '└─' : '├─';
+        console.log(`  ${branch} ${this.yellow(`${item.agent.name}[subagent] completed`)}, ${item.subagentResult.usage.totalTokens} tokens`);
+        if (this.verboseMode) {
+          for (const call of item.subagentResult.toolCalls) {
+            const toolPath = typeof call.params.path === 'string'
+              ? path.relative(process.cwd(), call.params.path) || '.'
+              : '';
+            console.log(`  │  ${this.dim(`tool: ${call.toolName} ${toolPath}`.trim())}`);
+          }
+          for (const warning of item.subagentResult.warnings) {
+            console.log(`  │  ${this.yellow('[warning]')} ${warning}`);
+          }
+        }
+      }
+      console.log(`  ${this.yellow('roy[root] synthesizing...')}\n`);
+    } else if (this.verboseMode) {
+      console.log(`  ${this.dim(`decision: solve_directly - ${result.decision.reason}`)}\n`);
+    }
+
+    console.log('  ' + this.green('roy[root] > ') + result.finalResponse + '\n');
   }
 
   private async printAgentOutput(): Promise<string> {

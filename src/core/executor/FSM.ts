@@ -4,6 +4,15 @@ import type { SignalBus, Signal } from './SignalBus.js';
 import { signalBus } from './SignalBus.js';
 
 export type FSMState =
+  | 'S_input_received'
+  | 'S_assess_task'
+  | 'S_solo_reasoning'
+  | 'S_delegate_planning'
+  | 'S_spawn_subagents'
+  | 'S_wait_subagents'
+  | 'S_synthesize'
+  | 'S_respond'
+  | 'S_turn_done'
   | 'S_solo'
   | 'S_diagnose'
   | 'S_decide'
@@ -229,6 +238,9 @@ export class FSM {
    */
   private registerDefaultTransitions(): void {
     const states: FSMState[] = [
+      'S_input_received', 'S_assess_task', 'S_solo_reasoning',
+      'S_delegate_planning', 'S_spawn_subagents', 'S_wait_subagents',
+      'S_synthesize', 'S_respond', 'S_turn_done',
       'S_solo', 'S_diagnose', 'S_decide', 'S_derive',
       'S_reuse', 'S_execute', 'S_merge', 'S_verify',
       'S_backtrack', 'S_final'

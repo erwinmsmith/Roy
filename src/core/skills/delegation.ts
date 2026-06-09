@@ -119,6 +119,7 @@ export class DelegateToSubagentSkill implements Skill {
       name: params.name,
       customRole: params.customRole,
       customStyle: params.customStyle,
+      budgetTokens: params.budgetTokens,
       requireRootSynthesis: params.requireRootSynthesis ?? true,
       showSubagentOutput: params.showSubagentOutput ?? false,
     };
