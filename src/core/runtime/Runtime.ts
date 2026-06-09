@@ -28,6 +28,7 @@ import {
   WorkspaceMemoryManager,
   type ConversationEntry,
   type ConversationSessionState,
+  type MemoryAutoState,
   type MemoryMode,
   type MemoryProposalSummary,
   type MemorySignals,
@@ -552,16 +553,30 @@ export class Runtime {
     return ctx.memory.getMemoryProposal(id);
   }
 
-  async proposeMemoryUpdates(): Promise<MemoryUpdateProposal[]> {
+  async proposeMemoryUpdates(source = 'manual'): Promise<MemoryUpdateProposal[]> {
     const ctx = this.getContext();
-    this.emit({ type: 'memory.update.propose.started', agentId: 'root' });
+    this.emit({ type: 'memory.update.propose.started', agentId: 'root', data: { source } });
     const signals = await ctx.memory.collectMemorySignals();
+    this.emit({
+      type: 'memory.signals.collected',
+      agentId: 'root',
+      data: {
+        source,
+        sessionId: signals.source.sessionId,
+        agentResults: signals.counts.agentResults,
+        rootFinalResponses: signals.counts.rootFinalResponses,
+        toolCalls: signals.toolCalls.length,
+        outputGrounded: signals.agents.filter(agent => agent.outputGrounded).length,
+        candidateSignals: signals.candidateSignals,
+      },
+    });
     const proposals = await ctx.memory.proposeMemoryUpdates();
     for (const proposal of proposals) {
       this.emit({
-        type: 'memory.update.proposed',
+        type: 'memory.proposal.created',
         agentId: proposal.target.type === 'agent' ? proposal.target.key : 'root',
         data: {
+          source,
           proposalId: proposal.id,
           target: proposal.target.path,
           section: proposal.target.section,
@@ -576,19 +591,41 @@ export class Runtime {
         agentId: 'root',
         data: {
           reason: signals.candidateSignals.length === 0 ? 'no_signals' : 'no_new_proposals',
+          source,
           signalCounts: signals.counts,
           candidateSignals: signals.candidateSignals,
         },
       });
     }
-    this.emit({ type: 'memory.update.propose.completed', agentId: 'root', data: { count: proposals.length } });
+    const records = await ctx.memory.listAllMemoryProposalRecords();
+    const summary: MemoryProposalSummary = {
+      createdThisRun: proposals.length,
+      skippedDuplicates: proposals.length === 0 ? signals.candidateSignals.length : 0,
+      updatedPendingProposals: 0,
+      pendingProposals: records.filter(record => record.status === 'pending').length,
+      alreadyCommitted: records.filter(record => record.status === 'committed').length,
+    };
+    await ctx.memory.recordAutoPropose(source, summary, proposals.length === 0 ? 'no_new_proposals' : undefined);
+    this.emit({
+      type: 'memory.update.propose.completed',
+      agentId: 'root',
+      data: {
+        source,
+        created: proposals.length,
+        updated: summary.updatedPendingProposals,
+        skippedDuplicates: summary.skippedDuplicates,
+        pending: summary.pendingProposals,
+        committed: summary.alreadyCommitted,
+      },
+    });
     return proposals;
   }
 
-  async summarizeMemoryUpdates(): Promise<MemoryProposalSummary> {
+  async summarizeMemoryUpdates(source = 'manual'): Promise<MemoryProposalSummary> {
     const ctx = this.getContext();
-    this.emit({ type: 'memory.update.propose.started', agentId: 'root' });
+    this.emit({ type: 'memory.update.propose.started', agentId: 'root', data: { source } });
     const summary = await ctx.memory.summarizeMemoryUpdates();
+    await ctx.memory.recordAutoPropose(source, summary, summary.createdThisRun === 0 ? 'no_new_proposals' : undefined);
     this.emit({
       type: summary.createdThisRun > 0 ? 'memory.update.propose.completed' : 'memory.update.skipped',
       agentId: 'root',
@@ -598,6 +635,7 @@ export class Runtime {
         updatedPendingProposals: summary.updatedPendingProposals,
         pendingProposals: summary.pendingProposals,
         alreadyCommitted: summary.alreadyCommitted,
+        source,
         reason: summary.createdThisRun === 0 ? 'no_new_proposals' : undefined,
       },
     });
@@ -607,6 +645,16 @@ export class Runtime {
   async collectMemorySignals(): Promise<MemorySignals> {
     const ctx = this.getContext();
     return ctx.memory.collectMemorySignals();
+  }
+
+  async getMemoryAutoState(): Promise<MemoryAutoState> {
+    const ctx = this.getContext();
+    return ctx.memory.getMemoryAutoState();
+  }
+
+  async getCachePatterns(kind: 'agents' | 'delegations' | 'teams'): Promise<Array<Record<string, unknown>>> {
+    const ctx = this.getContext();
+    return ctx.memory.getCachePatterns(kind);
   }
 
   async acceptMemoryProposal(id: string): Promise<MemoryUpdateRecord | undefined> {
@@ -838,7 +886,7 @@ export class Runtime {
     });
     await this.processQueuedMessage(finalMessage.id);
     await ctx.queue.ack(finalMessage.id);
-    await this.proposeMemoryUpdates();
+    await this.proposeMemoryUpdates('turn.completed');
 
     return {
       correlationId,

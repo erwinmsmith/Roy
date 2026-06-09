@@ -124,6 +124,7 @@ export type {
   DelegationPatternInput,
   ConversationEntry,
   ConversationSessionState,
+  MemoryAutoState,
   MemoryDocState,
   MemoryMode,
   MemoryProposalSummary,

@@ -357,6 +357,10 @@ export class Roy {
         await this.printQueue();
         break;
 
+      case '/cache':
+        await this.printCache(parts);
+        break;
+
       case '/messages':
         await this.printMessages(parts);
         break;
@@ -425,7 +429,7 @@ export class Roy {
         break;
 
       case '/context':
-        this.printContext();
+        await this.handleContext(parts);
         break;
 
       case '/conversation':
@@ -461,6 +465,8 @@ export class Roy {
       /events --type <type> Filter events by event type
       /events --latest <n> Show latest N events
       /queue              Show runtime message queue state
+      /cache agents       Show cached agent patterns
+      /cache delegations  Show cached delegation patterns
       /messages --correlation <id> Show messages for a delegation chain
       /memory             Show workspace memory state
       /memory public      Show public memory docs
@@ -473,6 +479,7 @@ export class Roy {
       /memory reject <id> Reject a memory proposal
       /memory summarize   Generate memory proposals from the current session
       /memory mode <mode> Set memory mode: suggest, auto-safe, or off
+      /memory auto on|off Enable or disable auto-propose
       /conversation       Show persisted conversation log
       /conversation sessions List persisted conversation sessions
       /conversation --session <id> Show a specific session
@@ -501,6 +508,7 @@ export class Roy {
       /config             Show runtime configuration
       /prompt agent <key> Show raw agent prompt.md
       /prompt render <key> --task "..." Render final system prompt preview
+      /context render <key> --task "..." Render context/prompt sources
       /color              Toggle color output
 
     ${this.bold('Exit')}
@@ -857,6 +865,20 @@ export class Roy {
       return;
     }
 
+    if (scope === 'auto') {
+      if (key === 'on') {
+        await runtime.setMemoryMode('suggest');
+        console.log('\n  Auto-propose: ' + this.green('enabled') + '\n');
+      } else if (key === 'off') {
+        await runtime.setMemoryMode('off');
+        console.log('\n  Auto-propose: ' + this.yellow('disabled') + '\n');
+      } else {
+        const state = await runtime.getMemoryAutoState();
+        console.log('\n  Auto-propose: ' + (state.enabled ? this.green('enabled') : this.yellow('disabled')) + '\n');
+      }
+      return;
+    }
+
     if (['project', 'context', 'decisions', 'constraints', 'glossary', 'user'].includes(scope)) {
       await this.printPublicMemory(scope);
       return;
@@ -868,10 +890,23 @@ export class Roy {
   private async printMemoryStatus(): Promise<void> {
     const state = await runtime.getMemoryState();
     const mode = await runtime.getMemoryMode();
+    const auto = await runtime.getMemoryAutoState();
     const proposals = await runtime.listMemoryProposals();
     console.log('\n  ' + this.bold('Workspace Memory'));
     console.log(`    Path:      ${this.cyan(path.relative(process.cwd(), state.rootPath) || state.rootPath)}`);
     console.log(`    Mode:      ${this.cyan(mode)}`);
+    console.log(`    Auto-propose: ${auto.enabled ? this.green('enabled') : this.yellow('disabled')}`);
+    if (auto.lastAutoPropose) {
+      console.log('    Last auto-propose:');
+      console.log(`      source:     ${auto.lastAutoPropose.source}`);
+      console.log(`      session:    ${auto.lastAutoPropose.sessionId}`);
+      console.log(`      created:    ${auto.lastAutoPropose.createdThisRun}`);
+      console.log(`      skipped:    ${auto.lastAutoPropose.skippedDuplicates}`);
+      console.log(`      updated:    ${auto.lastAutoPropose.updatedPendingProposals}`);
+      console.log(`      pending:    ${auto.lastAutoPropose.pendingProposals}`);
+      console.log(`      committed:  ${auto.lastAutoPropose.alreadyCommitted}`);
+      if (auto.lastAutoPropose.reason) console.log(`      reason:     ${auto.lastAutoPropose.reason}`);
+    }
     console.log(`    Public:    ${state.publicMemoryDocs.length} docs`);
     console.log(`    Agents:    ${state.agentMemories.length} memories`);
     console.log(`    Proposals: ${proposals.length} pending`);
@@ -1054,6 +1089,22 @@ export class Roy {
     console.log('');
   }
 
+  private async handleContext(parts: string[]): Promise<void> {
+    if (parts[1] === 'render') {
+      const agentKey = parts[2] ?? 'roy';
+      const task = this.optionValue(parts, '--task') ?? this.trailingTask(parts, 3);
+      const rendered = await runtime.renderAgentPrompt({ agentKey, task, archetype: agentKey as any });
+      console.log('\n  ' + this.bold(`Context Render: ${agentKey}`));
+      console.log('  ' + this.bold('Context Sources:'));
+      console.log('    ' + this.dim(JSON.stringify(rendered.sources, null, 2).replace(/\n/g, '\n    ')));
+      console.log('  ' + this.bold('Estimated Tokens:'));
+      console.log(`    prompt: ${this.cyan(String(rendered.estimatedTokens))}`);
+      console.log('');
+      return;
+    }
+    this.printContext();
+  }
+
   private printContext(): void {
     if (!this.ctx) return;
 
@@ -1111,7 +1162,7 @@ export class Roy {
     const commands = [
       '/help', '/h', '/clear', '/cls', '/reset', '/agents', '/spawn', '/run', '/exit', '/quit', '/q',
       '/api', '/status', '/skills', '/actions', '/tools', '/memory', '/session',
-      '/system', '/fsm', '/budget', '/events', '/queue', '/messages', '/traces', '/config', '/prompt', '/context', '/conversation', '/verbose', '/color'
+      '/system', '/fsm', '/budget', '/events', '/queue', '/cache', '/messages', '/traces', '/config', '/prompt', '/context', '/conversation', '/verbose', '/color'
     ];
 
     if (line.startsWith('/')) {
@@ -1194,6 +1245,31 @@ export class Roy {
     } catch (error) {
       console.log('\n  ' + this.red('Spawn error:') + ' ' + (error instanceof Error ? error.message : String(error)) + '\n');
     }
+  }
+
+  private async printCache(parts: string[]): Promise<void> {
+    const scope = parts[1] ?? 'agents';
+    const kind = scope === 'delegations' || scope === 'teams' ? scope : 'agents';
+    const patterns = await runtime.getCachePatterns(kind);
+    console.log('\n  ' + this.bold(`Cache: ${kind}`));
+    if (patterns.length === 0) {
+      console.log('    ' + this.dim('No cached patterns.'));
+      console.log('');
+      return;
+    }
+    for (const pattern of patterns) {
+      const usage = typeof pattern.usage === 'object' && pattern.usage !== null ? pattern.usage as Record<string, unknown> : {};
+      console.log(`    - ${this.cyan(String(pattern.id ?? pattern.key ?? 'pattern'))}`);
+      console.log(`      usage.count: ${usage.count ?? 0}`);
+      console.log(`      lastUsedAt:  ${usage.lastUsedAt ?? '-'}`);
+      if (pattern.promptPath) console.log(`      promptPath:  ${pattern.promptPath}`);
+      if (pattern.memoryPath) console.log(`      memoryPath:  ${pattern.memoryPath}`);
+      if (Array.isArray(pattern.tools)) console.log(`      tools:       ${pattern.tools.join(', ') || 'none'}`);
+      if (Array.isArray(pattern.skills)) console.log(`      skills:      ${pattern.skills.join(', ') || 'none'}`);
+      if (usage.definitionTokensSaved !== undefined) console.log(`      savedTokens: ${usage.definitionTokensSaved}`);
+      if (usage.lastRenderedPromptTokens !== undefined) console.log(`      rendered:    ${usage.lastRenderedPromptTokens} tokens`);
+    }
+    console.log('');
   }
 
   private printSpawnUsage(): void {

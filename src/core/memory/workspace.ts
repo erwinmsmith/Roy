@@ -97,6 +97,22 @@ export interface MemoryProposalSummary {
   alreadyCommitted: number;
 }
 
+export interface MemoryAutoState {
+  enabled: boolean;
+  mode: MemoryMode;
+  lastAutoPropose?: {
+    source: string;
+    sessionId: string;
+    createdThisRun: number;
+    skippedDuplicates: number;
+    updatedPendingProposals: number;
+    pendingProposals: number;
+    alreadyCommitted: number;
+    reason?: string;
+    updatedAt: number;
+  };
+}
+
 export interface AgentMemoryBundle {
   key: string;
   path: string;
@@ -512,6 +528,32 @@ Keep this agent identity separate from the model provider identity.
     return mode;
   }
 
+  async getMemoryAutoState(): Promise<MemoryAutoState> {
+    const config = await this.readJson<Record<string, unknown>>(path.join(this.rootPath, 'config.json'), {});
+    const mode = await this.getMemoryMode();
+    const raw = config.lastAutoPropose;
+    return {
+      enabled: mode !== 'off',
+      mode,
+      lastAutoPropose: raw && typeof raw === 'object'
+        ? raw as MemoryAutoState['lastAutoPropose']
+        : undefined,
+    };
+  }
+
+  async recordAutoPropose(source: string, summary: MemoryProposalSummary, reason?: string): Promise<void> {
+    const configPath = path.join(this.rootPath, 'config.json');
+    const config = await this.readJson<Record<string, unknown>>(configPath, {});
+    config.lastAutoPropose = {
+      source,
+      sessionId: this.sessionId,
+      ...summary,
+      reason,
+      updatedAt: Date.now(),
+    };
+    await writeFile(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+  }
+
   async listMemoryProposals(): Promise<MemoryUpdateProposal[]> {
     const file = await this.readJson<{ proposals?: MemoryUpdateProposal[] }>(
       path.join(this.rootPath, 'cache', 'memory-proposals.json'),
@@ -863,6 +905,15 @@ Keep this agent identity separate from the model provider identity.
       this.updatePatternUsageMetrics('agent-patterns.json', patternIds, metrics),
       this.updatePatternUsageMetrics('delegation-patterns.json', patternIds, metrics),
     ]);
+  }
+
+  async getCachePatterns(kind: 'agents' | 'delegations' | 'teams'): Promise<Array<Record<string, unknown>>> {
+    const fileName = kind === 'agents'
+      ? 'agent-patterns.json'
+      : kind === 'delegations'
+        ? 'delegation-patterns.json'
+        : 'team-patterns.json';
+    return this.readPatterns(fileName) as Promise<Array<Record<string, unknown>>>;
   }
 
   async listTraces(): Promise<Array<{ name: string; path: string; size: number; updatedAt: number }>> {
