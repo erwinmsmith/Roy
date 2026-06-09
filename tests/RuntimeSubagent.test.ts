@@ -109,6 +109,8 @@ describe('Runtime controlled subagent spawning', () => {
     const messages = await runtime.getMessages({ correlationId: result.correlationId });
     expect(messages.map(message => message.kind)).toEqual([
       'user.command.spawn',
+      'agent.create.request',
+      'agent.create.approved',
       'agent.task',
       'tool.call',
       'tool.result',
@@ -380,6 +382,50 @@ describe('Runtime controlled subagent spawning', () => {
     expect(tree.children[0].agent.identity.id).toBe(researcher.identity.id);
     expect(tree.children[0].children).toHaveLength(1);
     expect(tree.children[0].children[0].agent.identity.id).toBe(critic.identity.id);
+
+    await runtime.shutdown();
+  });
+
+  it('routes subsubagent results through parent synthesis before root final synthesis', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-parent-synthesis-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'parent-synthesis-test',
+      llmProvider: new EchoLLM(),
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+
+    const researcher = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'researcher',
+      name: 'Researcher-1',
+      tomLevel: 0,
+      description: 'Inspect project',
+      task: 'Inspect project',
+    });
+    const result = await runtime.handleSpawnCommand({
+      parentId: researcher.identity.id,
+      archetype: 'critic',
+      name: 'Critic-1',
+      task: 'Review Researcher-1 output',
+    });
+
+    const messages = await runtime.getMessages({ correlationId: result.correlationId });
+    expect(messages.map(message => message.kind)).toContain('agent.synthesis');
+    const parentResult = messages.find(message => message.kind === 'agent.result' && message.from === researcher.identity.id && message.to === 'root');
+    expect(parentResult).toBeDefined();
+
+    const eventTypes = runtime.getEvents().map(event => event.type);
+    expect(eventTypes).toContain('agent.synthesis.started');
+    expect(eventTypes).toContain('agent.synthesis.completed');
+    expect(eventTypes).toContain('root.synthesis.started');
+    expect(eventTypes).toContain('root.synthesis.completed');
+
+    const parentEvents = runtime.getEvents().filter(event => event.agentId === researcher.identity.id);
+    expect(parentEvents.some(event => event.type === 'agent.fsm.state' && event.data?.state === 'S_synthesize')).toBe(true);
+    expect(runtime.getBudgetState().perAgent[researcher.identity.id].totalTokens).toBeGreaterThan(0);
+    expect(result.finalResponse).toBe('subagent result');
 
     await runtime.shutdown();
   });

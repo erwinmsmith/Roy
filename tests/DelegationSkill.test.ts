@@ -82,6 +82,8 @@ describe('delegate_to_subagent skill', () => {
     const messages = await runtime.getMessages({ correlationId: result.correlationId });
     expect(messages.map(message => message.kind)).toEqual([
       'user.command.spawn',
+      'agent.create.request',
+      'agent.create.approved',
       'agent.task',
       'tool.call',
       'tool.result',
@@ -122,4 +124,3 @@ describe('delegate_to_subagent skill', () => {
     await runtime.shutdown();
   });
 });
-

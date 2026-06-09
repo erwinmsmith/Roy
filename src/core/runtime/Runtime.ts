@@ -11,7 +11,7 @@ import { AgentManager } from './AgentManager.js';
 import { FSM } from '../executor/FSM.js';
 import { signalBus } from '../executor/SignalBus.js';
 import { UnifiedAgent } from '../agent/UnifiedAgent.js';
-import type { AgentInfo, AgentUsage, ToMProfile } from '../agent/BaseAgent.js';
+import type { AgentInfo, AgentUsage, BaseAgent, ToMProfile } from '../agent/BaseAgent.js';
 import { actionRegistry } from '../actions/index.js';
 import { registerCoreTools, toolRegistry } from '../tools/index.js';
 import { skillRegistry } from '../skills/index.js';
@@ -162,6 +162,7 @@ export interface SpawnAgentSpec {
   spawnPolicy?: Partial<AgentSpawnPolicy>;
   budgetTokens?: number;
   systemPrompt?: string;
+  correlationId?: string;
 }
 
 export interface AgentTreeNode {
@@ -1338,6 +1339,7 @@ export class Runtime {
       skills: payload.skills,
       budgetTokens: payload.budgetTokens,
       systemPrompt: undefined,
+      correlationId,
       tomProfile,
       cacheHits,
     });
@@ -1415,9 +1417,59 @@ export class Runtime {
     await ctx.queue.ack(resultMessage.id);
     this.emit({ type: 'agent.result.sent', agentId: agent.identity.id, data: { correlationId, to: parentId } });
 
-    const finalResponse = requireRootSynthesis
-      ? await this.synthesizeSubagentResult(payload.task, agent, subagentResult, correlationId, resultMessage.id)
-      : '';
+    let finalResponse = '';
+    if (requireRootSynthesis) {
+      const parentSynthesis = await this.synthesizeChildResult(parentId, payload.task, agent, subagentResult, correlationId, resultMessage.id);
+      if (parentId === 'root') {
+        finalResponse = parentSynthesis;
+      } else {
+        const parentAgent = ctx.manager.getAgentById(parentId);
+        if (!parentAgent) {
+          throw new Error(`Parent agent "${parentId}" not found for root synthesis`);
+        }
+        const grandParentId = parentAgent.getIdentity().parentId ?? 'root';
+        const parentResultMessage = await this.enqueueMessage({
+          kind: 'agent.result',
+          sessionId: ctx.sessionId,
+          from: parentId,
+          to: grandParentId,
+          correlationId,
+          parentMessageId: resultMessage.id,
+          payload: {
+            task: payload.task,
+            result: parentSynthesis,
+            childId: agent.identity.id,
+          },
+          metadata: {
+            agentId: parentId,
+            tomLevel: parentAgent.getIdentity().tomProfile.level,
+          },
+        });
+        await this.recordConversation({
+          role: 'agent',
+          speaker: parentAgent.name,
+          content: parentSynthesis,
+          correlationId,
+          metadata: {
+            kind: 'agent.parent_synthesis',
+            agentId: parentId,
+            childId: agent.identity.id,
+            parentId: grandParentId,
+            grounded: subagentResult.grounded,
+            evidence: subagentResult.evidence,
+          },
+        });
+        await this.processQueuedMessage(parentResultMessage.id);
+        await ctx.queue.ack(parentResultMessage.id);
+        finalResponse = await this.synthesizeSubagentResult(
+          payload.task,
+          parentAgent.getInfo(),
+          this.createSyntheticRunResult(parentAgent.getInfo(), parentSynthesis, subagentResult),
+          correlationId,
+          parentResultMessage.id
+        );
+      }
+    }
 
     if (requireRootSynthesis) {
       const finalMessage = await this.enqueueMessage({
@@ -1476,6 +1528,24 @@ export class Runtime {
       .filter(binding => binding.enabled);
     const memoryScope = spec.memoryScope ?? this.getDefaultMemoryScope('subagent');
     const spawnPolicy = this.mergeSpawnPolicy(this.getDefaultSpawnPolicy('subagent', spec.archetype), spec.spawnPolicy);
+    const creationCorrelationId = spec.correlationId ?? this.createCorrelationId();
+    const createRequestMessage = await this.enqueueMessage({
+      kind: 'agent.create.request',
+      sessionId: ctx.sessionId,
+      from: spec.parentId,
+      to: 'runtime',
+      correlationId: creationCorrelationId,
+      payload: {
+        parentId: spec.parentId,
+        archetype: spec.archetype,
+        name: spec.name,
+        task: spec.task,
+        tools: toolBindings.map(binding => binding.name),
+        skills: skillBindings.map(binding => binding.name),
+      },
+      metadata: { agentId: spec.parentId },
+    });
+    await this.processQueuedMessage(createRequestMessage.id);
 
     this.emit({
       type: 'agent.create.requested',
@@ -1535,6 +1605,23 @@ export class Runtime {
           reason: policyResult.reason,
         },
       });
+      const rejectedMessage = await this.enqueueMessage({
+        kind: 'agent.create.rejected',
+        sessionId: ctx.sessionId,
+        from: 'runtime',
+        to: spec.parentId,
+        correlationId: creationCorrelationId,
+        parentMessageId: createRequestMessage.id,
+        payload: {
+          parentId: spec.parentId,
+          archetype: spec.archetype,
+          reason: policyResult.reason,
+        },
+        metadata: { agentId: spec.parentId },
+      });
+      await this.processQueuedMessage(rejectedMessage.id);
+      await ctx.queue.ack(rejectedMessage.id);
+      await ctx.queue.fail(createRequestMessage.id, new Error(policyResult.reason ?? 'spawn_rejected'));
       throw new Error(`Spawn rejected: ${policyResult.reason}`);
     }
 
@@ -1642,6 +1729,7 @@ export class Runtime {
     });
 
     const info = agent.getInfo();
+    this.emitAgentFsmState(id, 'S_created', { parentId: spec.parentId, archetype: spec.archetype });
     this.emit({
       type: cacheHits.length > 0 ? 'agent.definition.loaded_from_cache' : 'agent.definition.generated',
       agentId: id,
@@ -1664,6 +1752,26 @@ export class Runtime {
         maxChildrenForParent: policyResult.allowedChildren,
       },
     });
+    const approvedMessage = await this.enqueueMessage({
+      kind: 'agent.create.approved',
+      sessionId: ctx.sessionId,
+      from: 'runtime',
+      to: spec.parentId,
+      correlationId: creationCorrelationId,
+      parentMessageId: createRequestMessage.id,
+      payload: {
+        parentId: spec.parentId,
+        childId: id,
+        archetype: spec.archetype,
+        name,
+        tools: toolBindings.map(binding => binding.name),
+        skills: skillBindings.map(binding => binding.name),
+      },
+      metadata: { agentId: spec.parentId },
+    });
+    await this.processQueuedMessage(approvedMessage.id);
+    await ctx.queue.ack(approvedMessage.id);
+    await ctx.queue.ack(createRequestMessage.id);
     this.emit({
       type: 'agent.instance.created',
       agentId: id,
@@ -1721,6 +1829,7 @@ export class Runtime {
       },
     });
     this.emit({ type: 'agent.status.changed', agentId: id, data: { from: 'none', to: info.state } });
+    this.emitAgentFsmState(id, 'S_solo', { runtimeState: info.state });
     if (spec.budgetTokens !== undefined) {
       this.emit({ type: 'budget.allocated', agentId: id, data: { budgetTokens: spec.budgetTokens } });
     }
@@ -1747,14 +1856,24 @@ export class Runtime {
     const usageBefore = agent.getUsage();
     const from = agent.getState();
     agent.setRuntimeState('thinking');
+    this.emitAgentFsmState(agentId, 'S_input_received', { task, correlationId: options.correlationId });
     this.emit({ type: 'agent.run.started', agentId, data: { task, correlationId: options.correlationId } });
     this.emit({ type: 'agent.status.changed', agentId, data: { from, to: 'thinking' } });
 
     try {
+      this.emitAgentFsmState(agentId, 'S_assess_task', { task, correlationId: options.correlationId });
       const grounding = await this.runGroundingCheck(agentId, task, options);
+      if (grounding.toolCalls.length > 0) {
+        this.emitAgentFsmState(agentId, 'S_execute', {
+          toolCalls: grounding.toolCalls.map(call => call.toolName),
+          correlationId: options.correlationId,
+        });
+      }
+      this.emitAgentFsmState(agentId, 'S_solo_reasoning', { task, correlationId: options.correlationId });
       this.emit({ type: 'agent.llm.called', agentId, data: { task } });
       await agent.step(this.buildGroundedTask(task, grounding));
       agent.setRuntimeState('done');
+      this.emitAgentFsmState(agentId, 'S_respond', { correlationId: options.correlationId });
 
       const usageAfter = agent.getUsage();
       const usageDelta = this.toTokenUsage({
@@ -1797,6 +1916,7 @@ export class Runtime {
           warnings,
         },
       });
+      this.emitAgentFsmState(agentId, 'S_turn_done', { correlationId: options.correlationId });
 
       return {
         agent: agent.getInfo(),
@@ -1812,6 +1932,7 @@ export class Runtime {
       agent.addToMemory('result', `Error: ${message}`);
       agent.setRuntimeState('failed');
       this.emit({ type: 'agent.status.changed', agentId, data: { from: 'thinking', to: 'failed' } });
+      this.emitAgentFsmState(agentId, 'S_final', { failed: true, error: message, correlationId: options.correlationId });
       this.emit({ type: 'agent.run.failed', agentId, data: { task, error: message } });
       throw error;
     }
@@ -1848,6 +1969,10 @@ export class Runtime {
     const message = await ctx.queue.getMessage(messageId);
     if (!message) return undefined;
     return ctx.queue.dequeue({ to: message.to, kind: [message.kind], readyOnly: true });
+  }
+
+  private emitAgentFsmState(agentId: string, state: string, data: Record<string, unknown> = {}): void {
+    this.emit({ type: 'agent.fsm.state', agentId, data: { state, ...data } });
   }
 
   private async buildDelegationDecisionMetadata(decision: DelegationDecision): Promise<Record<string, unknown>> {
@@ -2268,6 +2393,194 @@ Produce the final response to the user as Roy, the root agent.`;
       totalTokens: 0,
       thinkingTokens: null,
     });
+  }
+
+  private async synthesizeChildResult(
+    parentId: string,
+    userTask: string,
+    childAgent: AgentInfo,
+    childResult: RunAgentResult,
+    correlationId: string,
+    parentMessageId: string
+  ): Promise<string> {
+    if (parentId === 'root') {
+      return this.synthesizeSubagentResult(userTask, childAgent, childResult, correlationId, parentMessageId);
+    }
+
+    const ctx = this.getContext();
+    const parent = ctx.manager.getAgentById(parentId);
+    if (!parent) {
+      throw new Error(`Parent agent "${parentId}" not found`);
+    }
+    const parentIdentity = parent.getIdentity();
+    const synthesisMessage = await this.enqueueMessage({
+      kind: 'agent.synthesis',
+      sessionId: ctx.sessionId,
+      from: parentId,
+      to: parentId,
+      correlationId,
+      parentMessageId,
+      payload: {
+        userTask,
+        parentId,
+        childId: childAgent.identity.id,
+      },
+      metadata: {
+        agentId: parentId,
+        tomLevel: parentIdentity.tomProfile.level,
+      },
+    });
+    await this.processQueuedMessage(synthesisMessage.id);
+
+    const usageBefore = parent.getUsage();
+    const from = parent.getState();
+    parent.setRuntimeState('synthesizing');
+    this.emitAgentFsmState(parentId, 'S_synthesize', { correlationId, childId: childAgent.identity.id });
+    this.emit({
+      type: 'agent.synthesis.started',
+      agentId: parentId,
+      data: {
+        correlationId,
+        childId: childAgent.identity.id,
+      },
+    });
+    this.emit({ type: 'agent.status.changed', agentId: parentId, data: { from, to: 'synthesizing', correlationId } });
+    this.emit({ type: 'agent.llm.called', agentId: parentId, data: { purpose: 'agent.child_synthesis', correlationId } });
+
+    const response = await this.completeAsAgent(
+      parent,
+      this.buildParentChildSynthesisPrompt(parent.getInfo(), userTask, childAgent, childResult),
+      'agent.child_synthesis',
+      correlationId
+    );
+    const usageAfter = parent.getUsage();
+    const usageDelta = this.toTokenUsage({
+      llmCalls: usageAfter.llmCalls - usageBefore.llmCalls,
+      promptTokens: usageAfter.promptTokens - usageBefore.promptTokens,
+      completionTokens: usageAfter.completionTokens - usageBefore.completionTokens,
+      totalTokens: usageAfter.totalTokens - usageBefore.totalTokens,
+    });
+    this.recordTurnUsage(usageDelta);
+    this.emit({ type: 'budget.updated', agentId: parentId, data: { ...usageDelta } });
+
+    parent.setRuntimeState('done');
+    this.emit({ type: 'agent.status.changed', agentId: parentId, data: { from: 'synthesizing', to: 'done', correlationId } });
+    this.emitAgentFsmState(parentId, 'S_turn_done', { correlationId, childId: childAgent.identity.id });
+    this.emit({
+      type: 'agent.synthesis.completed',
+      agentId: parentId,
+      data: {
+        correlationId,
+        childId: childAgent.identity.id,
+        totalTokens: usageDelta.totalTokens,
+      },
+    });
+    await ctx.queue.ack(synthesisMessage.id);
+    return response || parent.getInfo().lastResult || '';
+  }
+
+  private async completeAsAgent(agent: BaseAgent, prompt: string, purpose: string, correlationId: string): Promise<string> {
+    const ctx = this.getContext();
+    if (!ctx.llm) {
+      const message = 'Error: LLM not configured';
+      agent.recordRuntimeCompletion(message, {
+        content: message,
+        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      });
+      return message;
+    }
+
+    const messages = [
+      {
+        role: 'system',
+        content: [
+          `You are ${agent.name}, a runtime agent in the Roy autonomous agent system.`,
+          'You are not the model provider. The provider is only your inference backend.',
+          `Purpose: ${purpose}.`,
+          `Correlation: ${correlationId}.`,
+        ].join('\n'),
+      },
+      { role: 'user', content: prompt },
+    ] as const;
+    const chunks: string[] = [];
+    let usageChunk: { usage?: { promptTokens: number; completionTokens: number; totalTokens: number } } | undefined;
+    for await (const chunk of ctx.llm.stream([...messages], { temperature: 0.2 })) {
+      if (chunk.content) chunks.push(chunk.content);
+      if (chunk.usage) usageChunk = chunk;
+    }
+    const content = chunks.join('');
+    agent.recordRuntimeCompletion(content, {
+      content,
+      usage: usageChunk?.usage ?? {
+        promptTokens: this.estimateTextTokens(prompt),
+        completionTokens: this.estimateTextTokens(content),
+        totalTokens: this.estimateTextTokens(prompt) + this.estimateTextTokens(content),
+      },
+    });
+    return content;
+  }
+
+  private buildParentChildSynthesisPrompt(parent: AgentInfo, userTask: string, childAgent: AgentInfo, childResult: RunAgentResult): string {
+    const warnings = childResult.warnings.length > 0
+      ? childResult.warnings.map(item => `- ${item}`).join('\n')
+      : 'None';
+
+    return `You are the parent agent responsible for aggregating your direct child result.
+
+Parent agent:
+id: ${parent.identity.id}
+name: ${parent.identity.name}
+role: ${parent.identity.role}
+
+Assigned task:
+<task>
+${userTask}
+</task>
+
+Direct child:
+id: ${childAgent.identity.id}
+name: ${childAgent.identity.name}
+role: ${childAgent.identity.role}
+tom: ToM-${childAgent.identity.tomProfile.level}
+
+Child report:
+<child_report>
+${childResult.result}
+</child_report>
+
+Grounding:
+- grounded: ${childResult.grounded}
+- tool grounded: ${childResult.evidence.toolGrounded}
+- output grounded: ${childResult.evidence.outputGrounded}
+- tool calls: ${childResult.toolCalls.map(call => call.toolName).join(', ') || 'none'}
+- observed paths:
+${childResult.evidence.observedPaths.slice(0, 30).map(item => `  - ${item}`).join('\n') || '  none'}
+- warnings:
+${warnings}
+
+Produce a parent-level synthesis that can be passed upward to your parent. Do not answer as Roy unless your name is Roy. Preserve limitations and evidence.`;
+  }
+
+  private createSyntheticRunResult(parent: AgentInfo, result: string, childResult: RunAgentResult): RunAgentResult {
+    return {
+      agent: parent,
+      result,
+      usage: this.zeroTokenUsage(),
+      toolCalls: childResult.toolCalls,
+      evidence: childResult.evidence,
+      grounded: childResult.grounded,
+      warnings: childResult.warnings,
+    };
+  }
+
+  private zeroTokenUsage(): TokenUsage {
+    return {
+      llmCalls: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      thinkingTokens: null,
+    };
   }
 
   private async synthesizeSubagentResult(
