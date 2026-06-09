@@ -13,9 +13,10 @@ import { signalBus } from '../executor/SignalBus.js';
 import { UnifiedAgent } from '../agent/UnifiedAgent.js';
 import type { AgentInfo, AgentUsage, ToMProfile } from '../agent/BaseAgent.js';
 import { actionRegistry } from '../actions/index.js';
-import { toolRegistry } from '../tools/index.js';
+import { registerCoreTools, toolRegistry } from '../tools/index.js';
 import { skillRegistry } from '../skills/index.js';
 import { DelegateToSubagentSkill } from '../skills/delegation.js';
+import { UseToolWhenNeededSkill } from '../skills/toolUse.js';
 import {
   InMemoryMessageQueue,
   MessageScheduler,
@@ -278,6 +279,7 @@ export class Runtime {
 
     // Create AgentManager
     const manager = new AgentManager();
+    registerCoreTools();
     const memory = new WorkspaceMemoryManager();
     await memory.initWorkspace(options.workspaceCwd ?? process.cwd(), options.sessionId ?? 'main');
     const rootMemory = await memory.loadAgentMemory('roy');
@@ -443,6 +445,7 @@ export class Runtime {
 
   private registerCoreSkills(): void {
     skillRegistry.register(new DelegateToSubagentSkill(() => this));
+    skillRegistry.register(new UseToolWhenNeededSkill());
   }
 
   isInitialized(): boolean {

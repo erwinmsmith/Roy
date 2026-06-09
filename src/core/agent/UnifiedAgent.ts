@@ -240,6 +240,7 @@ export class UnifiedAgent extends BaseAgent {
     const actionIndicators = [
       'do', 'run', 'execute', 'perform', 'search', 'find',
       'calculate', 'create', 'update', 'delete', 'fetch', 'get me',
+      'inspect', 'list', 'read', 'status', 'test', 'check',
     ];
     const lowerObs = observation.toLowerCase();
 
@@ -290,7 +291,7 @@ export class UnifiedAgent extends BaseAgent {
       const result = await this.executeCapability(plan.action, plan.params);
 
       if (result.success) {
-        const response = String(result.result ?? 'Action completed successfully');
+        const response = this.formatCapabilityResult(result.result);
         this.addToMemory('action', `${plan.action}: ${response}`);
         this.fsm?.addToTrace(`Action executed: ${plan.action}`);
 
@@ -318,6 +319,16 @@ export class UnifiedAgent extends BaseAgent {
     }
   }
 
+  private formatCapabilityResult(result: unknown): string {
+    if (result === undefined) return 'Action completed successfully';
+    if (typeof result === 'string') return result;
+    try {
+      return JSON.stringify(result, null, 2);
+    } catch {
+      return String(result);
+    }
+  }
+
   /**
    * Decide action using LLM
    */
@@ -335,7 +346,12 @@ Observation: ${observation}
 Return a JSON object with:
 - action: the name of the action, tool, or skill to execute (or "none" if no action needed)
 - params: parameters for the action (or empty object)
-- reasoning: why you chose this action`;
+- reasoning: why you chose this action
+
+Tool-use policy:
+- If the task needs external evidence, filesystem inspection, command output, or validation, use a registered tool directly or the "use_tool_when_needed" skill.
+- If no tool is needed, return {"action":"none","params":{}}
+- Do not call tools just to appear active.`;
 
     const decisionMessages: LLMMessage[] = [
       ...messages.slice(0, 1),
