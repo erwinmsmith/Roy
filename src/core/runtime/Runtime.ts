@@ -172,6 +172,11 @@ export type DelegationDecision =
       reason: string;
     }
   | {
+      action: 'ask_clarification';
+      reason: string;
+      question: string;
+    }
+  | {
       action: 'spawn_subagents';
       reason: string;
       agents: DelegationAgentPlan[];
@@ -790,6 +795,7 @@ export class Runtime {
     await this.transitionRootTurnState('S_input_received', { correlationId });
     await this.transitionRootTurnState('S_assess_task', { correlationId });
     const decision = await this.decideDelegation(userInput, correlationId);
+    const decisionMetadata = await this.buildDelegationDecisionMetadata(decision);
     this.emit({
       type: 'delegation.decision',
       agentId: 'root',
@@ -798,19 +804,72 @@ export class Runtime {
         action: decision.action,
         reason: decision.reason,
         agents: decision.action === 'spawn_subagents' ? decision.agents : [],
+        ...decisionMetadata,
       },
     });
 
     let finalResponse = '';
     const subagents: RootMediatedSpawnResult[] = [];
 
-    if (decision.action === 'solve_directly') {
+    if (decision.action === 'ask_clarification') {
       await this.transitionRootTurnState('S_solo_reasoning', { correlationId, reason: decision.reason });
+      this.emit({
+        type: 'delegation.skipped',
+        agentId: 'root',
+        data: {
+          correlationId,
+          action: decision.action,
+          reason: decision.reason,
+        },
+      });
+      finalResponse = decision.question;
+    } else if (decision.action === 'solve_directly') {
+      await this.transitionRootTurnState('S_solo_reasoning', { correlationId, reason: decision.reason });
+      this.emit({
+        type: 'delegation.skipped',
+        agentId: 'root',
+        data: {
+          correlationId,
+          action: decision.action,
+          reason: decision.reason,
+        },
+      });
       finalResponse = await this.runRootSoloReasoning(userInput, correlationId);
     } else {
       await this.transitionRootTurnState('S_delegate_planning', { correlationId, count: decision.agents.length });
+      this.emit({
+        type: 'delegation.plan.created',
+        agentId: 'root',
+        data: {
+          correlationId,
+          count: decision.agents.length,
+          agents: decision.agents,
+          ...decisionMetadata,
+        },
+      });
       await this.transitionRootTurnState('S_spawn_subagents', { correlationId, count: decision.agents.length });
       for (const plan of decision.agents.slice(0, 3)) {
+        this.emit({
+          type: 'delegation.subagent.selected',
+          agentId: 'root',
+          data: {
+            correlationId,
+            archetype: plan.archetype,
+            name: plan.name,
+            tomLevel: plan.tomLevel,
+            budgetTokens: plan.budgetTokens,
+          },
+        });
+        this.emit({
+          type: 'delegation.subagent.task_assigned',
+          agentId: 'root',
+          data: {
+            correlationId,
+            archetype: plan.archetype,
+            name: plan.name,
+            task: plan.task,
+          },
+        });
         const result = await this.handleSpawnCommand({
           archetype: plan.archetype,
           task: plan.task,
@@ -831,6 +890,15 @@ export class Runtime {
       });
       await this.transitionRootTurnState('S_synthesize', { correlationId, completed: subagents.length });
       finalResponse = await this.synthesizeDelegatedResults(userInput, subagents, correlationId);
+      this.emit({
+        type: 'delegation.completed',
+        agentId: 'root',
+        data: {
+          correlationId,
+          subagentIds: subagents.map(result => result.agent.identity.id),
+          totalSubagents: subagents.length,
+        },
+      });
     }
 
     await this.transitionRootTurnState('S_respond', { correlationId });
@@ -1097,7 +1165,10 @@ export class Runtime {
 
     const sequence = ++this.agentSequence;
     const id = this.createAgentId(spec.archetype, sequence);
-    const name = spec.name ?? `${this.capitalize(spec.archetype)}-${sequence}`;
+    const requestedName = spec.name ?? `${this.capitalize(spec.archetype)}-${sequence}`;
+    const name = ctx.manager.getAgent(requestedName)
+      ? this.createUniqueAgentName(spec.archetype, requestedName, sequence)
+      : requestedName;
     if (ctx.manager.getAgent(name)) {
       throw new Error(`Agent name "${name}" already exists`);
     }
@@ -1350,6 +1421,41 @@ export class Runtime {
     return ctx.queue.dequeue({ to: message.to, kind: [message.kind], readyOnly: true });
   }
 
+  private async buildDelegationDecisionMetadata(decision: DelegationDecision): Promise<Record<string, unknown>> {
+    const budget = this.getBudgetState();
+    if (decision.action !== 'spawn_subagents') {
+      return {
+        budgetMode: budget.mode,
+        remainingTokens: budget.remainingTokens,
+        cacheUsed: false,
+      };
+    }
+
+    const ctx = this.getContext();
+    const agents = await Promise.all(decision.agents.map(async agent => {
+      const [agentPattern, delegationPattern] = await Promise.all([
+        ctx.memory.findAgentPattern(agent.archetype),
+        ctx.memory.findDelegationPattern(agent.archetype, agent.task),
+      ]);
+      const patternIds = [
+        typeof agentPattern?.id === 'string' ? agentPattern.id : undefined,
+        typeof delegationPattern?.id === 'string' ? delegationPattern.id : undefined,
+      ].filter((item): item is string => item !== undefined);
+
+      return {
+        ...agent,
+        patternIds,
+      };
+    }));
+
+    return {
+      budgetMode: budget.mode,
+      remainingTokens: budget.remainingTokens,
+      cacheUsed: agents.some(agent => agent.patternIds.length > 0),
+      agents,
+    };
+  }
+
   private async transitionRootTurnState(state: Parameters<FSM['transition']>[0], data: Record<string, unknown> = {}): Promise<void> {
     const ctx = this.getContext();
     if (!state) return;
@@ -1367,7 +1473,7 @@ export class Runtime {
         agentId: 'root',
         data: { correlationId, reason: 'llm_not_configured' },
       });
-      return fallback;
+      return this.applyBudgetConstraints(fallback);
     }
 
     try {
@@ -1377,11 +1483,13 @@ export class Runtime {
         {
           role: 'system',
           content: `You are Roy's root delegation controller.
-Decide whether the user request should be solved directly by Roy or delegated to 1-3 subagents.
+Decide whether the user request should be solved directly by Roy, clarified, or delegated to 1-3 subagents.
 Use delegation only when the task benefits from grounded inspection, critique, planning, coding, testing, or summarization.
 Do not spawn more than 3 subagents. Prefer 1-2 unless the task clearly needs more.
+Ask for clarification when the user request is too ambiguous to assign a concrete task safely.
 Return strict JSON matching one of:
 {"action":"solve_directly","reason":"..."}
+{"action":"ask_clarification","reason":"...","question":"..."}
 {"action":"spawn_subagents","reason":"...","agents":[{"archetype":"researcher","name":"Researcher-1","task":"...","tomLevel":0}]}
 Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, custom.`,
         },
@@ -1390,11 +1498,12 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
           content: [
             `<user_task>${userInput}</user_task>`,
             `<memory_context>${this.formatPublicContext(rootContext).slice(0, 6000)}</memory_context>`,
-            '<runtime_policy>Subagents must be runtime actors with identity, state, budget, messages, and events. If spawning, assign concrete non-overlapping tasks.</runtime_policy>',
+            `<budget_state>${JSON.stringify(this.getBudgetState(), null, 2)}</budget_state>`,
+            '<runtime_policy>Subagents must be runtime actors with identity, state, budget, messages, and events. If spawning, assign concrete non-overlapping tasks. If budget is limited, reduce the number of subagents or solve directly and explain the constraint.</runtime_policy>',
           ].join('\n\n'),
         },
       ], { temperature: 0.1, maxTokens: 900 });
-      const normalized = this.normalizeDelegationDecision(decision, userInput);
+      const normalized = this.applyBudgetConstraints(this.normalizeDelegationDecision(decision, userInput));
       this.emit({
         type: 'delegation.assess.completed',
         agentId: 'root',
@@ -1411,12 +1520,26 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
           error: error instanceof Error ? error.message : String(error),
         },
       });
-      return fallback;
+      return this.applyBudgetConstraints(fallback);
     }
   }
 
   private normalizeDelegationDecision(decision: unknown, userInput: string): DelegationDecision {
     const item = decision as Partial<DelegationDecision>;
+    if (item.action === 'ask_clarification') {
+      const question = typeof (item as { question?: unknown }).question === 'string'
+        && (item as { question: string }).question.trim()
+        ? (item as { question: string }).question.trim()
+        : 'What exactly would you like Roy to improve: code, architecture, documentation, tests, or runtime behavior?';
+      return {
+        action: 'ask_clarification',
+        reason: typeof item.reason === 'string' && item.reason.trim()
+          ? item.reason.trim()
+          : 'The task is too ambiguous to safely delegate.',
+        question,
+      };
+    }
+
     if (item.action === 'solve_directly') {
       return {
         action: 'solve_directly',
@@ -1451,11 +1574,22 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
       }
     }
 
-    return this.fallbackDelegationDecision(userInput);
+    return this.applyBudgetConstraints(this.fallbackDelegationDecision(userInput));
   }
 
   private fallbackDelegationDecision(userInput: string): DelegationDecision {
     const lower = userInput.toLowerCase();
+    const words = lower.trim().split(/\s+/).filter(Boolean);
+    const ambiguousImprove = /\b(help|improve|fix|make better|enhance|optimi[sz]e)\b/.test(lower)
+      && !/\b(code|repo|repository|project|architecture|test|tests|docs|documentation|memory|cache|runtime|cli|server|api|bug|risk|file|structure)\b/.test(lower);
+    if (ambiguousImprove || (words.length <= 5 && /\b(help|improve|fix)\b/.test(lower))) {
+      return {
+        action: 'ask_clarification',
+        reason: 'The request is too broad to select an agent or task safely.',
+        question: 'What would you like Roy to improve: code, architecture, documentation, tests, memory/cache behavior, or CLI/API behavior?',
+      };
+    }
+
     const asksProjectInspection = /\b(inspect|analy[sz]e|review|audit|check|read|list)\b/.test(lower)
       && /\b(repo|repository|project|codebase|architecture|structure|src|files?)\b/.test(lower);
     const asksRisk = /\b(risk|risks|problem|bug|bugs|issue|issues|critique|review|regression|coupling)\b/.test(lower);
@@ -1508,6 +1642,30 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
       action: 'solve_directly',
       reason: 'The request appears simple enough for Roy to answer without spawning subagents.',
     };
+  }
+
+  private applyBudgetConstraints(decision: DelegationDecision): DelegationDecision {
+    if (decision.action !== 'spawn_subagents') return decision;
+    const budget = this.getBudgetState();
+    if (budget.mode !== 'limited') return decision;
+
+    const remaining = budget.remainingTokens ?? 0;
+    if (remaining <= 500) {
+      return {
+        action: 'solve_directly',
+        reason: `Budget constrained: only ${remaining} tokens remain, so Roy will avoid spawning subagents and answer directly.`,
+      };
+    }
+
+    if (remaining <= 2000 && decision.agents.length > 1) {
+      return {
+        action: 'spawn_subagents',
+        reason: `${decision.reason} Budget constrained: reduced delegation to one subagent with ${remaining} tokens remaining.`,
+        agents: decision.agents.slice(0, 1),
+      };
+    }
+
+    return decision;
   }
 
   private async runRootSoloReasoning(userInput: string, correlationId: string): Promise<string> {
@@ -1924,6 +2082,7 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
     }
 
     const ctx = this.getContext();
+    const inspectionRoot = this.resolveInspectionRoot(task);
     const toolCall = await this.enqueueMessage({
       kind: 'tool.call',
       sessionId: ctx.sessionId,
@@ -1931,18 +2090,18 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
       to: 'tool.fs.list',
       correlationId: options.correlationId,
       parentMessageId: options.parentMessageId,
-      payload: { path: process.cwd(), maxDepth: 2 },
+      payload: { path: inspectionRoot, maxDepth: 2 },
       metadata: { agentId },
     });
     await this.processQueuedMessage(toolCall.id);
 
     try {
-      const files = await this.listProjectFiles(process.cwd(), 2);
+      const files = await this.listProjectFiles(inspectionRoot, 2);
       const observedPaths = files.slice(0, 80);
       const toolResultSummary = observedPaths.join('\n');
       const record: ToolCallRecord = {
         toolName: 'fs.list',
-        params: { path: process.cwd(), maxDepth: 2 },
+        params: { path: inspectionRoot, maxDepth: 2 },
         result: files,
         success: true,
       };
@@ -1978,12 +2137,22 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await ctx.queue.fail(toolCall.id, new Error(message));
-      const warning = `Researcher produced a report without using project inspection tools: ${message}`;
+      const warning = `Project inspection tool fs.list failed: ${message}`;
+      this.emit({
+        type: 'tool.error',
+        agentId,
+        data: {
+          toolName: 'fs.list',
+          path: inspectionRoot,
+          error: message,
+          correlationId: options.correlationId,
+        },
+      });
       this.emit({ type: 'agent.grounding.warning', agentId, data: { warning, correlationId: options.correlationId } });
       return {
         toolCalls: [{
           toolName: 'fs.list',
-          params: { path: process.cwd(), maxDepth: 2 },
+          params: { path: inspectionRoot, maxDepth: 2 },
           success: false,
           result: message,
         }],
@@ -2020,6 +2189,18 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
     return /\b(inspect|analy[sz]e|review|read|list|structure|project|codebase|file|repo|repository)\b/i.test(task);
   }
 
+  private resolveInspectionRoot(task: string): string {
+    const match = task.match(/(?:\.{1,2}\/|\/)[A-Za-z0-9._/@-]+/);
+    if (!match) return process.cwd();
+    const candidate = path.resolve(process.cwd(), match[0]);
+    const workspaceRoot = path.resolve(process.cwd());
+    const relative = path.relative(workspaceRoot, candidate);
+    if (relative.startsWith('..') || path.isAbsolute(relative)) {
+      return process.cwd();
+    }
+    return candidate;
+  }
+
   private async listProjectFiles(root: string, maxDepth: number): Promise<string[]> {
     const ignored = new Set(['.git', 'node_modules', 'dist', '.roy', '.cache', 'coverage']);
     const results: string[] = [];
@@ -2054,6 +2235,13 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
 
   private createAgentId(archetype: SubAgentArchetype, sequence: number): string {
     return `agent_${archetype}_${String(sequence).padStart(3, '0')}`;
+  }
+
+  private createUniqueAgentName(archetype: SubAgentArchetype, requestedName: string, sequence: number): string {
+    const defaultPattern = new RegExp(`^${this.capitalize(archetype)}-\\d+$`);
+    return defaultPattern.test(requestedName)
+      ? `${this.capitalize(archetype)}-${sequence}`
+      : `${requestedName}-${sequence}`;
   }
 
   private createCorrelationId(): string {

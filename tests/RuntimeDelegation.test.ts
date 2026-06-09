@@ -19,8 +19,12 @@ class RootDelegationLLM implements LLMProvider {
   async *stream(messages: LLMMessage[], _options?: LLMCompletionOptions): AsyncGenerator<LLMStreamChunk, void, unknown> {
     const text = messages.map(message => String(message.content)).join('\n');
     let content = 'Roy direct response.';
-    if (text.includes('Synthesize their results into one final user-facing response')) {
+    if (text.includes('fs.list failed')) {
+      content = 'Final synthesis: the subagent could not inspect the requested directory, so Roy reports the failure and suggests checking the path.';
+    } else if (text.includes('Synthesize their results into one final user-facing response')) {
       content = 'Final synthesis from Researcher-1 and Critic-2.';
+    } else if (text.includes('definitely-not-real-dir')) {
+      content = 'Researcher report: unable to inspect ./definitely-not-real-dir.';
     } else if (text.includes('architectural risks') || text.includes('failure modes')) {
       content = 'Critic report: coupling and runtime observability risks.';
     } else if (text.includes('grounded project structure')) {
@@ -35,6 +39,44 @@ class RootDelegationLLM implements LLMProvider {
 
   async completeJSON<T>(messages: LLMMessage[], _options?: LLMCompletionOptions): Promise<T> {
     const text = messages.map(message => String(message.content)).join('\n');
+    if (text.includes("Roy's root delegation controller") && text.includes('Help me improve this')) {
+      return {
+        action: 'ask_clarification',
+        reason: 'The request is too ambiguous to assign a safe delegation task.',
+        question: 'What would you like Roy to improve: code, architecture, documentation, tests, memory/cache behavior, or CLI/API behavior?',
+      } satisfies DelegationDecision as T;
+    }
+
+    if (text.includes("Roy's root delegation controller") && text.includes('definitely-not-real-dir')) {
+      return {
+        action: 'spawn_subagents',
+        reason: 'The request explicitly asks for project inspection by a subagent.',
+        agents: [
+          {
+            archetype: 'researcher',
+            name: 'Researcher-1',
+            task: 'Inspect ./definitely-not-real-dir and report whether it exists.',
+            tomLevel: 0,
+          },
+        ],
+      } satisfies DelegationDecision as T;
+    }
+
+    if (text.includes("Roy's root delegation controller") && text.includes('current project structure')) {
+      return {
+        action: 'spawn_subagents',
+        reason: 'Project structure inspection should use a researcher.',
+        agents: [
+          {
+            archetype: 'researcher',
+            name: 'Researcher-1',
+            task: 'Inspect the current project structure and summarize risks.',
+            tomLevel: 0,
+          },
+        ],
+      } satisfies DelegationDecision as T;
+    }
+
     if (text.includes("Roy's root delegation controller") && text.includes('architectural risks')) {
       return {
         action: 'spawn_subagents',
@@ -98,6 +140,10 @@ describe('Runtime root-controlled delegation', () => {
 
     const eventTypes = runtime.getEvents().map(event => event.type);
     expect(eventTypes).toContain('delegation.decision');
+    expect(eventTypes).toContain('delegation.plan.created');
+    expect(eventTypes).toContain('delegation.subagent.selected');
+    expect(eventTypes).toContain('delegation.subagent.task_assigned');
+    expect(eventTypes).toContain('delegation.completed');
     expect(eventTypes).toContain('agent.spawned');
     expect(eventTypes).toContain('agent.run.started');
     expect(eventTypes).toContain('agent.run.completed');
@@ -138,6 +184,103 @@ describe('Runtime root-controlled delegation', () => {
     expect(result.finalResponse).toBe('Roy direct response.');
     expect(runtime.getAgentTree().children).toHaveLength(0);
     expect(runtime.getEvents().map(event => event.type)).toContain('root.solo.completed');
+    expect(runtime.getEvents().map(event => event.type)).toContain('delegation.skipped');
+
+    await runtime.shutdown();
+  });
+
+  it('asks for clarification on ambiguous tasks without spawning subagents', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-phase2-clarify-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'phase2-clarify-test',
+      workspaceCwd,
+      fsmEnabled: true,
+      llmProvider: new RootDelegationLLM(),
+    });
+
+    const result = await runtime.handleUserTurn('Help me improve this.');
+
+    expect(result.decision.action).toBe('ask_clarification');
+    expect(result.subagents).toHaveLength(0);
+    expect(result.finalResponse).toContain('What would you like Roy to improve');
+    expect(runtime.getAgentTree().children).toHaveLength(0);
+    expect(runtime.getEvents().map(event => event.type)).toContain('delegation.skipped');
+
+    await runtime.shutdown();
+  });
+
+  it('records cache participation in delegation decisions and still creates fresh runtime instances', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-phase2-cache-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'phase2-cache-test',
+      workspaceCwd,
+      fsmEnabled: true,
+      llmProvider: new RootDelegationLLM(),
+    });
+
+    await runtime.handleSpawnCommand({
+      archetype: 'researcher',
+      task: 'Inspect the project structure',
+    });
+    const result = await runtime.handleUserTurn('Inspect the current project structure and summarize the risks.');
+
+    expect(result.decision.action).toBe('spawn_subagents');
+    expect(result.subagents).toHaveLength(1);
+    expect(result.subagents[0].agent.identity.id).toBe('agent_researcher_002');
+
+    const decisionEvent = runtime.getEvents()
+      .find(event => event.type === 'delegation.decision' && event.data?.correlationId === result.correlationId);
+    expect(decisionEvent?.data?.cacheUsed).toBe(true);
+    const hits = runtime.getEvents()
+      .filter(event => event.type === 'cache.hit' && event.data?.correlationId === result.correlationId);
+    expect(hits.map(event => event.data?.patternId)).toContain('agent_pattern_researcher_v1');
+
+    await runtime.shutdown();
+  });
+
+  it('reduces delegation under constrained budget', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-phase2-budget-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'phase2-budget-test',
+      workspaceCwd,
+      fsmEnabled: true,
+      llmProvider: new RootDelegationLLM(),
+    });
+    runtime.setBudget(2000);
+
+    const result = await runtime.handleUserTurn('Analyze this repo and find architectural risks');
+
+    expect(result.decision.action).toBe('spawn_subagents');
+    expect(result.subagents).toHaveLength(1);
+    expect(result.decision.reason).toContain('Budget constrained');
+    const decisionEvent = runtime.getEvents()
+      .find(event => event.type === 'delegation.decision' && event.data?.correlationId === result.correlationId);
+    expect(decisionEvent?.data?.budgetMode).toBe('limited');
+
+    await runtime.shutdown();
+  });
+
+  it('records tool errors and lets root recover when subagent inspection fails', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-phase2-failure-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'phase2-failure-test',
+      workspaceCwd,
+      fsmEnabled: true,
+      llmProvider: new RootDelegationLLM(),
+    });
+
+    const result = await runtime.handleUserTurn('Use a subagent to inspect a nonexistent directory named ./definitely-not-real-dir');
+
+    expect(result.decision.action).toBe('spawn_subagents');
+    expect(result.subagents).toHaveLength(1);
+    expect(result.subagents[0].subagentResult.grounded).toBe(false);
+    expect(result.subagents[0].subagentResult.warnings.some(warning => warning.includes('fs.list failed'))).toBe(true);
+    expect(result.finalResponse).toContain('could not inspect');
+    expect(runtime.getEvents().map(event => event.type)).toContain('tool.error');
 
     await runtime.shutdown();
   });
