@@ -210,6 +210,7 @@ export interface SpawnCommandPayload {
   budgetTokens?: number;
   requireRootSynthesis?: boolean;
   showSubagentOutput?: boolean;
+  disableRecursiveDelegation?: boolean;
 }
 
 export type DelegationDecision =
@@ -846,6 +847,14 @@ export class Runtime {
     return key || 'custom';
   }
 
+  private inferAgentArchetype(agent: AgentInfo): SubAgentArchetype {
+    const id = agent.identity.id.toLowerCase();
+    const name = agent.identity.name.toLowerCase();
+    const text = `${id} ${name}`;
+    const archetypes: SubAgentArchetype[] = ['researcher', 'critic', 'planner', 'coder', 'summarizer', 'tester'];
+    return archetypes.find(archetype => text.includes(archetype)) ?? 'custom';
+  }
+
   async enqueueMessage<TPayload>(message: EnqueueMessageInput<TPayload>): Promise<RuntimeMessage<TPayload>> {
     const ctx = this.getContext();
     return ctx.queue.enqueue(message);
@@ -1200,6 +1209,7 @@ export class Runtime {
           source: 'root',
           requireRootSynthesis: false,
           showSubagentOutput: false,
+          disableRecursiveDelegation: decision.agents.length > 1,
         });
         subagents.push(result);
       }
@@ -1389,6 +1399,7 @@ export class Runtime {
       correlationId,
       parentMessageId: taskMessage.id,
       archetype: payload.archetype,
+      disableRecursiveDelegation: payload.disableRecursiveDelegation,
     });
     await ctx.queue.ack(taskMessage.id);
 
@@ -1848,7 +1859,7 @@ export class Runtime {
   async runAgent(
     agentId: string,
     task: string,
-    options: { correlationId?: string; parentMessageId?: string; archetype?: SubAgentArchetype } = {}
+    options: { correlationId?: string; parentMessageId?: string; archetype?: SubAgentArchetype; disableRecursiveDelegation?: boolean } = {}
   ): Promise<RunAgentResult> {
     const ctx = this.getContext();
     const agent = ctx.manager.getAgentById(agentId);
@@ -1870,6 +1881,34 @@ export class Runtime {
 
     try {
       this.emitAgentFsmState(agentId, 'S_assess_task', { task, correlationId: options.correlationId });
+      const recursiveDelegation = options.disableRecursiveDelegation
+        ? { action: 'solve_directly', reason: 'Recursive delegation disabled for this run.' } satisfies DelegationDecision
+        : await this.decideAgentDelegation(agent.getInfo(), task, options.correlationId ?? this.createCorrelationId());
+      this.emit({
+        type: 'delegation.decision',
+        agentId,
+        data: {
+          correlationId: options.correlationId,
+          scope: 'agent',
+          action: recursiveDelegation.action,
+          reason: recursiveDelegation.reason,
+          agents: recursiveDelegation.action === 'spawn_subagents' ? recursiveDelegation.agents : [],
+        },
+      });
+      if (recursiveDelegation.action === 'spawn_subagents' && recursiveDelegation.agents.length > 0) {
+        return await this.runAgentDelegatedChildren(agentId, task, recursiveDelegation.agents, usageBefore, options);
+      }
+      if (recursiveDelegation.action !== 'spawn_subagents') {
+        this.emit({
+          type: 'delegation.skipped',
+          agentId,
+          data: {
+            correlationId: options.correlationId,
+            action: recursiveDelegation.action,
+            reason: recursiveDelegation.reason,
+          },
+        });
+      }
       const grounding = await this.runGroundingCheck(agentId, task, options);
       if (grounding.toolCalls.length > 0) {
         this.emitAgentFsmState(agentId, 'S_execute', {
@@ -2084,6 +2123,192 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
       });
       return this.applyBudgetConstraints(fallback);
     }
+  }
+
+  private async decideAgentDelegation(agent: AgentInfo, task: string, correlationId: string): Promise<DelegationDecision> {
+    if (agent.identity.id === 'root') {
+      return { action: 'solve_directly', reason: 'Root delegation is handled by the root turn controller.' };
+    }
+
+    const policy = this.getAgentPolicy(agent.identity.id);
+    if (!policy?.spawnPolicy.canSpawn) {
+      return { action: 'solve_directly', reason: 'Agent spawn policy does not allow child delegation.' };
+    }
+    if (policy.allowedChildren <= policy.currentChildren) {
+      return { action: 'solve_directly', reason: 'Agent has no remaining child slots for this parent.' };
+    }
+
+    const fallback = this.fallbackAgentDelegationDecision(agent, task);
+    if (fallback.action !== 'spawn_subagents') {
+      return fallback;
+    }
+
+    const ctx = this.getContext();
+    if (!ctx.llm) {
+      this.emit({
+        type: 'delegation.decision.fallback',
+        agentId: agent.identity.id,
+        data: { correlationId, reason: 'llm_not_configured_agent_delegation' },
+      });
+      return this.applyAgentBudgetAndPolicyConstraints(agent.identity.id, fallback);
+    }
+
+    try {
+      this.emit({ type: 'delegation.assess.started', agentId: agent.identity.id, data: { correlationId, scope: 'agent' } });
+      const decision = await ctx.llm.completeJSON<DelegationDecision>([
+        {
+          role: 'system',
+          content: `You are ${agent.identity.name}'s delegation controller.
+Decide whether this non-root agent should solve directly or delegate to at most one direct child agent.
+Only delegate when a child with a different specialty materially improves the result.
+Return strict JSON:
+{"action":"solve_directly","reason":"..."}
+{"action":"spawn_subagents","reason":"...","agents":[{"archetype":"critic","name":"Critic-1","task":"...","tomLevel":2}]}
+Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, custom.`,
+        },
+        {
+          role: 'user',
+          content: [
+            `<agent>${JSON.stringify(agent.identity, null, 2)}</agent>`,
+            `<task>${task}</task>`,
+            `<policy>${JSON.stringify(policy, null, 2)}</policy>`,
+            '<runtime_policy>Delegate only to a direct child. The parent must synthesize child results before passing anything upward.</runtime_policy>',
+          ].join('\n\n'),
+        },
+      ], { temperature: 0.1, maxTokens: 500 });
+      const normalized = this.normalizeAgentDelegationDecision(decision, task, fallback);
+      const constrained = this.applyAgentBudgetAndPolicyConstraints(agent.identity.id, normalized);
+      this.emit({
+        type: 'delegation.assess.completed',
+        agentId: agent.identity.id,
+        data: { correlationId, action: constrained.action, source: 'llm', scope: 'agent' },
+      });
+      return constrained.action === 'ask_clarification'
+        ? { action: 'solve_directly', reason: constrained.reason }
+        : constrained;
+    } catch (error) {
+      this.emit({
+        type: 'delegation.decision.fallback',
+        agentId: agent.identity.id,
+        data: {
+          correlationId,
+          reason: 'llm_agent_delegation_failed',
+          error: error instanceof Error ? error.message : String(error),
+        },
+      });
+      return this.applyAgentBudgetAndPolicyConstraints(agent.identity.id, fallback);
+    }
+  }
+
+  private fallbackAgentDelegationDecision(agent: AgentInfo, task: string): DelegationDecision {
+    const archetype = this.inferAgentArchetype(agent);
+    const lower = task.toLowerCase();
+    const wantsReview = /\b(review|critique|risk|risks|failure|validate|audit)\b/.test(lower);
+    const wantsPromptAudit = /\b(prompt|slot|slots|render|context)\b/.test(lower)
+      && /\b(check|inspect|audit|review|validate)\b/.test(lower);
+    const wantsTests = /\b(test|tests|verify|verification|regression)\b/.test(lower);
+
+    if (wantsPromptAudit && archetype !== 'custom') {
+      return {
+        action: 'spawn_subagents',
+        reason: 'The task asks for prompt/context validation, so a focused custom child can inspect that specialty.',
+        agents: [{
+          archetype: 'custom',
+          name: 'PromptAuditor-1',
+          task: `Inspect prompt/context correctness for parent ${agent.identity.name}: ${task}`,
+          tools: ['fs.read'],
+          skills: ['use_tool_when_needed'],
+          tomLevel: 1,
+        }],
+      };
+    }
+
+    if (wantsReview && archetype !== 'critic') {
+      return {
+        action: 'spawn_subagents',
+        reason: 'The task asks for critique or risk review, so a critic child should evaluate the parent result scope.',
+        agents: [{
+          archetype: 'critic',
+          name: 'Critic-1',
+          task: `Review the parent agent task for risks, gaps, and grounding issues: ${task}`,
+          tomLevel: 2,
+        }],
+      };
+    }
+
+    if (wantsTests && archetype !== 'tester') {
+      return {
+        action: 'spawn_subagents',
+        reason: 'The task asks for verification, so a tester child should inspect test strategy or command evidence.',
+        agents: [{
+          archetype: 'tester',
+          name: 'Tester-1',
+          task: `Evaluate test or verification needs for: ${task}`,
+          tomLevel: 0,
+        }],
+      };
+    }
+
+    return {
+      action: 'solve_directly',
+      reason: 'The task does not require a direct child specialist.',
+    };
+  }
+
+  private normalizeAgentDelegationDecision(decision: unknown, task: string, fallback: DelegationDecision): DelegationDecision {
+    const item = decision as Partial<DelegationDecision>;
+    if (item.action === 'solve_directly') {
+      return {
+        action: 'solve_directly',
+        reason: typeof item.reason === 'string' && item.reason.trim()
+          ? item.reason.trim()
+          : 'The agent can complete this task directly.',
+      };
+    }
+
+    if (item.action === 'spawn_subagents' && Array.isArray((item as { agents?: unknown[] }).agents)) {
+      const agents = (item as { agents: Array<Partial<DelegationAgentPlan>> }).agents
+        .filter(plan => this.isValidArchetype(String(plan.archetype)))
+        .slice(0, 1)
+        .map((plan): DelegationAgentPlan => ({
+          archetype: String(plan.archetype) as SubAgentArchetype,
+          name: typeof plan.name === 'string' ? plan.name : undefined,
+          task: typeof plan.task === 'string' && plan.task.trim() ? plan.task.trim() : task,
+          tools: Array.isArray(plan.tools) ? plan.tools.filter((item): item is string => typeof item === 'string') : undefined,
+          skills: Array.isArray(plan.skills) ? plan.skills.filter((item): item is string => typeof item === 'string') : undefined,
+          tomLevel: typeof plan.tomLevel === 'number' ? plan.tomLevel : undefined,
+          budgetTokens: typeof plan.budgetTokens === 'number' ? plan.budgetTokens : undefined,
+        }));
+      if (agents.length > 0) {
+        return {
+          action: 'spawn_subagents',
+          reason: typeof item.reason === 'string' && item.reason.trim()
+            ? item.reason.trim()
+            : 'The agent benefits from a direct child specialist.',
+          agents,
+        };
+      }
+    }
+
+    return fallback;
+  }
+
+  private applyAgentBudgetAndPolicyConstraints(parentId: string, decision: DelegationDecision): DelegationDecision {
+    if (decision.action !== 'spawn_subagents') return decision;
+    const policy = this.getAgentPolicy(parentId);
+    if (!policy) return { action: 'solve_directly', reason: 'Parent policy is unavailable.' };
+    const allowed = Math.max(0, policy.allowedChildren - policy.currentChildren);
+    if (allowed <= 0) {
+      return { action: 'solve_directly', reason: 'No child slots remain for this parent.' };
+    }
+    const supportedAgents = decision.agents.filter(agent => agent.archetype !== 'custom' || policy.spawnPolicy.allowCustomAgents);
+    if (supportedAgents.length === 0) {
+      return { action: 'solve_directly', reason: 'Requested custom child agents are not allowed by this parent policy.' };
+    }
+    return {
+      ...decision,
+      agents: supportedAgents.slice(0, Math.min(allowed, 1)),
+    };
   }
 
   private normalizeDelegationDecision(decision: unknown, userInput: string): DelegationDecision {
@@ -2485,6 +2710,141 @@ Produce the final response to the user as Roy, the root agent.`;
     });
     await ctx.queue.ack(synthesisMessage.id);
     return response || parent.getInfo().lastResult || '';
+  }
+
+  private async runAgentDelegatedChildren(
+    agentId: string,
+    task: string,
+    plans: DelegationAgentPlan[],
+    usageBefore: AgentUsage,
+    options: { correlationId?: string; parentMessageId?: string; archetype?: SubAgentArchetype }
+  ): Promise<RunAgentResult> {
+    const ctx = this.getContext();
+    const parent = ctx.manager.getAgentById(agentId);
+    if (!parent) {
+      throw new Error(`Agent "${agentId}" not found`);
+    }
+    const correlationId = options.correlationId ?? this.createCorrelationId();
+    this.emitAgentFsmState(agentId, 'S_delegate_planning', { correlationId, count: plans.length });
+    this.emit({
+      type: 'delegation.plan.created',
+      agentId,
+      data: {
+        correlationId,
+        scope: 'agent',
+        count: plans.length,
+        agents: plans,
+      },
+    });
+    this.emitAgentFsmState(agentId, 'S_spawn_subagents', { correlationId, count: plans.length });
+
+    const childResults: RootMediatedSpawnResult[] = [];
+    for (const plan of plans.slice(0, 1)) {
+      this.emit({
+        type: 'delegation.subagent.selected',
+        agentId,
+        data: {
+          correlationId,
+          archetype: plan.archetype,
+          name: plan.name,
+          tomLevel: plan.tomLevel,
+          budgetTokens: plan.budgetTokens,
+          scope: 'agent',
+        },
+      });
+      this.emit({
+        type: 'delegation.subagent.task_assigned',
+        agentId,
+        data: {
+          correlationId,
+          archetype: plan.archetype,
+          name: plan.name,
+          task: plan.task,
+          scope: 'agent',
+        },
+      });
+      const result = await this.handleSpawnCommand({
+        archetype: plan.archetype,
+        task: plan.task,
+        parentId: agentId,
+        name: plan.name,
+        tools: plan.tools,
+        skills: plan.skills,
+        tomLevel: plan.tomLevel,
+        budgetTokens: plan.budgetTokens,
+        correlationId,
+        source: agentId,
+        requireRootSynthesis: false,
+        showSubagentOutput: false,
+      });
+      childResults.push(result);
+    }
+
+    this.emitAgentFsmState(agentId, 'S_wait_subagents', { correlationId, completed: childResults.length });
+    if (childResults.length === 0) {
+      return this.runAgent(agentId, task, { ...options, disableRecursiveDelegation: true });
+    }
+
+    const first = childResults[0];
+    const synthesis = await this.synthesizeChildResult(
+      agentId,
+      task,
+      first.agent,
+      first.subagentResult,
+      correlationId,
+      first.messages.find(message => message.kind === 'agent.result')?.id ?? options.parentMessageId ?? ''
+    );
+    const usageAfter = parent.getUsage();
+    const usageDelta = this.toTokenUsage({
+      llmCalls: usageAfter.llmCalls - usageBefore.llmCalls,
+      promptTokens: usageAfter.promptTokens - usageBefore.promptTokens,
+      completionTokens: usageAfter.completionTokens - usageBefore.completionTokens,
+      totalTokens: usageAfter.totalTokens - usageBefore.totalTokens,
+    });
+    const evidence = this.mergeChildEvidence(childResults.map(result => result.subagentResult));
+    const warnings = childResults.flatMap(result => result.subagentResult.warnings);
+    this.emit({
+      type: 'agent.run.completed',
+      agentId,
+      data: {
+        task,
+        delegated: true,
+        childIds: childResults.map(result => result.agent.identity.id),
+        totalTokens: usageDelta.totalTokens,
+        grounded: childResults.every(result => result.subagentResult.grounded),
+        evidence,
+        warnings,
+      },
+    });
+    this.emit({
+      type: 'delegation.completed',
+      agentId,
+      data: {
+        correlationId,
+        scope: 'agent',
+        subagentIds: childResults.map(result => result.agent.identity.id),
+        totalSubagents: childResults.length,
+      },
+    });
+
+    return {
+      agent: parent.getInfo(),
+      result: synthesis,
+      usage: usageDelta,
+      toolCalls: childResults.flatMap(result => result.subagentResult.toolCalls),
+      evidence,
+      grounded: childResults.every(result => result.subagentResult.grounded),
+      warnings,
+    };
+  }
+
+  private mergeChildEvidence(results: RunAgentResult[]): RunEvidence {
+    return {
+      toolGrounded: results.some(result => result.evidence.toolGrounded),
+      outputGrounded: results.some(result => result.evidence.outputGrounded),
+      observedPaths: Array.from(new Set(results.flatMap(result => result.evidence.observedPaths))),
+      toolResultSummary: results.map(result => result.evidence.toolResultSummary).filter(Boolean).join('\n'),
+    };
   }
 
   private async completeAsAgent(agent: BaseAgent, prompt: string, purpose: string, correlationId: string): Promise<string> {

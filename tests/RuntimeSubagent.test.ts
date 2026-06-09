@@ -430,6 +430,54 @@ describe('Runtime controlled subagent spawning', () => {
     await runtime.shutdown();
   });
 
+  it('lets a non-root agent recursively delegate to a direct child during its run', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-recursive-delegation-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'recursive-delegation-test',
+      llmProvider: new EchoLLM(),
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+
+    const researcher = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'researcher',
+      name: 'Researcher-1',
+      tomLevel: 0,
+      description: 'Inspect project',
+      task: 'Inspect project',
+    });
+    const result = await runtime.runAgent(
+      researcher.identity.id,
+      'Review project risks and grounding gaps with a direct child critic.',
+      { correlationId: 'del_recursive_test', archetype: 'researcher' }
+    );
+
+    const tree = runtime.getAgentTree();
+    expect(tree.children[0].agent.identity.id).toBe(researcher.identity.id);
+    expect(tree.children[0].children).toHaveLength(1);
+    expect(tree.children[0].children[0].agent.identity.id).toBe('agent_critic_002');
+
+    expect(result.agent.identity.id).toBe(researcher.identity.id);
+    expect(result.result).toBe('subagent result');
+    expect(result.usage.totalTokens).toBeGreaterThan(0);
+
+    const messages = await runtime.getMessages({ correlationId: 'del_recursive_test' });
+    expect(messages.map(message => message.kind)).toContain('agent.create.request');
+    expect(messages.map(message => message.kind)).toContain('agent.task');
+    expect(messages.map(message => message.kind)).toContain('agent.result');
+    expect(messages.map(message => message.kind)).toContain('agent.synthesis');
+
+    const eventTypes = runtime.getEvents().map(event => event.type);
+    expect(eventTypes).toContain('delegation.decision');
+    expect(eventTypes).toContain('delegation.plan.created');
+    expect(eventTypes).toContain('delegation.completed');
+    expect(eventTypes).toContain('agent.synthesis.completed');
+
+    await runtime.shutdown();
+  });
+
   it('rejects child creation when the parent is failed', async () => {
     const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-invalid-fsm-'));
     const runtime = new Runtime();
