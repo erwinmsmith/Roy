@@ -2159,7 +2159,7 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
         {
           role: 'system',
           content: `You are ${agent.identity.name}'s delegation controller.
-Decide whether this non-root agent should solve directly or delegate to at most one direct child agent.
+Decide whether this non-root agent should solve directly or delegate to 1-3 direct child agents.
 Only delegate when a child with a different specialty materially improves the result.
 Return strict JSON:
 {"action":"solve_directly","reason":"..."}
@@ -2208,44 +2208,42 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
       && /\b(check|inspect|audit|review|validate)\b/.test(lower);
     const wantsTests = /\b(test|tests|verify|verification|regression)\b/.test(lower);
 
+    const agents: DelegationAgentPlan[] = [];
+
     if (wantsPromptAudit && archetype !== 'custom') {
-      return {
-        action: 'spawn_subagents',
-        reason: 'The task asks for prompt/context validation, so a focused custom child can inspect that specialty.',
-        agents: [{
-          archetype: 'custom',
-          name: 'PromptAuditor-1',
-          task: `Inspect prompt/context correctness for parent ${agent.identity.name}: ${task}`,
-          tools: ['fs.read'],
-          skills: ['use_tool_when_needed'],
-          tomLevel: 1,
-        }],
-      };
+      agents.push({
+        archetype: 'custom',
+        name: 'PromptAuditor-1',
+        task: `Inspect prompt/context correctness for parent ${agent.identity.name}: ${task}`,
+        tools: ['fs.read'],
+        skills: ['use_tool_when_needed'],
+        tomLevel: 1,
+      });
     }
 
     if (wantsReview && archetype !== 'critic') {
-      return {
-        action: 'spawn_subagents',
-        reason: 'The task asks for critique or risk review, so a critic child should evaluate the parent result scope.',
-        agents: [{
-          archetype: 'critic',
-          name: 'Critic-1',
-          task: `Review the parent agent task for risks, gaps, and grounding issues: ${task}`,
-          tomLevel: 2,
-        }],
-      };
+      agents.push({
+        archetype: 'critic',
+        name: 'Critic-1',
+        task: `Review the parent agent task for risks, gaps, and grounding issues: ${task}`,
+        tomLevel: 2,
+      });
     }
 
     if (wantsTests && archetype !== 'tester') {
+      agents.push({
+        archetype: 'tester',
+        name: 'Tester-1',
+        task: `Evaluate test or verification needs for: ${task}`,
+        tomLevel: 0,
+      });
+    }
+
+    if (agents.length > 0) {
       return {
         action: 'spawn_subagents',
-        reason: 'The task asks for verification, so a tester child should inspect test strategy or command evidence.',
-        agents: [{
-          archetype: 'tester',
-          name: 'Tester-1',
-          task: `Evaluate test or verification needs for: ${task}`,
-          tomLevel: 0,
-        }],
+        reason: 'The task benefits from direct child specialists before the parent synthesizes upward.',
+        agents: agents.slice(0, 3),
       };
     }
 
@@ -2269,7 +2267,7 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     if (item.action === 'spawn_subagents' && Array.isArray((item as { agents?: unknown[] }).agents)) {
       const agents = (item as { agents: Array<Partial<DelegationAgentPlan>> }).agents
         .filter(plan => this.isValidArchetype(String(plan.archetype)))
-        .slice(0, 1)
+        .slice(0, 3)
         .map((plan): DelegationAgentPlan => ({
           archetype: String(plan.archetype) as SubAgentArchetype,
           name: typeof plan.name === 'string' ? plan.name : undefined,
@@ -2307,7 +2305,7 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     }
     return {
       ...decision,
-      agents: supportedAgents.slice(0, Math.min(allowed, 1)),
+      agents: supportedAgents.slice(0, Math.min(allowed, 3)),
     };
   }
 
@@ -2712,6 +2710,103 @@ Produce the final response to the user as Roy, the root agent.`;
     return response || parent.getInfo().lastResult || '';
   }
 
+  private async synthesizeDirectChildResults(
+    parentId: string,
+    userTask: string,
+    childResults: RootMediatedSpawnResult[],
+    correlationId: string,
+    parentMessageId: string
+  ): Promise<string> {
+    if (childResults.length === 1) {
+      return this.synthesizeChildResult(
+        parentId,
+        userTask,
+        childResults[0].agent,
+        childResults[0].subagentResult,
+        correlationId,
+        parentMessageId
+      );
+    }
+
+    const ctx = this.getContext();
+    const parent = ctx.manager.getAgentById(parentId);
+    if (!parent) {
+      throw new Error(`Parent agent "${parentId}" not found`);
+    }
+    if (parentId === 'root') {
+      return this.synthesizeDelegatedResults(userTask, childResults, correlationId);
+    }
+
+    const parentIdentity = parent.getIdentity();
+    const synthesisMessage = await this.enqueueMessage({
+      kind: 'agent.synthesis',
+      sessionId: ctx.sessionId,
+      from: parentId,
+      to: parentId,
+      correlationId,
+      parentMessageId,
+      payload: {
+        userTask,
+        parentId,
+        childIds: childResults.map(result => result.agent.identity.id),
+      },
+      metadata: {
+        agentId: parentId,
+        tomLevel: parentIdentity.tomProfile.level,
+      },
+    });
+    await this.processQueuedMessage(synthesisMessage.id);
+
+    const usageBefore = parent.getUsage();
+    const from = parent.getState();
+    parent.setRuntimeState('synthesizing');
+    this.emitAgentFsmState(parentId, 'S_synthesize', {
+      correlationId,
+      childIds: childResults.map(result => result.agent.identity.id),
+    });
+    this.emit({
+      type: 'agent.synthesis.started',
+      agentId: parentId,
+      data: {
+        correlationId,
+        childIds: childResults.map(result => result.agent.identity.id),
+      },
+    });
+    this.emit({ type: 'agent.status.changed', agentId: parentId, data: { from, to: 'synthesizing', correlationId } });
+    this.emit({ type: 'agent.llm.called', agentId: parentId, data: { purpose: 'agent.multi_child_synthesis', correlationId } });
+
+    const response = await this.completeAsAgent(
+      parent,
+      this.buildParentMultiChildSynthesisPrompt(parent.getInfo(), userTask, childResults),
+      'agent.multi_child_synthesis',
+      correlationId
+    );
+    const usageAfter = parent.getUsage();
+    const usageDelta = this.toTokenUsage({
+      llmCalls: usageAfter.llmCalls - usageBefore.llmCalls,
+      promptTokens: usageAfter.promptTokens - usageBefore.promptTokens,
+      completionTokens: usageAfter.completionTokens - usageBefore.completionTokens,
+      totalTokens: usageAfter.totalTokens - usageBefore.totalTokens,
+    });
+    this.recordTurnUsage(usageDelta);
+    this.emit({ type: 'budget.updated', agentId: parentId, data: { ...usageDelta } });
+
+    parent.setRuntimeState('done');
+    this.emit({ type: 'agent.status.changed', agentId: parentId, data: { from: 'synthesizing', to: 'done', correlationId } });
+    this.emitAgentFsmState(parentId, 'S_turn_done', { correlationId, childIds: childResults.map(result => result.agent.identity.id) });
+    this.emit({
+      type: 'agent.synthesis.completed',
+      agentId: parentId,
+      data: {
+        correlationId,
+        childIds: childResults.map(result => result.agent.identity.id),
+        totalTokens: usageDelta.totalTokens,
+      },
+    });
+    await ctx.queue.ack(synthesisMessage.id);
+    return response || parent.getInfo().lastResult || '';
+  }
+
   private async runAgentDelegatedChildren(
     agentId: string,
     task: string,
@@ -2739,7 +2834,7 @@ Produce the final response to the user as Roy, the root agent.`;
     this.emitAgentFsmState(agentId, 'S_spawn_subagents', { correlationId, count: plans.length });
 
     const childResults: RootMediatedSpawnResult[] = [];
-    for (const plan of plans.slice(0, 1)) {
+    for (const plan of plans) {
       this.emit({
         type: 'delegation.subagent.selected',
         agentId,
@@ -2776,6 +2871,7 @@ Produce the final response to the user as Roy, the root agent.`;
         source: agentId,
         requireRootSynthesis: false,
         showSubagentOutput: false,
+        disableRecursiveDelegation: plans.length > 1,
       });
       childResults.push(result);
     }
@@ -2785,14 +2881,12 @@ Produce the final response to the user as Roy, the root agent.`;
       return this.runAgent(agentId, task, { ...options, disableRecursiveDelegation: true });
     }
 
-    const first = childResults[0];
-    const synthesis = await this.synthesizeChildResult(
+    const synthesis = await this.synthesizeDirectChildResults(
       agentId,
       task,
-      first.agent,
-      first.subagentResult,
+      childResults,
       correlationId,
-      first.messages.find(message => message.kind === 'agent.result')?.id ?? options.parentMessageId ?? ''
+      childResults[0].messages.find(message => message.kind === 'agent.result')?.id ?? options.parentMessageId ?? ''
     );
     const usageAfter = parent.getUsage();
     const usageDelta = this.toTokenUsage({
@@ -2927,6 +3021,48 @@ ${childResult.evidence.observedPaths.slice(0, 30).map(item => `  - ${item}`).joi
 ${warnings}
 
 Produce a parent-level synthesis that can be passed upward to your parent. Do not answer as Roy unless your name is Roy. Preserve limitations and evidence.`;
+  }
+
+  private buildParentMultiChildSynthesisPrompt(parent: AgentInfo, userTask: string, childResults: RootMediatedSpawnResult[]): string {
+    const reports = childResults.map(result => {
+      const warnings = result.subagentResult.warnings.length > 0
+        ? result.subagentResult.warnings.map(item => `- ${item}`).join('\n')
+        : 'None';
+      return `<direct_child_report>
+id: ${result.agent.identity.id}
+name: ${result.agent.identity.name}
+role: ${result.agent.identity.role}
+tom: ToM-${result.agent.identity.tomProfile.level}
+tokens: ${result.subagentResult.usage.totalTokens}
+grounded: ${result.subagentResult.grounded}
+tool_grounded: ${result.subagentResult.evidence.toolGrounded}
+output_grounded: ${result.subagentResult.evidence.outputGrounded}
+tool_calls: ${result.subagentResult.toolCalls.map(call => call.toolName).join(', ') || 'none'}
+observed_paths:
+${result.subagentResult.evidence.observedPaths.slice(0, 30).map(item => `- ${item}`).join('\n') || '- none'}
+warnings:
+${warnings}
+content:
+${result.subagentResult.result}
+</direct_child_report>`;
+    }).join('\n\n');
+
+    return `You are the parent agent responsible for aggregating your direct children.
+
+Parent agent:
+id: ${parent.identity.id}
+name: ${parent.identity.name}
+role: ${parent.identity.role}
+
+Assigned task:
+<task>
+${userTask}
+</task>
+
+You delegated to ${childResults.length} direct child agent(s). Synthesize their reports into a parent-level result that can be passed upward.
+Preserve concrete evidence and limitations. Do not answer as Roy unless your name is Roy.
+
+${reports}`;
   }
 
   private createSyntheticRunResult(parent: AgentInfo, result: string, childResult: RunAgentResult): RunAgentResult {

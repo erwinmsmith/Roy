@@ -478,6 +478,49 @@ describe('Runtime controlled subagent spawning', () => {
     await runtime.shutdown();
   });
 
+  it('lets a non-root parent aggregate multiple direct children', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-multi-child-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'multi-child-delegation-test',
+      llmProvider: new EchoLLM(),
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+
+    const researcher = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'researcher',
+      name: 'Researcher-1',
+      tomLevel: 0,
+      description: 'Inspect project',
+      task: 'Inspect project',
+    });
+    const result = await runtime.runAgent(
+      researcher.identity.id,
+      'Review project risks and verify test coverage gaps.',
+      { correlationId: 'del_multi_child_test', archetype: 'researcher' }
+    );
+
+    const children = runtime.getChildren(researcher.identity.id);
+    expect(children.map(child => child.identity.id)).toEqual([
+      'agent_critic_002',
+      'agent_tester_003',
+    ]);
+    expect(result.result).toBe('subagent result');
+
+    const messages = await runtime.getMessages({ correlationId: 'del_multi_child_test' });
+    expect(messages.filter(message => message.kind === 'agent.task')).toHaveLength(2);
+    expect(messages.filter(message => message.kind === 'agent.result' && message.to === researcher.identity.id)).toHaveLength(2);
+    expect(messages.filter(message => message.kind === 'agent.synthesis')).toHaveLength(1);
+
+    const synthesisEvent = runtime.getEvents().find(event => event.type === 'agent.synthesis.completed' && event.agentId === researcher.identity.id);
+    expect(synthesisEvent?.data?.childIds).toEqual(['agent_critic_002', 'agent_tester_003']);
+    expect(runtime.getBudgetState().perAgent[researcher.identity.id].totalTokens).toBeGreaterThan(0);
+
+    await runtime.shutdown();
+  });
+
   it('rejects child creation when the parent is failed', async () => {
     const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-invalid-fsm-'));
     const runtime = new Runtime();
