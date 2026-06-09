@@ -130,6 +130,7 @@ export interface AgentPatternInput {
   description?: string;
   tools?: string[];
   skills?: string[];
+  spawnPolicy?: unknown;
 }
 
 export interface DelegationPatternInput {
@@ -843,6 +844,7 @@ Keep this agent identity separate from the model provider identity.
       contextPath: `.roy/agents/${key}/context.md`,
       tools: input.tools ?? [],
       skills: input.skills ?? [],
+      spawnPolicy: input.spawnPolicy ?? {},
       usage: {
         count: Number((existing?.usage as Record<string, unknown> | undefined)?.count ?? 0) + 1,
         lastUsedAt: now,

@@ -216,4 +216,207 @@ describe('Runtime controlled subagent spawning', () => {
 
     await runtime.shutdown();
   });
+
+  it('exposes built-in archetype skills, tools, and spawn policies', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-archetypes-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'archetype-policy-test',
+      llmProvider: new EchoLLM(),
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+
+    const profiles = runtime.getAgentArchetypeProfiles();
+    const researcher = profiles.find(profile => profile.archetype === 'researcher');
+    const critic = profiles.find(profile => profile.archetype === 'critic');
+
+    expect(researcher?.tools.map(tool => tool.name)).toEqual(['fs.list', 'fs.read']);
+    expect(researcher?.skills.map(skill => skill.name)).toContain('delegate_to_subagent');
+    expect(critic?.tools.map(tool => tool.name)).toEqual(['fs.read']);
+    expect(critic?.skills.map(skill => skill.name)).toContain('delegate_to_subagent');
+    expect(researcher?.spawnPolicy.maxChildren).toBe(5);
+    expect(researcher?.spawnPolicy.maxDepth).toBe(3);
+
+    await runtime.shutdown();
+  });
+
+  it('binds parent-approved tools and skills, and stores them in cache patterns', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-bindings-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'binding-cache-test',
+      llmProvider: new EchoLLM(),
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+
+    const result = await runtime.handleSpawnCommand({
+      archetype: 'researcher',
+      task: 'Inspect the project structure',
+    });
+    const policy = runtime.getAgentPolicy(result.agent.identity.id);
+    expect(policy?.tools.map(tool => tool.name)).toEqual(['fs.list', 'fs.read']);
+    expect(policy?.skills.map(skill => skill.name)).toEqual(['use_tool_when_needed', 'delegate_to_subagent']);
+
+    const agentPatterns = await runtime.getCachePatterns('agents');
+    const researcherPattern = agentPatterns.find(pattern => pattern.id === 'agent_pattern_researcher_v1');
+    expect(researcherPattern?.tools).toEqual(['fs.list', 'fs.read']);
+    expect(researcherPattern?.skills).toEqual(['use_tool_when_needed', 'delegate_to_subagent']);
+    expect(researcherPattern?.spawnPolicy).toMatchObject({
+      maxChildren: 5,
+      maxDepth: 3,
+      budgetAware: true,
+    });
+
+    const eventTypes = runtime.getEvents().map(event => event.type);
+    expect(eventTypes).toContain('agent.create.requested');
+    expect(eventTypes).toContain('spawn.policy.checked');
+    expect(eventTypes).toContain('agent.create.approved');
+    expect(eventTypes).toContain('agent.instance.created');
+    expect(eventTypes).toContain('agent.tool.bound');
+    expect(eventTypes).toContain('agent.skill.bound');
+
+    await runtime.shutdown();
+  });
+
+  it('creates custom agents with custom identity, role, and explicit bindings', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-custom-spawn-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'custom-spawn-test',
+      llmProvider: new EchoLLM(),
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+
+    const result = await runtime.handleSpawnCommand({
+      archetype: 'custom',
+      name: 'PromptAuditor-1',
+      customRole: 'prompt inspector',
+      task: 'Introduce yourself briefly.',
+      tools: ['fs.read'],
+      skills: ['use_tool_when_needed'],
+    });
+
+    expect(result.agent.identity.name).toBe('PromptAuditor-1');
+    expect(result.agent.identity.description).toContain('Introduce yourself briefly.');
+    const policy = runtime.getAgentPolicy(result.agent.identity.id);
+    expect(policy?.tools.map(tool => tool.name)).toEqual(['fs.read']);
+    expect(policy?.skills.map(skill => skill.name)).toEqual(['use_tool_when_needed']);
+
+    const prompt = await readFile(path.join(workspaceCwd, '.roy', 'agents', 'promptauditor-1', 'prompt.md'), 'utf8');
+    expect(prompt).toContain('{{agent_identity}}');
+
+    await runtime.shutdown();
+  });
+
+  it('rejects the sixth direct child under the default parent child limit', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-child-limit-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'child-limit-test',
+      llmProvider: new EchoLLM(),
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+
+    for (let index = 1; index <= 5; index += 1) {
+      await runtime.spawnAgent({
+        parentId: 'root',
+        archetype: 'researcher',
+        name: `Researcher-${index}`,
+        tomLevel: 0,
+        description: `task ${index}`,
+        task: `task ${index}`,
+      });
+    }
+
+    await expect(runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'researcher',
+      name: 'Researcher-6',
+      tomLevel: 0,
+      description: 'task 6',
+      task: 'task 6',
+    })).rejects.toThrow('max_children_exceeded');
+
+    const rejected = runtime.getEvents().find(event => event.type === 'spawn.policy.rejected');
+    expect(rejected?.data?.reason).toBe('max_children_exceeded');
+    expect(runtime.getChildren('root')).toHaveLength(5);
+
+    await runtime.shutdown();
+  });
+
+  it('supports creating a subsubagent under a subagent parent', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-subsubagent-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'subsubagent-test',
+      llmProvider: new EchoLLM(),
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+
+    const researcher = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'researcher',
+      name: 'Researcher-1',
+      tomLevel: 0,
+      description: 'Inspect project',
+      task: 'Inspect project',
+    });
+    const critic = await runtime.spawnAgent({
+      parentId: researcher.identity.id,
+      archetype: 'critic',
+      name: 'Critic-1',
+      tomLevel: 2,
+      description: 'Review Researcher-1 output',
+      task: 'Review Researcher-1 output',
+    });
+
+    const tree = runtime.getAgentTree();
+    expect(tree.children).toHaveLength(1);
+    expect(tree.children[0].agent.identity.id).toBe(researcher.identity.id);
+    expect(tree.children[0].children).toHaveLength(1);
+    expect(tree.children[0].children[0].agent.identity.id).toBe(critic.identity.id);
+
+    await runtime.shutdown();
+  });
+
+  it('rejects child creation when the parent is failed', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-invalid-fsm-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'invalid-fsm-test',
+      llmProvider: new EchoLLM(),
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+
+    const researcher = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'researcher',
+      name: 'Researcher-1',
+      tomLevel: 0,
+      description: 'Inspect project',
+      task: 'Inspect project',
+    });
+    const agent = runtime.getContext().manager.getAgentById(researcher.identity.id);
+    agent?.setRuntimeState('failed');
+
+    await expect(runtime.spawnAgent({
+      parentId: researcher.identity.id,
+      archetype: 'critic',
+      name: 'Critic-1',
+      tomLevel: 2,
+      description: 'Review failed researcher',
+      task: 'Review failed researcher',
+    })).rejects.toThrow('invalid_fsm_state');
+
+    const rejected = runtime.getEvents().find(event => event.type === 'delegation.rejected');
+    expect(rejected?.data?.reason).toBe('invalid_fsm_state');
+
+    await runtime.shutdown();
+  });
 });

@@ -325,7 +325,13 @@ export class Roy {
         break;
 
       case '/agents':
-        this.printAgents(parts.includes('--tree'), parts.includes('--tom'));
+        if (parts[1] === 'archetypes') {
+          this.printAgentArchetypes();
+        } else if (parts[1] === 'policy') {
+          this.printAgentPolicy(parts[2]);
+        } else {
+          this.printAgents(parts.includes('--tree'), parts.includes('--tom'));
+        }
         break;
 
       case '/spawn':
@@ -490,6 +496,8 @@ export class Roy {
       /agents             List available agents
       /agents --tree      Show agent parent-child tree
       /agents --tree --tom Show agent tree with ToM profiles
+      /agents archetypes  Show built-in archetype skills/tools
+      /agents policy <id> Show spawn policy for an agent
       /spawn <type> "task" Spawn and run a controlled subagent
       /spawn <type> --parent <id> "task" Spawn below another agent
       /spawn custom --name <name> [--role <role>] [--style <style>] "task"
@@ -542,6 +550,45 @@ export class Roy {
         }
       }
     }
+    console.log('');
+  }
+
+  private printAgentArchetypes(): void {
+    console.log('\n  ' + this.bold('Agent Archetypes'));
+    for (const profile of runtime.getAgentArchetypeProfiles()) {
+      const tools = profile.tools.map(tool => tool.name).join(', ') || 'none';
+      const skills = profile.skills.map(skill => skill.name).join(', ') || 'none';
+      console.log(`    - ${this.cyan(profile.archetype)}`);
+      console.log(`      tools:  ${tools}`);
+      console.log(`      skills: ${skills}`);
+      console.log(`      spawn:  maxChildren=${profile.spawnPolicy.maxChildren}, maxDepth=${profile.spawnPolicy.maxDepth}, custom=${profile.spawnPolicy.allowCustomAgents ? 'allowed' : 'blocked'}`);
+    }
+    console.log('');
+  }
+
+  private printAgentPolicy(agentId: string | undefined): void {
+    if (!agentId) {
+      console.log('\n  Usage: /agents policy <agentId>\n');
+      return;
+    }
+    const policy = runtime.getAgentPolicy(agentId);
+    if (!policy) {
+      console.log('\n  ' + this.yellow(`No agent found: ${agentId}`) + '\n');
+      return;
+    }
+    console.log('\n  ' + this.bold(`Spawn Policy for ${agentId}`));
+    console.log(`    parent:          ${policy.parentId ?? '-'}`);
+    console.log(`    depth:           ${policy.depth}`);
+    console.log(`    canSpawn:        ${policy.spawnPolicy.canSpawn ? 'yes' : 'no'}`);
+    console.log(`    maxChildren:     ${policy.spawnPolicy.maxChildren}`);
+    console.log(`    currentChildren: ${policy.currentChildren}`);
+    console.log(`    allowedChildren: ${policy.allowedChildren}`);
+    console.log(`    maxDepth:        ${policy.spawnPolicy.maxDepth}`);
+    console.log(`    customAgents:    ${policy.spawnPolicy.allowCustomAgents ? 'allowed' : 'blocked'}`);
+    console.log(`    budgetAware:     ${policy.spawnPolicy.budgetAware ? 'yes' : 'no'}`);
+    console.log(`    allowedStates:   ${policy.spawnPolicy.allowedStates.join(', ')}`);
+    console.log(`    tools:           ${policy.tools.map(tool => tool.name).join(', ') || 'none'}`);
+    console.log(`    skills:          ${policy.skills.map(skill => skill.name).join(', ') || 'none'}`);
     console.log('');
   }
 
@@ -1191,6 +1238,8 @@ export class Roy {
     const name = this.optionValue(parts, '--name');
     const customRole = this.optionValue(parts, '--role');
     const customStyle = this.optionValue(parts, '--style');
+    const tools = this.optionList(parts, '--tools');
+    const skills = this.optionList(parts, '--skills');
     const task = this.trailingTask(parts, 2);
     const allowed = ['researcher', 'critic', 'planner', 'coder', 'summarizer', 'tester', 'custom'];
 
@@ -1207,6 +1256,8 @@ export class Roy {
         name,
         customRole,
         customStyle,
+        tools,
+        skills,
         requireRootSynthesis: true,
         showSubagentOutput: !quiet,
       });
@@ -1267,6 +1318,10 @@ export class Roy {
       if (pattern.memoryPath) console.log(`      memoryPath:  ${pattern.memoryPath}`);
       if (Array.isArray(pattern.tools)) console.log(`      tools:       ${pattern.tools.join(', ') || 'none'}`);
       if (Array.isArray(pattern.skills)) console.log(`      skills:      ${pattern.skills.join(', ') || 'none'}`);
+      if (typeof pattern.spawnPolicy === 'object' && pattern.spawnPolicy !== null) {
+        const policy = pattern.spawnPolicy as Record<string, unknown>;
+        console.log(`      spawnPolicy: maxChildren=${policy.maxChildren ?? '-'}, maxDepth=${policy.maxDepth ?? '-'}, budgetAware=${policy.budgetAware ?? '-'}`);
+      }
       if (usage.definitionTokensSaved !== undefined) console.log(`      savedTokens: ${usage.definitionTokensSaved}`);
       if (usage.lastRenderedPromptTokens !== undefined) console.log(`      rendered:    ${usage.lastRenderedPromptTokens} tokens`);
     }
@@ -1278,6 +1333,7 @@ export class Roy {
   Usage:
     /spawn <researcher|critic|planner|coder|summarizer|tester> "task"
     /spawn custom --name <agentName> [--role <role>] [--style <style>] "task"
+    /spawn custom --name <agentName> [--tools fs.read,fs.list] [--skills use_tool_when_needed] "task"
     /spawn <archetype> --parent <agentId> "task"
 
   Examples:
@@ -1288,6 +1344,7 @@ export class Roy {
   Notes:
     - The first argument is an agent archetype, not an agent name.
     - Custom names must be passed with --name.
+    - --tools and --skills are parent-approved bindings for the child agent.
     - A cache hit reuses agent pattern/config, but still creates a new runtime agent instance.
 `);
   }
@@ -1297,8 +1354,15 @@ export class Roy {
     return index >= 0 ? parts[index + 1] : undefined;
   }
 
+  private optionList(parts: string[], option: string): string[] | undefined {
+    const value = this.optionValue(parts, option);
+    if (!value) return undefined;
+    const items = value.split(',').map(item => item.trim()).filter(Boolean);
+    return items.length > 0 ? items : undefined;
+  }
+
   private trailingTask(parts: string[], startIndex: number): string {
-    const optionsWithValues = new Set(['--parent', '--name', '--role', '--style', '--task']);
+    const optionsWithValues = new Set(['--parent', '--name', '--role', '--style', '--task', '--tools', '--skills']);
     const taskParts: string[] = [];
     for (let index = startIndex; index < parts.length; index += 1) {
       const part = parts[index];

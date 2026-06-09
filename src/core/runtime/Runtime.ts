@@ -108,6 +108,45 @@ export type SubAgentArchetype =
   | 'tester'
   | 'custom';
 
+export interface ToolBinding {
+  name: string;
+  enabled: boolean;
+  permission: 'read_only' | 'write' | 'execute';
+  constraints?: {
+    allowedPaths?: string[];
+    blockedPaths?: string[];
+    allowlistedCommands?: string[];
+    maxCalls?: number;
+  };
+}
+
+export interface SkillBinding {
+  name: string;
+  enabled: boolean;
+  description: string;
+  constraints?: {
+    maxCalls?: number;
+    requiresApproval?: boolean;
+  };
+}
+
+export interface AgentSpawnPolicy {
+  canSpawn: boolean;
+  maxChildren: number;
+  maxDepth: number;
+  maxTotalAgentsPerTurn: number;
+  allowCustomAgents: boolean;
+  budgetAware: boolean;
+  allowedStates: string[];
+}
+
+export interface AgentMemoryScope {
+  public: boolean;
+  private: boolean;
+  parentContext: boolean;
+  sessionWindowTurns: number;
+}
+
 export interface SpawnAgentSpec {
   parentId: string;
   name?: string;
@@ -117,7 +156,10 @@ export interface SpawnAgentSpec {
   tomLevel: number;
   description: string;
   task?: string;
-  tools?: string[];
+  tools?: string[] | ToolBinding[];
+  skills?: string[] | SkillBinding[];
+  memoryScope?: AgentMemoryScope;
+  spawnPolicy?: Partial<AgentSpawnPolicy>;
   budgetTokens?: number;
   systemPrompt?: string;
 }
@@ -160,6 +202,8 @@ export interface SpawnCommandPayload {
   name?: string;
   customRole?: string;
   customStyle?: string;
+  tools?: string[];
+  skills?: string[];
   tomLevel?: number;
   budgetTokens?: number;
   requireRootSynthesis?: boolean;
@@ -186,6 +230,8 @@ export interface DelegationAgentPlan {
   archetype: SubAgentArchetype;
   name?: string;
   task: string;
+  tools?: string[];
+  skills?: string[];
   tomLevel?: number;
   budgetTokens?: number;
 }
@@ -221,6 +267,28 @@ export interface AgentCreationUsage {
   renderedPromptChars: number;
 }
 
+export interface AgentBindingState {
+  tools: ToolBinding[];
+  skills: SkillBinding[];
+  memoryScope: AgentMemoryScope;
+  spawnPolicy: AgentSpawnPolicy;
+}
+
+export interface AgentPolicyView extends AgentBindingState {
+  agentId: string;
+  parentId?: string;
+  depth: number;
+  currentChildren: number;
+  allowedChildren: number;
+}
+
+export interface AgentArchetypeProfile {
+  archetype: SubAgentArchetype;
+  tools: ToolBinding[];
+  skills: SkillBinding[];
+  spawnPolicy: AgentSpawnPolicy;
+}
+
 export class Runtime {
   private static instance: Runtime | null = null;
 
@@ -233,6 +301,7 @@ export class Runtime {
   private queue: MessageQueue | null = null;
   private scheduler: MessageScheduler | null = null;
   private memory: WorkspaceMemoryManager | null = null;
+  private agentBindings = new Map<string, AgentBindingState>();
 
   static getInstance(): Runtime {
     if (!Runtime.instance) {
@@ -285,6 +354,7 @@ export class Runtime {
     // Create AgentManager
     const manager = new AgentManager();
     registerCoreTools();
+    this.registerCoreSkills();
     const memory = new WorkspaceMemoryManager();
     await memory.initWorkspace(options.workspaceCwd ?? process.cwd(), options.sessionId ?? 'main');
     const rootMemory = await memory.loadAgentMemory('roy');
@@ -323,10 +393,14 @@ export class Runtime {
 
     logger.info(`Agent created: ${agentName} in ${options.mode ?? 'hybrid'} mode`);
 
-    this.registerCoreSkills();
-
     // Register capabilities with agent
     const capabilities = this.registerCapabilities(agent);
+    this.agentBindings.set('root', {
+      tools: this.getRootToolBindings(),
+      skills: this.getRootSkillBindings(),
+      memoryScope: this.getDefaultMemoryScope('root'),
+      spawnPolicy: this.getDefaultSpawnPolicy('root'),
+    });
 
     // Add agent to manager
     manager.addAgent(agent);
@@ -390,6 +464,7 @@ export class Runtime {
     this.queue = null;
     this.scheduler = null;
     this.memory = null;
+    this.agentBindings.clear();
     this.initialized = false;
     logger.info('Runtime shutdown complete');
   }
@@ -422,7 +497,7 @@ export class Runtime {
     }
   }
 
-  private registerCapabilities(agent: UnifiedAgent): RuntimeContext['capabilities'] {
+  private registerCapabilities(agent: UnifiedAgent, toolNames?: string[]): RuntimeContext['capabilities'] {
     // Register actions
     const actions = actionRegistry.list();
     for (const action of actions) {
@@ -431,7 +506,8 @@ export class Runtime {
     }
 
     // Register tools
-    const tools = toolRegistry.list();
+    const allowedToolNames = toolNames ? new Set(toolNames) : undefined;
+    const tools = toolRegistry.list().filter(tool => !allowedToolNames || allowedToolNames.has(tool.name));
     for (const tool of tools) {
       agent.registerTool(tool);
       logger.debug(`Registered tool: ${tool.name}`);
@@ -449,8 +525,44 @@ export class Runtime {
   }
 
   private registerCoreSkills(): void {
-    skillRegistry.register(new DelegateToSubagentSkill(() => this));
-    skillRegistry.register(new UseToolWhenNeededSkill());
+    if (!skillRegistry.has('delegate_to_subagent')) {
+      skillRegistry.register(new DelegateToSubagentSkill(() => this));
+    }
+    if (!skillRegistry.has('use_tool_when_needed')) {
+      skillRegistry.register(new UseToolWhenNeededSkill());
+    }
+  }
+
+  getAgentArchetypeProfiles(): AgentArchetypeProfile[] {
+    const archetypes: SubAgentArchetype[] = ['researcher', 'critic', 'planner', 'coder', 'summarizer', 'tester', 'custom'];
+    return archetypes.map(archetype => ({
+      archetype,
+      tools: this.getDefaultToolBindings(archetype),
+      skills: this.getDefaultSkillBindings(archetype),
+      spawnPolicy: this.getDefaultSpawnPolicy('subagent', archetype),
+    }));
+  }
+
+  getAgentPolicy(agentId: string): AgentPolicyView | undefined {
+    const ctx = this.getContext();
+    const agent = ctx.manager.getAgentById(agentId);
+    if (!agent) return undefined;
+    const identity = agent.getIdentity();
+    const bindings = this.agentBindings.get(agentId) ?? {
+      tools: [],
+      skills: [],
+      memoryScope: this.getDefaultMemoryScope(identity.role),
+      spawnPolicy: this.getDefaultSpawnPolicy(identity.role === 'root' ? 'root' : 'subagent'),
+    };
+    const depth = this.getAgentDepth(agentId);
+    return {
+      ...bindings,
+      agentId,
+      parentId: identity.parentId,
+      depth,
+      currentChildren: this.getChildren(agentId).length,
+      allowedChildren: this.computeAllowedChildren(bindings.spawnPolicy),
+    };
   }
 
   isInitialized(): boolean {
@@ -527,6 +639,202 @@ export class Runtime {
       this.emit({ type: 'budget.updated', data: { mode: 'limited', limitTokens } });
     }
     return this.getBudgetState();
+  }
+
+  private getRootToolBindings(): ToolBinding[] {
+    return toolRegistry.list().map(tool => this.createToolBinding(tool.name));
+  }
+
+  private getRootSkillBindings(): SkillBinding[] {
+    return skillRegistry.list().map(skill => this.createSkillBinding(skill.name));
+  }
+
+  private getDefaultToolBindings(archetype: SubAgentArchetype): ToolBinding[] {
+    const namesByArchetype: Record<SubAgentArchetype, string[]> = {
+      researcher: ['fs.list', 'fs.read'],
+      critic: ['fs.read'],
+      planner: [],
+      coder: ['fs.read', 'shell.exec'],
+      summarizer: [],
+      tester: ['fs.read', 'shell.exec'],
+      custom: [],
+    };
+    return namesByArchetype[archetype].map(name => this.createToolBinding(name));
+  }
+
+  private getDefaultSkillBindings(archetype: SubAgentArchetype): SkillBinding[] {
+    const namesByArchetype: Record<SubAgentArchetype, string[]> = {
+      researcher: ['use_tool_when_needed', 'delegate_to_subagent'],
+      critic: ['use_tool_when_needed', 'delegate_to_subagent'],
+      planner: ['delegate_to_subagent'],
+      coder: ['use_tool_when_needed', 'delegate_to_subagent'],
+      summarizer: [],
+      tester: ['use_tool_when_needed', 'delegate_to_subagent'],
+      custom: [],
+    };
+    return namesByArchetype[archetype].map(name => this.createSkillBinding(name));
+  }
+
+  private createToolBinding(name: string): ToolBinding {
+    const permission: ToolBinding['permission'] = name === 'shell.exec'
+      ? 'execute'
+      : name === 'fs.write'
+        ? 'write'
+        : 'read_only';
+    return {
+      name,
+      enabled: true,
+      permission,
+      constraints: name === 'shell.exec'
+        ? {
+            allowlistedCommands: ['npm', 'node', 'git', 'pwd', 'ls', 'cat', 'rg', 'sed'],
+            maxCalls: 5,
+          }
+        : { allowedPaths: [process.cwd()], maxCalls: 20 },
+    };
+  }
+
+  private createSkillBinding(name: string): SkillBinding {
+    const skill = skillRegistry.get(name);
+    return {
+      name,
+      enabled: true,
+      description: skill?.description ?? name,
+      constraints: name === 'delegate_to_subagent'
+        ? { maxCalls: 5, requiresApproval: false }
+        : undefined,
+    };
+  }
+
+  private normalizeToolBindings(input: SpawnAgentSpec['tools'] | SpawnCommandPayload['tools'], archetype: SubAgentArchetype): ToolBinding[] {
+    const raw = input ?? this.getDefaultToolBindings(archetype);
+    return raw.map(item => typeof item === 'string' ? this.createToolBinding(item) : item);
+  }
+
+  private normalizeSkillBindings(input: SpawnAgentSpec['skills'] | SpawnCommandPayload['skills'], archetype: SubAgentArchetype): SkillBinding[] {
+    const raw = input ?? this.getDefaultSkillBindings(archetype);
+    return raw.map(item => typeof item === 'string' ? this.createSkillBinding(item) : item);
+  }
+
+  private getDefaultSpawnPolicy(role: 'root' | 'subagent' | string, archetype?: SubAgentArchetype): AgentSpawnPolicy {
+    const isRoot = role === 'root';
+    const canSpawn = isRoot || archetype !== 'summarizer';
+    return {
+      canSpawn,
+      maxChildren: 5,
+      maxDepth: 3,
+      maxTotalAgentsPerTurn: 10,
+      allowCustomAgents: isRoot,
+      budgetAware: true,
+      allowedStates: ['idle', 'thinking', 'waiting', 'done'],
+    };
+  }
+
+  private getDefaultMemoryScope(role: string): AgentMemoryScope {
+    return {
+      public: true,
+      private: true,
+      parentContext: role !== 'root',
+      sessionWindowTurns: role === 'root' ? 10 : 5,
+    };
+  }
+
+  private mergeSpawnPolicy(base: AgentSpawnPolicy, override?: Partial<AgentSpawnPolicy>): AgentSpawnPolicy {
+    return {
+      ...base,
+      ...override,
+      allowedStates: override?.allowedStates ?? base.allowedStates,
+    };
+  }
+
+  private computeAllowedChildren(policy: AgentSpawnPolicy): number {
+    if (!policy.canSpawn) return 0;
+    const budget = this.getBudgetState();
+    if (!policy.budgetAware || budget.mode === 'unlimited') return policy.maxChildren;
+    const remaining = budget.remainingTokens ?? 0;
+    if (remaining < 1000) return 0;
+    if (remaining < 3000) return Math.min(policy.maxChildren, 1);
+    if (remaining < 8000) return Math.min(policy.maxChildren, 2);
+    return policy.maxChildren;
+  }
+
+  private getAgentDepth(agentId: string): number {
+    const ctx = this.getContext();
+    let depth = 0;
+    let current = ctx.manager.getAgentById(agentId)?.getIdentity().parentId;
+    while (current) {
+      depth += 1;
+      current = ctx.manager.getAgentById(current)?.getIdentity().parentId;
+    }
+    return depth;
+  }
+
+  private validateSpawnPolicy(input: {
+    parentId: string;
+    archetype: SubAgentArchetype;
+    tools: ToolBinding[];
+    skills: SkillBinding[];
+  }): {
+    allowed: boolean;
+    reason?: string;
+    currentChildren: number;
+    allowedChildren: number;
+    depth: number;
+  } {
+    const ctx = this.getContext();
+    const parent = ctx.manager.getAgentById(input.parentId);
+    if (!parent) {
+      return { allowed: false, reason: 'parent_not_found', currentChildren: 0, allowedChildren: 0, depth: 0 };
+    }
+
+    const parentInfo = parent.getInfo();
+    const parentBindings = this.agentBindings.get(input.parentId) ?? {
+      tools: [],
+      skills: [],
+      memoryScope: this.getDefaultMemoryScope(parentInfo.role),
+      spawnPolicy: this.getDefaultSpawnPolicy(parentInfo.role === 'root' ? 'root' : 'subagent'),
+    };
+    const currentChildren = this.getChildren(input.parentId).length;
+    const allowedChildren = this.computeAllowedChildren(parentBindings.spawnPolicy);
+    const depth = this.getAgentDepth(input.parentId);
+    const nextDepth = depth + 1;
+
+    if (!parentBindings.spawnPolicy.canSpawn) {
+      return { allowed: false, reason: 'spawn_disabled_for_parent', currentChildren, allowedChildren, depth };
+    }
+    if (!parentBindings.spawnPolicy.allowedStates.includes(parentInfo.state)) {
+      return { allowed: false, reason: 'invalid_fsm_state', currentChildren, allowedChildren, depth };
+    }
+    if (currentChildren >= allowedChildren) {
+      return { allowed: false, reason: 'max_children_exceeded', currentChildren, allowedChildren, depth };
+    }
+    if (nextDepth > parentBindings.spawnPolicy.maxDepth) {
+      return { allowed: false, reason: 'max_depth_exceeded', currentChildren, allowedChildren, depth };
+    }
+    if (input.archetype === 'custom' && !parentBindings.spawnPolicy.allowCustomAgents) {
+      return { allowed: false, reason: 'custom_agents_not_allowed', currentChildren, allowedChildren, depth };
+    }
+    for (const binding of input.tools) {
+      if (!toolRegistry.has(binding.name)) {
+        return { allowed: false, reason: `tool_not_registered:${binding.name}`, currentChildren, allowedChildren, depth };
+      }
+    }
+    for (const binding of input.skills) {
+      if (!skillRegistry.has(binding.name)) {
+        return { allowed: false, reason: `skill_not_registered:${binding.name}`, currentChildren, allowedChildren, depth };
+      }
+    }
+
+    return { allowed: true, currentChildren, allowedChildren, depth };
+  }
+
+  private safeAgentKey(value: string): string {
+    const key = value
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '');
+    return key || 'custom';
   }
 
   async enqueueMessage<TPayload>(message: EnqueueMessageInput<TPayload>): Promise<RuntimeMessage<TPayload>> {
@@ -875,6 +1183,8 @@ export class Runtime {
           task: plan.task,
           parentId: 'root',
           name: plan.name,
+          tools: plan.tools,
+          skills: plan.skills,
           tomLevel: plan.tomLevel,
           budgetTokens: plan.budgetTokens,
           correlationId,
@@ -1024,6 +1334,8 @@ export class Runtime {
       tomLevel: tomProfile.level,
       description: payload.task,
       task: payload.task,
+      tools: payload.tools,
+      skills: payload.skills,
       budgetTokens: payload.budgetTokens,
       systemPrompt: undefined,
       tomProfile,
@@ -1148,12 +1460,6 @@ export class Runtime {
     if (!this.isValidArchetype(spec.archetype)) {
       throw new Error(`Unsupported subagent archetype "${spec.archetype}"`);
     }
-    await ctx.memory.ensureAgentMemory(spec.archetype, {
-      name: this.capitalize(spec.archetype),
-      role: spec.customRole ?? spec.archetype,
-      description: `Reusable ${spec.archetype} agent archetype memory.`,
-    });
-    const agentMemory = await ctx.memory.loadAgentMemory(spec.archetype);
     if (!spec.description.trim()) {
       throw new Error('Subagent description is required');
     }
@@ -1162,6 +1468,85 @@ export class Runtime {
     if (!parent) {
       throw new Error(`Parent agent "${spec.parentId}" not found`);
     }
+
+    const parentIdentity = parent.getIdentity();
+    const toolBindings = this.normalizeToolBindings(spec.tools, spec.archetype)
+      .filter(binding => binding.enabled);
+    const skillBindings = this.normalizeSkillBindings(spec.skills, spec.archetype)
+      .filter(binding => binding.enabled);
+    const memoryScope = spec.memoryScope ?? this.getDefaultMemoryScope('subagent');
+    const spawnPolicy = this.mergeSpawnPolicy(this.getDefaultSpawnPolicy('subagent', spec.archetype), spec.spawnPolicy);
+
+    this.emit({
+      type: 'agent.create.requested',
+      agentId: spec.parentId,
+      data: {
+        parentId: spec.parentId,
+        archetype: spec.archetype,
+        name: spec.name,
+        tools: toolBindings.map(binding => binding.name),
+        skills: skillBindings.map(binding => binding.name),
+      },
+    });
+    const policyResult = this.validateSpawnPolicy({
+      parentId: spec.parentId,
+      archetype: spec.archetype,
+      tools: toolBindings,
+      skills: skillBindings,
+    });
+    this.emit({
+      type: 'spawn.policy.checked',
+      agentId: spec.parentId,
+      data: {
+        parentId: spec.parentId,
+        archetype: spec.archetype,
+        allowed: policyResult.allowed,
+        reason: policyResult.reason,
+        currentChildren: policyResult.currentChildren,
+        allowedChildren: policyResult.allowedChildren,
+        depth: policyResult.depth,
+      },
+    });
+    if (!policyResult.allowed) {
+      this.emit({
+        type: 'spawn.policy.rejected',
+        agentId: spec.parentId,
+        data: {
+          parentId: spec.parentId,
+          archetype: spec.archetype,
+          reason: policyResult.reason,
+        },
+      });
+      this.emit({
+        type: 'agent.create.rejected',
+        agentId: spec.parentId,
+        data: {
+          parentId: spec.parentId,
+          archetype: spec.archetype,
+          reason: policyResult.reason,
+        },
+      });
+      this.emit({
+        type: 'delegation.rejected',
+        agentId: spec.parentId,
+        data: {
+          parentId: spec.parentId,
+          archetype: spec.archetype,
+          reason: policyResult.reason,
+        },
+      });
+      throw new Error(`Spawn rejected: ${policyResult.reason}`);
+    }
+
+    const agentMemoryKey = spec.archetype === 'custom' && spec.name
+      ? this.safeAgentKey(spec.name)
+      : spec.archetype;
+    await ctx.memory.ensureAgentMemory(agentMemoryKey, {
+      name: spec.name ?? this.capitalize(spec.archetype),
+      role: spec.customRole ?? spec.archetype,
+      description: `Reusable ${spec.archetype} agent archetype memory.`,
+    });
+    const agentMemory = await ctx.memory.loadAgentMemory(agentMemoryKey);
 
     const sequence = ++this.agentSequence;
     const id = this.createAgentId(spec.archetype, sequence);
@@ -1172,7 +1557,6 @@ export class Runtime {
     if (ctx.manager.getAgent(name)) {
       throw new Error(`Agent name "${name}" already exists`);
     }
-    const parentIdentity = parent.getIdentity();
     const generation = parentIdentity.generation + 1;
 
     const fsm = new FSM({
@@ -1205,8 +1589,8 @@ export class Runtime {
         ? this.formatCachedPublicContext(cacheHits)
         : this.formatPublicContext(await ctx.memory.loadRootContext()),
       tomProfile: spec.tomProfile ? { ...spec.tomProfile, subjectAgentId: id } : this.createSubagentToMProfile(spec.archetype, id, spec.task ?? ''),
-      availableSkills: skillRegistry.list().map(skill => skill.name),
-      availableTools: toolRegistry.list().map(tool => tool.name),
+      availableSkills: skillBindings.map(binding => binding.name),
+      availableTools: toolBindings.map(binding => binding.name),
       parentContext: `Parent agent ${parentIdentity.name} (${parentIdentity.id}) spawned this agent for: ${spec.description}`,
     });
     const renderedPromptTokens = this.estimateTextTokens(goal);
@@ -1217,8 +1601,8 @@ export class Runtime {
       spec.customStyle,
       spec.description,
       spec.tomProfile ? JSON.stringify(spec.tomProfile) : '',
-      toolRegistry.list().map(tool => tool.name).join(','),
-      skillRegistry.list().map(skill => skill.name).join(','),
+      toolBindings.map(binding => binding.name).join(','),
+      skillBindings.map(binding => binding.name).join(','),
     ].filter(Boolean).join('\n');
     const definitionTokens = cacheHits.length > 0 ? 0 : this.estimateTextTokens(definitionText);
 
@@ -1237,20 +1621,65 @@ export class Runtime {
       mode: 'hybrid',
     });
 
-    this.registerCapabilities(agent);
+    this.registerCapabilities(agent, toolBindings.map(binding => binding.name));
+    this.agentBindings.set(id, {
+      tools: toolBindings,
+      skills: skillBindings,
+      memoryScope,
+      spawnPolicy,
+    });
     ctx.manager.addAgent(agent);
     await ctx.manager.attachAgentToSessions(agent);
     await ctx.memory.upsertAgentPattern({
-      key: spec.archetype,
-      name: this.capitalize(spec.archetype),
+      key: agentMemoryKey,
+      name: spec.name ?? this.capitalize(spec.archetype),
       archetype: spec.archetype,
       tomLevel: spec.tomLevel,
       description: spec.description,
-      tools: toolRegistry.list().map(tool => tool.name),
-      skills: skillRegistry.list().map(skill => skill.name),
+      tools: toolBindings.map(binding => binding.name),
+      skills: skillBindings.map(binding => binding.name),
+      spawnPolicy,
     });
 
     const info = agent.getInfo();
+    this.emit({
+      type: cacheHits.length > 0 ? 'agent.definition.loaded_from_cache' : 'agent.definition.generated',
+      agentId: id,
+      data: {
+        archetype: spec.archetype,
+        cacheHits,
+        definitionTokens,
+      },
+    });
+    this.emit({
+      type: 'agent.create.approved',
+      agentId: spec.parentId,
+      data: {
+        parentId: spec.parentId,
+        childId: id,
+        archetype: spec.archetype,
+        creationMode: cacheHits.length > 0 ? 'cache_hit' : 'generated',
+        skills: skillBindings.map(binding => binding.name),
+        tools: toolBindings.map(binding => binding.name),
+        maxChildrenForParent: policyResult.allowedChildren,
+      },
+    });
+    this.emit({
+      type: 'agent.instance.created',
+      agentId: id,
+      data: {
+        parentId: spec.parentId,
+        archetype: spec.archetype,
+        name,
+        memoryKey: agentMemoryKey,
+      },
+    });
+    for (const binding of toolBindings) {
+      this.emit({ type: 'agent.tool.bound', agentId: id, data: { tool: binding.name, permission: binding.permission } });
+    }
+    for (const binding of skillBindings) {
+      this.emit({ type: 'agent.skill.bound', agentId: id, data: { skill: binding.name } });
+    }
     this.emit({
       type: 'agent.spawned',
       agentId: id,

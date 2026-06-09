@@ -9,6 +9,7 @@ export interface DelegateToSubagentParams {
   customRole?: string;
   customStyle?: string;
   tools?: string[];
+  skills?: string[];
   budgetTokens?: number;
   requireRootSynthesis?: boolean;
   showSubagentOutput?: boolean;
@@ -119,6 +120,8 @@ export class DelegateToSubagentSkill implements Skill {
       name: params.name,
       customRole: params.customRole,
       customStyle: params.customStyle,
+      tools: params.tools,
+      skills: params.skills,
       budgetTokens: params.budgetTokens,
       requireRootSynthesis: params.requireRootSynthesis ?? true,
       showSubagentOutput: params.showSubagentOutput ?? false,
