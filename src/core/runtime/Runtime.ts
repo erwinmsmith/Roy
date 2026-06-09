@@ -15,6 +15,7 @@ import type { AgentInfo, AgentUsage, ToMProfile } from '../agent/BaseAgent.js';
 import { actionRegistry } from '../actions/index.js';
 import { toolRegistry } from '../tools/index.js';
 import { skillRegistry } from '../skills/index.js';
+import { DelegateToSubagentSkill } from '../skills/delegation.js';
 import {
   InMemoryMessageQueue,
   MessageScheduler,
@@ -279,6 +280,8 @@ export class Runtime {
 
     logger.info(`Agent created: ${agentName} in ${options.mode ?? 'hybrid'} mode`);
 
+    this.registerCoreSkills();
+
     // Register capabilities with agent
     const capabilities = this.registerCapabilities(agent);
 
@@ -400,6 +403,10 @@ export class Runtime {
       actions: actions.length,
       tools: tools.length,
     };
+  }
+
+  private registerCoreSkills(): void {
+    skillRegistry.register(new DelegateToSubagentSkill(() => this));
   }
 
   isInitialized(): boolean {
