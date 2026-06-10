@@ -17,6 +17,7 @@ import { registerCoreTools, toolRegistry } from '../tools/index.js';
 import { skillRegistry } from '../skills/index.js';
 import { DelegateToSubagentSkill } from '../skills/delegation.js';
 import { UseToolWhenNeededSkill } from '../skills/toolUse.js';
+import { DefaultDelegationCandidatePlanner, type DelegationCandidateSelection } from '../delegation/index.js';
 import {
   InMemoryMessageQueue,
   MessageScheduler,
@@ -306,6 +307,8 @@ export class Runtime {
   private memory: WorkspaceMemoryManager | null = null;
   private agentBindings = new Map<string, AgentBindingState>();
   private workspaceRuntimeConfig: WorkspaceRuntimeConfig | null = null;
+  private readonly candidatePlanner = new DefaultDelegationCandidatePlanner();
+  private turnAgentCounts = new Map<string, number>();
 
   static getInstance(): Runtime {
     if (!Runtime.instance) {
@@ -471,6 +474,7 @@ export class Runtime {
     this.memory = null;
     this.workspaceRuntimeConfig = null;
     this.agentBindings.clear();
+    this.turnAgentCounts.clear();
     this.initialized = false;
     logger.info('Runtime shutdown complete');
   }
@@ -779,11 +783,31 @@ export class Runtime {
     return depth;
   }
 
+  private getTurnAgentCount(correlationId?: string): number {
+    return correlationId ? this.turnAgentCounts.get(correlationId) ?? 0 : 0;
+  }
+
+  private getMaxTotalAgentsPerTurn(parentId: string): number {
+    return this.getAgentPolicy(parentId)?.spawnPolicy.maxTotalAgentsPerTurn
+      ?? this.workspaceRuntimeConfig?.delegation.maxTotalAgentsPerTurn
+      ?? 10;
+  }
+
+  private getRemainingTotalAgentsForTurn(parentId: string, correlationId?: string): number {
+    return Math.max(0, this.getMaxTotalAgentsPerTurn(parentId) - this.getTurnAgentCount(correlationId));
+  }
+
+  private recordTurnAgentCreated(correlationId?: string): void {
+    if (!correlationId) return;
+    this.turnAgentCounts.set(correlationId, this.getTurnAgentCount(correlationId) + 1);
+  }
+
   private validateSpawnPolicy(input: {
     parentId: string;
     archetype: SubAgentArchetype;
     tools: ToolBinding[];
     skills: SkillBinding[];
+    correlationId?: string;
   }): {
     allowed: boolean;
     reason?: string;
@@ -817,6 +841,9 @@ export class Runtime {
     }
     if (currentChildren >= allowedChildren) {
       return { allowed: false, reason: 'max_children_exceeded', currentChildren, allowedChildren, depth };
+    }
+    if (this.getRemainingTotalAgentsForTurn(input.parentId, input.correlationId) <= 0) {
+      return { allowed: false, reason: 'max_total_agents_per_turn_exceeded', currentChildren, allowedChildren, depth };
     }
     if (nextDepth > parentBindings.spawnPolicy.maxDepth) {
       return { allowed: false, reason: 'max_depth_exceeded', currentChildren, allowedChildren, depth };
@@ -1120,7 +1147,8 @@ export class Runtime {
 
     await this.transitionRootTurnState('S_input_received', { correlationId });
     await this.transitionRootTurnState('S_assess_task', { correlationId });
-    const decision = await this.decideDelegation(userInput, correlationId);
+    let decision = await this.decideDelegation(userInput, correlationId);
+    decision = await this.selectDelegationCandidate('root', userInput, decision, correlationId, 'root');
     const decisionMetadata = await this.buildDelegationDecisionMetadata(decision);
     this.emit({
       type: 'delegation.decision',
@@ -1582,6 +1610,7 @@ export class Runtime {
       archetype: spec.archetype,
       tools: toolBindings,
       skills: skillBindings,
+      correlationId: creationCorrelationId,
     });
     this.emit({
       type: 'spawn.policy.checked',
@@ -1593,6 +1622,9 @@ export class Runtime {
         reason: policyResult.reason,
         currentChildren: policyResult.currentChildren,
         allowedChildren: policyResult.allowedChildren,
+        turnAgentsCreated: this.getTurnAgentCount(creationCorrelationId),
+        remainingTotalAgentsForTurn: this.getRemainingTotalAgentsForTurn(spec.parentId, creationCorrelationId),
+        maxTotalAgentsPerTurn: this.getMaxTotalAgentsPerTurn(spec.parentId),
         depth: policyResult.depth,
       },
     });
@@ -1748,6 +1780,7 @@ export class Runtime {
     });
 
     const info = agent.getInfo();
+    this.recordTurnAgentCreated(creationCorrelationId);
     this.emitAgentFsmState(id, 'S_created', { parentId: spec.parentId, archetype: spec.archetype });
     this.emit({
       type: cacheHits.length > 0 ? 'agent.definition.loaded_from_cache' : 'agent.definition.generated',
@@ -2057,6 +2090,91 @@ export class Runtime {
     };
   }
 
+  private async selectDelegationCandidate(
+    parentId: string,
+    task: string,
+    decision: DelegationDecision,
+    correlationId: string,
+    scope: 'root' | 'agent'
+  ): Promise<DelegationDecision> {
+    if (decision.action !== 'spawn_subagents') return decision;
+    const policy = this.getAgentPolicy(parentId);
+    const budget = this.getBudgetState();
+    const ctx = this.getContext();
+    const cacheHits = await Promise.all(decision.agents.map(async agent => {
+      const [agentPattern, delegationPattern] = await Promise.all([
+        ctx.memory.findAgentPattern(agent.archetype),
+        ctx.memory.findDelegationPattern(agent.archetype, agent.task),
+      ]);
+      return Boolean(agentPattern || delegationPattern);
+    }));
+    const selection = this.candidatePlanner.select({
+      parentId,
+      task,
+      decision,
+      allowedChildren: policy ? Math.max(0, policy.allowedChildren - policy.currentChildren) : 0,
+      remainingTotalAgentsForTurn: this.getRemainingTotalAgentsForTurn(parentId, correlationId),
+      budgetMode: budget.mode,
+      remainingBudgetTokens: budget.remainingTokens,
+      cacheUsed: cacheHits.some(Boolean),
+    });
+
+    this.emitDelegationCandidateEvents(parentId, correlationId, scope, selection);
+    return selection.decision;
+  }
+
+  private emitDelegationCandidateEvents(
+    parentId: string,
+    correlationId: string,
+    scope: 'root' | 'agent',
+    selection: DelegationCandidateSelection
+  ): void {
+    for (const candidate of selection.candidates) {
+      this.emit({
+        type: 'delegation.candidate.generated',
+        agentId: parentId,
+        data: {
+          correlationId,
+          scope,
+          candidateId: candidate.id,
+          source: candidate.source,
+          agents: candidate.agents,
+          expectedUtility: candidate.expectedUtility,
+          expectedCostTokens: candidate.expectedCostTokens,
+          score: candidate.score,
+          rationale: candidate.rationale,
+        },
+      });
+    }
+    if (selection.selected) {
+      this.emit({
+        type: 'delegation.candidate.selected',
+        agentId: parentId,
+        data: {
+          correlationId,
+          scope,
+          candidateId: selection.selected.id,
+          source: selection.selected.source,
+          agents: selection.selected.agents,
+          expectedUtility: selection.selected.expectedUtility,
+          expectedCostTokens: selection.selected.expectedCostTokens,
+          score: selection.selected.score,
+          rationale: selection.selected.rationale,
+        },
+      });
+    } else if (selection.rejectedReason) {
+      this.emit({
+        type: 'delegation.rejected',
+        agentId: parentId,
+        data: {
+          correlationId,
+          scope,
+          reason: selection.rejectedReason,
+        },
+      });
+    }
+  }
+
   private async transitionRootTurnState(state: Parameters<FSM['transition']>[0], data: Record<string, unknown> = {}): Promise<void> {
     const ctx = this.getContext();
     if (!state) return;
@@ -2150,7 +2268,8 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
         agentId: agent.identity.id,
         data: { correlationId, reason: 'llm_not_configured_agent_delegation' },
       });
-      return this.applyAgentBudgetAndPolicyConstraints(agent.identity.id, fallback);
+      const constrained = this.applyAgentBudgetAndPolicyConstraints(agent.identity.id, fallback);
+      return this.selectDelegationCandidate(agent.identity.id, task, constrained, correlationId, 'agent');
     }
 
     try {
@@ -2178,14 +2297,15 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
       ], { temperature: 0.1, maxTokens: 500 });
       const normalized = this.normalizeAgentDelegationDecision(decision, task, fallback);
       const constrained = this.applyAgentBudgetAndPolicyConstraints(agent.identity.id, normalized);
+      const selected = await this.selectDelegationCandidate(agent.identity.id, task, constrained, correlationId, 'agent');
       this.emit({
         type: 'delegation.assess.completed',
         agentId: agent.identity.id,
-        data: { correlationId, action: constrained.action, source: 'llm', scope: 'agent' },
+        data: { correlationId, action: selected.action, source: 'llm', scope: 'agent' },
       });
-      return constrained.action === 'ask_clarification'
-        ? { action: 'solve_directly', reason: constrained.reason }
-        : constrained;
+      return selected.action === 'ask_clarification'
+        ? { action: 'solve_directly', reason: selected.reason }
+        : selected;
     } catch (error) {
       this.emit({
         type: 'delegation.decision.fallback',
@@ -2196,7 +2316,8 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
           error: error instanceof Error ? error.message : String(error),
         },
       });
-      return this.applyAgentBudgetAndPolicyConstraints(agent.identity.id, fallback);
+      const constrained = this.applyAgentBudgetAndPolicyConstraints(agent.identity.id, fallback);
+      return this.selectDelegationCandidate(agent.identity.id, task, constrained, correlationId, 'agent');
     }
   }
 

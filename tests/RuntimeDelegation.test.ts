@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Runtime, { type DelegationDecision } from '../src/core/runtime/Runtime.js';
@@ -259,6 +259,52 @@ describe('Runtime root-controlled delegation', () => {
     const decisionEvent = runtime.getEvents()
       .find(event => event.type === 'delegation.decision' && event.data?.correlationId === result.correlationId);
     expect(decisionEvent?.data?.budgetMode).toBe('limited');
+
+    await runtime.shutdown();
+  });
+
+  it('scores delegation candidates and respects maxTotalAgentsPerTurn', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-phase2-max-total-'));
+    await mkdir(path.join(workspaceCwd, '.roy'), { recursive: true });
+    await writeFile(
+      path.join(workspaceCwd, '.roy', 'config.json'),
+      JSON.stringify({
+        version: 1,
+        memoryUpdates: 'suggest',
+        delegation: {
+          maxChildrenPerParent: 5,
+          maxDepth: 3,
+          maxTotalAgentsPerTurn: 1,
+          allowCustomAgents: true,
+          budgetAware: true,
+        },
+      }, null, 2) + '\n',
+      'utf8'
+    );
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'phase2-max-total-test',
+      workspaceCwd,
+      fsmEnabled: true,
+      llmProvider: new RootDelegationLLM(),
+    });
+
+    const result = await runtime.handleUserTurn('Analyze this repo and find architectural risks');
+
+    expect(result.decision.action).toBe('spawn_subagents');
+    expect(result.subagents).toHaveLength(1);
+    expect(runtime.getAgentTree().children).toHaveLength(1);
+    const eventTypes = runtime.getEvents().map(event => event.type);
+    expect(eventTypes).toContain('delegation.candidate.generated');
+    expect(eventTypes).toContain('delegation.candidate.selected');
+    const selected = runtime.getEvents().find(event => event.type === 'delegation.candidate.selected');
+    expect((selected?.data?.agents as unknown[] | undefined)?.length).toBe(1);
+
+    await expect(runtime.handleSpawnCommand({
+      archetype: 'critic',
+      task: 'Try to exceed the same turn total agent limit',
+      correlationId: result.correlationId,
+    })).rejects.toThrow('max_total_agents_per_turn_exceeded');
 
     await runtime.shutdown();
   });
