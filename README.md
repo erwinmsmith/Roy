@@ -1,6 +1,6 @@
 # Roy
 
-Roy is an experimental TypeScript framework for building dynamically expanding multi-agent systems. It starts from a single root agent and grows a Theory-of-Mind-aware reasoning structure only when the current reasoning trace shows that more perspective, verification, evidence, or decomposition is worth the cost.
+Roy is an TypeScript framework for building dynamically expanding multi-agent systems. It starts from a single root agent and grows a Theory-of-Mind-aware reasoning structure only when the current reasoning trace shows that more perspective, verification, evidence, or decomposition is worth the cost.
 
 The core design is based on FSM-controlled Evo-ToM expansion: finite-state control governs when the system can expand, ToM/MIA diagnosis explains why expansion may be needed, a market-style allocator estimates whether the next thinking investment is worth paying for, and EvoAgent-style derivation creates or reuses specialized agents and subteams.
 
