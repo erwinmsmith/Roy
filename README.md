@@ -103,3 +103,5 @@ The server exposes:
 - `GET /` for project metadata
 - `GET /health` for agent and session status
 - Socket.IO `user_message` events for streaming agent responses
+
+## contact us
