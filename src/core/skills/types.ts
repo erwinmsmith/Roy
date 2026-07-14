@@ -1,5 +1,5 @@
-// Skill types and interfaces
-// Skills are installable extensions that can be discovered, installed, and managed
+// Skill types and interfaces. Skills may be system-native runtime capabilities
+// or installable extensions; manifests make that boundary explicit.
 
 export interface SkillContext {
   agentId: string;
@@ -36,7 +36,7 @@ export interface SkillConfig {
 }
 
 /**
- * Skill metadata for discovery and installation
+ * Skill metadata for runtime discovery and optional installation
  */
 export interface SkillManifest {
   name: string;
@@ -44,13 +44,14 @@ export interface SkillManifest {
   author?: string;
   description: string;
   tags: string[];
+  scope?: 'system' | 'extension';
+  permissions?: string[];
   source?: string;
   installedAt?: number;
 }
 
 /**
- * Base interface for all Skills
- * Skills are installable extensions that agents can use
+ * Base interface for system-native and extension skills agents can use
  */
 export interface Skill {
   readonly name: string;

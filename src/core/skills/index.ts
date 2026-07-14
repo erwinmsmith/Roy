@@ -211,6 +211,16 @@ export const skillRegistry = new SkillRegistry();
 // Export decorator for convenience
 export { skillDecorator as registerSkill };
 export { DelegateToSubagentSkill } from './delegation.js';
+export type {
+  AgentComputeNodeDefinition,
+  AgentComputeNodeExecution,
+  AgentComputeNodeRequest,
+  AgentCreationGateway,
+  AgentCreationInvocation,
+  AgentNodeCreationMode,
+  AgentNodeOutputContract,
+  AgentNodeReuseMode,
+} from './agentCreation.js';
 export { UseToolWhenNeededSkill } from './toolUse.js';
 
 // Re-export types

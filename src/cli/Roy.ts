@@ -1344,6 +1344,7 @@ export class Roy {
         }
       }
       console.log(`  ${this.dim(`agent creation: mode=${result.creationUsage.mode}, definition=${result.creationUsage.definitionTokens} tokens, rendered=${result.creationUsage.renderedPromptTokens} tokens (${result.creationUsage.renderedPromptChars} chars), cache hits=${result.creationUsage.cacheHits.length}`)}`);
+      console.log(`  ${this.dim(`node: ${result.node.nodeId}, definition=${result.node.definitionFingerprint.slice(0, 12)}, invocation=${result.node.invocationFingerprint.slice(0, 12)}`)}`);
       console.log(`  ${this.yellow('roy[root] delegating...')}`);
       console.log(`  ├─ ${this.yellow(`${result.agent.name}[subagent] thinking...`)}`);
       if (result.subagentResult.toolCalls.length > 0) {
@@ -1581,6 +1582,7 @@ export class Roy {
         const branch = index === result.subagents.length - 1 ? '└─' : '├─';
         console.log(`  ${branch} ${this.yellow(`${item.agent.name}[subagent] completed`)}, ${item.subagentResult.usage.totalTokens} tokens`);
         if (this.verboseMode) {
+          console.log(`  │  ${this.dim(`node: ${item.node.nodeId} definition=${item.node.definitionFingerprint.slice(0, 12)}`)}`);
           for (const call of item.subagentResult.toolCalls) {
             const toolPath = typeof call.params.path === 'string'
               ? path.relative(process.cwd(), call.params.path) || '.'

@@ -1,4 +1,11 @@
-import type { Runtime, RuntimeEvent, RootMediatedSpawnResult, SpawnCommandPayload, SubAgentArchetype, TokenUsage } from '../runtime/Runtime.js';
+import type { RuntimeEvent, RootMediatedSpawnResult, SubAgentArchetype, TokenUsage } from '../runtime/Runtime.js';
+import type {
+  AgentComputeNodeDefinition,
+  AgentComputeNodeRequest,
+  AgentCreationGateway,
+  AgentNodeOutputContract,
+  AgentNodeReuseMode,
+} from './agentCreation.js';
 import type { Skill, SkillContext, SkillInput, SkillManifest, SkillOutput } from './types.js';
 
 export interface DelegateToSubagentParams {
@@ -8,9 +15,15 @@ export interface DelegateToSubagentParams {
   name?: string;
   customRole?: string;
   customStyle?: string;
+  description?: string;
   tools?: string[];
   skills?: string[];
   budgetTokens?: number;
+  memoryScope?: AgentComputeNodeRequest['memoryScope'];
+  spawnPolicy?: AgentComputeNodeRequest['spawnPolicy'];
+  tomProfile?: AgentComputeNodeRequest['tomProfile'];
+  reuseMode?: AgentNodeReuseMode;
+  outputContract?: AgentNodeOutputContract;
   requireRootSynthesis?: boolean;
   showSubagentOutput?: boolean;
 }
@@ -19,6 +32,8 @@ export interface DelegateToSubagentResult {
   correlationId: string;
   agentId: string;
   agentName: string;
+  node: AgentComputeNodeDefinition;
+  creationUsage: RootMediatedSpawnResult['creationUsage'];
   agentResult: RootMediatedSpawnResult['subagentResult'];
   rootSynthesis?: string;
   tokenUsage: {
@@ -31,10 +46,10 @@ export interface DelegateToSubagentResult {
 
 export class DelegateToSubagentSkill implements Skill {
   readonly name = 'delegate_to_subagent';
-  readonly description = 'Delegate a task to a root-managed subagent through the Roy runtime message chain.';
+  readonly description = 'Compile and execute a parent-authorized child agent node through the Roy runtime message chain.';
   readonly version = '0.1.0';
 
-  constructor(private readonly getRuntime: () => Runtime) {}
+  constructor(private readonly gateway: AgentCreationGateway) {}
 
   getManifest(): SkillManifest {
     return {
@@ -42,6 +57,8 @@ export class DelegateToSubagentSkill implements Skill {
       version: this.version,
       description: this.description,
       tags: ['delegation', 'subagent', 'runtime', 'message-queue'],
+      scope: 'system',
+      permissions: ['agent.create', 'agent.delegate'],
     };
   }
 
@@ -68,7 +85,7 @@ export class DelegateToSubagentSkill implements Skill {
     };
   }
 
-  async execute(input: SkillInput, _context: SkillContext): Promise<SkillOutput> {
+  async execute(input: SkillInput, context: SkillContext): Promise<SkillOutput> {
     const validation = this.validate(input);
     if (!validation.valid) {
       return {
@@ -77,27 +94,24 @@ export class DelegateToSubagentSkill implements Skill {
       };
     }
 
-    const runtime = this.getRuntime();
     const params = input.params as unknown as DelegateToSubagentParams;
-    const eventsBefore = runtime.getEvents().length;
-    const result = await runtime.handleSpawnCommand(this.toSpawnCommand(params));
-    const budget = runtime.getBudgetState();
-    const rootUsage = budget.perAgent.root ?? this.zeroUsage();
-    const subagentUsage = budget.perAgent[result.agent.identity.id] ?? this.zeroUsage();
-    const totalUsage = this.addUsage(rootUsage, subagentUsage);
+    const execution = await this.gateway.createAgentComputeNode(this.toNodeRequest(params), {
+      agentId: context.agentId,
+      sessionId: context.sessionId,
+      source: `skill:${this.name}`,
+    });
+    const result = execution.delegation;
 
     const output: DelegateToSubagentResult = {
       correlationId: result.correlationId,
       agentId: result.agent.identity.id,
       agentName: result.agent.identity.name,
+      node: execution.node,
+      creationUsage: result.creationUsage,
       agentResult: result.subagentResult,
       rootSynthesis: result.finalResponse,
-      tokenUsage: {
-        root: rootUsage,
-        subagent: subagentUsage,
-        total: totalUsage,
-      },
-      events: runtime.getEvents().slice(eventsBefore),
+      tokenUsage: execution.tokenUsage,
+      events: execution.events,
     };
 
     return {
@@ -107,24 +121,34 @@ export class DelegateToSubagentSkill implements Skill {
         skill: this.name,
         correlationId: result.correlationId,
         agentId: result.agent.identity.id,
+        nodeId: execution.node.nodeId,
+        definitionFingerprint: execution.node.definitionFingerprint,
         messageMediated: true,
       },
     };
   }
 
-  private toSpawnCommand(params: DelegateToSubagentParams): SpawnCommandPayload {
+  private toNodeRequest(params: DelegateToSubagentParams): AgentComputeNodeRequest {
     return {
       parentId: params.parentId,
       archetype: params.archetype,
       task: params.task,
       name: params.name,
-      customRole: params.customRole,
-      customStyle: params.customStyle,
+      role: params.customRole,
+      style: params.customStyle,
+      description: params.description,
       tools: params.tools,
       skills: params.skills,
       budgetTokens: params.budgetTokens,
-      requireRootSynthesis: params.requireRootSynthesis ?? true,
-      showSubagentOutput: params.showSubagentOutput ?? false,
+      memoryScope: params.memoryScope,
+      spawnPolicy: params.spawnPolicy,
+      tomProfile: params.tomProfile,
+      reuse: { mode: params.reuseMode ?? 'prefer_cache' },
+      outputContract: params.outputContract,
+      execution: {
+        requireParentSynthesis: params.requireRootSynthesis ?? true,
+        showSubagentOutput: params.showSubagentOutput ?? false,
+      },
     };
   }
 
@@ -138,25 +162,4 @@ export class DelegateToSubagentSkill implements Skill {
       || value === 'custom';
   }
 
-  private zeroUsage(): TokenUsage {
-    return {
-      llmCalls: 0,
-      promptTokens: 0,
-      completionTokens: 0,
-      totalTokens: 0,
-      thinkingTokens: null,
-    };
-  }
-
-  private addUsage(left: TokenUsage, right: TokenUsage): TokenUsage {
-    return {
-      llmCalls: left.llmCalls + right.llmCalls,
-      promptTokens: left.promptTokens + right.promptTokens,
-      completionTokens: left.completionTokens + right.completionTokens,
-      totalTokens: left.totalTokens + right.totalTokens,
-      thinkingTokens: left.thinkingTokens === null && right.thinkingTokens === null
-        ? null
-        : Number(left.thinkingTokens ?? 0) + Number(right.thinkingTokens ?? 0),
-    };
-  }
 }

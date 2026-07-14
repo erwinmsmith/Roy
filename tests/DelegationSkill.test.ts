@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Runtime from '../src/core/runtime/Runtime.js';
@@ -39,6 +39,23 @@ class DelegationLLM implements LLMProvider {
 }
 
 describe('delegate_to_subagent skill', () => {
+  it('is registered as a system skill with agent creation permissions', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-delegation-manifest-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'delegation-manifest-test',
+      workspaceCwd,
+      fsmEnabled: false,
+      llmProvider: new DelegationLLM(),
+    });
+
+    const manifest = skillRegistry.getManifest('delegate_to_subagent');
+    expect(manifest?.scope).toBe('system');
+    expect(manifest?.permissions).toEqual(['agent.create', 'agent.delegate']);
+
+    await runtime.shutdown();
+  });
+
   it('delegates through the runtime message-mediated subagent flow', async () => {
     const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-delegation-skill-'));
     const runtime = new Runtime();
@@ -72,16 +89,27 @@ describe('delegate_to_subagent skill', () => {
     expect(result.correlationId).toMatch(/^del_/);
     expect(result.agentId).toBe('agent_researcher_001');
     expect(result.agentName).toBe('Researcher-1');
+    expect(result.node.nodeId).toMatch(/^node_del_/);
+    expect(result.node.parentId).toBe('root');
+    expect(result.node.sessionId).toBe('delegation-skill-test');
+    expect(result.node.definitionFingerprint).toMatch(/^[a-f0-9]{64}$/);
+    expect(result.node.invocationFingerprint).toMatch(/^[a-f0-9]{64}$/);
+    expect(result.node.capabilities.tools).toEqual(['fs.list', 'fs.read']);
+    expect(result.node.capabilities.skills).toEqual(['use_tool_when_needed', 'delegate_to_subagent']);
+    expect(result.node.assignment.outputContract.groundingRequired).toBe(true);
     expect(result.agentResult.toolCalls.map((call: any) => call.toolName)).toContain('fs.list');
     expect(result.rootSynthesis).toBe('Roy synthesized the researcher result.');
     expect(result.tokenUsage.root.totalTokens).toBeGreaterThan(0);
     expect(result.tokenUsage.subagent.totalTokens).toBeGreaterThan(0);
     expect(result.events.map((event: any) => event.type)).toContain('agent.spawned');
     expect(result.events.map((event: any) => event.type)).toContain('agent.run.completed');
+    expect(result.events.map((event: any) => event.type)).toContain('agent.node.resolved');
+    expect(result.events.map((event: any) => event.type)).toContain('agent.node.execution.completed');
+    expect(result.events.every((event: any) => (event.correlationId ?? event.data?.correlationId) === result.correlationId)).toBe(true);
 
     const messages = await runtime.getMessages({ correlationId: result.correlationId });
     expect(messages.map(message => message.kind)).toEqual([
-      'user.command.spawn',
+      'agent.control',
       'agent.create.request',
       'budget.request',
       'budget.grant',
@@ -95,6 +123,117 @@ describe('delegate_to_subagent skill', () => {
       'root.synthesis',
       'root.final_response',
     ]);
+    expect(messages.find(message => message.kind === 'agent.create.request')?.payload).toMatchObject({
+      nodeId: result.node.nodeId,
+      definitionFingerprint: result.node.definitionFingerprint,
+      creationMode: 'generated',
+    });
+    const conversation = await runtime.getConversation('delegation-skill-test', 20);
+    expect(conversation.some(entry => entry.content.startsWith('/spawn '))).toBe(false);
+    expect(conversation.find(entry => entry.metadata?.kind === 'agent.result')?.metadata).toMatchObject({
+      nodeId: result.node.nodeId,
+      definitionFingerprint: result.node.definitionFingerprint,
+      creationMode: 'generated',
+    });
+
+    await runtime.shutdown();
+  });
+
+  it('rejects parent impersonation and cross-session execution', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-delegation-boundary-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'delegation-boundary-test',
+      workspaceCwd,
+      fsmEnabled: false,
+      llmProvider: new DelegationLLM(),
+    });
+
+    const impersonation = await skillRegistry.execute(
+      'delegate_to_subagent',
+      {
+        action: 'delegate_to_subagent',
+        params: { parentId: 'root', archetype: 'researcher', task: 'Inspect the project' },
+      },
+      { agentId: 'agent_other_001', sessionId: 'delegation-boundary-test', variables: {} }
+    );
+    expect(impersonation.success).toBe(false);
+    expect(impersonation.error).toContain('parent mismatch');
+
+    const wrongSession = await skillRegistry.execute(
+      'delegate_to_subagent',
+      {
+        action: 'delegate_to_subagent',
+        params: { parentId: 'root', archetype: 'researcher', task: 'Inspect the project' },
+      },
+      { agentId: 'root', sessionId: 'different-session', variables: {} }
+    );
+    expect(wrongSession.success).toBe(false);
+    expect(wrongSession.error).toContain('session mismatch');
+
+    await expect(runtime.createAgentComputeNode({
+      archetype: 'researcher',
+      task: 'Inspect the project',
+      reuse: { mode: 'require_cache' },
+    }, {
+      agentId: 'root',
+      sessionId: 'delegation-boundary-test',
+      source: 'test',
+    })).rejects.toThrow('requires a cached pattern');
+
+    await expect(runtime.createAgentComputeNode({
+      archetype: 'custom',
+      task: 'Use an unknown capability',
+      tools: ['unknown.tool'],
+    }, {
+      agentId: 'root',
+      sessionId: 'delegation-boundary-test',
+      source: 'test',
+    })).rejects.toThrow('requested unknown tool');
+
+    await runtime.shutdown();
+  });
+
+  it('reuses a cached definition while creating a fresh runtime instance', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-delegation-cache-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'delegation-cache-test',
+      workspaceCwd,
+      fsmEnabled: false,
+      llmProvider: new DelegationLLM(),
+    });
+    const execute = (task: string, reuseMode: string = 'prefer_cache', overrides: Record<string, unknown> = {}) => skillRegistry.execute(
+      'delegate_to_subagent',
+      { action: 'delegate_to_subagent', params: { archetype: 'researcher', task, reuseMode, ...overrides } },
+      { agentId: 'root', sessionId: 'delegation-cache-test', variables: {} }
+    );
+
+    const first = (await execute('Inspect the project structure')).result as Record<string, any>;
+    const second = (await execute('Inspect the project structure')).result as Record<string, any>;
+    expect(first.node.reuse.creationMode).toBe('generated');
+    expect(second.node.reuse.creationMode).toBe('cache_hit');
+    expect(first.node.definitionFingerprint).toBe(second.node.definitionFingerprint);
+    expect(first.node.invocationFingerprint).not.toBe(second.node.invocationFingerprint);
+    expect(first.agentId).not.toBe(second.agentId);
+    expect(second.node.reuse.cacheHits).toContain('agent_pattern_researcher_v1');
+    expect(second.events.some((event: any) => event.type === 'cache.hit')).toBe(true);
+
+    const cache = JSON.parse(await readFile(path.join(workspaceCwd, '.roy', 'cache', 'agent-patterns.json'), 'utf8'));
+    const pattern = cache.patterns.find((item: any) => item.id === 'agent_pattern_researcher_v1');
+    expect(pattern.definitionFingerprint).toBe(second.node.definitionFingerprint);
+    expect(pattern.memoryScope).toEqual(second.node.context.memoryScope);
+    expect(pattern.outputContract).toEqual(second.node.assignment.outputContract);
+    expect(pattern.usage.count).toBe(2);
+
+    const mutated = (await execute('Inspect only package metadata', 'prefer_cache', { tools: ['fs.read'] })).result as Record<string, any>;
+    expect(mutated.node.reuse.creationMode).toBe('mutated_from_cache');
+    expect(mutated.node.definitionFingerprint).not.toBe(second.node.definitionFingerprint);
+    expect(mutated.creationUsage.definitionTokens).toBeGreaterThan(0);
+
+    const fresh = (await execute('Inspect another project area', 'fresh')).result as Record<string, any>;
+    expect(fresh.node.reuse.creationMode).toBe('generated');
+    expect(fresh.node.reuse.cacheHits).toEqual([]);
 
     await runtime.shutdown();
   });

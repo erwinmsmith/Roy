@@ -200,6 +200,45 @@ async function main(): Promise<void> {
     }
   });
 
+  app.post('/v1/agents/delegate', async (req, res) => {
+    const body = req.body ?? {};
+    const parentId = typeof body.parentId === 'string' ? body.parentId : 'root';
+    if (typeof body.archetype !== 'string' || typeof body.task !== 'string' || body.task.trim().length === 0) {
+      res.status(400).json({
+        error: 'Expected body { archetype, task, parentId?, name?, role?, style?, tools?, skills?, budgetTokens?, reuse?, execution?, outputContract? }',
+      });
+      return;
+    }
+
+    try {
+      const execution = await runtime.createAgentComputeNode({
+        parentId,
+        archetype: body.archetype,
+        task: body.task,
+        name: body.name,
+        role: body.role,
+        style: body.style,
+        description: body.description,
+        tools: body.tools,
+        skills: body.skills,
+        budgetTokens: body.budgetTokens,
+        memoryScope: body.memoryScope,
+        spawnPolicy: body.spawnPolicy,
+        tomProfile: body.tomProfile,
+        reuse: body.reuse,
+        execution: body.execution,
+        outputContract: body.outputContract,
+      }, {
+        agentId: parentId,
+        sessionId: runtime.getState().sessionId,
+        source: 'server',
+      });
+      res.status(201).json(execution);
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
   app.get('/v1/agents/:id', (req, res) => {
     const agent = runtime.getState().agents.find(item => item.identity.id === req.params.id);
     if (!agent) {

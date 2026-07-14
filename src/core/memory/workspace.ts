@@ -131,6 +131,10 @@ export interface AgentPatternInput {
   tools?: string[];
   skills?: string[];
   spawnPolicy?: unknown;
+  memoryScope?: unknown;
+  outputContract?: unknown;
+  definitionFingerprint?: string;
+  creationMode?: string;
 }
 
 export interface WorkspaceRuntimeConfig {
@@ -1015,6 +1019,11 @@ Keep this agent identity separate from the model provider identity.
       tools: input.tools ?? [],
       skills: input.skills ?? [],
       spawnPolicy: input.spawnPolicy ?? {},
+      memoryScope: input.memoryScope ?? {},
+      outputContract: input.outputContract ?? {},
+      definitionFingerprint: input.definitionFingerprint,
+      creationMode: existing?.creationMode ?? input.creationMode,
+      lastCreationMode: input.creationMode,
       usage: {
         count: Number((existing?.usage as Record<string, unknown> | undefined)?.count ?? 0) + 1,
         lastUsedAt: now,
