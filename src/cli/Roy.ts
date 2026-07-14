@@ -3,7 +3,7 @@
 import * as readline from 'readline';
 import * as path from 'path';
 import { bootstrap, cleanup, type BootstrapContext } from '../bootstrap.js';
-import { runtime, type AgentTreeNode, type SubAgentArchetype } from '../core/runtime/Runtime.js';
+import { runtime, type AgentTreeNode, type RuntimeActorNode, type SubAgentArchetype } from '../core/runtime/Runtime.js';
 import { skillRegistry } from '../core/skills/index.js';
 import { actionRegistry } from '../core/actions/index.js';
 import { toolRegistry } from '../core/tools/index.js';
@@ -33,18 +33,11 @@ interface DialogOption {
 
 export class Roy {
   private ctx: BootstrapContext | null = null;
-  private rl: readline.Interface;
+  private rl: readline.Interface | null = null;
+  private shuttingDown = false;
   private autoColor = true;
   private verboseMode = false;
   private sessionId = process.env.ROY_SESSION_ID ?? `cli-${new Date().toISOString().replace(/[:.]/g, '-')}`;
-
-  constructor() {
-    this.rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-      completer: this.completer.bind(this),
-    });
-  }
 
   // Color utilities
   private green(text: string): string {
@@ -71,7 +64,7 @@ export class Roy {
     return this.autoColor ? `\x1b[2m${text}\x1b[0m` : text;
   }
 
-  private async launch(): Promise<void> {
+  async launch(): Promise<void> {
     this.printBanner();
 
     try {
@@ -84,12 +77,17 @@ export class Roy {
 
       logger.info('CLI Bootstrap complete');
       await this.printReady();
-      this.startChat();
+      this.rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout,
+        completer: this.completer.bind(this),
+      });
+      await this.startChat();
     } catch (error) {
       console.log('\n  ' + this.red('[ERROR]') + ' Failed to initialize Roy');
       console.log('  ' + this.dim(String(error)));
       logger.error('Bootstrap failed:', error);
-      process.exit(1);
+      process.exitCode = 1;
     }
   }
 
@@ -145,7 +143,7 @@ export class Roy {
       console.log('');
 
       const question = '\n  Press Enter to start with defaults, or type option number: ';
-      this.rl.question(question, async (answer) => {
+      this.requireReadline().question(question, async (answer) => {
         const choice = answer.trim();
 
         if (choice === '2') {
@@ -231,7 +229,7 @@ export class Roy {
 
   private async pause(message: string): Promise<void> {
     return new Promise((resolve) => {
-      this.rl.question('\n  ' + message + ' ', () => {
+      this.requireReadline().question('\n  ' + message + ' ', () => {
         resolve();
       });
     });
@@ -269,38 +267,46 @@ export class Roy {
     return messages.length + ' messages';
   }
 
-  private startChat(): void {
-    const prompt = () => {
-      this.rl.question(this.cyan('\nyou') + ' > ', async (input) => {
+  private async startChat(): Promise<void> {
+    const rl = this.requireReadline();
+    const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+    if (interactive) {
+      rl.setPrompt(this.cyan('\nyou') + ' > ');
+      rl.prompt();
+    }
+    try {
+      for await (const input of rl) {
         const trimmed = input.trim();
-
-        if (!trimmed) {
-          prompt();
-          return;
-        }
-
-        if (trimmed.startsWith('/')) {
-          const shouldContinue = await this.handleCommand(trimmed);
-          if (shouldContinue !== false) {
-            prompt();
+        if (trimmed) {
+          if (trimmed.startsWith('/')) {
+            try {
+              const shouldContinue = await this.handleCommand(trimmed);
+              if (shouldContinue === false) break;
+            } catch (error) {
+              console.log('\n  ' + this.red('Command error:') + ' ' + (error instanceof Error ? error.message : String(error)) + '\n');
+            }
+          } else {
+            await this.processMessage(trimmed);
           }
-          return;
         }
-
-        await this.processMessage(trimmed);
-        prompt();
-      });
-    };
-
-    prompt();
-
-    this.rl.on('close', async () => {
-      console.log('\n\n' + this.yellow('Goodbye! Roy shutting down...') + '\n');
-      if (this.ctx) {
-        await cleanup(this.ctx);
+        if (interactive) rl.prompt();
       }
-      process.exit(0);
-    });
+    } finally {
+      rl.close();
+      await this.shutdown();
+    }
+  }
+
+  private requireReadline(): readline.Interface {
+    if (!this.rl) throw new Error('CLI input is not initialized');
+    return this.rl;
+  }
+
+  private async shutdown(): Promise<void> {
+    if (this.shuttingDown) return;
+    this.shuttingDown = true;
+    console.log('\n\n' + this.yellow('Goodbye! Roy shutting down...') + '\n');
+    if (this.ctx) await cleanup(this.ctx);
   }
 
   private async handleCommand(command: string): Promise<boolean | undefined> {
@@ -874,16 +880,7 @@ export class Roy {
       console.log('    ' + this.dim('No runtime teams'));
     } else if (tree) {
       const actorTree = runtime.getTeamActorTree();
-      console.log(`    ${this.cyan(actorTree.root.identity.name)} [root, ${actorTree.root.state}]`);
-      actorTree.teams.forEach((node, index) => {
-        const lastTeam = index === actorTree.teams.length - 1;
-        const branch = lastTeam ? '└── ' : '├── ';
-        const continuation = lastTeam ? '    ' : '│   ';
-        console.log(`    ${branch}${this.cyan(node.team.identity.name)} [subteam, ToM-${node.team.identity.tomLevel}, ${node.team.status}, ${node.team.tokenUsage.totalTokens} tokens]`);
-        node.members.forEach((member, memberIndex) => {
-          this.printTeamMemberTree(member, `    ${continuation}`, memberIndex === node.members.length - 1);
-        });
-      });
+      this.printRuntimeActorTree(actorTree.hierarchy, '    ', true, true);
     } else {
       for (const team of teams) {
         console.log(`    - ${this.cyan(team.identity.id)} ${team.identity.name} [${team.status}] parent=${team.identity.parentAgentId}`);
@@ -899,6 +896,19 @@ export class Roy {
     console.log(`${prefix}${branch}${node.agent.identity.name} [${node.agent.identity.role}, ${node.agent.state}, ${node.agent.usage.totalTokens} tokens]`);
     node.children.forEach((child, index) => {
       this.printTeamMemberTree(child, prefix + continuation, index === node.children.length - 1);
+    });
+  }
+
+  private printRuntimeActorTree(node: RuntimeActorNode, prefix: string, last: boolean, root = false): void {
+    const branch = root ? '' : last ? '└── ' : '├── ';
+    const continuation = root ? '' : last ? '    ' : '│   ';
+    if (node.type === 'agent') {
+      console.log(`${prefix}${branch}${this.cyan(node.agent.identity.name)} [${node.agent.identity.role}, ${node.agent.state}, ${node.agent.usage.totalTokens} tokens]`);
+    } else {
+      console.log(`${prefix}${branch}${this.cyan(node.team.identity.name)} [subteam, ToM-${node.team.identity.tomLevel}, ${node.team.status}, ${node.team.tokenUsage.totalTokens} tokens]`);
+    }
+    node.children.forEach((child, index) => {
+      this.printRuntimeActorTree(child, prefix + continuation, index === node.children.length - 1);
     });
   }
 
@@ -1086,7 +1096,7 @@ export class Roy {
         console.log('\n  Usage: /memory mode <suggest|auto-safe|off>\n');
         return;
       }
-      await runtime.setMemoryMode(key as any);
+      await runtime.setMemoryMode(key as 'suggest' | 'auto-safe' | 'off');
       console.log('\n  Memory mode: ' + this.cyan(key) + '\n');
       return;
     }
@@ -1379,7 +1389,7 @@ export class Roy {
       parentId,
       task,
       archetype: ['researcher', 'critic', 'planner', 'coder', 'summarizer', 'tester', 'custom'].includes(agentKey)
-        ? agentKey as any
+        ? agentKey as SubAgentArchetype
         : undefined,
     });
     console.log('\n  ' + this.bold(`Rendered Prompt: ${agentKey}`));
@@ -1416,7 +1426,7 @@ export class Roy {
   }
 
   private async spawnAgent(parts: string[]): Promise<void> {
-    const archetype = parts[1] as any;
+    const archetype = parts[1] as SubAgentArchetype;
     const quiet = parts.includes('--quiet');
     const parentId = this.optionValue(parts, '--parent');
     const name = this.optionValue(parts, '--name');
@@ -1745,7 +1755,7 @@ export class Roy {
 // CLI entry point
 async function main(): Promise<void> {
   const roy = new Roy();
-  await (roy as any).launch();
+  await roy.launch();
 }
 
 main().catch(console.error);

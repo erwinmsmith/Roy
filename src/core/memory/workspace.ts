@@ -2,6 +2,8 @@ import { mkdir, readFile, readdir, stat, writeFile, appendFile } from 'node:fs/p
 import path from 'node:path';
 import type { RuntimeEvent } from '../runtime/Runtime.js';
 
+const WORKSPACE_FILE_LOCKS = new Map<string, Promise<void>>();
+
 export interface MemoryDocState {
   name: string;
   path: string;
@@ -865,7 +867,17 @@ Keep this agent identity separate from the model provider identity.
   async proposeMemoryUpdates(): Promise<MemoryUpdateProposal[]> {
     const mode = await this.getMemoryMode();
     if (mode === 'off') return [];
+    const proposalPath = path.join(this.rootPath, 'cache', 'memory-proposals.json');
+    const created = await this.withFileLock(proposalPath, () => this.proposeMemoryUpdatesLocked());
+    if (mode === 'auto-safe') {
+      for (const proposal of created.filter(item => item.risk === 'low')) {
+        await this.acceptMemoryProposal(proposal.id);
+      }
+    }
+    return created;
+  }
 
+  private async proposeMemoryUpdatesLocked(): Promise<MemoryUpdateProposal[]> {
     const conversations = await this.readConversation(this.sessionId, 200);
     const signals = await this.collectMemorySignals();
     const existing = await this.listAllMemoryProposals();
@@ -965,29 +977,26 @@ Keep this agent identity separate from the model provider identity.
     const proposals = [...existing, ...created];
     await this.writeProposalFile(proposals);
 
-    if (mode === 'auto-safe') {
-      for (const proposal of created.filter(item => item.risk === 'low')) {
-        await this.acceptMemoryProposal(proposal.id);
-      }
-    }
-
     return created;
   }
 
   async acceptMemoryProposal(id: string): Promise<MemoryUpdateRecord | undefined> {
-    const proposals = await this.listAllMemoryProposals();
-    const proposal = proposals.find(item => item.id === id && item.status === 'pending');
+    const proposalPath = path.join(this.rootPath, 'cache', 'memory-proposals.json');
+    const proposal = await this.withFileLock(proposalPath, async () => {
+      const proposals = await this.listAllMemoryProposals();
+      const pending = proposals.find(item => item.id === id && item.status === 'pending');
+      if (!pending) return undefined;
+
+      if (pending.operation === 'append' && typeof pending.content === 'string') {
+        await this.appendToSection(pending.target.path, pending.target.section, pending.content);
+      }
+
+      pending.status = 'committed';
+      pending.updatedAt = Date.now();
+      await this.writeProposalFile(proposals);
+      return { ...pending, source: { ...pending.source }, target: { ...pending.target } };
+    });
     if (!proposal) return undefined;
-
-    if (proposal.operation === 'append' && typeof proposal.content === 'string') {
-      await this.appendToSection(proposal.target.path, proposal.target.section, proposal.content);
-    }
-
-    proposal.status = 'committed';
-    proposal.updatedAt = Date.now();
-    await this.writeProposalFile(proposals);
-
-    const updates = await this.listMemoryUpdates();
     const record: MemoryUpdateRecord = {
       id: `mem_update_${Date.now()}`,
       proposalId: proposal.id,
@@ -996,66 +1005,64 @@ Keep this agent identity separate from the model provider identity.
       operation: proposal.operation,
       committedAt: Date.now(),
     };
-    await writeFile(
-      path.join(this.rootPath, 'cache', 'memory-updates.json'),
-      JSON.stringify({ updates: [...updates, record] }, null, 2) + '\n',
-      'utf8'
-    );
+    const updatesPath = path.join(this.rootPath, 'cache', 'memory-updates.json');
+    await this.withFileLock(updatesPath, async () => {
+      const updates = await this.listMemoryUpdates();
+      await writeFile(updatesPath, JSON.stringify({ updates: [...updates, record] }, null, 2) + '\n', 'utf8');
+    });
     return record;
   }
 
   async rejectMemoryProposal(id: string): Promise<boolean> {
-    const proposals = await this.listAllMemoryProposals();
-    const proposal = proposals.find(item => item.id === id && item.status === 'pending');
-    if (!proposal) return false;
-    proposal.status = 'rejected';
-    proposal.updatedAt = Date.now();
-    await this.writeProposalFile(proposals);
-    return true;
+    const proposalPath = path.join(this.rootPath, 'cache', 'memory-proposals.json');
+    return this.withFileLock(proposalPath, async () => {
+      const proposals = await this.listAllMemoryProposals();
+      const proposal = proposals.find(item => item.id === id && item.status === 'pending');
+      if (!proposal) return false;
+      proposal.status = 'rejected';
+      proposal.updatedAt = Date.now();
+      await this.writeProposalFile(proposals);
+      return true;
+    });
   }
 
   async upsertAgentPattern(input: AgentPatternInput): Promise<void> {
     const key = this.safeKey(input.key);
     const cachePath = path.join(this.rootPath, 'cache', 'agent-patterns.json');
-    const file = await this.readJson<{ patterns?: Array<Record<string, unknown>> }>(cachePath, { patterns: [] });
-    const patterns = file.patterns ?? [];
-    const now = new Date().toISOString();
-    const canonicalId = `agent_pattern_${key}_v1`;
-    const patternId = input.patternId ?? canonicalId;
-    const existing = patterns.find(pattern => pattern.id === patternId);
-    const pattern = {
-      id: patternId,
-      key,
-      name: input.name,
-      archetype: input.archetype,
-      tomLevel: input.tomLevel,
-      description: input.description ?? '',
-      promptPath: `.roy/agents/${key}/prompt.md`,
-      memoryPath: `.roy/agents/${key}/memory.md`,
-      contextPath: `.roy/agents/${key}/context.md`,
-      tools: input.tools ?? [],
-      skills: input.skills ?? [],
-      spawnPolicy: input.spawnPolicy ?? {},
-      memoryScope: input.memoryScope ?? {},
-      outputContract: input.outputContract ?? {},
-      definitionFingerprint: input.definitionFingerprint,
-      creationMode: existing?.creationMode ?? input.creationMode,
-      lastCreationMode: input.creationMode,
-      basePatternId: input.basePatternId,
-      status: input.status ?? existing?.status ?? 'candidate',
-      usage: {
-        count: Number((existing?.usage as Record<string, unknown> | undefined)?.count ?? 0) + 1,
-        lastUsedAt: now,
-      },
-      updatedAt: now,
-    };
-
-    if (existing) {
-      Object.assign(existing, pattern);
-    } else {
-      patterns.push(pattern);
-    }
-    await writeFile(cachePath, JSON.stringify({ patterns }, null, 2) + '\n', 'utf8');
+    await this.updatePatternFile(cachePath, patterns => {
+      const now = new Date().toISOString();
+      const canonicalId = `agent_pattern_${key}_v1`;
+      const patternId = input.patternId ?? canonicalId;
+      const existing = patterns.find(pattern => pattern.id === patternId);
+      const pattern = {
+        id: patternId,
+        key,
+        name: input.name,
+        archetype: input.archetype,
+        tomLevel: input.tomLevel,
+        description: input.description ?? '',
+        promptPath: `.roy/agents/${key}/prompt.md`,
+        memoryPath: `.roy/agents/${key}/memory.md`,
+        contextPath: `.roy/agents/${key}/context.md`,
+        tools: input.tools ?? [],
+        skills: input.skills ?? [],
+        spawnPolicy: input.spawnPolicy ?? {},
+        memoryScope: input.memoryScope ?? {},
+        outputContract: input.outputContract ?? {},
+        definitionFingerprint: input.definitionFingerprint,
+        creationMode: existing?.creationMode ?? input.creationMode,
+        lastCreationMode: input.creationMode,
+        basePatternId: input.basePatternId,
+        status: input.status ?? existing?.status ?? 'candidate',
+        usage: {
+          count: Number((existing?.usage as Record<string, unknown> | undefined)?.count ?? 0) + 1,
+          lastUsedAt: now,
+        },
+        updatedAt: now,
+      };
+      if (existing) Object.assign(existing, pattern);
+      else patterns.push(pattern);
+    });
   }
 
   async findAgentPattern(archetype: string): Promise<Record<string, unknown> | undefined> {
@@ -1077,29 +1084,28 @@ Keep this agent identity separate from the model provider identity.
   ): Promise<void> {
     const key = this.safeKey(archetype);
     const cachePath = path.join(this.rootPath, 'cache', 'agent-patterns.json');
-    const file = await this.readJson<{ patterns?: Array<Record<string, unknown>> }>(cachePath, { patterns: [] });
-    const patterns = file.patterns ?? [];
-    const pattern = patternId
-      ? patterns.find(item => item.id === patternId)
-      : patterns.find(item => item.id === `agent_pattern_${key}_v1`)
-        ?? patterns.find(item => (item.key === key || item.archetype === key) && !item.basePatternId);
-    if (!pattern) return;
-    const evaluation = (pattern.evaluation as Record<string, unknown> | undefined) ?? {};
-    const runs = Number(evaluation.runs ?? 0) + 1;
-    const successes = Number(evaluation.successes ?? 0) + (outcome.success ? 1 : 0);
-    const groundedRuns = Number(evaluation.groundedRuns ?? 0) + (outcome.grounded ? 1 : 0);
-    const previousAverage = Number(evaluation.averageTokens ?? 0);
-    pattern.evaluation = {
-      runs,
-      successes,
-      groundedRuns,
-      successRate: Number((successes / runs).toFixed(4)),
-      groundingRate: Number((groundedRuns / runs).toFixed(4)),
-      averageTokens: Math.round(((previousAverage * (runs - 1)) + outcome.totalTokens) / runs),
-      lastEvaluatedAt: new Date().toISOString(),
-    };
-    pattern.status = runs >= 3 && successes / runs >= 0.67 ? 'active' : outcome.success ? 'candidate' : 'candidate_failed';
-    await writeFile(cachePath, JSON.stringify({ patterns }, null, 2) + '\n', 'utf8');
+    await this.updatePatternFile(cachePath, patterns => {
+      const pattern = patternId
+        ? patterns.find(item => item.id === patternId)
+        : patterns.find(item => item.id === `agent_pattern_${key}_v1`)
+          ?? patterns.find(item => (item.key === key || item.archetype === key) && !item.basePatternId);
+      if (!pattern) return;
+      const evaluation = (pattern.evaluation as Record<string, unknown> | undefined) ?? {};
+      const runs = Number(evaluation.runs ?? 0) + 1;
+      const successes = Number(evaluation.successes ?? 0) + (outcome.success ? 1 : 0);
+      const groundedRuns = Number(evaluation.groundedRuns ?? 0) + (outcome.grounded ? 1 : 0);
+      const previousAverage = Number(evaluation.averageTokens ?? 0);
+      pattern.evaluation = {
+        runs,
+        successes,
+        groundedRuns,
+        successRate: Number((successes / runs).toFixed(4)),
+        groundingRate: Number((groundedRuns / runs).toFixed(4)),
+        averageTokens: Math.round(((previousAverage * (runs - 1)) + outcome.totalTokens) / runs),
+        lastEvaluatedAt: new Date().toISOString(),
+      };
+      pattern.status = runs >= 3 && successes / runs >= 0.67 ? 'active' : outcome.success ? 'candidate' : 'candidate_failed';
+    });
   }
 
   async findDelegationPattern(archetype: string, task: string): Promise<Record<string, unknown> | undefined> {
@@ -1111,31 +1117,26 @@ Keep this agent identity separate from the model provider identity.
   async upsertDelegationPattern(input: DelegationPatternInput): Promise<Record<string, unknown>> {
     const signature = this.delegationSignature(input.archetype, input.task);
     const cachePath = path.join(this.rootPath, 'cache', 'delegation-patterns.json');
-    const file = await this.readJson<{ patterns?: Array<Record<string, unknown>> }>(cachePath, { patterns: [] });
-    const patterns = file.patterns ?? [];
-    const now = new Date().toISOString();
-    const existing = patterns.find(pattern => pattern.signature === signature || pattern.id === `delegation_${signature}_v1`);
-    const pattern = {
-      id: `delegation_${signature}_v1`,
-      signature,
-      archetype: input.archetype,
-      parentId: input.parentId,
-      agentPatternId: input.agentPatternId,
-      taskSignature: signature.replace(`${this.safeKey(input.archetype)}_`, ''),
-      usage: {
-        count: Number((existing?.usage as Record<string, unknown> | undefined)?.count ?? 0) + 1,
-        lastUsedAt: now,
-      },
-      updatedAt: now,
-    };
-
-    if (existing) {
-      Object.assign(existing, pattern);
-    } else {
-      patterns.push(pattern);
-    }
-    await writeFile(cachePath, JSON.stringify({ patterns }, null, 2) + '\n', 'utf8');
-    return pattern;
+    return this.updatePatternFile(cachePath, patterns => {
+      const now = new Date().toISOString();
+      const existing = patterns.find(pattern => pattern.signature === signature || pattern.id === `delegation_${signature}_v1`);
+      const pattern = {
+        id: `delegation_${signature}_v1`,
+        signature,
+        archetype: input.archetype,
+        parentId: input.parentId,
+        agentPatternId: input.agentPatternId,
+        taskSignature: signature.replace(`${this.safeKey(input.archetype)}_`, ''),
+        usage: {
+          count: Number((existing?.usage as Record<string, unknown> | undefined)?.count ?? 0) + 1,
+          lastUsedAt: now,
+        },
+        updatedAt: now,
+      };
+      if (existing) Object.assign(existing, pattern);
+      else patterns.push(pattern);
+      return pattern;
+    });
   }
 
   async ensureTeamMemory(teamKey: string, options: { name: string; purpose: string }): Promise<string> {
@@ -1152,35 +1153,31 @@ Keep this agent identity separate from the model provider identity.
   async upsertTeamPattern(input: TeamPatternInput): Promise<Record<string, unknown>> {
     const key = this.safeKey(input.key);
     const cachePath = path.join(this.rootPath, 'cache', 'team-patterns.json');
-    const file = await this.readJson<{ patterns?: Array<Record<string, unknown>> }>(cachePath, { patterns: [] });
-    const patterns = file.patterns ?? [];
-    const id = `team_pattern_${key}_v1`;
-    const existing = patterns.find(pattern => pattern.id === id || pattern.key === key);
-    const now = new Date().toISOString();
-    const usageCount = Number((existing?.usage as Record<string, unknown> | undefined)?.count ?? 0) + 1;
-    const pattern = {
-      id,
-      key,
-      name: input.name,
-      purpose: input.purpose,
-      parentId: input.parentId,
-      memberArchetypes: input.memberArchetypes,
-      tomLevel: input.tomLevel ?? 2,
-      leadArchetype: input.leadArchetype,
-      members: input.members ?? input.memberArchetypes.map(archetype => ({ archetype })),
-      memoryPath: `.roy/teams/${key}/memory.md`,
-      topologyPath: `.roy/teams/${key}/topology.json`,
-      status: usageCount >= 2 ? 'active' : 'candidate',
-      usage: {
-        count: usageCount,
-        lastUsedAt: now,
-      },
-      updatedAt: now,
-    };
-    if (existing) Object.assign(existing, pattern);
-    else patterns.push(pattern);
-    await writeFile(cachePath, JSON.stringify({ patterns }, null, 2) + '\n', 'utf8');
-    return pattern;
+    return this.updatePatternFile(cachePath, patterns => {
+      const id = `team_pattern_${key}_v1`;
+      const existing = patterns.find(pattern => pattern.id === id || pattern.key === key);
+      const now = new Date().toISOString();
+      const usageCount = Number((existing?.usage as Record<string, unknown> | undefined)?.count ?? 0) + 1;
+      const pattern = {
+        id,
+        key,
+        name: input.name,
+        purpose: input.purpose,
+        parentId: input.parentId,
+        memberArchetypes: input.memberArchetypes,
+        tomLevel: input.tomLevel ?? 2,
+        leadArchetype: input.leadArchetype,
+        members: input.members ?? input.memberArchetypes.map(archetype => ({ archetype })),
+        memoryPath: `.roy/teams/${key}/memory.md`,
+        topologyPath: `.roy/teams/${key}/topology.json`,
+        status: usageCount >= 2 ? 'active' : 'candidate',
+        usage: { count: usageCount, lastUsedAt: now },
+        updatedAt: now,
+      };
+      if (existing) Object.assign(existing, pattern);
+      else patterns.push(pattern);
+      return pattern;
+    });
   }
 
   async recordTeamPatternOutcome(
@@ -1189,25 +1186,24 @@ Keep this agent identity separate from the model provider identity.
   ): Promise<void> {
     const key = this.safeKey(teamKey);
     const cachePath = path.join(this.rootPath, 'cache', 'team-patterns.json');
-    const file = await this.readJson<{ patterns?: Array<Record<string, unknown>> }>(cachePath, { patterns: [] });
-    const patterns = file.patterns ?? [];
-    const pattern = patterns.find(item => item.id === `team_pattern_${key}_v1` || item.key === key);
-    if (!pattern) return;
-    const usage = (pattern.usage as Record<string, unknown> | undefined) ?? {};
-    const completedCount = Number(usage.completedCount ?? 0) + 1;
-    const totalTokens = Number(usage.totalTokens ?? 0) + Math.max(0, outcome.totalTokens);
-    pattern.usage = {
-      ...usage,
-      completedCount,
-      successCount: Number(usage.successCount ?? 0) + (outcome.success ? 1 : 0),
-      totalTokens,
-      averageTokens: Math.round(totalTokens / completedCount),
-      lastMemberCount: outcome.memberCount,
-      lastCompletedAt: new Date().toISOString(),
-    };
-    pattern.status = outcome.success && completedCount >= 2 ? 'active' : pattern.status;
-    pattern.updatedAt = new Date().toISOString();
-    await writeFile(cachePath, JSON.stringify({ patterns }, null, 2) + '\n', 'utf8');
+    await this.updatePatternFile(cachePath, patterns => {
+      const pattern = patterns.find(item => item.id === `team_pattern_${key}_v1` || item.key === key);
+      if (!pattern) return;
+      const usage = (pattern.usage as Record<string, unknown> | undefined) ?? {};
+      const completedCount = Number(usage.completedCount ?? 0) + 1;
+      const totalTokens = Number(usage.totalTokens ?? 0) + Math.max(0, outcome.totalTokens);
+      pattern.usage = {
+        ...usage,
+        completedCount,
+        successCount: Number(usage.successCount ?? 0) + (outcome.success ? 1 : 0),
+        totalTokens,
+        averageTokens: Math.round(totalTokens / completedCount),
+        lastMemberCount: outcome.memberCount,
+        lastCompletedAt: new Date().toISOString(),
+      };
+      pattern.status = outcome.success && completedCount >= 2 ? 'active' : pattern.status;
+      pattern.updatedAt = new Date().toISOString();
+    });
   }
 
   async updateTeamPatternMembers(
@@ -1221,16 +1217,15 @@ Keep this agent identity separate from the model provider identity.
   ): Promise<void> {
     const key = this.safeKey(teamKey);
     const cachePath = path.join(this.rootPath, 'cache', 'team-patterns.json');
-    const file = await this.readJson<{ patterns?: Array<Record<string, unknown>> }>(cachePath, { patterns: [] });
-    const patterns = file.patterns ?? [];
-    const pattern = patterns.find(item => item.id === `team_pattern_${key}_v1` || item.key === key);
-    if (!pattern) return;
-    pattern.memberArchetypes = [...definition.memberArchetypes];
-    pattern.tomLevel = definition.tomLevel;
-    pattern.leadArchetype = definition.leadArchetype;
-    pattern.members = definition.members.map(member => ({ ...member }));
-    pattern.updatedAt = new Date().toISOString();
-    await writeFile(cachePath, JSON.stringify({ patterns }, null, 2) + '\n', 'utf8');
+    await this.updatePatternFile(cachePath, patterns => {
+      const pattern = patterns.find(item => item.id === `team_pattern_${key}_v1` || item.key === key);
+      if (!pattern) return;
+      pattern.memberArchetypes = [...definition.memberArchetypes];
+      pattern.tomLevel = definition.tomLevel;
+      pattern.leadArchetype = definition.leadArchetype;
+      pattern.members = definition.members.map(member => ({ ...member }));
+      pattern.updatedAt = new Date().toISOString();
+    });
   }
 
   async updateCacheUsageMetrics(patternIds: string[], metrics: { definitionTokensSaved?: number; renderedPromptTokens?: number }): Promise<void> {
@@ -1557,24 +1552,19 @@ Keep this agent identity separate from the model provider identity.
   ): Promise<void> {
     if (patternIds.length === 0) return;
     const filePath = path.join(this.rootPath, 'cache', fileName);
-    const file = await this.readJson<{ patterns?: Array<Record<string, unknown>> }>(filePath, { patterns: [] });
-    let changed = false;
-    const patterns = (file.patterns ?? []).map(pattern => {
-      if (!patternIds.includes(String(pattern.id))) return pattern;
-      const usage = typeof pattern.usage === 'object' && pattern.usage !== null
-        ? pattern.usage as Record<string, unknown>
-        : {};
-      pattern.usage = {
-        ...usage,
-        definitionTokensSaved: Number(usage.definitionTokensSaved ?? 0) + Number(metrics.definitionTokensSaved ?? 0),
-        lastRenderedPromptTokens: metrics.renderedPromptTokens ?? usage.lastRenderedPromptTokens,
-      };
-      changed = true;
-      return pattern;
+    await this.updatePatternFile(filePath, patterns => {
+      for (const pattern of patterns) {
+        if (!patternIds.includes(String(pattern.id))) continue;
+        const usage = typeof pattern.usage === 'object' && pattern.usage !== null
+          ? pattern.usage as Record<string, unknown>
+          : {};
+        pattern.usage = {
+          ...usage,
+          definitionTokensSaved: Number(usage.definitionTokensSaved ?? 0) + Number(metrics.definitionTokensSaved ?? 0),
+          lastRenderedPromptTokens: metrics.renderedPromptTokens ?? usage.lastRenderedPromptTokens,
+        };
+      }
     });
-    if (changed) {
-      await writeFile(filePath, JSON.stringify({ patterns }, null, 2) + '\n', 'utf8');
-    }
   }
 
   private async ensurePromptSlots(filePath: string): Promise<void> {
@@ -1783,6 +1773,37 @@ Keep this agent identity separate from the model provider identity.
       return role;
     }
     return 'user';
+  }
+
+  private async updatePatternFile<T>(
+    filePath: string,
+    mutate: (patterns: Array<Record<string, unknown>>) => T | Promise<T>
+  ): Promise<T> {
+    return this.withFileLock(filePath, async () => {
+      const file = await this.readJson<{ patterns?: Array<Record<string, unknown>> }>(filePath, { patterns: [] });
+      const patterns = file.patterns ?? [];
+      const result = await mutate(patterns);
+      await writeFile(filePath, JSON.stringify({ patterns }, null, 2) + '\n', 'utf8');
+      return result;
+    });
+  }
+
+  private async withFileLock<T>(filePath: string, operation: () => Promise<T>): Promise<T> {
+    const key = path.resolve(filePath);
+    const previous = WORKSPACE_FILE_LOCKS.get(key) ?? Promise.resolve();
+    let release = (): void => {};
+    const gate = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    const tail = previous.catch(() => undefined).then(() => gate);
+    WORKSPACE_FILE_LOCKS.set(key, tail);
+    await previous.catch(() => undefined);
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (WORKSPACE_FILE_LOCKS.get(key) === tail) WORKSPACE_FILE_LOCKS.delete(key);
+    }
   }
 
   private async writeIfMissing(filePath: string, content: string): Promise<void> {

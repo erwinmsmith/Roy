@@ -2,7 +2,6 @@
 
 import type {
   Skill,
-  SkillConfig,
   SkillInput,
   SkillContext,
   SkillOutput,

@@ -1,6 +1,6 @@
 // Tool registry implementation
 
-import type { Tool, ToolConfig, ToolResult, ToolMetadata } from './types.js';
+import type { Tool, ToolResult, ToolMetadata } from './types.js';
 import { logger } from '../utils/logger.js';
 
 class ToolRegistry {

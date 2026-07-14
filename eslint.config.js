@@ -32,6 +32,17 @@ export default tseslint.config(
     },
   },
   {
+    files: [
+      'src/cli/**/*.ts',
+      'src/server/**/*.ts',
+      'src/core/logging/**/*.ts',
+      'src/core/utils/logger.ts',
+    ],
+    rules: {
+      'no-console': 'off',
+    },
+  },
+  {
     ignores: ['dist/**', 'node_modules/**', '*.js'],
   }
 );

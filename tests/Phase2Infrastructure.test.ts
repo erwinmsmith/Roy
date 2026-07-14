@@ -99,11 +99,12 @@ describe('Phase 2 engineering infrastructure', () => {
   it('enforces formal subteam lifecycle transitions', () => {
     const teams = new TeamRegistry();
     const team = teams.create({ name: 'Review Team', parentId: 'root', purpose: 'review', generation: 1 });
-    teams.transition(team.identity.id, 'ready');
-    expect(() => teams.transition(team.identity.id, 'done')).toThrow(InvalidTeamTransitionError);
-    teams.transition(team.identity.id, 'running');
-    teams.transition(team.identity.id, 'synthesizing');
-    expect(teams.transition(team.identity.id, 'done').state).toBe('done');
+    teams.transitionFsm(team.identity.id, 'S_team_plan');
+    expect(() => teams.transitionFsm(team.identity.id, 'S_team_done')).toThrow(InvalidTeamTransitionError);
+    teams.transitionFsm(team.identity.id, 'S_member_execute');
+    teams.transitionFsm(team.identity.id, 'S_member_aggregate');
+    teams.transitionFsm(team.identity.id, 'S_team_synthesize');
+    expect(teams.transitionFsm(team.identity.id, 'S_team_done').state).toBe('done');
   });
 
   it('uses LLM scoring and cache mutation through the pluggable planner', async () => {

@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Runtime from '../src/core/runtime/Runtime.js';
+import { WorkspaceMemoryManager } from '../src/core/memory/workspace.js';
 
 describe('Workspace memory initialization', () => {
   it('creates .roy memory, cache, queue, and trace files', async () => {
@@ -166,5 +167,31 @@ describe('Workspace memory initialization', () => {
     expect(researcher?.skills.map(skill => skill.name)).toEqual(['use_tool_when_needed']);
 
     await runtime.shutdown();
+  });
+
+  it('serializes concurrent pattern updates from multiple runtime memory managers', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-pattern-lock-'));
+    const first = new WorkspaceMemoryManager();
+    const second = new WorkspaceMemoryManager();
+    await Promise.all([
+      first.initWorkspace(workspaceCwd, 'lock-first'),
+      second.initWorkspace(workspaceCwd, 'lock-second'),
+    ]);
+
+    await Promise.all(Array.from({ length: 20 }, (_, index) => {
+      const manager = index % 2 === 0 ? first : second;
+      return manager.upsertAgentPattern({
+        key: 'researcher',
+        name: 'Researcher',
+        archetype: 'researcher',
+        tomLevel: 0,
+        tools: ['fs.list', 'fs.read'],
+        skills: ['use_tool_when_needed'],
+      });
+    }));
+
+    const patterns = await first.getCachePatterns('agents');
+    expect(patterns).toHaveLength(1);
+    expect((patterns[0].usage as { count: number }).count).toBe(20);
   });
 });

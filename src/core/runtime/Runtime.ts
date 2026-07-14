@@ -222,9 +222,24 @@ export interface TeamTreeNode {
   members: AgentTreeNode[];
 }
 
+export type RuntimeActorNode = RuntimeAgentActorNode | RuntimeTeamActorNode;
+
+export interface RuntimeAgentActorNode {
+  type: 'agent';
+  agent: AgentInfo;
+  children: RuntimeActorNode[];
+}
+
+export interface RuntimeTeamActorNode {
+  type: 'team';
+  team: TeamRuntimeState;
+  children: RuntimeActorNode[];
+}
+
 export interface RuntimeActorTree {
   root: AgentInfo;
   teams: TeamTreeNode[];
+  hierarchy: RuntimeAgentActorNode;
 }
 
 export interface TeamRunResult {
@@ -387,6 +402,7 @@ export class Runtime {
   private agentFsms = new Map<string, FSM>();
   private budgetMarket: BudgetMarket | null = null;
   private agentBudgetAllocations = new Map<string, string>();
+  private agentBudgetLimits = new Map<string, number>();
   private toolApprovalManager: ToolApprovalManager | null = null;
   private toolCallCounts = new Map<string, number>();
   private readonly teams = new TeamRegistry();
@@ -585,6 +601,7 @@ export class Runtime {
     this.agentBindings.clear();
     this.agentFsms.clear();
     this.agentBudgetAllocations.clear();
+    this.agentBudgetLimits.clear();
     this.budgetMarket = null;
     this.toolApprovalManager = null;
     this.toolCallCounts.clear();
@@ -810,6 +827,7 @@ export class Runtime {
       teams: this.teams.list()
         .map(team => this.getTeamTree(team.identity.id))
         .filter((team): team is TeamTreeNode => Boolean(team)),
+      hierarchy: this.buildRuntimeAgentActorTree(this.getContext().agent.getInfo(), new Set()),
     };
   }
 
@@ -835,10 +853,37 @@ export class Runtime {
       if (!parent) throw new Error(`Parent agent "${parentAgentId}" not found`);
       if (!spec.name?.trim()) throw new Error('Team name is required');
       if (!spec.description?.trim()) throw new Error('Team description is required');
+      if (spec.task !== undefined && (typeof spec.task !== 'string' || !spec.task.trim())) {
+        throw new Error('Team task must be a non-empty string when provided');
+      }
+      if (spec.tomLevel !== undefined
+        && (!Number.isInteger(spec.tomLevel) || spec.tomLevel < 0 || spec.tomLevel > 3)) {
+        throw new Error('Team tomLevel must be an integer from 0 to 3');
+      }
       const requestedMembers = spec.members ?? [];
       for (const member of requestedMembers) {
+        if (!member || typeof member !== 'object') throw new Error('Every planned team member must be an object');
         if (!this.isValidArchetype(member.archetype)) throw new Error(`Unsupported team member archetype "${member.archetype}"`);
         if (typeof member.task !== 'string' || !member.task.trim()) throw new Error('Every planned team member requires a task');
+        if (member.name !== undefined && (typeof member.name !== 'string' || !member.name.trim())) {
+          throw new Error('Team member name must be a non-empty string when provided');
+        }
+        if (member.tools !== undefined
+          && (!Array.isArray(member.tools) || member.tools.some(tool => typeof tool !== 'string' || !tool.trim()))) {
+          throw new Error('Team member tools must be an array of non-empty strings');
+        }
+        if (member.skills !== undefined
+          && (!Array.isArray(member.skills) || member.skills.some(skill => typeof skill !== 'string' || !skill.trim()))) {
+          throw new Error('Team member skills must be an array of non-empty strings');
+        }
+        if (member.budgetTokens !== undefined
+          && (!Number.isFinite(member.budgetTokens) || member.budgetTokens <= 0)) {
+          throw new Error('Team member budgetTokens must be a positive number when provided');
+        }
+        if (member.tomLevel !== undefined
+          && (!Number.isInteger(member.tomLevel) || member.tomLevel < 0 || member.tomLevel > 3)) {
+          throw new Error('Team member tomLevel must be an integer from 0 to 3');
+        }
       }
       const members = requestedMembers.map(member => ({
         ...member,
@@ -1187,35 +1232,17 @@ export class Runtime {
       await this.processQueuedMessage(resultMessage.id);
       await ctx.queue.ack(taskMessage.id);
       await ctx.queue.ack(resultMessage.id);
-      await ctx.memory.appendTeamSession(this.safeAgentKey(initial.identity.name), {
-        timestamp: Date.now(),
-        sessionId: ctx.sessionId,
-        correlationId,
-        teamId,
+      await this.transitionTeamFsm(teamId, 'S_team_done', { totalTokens: this.teams.get(teamId)!.tokenUsage.totalTokens });
+      const completedTeam = this.teams.get(teamId)!;
+      const runUsage = this.subtractTokenUsage(completedTeam.tokenUsage, usageBefore);
+      await this.persistTeamRunArtifacts({
+        team: completedTeam,
         task,
         result: synthesis.content,
-        memberAgentIds: this.teams.get(teamId)!.memberAgentIds,
-        tokenUsage: this.subtractTokenUsage(this.teams.get(teamId)!.tokenUsage, usageBefore),
-        cumulativeTokenUsage: this.teams.get(teamId)!.tokenUsage,
-      });
-      await this.persistTeamTopology(this.teams.get(teamId)!);
-      await ctx.memory.recordTeamPatternOutcome(this.safeAgentKey(initial.identity.name), {
+        correlationId,
+        usage: runUsage,
         success: true,
-        totalTokens: this.subtractTokenUsage(this.teams.get(teamId)!.tokenUsage, usageBefore).totalTokens,
-        memberCount: this.teams.get(teamId)!.memberAgentIds.length,
       });
-      await this.transitionTeamFsm(teamId, 'S_team_done', { totalTokens: this.teams.get(teamId)!.tokenUsage.totalTokens });
-      try {
-        await this.persistTeamTopology(this.teams.get(teamId)!);
-      } catch (error) {
-        this.emit({
-          type: 'team.persistence.failed',
-          agentId: teamId,
-          sessionId: ctx.sessionId,
-          correlationId,
-          data: { teamId, parentAgentId: initial.identity.parentAgentId, error: error instanceof Error ? error.message : String(error) },
-        });
-      }
       this.emit({
         type: 'team.completed',
         agentId: teamId,
@@ -1225,7 +1252,7 @@ export class Runtime {
           teamId,
           result: synthesis.content,
           memberAgentIds: this.teams.get(teamId)!.memberAgentIds,
-          totalTokens: this.subtractTokenUsage(this.teams.get(teamId)!.tokenUsage, usageBefore).totalTokens,
+          totalTokens: runUsage.totalTokens,
           cumulativeTokens: this.teams.get(teamId)!.tokenUsage.totalTokens,
           parentAgentId: initial.identity.parentAgentId,
         },
@@ -1237,7 +1264,7 @@ export class Runtime {
         memberExecutions,
         correlationId,
         messages: await this.getMessages({ correlationId }),
-        usage: this.subtractTokenUsage(this.teams.get(teamId)!.tokenUsage, usageBefore),
+        usage: runUsage,
       };
     } catch (error) {
       const current = await ctx.queue.getMessage(taskMessage.id);
@@ -1247,10 +1274,13 @@ export class Runtime {
       await this.transitionTeamFsm(teamId, 'S_team_failed', {
         error: error instanceof Error ? error.message : String(error),
       });
-      await ctx.memory.recordTeamPatternOutcome(this.safeAgentKey(initial.identity.name), {
+      const failedTeam = this.teams.get(teamId)!;
+      await this.persistTeamRunArtifacts({
+        team: failedTeam,
+        task,
+        correlationId,
+        usage: this.subtractTokenUsage(failedTeam.tokenUsage, usageBefore),
         success: false,
-        totalTokens: this.subtractTokenUsage(this.teams.get(teamId)?.tokenUsage ?? usageBefore, usageBefore).totalTokens,
-        memberCount: this.teams.get(teamId)?.memberAgentIds.length ?? 0,
       });
       this.emit({
         type: 'team.failed',
@@ -1485,6 +1515,143 @@ export class Runtime {
     return allocation;
   }
 
+  private async requestTeamSynthesisBudget(input: {
+    team: TeamRuntimeState;
+    correlationId: string;
+    promptTokens: number;
+    completionTokens: number;
+  }): Promise<BudgetAllocation | undefined> {
+    if (this.workspaceRuntimeConfig?.budgetMarket.enabled === false) return undefined;
+    if (!this.budgetMarket) throw new Error('Budget market is not initialized');
+    const requestedTokens = input.promptTokens + input.completionTokens;
+    const minimumTokens = Math.max(
+      input.promptTokens + 1,
+      this.workspaceRuntimeConfig?.budgetMarket.minimumGrantTokens ?? 256
+    );
+    const requestMessage = await this.enqueueMessage({
+      kind: 'budget.request',
+      sessionId: this.getContext().sessionId,
+      from: input.team.identity.id,
+      to: 'budget.market',
+      correlationId: input.correlationId,
+      payload: {
+        requesterId: input.team.identity.id,
+        parentId: input.team.identity.parentAgentId,
+        requestedTokens,
+        minimumTokens,
+        purpose: 'team_synthesis',
+      },
+      metadata: {
+        agentId: input.team.identity.id,
+        teamId: input.team.identity.id,
+        budgetTokens: requestedTokens,
+      },
+    });
+    await this.processQueuedMessage(requestMessage.id);
+    this.emit({
+      type: 'budget.requested',
+      agentId: input.team.identity.id,
+      correlationId: input.correlationId,
+      data: {
+        teamId: input.team.identity.id,
+        requestedTokens,
+        minimumTokens,
+        purpose: 'team_synthesis',
+      },
+    });
+    const allocation = this.budgetMarket.request({
+      requesterId: input.team.identity.id,
+      parentId: input.team.identity.parentAgentId,
+      correlationId: input.correlationId,
+      requestedTokens,
+      minimumTokens,
+      purpose: 'team_synthesis',
+    });
+    const responseMessage = await this.enqueueMessage({
+      kind: allocation.status === 'granted' ? 'budget.grant' : 'budget.denied',
+      sessionId: this.getContext().sessionId,
+      from: 'budget.market',
+      to: input.team.identity.id,
+      correlationId: input.correlationId,
+      parentMessageId: requestMessage.id,
+      payload: allocation,
+      metadata: {
+        agentId: input.team.identity.id,
+        teamId: input.team.identity.id,
+        budgetTokens: allocation.grantedTokens,
+      },
+    });
+    await this.processQueuedMessage(responseMessage.id);
+    await this.getContext().queue.ack(requestMessage.id);
+    await this.getContext().queue.ack(responseMessage.id);
+    this.emit({
+      type: allocation.status === 'granted' ? 'budget.granted' : 'budget.denied',
+      agentId: input.team.identity.id,
+      correlationId: input.correlationId,
+      data: {
+        teamId: input.team.identity.id,
+        allocationId: allocation.id,
+        requestedTokens,
+        grantedTokens: allocation.grantedTokens,
+        reason: allocation.reason,
+      },
+    });
+    return allocation;
+  }
+
+  private settleTeamSynthesisBudget(
+    teamId: string,
+    allocation: BudgetAllocation | undefined,
+    actualTokens: number,
+    correlationId: string
+  ): void {
+    if (!allocation || allocation.status !== 'granted' || !this.budgetMarket) return;
+    const settled = this.budgetMarket.settle(allocation.id, actualTokens);
+    if (!settled) return;
+    this.emit({
+      type: 'budget.settled',
+      agentId: teamId,
+      correlationId,
+      data: {
+        teamId,
+        allocationId: allocation.id,
+        grantedTokens: allocation.grantedTokens,
+        actualTokens,
+      },
+    });
+    if (actualTokens > allocation.grantedTokens) {
+      this.emit({
+        type: 'budget.overrun',
+        agentId: teamId,
+        correlationId,
+        data: {
+          teamId,
+          allocationId: allocation.id,
+          grantedTokens: allocation.grantedTokens,
+          actualTokens,
+        },
+      });
+    }
+  }
+
+  private releaseTeamSynthesisBudget(
+    teamId: string,
+    allocation: BudgetAllocation | undefined,
+    correlationId: string,
+    reason: string
+  ): void {
+    if (!allocation || allocation.status !== 'granted' || !this.budgetMarket) return;
+    const released = this.budgetMarket.release(allocation.id, reason);
+    if (released) {
+      this.emit({
+        type: 'budget.released',
+        agentId: teamId,
+        correlationId,
+        data: { teamId, allocationId: allocation.id, reason },
+      });
+    }
+  }
+
   private settleAgentBudget(agentId: string, actualTokens: number): void {
     const allocationId = this.agentBudgetAllocations.get(agentId);
     if (!allocationId || !this.budgetMarket) return;
@@ -1496,6 +1663,13 @@ export class Runtime {
         agentId,
         data: { allocationId, grantedTokens: allocation.grantedTokens, actualTokens },
       });
+      if (actualTokens > allocation.grantedTokens) {
+        this.emit({
+          type: 'budget.overrun',
+          agentId,
+          data: { allocationId, grantedTokens: allocation.grantedTokens, actualTokens },
+        });
+      }
     }
   }
 
@@ -2607,13 +2781,22 @@ export class Runtime {
     });
     if (payload.teamId) {
       const team = this.teams.addMember(payload.teamId, agent.identity.id);
-      await ctx.memory.writeTeamTopology(this.safeAgentKey(team.identity.name), {
-        type: 'parent-child',
-        teamId: team.identity.id,
-        parentId: team.identity.parentId,
-        members: team.memberIds,
-        updatedAt: new Date().toISOString(),
-      });
+      try {
+        await this.persistTeamTopology(team);
+      } catch (error) {
+        this.emit({
+          type: 'team.persistence.failed',
+          agentId: team.identity.id,
+          sessionId: ctx.sessionId,
+          correlationId,
+          data: {
+            teamId: team.identity.id,
+            parentAgentId: team.identity.parentAgentId,
+            operation: 'persist_member_addition',
+            error: error instanceof Error ? error.message : String(error),
+          },
+        });
+      }
       this.emit({ type: 'team.member.added', agentId: agent.identity.id, data: { teamId: payload.teamId, parentId } });
     }
     const delegationPattern = await ctx.memory.upsertDelegationPattern({
@@ -2989,6 +3172,9 @@ export class Runtime {
     if (budgetAllocation?.status === 'granted') {
       this.agentBudgetAllocations.set(id, budgetAllocation.id);
     }
+    if (spec.budgetTokens !== undefined) {
+      this.agentBudgetLimits.set(id, Math.max(0, Math.floor(spec.budgetTokens)));
+    }
 
     try {
       const agentMemoryKey =
@@ -3297,6 +3483,7 @@ export class Runtime {
       ctx.manager.removeAgent(name);
       this.agentBindings.delete(id);
       this.agentFsms.delete(id);
+      this.agentBudgetLimits.delete(id);
       this.releaseAgentBudget(id, 'agent_creation_failed');
       const currentRequest = await ctx.queue.getMessage(createRequestMessage.id);
       if (currentRequest?.status === 'pending' || currentRequest?.status === 'processing') {
@@ -3338,6 +3525,32 @@ export class Runtime {
     const agent = ctx.manager.getAgentById(agentId);
     if (!agent) {
       throw new Error(`Agent "${agentId}" not found`);
+    }
+
+    if (!this.agentBudgetAllocations.has(agentId)) {
+      const archetype = options.archetype ?? this.inferAgentArchetype(agent.getInfo());
+      const allocation = await this.requestAgentBudget({
+        parentId: agent.getIdentity().parentId ?? 'root',
+        archetype,
+        correlationId: options.correlationId,
+        nodeId: options.nodeId,
+        requestedTokens: this.agentBudgetLimits.get(agentId),
+        purpose: task,
+      });
+      if (allocation?.status === 'denied') {
+        this.emit({
+          type: 'agent.run.rejected',
+          agentId,
+          sessionId: ctx.sessionId,
+          correlationId: options.correlationId,
+          nodeId: options.nodeId,
+          data: { task, reason: 'budget_request_denied' },
+        });
+        throw new Error('Agent run rejected: budget_request_denied');
+      }
+      if (allocation?.status === 'granted') {
+        this.agentBudgetAllocations.set(agentId, allocation.id);
+      }
     }
 
     const session = ctx.manager.getSession(ctx.sessionId);
@@ -4823,6 +5036,67 @@ Produce the final response to the user as Roy, the root agent.`;
     });
   }
 
+  private async persistTeamRunArtifacts(input: {
+    team: TeamRuntimeState;
+    task: string;
+    result?: string;
+    correlationId: string;
+    usage: TokenUsage;
+    success: boolean;
+  }): Promise<void> {
+    const ctx = this.getContext();
+    const teamKey = this.safeAgentKey(input.team.identity.name);
+    const operations: Array<{ name: string; run: () => Promise<void> }> = [];
+    if (input.success && input.result !== undefined) {
+      operations.push({
+        name: 'append_team_session',
+        run: () => ctx.memory.appendTeamSession(teamKey, {
+          timestamp: Date.now(),
+          sessionId: ctx.sessionId,
+          correlationId: input.correlationId,
+          teamId: input.team.identity.id,
+          task: input.task,
+          result: input.result,
+          memberAgentIds: input.team.memberAgentIds,
+          tokenUsage: input.usage,
+          cumulativeTokenUsage: input.team.tokenUsage,
+        }),
+      });
+    }
+    operations.push(
+      {
+        name: 'persist_team_topology',
+        run: () => this.persistTeamTopology(input.team),
+      },
+      {
+        name: 'record_team_pattern_outcome',
+        run: () => ctx.memory.recordTeamPatternOutcome(teamKey, {
+          success: input.success,
+          totalTokens: input.usage.totalTokens,
+          memberCount: input.team.memberAgentIds.length,
+        }),
+      }
+    );
+    for (const operation of operations) {
+      try {
+        await operation.run();
+      } catch (error) {
+        this.emit({
+          type: 'team.persistence.failed',
+          agentId: input.team.identity.id,
+          sessionId: ctx.sessionId,
+          correlationId: input.correlationId,
+          data: {
+            teamId: input.team.identity.id,
+            parentAgentId: input.team.identity.parentAgentId,
+            operation: operation.name,
+            error: error instanceof Error ? error.message : String(error),
+          },
+        });
+      }
+    }
+  }
+
   private async completeAsTeam(
     team: TeamRuntimeState,
     task: string,
@@ -4871,6 +5145,12 @@ Produce the final response to the user as Roy, the root agent.`;
       'Do not claim evidence that is absent from member reports.',
       reports,
     ].join('\n\n');
+    const systemPrompt = [
+      `You are ${team.identity.name}, a formal subteam actor in the Roy autonomous agent system.`,
+      'You are not Roy and you are not the model provider.',
+      `Parent agent: ${team.identity.parentAgentId}.`,
+      `Correlation: ${correlationId}.`,
+    ].join('\n');
     this.emit({
       type: 'team.synthesis.started',
       agentId: team.identity.id,
@@ -4892,31 +5172,42 @@ Produce the final response to the user as Roy, the root agent.`;
         usage,
       };
     }
+    const estimatedPromptTokens = this.estimateTextTokens(`${systemPrompt}\n${prompt}`);
+    const allocation = await this.requestTeamSynthesisBudget({
+      team,
+      correlationId,
+      promptTokens: estimatedPromptTokens,
+      completionTokens: 1024,
+    });
+    if (allocation?.status === 'denied') {
+      throw new Error(`Team synthesis rejected: ${allocation.reason}`);
+    }
+    const maxCompletionTokens = allocation
+      ? Math.max(1, allocation.grantedTokens - estimatedPromptTokens)
+      : 1024;
     const chunks: string[] = [];
     let providerUsage: { promptTokens: number; completionTokens: number; totalTokens: number } | undefined;
-    for await (const chunk of ctx.llm.stream([
-      {
-        role: 'system',
-        content: [
-          `You are ${team.identity.name}, a formal subteam actor in the Roy autonomous agent system.`,
-          'You are not Roy and you are not the model provider.',
-          `Parent agent: ${team.identity.parentAgentId}.`,
-          `Correlation: ${correlationId}.`,
-        ].join('\n'),
-      },
-      { role: 'user', content: prompt },
-    ], { temperature: 0.2 })) {
-      if (chunk.content) chunks.push(chunk.content);
-      if (chunk.usage) providerUsage = chunk.usage;
+    try {
+      for await (const chunk of ctx.llm.stream([
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: prompt },
+      ], { temperature: 0.2, maxTokens: maxCompletionTokens })) {
+        if (chunk.content) chunks.push(chunk.content);
+        if (chunk.usage) providerUsage = chunk.usage;
+      }
+    } catch (error) {
+      this.releaseTeamSynthesisBudget(team.identity.id, allocation, correlationId, 'team_synthesis_failed');
+      throw error;
     }
     const content = chunks.join('');
     const usage = this.toTokenUsage({
       llmCalls: 1,
-      promptTokens: providerUsage?.promptTokens ?? this.estimateTextTokens(prompt),
+      promptTokens: providerUsage?.promptTokens ?? estimatedPromptTokens,
       completionTokens: providerUsage?.completionTokens ?? this.estimateTextTokens(content),
       totalTokens: providerUsage?.totalTokens
-        ?? this.estimateTextTokens(prompt) + this.estimateTextTokens(content),
+        ?? estimatedPromptTokens + this.estimateTextTokens(content),
     });
+    this.settleTeamSynthesisBudget(team.identity.id, allocation, usage.totalTokens, correlationId);
     this.recordTurnUsage(usage);
     this.emit({
       type: 'budget.updated',
@@ -5641,6 +5932,35 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
       agent,
       children: this.getChildren(agent.identity.id).map(child => this.buildAgentTree(child)),
     };
+  }
+
+  private buildRuntimeAgentActorTree(agent: AgentInfo, visited: Set<string>): RuntimeAgentActorNode {
+    const key = `agent:${agent.identity.id}`;
+    if (visited.has(key)) return { type: 'agent', agent, children: [] };
+    const nextVisited = new Set(visited).add(key);
+    const teamChildren = this.teams.list()
+      .filter(team => team.identity.parentAgentId === agent.identity.id)
+      .map(team => this.buildRuntimeTeamActorTree(team, nextVisited));
+    const agentChildren = this.getChildren(agent.identity.id)
+      .filter(child => !child.identity.teamId)
+      .map(child => this.buildRuntimeAgentActorTree(child, nextVisited));
+    return {
+      type: 'agent',
+      agent,
+      children: [...teamChildren, ...agentChildren],
+    };
+  }
+
+  private buildRuntimeTeamActorTree(team: TeamRuntimeState, visited: Set<string>): RuntimeTeamActorNode {
+    const key = `team:${team.identity.id}`;
+    if (visited.has(key)) return { type: 'team', team, children: [] };
+    const nextVisited = new Set(visited).add(key);
+    const ctx = this.getContext();
+    const children = team.memberAgentIds
+      .map(agentId => ctx.manager.getAgentById(agentId)?.getInfo())
+      .filter((agent): agent is AgentInfo => Boolean(agent))
+      .map(agent => this.buildRuntimeAgentActorTree(agent, nextVisited));
+    return { type: 'team', team, children };
   }
 
   private createAgentId(archetype: SubAgentArchetype, sequence: number): string {

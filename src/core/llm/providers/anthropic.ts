@@ -9,7 +9,6 @@ import type {
   LLMStreamChunk,
   ProviderConfig,
 } from '../types.js';
-import { logger } from '../../utils/logger.js';
 
 export class AnthropicProvider implements LLMProvider {
   readonly name = 'anthropic';
@@ -93,13 +92,11 @@ export class AnthropicProvider implements LLMProvider {
       })),
     });
 
-    let fullContent = '';
     let totalUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
 
     for await (const event of stream) {
       if (event.type === 'content_block_delta') {
         if (event.delta.type === 'text_delta') {
-          fullContent += event.delta.text;
           yield {
             content: event.delta.text,
             done: false,

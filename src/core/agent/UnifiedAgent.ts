@@ -1,8 +1,7 @@
 // UnifiedAgent - Full-featured agent that integrates FSM, Actions, Tools, Prompts, Memory
 
-import type { LLMProvider, LLMMessage } from '../llm/types.js';
+import type { LLMMessage } from '../llm/types.js';
 import { BaseAgent, type AgentConfig } from './BaseAgent.js';
-import { FSM, FSMState } from '../executor/FSM.js';
 import type { Plan, Planner } from '../actions/Planner.js';
 import { actionRegistry } from '../actions/index.js';
 import { toolRegistry } from '../tools/index.js';

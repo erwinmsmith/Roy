@@ -1,10 +1,8 @@
 // Action Agent - Agent that decides and executes actions using Planner
 
-import type { LLMProvider, LLMMessage } from '../llm/types.js';
-import type { MessageQueue } from '../message/MessageQueue.js';
-import type { FSM } from '../executor/FSM.js';
+import type { LLMMessage } from '../llm/types.js';
 import { BaseAgent, type AgentConfig } from './BaseAgent.js';
-import type { Plan, Planner } from '../actions/Planner.js';
+import type { Planner } from '../actions/Planner.js';
 import { actionRegistry } from '../actions/index.js';
 import { logger } from '../utils/logger.js';
 

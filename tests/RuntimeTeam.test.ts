@@ -181,6 +181,17 @@ describe('Phase 3 subteam runtime', () => {
     expect((await runtime.getMessages()).map(message => message.kind)).toContain('team.create.rejected');
     expect(runtime.getEvents().map(event => event.type)).toContain('team.create.rejected');
 
+    await expect(runtime.spawnTeam({
+      name: 'InvalidBindingTeam',
+      description: 'Reject malformed runtime input.',
+      members: [{ archetype: 'researcher', task: 'Inspect.', tools: 'fs.read' as unknown as string[] }],
+    })).rejects.toThrow('Team member tools must be an array');
+    await expect(runtime.spawnTeam({
+      name: 'InvalidToMTeam',
+      description: 'Reject malformed ToM input.',
+      tomLevel: 4,
+    })).rejects.toThrow('Team tomLevel must be an integer from 0 to 3');
+
     await runtime.shutdown();
   });
 
@@ -220,6 +231,81 @@ describe('Phase 3 subteam runtime', () => {
     const result = await runtime.runTeam(team.identity.id, 'Inspect and summarize the project.');
     expect(result.team.memberAgentIds).toHaveLength(1);
     expect(result.team.status).toBe('done');
+    await runtime.shutdown();
+  });
+
+  it('keeps a completed run successful when non-critical team persistence fails', async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), 'roy-phase3-team-persistence-'));
+    const runtime = new Runtime();
+    await runtime.initialize({ sessionId: 'phase3-team-persistence', workspaceCwd: cwd, llmProvider: new TeamTestLLM() });
+    const memory = (runtime as unknown as { ctx: { memory: { appendTeamSession: () => Promise<void> } } }).ctx.memory;
+    memory.appendTeamSession = async () => {
+      throw new Error('simulated session storage failure');
+    };
+
+    const team = await runtime.spawnTeam({
+      name: 'ResilientTeam',
+      description: 'Validate that persistence failures do not rewrite execution state.',
+      members: [{ archetype: 'summarizer', task: 'Summarize the bounded input.' }],
+    });
+    const result = await runtime.runTeam(team.identity.id, 'Summarize the bounded input.');
+
+    expect(result.team.status).toBe('done');
+    expect(runtime.getEvents().find(event => event.type === 'team.persistence.failed')?.data?.operation)
+      .toBe('append_team_session');
+    expect(runtime.getEvents().map(event => event.type)).toContain('team.completed');
+    expect(runtime.getEvents().map(event => event.type)).not.toContain('team.failed');
+    await runtime.shutdown();
+  });
+
+  it('rejects team synthesis when the remaining token budget cannot cover its prompt', async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), 'roy-phase3-team-budget-'));
+    const runtime = new Runtime();
+    await runtime.initialize({ sessionId: 'phase3-team-budget', workspaceCwd: cwd, llmProvider: new TeamTestLLM() });
+    (runtime as unknown as { workspaceRuntimeConfig: { budgetMarket: { minimumGrantTokens: number } } })
+      .workspaceRuntimeConfig.budgetMarket.minimumGrantTokens = 1;
+    const team = await runtime.spawnTeam({
+      name: 'BudgetedTeam',
+      description: 'Validate synthesis budget enforcement.',
+      members: [{ archetype: 'summarizer', task: 'Summarize the bounded input.', budgetTokens: 40 }],
+    });
+    await runtime.runTeam(team.identity.id, 'Create the initial bounded summary.');
+    runtime.setBudget(150);
+    await expect(runtime.runTeam(team.identity.id, 'Summarize the bounded input again.'))
+      .rejects.toThrow('Team synthesis rejected: insufficient_remaining_budget');
+
+    expect(runtime.getTeamState(team.identity.id)?.status).toBe('failed');
+    const denial = runtime.getEvents().find(event => event.type === 'budget.denied' && event.agentId === team.identity.id);
+    expect(denial?.data?.teamId).toBe(team.identity.id);
+    expect(runtime.getBudgetMarketState().reservedTokens).toBe(0);
+    await runtime.shutdown();
+  });
+
+  it('builds a mixed actor hierarchy with a subagent-owned team under its parent', async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), 'roy-phase3-team-tree-'));
+    const runtime = new Runtime();
+    await runtime.initialize({ sessionId: 'phase3-team-tree', workspaceCwd: cwd, llmProvider: new TeamTestLLM() });
+    const delegated = await runtime.handleSpawnCommand({
+      archetype: 'researcher',
+      task: 'Inspect a bounded architecture question.',
+      requireRootSynthesis: true,
+    });
+    await (runtime as unknown as {
+      prepareParentForDelegation: (parentId: string, correlationId: string, task: string) => Promise<void>;
+    }).prepareParentForDelegation(delegated.agent.identity.id, 'nested-team-correlation', 'Create a review team.');
+    const team = await runtime.spawnTeam({
+      parentAgentId: delegated.agent.identity.id,
+      name: 'NestedReviewTeam',
+      description: 'Review the researcher result.',
+    });
+
+    const hierarchy = runtime.getTeamActorTree().hierarchy;
+    const researcherNode = hierarchy.children.find(node => node.type === 'agent' && node.agent.identity.id === delegated.agent.identity.id);
+    expect(researcherNode?.type).toBe('agent');
+    const nestedTeam = researcherNode?.type === 'agent'
+      ? researcherNode.children.find(node => node.type === 'team' && node.team.identity.id === team.identity.id)
+      : undefined;
+    expect(nestedTeam?.type).toBe('team');
     await runtime.shutdown();
   });
 });

@@ -3,10 +3,13 @@
 import 'dotenv/config';
 import express from 'express';
 import { createServer } from 'http';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { Server } from 'socket.io';
 import { bootstrap, cleanup, type BootstrapContext } from '../bootstrap.js';
-import { runtime } from '../core/runtime/Runtime.js';
+import { runtime as defaultRuntime } from '../core/runtime/Runtime.js';
+import type Runtime from '../core/runtime/Runtime.js';
 import { logger } from '../core/utils/logger.js';
+import { RuntimeSessionPool } from './RuntimeSessionPool.js';
 
 // ASCII Banner - compatible with all terminals
 const SERVER_BANNER = `
@@ -53,15 +56,18 @@ function dim(text: string): string {
 function tryListen(server: ReturnType<typeof createServer>, port: number, retries = 3): Promise<number> {
   return new Promise((resolve, reject) => {
     const attempt = (currentPort: number, remainingRetries: number) => {
-      server.listen(currentPort, () => {
-        resolve(currentPort);
-      }).on('error', (err: NodeJS.ErrnoException) => {
+      const onError = (err: NodeJS.ErrnoException) => {
         if (err.code === 'EADDRINUSE' && remainingRetries > 0) {
           logger.warn(`Port ${currentPort} in use, trying ${currentPort + 1}...`);
           attempt(currentPort + 1, remainingRetries - 1);
         } else {
           reject(err);
         }
+      };
+      server.once('error', onError);
+      server.listen(currentPort, () => {
+        server.off('error', onError);
+        resolve(currentPort);
       });
     };
     attempt(port, retries);
@@ -88,10 +94,37 @@ async function main(): Promise<void> {
   }
 
   const PORT = ctx.config.server?.port ?? 3000;
+  const runtimeStorage = new AsyncLocalStorage<Runtime>();
+  const runtimePool = new RuntimeSessionPool({
+    defaultSessionId: ctx.sessionId,
+    defaultRuntime,
+    defaultContext: ctx,
+    workspaceCwd: process.cwd(),
+  });
+  const runtime = new Proxy(defaultRuntime, {
+    get(target, property) {
+      const selected = runtimeStorage.getStore() ?? target;
+      const value = Reflect.get(selected, property, selected) as unknown;
+      return typeof value === 'function' ? value.bind(selected) : value;
+    },
+  });
 
   const app = express();
   const httpServer = createServer(app);
   app.use(express.json());
+  app.use('/v1', async (req, res, next) => {
+    const requestedSessionId = req.header('x-roy-session-id')
+      ?? (typeof req.query.runtimeSessionId === 'string' ? req.query.runtimeSessionId : undefined)
+      ?? req.body?.runtimeSessionId;
+    try {
+      const sessionId = runtimePool.normalizeSessionId(requestedSessionId);
+      const selected = await runtimePool.get(sessionId);
+      res.setHeader('X-Roy-Session-Id', sessionId);
+      runtimeStorage.run(selected, next);
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
 
   // Socket.IO connection handling
   const io = new Server(httpServer, {
@@ -102,11 +135,8 @@ async function main(): Promise<void> {
   });
 
   io.on('connection', (socket) => {
-    const sid = socket.id;
+    const sid = `socket-${socket.id.replace(/[^A-Za-z0-9._-]/g, '_')}`;
     logger.info(`Client connected: ${sid}`);
-
-    // Create session for this socket
-    ctx.manager.createSession(sid);
 
     socket.on('user_message', async (message: string) => {
       logger.info(`Received message from ${sid}: ${message.substring(0, 100)}...`);
@@ -114,12 +144,8 @@ async function main(): Promise<void> {
       socket.emit('bot_response_start', 'Bot: Processing your request...');
 
       try {
-        const session = ctx.manager.getSession(sid);
-        if (!session) {
-          throw new Error(`Session ${sid} not found`);
-        }
-
-        const result = await runtime.handleUserTurn(message);
+        const selected = await runtimePool.get(sid);
+        const result = await runtimeStorage.run(selected, () => runtime.handleUserTurn(message));
         socket.emit('bot_response_stream', result.finalResponse);
       } catch (error) {
         logger.error(`Error processing message:`, error);
@@ -129,7 +155,7 @@ async function main(): Promise<void> {
 
     socket.on('disconnect', async () => {
       logger.info(`Client disconnected: ${sid}`);
-      await ctx.manager.closeSession(sid);
+      await runtimePool.close(sid);
     });
   });
 
@@ -159,6 +185,17 @@ async function main(): Promise<void> {
 
   app.get('/v1/status', (req, res) => {
     res.json(runtime.getState());
+  });
+
+  app.delete('/v1/runtime/session', async (req, res) => {
+    const sessionId = req.header('x-roy-session-id') ?? req.body?.runtimeSessionId;
+    try {
+      const normalized = runtimePool.normalizeSessionId(sessionId);
+      const closed = await runtimePool.close(normalized);
+      res.status(closed ? 200 : 400).json({ closed, sessionId: normalized });
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
   });
 
   app.post('/v1/chat', async (req, res) => {
@@ -503,12 +540,15 @@ async function main(): Promise<void> {
       logger.error('Failed to start server:', err);
       console.error(red('[ERROR] Failed to start server:') + ' ' + err.message);
       process.exit(1);
-    });
+  });
 
   // Graceful shutdown
+  let shuttingDown = false;
   const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     console.log(yellow('\nShutting down...'));
-    await cleanup(ctx);
+    await Promise.allSettled([runtimePool.shutdown(), cleanup(ctx)]);
     io.close();
     httpServer.close(() => {
       console.log(green('[OK] Server closed'));

@@ -7,17 +7,6 @@ import type {
 } from './types.js';
 import type { TokenUsage } from '../runtime/Runtime.js';
 
-const TEAM_TRANSITIONS: Record<TeamState, TeamState[]> = {
-  created: ['ready', 'failed', 'cancelled'],
-  ready: ['running', 'failed', 'cancelled'],
-  running: ['waiting', 'synthesizing', 'failed', 'cancelled'],
-  waiting: ['synthesizing', 'failed', 'cancelled'],
-  synthesizing: ['done', 'failed', 'cancelled'],
-  done: [],
-  failed: [],
-  cancelled: [],
-};
-
 const TEAM_FSM_TRANSITIONS: Record<TeamFSMState, TeamFSMState[]> = {
   S_team_created: ['S_team_plan', 'S_team_failed'],
   S_team_plan: ['S_member_spawn', 'S_member_execute', 'S_team_failed'],
@@ -38,7 +27,7 @@ const ZERO_USAGE: TokenUsage = {
 };
 
 export class InvalidTeamTransitionError extends Error {
-  constructor(readonly from: TeamState | TeamFSMState, readonly to: TeamState | TeamFSMState) {
+  constructor(readonly from: TeamFSMState, readonly to: TeamFSMState) {
     super(`Invalid team transition: ${from} -> ${to}`);
     this.name = 'InvalidTeamTransitionError';
   }
@@ -133,30 +122,6 @@ export class TeamRegistry {
     team.status = this.statusFor(next);
     team.state = this.legacyStateFor(next);
     team.error = error;
-    team.updatedAt = Date.now();
-    return this.clone(team);
-  }
-
-  transition(teamId: string, state: TeamState, error?: string): TeamRuntimeState {
-    const team = this.require(teamId);
-    if (team.state !== state && !TEAM_TRANSITIONS[team.state].includes(state)) {
-      throw new InvalidTeamTransitionError(team.state, state);
-    }
-    team.state = state;
-    team.status = state === 'done' ? 'done'
-      : state === 'failed' || state === 'cancelled' ? 'failed'
-        : state === 'waiting' ? 'waiting'
-          : state === 'synthesizing' ? 'synthesizing'
-            : state === 'running' ? 'running' : 'idle';
-    team.error = error;
-    team.updatedAt = Date.now();
-    return this.clone(team);
-  }
-
-  recordUsage(teamId: string, totalTokens: number): TeamRuntimeState {
-    const usage = { ...ZERO_USAGE, totalTokens: Math.max(0, totalTokens) };
-    const team = this.require(teamId);
-    team.tokenUsage = this.addUsage(team.tokenUsage, usage);
     team.updatedAt = Date.now();
     return this.clone(team);
   }
