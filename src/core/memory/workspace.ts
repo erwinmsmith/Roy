@@ -124,6 +124,9 @@ export interface AgentMemoryBundle {
 
 export interface AgentPatternInput {
   key: string;
+  patternId?: string;
+  basePatternId?: string;
+  status?: 'candidate' | 'active' | 'candidate_failed' | 'deprecated';
   name: string;
   archetype: string;
   tomLevel: number;
@@ -1005,9 +1008,11 @@ Keep this agent identity separate from the model provider identity.
     const file = await this.readJson<{ patterns?: Array<Record<string, unknown>> }>(cachePath, { patterns: [] });
     const patterns = file.patterns ?? [];
     const now = new Date().toISOString();
-    const existing = patterns.find(pattern => pattern.key === key || pattern.id === `agent_pattern_${key}` || pattern.id === `agent_pattern_${key}_v1`);
+    const canonicalId = `agent_pattern_${key}_v1`;
+    const patternId = input.patternId ?? canonicalId;
+    const existing = patterns.find(pattern => pattern.id === patternId);
     const pattern = {
-      id: `agent_pattern_${key}_v1`,
+      id: patternId,
       key,
       name: input.name,
       archetype: input.archetype,
@@ -1024,6 +1029,8 @@ Keep this agent identity separate from the model provider identity.
       definitionFingerprint: input.definitionFingerprint,
       creationMode: existing?.creationMode ?? input.creationMode,
       lastCreationMode: input.creationMode,
+      basePatternId: input.basePatternId,
+      status: input.status ?? existing?.status ?? 'candidate',
       usage: {
         count: Number((existing?.usage as Record<string, unknown> | undefined)?.count ?? 0) + 1,
         lastUsedAt: now,
@@ -1042,15 +1049,28 @@ Keep this agent identity separate from the model provider identity.
   async findAgentPattern(archetype: string): Promise<Record<string, unknown> | undefined> {
     const key = this.safeKey(archetype);
     const patterns = await this.readPatterns('agent-patterns.json') as Array<Record<string, unknown>>;
-    return patterns.find(pattern => pattern.key === key || pattern.archetype === key);
+    return patterns.find(pattern => pattern.id === `agent_pattern_${key}_v1`)
+      ?? patterns.find(pattern => (pattern.key === key || pattern.archetype === key) && !pattern.basePatternId);
   }
 
-  async recordAgentPatternOutcome(archetype: string, outcome: { success: boolean; grounded: boolean; totalTokens: number }): Promise<void> {
+  async findAgentPatternById(patternId: string): Promise<Record<string, unknown> | undefined> {
+    const patterns = await this.readPatterns('agent-patterns.json') as Array<Record<string, unknown>>;
+    return patterns.find(pattern => pattern.id === patternId);
+  }
+
+  async recordAgentPatternOutcome(
+    archetype: string,
+    outcome: { success: boolean; grounded: boolean; totalTokens: number },
+    patternId?: string
+  ): Promise<void> {
     const key = this.safeKey(archetype);
     const cachePath = path.join(this.rootPath, 'cache', 'agent-patterns.json');
     const file = await this.readJson<{ patterns?: Array<Record<string, unknown>> }>(cachePath, { patterns: [] });
     const patterns = file.patterns ?? [];
-    const pattern = patterns.find(item => item.key === key || item.archetype === key);
+    const pattern = patternId
+      ? patterns.find(item => item.id === patternId)
+      : patterns.find(item => item.id === `agent_pattern_${key}_v1`)
+        ?? patterns.find(item => (item.key === key || item.archetype === key) && !item.basePatternId);
     if (!pattern) return;
     const evaluation = (pattern.evaluation as Record<string, unknown> | undefined) ?? {};
     const runs = Number(evaluation.runs ?? 0) + 1;

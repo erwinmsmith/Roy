@@ -25,6 +25,9 @@ export interface UnifiedAgentConfig extends AgentConfig {
   mode?: AgentMode;
   planner?: Planner;
   useContextManager?: boolean;
+  allowedActions?: string[];
+  allowedTools?: string[];
+  allowedSkills?: string[];
 }
 
 export class UnifiedAgent extends BaseAgent {
@@ -32,6 +35,9 @@ export class UnifiedAgent extends BaseAgent {
   private planner?: Planner;
   private useContextManager: boolean;
   private sessionId: string = '';
+  private allowedActions?: Set<string>;
+  private allowedTools?: Set<string>;
+  private allowedSkills?: Set<string>;
 
   constructor(config: UnifiedAgentConfig) {
     super({
@@ -52,6 +58,9 @@ export class UnifiedAgent extends BaseAgent {
     this.mode = config.mode ?? 'hybrid';
     this.planner = config.planner;
     this.useContextManager = config.useContextManager ?? true;
+    this.allowedActions = config.allowedActions ? new Set(config.allowedActions) : undefined;
+    this.allowedTools = config.allowedTools ? new Set(config.allowedTools) : undefined;
+    this.allowedSkills = config.allowedSkills ? new Set(config.allowedSkills) : undefined;
   }
 
   /**
@@ -389,14 +398,23 @@ Tool-use policy:
     params: Record<string, unknown>
   ): Promise<{ success: boolean; result?: unknown; error?: string; metadata?: Record<string, unknown> }> {
     if (actionRegistry.has(name)) {
+      if (this.allowedActions && !this.allowedActions.has(name)) {
+        return { success: false, error: `Action "${name}" is not authorized for agent "${this.id}"` };
+      }
       return actionRegistry.execute(name, params);
     }
 
     if (toolRegistry.has(name)) {
+      if (this.allowedTools && !this.allowedTools.has(name)) {
+        return { success: false, error: `Tool "${name}" is not authorized for agent "${this.id}"` };
+      }
       return toolRegistry.execute(name, params);
     }
 
     if (skillRegistry.has(name)) {
+      if (this.allowedSkills && !this.allowedSkills.has(name)) {
+        return { success: false, error: `Skill "${name}" is not authorized for agent "${this.id}"` };
+      }
       const validation = skillRegistry.get(name)?.validate?.({ action: name, params });
       if (validation && !validation.valid) {
         return {
@@ -409,7 +427,7 @@ Tool-use policy:
         name,
         { action: name, params },
         {
-          agentId: this.name,
+          agentId: this.id,
           sessionId: this.sessionId,
           variables: {
             mode: this.mode,
@@ -430,9 +448,9 @@ Tool-use policy:
    */
   private getCapabilityNames(): string[] {
     return [
-      ...actionRegistry.keys(),
-      ...toolRegistry.keys(),
-      ...skillRegistry.keys(),
+      ...actionRegistry.keys().filter(name => !this.allowedActions || this.allowedActions.has(name)),
+      ...toolRegistry.keys().filter(name => !this.allowedTools || this.allowedTools.has(name)),
+      ...skillRegistry.keys().filter(name => !this.allowedSkills || this.allowedSkills.has(name)),
     ];
   }
 
@@ -442,12 +460,14 @@ Tool-use policy:
   private formatCapabilitiesForPrompt(): string {
     const lines: string[] = [];
 
-    const actions = actionRegistry.formatActionsForPrompt();
-    if (actions) {
-      lines.push('Actions:', actions);
+    const actions = actionRegistry.list()
+      .filter(action => !this.allowedActions || this.allowedActions.has(action.name));
+    if (actions.length > 0) {
+      lines.push('Actions:', ...actions.map(action => `- ${action.name}: ${action.description || 'No description'}`));
     }
 
-    const tools = toolRegistry.list();
+    const tools = toolRegistry.list()
+      .filter(tool => !this.allowedTools || this.allowedTools.has(tool.name));
     if (tools.length > 0) {
       lines.push(
         'Tools:',
@@ -455,7 +475,8 @@ Tool-use policy:
       );
     }
 
-    const skills = skillRegistry.listManifests();
+    const skills = skillRegistry.listManifests()
+      .filter(skill => !this.allowedSkills || this.allowedSkills.has(skill.name));
     if (skills.length > 0) {
       lines.push(
         'Skills:',

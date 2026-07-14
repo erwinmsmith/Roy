@@ -93,9 +93,12 @@ export interface AgentComputeNodeDefinition {
   reuse: {
     mode: AgentNodeReuseMode;
     creationMode: AgentNodeCreationMode;
+    definitionOverrides: boolean;
     cacheHits: string[];
     agentPatternId?: string;
+    basePatternId?: string;
     delegationPatternId?: string;
+    targetPatternId: string;
   };
   source: string;
 }

@@ -17,11 +17,15 @@ class SkillRegistry {
   private skills: Map<string, Skill> = new Map();
   private manifests: Map<string, SkillManifest> = new Map();
   private installers: Map<string, SkillInstaller> = new Map();
+  private systemSkills: Set<string> = new Set();
 
   /**
    * Register a skill
    */
   register(skill: Skill): void {
+    if (this.systemSkills.has(skill.name)) {
+      throw new Error(`System skill "${skill.name}" cannot be overwritten by an extension`);
+    }
     if (this.skills.has(skill.name)) {
       logger.warn(`Skill "${skill.name}" already registered, overwriting`);
     }
@@ -32,9 +36,23 @@ class SkillRegistry {
   }
 
   /**
+   * Register or rebind a runtime-owned system skill.
+   */
+  registerSystem(skill: Skill): void {
+    const manifest = skill.getManifest();
+    if (manifest.scope !== 'system') {
+      throw new Error(`System skill "${skill.name}" must declare scope=system`);
+    }
+    this.skills.set(skill.name, skill);
+    this.manifests.set(skill.name, manifest);
+    this.systemSkills.add(skill.name);
+  }
+
+  /**
    * Unregister a skill
    */
   unregister(name: string): boolean {
+    if (this.systemSkills.has(name)) return false;
     this.manifests.delete(name);
     return this.skills.delete(name);
   }
@@ -172,8 +190,11 @@ class SkillRegistry {
    * Clear all skills
    */
   clear(): void {
-    this.skills.clear();
-    this.manifests.clear();
+    for (const name of this.skills.keys()) {
+      if (this.systemSkills.has(name)) continue;
+      this.skills.delete(name);
+      this.manifests.delete(name);
+    }
   }
 
   /**

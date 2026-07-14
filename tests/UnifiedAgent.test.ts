@@ -71,6 +71,14 @@ class EchoSkill implements Skill {
   async initialize(_config: SkillConfig): Promise<void> {}
 }
 
+class ContextIdentitySkill extends EchoSkill {
+  override readonly name = 'context-identity-skill';
+
+  override async execute(_input: SkillInput, context: SkillContext): Promise<SkillOutput> {
+    return { success: true, result: context.agentId };
+  }
+}
+
 describe('UnifiedAgent capability execution', () => {
   beforeEach(() => {
     actionRegistry.clear();
@@ -116,5 +124,44 @@ describe('UnifiedAgent capability execution', () => {
     const output = await queue.receive('env');
     expect(output?.content).toBe('skill:hello');
     expect(output?.metadata?.done).toBe(true);
+  });
+
+  it('passes the stable agent id to system skills instead of the display name', async () => {
+    skillRegistry.register(new ContextIdentitySkill());
+
+    const agent = new UnifiedAgent({
+      id: 'agent_researcher_001',
+      name: 'Researcher-1',
+      goal: 'test',
+      llm: new PlanningLLM('context-identity-skill'),
+      mode: 'action',
+      allowedSkills: ['context-identity-skill'],
+    });
+    const queue = new MessageQueue(['env', 'Researcher-1']);
+    agent.setMessageQueue(queue);
+    await agent.initialize('session');
+
+    await agent.step('delegate a child task');
+
+    expect((await queue.receive('env'))?.content).toBe('agent_researcher_001');
+  });
+
+  it('rejects globally registered skills that were not authorized for the agent', async () => {
+    skillRegistry.register(new EchoSkill());
+    const agent = new UnifiedAgent({
+      id: 'agent_restricted_001',
+      name: 'Restricted-1',
+      goal: 'test',
+      llm: new PlanningLLM('echo-skill'),
+      mode: 'action',
+      allowedSkills: [],
+    });
+    const queue = new MessageQueue(['env', 'Restricted-1']);
+    agent.setMessageQueue(queue);
+    await agent.initialize('session');
+
+    await agent.step('attempt an unauthorized skill');
+
+    expect((await queue.receive('env'))?.content).toContain('is not authorized');
   });
 });

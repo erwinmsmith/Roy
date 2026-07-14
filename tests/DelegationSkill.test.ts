@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Runtime from '../src/core/runtime/Runtime.js';
 import { skillRegistry } from '../src/core/skills/index.js';
+import { DelegateToSubagentSkill } from '../src/core/skills/delegation.js';
 import type { LLMCompletionOptions, LLMCompletionResult, LLMMessage, LLMProvider, LLMStreamChunk } from '../src/core/llm/types.js';
 
 class DelegationLLM implements LLMProvider {
@@ -38,6 +39,12 @@ class DelegationLLM implements LLMProvider {
   }
 }
 
+class FailingDelegationLLM extends DelegationLLM {
+  override async *stream(): AsyncGenerator<LLMStreamChunk, void, unknown> {
+    throw new Error('simulated_llm_failure');
+  }
+}
+
 describe('delegate_to_subagent skill', () => {
   it('is registered as a system skill with agent creation permissions', async () => {
     const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-delegation-manifest-'));
@@ -52,6 +59,10 @@ describe('delegate_to_subagent skill', () => {
     const manifest = skillRegistry.getManifest('delegate_to_subagent');
     expect(manifest?.scope).toBe('system');
     expect(manifest?.permissions).toEqual(['agent.create', 'agent.delegate']);
+    expect(skillRegistry.unregister('delegate_to_subagent')).toBe(false);
+    expect(skillRegistry.has('delegate_to_subagent')).toBe(true);
+    expect(() => skillRegistry.register(new DelegateToSubagentSkill(runtime)))
+      .toThrow('cannot be overwritten by an extension');
 
     await runtime.shutdown();
   });
@@ -171,6 +182,7 @@ describe('delegate_to_subagent skill', () => {
     expect(wrongSession.success).toBe(false);
     expect(wrongSession.error).toContain('session mismatch');
 
+    const failedCorrelationId = 'del_require_cache_failure';
     await expect(runtime.createAgentComputeNode({
       archetype: 'researcher',
       task: 'Inspect the project',
@@ -179,7 +191,9 @@ describe('delegate_to_subagent skill', () => {
       agentId: 'root',
       sessionId: 'delegation-boundary-test',
       source: 'test',
-    })).rejects.toThrow('requires a cached pattern');
+    }, failedCorrelationId)).rejects.toThrow('requires a cached pattern');
+    expect(runtime.getEvents().find(event => event.type === 'agent.node.resolve.failed'
+      && event.correlationId === failedCorrelationId)?.data?.error).toContain('requires a cached pattern');
 
     await expect(runtime.createAgentComputeNode({
       archetype: 'custom',
@@ -231,9 +245,122 @@ describe('delegate_to_subagent skill', () => {
     expect(mutated.node.definitionFingerprint).not.toBe(second.node.definitionFingerprint);
     expect(mutated.creationUsage.definitionTokens).toBeGreaterThan(0);
 
+    const cacheAfterMutation = JSON.parse(await readFile(path.join(workspaceCwd, '.roy', 'cache', 'agent-patterns.json'), 'utf8'));
+    const canonicalAfterMutation = cacheAfterMutation.patterns.find((item: any) => item.id === 'agent_pattern_researcher_v1');
+    const mutationPattern = cacheAfterMutation.patterns.find((item: any) => item.id === mutated.node.reuse.targetPatternId);
+    expect(canonicalAfterMutation.tools).toEqual(['fs.list', 'fs.read']);
+    expect(canonicalAfterMutation.definitionFingerprint).toBe(second.node.definitionFingerprint);
+    expect(mutationPattern.basePatternId).toBe('agent_pattern_researcher_v1');
+    expect(mutationPattern.tools).toEqual(['fs.read']);
+    expect(mutationPattern.status).toBe('candidate');
+    expect(mutationPattern.evaluation.runs).toBe(1);
+
     const fresh = (await execute('Inspect another project area', 'fresh')).result as Record<string, any>;
     expect(fresh.node.reuse.creationMode).toBe('generated');
     expect(fresh.node.reuse.cacheHits).toEqual([]);
+
+    await runtime.shutdown();
+  });
+
+  it('scopes repeated-correlation executions to the current compute node', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-delegation-event-scope-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'delegation-event-scope-test',
+      workspaceCwd,
+      fsmEnabled: false,
+      llmProvider: new DelegationLLM(),
+    });
+    const invocation = { agentId: 'root', sessionId: 'delegation-event-scope-test', source: 'test' };
+    const correlationId = 'del_shared_correlation';
+    const first = await runtime.createAgentComputeNode({
+      archetype: 'researcher',
+      task: 'Inspect the project structure',
+    }, invocation, correlationId);
+    const second = await runtime.createAgentComputeNode({
+      archetype: 'researcher',
+      task: 'Inspect the project structure again',
+    }, invocation, correlationId);
+
+    expect(first.delegation.agent.identity.id).not.toBe(second.delegation.agent.identity.id);
+    expect(second.events.filter(event => event.type === 'agent.spawned').map(event => event.agentId))
+      .toEqual([second.delegation.agent.identity.id]);
+    expect(second.events.some(event => event.agentId === first.delegation.agent.identity.id)).toBe(false);
+
+    await runtime.shutdown();
+  });
+
+  it('constrains child memory and spawn policy to parent and workspace limits', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-delegation-policy-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'delegation-policy-test',
+      workspaceCwd,
+      fsmEnabled: false,
+      llmProvider: new DelegationLLM(),
+    });
+    const invocation = { agentId: 'root', sessionId: 'delegation-policy-test', source: 'test' };
+    const execution = await runtime.createAgentComputeNode({
+      archetype: 'researcher',
+      task: 'Inspect the project structure',
+      memoryScope: { public: true, private: true, parentContext: true, sessionWindowTurns: 999 },
+      spawnPolicy: {
+        canSpawn: true,
+        maxChildren: 999,
+        maxDepth: 99,
+        maxTotalAgentsPerTurn: 999,
+        allowCustomAgents: true,
+        budgetAware: false,
+        allowedStates: ['S_planning', 'S_delegating'],
+      },
+    }, invocation);
+
+    expect(execution.node.context.memoryScope.sessionWindowTurns).toBe(10);
+    expect(execution.node.governance.spawnPolicy).toMatchObject({
+      maxChildren: 5,
+      maxDepth: 3,
+      maxTotalAgentsPerTurn: 10,
+      budgetAware: true,
+      allowedStates: ['S_planning', 'S_delegating'],
+    });
+
+    await expect(runtime.createAgentComputeNode({
+      archetype: 'researcher',
+      task: 'Use an invalid child state',
+      spawnPolicy: { allowedStates: ['S_done'] },
+    }, invocation)).rejects.toThrow('allowedStates may only contain');
+
+    await runtime.shutdown();
+  });
+
+  it('fails the task message and releases reserved budget when execution fails', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-delegation-failure-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'delegation-failure-test',
+      workspaceCwd,
+      fsmEnabled: false,
+      llmProvider: new FailingDelegationLLM(),
+    });
+    runtime.setBudget(5000);
+    const correlationId = 'del_execution_failure';
+
+    await expect(runtime.createAgentComputeNode({
+      archetype: 'researcher',
+      task: 'Inspect the project structure',
+      execution: { disableRecursiveDelegation: true },
+    }, {
+      agentId: 'root',
+      sessionId: 'delegation-failure-test',
+      source: 'test',
+    }, correlationId)).rejects.toThrow('simulated_llm_failure');
+
+    const messages = await runtime.getMessages({ correlationId });
+    expect(messages.find(message => message.kind === 'agent.task')?.status).toBe('failed');
+    expect(runtime.getBudgetMarketState().reservedTokens).toBe(0);
+    expect(runtime.getBudgetMarketState().allocations.some(allocation => allocation.status === 'released')).toBe(true);
+    expect(runtime.getEvents().some(event => event.type === 'agent.task.failed' && event.correlationId === correlationId)).toBe(true);
+    expect(runtime.getEvents().some(event => event.type === 'agent.node.execution.failed' && event.correlationId === correlationId)).toBe(true);
 
     await runtime.shutdown();
   });

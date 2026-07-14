@@ -51,6 +51,7 @@ export interface RuntimeMessage<TPayload = unknown> {
   error?: string;
   metadata?: {
     agentId?: string;
+    nodeId?: string;
     teamId?: string;
     tomLevel?: number;
     budgetTokens?: number;
