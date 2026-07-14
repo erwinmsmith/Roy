@@ -515,7 +515,9 @@ describe('Runtime controlled subagent spawning', () => {
 
     const messages = await runtime.getMessages({ correlationId: 'del_multi_child_test' });
     expect(messages.filter(message => message.kind === 'agent.task')).toHaveLength(2);
-    expect(messages.filter(message => message.kind === 'agent.result' && message.to === researcher.identity.id)).toHaveLength(2);
+    const team = runtime.getTeams()[0];
+    expect(messages.filter(message => message.kind === 'agent.result' && message.to === team.identity.id)).toHaveLength(2);
+    expect(messages.filter(message => message.kind === 'team.result' && message.to === researcher.identity.id)).toHaveLength(1);
     expect(messages.filter(message => message.kind === 'agent.synthesis')).toHaveLength(1);
 
     const synthesisEvent = runtime.getEvents().find(event => event.type === 'agent.synthesis.completed' && event.agentId === researcher.identity.id);

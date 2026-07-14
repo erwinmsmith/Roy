@@ -15,6 +15,7 @@ export type MessageKind =
   | 'team.result'
   | 'team.create.request'
   | 'team.create.approved'
+  | 'team.create.rejected'
   | 'tool.call'
   | 'tool.result'
   | 'budget.request'

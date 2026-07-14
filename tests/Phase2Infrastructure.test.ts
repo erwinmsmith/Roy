@@ -141,9 +141,12 @@ describe('Phase 2 engineering infrastructure', () => {
     });
     const result = await runtime.handleUserTurn('Analyze this repo and find architectural risks');
     expect(result.subagents).toHaveLength(2);
+    expect(result.teams).toHaveLength(1);
     const teams = runtime.getTeams();
     expect(teams).toHaveLength(1);
     expect(teams[0].state).toBe('done');
+    expect(teams[0].fsmState).toBe('S_team_done');
+    expect(teams[0].identity.name).toBe('ReviewTeam');
     expect(teams[0].memberIds).toHaveLength(2);
     const events = runtime.getEvents().map(event => event.type);
     expect(events).toContain('team.created');
@@ -157,8 +160,11 @@ describe('Phase 2 engineering infrastructure', () => {
     const messages = await runtime.getMessages({ correlationId: result.correlationId });
     expect(messages.map(message => message.kind)).toContain('team.task');
     expect(messages.map(message => message.kind)).toContain('team.result');
+    expect(messages.filter(message => message.kind === 'agent.task' && message.from === teams[0].identity.id)).toHaveLength(2);
+    expect(messages.filter(message => message.kind === 'agent.result' && message.to === teams[0].identity.id)).toHaveLength(2);
     expect(messages.map(message => message.kind)).toContain('evo.select');
     expect(await runtime.getEvolutionHistory()).toHaveLength(1);
+    expect(result.usage.teamSynthesis[teams[0].identity.id].totalTokens).toBeGreaterThan(0);
     await runtime.shutdown();
   });
 

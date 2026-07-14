@@ -184,6 +184,7 @@ export interface WorkspaceRuntimeConfig {
   teams: {
     enabled: boolean;
     createForMultipleAgents: boolean;
+    maxMembersPerTeam: number;
   };
 }
 
@@ -200,6 +201,9 @@ export interface TeamPatternInput {
   purpose: string;
   parentId: string;
   memberArchetypes: string[];
+  tomLevel?: number;
+  leadArchetype?: string;
+  members?: Array<Record<string, unknown>>;
 }
 
 export interface MemorySignals {
@@ -455,6 +459,7 @@ const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
   teams: {
     enabled: true,
     createForMultipleAgents: true,
+    maxMembersPerTeam: 5,
   },
 };
 
@@ -684,6 +689,13 @@ Keep this agent identity separate from the model provider identity.
     const teamPath = path.join(this.rootPath, 'teams', safeKey);
     await mkdir(teamPath, { recursive: true });
     await writeFile(path.join(teamPath, 'topology.json'), JSON.stringify(topology, null, 2) + '\n', 'utf8');
+  }
+
+  async appendTeamSession(teamKey: string, record: Record<string, unknown>): Promise<void> {
+    const safeKey = this.safeKey(teamKey);
+    const teamPath = path.join(this.rootPath, 'teams', safeKey);
+    await mkdir(teamPath, { recursive: true });
+    await appendFile(path.join(teamPath, 'sessions.jsonl'), JSON.stringify(record) + '\n', 'utf8');
   }
 
   async getMemoryMode(): Promise<MemoryMode> {
@@ -1145,6 +1157,7 @@ Keep this agent identity separate from the model provider identity.
     const id = `team_pattern_${key}_v1`;
     const existing = patterns.find(pattern => pattern.id === id || pattern.key === key);
     const now = new Date().toISOString();
+    const usageCount = Number((existing?.usage as Record<string, unknown> | undefined)?.count ?? 0) + 1;
     const pattern = {
       id,
       key,
@@ -1152,11 +1165,14 @@ Keep this agent identity separate from the model provider identity.
       purpose: input.purpose,
       parentId: input.parentId,
       memberArchetypes: input.memberArchetypes,
+      tomLevel: input.tomLevel ?? 2,
+      leadArchetype: input.leadArchetype,
+      members: input.members ?? input.memberArchetypes.map(archetype => ({ archetype })),
       memoryPath: `.roy/teams/${key}/memory.md`,
       topologyPath: `.roy/teams/${key}/topology.json`,
-      status: Number((existing?.usage as Record<string, unknown> | undefined)?.count ?? 0) >= 2 ? 'active' : 'candidate',
+      status: usageCount >= 2 ? 'active' : 'candidate',
       usage: {
-        count: Number((existing?.usage as Record<string, unknown> | undefined)?.count ?? 0) + 1,
+        count: usageCount,
         lastUsedAt: now,
       },
       updatedAt: now,
@@ -1165,6 +1181,56 @@ Keep this agent identity separate from the model provider identity.
     else patterns.push(pattern);
     await writeFile(cachePath, JSON.stringify({ patterns }, null, 2) + '\n', 'utf8');
     return pattern;
+  }
+
+  async recordTeamPatternOutcome(
+    teamKey: string,
+    outcome: { success: boolean; totalTokens: number; memberCount: number }
+  ): Promise<void> {
+    const key = this.safeKey(teamKey);
+    const cachePath = path.join(this.rootPath, 'cache', 'team-patterns.json');
+    const file = await this.readJson<{ patterns?: Array<Record<string, unknown>> }>(cachePath, { patterns: [] });
+    const patterns = file.patterns ?? [];
+    const pattern = patterns.find(item => item.id === `team_pattern_${key}_v1` || item.key === key);
+    if (!pattern) return;
+    const usage = (pattern.usage as Record<string, unknown> | undefined) ?? {};
+    const completedCount = Number(usage.completedCount ?? 0) + 1;
+    const totalTokens = Number(usage.totalTokens ?? 0) + Math.max(0, outcome.totalTokens);
+    pattern.usage = {
+      ...usage,
+      completedCount,
+      successCount: Number(usage.successCount ?? 0) + (outcome.success ? 1 : 0),
+      totalTokens,
+      averageTokens: Math.round(totalTokens / completedCount),
+      lastMemberCount: outcome.memberCount,
+      lastCompletedAt: new Date().toISOString(),
+    };
+    pattern.status = outcome.success && completedCount >= 2 ? 'active' : pattern.status;
+    pattern.updatedAt = new Date().toISOString();
+    await writeFile(cachePath, JSON.stringify({ patterns }, null, 2) + '\n', 'utf8');
+  }
+
+  async updateTeamPatternMembers(
+    teamKey: string,
+    definition: {
+      memberArchetypes: string[];
+      tomLevel: number;
+      leadArchetype?: string;
+      members: Array<Record<string, unknown>>;
+    }
+  ): Promise<void> {
+    const key = this.safeKey(teamKey);
+    const cachePath = path.join(this.rootPath, 'cache', 'team-patterns.json');
+    const file = await this.readJson<{ patterns?: Array<Record<string, unknown>> }>(cachePath, { patterns: [] });
+    const patterns = file.patterns ?? [];
+    const pattern = patterns.find(item => item.id === `team_pattern_${key}_v1` || item.key === key);
+    if (!pattern) return;
+    pattern.memberArchetypes = [...definition.memberArchetypes];
+    pattern.tomLevel = definition.tomLevel;
+    pattern.leadArchetype = definition.leadArchetype;
+    pattern.members = definition.members.map(member => ({ ...member }));
+    pattern.updatedAt = new Date().toISOString();
+    await writeFile(cachePath, JSON.stringify({ patterns }, null, 2) + '\n', 'utf8');
   }
 
   async updateCacheUsageMetrics(patternIds: string[], metrics: { definitionTokensSaved?: number; renderedPromptTokens?: number }): Promise<void> {

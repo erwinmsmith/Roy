@@ -1,2 +1,9 @@
 export { InvalidTeamTransitionError, TeamRegistry } from './TeamRegistry.js';
-export type { CreateTeamSpec, TeamIdentity, TeamRuntimeState, TeamState } from './types.js';
+export type {
+  CreateTeamSpec,
+  TeamFSMState,
+  TeamIdentity,
+  TeamRuntimeState,
+  TeamState,
+  TeamStatus,
+} from './types.js';

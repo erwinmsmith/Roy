@@ -27,7 +27,7 @@ import { UseToolWhenNeededSkill } from '../skills/toolUse.js';
 import { DefaultDelegationCandidatePlanner, type DelegationCandidateSelection } from '../delegation/index.js';
 import { ContextWindowManager, type ContextWindow } from '../context/index.js';
 import { BudgetMarket, type BudgetAllocation, type BudgetMarketState } from '../budget/index.js';
-import { TeamRegistry, type TeamRuntimeState } from '../team/index.js';
+import { TeamRegistry, type TeamFSMState, type TeamRuntimeState } from '../team/index.js';
 import { ToolApprovalManager, type ToolApprovalRequest } from '../tools/approval.js';
 import type { ToolResult } from '../tools/types.js';
 import { AgentToolPlanner } from '../tools/planner.js';
@@ -95,6 +95,7 @@ export interface BudgetState {
   usedTokens: number;
   remainingTokens?: number;
   perAgent: Record<string, TokenUsage>;
+  perTeam: Record<string, TokenUsage>;
   perTurn: TokenUsage[];
 }
 
@@ -113,6 +114,7 @@ export interface RuntimeState {
   rootAgentId: string;
   rootAgent: AgentInfo;
   agents: AgentInfo[];
+  teams: TeamRuntimeState[];
   events: RuntimeEvent[];
   budget: BudgetState;
 }
@@ -189,6 +191,50 @@ export interface SpawnAgentSpec {
 export interface AgentTreeNode {
   agent: AgentInfo;
   children: AgentTreeNode[];
+}
+
+export interface TeamMemberSpec {
+  archetype: SubAgentArchetype;
+  task: string;
+  name?: string;
+  role?: string;
+  style?: string;
+  tools?: string[];
+  skills?: string[];
+  budgetTokens?: number;
+  tomLevel?: number;
+  lead?: boolean;
+}
+
+export interface SpawnTeamSpec {
+  parentAgentId?: string;
+  name: string;
+  description: string;
+  tomLevel?: number;
+  leadAgentId?: string;
+  task?: string;
+  members?: TeamMemberSpec[];
+  correlationId?: string;
+}
+
+export interface TeamTreeNode {
+  team: TeamRuntimeState;
+  members: AgentTreeNode[];
+}
+
+export interface RuntimeActorTree {
+  root: AgentInfo;
+  teams: TeamTreeNode[];
+}
+
+export interface TeamRunResult {
+  team: TeamRuntimeState;
+  result: string;
+  members: RunAgentResult[];
+  memberExecutions: RootMediatedSpawnResult[];
+  correlationId: string;
+  messages: RuntimeMessage[];
+  usage: TokenUsage;
 }
 
 export interface RunAgentResult {
@@ -280,10 +326,12 @@ export interface RootTurnResult {
   decision: DelegationDecision;
   finalResponse: string;
   subagents: RootMediatedSpawnResult[];
+  teams: TeamRunResult[];
   messages: RuntimeMessage[];
   usage: {
     root: TokenUsage;
     subagents: Record<string, TokenUsage>;
+    teamSynthesis: Record<string, TokenUsage>;
     total: TokenUsage;
   };
 }
@@ -342,6 +390,7 @@ export class Runtime {
   private toolApprovalManager: ToolApprovalManager | null = null;
   private toolCallCounts = new Map<string, number>();
   private readonly teams = new TeamRegistry();
+  private teamMemberPlans = new Map<string, TeamMemberSpec[]>();
   private readonly toolPlanner = new AgentToolPlanner();
   private candidatePlanner: DefaultDelegationCandidatePlanner | null = null;
   private turnAgentCounts = new Map<string, number>();
@@ -540,6 +589,7 @@ export class Runtime {
     this.toolApprovalManager = null;
     this.toolCallCounts.clear();
     this.teams.clear();
+    this.teamMemberPlans.clear();
     this.turnAgentCounts.clear();
     this.initialized = false;
     logger.info('Runtime shutdown complete');
@@ -672,6 +722,7 @@ export class Runtime {
       rootAgentId: rootAgent.identity.id,
       rootAgent,
       agents,
+      teams: this.teams.list(),
       events: this.getEvents(),
       budget: this.getBudgetState(),
     };
@@ -686,12 +737,17 @@ export class Runtime {
     const fsmCtx = ctx.fsm.getContext();
     const agents = ctx.manager.listAgentInfo();
     const perAgent: Record<string, TokenUsage> = {};
+    const perTeam: Record<string, TokenUsage> = {};
     let usedTokens = 0;
 
     for (const agent of agents) {
       const usage = this.toTokenUsage(agent.usage);
       perAgent[agent.identity.id] = usage;
       usedTokens += usage.totalTokens;
+    }
+    for (const team of this.teams.list()) {
+      perTeam[team.identity.id] = { ...team.tokenUsage };
+      usedTokens += team.synthesisUsage.totalTokens;
     }
 
     return {
@@ -700,6 +756,7 @@ export class Runtime {
       usedTokens,
       remainingTokens: fsmCtx.budget === null ? undefined : Math.max(0, fsmCtx.budget - usedTokens),
       perAgent,
+      perTeam,
       perTurn: [...this.perTurnUsage],
     };
   }
@@ -730,6 +787,202 @@ export class Runtime {
     return this.teams.get(teamId);
   }
 
+  getTeamState(teamId: string): TeamRuntimeState | undefined {
+    return this.getTeam(teamId);
+  }
+
+  getTeamTree(teamId: string): TeamTreeNode | undefined {
+    const team = this.teams.get(teamId);
+    if (!team) return undefined;
+    const ctx = this.getContext();
+    return {
+      team,
+      members: team.memberAgentIds
+        .map(agentId => ctx.manager.getAgentById(agentId)?.getInfo())
+        .filter((agent): agent is AgentInfo => Boolean(agent))
+        .map(agent => this.buildAgentTree(agent)),
+    };
+  }
+
+  getTeamActorTree(): RuntimeActorTree {
+    return {
+      root: this.getContext().agent.getInfo(),
+      teams: this.teams.list()
+        .map(team => this.getTeamTree(team.identity.id))
+        .filter((team): team is TeamTreeNode => Boolean(team)),
+    };
+  }
+
+  async spawnTeam(spec: SpawnTeamSpec): Promise<TeamRuntimeState> {
+    const ctx = this.getContext();
+    const parentAgentId = spec.parentAgentId ?? 'root';
+    const correlationId = spec.correlationId ?? this.createCorrelationId();
+    const request = await this.enqueueMessage({
+      kind: 'team.create.request',
+      sessionId: ctx.sessionId,
+      from: parentAgentId,
+      to: 'runtime',
+      correlationId,
+      payload: { ...spec, parentAgentId },
+      metadata: { agentId: parentAgentId, tomLevel: spec.tomLevel ?? 2 },
+    });
+    await this.processQueuedMessage(request.id);
+
+    let createdTeamId: string | undefined;
+    try {
+      if (this.workspaceRuntimeConfig?.teams.enabled === false) throw new Error('Subteams are disabled by workspace policy');
+      const parent = ctx.manager.getAgentById(parentAgentId);
+      if (!parent) throw new Error(`Parent agent "${parentAgentId}" not found`);
+      if (!spec.name?.trim()) throw new Error('Team name is required');
+      if (!spec.description?.trim()) throw new Error('Team description is required');
+      const requestedMembers = spec.members ?? [];
+      for (const member of requestedMembers) {
+        if (!this.isValidArchetype(member.archetype)) throw new Error(`Unsupported team member archetype "${member.archetype}"`);
+        if (typeof member.task !== 'string' || !member.task.trim()) throw new Error('Every planned team member requires a task');
+      }
+      const members = requestedMembers.map(member => ({
+        ...member,
+        tools: member.tools ?? this.getDefaultToolBindings(member.archetype).map(binding => binding.name),
+        skills: member.skills ?? this.getDefaultSkillBindings(member.archetype).map(binding => binding.name),
+        tomLevel: member.tomLevel ?? this.createSubagentToMProfile(
+          member.archetype,
+          '',
+          member.task,
+          parentAgentId
+        ).level,
+      }));
+      const maxMembers = this.workspaceRuntimeConfig?.teams.maxMembersPerTeam ?? 5;
+      if (members.length > maxMembers) {
+        throw new Error(`Team member limit exceeded: requested ${members.length}, maximum ${maxMembers}`);
+      }
+      const parentPolicy = this.getAgentPolicy(parentAgentId);
+      if (!parentPolicy?.spawnPolicy.canSpawn) {
+        throw new Error(`Agent "${parentAgentId}" is not authorized to create subteams`);
+      }
+      const parentFsmState = parentAgentId === 'root'
+        ? ctx.fsm.getState()
+        : this.agentFsms.get(parentAgentId)?.getState();
+      if (!parentFsmState || !parentPolicy.spawnPolicy.allowedStates.includes(parentFsmState)) {
+        throw new Error(`Agent "${parentAgentId}" cannot create a subteam in FSM state "${parentFsmState ?? 'unknown'}"`);
+      }
+      const team = this.teams.create({
+        name: spec.name,
+        parentAgentId,
+        description: spec.description,
+        generation: parent.getIdentity().generation + 1,
+        tomLevel: spec.tomLevel ?? 2,
+        leadAgentId: spec.leadAgentId,
+        task: spec.task,
+        correlationId,
+      });
+      createdTeamId = team.identity.id;
+      this.teamMemberPlans.set(team.identity.id, members.map(member => ({ ...member })));
+      const teamKey = this.safeAgentKey(spec.name);
+      await ctx.memory.ensureTeamMemory(teamKey, { name: spec.name, purpose: spec.description });
+      const cachedTeamPattern = (await ctx.memory.getCachePatterns('teams'))
+        .find(item => item.id === `team_pattern_${teamKey}_v1` || item.key === teamKey);
+      if (cachedTeamPattern) {
+        this.emit({
+          type: 'cache.hit',
+          agentId: parentAgentId,
+          sessionId: ctx.sessionId,
+          correlationId,
+          data: { cacheType: 'team-pattern', patternId: cachedTeamPattern.id, teamKey },
+        });
+      }
+      const pattern = await ctx.memory.upsertTeamPattern({
+        key: teamKey,
+        name: spec.name,
+        purpose: spec.description,
+        parentId: parentAgentId,
+        memberArchetypes: members.map(member => member.archetype),
+        tomLevel: spec.tomLevel ?? 2,
+        leadArchetype: members.find(member => member.lead)?.archetype,
+        members: members.map(member => ({
+          archetype: member.archetype,
+          name: member.name,
+          role: member.role,
+          tools: member.tools,
+          skills: member.skills,
+          tomLevel: member.tomLevel,
+          lead: member.lead ?? false,
+        })),
+      });
+      await ctx.memory.writeTeamTopology(teamKey, {
+        type: 'subteam',
+        teamId: team.identity.id,
+        parentAgentId,
+        leadAgentId: spec.leadAgentId,
+        members: [],
+        plannedMembers: members,
+        tomLevel: team.identity.tomLevel,
+        updatedAt: new Date().toISOString(),
+      });
+      const approved = await this.enqueueMessage({
+        kind: 'team.create.approved',
+        sessionId: ctx.sessionId,
+        from: 'runtime',
+        to: parentAgentId,
+        correlationId,
+        parentMessageId: request.id,
+        payload: team,
+        metadata: { agentId: parentAgentId, teamId: team.identity.id, tomLevel: team.identity.tomLevel },
+      });
+      await this.processQueuedMessage(approved.id);
+      await ctx.queue.ack(request.id);
+      await ctx.queue.ack(approved.id);
+      this.emit({
+        type: 'team.created',
+        agentId: team.identity.id,
+        sessionId: ctx.sessionId,
+        correlationId,
+        data: {
+          teamId: team.identity.id,
+          name: spec.name,
+          description: spec.description,
+          tomLevel: team.identity.tomLevel,
+          plannedMembers: members.length,
+          patternId: pattern.id,
+          parentAgentId,
+        },
+      });
+      return this.teams.get(team.identity.id)!;
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      const current = await ctx.queue.getMessage(request.id);
+      if (current?.status === 'processing' || current?.status === 'pending') {
+        await ctx.queue.fail(request.id, failure);
+      }
+      if (createdTeamId) {
+        try {
+          await this.transitionTeamFsm(createdTeamId, 'S_team_failed', { error: failure.message });
+        } catch {
+          // The original creation failure is the actionable error.
+        }
+      }
+      const rejected = await this.enqueueMessage({
+        kind: 'team.create.rejected',
+        sessionId: ctx.sessionId,
+        from: 'runtime',
+        to: parentAgentId,
+        correlationId,
+        parentMessageId: request.id,
+        payload: { parentAgentId, teamId: createdTeamId, reason: failure.message },
+        metadata: { agentId: createdTeamId ?? parentAgentId, teamId: createdTeamId },
+      });
+      await this.processQueuedMessage(rejected.id);
+      await ctx.queue.ack(rejected.id);
+      this.emit({
+        type: createdTeamId ? 'team.create.failed' : 'team.create.rejected',
+        agentId: createdTeamId ?? parentAgentId,
+        sessionId: ctx.sessionId,
+        correlationId,
+        data: { teamId: createdTeamId, parentAgentId, error: failure.message },
+      });
+      throw failure;
+    }
+  }
+
   async createSubteam(input: {
     parentId: string;
     name: string;
@@ -737,56 +990,277 @@ export class Runtime {
     memberArchetypes: SubAgentArchetype[];
     correlationId?: string;
   }): Promise<TeamRuntimeState> {
-    if (this.workspaceRuntimeConfig?.teams.enabled === false) throw new Error('Subteams are disabled by workspace policy');
-    const ctx = this.getContext();
-    const parent = ctx.manager.getAgentById(input.parentId);
-    if (!parent) throw new Error(`Parent agent "${input.parentId}" not found`);
-    const request = await this.enqueueMessage({
-      kind: 'team.create.request',
-      sessionId: ctx.sessionId,
-      from: input.parentId,
-      to: 'runtime',
-      correlationId: input.correlationId,
-      payload: input,
-      metadata: { agentId: input.parentId },
-    });
-    await this.processQueuedMessage(request.id);
-    const team = this.teams.create({
+    return this.spawnTeam({
+      parentAgentId: input.parentId,
       name: input.name,
-      parentId: input.parentId,
-      purpose: input.purpose,
-      generation: parent.getIdentity().generation + 1,
+      description: input.purpose,
+      members: input.memberArchetypes.map(archetype => ({ archetype, task: input.purpose })),
       correlationId: input.correlationId,
     });
-    const teamKey = this.safeAgentKey(input.name);
-    await ctx.memory.ensureTeamMemory(teamKey, { name: input.name, purpose: input.purpose });
-    const pattern = await ctx.memory.upsertTeamPattern({
-      key: teamKey,
-      name: input.name,
-      purpose: input.purpose,
-      parentId: input.parentId,
-      memberArchetypes: input.memberArchetypes,
+  }
+
+  async spawnAgentIntoTeam(teamId: string, spec: TeamMemberSpec): Promise<TeamRuntimeState> {
+    const team = this.teams.get(teamId);
+    if (!team) throw new Error(`Team "${teamId}" not found`);
+    if (team.status === 'done' || team.status === 'failed') {
+      throw new Error(`Team "${teamId}" cannot add members while status is ${team.status}`);
+    }
+    const maxMembers = this.workspaceRuntimeConfig?.teams.maxMembersPerTeam ?? 5;
+    const plans = this.teamMemberPlans.get(teamId) ?? [];
+    if (team.memberAgentIds.length + plans.length >= maxMembers) {
+      throw new Error(`Team "${teamId}" already has the maximum ${maxMembers} members`);
+    }
+    if (!this.isValidArchetype(spec.archetype)) throw new Error(`Unsupported team member archetype "${spec.archetype}"`);
+    if (!spec.task.trim()) throw new Error('Team member task is required');
+    const normalizedSpec: TeamMemberSpec = {
+      ...spec,
+      tools: spec.tools ?? this.getDefaultToolBindings(spec.archetype).map(binding => binding.name),
+      skills: spec.skills ?? this.getDefaultSkillBindings(spec.archetype).map(binding => binding.name),
+      tomLevel: spec.tomLevel ?? this.createSubagentToMProfile(
+        spec.archetype,
+        '',
+        spec.task,
+        team.identity.parentAgentId
+      ).level,
+    };
+    const nextPlans = [...plans, normalizedSpec];
+    this.teamMemberPlans.set(teamId, nextPlans);
+    await this.getContext().memory.updateTeamPatternMembers(this.safeAgentKey(team.identity.name), {
+      memberArchetypes: nextPlans.map(member => member.archetype),
+      leadArchetype: nextPlans.find(member => member.lead)?.archetype,
+      tomLevel: team.identity.tomLevel,
+      members: nextPlans.map(member => ({
+        archetype: member.archetype,
+        name: member.name,
+        role: member.role,
+        tools: member.tools,
+        skills: member.skills,
+        tomLevel: member.tomLevel,
+        lead: member.lead ?? false,
+      })),
     });
-    const approved = await this.enqueueMessage({
-      kind: 'team.create.approved',
-      sessionId: ctx.sessionId,
-      from: 'runtime',
-      to: input.parentId,
-      correlationId: input.correlationId,
-      parentMessageId: request.id,
-      payload: team,
-      metadata: { agentId: input.parentId, teamId: team.identity.id },
-    });
-    await this.processQueuedMessage(approved.id);
-    await ctx.queue.ack(request.id);
-    await ctx.queue.ack(approved.id);
-    this.teams.transition(team.identity.id, 'ready');
+    await this.persistTeamTopology(team);
     this.emit({
-      type: 'team.created',
-      agentId: input.parentId,
-      data: { teamId: team.identity.id, name: input.name, purpose: input.purpose, patternId: pattern.id, correlationId: input.correlationId },
+      type: 'team.member.planned',
+      agentId: team.identity.id,
+      sessionId: this.getContext().sessionId,
+      correlationId: team.correlationId,
+      data: { teamId, archetype: spec.archetype, name: spec.name, task: spec.task, lead: spec.lead ?? false },
     });
-    return this.teams.get(team.identity.id)!;
+    return this.teams.get(teamId)!;
+  }
+
+  private async executeTeamMember(teamId: string, spec: TeamMemberSpec): Promise<RootMediatedSpawnResult> {
+    const team = this.teams.get(teamId);
+    if (!team) throw new Error(`Team "${teamId}" not found`);
+    if (team.fsmState !== 'S_member_execute') {
+      throw new Error(`Team "${teamId}" cannot execute a member in FSM state "${team.fsmState}"`);
+    }
+    const execution = await this.createAgentComputeNode({
+      parentId: team.identity.parentAgentId,
+      archetype: spec.archetype,
+      task: spec.task,
+      name: spec.name,
+      role: spec.role,
+      style: spec.style,
+      tools: spec.tools,
+      skills: spec.skills,
+      budgetTokens: spec.budgetTokens,
+      tomProfile: spec.tomLevel === undefined
+        ? undefined
+        : {
+          ...this.createSubagentToMProfile(spec.archetype, '', spec.task, team.identity.parentAgentId),
+          level: spec.tomLevel as ToMProfile['level'],
+        },
+      execution: {
+        requireParentSynthesis: false,
+        showSubagentOutput: false,
+        disableRecursiveDelegation: true,
+        teamId,
+      },
+    }, {
+      agentId: team.identity.parentAgentId,
+      sessionId: this.getContext().sessionId,
+      source: teamId,
+    }, team.correlationId);
+    const result = execution.delegation;
+    const updated = this.teams.addMember(teamId, result.agent.identity.id, spec.task, spec.lead);
+    this.teams.recordMemberResult(
+      teamId,
+      result.agent.identity.id,
+      spec.task,
+      result.subagentResult.result,
+      result.subagentResult.usage
+    );
+    await this.persistTeamTopology(updated);
+    this.emit({
+      type: 'team.member.completed',
+      agentId: result.agent.identity.id,
+      sessionId: this.getContext().sessionId,
+      correlationId: result.correlationId,
+      data: {
+        teamId,
+        parentAgentId: team.identity.parentAgentId,
+        task: spec.task,
+        totalTokens: result.subagentResult.usage.totalTokens,
+      },
+    });
+    return result;
+  }
+
+  async runTeam(teamId: string, task: string): Promise<TeamRunResult> {
+    const ctx = this.getContext();
+    const initial = this.teams.get(teamId);
+    if (!initial) throw new Error(`Team "${teamId}" not found`);
+    if (!task.trim()) throw new Error('Team task is required');
+    const usageBefore = { ...initial.tokenUsage };
+    const correlationId = initial.correlationId ?? this.createCorrelationId();
+    this.teams.setTask(teamId, task, correlationId);
+    await this.transitionTeamFsm(teamId, 'S_team_plan', { task });
+
+    const taskMessage = await this.enqueueMessage({
+      kind: 'team.task',
+      sessionId: ctx.sessionId,
+      from: initial.identity.parentAgentId,
+      to: teamId,
+      correlationId,
+      payload: { teamId, task },
+      metadata: { agentId: initial.identity.parentAgentId, teamId, tomLevel: initial.identity.tomLevel },
+    });
+    await this.processQueuedMessage(taskMessage.id);
+
+    const memberExecutions: RootMediatedSpawnResult[] = [];
+    const members: RunAgentResult[] = [];
+    try {
+      const plans = this.teamMemberPlans.get(teamId) ?? [];
+      if (plans.length > 0) {
+        await this.transitionTeamFsm(teamId, 'S_member_spawn', { count: plans.length });
+        await this.transitionTeamFsm(teamId, 'S_member_execute', { count: plans.length });
+        for (const plan of plans) {
+          const execution = await this.executeTeamMember(teamId, plan);
+          memberExecutions.push(execution);
+          members.push(execution.subagentResult);
+        }
+        this.teamMemberPlans.set(teamId, []);
+      } else {
+        const team = this.teams.get(teamId)!;
+        if (team.memberAgentIds.length === 0) throw new Error(`Team "${teamId}" has no members or member plans`);
+        await this.transitionTeamFsm(teamId, 'S_member_execute', { count: team.memberAgentIds.length });
+        for (const agentId of team.memberAgentIds) {
+          const memberTask = team.memberTasks[agentId] ?? task;
+          const result = await this.runAgent(agentId, memberTask, {
+            correlationId,
+            disableRecursiveDelegation: true,
+          });
+          members.push(result);
+          this.teams.recordMemberResult(teamId, agentId, memberTask, result.result, result.usage);
+          this.emit({
+            type: 'team.member.completed',
+            agentId,
+            sessionId: ctx.sessionId,
+            correlationId,
+            data: { teamId, task: memberTask, totalTokens: result.usage.totalTokens },
+          });
+        }
+      }
+
+      await this.transitionTeamFsm(teamId, 'S_member_aggregate', { completed: members.length });
+      await this.transitionTeamFsm(teamId, 'S_team_synthesize', { completed: members.length });
+      const synthesis = await this.completeAsTeam(this.teams.get(teamId)!, task, members, correlationId);
+      this.teams.recordSynthesis(teamId, synthesis.content, synthesis.usage);
+
+      const resultMessage = await this.enqueueMessage({
+        kind: 'team.result',
+        sessionId: ctx.sessionId,
+        from: teamId,
+        to: initial.identity.parentAgentId,
+        correlationId,
+        parentMessageId: taskMessage.id,
+        payload: {
+          teamId,
+          task,
+          result: synthesis.content,
+          memberAgentIds: this.teams.get(teamId)!.memberAgentIds,
+        },
+        metadata: { agentId: initial.identity.parentAgentId, teamId, tomLevel: initial.identity.tomLevel },
+      });
+      await this.processQueuedMessage(resultMessage.id);
+      await ctx.queue.ack(taskMessage.id);
+      await ctx.queue.ack(resultMessage.id);
+      await ctx.memory.appendTeamSession(this.safeAgentKey(initial.identity.name), {
+        timestamp: Date.now(),
+        sessionId: ctx.sessionId,
+        correlationId,
+        teamId,
+        task,
+        result: synthesis.content,
+        memberAgentIds: this.teams.get(teamId)!.memberAgentIds,
+        tokenUsage: this.subtractTokenUsage(this.teams.get(teamId)!.tokenUsage, usageBefore),
+        cumulativeTokenUsage: this.teams.get(teamId)!.tokenUsage,
+      });
+      await this.persistTeamTopology(this.teams.get(teamId)!);
+      await ctx.memory.recordTeamPatternOutcome(this.safeAgentKey(initial.identity.name), {
+        success: true,
+        totalTokens: this.subtractTokenUsage(this.teams.get(teamId)!.tokenUsage, usageBefore).totalTokens,
+        memberCount: this.teams.get(teamId)!.memberAgentIds.length,
+      });
+      await this.transitionTeamFsm(teamId, 'S_team_done', { totalTokens: this.teams.get(teamId)!.tokenUsage.totalTokens });
+      try {
+        await this.persistTeamTopology(this.teams.get(teamId)!);
+      } catch (error) {
+        this.emit({
+          type: 'team.persistence.failed',
+          agentId: teamId,
+          sessionId: ctx.sessionId,
+          correlationId,
+          data: { teamId, parentAgentId: initial.identity.parentAgentId, error: error instanceof Error ? error.message : String(error) },
+        });
+      }
+      this.emit({
+        type: 'team.completed',
+        agentId: teamId,
+        sessionId: ctx.sessionId,
+        correlationId,
+        data: {
+          teamId,
+          result: synthesis.content,
+          memberAgentIds: this.teams.get(teamId)!.memberAgentIds,
+          totalTokens: this.subtractTokenUsage(this.teams.get(teamId)!.tokenUsage, usageBefore).totalTokens,
+          cumulativeTokens: this.teams.get(teamId)!.tokenUsage.totalTokens,
+          parentAgentId: initial.identity.parentAgentId,
+        },
+      });
+      return {
+        team: this.teams.get(teamId)!,
+        result: synthesis.content,
+        members,
+        memberExecutions,
+        correlationId,
+        messages: await this.getMessages({ correlationId }),
+        usage: this.subtractTokenUsage(this.teams.get(teamId)!.tokenUsage, usageBefore),
+      };
+    } catch (error) {
+      const current = await ctx.queue.getMessage(taskMessage.id);
+      if (current?.status === 'pending' || current?.status === 'processing') {
+        await ctx.queue.fail(taskMessage.id, error instanceof Error ? error : new Error(String(error)));
+      }
+      await this.transitionTeamFsm(teamId, 'S_team_failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      await ctx.memory.recordTeamPatternOutcome(this.safeAgentKey(initial.identity.name), {
+        success: false,
+        totalTokens: this.subtractTokenUsage(this.teams.get(teamId)?.tokenUsage ?? usageBefore, usageBefore).totalTokens,
+        memberCount: this.teams.get(teamId)?.memberAgentIds.length ?? 0,
+      });
+      this.emit({
+        type: 'team.failed',
+        agentId: teamId,
+        sessionId: ctx.sessionId,
+        correlationId,
+        data: { teamId, parentAgentId: initial.identity.parentAgentId, error: error instanceof Error ? error.message : String(error) },
+      });
+      throw error;
+    }
   }
 
   getToolApprovals(status?: ToolApprovalRequest['status']): ToolApprovalRequest[] {
@@ -1277,6 +1751,19 @@ export class Runtime {
     return key || 'custom';
   }
 
+  private deriveTeamName(plans: DelegationAgentPlan[]): string {
+    const archetypes = Array.from(new Set(plans.map(plan => plan.archetype)));
+    const has = (archetype: SubAgentArchetype) => archetypes.includes(archetype);
+    if (has('coder') && has('tester')) return 'ImplementationTeam';
+    if (has('researcher') && has('critic') && has('summarizer')) return 'AnalysisTeam';
+    if (has('researcher') && has('critic')) return 'ReviewTeam';
+    if (has('researcher') && has('planner')) return 'DiscoveryTeam';
+    const label = archetypes
+      .map(archetype => archetype.charAt(0).toUpperCase() + archetype.slice(1))
+      .join('');
+    return `${label || 'Delegation'}Team`;
+  }
+
   private inferAgentArchetype(agent: AgentInfo): SubAgentArchetype {
     const id = agent.identity.id.toLowerCase();
     const name = agent.identity.name.toLowerCase();
@@ -1575,7 +2062,7 @@ export class Runtime {
 
     let finalResponse: string;
     const subagents: RootMediatedSpawnResult[] = [];
-    let delegationTeamId: string | undefined;
+    const teamResults: TeamRunResult[] = [];
 
     if (decision.action === 'ask_clarification') {
       await this.transitionRootTurnState('S_solo_reasoning', { correlationId, reason: decision.reason });
@@ -1602,28 +2089,6 @@ export class Runtime {
       });
       finalResponse = await this.runRootSoloReasoning(userInput, correlationId);
     } else {
-      if (decision.agents.length > 1 && this.workspaceRuntimeConfig?.teams.createForMultipleAgents !== false) {
-        const team = await this.createSubteam({
-          parentId: 'root',
-          name: `Delegation-${correlationId}`,
-          purpose: userInput,
-          memberArchetypes: decision.agents.map(agent => agent.archetype),
-          correlationId,
-        });
-        delegationTeamId = team.identity.id;
-        this.teams.transition(delegationTeamId, 'running');
-        const teamTask = await this.enqueueMessage({
-          kind: 'team.task',
-          sessionId: ctx.sessionId,
-          from: 'root',
-          to: delegationTeamId,
-          correlationId,
-          payload: { task: userInput, plans: decision.agents },
-          metadata: { agentId: 'root', teamId: delegationTeamId },
-        });
-        await this.processQueuedMessage(teamTask.id);
-        await ctx.queue.ack(teamTask.id);
-      }
       await this.transitionRootTurnState('S_delegate_planning', { correlationId, count: decision.agents.length });
       this.emit({
         type: 'delegation.plan.created',
@@ -1658,49 +2123,46 @@ export class Runtime {
             task: plan.task,
           },
         });
-        const result = await this.handleSpawnCommand({
-          archetype: plan.archetype,
-          task: plan.task,
-          parentId: 'root',
-          name: plan.name,
-          tools: plan.tools,
-          skills: plan.skills,
-          tomLevel: plan.tomLevel,
-          budgetTokens: plan.budgetTokens,
+      }
+      const plans = decision.agents.slice(0, 3);
+      if (plans.length > 1 && this.workspaceRuntimeConfig?.teams.createForMultipleAgents !== false) {
+        const team = await this.spawnTeam({
+          parentAgentId: 'root',
+          name: this.deriveTeamName(plans),
+          description: userInput,
+          task: userInput,
+          members: plans.map((plan, index) => ({ ...plan, lead: index === 0 })),
           correlationId,
-          source: 'root',
-          requireRootSynthesis: false,
-          showSubagentOutput: false,
-          disableRecursiveDelegation: decision.agents.length > 1 || this.getBudgetState().mode === 'limited',
-          teamId: delegationTeamId,
         });
-        subagents.push(result);
+        const teamResult = await this.runTeam(team.identity.id, userInput);
+        teamResults.push(teamResult);
+        subagents.push(...teamResult.memberExecutions);
+      } else {
+        for (const plan of plans) {
+          const result = await this.handleSpawnCommand({
+            archetype: plan.archetype,
+            task: plan.task,
+            parentId: 'root',
+            name: plan.name,
+            tools: plan.tools,
+            skills: plan.skills,
+            tomLevel: plan.tomLevel,
+            budgetTokens: plan.budgetTokens,
+            correlationId,
+            source: 'root',
+            requireRootSynthesis: false,
+            showSubagentOutput: false,
+            disableRecursiveDelegation: this.getBudgetState().mode === 'limited',
+          });
+          subagents.push(result);
+        }
       }
       await this.transitionRootTurnState('S_wait_subagents', {
         correlationId,
         completed: subagents.length,
       });
-      if (delegationTeamId) this.teams.transition(delegationTeamId, 'waiting');
       await this.transitionRootTurnState('S_synthesize', { correlationId, completed: subagents.length });
-      if (delegationTeamId) this.teams.transition(delegationTeamId, 'synthesizing');
-      finalResponse = await this.synthesizeDelegatedResults(userInput, subagents, correlationId);
-      if (delegationTeamId) {
-        const totalTokens = subagents.reduce((sum, result) => sum + result.subagentResult.usage.totalTokens, 0);
-        this.teams.recordUsage(delegationTeamId, totalTokens);
-        this.teams.transition(delegationTeamId, 'done');
-        const teamResult = await this.enqueueMessage({
-          kind: 'team.result',
-          sessionId: ctx.sessionId,
-          from: delegationTeamId,
-          to: 'root',
-          correlationId,
-          payload: { teamId: delegationTeamId, finalResponse, memberIds: subagents.map(result => result.agent.identity.id) },
-          metadata: { agentId: 'root', teamId: delegationTeamId },
-        });
-        await this.processQueuedMessage(teamResult.id);
-        await ctx.queue.ack(teamResult.id);
-        this.emit({ type: 'team.completed', agentId: 'root', data: { teamId: delegationTeamId, correlationId, totalTokens } });
-      }
+      finalResponse = await this.synthesizeDelegatedResults(userInput, subagents, correlationId, teamResults);
       this.emit({
         type: 'delegation.completed',
         agentId: 'root',
@@ -1751,17 +2213,22 @@ export class Runtime {
     for (const item of subagents) {
       subagentUsage[item.agent.identity.id] = item.subagentResult.usage;
     }
+    const teamSynthesisUsage = Object.fromEntries(
+      teamResults.map(result => [result.team.identity.id, { ...result.team.synthesisUsage }])
+    );
 
     return {
       correlationId,
       decision,
       finalResponse,
       subagents,
+      teams: teamResults,
       messages: await this.getMessages({ correlationId }),
       usage: {
         root: rootUsage,
         subagents: subagentUsage,
-        total: this.sumUsage([rootUsage, ...Object.values(subagentUsage)]),
+        teamSynthesis: teamSynthesisUsage,
+        total: this.sumUsage([rootUsage, ...Object.values(subagentUsage), ...Object.values(teamSynthesisUsage)]),
       },
     };
   }
@@ -2165,10 +2632,12 @@ export class Runtime {
       },
     });
 
+    const taskSender = payload.teamId ?? parentId;
+    const resultRecipient = payload.teamId ?? parentId;
     const taskMessage = await this.enqueueMessage({
       kind: 'agent.task',
       sessionId: ctx.sessionId,
-      from: parentId,
+      from: taskSender,
       to: agent.identity.id,
       correlationId,
       parentMessageId: command.id,
@@ -2211,7 +2680,7 @@ export class Runtime {
       kind: 'agent.result',
       sessionId: ctx.sessionId,
       from: agent.identity.id,
-      to: parentId,
+      to: resultRecipient,
       correlationId,
       parentMessageId: taskMessage.id,
       payload: subagentResult,
@@ -2231,6 +2700,7 @@ export class Runtime {
         agentId: agent.identity.id,
         archetype: payload.archetype,
         parentId,
+        teamId: payload.teamId,
         grounded: subagentResult.grounded,
         warnings: subagentResult.warnings,
         toolCalls: subagentResult.toolCalls.map(call => call.toolName),
@@ -2243,7 +2713,7 @@ export class Runtime {
     });
     await this.processQueuedMessage(resultMessage.id);
     await ctx.queue.ack(resultMessage.id);
-    this.emit({ type: 'agent.result.sent', agentId: agent.identity.id, data: { correlationId, to: parentId } });
+    this.emit({ type: 'agent.result.sent', agentId: agent.identity.id, data: { correlationId, to: resultRecipient, teamId: payload.teamId } });
 
     let finalResponse = '';
     if (requireRootSynthesis) {
@@ -3791,7 +4261,8 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
   private async synthesizeDelegatedResults(
     userTask: string,
     results: RootMediatedSpawnResult[],
-    correlationId: string
+    correlationId: string,
+    teamResults: TeamRunResult[] = []
   ): Promise<string> {
     const ctx = this.getContext();
     const synthesisMessage = await this.enqueueMessage({
@@ -3803,6 +4274,7 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
       payload: {
         userTask,
         subagentIds: results.map(result => result.agent.identity.id),
+        teamIds: teamResults.map(result => result.team.identity.id),
       },
       metadata: { agentId: 'root', tomLevel: ctx.agent.getIdentity().tomProfile.level },
     });
@@ -3818,7 +4290,7 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     this.emit({ type: 'agent.status.changed', agentId: 'root', data: { to: 'synthesizing', correlationId } });
     this.emit({ type: 'agent.llm.called', agentId: 'root', data: { purpose: 'root.multi_agent_synthesis', correlationId } });
     const response = await this.completeAsRoot(
-      this.buildMultiAgentSynthesisPrompt(userTask, results),
+      this.buildMultiAgentSynthesisPrompt(userTask, results, teamResults),
       'root.multi_agent_synthesis',
       correlationId
     );
@@ -3842,7 +4314,11 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     return response || ctx.agent.getInfo().lastResult || '';
   }
 
-  private buildMultiAgentSynthesisPrompt(userTask: string, results: RootMediatedSpawnResult[]): string {
+  private buildMultiAgentSynthesisPrompt(
+    userTask: string,
+    results: RootMediatedSpawnResult[],
+    teamResults: TeamRunResult[] = []
+  ): string {
     const reports = results.map(result => {
       const warnings = result.subagentResult.warnings.length > 0
         ? result.subagentResult.warnings.map(item => `- ${item}`).join('\n')
@@ -3866,6 +4342,16 @@ ${result.subagentResult.result}
 </subagent_report>`;
     }).join('\n\n');
 
+    const teamReports = teamResults.map(result => `<team_report>
+id: ${result.team.identity.id}
+name: ${result.team.identity.name}
+tom: ToM-${result.team.identity.tomLevel}
+members: ${result.team.memberAgentIds.join(', ')}
+tokens: ${result.usage.totalTokens}
+content:
+${result.result}
+</team_report>`).join('\n\n');
+
     return `The user requested:
 <user_task>
 ${userTask}
@@ -3873,6 +4359,8 @@ ${userTask}
 
 Roy delegated this task to ${results.length} subagent(s). Synthesize their results into one final user-facing response.
 Use concrete evidence from grounded reports. If a report is ungrounded or missing concrete tool output, say so and avoid overstating it.
+
+${teamReports ? `The following subteam reports have already aggregated their direct members. Treat them as the primary delegation result.\n\n${teamReports}` : ''}
 
 ${reports}
 
@@ -3895,6 +4383,21 @@ Produce the final response to the user as Roy, the root agent.`;
       totalTokens: 0,
       thinkingTokens: null,
     });
+  }
+
+  private subtractTokenUsage(after: TokenUsage, before: TokenUsage): TokenUsage {
+    const thinkingTokens = after.thinkingTokens === null && before.thinkingTokens === null
+      ? null
+      : Math.max(0, Number(after.thinkingTokens ?? 0) - Number(before.thinkingTokens ?? 0));
+    const estimatedCostUsd = Math.max(0, Number(after.estimatedCostUsd ?? 0) - Number(before.estimatedCostUsd ?? 0));
+    return {
+      llmCalls: Math.max(0, after.llmCalls - before.llmCalls),
+      promptTokens: Math.max(0, after.promptTokens - before.promptTokens),
+      completionTokens: Math.max(0, after.completionTokens - before.completionTokens),
+      totalTokens: Math.max(0, after.totalTokens - before.totalTokens),
+      thinkingTokens,
+      estimatedCostUsd: estimatedCostUsd > 0 ? estimatedCostUsd : undefined,
+    };
   }
 
   private async synthesizeChildResult(
@@ -3990,7 +4493,8 @@ Produce the final response to the user as Roy, the root agent.`;
     userTask: string,
     childResults: RootMediatedSpawnResult[],
     correlationId: string,
-    parentMessageId: string
+    parentMessageId: string,
+    teamResult?: TeamRunResult
   ): Promise<string> {
     if (childResults.length === 1) {
       return this.synthesizeChildResult(
@@ -4009,7 +4513,7 @@ Produce the final response to the user as Roy, the root agent.`;
       throw new Error(`Parent agent "${parentId}" not found`);
     }
     if (parentId === 'root') {
-      return this.synthesizeDelegatedResults(userTask, childResults, correlationId);
+      return this.synthesizeDelegatedResults(userTask, childResults, correlationId, teamResult ? [teamResult] : []);
     }
 
     const parentIdentity = parent.getIdentity();
@@ -4052,7 +4556,7 @@ Produce the final response to the user as Roy, the root agent.`;
 
     const response = await this.completeAsAgent(
       parent,
-      this.buildParentMultiChildSynthesisPrompt(parent.getInfo(), userTask, childResults),
+      this.buildParentMultiChildSynthesisPrompt(parent.getInfo(), userTask, childResults, teamResult),
       'agent.multi_child_synthesis',
       correlationId
     );
@@ -4116,19 +4620,6 @@ Produce the final response to the user as Roy, the root agent.`;
     });
     await this.transitionAgentFsm(agentId, 'S_delegating', { correlationId, count: plans.length });
 
-    let delegationTeamId: string | undefined;
-    if (plans.length > 1 && this.workspaceRuntimeConfig?.teams.createForMultipleAgents !== false) {
-      const team = await this.createSubteam({
-        parentId: agentId,
-        name: `${parent.name}-Delegation-${correlationId}`,
-        purpose: task,
-        memberArchetypes: plans.map(plan => plan.archetype),
-        correlationId,
-      });
-      delegationTeamId = team.identity.id;
-      this.teams.transition(delegationTeamId, 'running');
-    }
-
     const childResults: RootMediatedSpawnResult[] = [];
     for (const plan of plans) {
       this.emit({
@@ -4154,38 +4645,53 @@ Produce the final response to the user as Roy, the root agent.`;
           scope: 'agent',
         },
       });
-      const result = await this.handleSpawnCommand({
-        archetype: plan.archetype,
-        task: plan.task,
-        parentId: agentId,
-        name: plan.name,
-        tools: plan.tools,
-        skills: plan.skills,
-        tomLevel: plan.tomLevel,
-        budgetTokens: plan.budgetTokens,
+    }
+
+    let teamResult: TeamRunResult | undefined;
+    if (plans.length > 1 && this.workspaceRuntimeConfig?.teams.createForMultipleAgents !== false) {
+      const team = await this.spawnTeam({
+        parentAgentId: agentId,
+        name: this.deriveTeamName(plans),
+        description: task,
+        task,
+        members: plans.map((plan, index) => ({ ...plan, lead: index === 0 })),
         correlationId,
-        source: agentId,
-        requireRootSynthesis: false,
-        showSubagentOutput: false,
-        disableRecursiveDelegation: plans.length > 1,
-        teamId: delegationTeamId,
       });
-      childResults.push(result);
+      teamResult = await this.runTeam(team.identity.id, task);
+      childResults.push(...teamResult.memberExecutions);
+    } else {
+      for (const plan of plans) {
+        const result = await this.handleSpawnCommand({
+          archetype: plan.archetype,
+          task: plan.task,
+          parentId: agentId,
+          name: plan.name,
+          tools: plan.tools,
+          skills: plan.skills,
+          tomLevel: plan.tomLevel,
+          budgetTokens: plan.budgetTokens,
+          correlationId,
+          source: agentId,
+          requireRootSynthesis: false,
+          showSubagentOutput: false,
+          disableRecursiveDelegation: false,
+        });
+        childResults.push(result);
+      }
     }
 
     await this.transitionAgentFsm(agentId, 'S_waiting_children', { correlationId, completed: childResults.length });
-    if (delegationTeamId) this.teams.transition(delegationTeamId, 'waiting');
     if (childResults.length === 0) {
       return this.runAgent(agentId, task, { ...options, disableRecursiveDelegation: true });
     }
 
-    if (delegationTeamId) this.teams.transition(delegationTeamId, 'synthesizing');
     const synthesis = await this.synthesizeDirectChildResults(
       agentId,
       task,
       childResults,
       correlationId,
-      childResults[0].messages.find(message => message.kind === 'agent.result')?.id ?? options.parentMessageId ?? ''
+      childResults[0].messages.find(message => message.kind === 'agent.result')?.id ?? options.parentMessageId ?? '',
+      teamResult
     );
     const usageAfter = parent.getUsage();
     const usageDelta = this.toTokenUsage({
@@ -4196,11 +4702,6 @@ Produce the final response to the user as Roy, the root agent.`;
     });
     const evidence = this.mergeChildEvidence(childResults.map(result => result.subagentResult));
     const warnings = childResults.flatMap(result => result.subagentResult.warnings);
-    if (delegationTeamId) {
-      this.teams.recordUsage(delegationTeamId, childResults.reduce((sum, result) => sum + result.subagentResult.usage.totalTokens, 0));
-      this.teams.transition(delegationTeamId, 'done');
-      this.emit({ type: 'team.completed', agentId, data: { teamId: delegationTeamId, correlationId } });
-    }
     this.emit({
       type: 'agent.run.completed',
       agentId,
@@ -4252,6 +4753,186 @@ Produce the final response to the user as Roy, the root agent.`;
       observedPaths: Array.from(new Set(results.flatMap(result => result.evidence.observedPaths))),
       toolResultSummary: results.map(result => result.evidence.toolResultSummary).filter(Boolean).join('\n'),
     };
+  }
+
+  private async transitionTeamFsm(
+    teamId: string,
+    state: TeamFSMState,
+    data: Record<string, unknown> = {}
+  ): Promise<TeamRuntimeState> {
+    const team = this.teams.get(teamId);
+    if (!team) throw new Error(`Team "${teamId}" not found`);
+    const from = team.fsmState;
+    try {
+      const updated = this.teams.transitionFsm(teamId, state, typeof data.error === 'string' ? data.error : undefined);
+      this.emit({
+        type: 'team.fsm.transition',
+        agentId: updated.identity.id,
+        sessionId: this.getContext().sessionId,
+        correlationId: updated.correlationId,
+        data: { teamId, from, to: state, status: updated.status, ...data },
+      });
+      return updated;
+    } catch (error) {
+      this.emit({
+        type: 'team.fsm.invalid_transition',
+        agentId: team.identity.id,
+        sessionId: this.getContext().sessionId,
+        correlationId: team.correlationId,
+        data: { teamId, from, to: state, error: error instanceof Error ? error.message : String(error) },
+      });
+      throw error;
+    }
+  }
+
+  private async persistTeamTopology(team: TeamRuntimeState): Promise<void> {
+    const ctx = this.getContext();
+    const plannedMembers = (this.teamMemberPlans.get(team.identity.id) ?? []).map(member => ({
+      archetype: member.archetype,
+      name: member.name,
+      role: member.role,
+      task: member.task,
+      tools: member.tools,
+      skills: member.skills,
+      tomLevel: member.tomLevel,
+      lead: member.lead ?? false,
+    }));
+    const members = team.memberAgentIds.map(agentId => {
+      const agent = ctx.manager.getAgentById(agentId)?.getInfo();
+      return {
+        id: agentId,
+        name: agent?.identity.name,
+        role: agent?.identity.role,
+        parentId: agent?.identity.parentId,
+        teamId: agent?.identity.teamId,
+        task: team.memberTasks[agentId],
+      };
+    });
+    await ctx.memory.writeTeamTopology(this.safeAgentKey(team.identity.name), {
+      type: 'subteam',
+      teamId: team.identity.id,
+      parentAgentId: team.identity.parentAgentId,
+      leadAgentId: team.leadAgentId,
+      tomLevel: team.identity.tomLevel,
+      status: team.status,
+      fsmState: team.fsmState,
+      members,
+      plannedMembers,
+      tokenUsage: team.tokenUsage,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  private async completeAsTeam(
+    team: TeamRuntimeState,
+    task: string,
+    members: RunAgentResult[],
+    correlationId: string
+  ): Promise<{ content: string; usage: TokenUsage }> {
+    const ctx = this.getContext();
+    const teamKey = this.safeAgentKey(team.identity.name);
+    const [teamDefinition, teamMemory, rootContext] = await Promise.all([
+      ctx.memory.readTeamDoc(teamKey, 'team'),
+      ctx.memory.readTeamDoc(teamKey, 'memory'),
+      ctx.memory.loadRootContext(),
+    ]);
+    const publicContext = [rootContext.projectMemory, rootContext.constraints, rootContext.decisions]
+      .filter(Boolean)
+      .join('\n\n')
+      .slice(0, 6000);
+    this.emit({
+      type: 'team.context.loaded',
+      agentId: team.identity.id,
+      sessionId: ctx.sessionId,
+      correlationId,
+      data: {
+        teamId: team.identity.id,
+        teamDefinitionChars: teamDefinition.length,
+        teamMemoryChars: teamMemory.length,
+        publicContextChars: publicContext.length,
+      },
+    });
+    const reports = members.map(member => [
+      `<member id="${member.agent.identity.id}" name="${member.agent.identity.name}">`,
+      `tokens: ${member.usage.totalTokens}`,
+      `grounded: ${member.grounded}`,
+      member.result,
+      '</member>',
+    ].join('\n')).join('\n\n');
+    const prompt = [
+      `Team task: ${task}`,
+      `You are ${team.identity.name}, a subteam actor in Roy.`,
+      `Description: ${team.identity.description}`,
+      `ToM level: ${team.identity.tomLevel}`,
+      `<team_definition>\n${teamDefinition}\n</team_definition>`,
+      `<team_private_memory>\n${teamMemory}\n</team_private_memory>`,
+      `<public_context>\n${publicContext}\n</public_context>`,
+      'Aggregate direct member reports into one grounded result for the parent agent.',
+      'Do not claim evidence that is absent from member reports.',
+      reports,
+    ].join('\n\n');
+    this.emit({
+      type: 'team.synthesis.started',
+      agentId: team.identity.id,
+      sessionId: ctx.sessionId,
+      correlationId,
+      data: { teamId: team.identity.id, memberAgentIds: team.memberAgentIds },
+    });
+    if (!ctx.llm) {
+      const usage = this.zeroTokenUsage();
+      this.emit({
+        type: 'team.synthesis.completed',
+        agentId: team.identity.id,
+        sessionId: ctx.sessionId,
+        correlationId,
+        data: { teamId: team.identity.id, totalTokens: 0, limited: true, reason: 'llm_not_configured' },
+      });
+      return {
+        content: `Team ${team.identity.name} could not synthesize results because no LLM is configured.`,
+        usage,
+      };
+    }
+    const chunks: string[] = [];
+    let providerUsage: { promptTokens: number; completionTokens: number; totalTokens: number } | undefined;
+    for await (const chunk of ctx.llm.stream([
+      {
+        role: 'system',
+        content: [
+          `You are ${team.identity.name}, a formal subteam actor in the Roy autonomous agent system.`,
+          'You are not Roy and you are not the model provider.',
+          `Parent agent: ${team.identity.parentAgentId}.`,
+          `Correlation: ${correlationId}.`,
+        ].join('\n'),
+      },
+      { role: 'user', content: prompt },
+    ], { temperature: 0.2 })) {
+      if (chunk.content) chunks.push(chunk.content);
+      if (chunk.usage) providerUsage = chunk.usage;
+    }
+    const content = chunks.join('');
+    const usage = this.toTokenUsage({
+      llmCalls: 1,
+      promptTokens: providerUsage?.promptTokens ?? this.estimateTextTokens(prompt),
+      completionTokens: providerUsage?.completionTokens ?? this.estimateTextTokens(content),
+      totalTokens: providerUsage?.totalTokens
+        ?? this.estimateTextTokens(prompt) + this.estimateTextTokens(content),
+    });
+    this.recordTurnUsage(usage);
+    this.emit({
+      type: 'budget.updated',
+      agentId: team.identity.id,
+      sessionId: ctx.sessionId,
+      correlationId,
+      data: { teamId: team.identity.id, ...usage },
+    });
+    this.emit({
+      type: 'team.synthesis.completed',
+      agentId: team.identity.id,
+      sessionId: ctx.sessionId,
+      correlationId,
+      data: { teamId: team.identity.id, totalTokens: usage.totalTokens },
+    });
+    return { content, usage };
   }
 
   private async completeAsAgent(agent: BaseAgent, prompt: string, purpose: string, correlationId: string): Promise<string> {
@@ -4336,7 +5017,12 @@ ${warnings}
 Produce a parent-level synthesis that can be passed upward to your parent. Do not answer as Roy unless your name is Roy. Preserve limitations and evidence.`;
   }
 
-  private buildParentMultiChildSynthesisPrompt(parent: AgentInfo, userTask: string, childResults: RootMediatedSpawnResult[]): string {
+  private buildParentMultiChildSynthesisPrompt(
+    parent: AgentInfo,
+    userTask: string,
+    childResults: RootMediatedSpawnResult[],
+    teamResult?: TeamRunResult
+  ): string {
     const reports = childResults.map(result => {
       const warnings = result.subagentResult.warnings.length > 0
         ? result.subagentResult.warnings.map(item => `- ${item}`).join('\n')
@@ -4374,6 +5060,8 @@ ${userTask}
 
 You delegated to ${childResults.length} direct child agent(s). Synthesize their reports into a parent-level result that can be passed upward.
 Preserve concrete evidence and limitations. Do not answer as Roy unless your name is Roy.
+
+${teamResult ? `Your subteam already aggregated its members into this report:\n<team_report>\n${teamResult.result}\n</team_report>\nUse this report as the primary result and verify it against the direct child reports below.` : ''}
 
 ${reports}`;
   }

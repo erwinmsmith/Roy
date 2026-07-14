@@ -32,6 +32,18 @@ Roy [root]
 
 Each parent owns its direct children and synthesizes their results before returning a result upward.
 
+When a delegation needs multiple cooperating actors, the runtime creates a formal subteam rather than treating the agents as a flat list:
+
+```text
+Roy [root]
+└── ReviewTeam [subteam, ToM-2]
+    ├── Researcher-1
+    ├── Critic-1
+    └── Summarizer-1
+```
+
+A subteam has its own identity, FSM, task/result boundary, synthesis call, token usage, message flow, memory directory, topology snapshot, session log, and reusable cache pattern. Member tasks flow `parent -> team -> member`; member results flow `member -> team -> parent`.
+
 ## Core Architecture
 
 ```text
@@ -170,6 +182,11 @@ npm test
 /spawn researcher "Inspect the project structure"
 /spawn critic --parent <agentId> "Review the parent result"
 /teams
+/teams --tree
+/team <teamId>
+/team create --name "AnalysisTeam" --description "Inspect architecture and risks"
+/team add <teamId> researcher "Inspect the project structure"
+/team run <teamId> "Analyze the project architecture"
 /budget
 /budget market
 /events --latest 50
@@ -201,6 +218,11 @@ GET  /v1/agents/tree
 POST /v1/agents
 POST /v1/agents/:id/run
 GET  /v1/teams
+GET  /v1/teams/tree
+GET  /v1/teams/:id
+POST /v1/teams
+POST /v1/teams/:id/agents
+POST /v1/teams/:id/run
 GET  /v1/budget
 GET  /v1/budget/market
 GET  /v1/cache/:kind

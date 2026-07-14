@@ -3,7 +3,7 @@
 import * as readline from 'readline';
 import * as path from 'path';
 import { bootstrap, cleanup, type BootstrapContext } from '../bootstrap.js';
-import { runtime } from '../core/runtime/Runtime.js';
+import { runtime, type AgentTreeNode, type SubAgentArchetype } from '../core/runtime/Runtime.js';
 import { skillRegistry } from '../core/skills/index.js';
 import { actionRegistry } from '../core/actions/index.js';
 import { toolRegistry } from '../core/tools/index.js';
@@ -343,7 +343,11 @@ export class Roy {
         break;
 
       case '/teams':
-        this.printTeams();
+        this.printTeams(parts.includes('--tree'));
+        break;
+
+      case '/team':
+        await this.handleTeam(parts);
         break;
 
       case '/exit':
@@ -521,6 +525,11 @@ export class Roy {
       /tools approve <id> Approve a pending tool request
       /tools deny <id>    Deny a pending tool request
       /teams              Show runtime subteams
+      /teams --tree       Show root, team, and member actor tree
+      /team <team-id>     Show one team and its member tree
+      /team create --name <name> --description <text>
+      /team add <team-id> <archetype> "task"
+      /team run <team-id> "task"
       /memory             Show workspace memory and agent memory statistics
 
     ${this.bold('Configuration')}
@@ -630,6 +639,10 @@ export class Roy {
     console.log('    GET  /v1/agents/tree - Agent tree');
     console.log('    POST /v1/agents  - Spawn subagent');
     console.log('    POST /v1/agents/:id/run - Run subagent');
+    console.log('    GET  /v1/teams - Team states');
+    console.log('    GET  /v1/teams/tree - Team actor tree');
+    console.log('    POST /v1/teams - Create subteam');
+    console.log('    POST /v1/teams/:id/run - Run subteam');
     console.log('    GET  /v1/budget  - Token budget');
     console.log('    GET  /v1/events  - Runtime events');
     console.log('    GET  /v1/queue   - Runtime message queue');
@@ -657,6 +670,19 @@ export class Roy {
     for (const agent of runtime.getState().agents) {
       const total = budget.perAgent[agent.identity.id]?.totalTokens ?? 0;
       console.log(`    ${agent.name.padEnd(18)} ${String(total).padStart(8)} tokens`);
+    }
+    console.log('\n  ' + this.bold('Per Team:'));
+    const teams = runtime.getTeams();
+    if (teams.length === 0) console.log('    ' + this.dim('No runtime teams'));
+    for (const team of teams) {
+      const usage = budget.perTeam[team.identity.id] ?? team.tokenUsage;
+      console.log(`    ${team.identity.name.padEnd(18)} ${String(usage.totalTokens).padStart(8)} tokens`);
+      for (const agentId of team.memberAgentIds) {
+        const member = runtime.getState().agents.find(agent => agent.identity.id === agentId);
+        const memberTokens = team.memberUsage[agentId]?.totalTokens ?? 0;
+        console.log(`      ${member?.identity.name ?? agentId} ${memberTokens} tokens`);
+      }
+      console.log(`      team synthesis ${team.synthesisUsage.totalTokens} tokens`);
     }
     console.log('');
   }
@@ -841,18 +867,102 @@ export class Roy {
     this.printTools();
   }
 
-  private printTeams(): void {
+  private printTeams(tree = false): void {
     const teams = runtime.getTeams();
     console.log('\n  ' + this.bold('Runtime Teams'));
     if (teams.length === 0) {
       console.log('    ' + this.dim('No runtime teams'));
+    } else if (tree) {
+      const actorTree = runtime.getTeamActorTree();
+      console.log(`    ${this.cyan(actorTree.root.identity.name)} [root, ${actorTree.root.state}]`);
+      actorTree.teams.forEach((node, index) => {
+        const lastTeam = index === actorTree.teams.length - 1;
+        const branch = lastTeam ? '└── ' : '├── ';
+        const continuation = lastTeam ? '    ' : '│   ';
+        console.log(`    ${branch}${this.cyan(node.team.identity.name)} [subteam, ToM-${node.team.identity.tomLevel}, ${node.team.status}, ${node.team.tokenUsage.totalTokens} tokens]`);
+        node.members.forEach((member, memberIndex) => {
+          this.printTeamMemberTree(member, `    ${continuation}`, memberIndex === node.members.length - 1);
+        });
+      });
     } else {
       for (const team of teams) {
-        console.log(`    - ${this.cyan(team.identity.id)} ${team.identity.name} [${team.state}] parent=${team.identity.parentId}`);
-        console.log(`      members=${team.memberIds.join(', ') || 'none'} tokens=${team.tokenUsage.totalTokens}`);
+        console.log(`    - ${this.cyan(team.identity.id)} ${team.identity.name} [${team.status}] parent=${team.identity.parentAgentId}`);
+        console.log(`      fsm=${team.fsmState} members=${team.memberAgentIds.length} tokens=${team.tokenUsage.totalTokens}`);
       }
     }
     console.log('');
+  }
+
+  private printTeamMemberTree(node: AgentTreeNode, prefix: string, last: boolean): void {
+    const branch = last ? '└── ' : '├── ';
+    const continuation = last ? '    ' : '│   ';
+    console.log(`${prefix}${branch}${node.agent.identity.name} [${node.agent.identity.role}, ${node.agent.state}, ${node.agent.usage.totalTokens} tokens]`);
+    node.children.forEach((child, index) => {
+      this.printTeamMemberTree(child, prefix + continuation, index === node.children.length - 1);
+    });
+  }
+
+  private async handleTeam(parts: string[]): Promise<void> {
+    const subcommand = parts[1];
+    try {
+      if (subcommand === 'create') {
+        const name = this.optionValue(parts, '--name');
+        const description = this.optionValue(parts, '--description') ?? this.optionValue(parts, '--role');
+        if (!name || !description) {
+          console.log('\n  Usage: /team create --name <name> --description <description>\n');
+          return;
+        }
+        const team = await runtime.spawnTeam({ name, description, parentAgentId: this.optionValue(parts, '--parent') ?? 'root' });
+        console.log(`\n  ${this.green(`Created ${team.identity.name}`)} ${this.dim(team.identity.id)}\n`);
+        return;
+      }
+      if (subcommand === 'add') {
+        const teamId = parts[2];
+        const archetype = parts[3] as SubAgentArchetype | undefined;
+        const task = parts.slice(4).join(' ').trim();
+        if (!teamId || !archetype || !task) {
+          console.log('\n  Usage: /team add <team-id> <archetype> "task"\n');
+          return;
+        }
+        const team = await runtime.spawnAgentIntoTeam(teamId, { archetype, task });
+        console.log(`\n  ${this.green('Team member planned:')} ${archetype} for ${team.identity.name}. Run ${this.cyan(`/team run ${teamId} "task"`)} to execute.\n`);
+        return;
+      }
+      if (subcommand === 'run') {
+        const teamId = parts[2];
+        const task = parts.slice(3).join(' ').trim();
+        if (!teamId || !task) {
+          console.log('\n  Usage: /team run <team-id> "task"\n');
+          return;
+        }
+        const result = await runtime.runTeam(teamId, task);
+        console.log(`\n  ${this.green(`${result.team.identity.name}[subteam] >`)} ${result.result}\n`);
+        return;
+      }
+
+      const teamId = subcommand;
+      const tree = teamId ? runtime.getTeamTree(teamId) : undefined;
+      if (!tree) {
+        console.log(teamId ? `\n  ${this.red(`Team not found: ${teamId}`)}\n` : '\n  Usage: /team <team-id>\n');
+        return;
+      }
+      const team = tree.team;
+      console.log('\n  ' + this.bold(`${team.identity.name} [${team.identity.id}]`));
+      console.log(`    Parent: ${team.identity.parentAgentId}`);
+      console.log(`    Status: ${team.status}`);
+      console.log(`    FSM:    ${team.fsmState}`);
+      console.log(`    ToM:    ${team.identity.tomLevel}`);
+      console.log(`    Lead:   ${team.leadAgentId ?? 'none'}`);
+      console.log(`    Tokens: ${team.tokenUsage.totalTokens} (members ${team.tokenUsage.totalTokens - team.synthesisUsage.totalTokens}, synthesis ${team.synthesisUsage.totalTokens})`);
+      console.log(`    Task:   ${team.task ?? 'none'}`);
+      console.log(`    Result: ${team.result ?? 'none'}`);
+      tree.members.forEach((member, index) => {
+        this.printTeamMemberTree(member, '    ', index === tree.members.length - 1);
+      });
+      console.log('');
+    } catch (error) {
+      console.log(`\n  ${this.red('[ERROR]')} ${error instanceof Error ? error.message : String(error)}\n`);
+    }
   }
 
   private printMemory(): void {
@@ -1282,7 +1392,7 @@ export class Roy {
 
   private completer(line: string): [string[], string] {
     const commands = [
-      '/help', '/h', '/clear', '/cls', '/reset', '/agents', '/spawn', '/run', '/teams', '/exit', '/quit', '/q',
+      '/help', '/h', '/clear', '/cls', '/reset', '/agents', '/spawn', '/run', '/teams', '/team', '/exit', '/quit', '/q',
       '/api', '/status', '/skills', '/actions', '/tools', '/memory', '/session',
       '/system', '/fsm', '/budget', '/events', '/queue', '/cache', '/messages', '/traces', '/config', '/prompt', '/context', '/conversation', '/verbose', '/color'
     ];

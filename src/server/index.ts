@@ -314,13 +314,56 @@ async function main(): Promise<void> {
     res.json(runtime.getTeams());
   });
 
+  app.get('/v1/teams/tree', (req, res) => {
+    res.json(runtime.getTeamActorTree());
+  });
+
+  app.post('/v1/teams', async (req, res) => {
+    const body = req.body ?? {};
+    if (typeof body.name !== 'string' || typeof body.description !== 'string') {
+      res.status(400).json({ error: 'Expected body { name, description, parentAgentId?, tomLevel?, task?, members? }' });
+      return;
+    }
+    try {
+      res.status(201).json(await runtime.spawnTeam(body));
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
   app.get('/v1/teams/:id', (req, res) => {
-    const team = runtime.getTeam(req.params.id);
+    const team = runtime.getTeamTree(req.params.id);
     if (!team) {
       res.status(404).json({ error: `Team "${req.params.id}" not found` });
       return;
     }
     res.json(team);
+  });
+
+  app.post('/v1/teams/:id/agents', async (req, res) => {
+    const body = req.body ?? {};
+    if (typeof body.archetype !== 'string' || typeof body.task !== 'string') {
+      res.status(400).json({ error: 'Expected body { archetype, task, name?, role?, tools?, skills?, budgetTokens?, tomLevel?, lead? }' });
+      return;
+    }
+    try {
+      res.status(201).json(await runtime.spawnAgentIntoTeam(req.params.id, body));
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post('/v1/teams/:id/run', async (req, res) => {
+    const task = req.body?.task;
+    if (typeof task !== 'string' || task.trim().length === 0) {
+      res.status(400).json({ error: 'Expected body { "task": non-empty string }' });
+      return;
+    }
+    try {
+      res.json(await runtime.runTeam(req.params.id, task));
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
   });
 
   app.get('/v1/tools/approvals', (req, res) => {
