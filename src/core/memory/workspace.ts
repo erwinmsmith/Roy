@@ -145,10 +145,38 @@ export interface WorkspaceRuntimeConfig {
     maxTotalAgentsPerTurn: number;
     allowCustomAgents: boolean;
     budgetAware: boolean;
+    candidateScoring: {
+      enabledScorers: Array<'heuristic' | 'cost' | 'tom' | 'cache_evolution' | 'llm'>;
+      minimumScore: number;
+    };
   };
   agents: {
     defaultToolsByArchetype: Record<string, string[]>;
     defaultSkillsByArchetype: Record<string, string[]>;
+  };
+  context: {
+    sessionWindowTurns: number;
+    maxContextTokens: number;
+    includeToolResults: 'none' | 'summary';
+    includeSubagentReports: 'none' | 'summary' | 'full';
+    includePrivateMemory: boolean;
+    includePublicMemory: boolean;
+  };
+  budgetMarket: {
+    enabled: boolean;
+    minimumGrantTokens: number;
+  };
+  tools: {
+    approval: {
+      readOnly: 'auto' | 'ask' | 'deny';
+      write: 'auto' | 'ask' | 'deny';
+      execute: 'auto' | 'ask' | 'deny';
+      overrides: Record<string, 'auto' | 'ask' | 'deny'>;
+    };
+  };
+  teams: {
+    enabled: boolean;
+    createForMultipleAgents: boolean;
   };
 }
 
@@ -157,6 +185,14 @@ export interface DelegationPatternInput {
   task: string;
   parentId: string;
   agentPatternId: string;
+}
+
+export interface TeamPatternInput {
+  key: string;
+  name: string;
+  purpose: string;
+  parentId: string;
+  memberArchetypes: string[];
 }
 
 export interface MemorySignals {
@@ -342,6 +378,10 @@ const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
     maxTotalAgentsPerTurn: 10,
     allowCustomAgents: true,
     budgetAware: true,
+    candidateScoring: {
+      enabledScorers: ['heuristic', 'cost', 'tom', 'cache_evolution', 'llm'],
+      minimumScore: 0.05,
+    },
   },
   agents: {
     defaultToolsByArchetype: {
@@ -362,6 +402,30 @@ const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
       tester: ['use_tool_when_needed', 'delegate_to_subagent'],
       custom: [],
     },
+  },
+  context: {
+    sessionWindowTurns: 10,
+    maxContextTokens: 4000,
+    includeToolResults: 'summary',
+    includeSubagentReports: 'summary',
+    includePrivateMemory: true,
+    includePublicMemory: true,
+  },
+  budgetMarket: {
+    enabled: true,
+    minimumGrantTokens: 256,
+  },
+  tools: {
+    approval: {
+      readOnly: 'auto',
+      write: 'ask',
+      execute: 'ask',
+      overrides: {},
+    },
+  },
+  teams: {
+    enabled: true,
+    createForMultipleAgents: true,
   },
 };
 
@@ -408,6 +472,7 @@ export class WorkspaceMemoryManager {
     await this.writeIfMissing(path.join(cachePath, 'tool-results.json'), JSON.stringify({ results: [] }, null, 2) + '\n');
     await this.writeIfMissing(path.join(cachePath, 'memory-proposals.json'), JSON.stringify({ proposals: [] }, null, 2) + '\n');
     await this.writeIfMissing(path.join(cachePath, 'memory-updates.json'), JSON.stringify({ updates: [] }, null, 2) + '\n');
+    await this.writeIfMissing(path.join(cachePath, 'evolution-history.jsonl'), '');
     await this.writeIfMissing(
       path.join(this.rootPath, 'config.json'),
       JSON.stringify(DEFAULT_WORKSPACE_CONFIG, null, 2) + '\n'
@@ -568,6 +633,19 @@ Keep this agent identity separate from the model provider identity.
     const safeKey = this.safeKey(agentKey);
     const fileName = doc.endsWith('.md') ? doc : `${doc}.md`;
     return this.readOptional(path.join(this.rootPath, 'agents', safeKey, fileName));
+  }
+
+  async readTeamDoc(teamKey: string, doc = 'memory'): Promise<string> {
+    const safeKey = this.safeKey(teamKey);
+    const fileName = doc.endsWith('.md') || doc.endsWith('.json') ? doc : `${doc}.md`;
+    return this.readOptional(path.join(this.rootPath, 'teams', safeKey, fileName));
+  }
+
+  async writeTeamTopology(teamKey: string, topology: Record<string, unknown>): Promise<void> {
+    const safeKey = this.safeKey(teamKey);
+    const teamPath = path.join(this.rootPath, 'teams', safeKey);
+    await mkdir(teamPath, { recursive: true });
+    await writeFile(path.join(teamPath, 'topology.json'), JSON.stringify(topology, null, 2) + '\n', 'utf8');
   }
 
   async getMemoryMode(): Promise<MemoryMode> {
@@ -927,6 +1005,31 @@ Keep this agent identity separate from the model provider identity.
     return patterns.find(pattern => pattern.key === key || pattern.archetype === key);
   }
 
+  async recordAgentPatternOutcome(archetype: string, outcome: { success: boolean; grounded: boolean; totalTokens: number }): Promise<void> {
+    const key = this.safeKey(archetype);
+    const cachePath = path.join(this.rootPath, 'cache', 'agent-patterns.json');
+    const file = await this.readJson<{ patterns?: Array<Record<string, unknown>> }>(cachePath, { patterns: [] });
+    const patterns = file.patterns ?? [];
+    const pattern = patterns.find(item => item.key === key || item.archetype === key);
+    if (!pattern) return;
+    const evaluation = (pattern.evaluation as Record<string, unknown> | undefined) ?? {};
+    const runs = Number(evaluation.runs ?? 0) + 1;
+    const successes = Number(evaluation.successes ?? 0) + (outcome.success ? 1 : 0);
+    const groundedRuns = Number(evaluation.groundedRuns ?? 0) + (outcome.grounded ? 1 : 0);
+    const previousAverage = Number(evaluation.averageTokens ?? 0);
+    pattern.evaluation = {
+      runs,
+      successes,
+      groundedRuns,
+      successRate: Number((successes / runs).toFixed(4)),
+      groundingRate: Number((groundedRuns / runs).toFixed(4)),
+      averageTokens: Math.round(((previousAverage * (runs - 1)) + outcome.totalTokens) / runs),
+      lastEvaluatedAt: new Date().toISOString(),
+    };
+    pattern.status = runs >= 3 && successes / runs >= 0.67 ? 'active' : outcome.success ? 'candidate' : 'candidate_failed';
+    await writeFile(cachePath, JSON.stringify({ patterns }, null, 2) + '\n', 'utf8');
+  }
+
   async findDelegationPattern(archetype: string, task: string): Promise<Record<string, unknown> | undefined> {
     const signature = this.delegationSignature(archetype, task);
     const patterns = await this.readPatterns('delegation-patterns.json') as Array<Record<string, unknown>>;
@@ -963,6 +1066,47 @@ Keep this agent identity separate from the model provider identity.
     return pattern;
   }
 
+  async ensureTeamMemory(teamKey: string, options: { name: string; purpose: string }): Promise<string> {
+    const key = this.safeKey(teamKey);
+    const teamPath = path.join(this.rootPath, 'teams', key);
+    await mkdir(teamPath, { recursive: true });
+    await this.writeIfMissing(path.join(teamPath, 'team.md'), `# ${options.name}\n\n${options.purpose}\n`);
+    await this.writeIfMissing(path.join(teamPath, 'memory.md'), '# Team Memory\n\n<!-- ROY:BEGIN:team-lessons -->\n<!-- ROY:END:team-lessons -->\n');
+    await this.writeIfMissing(path.join(teamPath, 'topology.json'), JSON.stringify({ type: 'parent-child', members: [] }, null, 2) + '\n');
+    await this.writeIfMissing(path.join(teamPath, 'sessions.jsonl'), '');
+    return teamPath;
+  }
+
+  async upsertTeamPattern(input: TeamPatternInput): Promise<Record<string, unknown>> {
+    const key = this.safeKey(input.key);
+    const cachePath = path.join(this.rootPath, 'cache', 'team-patterns.json');
+    const file = await this.readJson<{ patterns?: Array<Record<string, unknown>> }>(cachePath, { patterns: [] });
+    const patterns = file.patterns ?? [];
+    const id = `team_pattern_${key}_v1`;
+    const existing = patterns.find(pattern => pattern.id === id || pattern.key === key);
+    const now = new Date().toISOString();
+    const pattern = {
+      id,
+      key,
+      name: input.name,
+      purpose: input.purpose,
+      parentId: input.parentId,
+      memberArchetypes: input.memberArchetypes,
+      memoryPath: `.roy/teams/${key}/memory.md`,
+      topologyPath: `.roy/teams/${key}/topology.json`,
+      status: Number((existing?.usage as Record<string, unknown> | undefined)?.count ?? 0) >= 2 ? 'active' : 'candidate',
+      usage: {
+        count: Number((existing?.usage as Record<string, unknown> | undefined)?.count ?? 0) + 1,
+        lastUsedAt: now,
+      },
+      updatedAt: now,
+    };
+    if (existing) Object.assign(existing, pattern);
+    else patterns.push(pattern);
+    await writeFile(cachePath, JSON.stringify({ patterns }, null, 2) + '\n', 'utf8');
+    return pattern;
+  }
+
   async updateCacheUsageMetrics(patternIds: string[], metrics: { definitionTokensSaved?: number; renderedPromptTokens?: number }): Promise<void> {
     await Promise.all([
       this.updatePatternUsageMetrics('agent-patterns.json', patternIds, metrics),
@@ -977,6 +1121,29 @@ Keep this agent identity separate from the model provider identity.
         ? 'delegation-patterns.json'
         : 'team-patterns.json';
     return this.readPatterns(fileName) as Promise<Array<Record<string, unknown>>>;
+  }
+
+  async recordEvolutionRun(record: Record<string, unknown>): Promise<void> {
+    await appendFile(
+      path.join(this.rootPath, 'cache', 'evolution-history.jsonl'),
+      JSON.stringify({ ...record, recordedAt: Date.now() }) + '\n',
+      'utf8'
+    );
+  }
+
+  async readEvolutionHistory(limit = 50): Promise<Array<Record<string, unknown>>> {
+    const raw = await this.readOptional(path.join(this.rootPath, 'cache', 'evolution-history.jsonl'));
+    if (!raw.trim()) return [];
+    const records = raw.trim().split('\n')
+      .map(line => {
+        try {
+          return JSON.parse(line) as Record<string, unknown>;
+        } catch {
+          return undefined;
+        }
+      })
+      .filter((record): record is Record<string, unknown> => record !== undefined);
+    return limit > 0 ? records.slice(-limit) : records;
   }
 
   async listTraces(): Promise<Array<{ name: string; path: string; size: number; updatedAt: number }>> {

@@ -1,9 +1,8 @@
 // Agent Manager - manages agents and sessions
 
 import type { BaseAgent } from '../agent/BaseAgent.js';
-import { MessageQueue, type QueueMessage } from '../message/MessageQueue.js';
+import { MessageQueue } from '../message/MessageQueue.js';
 import type { LLMProvider } from '../llm/types.js';
-import type { FSM } from '../executor/FSM.js';
 import { llmFactory } from '../llm/index.js';
 import { logger } from '../utils/logger.js';
 
@@ -11,7 +10,6 @@ interface Session {
   id: string;
   agents: BaseAgent[];
   messageQueue: MessageQueue;
-  tasks: Array<{ cancel: () => void }>;
 }
 
 export class AgentManager {
@@ -108,7 +106,6 @@ export class AgentManager {
       id: sessionId,
       agents: [],
       messageQueue,
-      tasks: [],
     };
 
     // Initialize all agents with this session
@@ -118,12 +115,6 @@ export class AgentManager {
         logger.error(`Failed to initialize agent ${agent.name}:`, err);
       });
       session.agents.push(agent);
-
-      // Start agent run loop
-      const task = {
-        cancel: () => { /* placeholder */ }
-      };
-      session.tasks.push(task);
     }
 
     this.sessions.set(sessionId, session);
@@ -145,11 +136,6 @@ export class AgentManager {
   async closeSession(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
-
-    // Cancel all tasks
-    for (const task of session.tasks) {
-      task.cancel();
-    }
 
     // Cleanup agents
     for (const agent of session.agents) {
@@ -204,8 +190,7 @@ export class AgentManager {
       throw new Error(`Agent ${this.interactWithEnv} not found`);
     }
 
-    // This would need the agent to emit messages through the queue
-    // For now, we stream from the message queue
+    // Agent responses are emitted to the environment receiver through the session queue.
     let done = false;
     while (!done) {
       const msg = await session.messageQueue.receive('env');

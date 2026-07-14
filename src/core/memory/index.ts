@@ -133,6 +133,7 @@ export type {
   MemoryUpdateRecord,
   PatternCacheState,
   RootMemoryContext,
+  TeamPatternInput,
   WorkspaceRuntimeConfig,
   WorkspaceMemoryState,
 } from './workspace.js';

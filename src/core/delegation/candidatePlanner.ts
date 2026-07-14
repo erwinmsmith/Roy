@@ -1,22 +1,21 @@
-import type { SubAgentArchetype } from '../runtime/Runtime.js';
+import type { LLMProvider } from '../llm/types.js';
+import { EvolutionEngine, type EvolutionEvaluation, type EvolutionStrategy } from '../evolution/index.js';
 import type {
   DelegationCandidate,
   DelegationCandidateInput,
+  DelegationCandidateScorer,
   DelegationCandidateSelection,
   DelegationCandidateSource,
 } from './types.js';
+import {
+  CacheEvolutionDelegationScorer,
+  CostDelegationScorer,
+  HeuristicDelegationScorer,
+  LLMDelegationScorer,
+  ToMDelegationScorer,
+} from './scorers.js';
 
-const ARCHETYPE_UTILITY: Record<SubAgentArchetype, number> = {
-  researcher: 0.78,
-  critic: 0.72,
-  planner: 0.62,
-  coder: 0.7,
-  summarizer: 0.48,
-  tester: 0.66,
-  custom: 0.58,
-};
-
-const ARCHETYPE_COST: Record<SubAgentArchetype, number> = {
+const ARCHETYPE_COST: Record<string, number> = {
   researcher: 2200,
   critic: 1600,
   planner: 1400,
@@ -26,45 +25,51 @@ const ARCHETYPE_COST: Record<SubAgentArchetype, number> = {
   custom: 1800,
 };
 
+export interface DelegationCandidatePlannerOptions {
+  llm?: LLMProvider | null;
+  scorers?: DelegationCandidateScorer[];
+  minimumScore?: number;
+  enabledScorers?: string[];
+}
+
 export class DefaultDelegationCandidatePlanner {
-  select(input: DelegationCandidateInput): DelegationCandidateSelection {
-    if (input.decision.action !== 'spawn_subagents') {
-      return {
-        candidates: [],
-        decision: input.decision,
-      };
-    }
+  private readonly scorers: DelegationCandidateScorer[];
+  private readonly minimumScore: number;
 
-    const limit = Math.max(0, Math.min(
-      input.allowedChildren,
-      input.remainingTotalAgentsForTurn,
-      input.decision.agents.length
-    ));
+  constructor(options: DelegationCandidatePlannerOptions = {}) {
+    const defaultScorers = [
+      new HeuristicDelegationScorer(),
+      new CostDelegationScorer(),
+      new ToMDelegationScorer(),
+      new CacheEvolutionDelegationScorer(),
+      ...(options.llm ? [new LLMDelegationScorer(options.llm)] : []),
+    ];
+    this.scorers = options.scorers ?? defaultScorers.filter(scorer => !options.enabledScorers || options.enabledScorers.includes(scorer.name));
+    this.minimumScore = options.minimumScore ?? 0.05;
+  }
 
+  async select(input: DelegationCandidateInput): Promise<DelegationCandidateSelection> {
+    if (input.decision.action !== 'spawn_subagents') return { candidates: [], decision: input.decision };
+    const limit = Math.max(0, Math.min(input.allowedChildren, input.remainingTotalAgentsForTurn, input.decision.agents.length));
     if (limit <= 0) {
       return {
         candidates: [],
-        decision: {
-          action: 'solve_directly',
-          reason: `${input.decision.reason} Delegation skipped because no agent slots remain for this turn or parent.`,
-        },
+        decision: { action: 'solve_directly', reason: `${input.decision.reason} Delegation skipped because no agent slots remain for this turn or parent.` },
         rejectedReason: 'no_agent_slots_remaining',
       };
     }
 
-    const candidates = this.generateCandidates(input, limit);
-    const selected = candidates[0];
-    if (!selected || selected.agents.length === 0) {
+    const engine = new EvolutionEngine<DelegationCandidateInput, DelegationCandidate>(this.createStrategy(limit));
+    const run = await engine.run(input);
+    const candidates = run.evaluated.map(item => item.candidate).sort((a, b) => b.score - a.score);
+    const selected = run.selected?.candidate;
+    if (!selected || selected.score < this.minimumScore || selected.agents.length === 0) {
       return {
         candidates,
-        decision: {
-          action: 'solve_directly',
-          reason: `${input.decision.reason} Delegation skipped because no candidate passed policy scoring.`,
-        },
+        decision: { action: 'solve_directly', reason: `${input.decision.reason} Delegation skipped because no candidate passed policy scoring.` },
         rejectedReason: 'no_candidate_selected',
       };
     }
-
     return {
       candidates,
       selected,
@@ -76,85 +81,83 @@ export class DefaultDelegationCandidatePlanner {
     };
   }
 
-  private generateCandidates(input: DelegationCandidateInput, limit: number): DelegationCandidate[] {
-    const boundedAgents = input.decision.action === 'spawn_subagents'
-      ? input.decision.agents.slice(0, limit)
-      : [];
-    const candidates: DelegationCandidate[] = [];
-
-    if (boundedAgents.length > 0) {
-      candidates.push(this.scoreCandidate({
-        id: 'candidate_full_plan',
-        parentId: input.parentId,
-        agents: boundedAgents,
-        source: this.sourceFor(boundedAgents, input.cacheUsed),
-        rationale: 'uses the highest-ranked bounded delegation plan',
-        task: input.task,
-        budgetMode: input.budgetMode,
-        remainingBudgetTokens: input.remainingBudgetTokens,
-      }));
-    }
-
-    const topSingle = boundedAgents[0];
-    if (topSingle && boundedAgents.length > 1) {
-      candidates.push(this.scoreCandidate({
-        id: `candidate_single_${topSingle.archetype}`,
-        parentId: input.parentId,
-        agents: [topSingle],
-        source: input.cacheUsed ? 'cache_hit' : topSingle.archetype === 'custom' ? 'custom_generated' : 'generated',
-        rationale: 'uses the most valuable single specialist to reduce cost and branching',
-        task: input.task,
-        budgetMode: input.budgetMode,
-        remainingBudgetTokens: input.remainingBudgetTokens,
-      }));
-    }
-
-    return candidates.sort((a, b) => b.score - a.score);
-  }
-
-  private scoreCandidate(input: {
-    id: string;
-    parentId: string;
-    agents: DelegationCandidate['agents'];
-    source: DelegationCandidateSource;
-    rationale: string;
-    task: string;
-    budgetMode: 'unlimited' | 'limited';
-    remainingBudgetTokens?: number;
-  }): DelegationCandidate {
-    const expectedUtility = input.agents.reduce((total, agent) => {
-      const base = ARCHETYPE_UTILITY[agent.archetype] ?? 0.5;
-      return total + base + this.taskMatchBonus(input.task, agent.archetype);
-    }, 0);
-    const expectedCostTokens = input.agents.reduce((total, agent) => total + (agent.budgetTokens ?? ARCHETYPE_COST[agent.archetype] ?? 1800), 0);
-    const budgetPenalty = input.budgetMode === 'limited' && input.remainingBudgetTokens !== undefined
-      ? Math.max(0, expectedCostTokens - input.remainingBudgetTokens) / 2000
-      : 0;
-    const branchingPenalty = Math.max(0, input.agents.length - 1) * 0.1;
-    const cacheBonus = input.source === 'cache_hit' || input.source === 'mixed' ? 0.15 : 0;
-    const score = expectedUtility + cacheBonus - expectedCostTokens / 10000 - budgetPenalty - branchingPenalty;
-
+  private createStrategy(limit: number): EvolutionStrategy<DelegationCandidateInput, DelegationCandidate> {
     return {
-      id: input.id,
-      source: input.source,
-      parentId: input.parentId,
-      agents: input.agents,
-      expectedUtility: Number(expectedUtility.toFixed(3)),
-      expectedCostTokens,
-      score: Number(score.toFixed(3)),
-      rationale: input.rationale,
+      propose: input => this.generateCandidates(input, limit),
+      evaluate: (candidates, input) => this.evaluateCandidates(candidates, input),
+      select: evaluated => [...evaluated].sort((a, b) => b.score - a.score)[0],
     };
   }
 
-  private taskMatchBonus(task: string, archetype: SubAgentArchetype): number {
-    const lower = task.toLowerCase();
-    if (archetype === 'researcher' && /\b(inspect|read|list|evidence|structure)\b/.test(lower)) return 0.16;
-    if (archetype === 'critic' && /\b(risk|review|critique|failure|gap)\b/.test(lower)) return 0.16;
-    if (archetype === 'tester' && /\b(test|verify|coverage|regression)\b/.test(lower)) return 0.14;
-    if (archetype === 'planner' && /\b(plan|steps|roadmap|design)\b/.test(lower)) return 0.12;
-    if (archetype === 'coder' && /\b(code|implement|fix|patch)\b/.test(lower)) return 0.14;
-    if (archetype === 'custom' && /\b(prompt|slot|context|special)\b/.test(lower)) return 0.12;
-    return 0;
+  private generateCandidates(input: DelegationCandidateInput, limit: number): DelegationCandidate[] {
+    if (input.decision.action !== 'spawn_subagents') return [];
+    const bounded = input.decision.agents.slice(0, limit);
+    const candidates: DelegationCandidate[] = [];
+    if (bounded.length > 0) {
+      candidates.push(this.createCandidate('candidate_full_plan', input.parentId, bounded, this.sourceFor(bounded, input.cacheUsed), 'uses the complete bounded delegation plan'));
+    }
+    if (bounded.length > 1) {
+      candidates.push(this.createCandidate(`candidate_single_${bounded[0].archetype}`, input.parentId, [bounded[0]], input.cacheUsed ? 'cache_hit' : bounded[0].archetype === 'custom' ? 'custom_generated' : 'generated', 'uses the highest-priority specialist to reduce cost'));
+    }
+    const cached = input.cachedPatterns ?? [];
+    if (cached.length > 0 && bounded.length > 0) {
+      const patternIds = cached.map(pattern => String(pattern.id ?? '')).filter(Boolean);
+      const mutated = bounded.map(agent => {
+        const pattern = cached.find(item => item.archetype === agent.archetype || item.key === agent.archetype);
+        return {
+          ...agent,
+          tools: this.mergeStringLists(agent.tools, pattern?.tools),
+          skills: this.mergeStringLists(agent.skills, pattern?.skills),
+        };
+      });
+      candidates.push({
+        ...this.createCandidate('candidate_mutated_cache', input.parentId, mutated, 'mutated_from_cache', 'adapts cached bindings to the current task while preserving fresh runtime instances'),
+        lineage: { parentPatternIds: patternIds, mutation: 'merge cached tool and skill bindings into current task plan' },
+      });
+    }
+    return candidates;
+  }
+
+  private async evaluateCandidates(
+    candidates: DelegationCandidate[],
+    input: DelegationCandidateInput
+  ): Promise<Array<EvolutionEvaluation<DelegationCandidate>>> {
+    const outputs = await Promise.all(this.scorers.map(async scorer => ({
+      name: scorer.name,
+      values: await scorer.score(candidates, input),
+    })));
+    return candidates.map(candidate => {
+      const breakdown = Object.fromEntries(outputs.map(output => [output.name, Number((output.values.get(candidate.id) ?? 0).toFixed(4))]));
+      const score = Object.values(breakdown).reduce((sum, value) => sum + value, 0);
+      const expectedUtility = Math.max(0, (breakdown.heuristic ?? 0) + (breakdown.tom ?? 0) + (breakdown.cache_evolution ?? 0));
+      const evaluated = {
+        ...candidate,
+        expectedUtility: Number(expectedUtility.toFixed(4)),
+        score: Number(score.toFixed(4)),
+        scoreBreakdown: breakdown,
+      };
+      return { candidate: evaluated, score: evaluated.score, breakdown };
+    });
+  }
+
+  private createCandidate(
+    id: string,
+    parentId: string,
+    agents: DelegationCandidate['agents'],
+    source: DelegationCandidateSource,
+    rationale: string
+  ): DelegationCandidate {
+    return {
+      id,
+      source,
+      parentId,
+      agents,
+      expectedUtility: 0,
+      expectedCostTokens: agents.reduce((sum, agent) => sum + (agent.budgetTokens ?? ARCHETYPE_COST[agent.archetype] ?? 1800), 0),
+      score: 0,
+      scoreBreakdown: {},
+      rationale,
+    };
   }
 
   private sourceFor(agents: DelegationCandidate['agents'], cacheUsed: boolean): DelegationCandidateSource {
@@ -162,5 +165,11 @@ export class DefaultDelegationCandidatePlanner {
     if (cacheUsed) return 'cache_hit';
     if (agents.some(agent => agent.archetype === 'custom')) return 'custom_generated';
     return 'generated';
+  }
+
+  private mergeStringLists(primary: string[] | undefined, cached: unknown): string[] | undefined {
+    const cachedList = Array.isArray(cached) ? cached.filter((value): value is string => typeof value === 'string') : [];
+    const merged = Array.from(new Set([...(primary ?? []), ...cachedList]));
+    return merged.length > 0 ? merged : undefined;
   }
 }

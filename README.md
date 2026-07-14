@@ -1,107 +1,224 @@
 # Roy
 
-Roy is an TypeScript framework for building dynamically expanding multi-agent systems. It starts from a single root agent and grows a Theory-of-Mind-aware reasoning structure only when the current reasoning trace shows that more perspective, verification, evidence, or decomposition is worth the cost.
+Roy is a TypeScript runtime for building observable, budget-aware, Theory-of-Mind multi-agent systems. A session starts with Roy as the root agent. Roy can solve a task directly, request clarification, or create a bounded tree of specialized child agents and subteams.
 
-The core design is based on FSM-controlled Evo-ToM expansion: finite-state control governs when the system can expand, ToM/MIA diagnosis explains why expansion may be needed, a market-style allocator estimates whether the next thinking investment is worth paying for, and EvoAgent-style derivation creates or reuses specialized agents and subteams.
+Every agent is a runtime actor with an identity, strict finite-state lifecycle, approved skills and tools, a private memory boundary, token accounting, parent-child relationships, and persisted message/event traces. CLI and HTTP interfaces are adapters over the same runtime.
 
-## Core Idea
-
-Most multi-agent systems begin with a predefined team. Roy takes the opposite approach. A task starts with one first-order root agent. As the trace develops, the system diagnoses uncertainty, disagreement, missing evidence, blind spots, and reliability gaps. Only then can the finite-state controller decide whether to continue solo reasoning, reuse cached reasoning structures, derive a new agent, derive a ToM-aware subteam, verify, backtrack, merge results, or finalize.
-
-This keeps the multi-agent structure adaptive instead of fixed:
+## Runtime Model
 
 ```text
-root agent
-  -> diagnose reasoning bottleneck
-  -> estimate expected reasoning return
-  -> derive or reuse agent/subteam when useful
-  -> execute ToM-aware inference
-  -> merge explicit outputs and meta-traces
-  -> verify, backtrack, or finalize
+User input
+  -> CLI or HTTP adapter
+  -> ContextWindowManager
+  -> Roy delegation assessment
+  -> candidate propose / evaluate / select
+  -> solve directly or create child agents/subteam
+  -> message-mediated execution
+  -> tool policy and approval
+  -> parent-level synthesis
+  -> final response
+  -> trace, cache, memory proposal, and budget settlement
 ```
 
-## Architecture
+The runtime supports recursive delegation:
 
-Roy combines several layers:
+```text
+Roy [root]
+├── Researcher-1
+│   └── Critic-1
+└── Planner-1
+    └── Tester-1
+```
 
-- **FSM control**: explicit runtime states decide when the system should continue, diagnose, derive, reuse, execute, merge, verify, backtrack, or finish.
-- **ToM/MIA diagnosis**: reasoning traces are inspected for beliefs, uncertainty, reliability, evidence coverage, disagreement, and blind spots.
-- **Market-based thinking allocation**: candidate reasoning investments are scored by expected gain, cost, risk, budget pressure, and relevance to the user's objective.
-- **Evo-style derivation**: mutation, crossover, and selection generate candidate agents or ToM-aware subteams from the current parent unit.
-- **Cache reuse**: previously useful agents, subteams, bottleneck mappings, team-generation directions, and ToM inference traces can be reused when cheaper than recomputation.
-- **Modular prompt management**: prompts are treated as versioned contracts with structured inputs and outputs rather than inline strings hidden inside agent logic.
+Each parent owns its direct children and synthesizes their results before returning a result upward.
 
-## Current Implementation
+## Core Architecture
 
-The repository currently includes:
+```text
+src/core/
+  agent/        Agent identity, state, usage, and execution
+  runtime/      Runtime orchestration and actor registry
+  context/      Bounded public/private/session context construction
+  executor/     Strict FSM and signal control
+  delegation/   Candidate generation and pluggable scorers
+  evolution/    Propose/evaluate/select execution pipeline
+  budget/       Token allocation market and settlement
+  team/         Formal subteam actor registry
+  queue/        Runtime message queue and scheduler
+  memory/       Workspace memory, sessions, traces, and caches
+  skills/       Agent-facing composed capabilities
+  tools/        Tool registry, planning, policy, and approvals
+  prompts/      Prompt templates and slot rendering
+  llm/          Anthropic and OpenAI-compatible providers
 
-- action and planner primitives
-- base, conversational, and action-oriented agents
-- an executor layer with FSM and signal bus components
-- LLM provider abstractions for Anthropic and OpenAI-compatible APIs
-- short-term, long-term, and contextual memory interfaces
-- prompt templates for conversational, action, FSM, and G1-style reasoning
-- tool and skill registries
-- configuration loading from environment variables and YAML
-- structured logging/event transport modules
-- an Express + Socket.IO server entry point
-- Vitest coverage for core action and signal bus behavior
+src/cli/        Terminal adapter
+src/server/     Express and Socket.IO adapter
+```
+
+## Delegation Scoring
+
+Delegation candidates are evaluated by replaceable scorers:
+
+- task/archetype fit
+- expected token cost and remaining budget
+- ToM role complementarity
+- cache similarity using deterministic task embeddings
+- cache reuse and mutation lineage
+- LLM-based candidate evaluation
+
+Candidate generation and selection run through an explicit `propose -> evaluate -> select` pipeline. Evaluations are written to `.roy/cache/evolution-history.jsonl` for inspection and later reuse.
+
+## Context And Memory
+
+Roy initializes a project-local `.roy/` workspace:
+
+```text
+.roy/
+  public/       Shared project, context, decision, and constraint memory
+  agents/       Private identity, prompt, context, memory, state, and sessions
+  teams/        Team memory and topology
+  cache/        Agent, delegation, team, proposal, and evolution records
+  queue/        Queue state location
+  sessions/     Complete conversation JSONL files
+  traces/       Runtime event traces
+  config.json   Workspace runtime policy
+```
+
+`ContextWindowManager` loads bounded public memory, the current agent's private memory, approved parent context, and a compact recent-session window. It never injects another agent's private memory by default.
+
+Agent prompt templates support these runtime slots:
+
+```text
+{{public_context}}
+{{agent_private_memory}}
+{{agent_identity}}
+{{tom_profile}}
+{{available_skills}}
+{{available_tools}}
+{{parent_context}}
+{{task}}
+```
+
+## Tools And Approvals
+
+Built-in tools include:
+
+- `fs.list`
+- `fs.read`
+- `shell.exec`
+
+Agents plan tool use only when the task needs external evidence or execution. Tool availability comes from parent-approved bindings. Read-only tools can run automatically by default; write and execute tools require an approval unless workspace policy overrides them. `shell.exec` also applies its own command allowlist.
+
+## Budget Control
+
+Token metering is always enabled. Without a configured limit, the budget is unlimited. With a limit, the budget market reserves tokens before agent creation, grants or denies requests, and settles allocations against actual usage.
+
+The runtime enforces:
+
+- maximum children per parent
+- maximum agent-tree depth
+- maximum total agents per turn
+- budget-aware candidate reduction
+- per-agent tool-call limits
+- strict FSM states for child creation
 
 ## Installation
 
 ```bash
 npm install
-```
-
-## Configuration
-
-Copy the example environment file and fill in at least one provider key:
-
-```bash
 cp .env.example .env
 ```
 
-Supported environment variables:
+Configure one provider in `.env`. DeepSeek uses the OpenAI-compatible API:
 
 ```text
-ANTHROPIC_API_KEY=
-OPENAI_API_KEY=
-OPENAI_BASE_URL=
-DEFAULT_MODEL=claude-sonnet-4-20250514
-PORT=3000
-LOG_LEVEL=info
+DEEPSEEK_API_KEY=
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEFAULT_MODEL=deepseek-v4-flash
 ```
 
-Roy can also load YAML configuration from `roy.config.yaml` or `roy.config.yml`, with optional secrets from `roy.secrets.yaml` or `roy.secrets.yml`.
+Roy also supports Anthropic and OpenAI-compatible providers through `roy.config.yaml` and environment variables.
 
-## Development
+## Run
 
-Run the development server:
+Start the CLI:
 
-```bash
-npm run dev
-```
-or
 ```bash
 npm run dev:cli
 ```
 
-Build the TypeScript project:
+Start the HTTP and Socket.IO server:
+
+```bash
+npm run dev:server
+```
+
+Build and test:
 
 ```bash
 npm run build
-```
-
-Run tests:
-
-```bash
 npm test
 ```
 
-The server exposes:
+## CLI Commands
 
-- `GET /` for project metadata
-- `GET /health` for agent and session status
-- Socket.IO `user_message` events for streaming agent responses
+```text
+/status
+/agents --tree --tom
+/agents archetypes
+/agents policy <agentId>
+/spawn researcher "Inspect the project structure"
+/spawn critic --parent <agentId> "Review the parent result"
+/teams
+/budget
+/budget market
+/events --latest 50
+/messages --correlation <id>
+/context render researcher --task "Inspect the repository"
+/prompt render researcher --task "Inspect the repository"
+/tools approvals
+/tools approve <approvalId>
+/tools deny <approvalId>
+/memory
+/cache agents
+/cache delegations
+/cache teams
+/cache evolution
+/traces latest
+```
 
-## contact us
+Normal chat input uses root-controlled delegation. `/spawn` remains available for controlled testing and explicit actor creation.
+
+## HTTP API
+
+Primary endpoints:
+
+```text
+POST /v1/chat
+GET  /v1/status
+GET  /v1/agents
+GET  /v1/agents/tree
+POST /v1/agents
+POST /v1/agents/:id/run
+GET  /v1/teams
+GET  /v1/budget
+GET  /v1/budget/market
+GET  /v1/cache/:kind
+GET  /v1/events
+GET  /v1/messages
+GET  /v1/queue
+POST /v1/context/render
+GET  /v1/tools/approvals
+POST /v1/tools/approvals/:id
+POST /v1/tools/:name/execute
+GET  /v1/memory
+GET  /v1/traces
+```
+
+## Validation
+
+The test suite covers root-controlled and recursive delegation, strict nested FSM transitions, context boundaries, subteam lifecycle, candidate scoring, cache mutation, budget allocation, tool approval, memory persistence, queue transitions, and CLI-facing runtime behavior.
+
+## Contact
+
+Use [GitHub Issues](https://github.com/erwinmsmith/Roy/issues) for bug reports and engineering discussions.

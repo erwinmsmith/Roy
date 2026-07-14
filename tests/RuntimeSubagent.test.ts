@@ -110,8 +110,12 @@ describe('Runtime controlled subagent spawning', () => {
     expect(messages.map(message => message.kind)).toEqual([
       'user.command.spawn',
       'agent.create.request',
+      'budget.request',
+      'budget.grant',
       'agent.create.approved',
       'agent.task',
+      'tool.approval.request',
+      'tool.approval.resolved',
       'tool.call',
       'tool.result',
       'agent.result',
@@ -423,7 +427,7 @@ describe('Runtime controlled subagent spawning', () => {
     expect(eventTypes).toContain('root.synthesis.completed');
 
     const parentEvents = runtime.getEvents().filter(event => event.agentId === researcher.identity.id);
-    expect(parentEvents.some(event => event.type === 'agent.fsm.state' && event.data?.state === 'S_synthesize')).toBe(true);
+    expect(parentEvents.some(event => event.type === 'agent.fsm.state' && event.data?.state === 'S_synthesizing')).toBe(true);
     expect(runtime.getBudgetState().perAgent[researcher.identity.id].totalTokens).toBeGreaterThan(0);
     expect(result.finalResponse).toBe('subagent result');
 

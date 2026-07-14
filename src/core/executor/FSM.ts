@@ -1,9 +1,23 @@
 // FSM - Finite State Machine for agent control
 
-import type { SignalBus, Signal } from './SignalBus.js';
+import type { SignalBus } from './SignalBus.js';
 import { signalBus } from './SignalBus.js';
 
 export type FSMState =
+  | 'S_created'
+  | 'S_context_loading'
+  | 'S_ready'
+  | 'S_task_received'
+  | 'S_planning'
+  | 'S_tool_calling'
+  | 'S_reasoning'
+  | 'S_delegating'
+  | 'S_waiting_children'
+  | 'S_synthesizing'
+  | 'S_responding'
+  | 'S_done'
+  | 'S_failed'
+  | 'S_cancelled'
   | 'S_input_received'
   | 'S_assess_task'
   | 'S_solo_reasoning'
@@ -48,6 +62,15 @@ export interface FSMConfig {
   signalBus?: SignalBus;
   onTransition?: (from: FSMState, to: FSMState, context: FSMContext) => void;
   onStateChange?: (state: FSMState, context: FSMContext) => void;
+  onInvalidTransition?: (from: FSMState, to: FSMState, context: FSMContext) => void;
+  strict?: boolean;
+}
+
+export class InvalidFSMTransitionError extends Error {
+  constructor(readonly from: FSMState, readonly to: FSMState) {
+    super(`Invalid FSM transition: ${from} -> ${to}`);
+    this.name = 'InvalidFSMTransitionError';
+  }
 }
 
 export class FSM {
@@ -59,6 +82,7 @@ export class FSM {
 
   private onTransition?: (from: FSMState, to: FSMState, context: FSMContext) => void;
   private onStateChange?: (state: FSMState, context: FSMContext) => void;
+  private onInvalidTransition?: (from: FSMState, to: FSMState, context: FSMContext) => void;
 
   constructor(config: FSMConfig = {}) {
     this.config = config;
@@ -66,6 +90,7 @@ export class FSM {
     this.signalBus = config.signalBus || signalBus;
     this.onTransition = config.onTransition;
     this.onStateChange = config.onStateChange;
+    this.onInvalidTransition = config.onInvalidTransition;
 
     this.context = {
       state: this.state,
@@ -119,6 +144,10 @@ export class FSM {
     if (targetState) {
       // Direct transition to target state
       const transition = this.findTransition(from, targetState);
+      if (!transition && this.config.strict) {
+        this.onInvalidTransition?.(from, targetState, this.context);
+        throw new InvalidFSMTransitionError(from, targetState);
+      }
       if (transition) {
         if (transition.condition) {
           const result = await transition.condition(this.context);
@@ -237,22 +266,61 @@ export class FSM {
    * Register default transitions
    */
   private registerDefaultTransitions(): void {
-    const states: FSMState[] = [
-      'S_input_received', 'S_assess_task', 'S_solo_reasoning',
-      'S_delegate_planning', 'S_spawn_subagents', 'S_wait_subagents',
-      'S_synthesize', 'S_respond', 'S_turn_done',
-      'S_solo', 'S_diagnose', 'S_decide', 'S_derive',
-      'S_reuse', 'S_execute', 'S_merge', 'S_verify',
-      'S_backtrack', 'S_final'
+    const paths: Array<[FSMState, FSMState]> = [
+      ['S_solo', 'S_input_received'],
+      ['S_input_received', 'S_assess_task'],
+      ['S_assess_task', 'S_solo_reasoning'],
+      ['S_assess_task', 'S_delegate_planning'],
+      ['S_solo_reasoning', 'S_respond'],
+      ['S_delegate_planning', 'S_spawn_subagents'],
+      ['S_spawn_subagents', 'S_wait_subagents'],
+      ['S_wait_subagents', 'S_synthesize'],
+      ['S_synthesize', 'S_respond'],
+      ['S_respond', 'S_turn_done'],
+      ['S_turn_done', 'S_solo'],
+      ['S_created', 'S_context_loading'],
+      ['S_created', 'S_ready'],
+      ['S_context_loading', 'S_ready'],
+      ['S_ready', 'S_task_received'],
+      ['S_task_received', 'S_context_loading'],
+      ['S_context_loading', 'S_planning'],
+      ['S_context_loading', 'S_tool_calling'],
+      ['S_context_loading', 'S_reasoning'],
+      ['S_planning', 'S_delegating'],
+      ['S_planning', 'S_reasoning'],
+      ['S_delegating', 'S_waiting_children'],
+      ['S_waiting_children', 'S_synthesizing'],
+      ['S_tool_calling', 'S_reasoning'],
+      ['S_reasoning', 'S_delegating'],
+      ['S_reasoning', 'S_responding'],
+      ['S_synthesizing', 'S_responding'],
+      ['S_responding', 'S_done'],
+      ['S_done', 'S_ready'],
+      ['S_failed', 'S_ready'],
+      ['S_solo', 'S_diagnose'],
+      ['S_diagnose', 'S_decide'],
+      ['S_decide', 'S_solo'],
+      ['S_decide', 'S_derive'],
+      ['S_decide', 'S_reuse'],
+      ['S_decide', 'S_final'],
+      ['S_derive', 'S_execute'],
+      ['S_reuse', 'S_execute'],
+      ['S_execute', 'S_merge'],
+      ['S_merge', 'S_verify'],
+      ['S_verify', 'S_final'],
+      ['S_verify', 'S_backtrack'],
+      ['S_backtrack', 'S_derive'],
     ];
+    for (const [from, to] of paths) this.registerTransition({ from, to });
 
-    for (const state of states) {
-      // Can always transition to S_solo (reset)
-      this.registerTransition({
-        from: state,
-        to: 'S_solo',
-        condition: () => this.context.budget !== null && this.context.cost > this.context.budget * 0.8,
-      });
+    const actorStates: FSMState[] = [
+      'S_created', 'S_context_loading', 'S_ready', 'S_task_received', 'S_planning',
+      'S_tool_calling', 'S_reasoning', 'S_delegating', 'S_waiting_children',
+      'S_synthesizing', 'S_responding', 'S_done',
+    ];
+    for (const state of actorStates) {
+      this.registerTransition({ from: state, to: 'S_failed' });
+      this.registerTransition({ from: state, to: 'S_cancelled' });
     }
   }
 
@@ -262,6 +330,10 @@ export class FSM {
   private findTransition(from: FSMState, to: FSMState): FSMTransition | undefined {
     const key = `${from}:${to}`;
     return this.transitions.get(key)?.[0];
+  }
+
+  canTransition(to: FSMState): boolean {
+    return this.findTransition(this.state, to) !== undefined;
   }
 
   /**

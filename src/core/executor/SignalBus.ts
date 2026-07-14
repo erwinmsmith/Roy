@@ -32,7 +32,6 @@ export interface SignalHandler {
 }
 
 interface PendingSignalHandler {
-  event: Promise<void>;
   resolve: (value?: unknown) => void;
   reject: (error: Error) => void;
   timeoutId?: NodeJS.Timeout;
@@ -147,7 +146,6 @@ export class SignalBus implements SignalHandler {
       let timeoutId: NodeJS.Timeout | undefined;
 
       const pending: PendingSignalHandler = {
-        event: new Promise<void>(res => { /* placeholder */ }),
         resolve: (value?: unknown) => {
           if (timeoutId) clearTimeout(timeoutId);
           resolve(value as T);
@@ -174,6 +172,7 @@ export class SignalBus implements SignalHandler {
           }
           reject(new Error(`Timeout waiting for signal: ${signalName} (${timeoutMs}ms)`));
         }, timeoutMs);
+        pending.timeoutId = timeoutId;
       }
     });
   }

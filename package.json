@@ -1,7 +1,7 @@
 {
   "name": "roy",
   "version": "0.1.0",
-  "description": "Theory of Mind based autonomous derived MAS",
+  "description": "Observable, budget-aware Theory-of-Mind multi-agent runtime",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {

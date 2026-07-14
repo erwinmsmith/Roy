@@ -1,7 +1,6 @@
 // Runtime - Lifecycle management and orchestration for Roy Agent System
 
 import 'dotenv/config';
-import { readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { config } from '../../config/index.js';
 import { logger } from '../utils/logger.js';
@@ -18,6 +17,12 @@ import { skillRegistry } from '../skills/index.js';
 import { DelegateToSubagentSkill } from '../skills/delegation.js';
 import { UseToolWhenNeededSkill } from '../skills/toolUse.js';
 import { DefaultDelegationCandidatePlanner, type DelegationCandidateSelection } from '../delegation/index.js';
+import { ContextWindowManager, type ContextWindow } from '../context/index.js';
+import { BudgetMarket, type BudgetAllocation, type BudgetMarketState } from '../budget/index.js';
+import { TeamRegistry, type TeamRuntimeState } from '../team/index.js';
+import { ToolApprovalManager, type ToolApprovalRequest } from '../tools/approval.js';
+import type { ToolResult } from '../tools/types.js';
+import { AgentToolPlanner } from '../tools/planner.js';
 import {
   InMemoryMessageQueue,
   MessageScheduler,
@@ -165,6 +170,7 @@ export interface SpawnAgentSpec {
   budgetTokens?: number;
   systemPrompt?: string;
   correlationId?: string;
+  teamId?: string;
 }
 
 export interface AgentTreeNode {
@@ -212,6 +218,7 @@ export interface SpawnCommandPayload {
   requireRootSynthesis?: boolean;
   showSubagentOutput?: boolean;
   disableRecursiveDelegation?: boolean;
+  teamId?: string;
 }
 
 export type DelegationDecision =
@@ -307,7 +314,15 @@ export class Runtime {
   private memory: WorkspaceMemoryManager | null = null;
   private agentBindings = new Map<string, AgentBindingState>();
   private workspaceRuntimeConfig: WorkspaceRuntimeConfig | null = null;
-  private readonly candidatePlanner = new DefaultDelegationCandidatePlanner();
+  private contextWindowManager: ContextWindowManager | null = null;
+  private agentFsms = new Map<string, FSM>();
+  private budgetMarket: BudgetMarket | null = null;
+  private agentBudgetAllocations = new Map<string, string>();
+  private toolApprovalManager: ToolApprovalManager | null = null;
+  private toolCallCounts = new Map<string, number>();
+  private readonly teams = new TeamRegistry();
+  private readonly toolPlanner = new AgentToolPlanner();
+  private candidatePlanner: DefaultDelegationCandidatePlanner | null = null;
   private turnAgentCounts = new Map<string, number>();
 
   static getInstance(): Runtime {
@@ -341,6 +356,7 @@ export class Runtime {
     // Create FSM
     const fsm = new FSM({
       initialState: 'S_solo',
+      strict: true,
       signalBus,
       onTransition: (from, to) => {
         logger.debug(`FSM transition: ${from} -> ${to}`);
@@ -351,6 +367,9 @@ export class Runtime {
         logger.debug(`FSM state: ${state}`);
         signalBus.emit('fsm:stateChange', { state });
         this.emit({ type: 'fsm.state.changed', agentId: 'root', data: { state } });
+      },
+      onInvalidTransition: (from, to) => {
+        this.emit({ type: 'fsm.invalid_transition', agentId: 'root', data: { from, to } });
       },
     });
 
@@ -365,8 +384,25 @@ export class Runtime {
     const memory = new WorkspaceMemoryManager();
     await memory.initWorkspace(options.workspaceCwd ?? process.cwd(), options.sessionId ?? 'main');
     this.workspaceRuntimeConfig = await memory.getWorkspaceConfig();
+    this.candidatePlanner = new DefaultDelegationCandidatePlanner({
+      llm,
+      enabledScorers: this.workspaceRuntimeConfig.delegation.candidateScoring.enabledScorers,
+      minimumScore: this.workspaceRuntimeConfig.delegation.candidateScoring.minimumScore,
+    });
+    this.budgetMarket = new BudgetMarket(() => this.ctx ? this.getBudgetState().usedTokens : 0);
+    this.budgetMarket.configure(options.budget ?? null);
+    this.toolApprovalManager = new ToolApprovalManager(this.workspaceRuntimeConfig.tools.approval);
+    const contextWindowManager = new ContextWindowManager(memory, this.workspaceRuntimeConfig.context);
+    this.contextWindowManager = contextWindowManager;
     const rootMemory = await memory.loadAgentMemory('roy');
-    const rootContext = await memory.loadRootContext();
+    const rootWindow = await contextWindowManager.build({
+      sessionId: options.sessionId ?? 'main',
+      agentId: 'root',
+      agentKey: 'roy',
+      role: 'root',
+      task: 'Operate as the root agent for the current Roy runtime session.',
+      memoryScope: this.getDefaultMemoryScope('root'),
+    });
     const queue = new InMemoryMessageQueue(transition => this.handleQueueTransition(transition));
     const scheduler = new MessageScheduler(queue);
 
@@ -379,7 +415,7 @@ export class Runtime {
       task: 'Operate as the root agent for the current Roy runtime session.',
       description: 'You are Roy, the root agent of a Theory-of-Mind based autonomous agent system.',
       bundle: rootMemory,
-      publicContext: this.formatPublicContext(rootContext),
+      publicContext: [rootWindow.publicContext, rootWindow.sessionContext].filter(Boolean).join('\n\n'),
       tomProfile: this.createRootToMProfile(),
       availableSkills: skillRegistry.list().map(skill => skill.name),
       availableTools: toolRegistry.list().map(tool => tool.name),
@@ -437,6 +473,7 @@ export class Runtime {
     this.queue = queue;
     this.scheduler = scheduler;
     this.memory = memory;
+    this.agentFsms.set('root', fsm);
 
     this.initialized = true;
     this.emit({ type: 'runtime.initialized', agentId: 'root', data: { sessionId, provider: llm?.name ?? null } });
@@ -473,7 +510,15 @@ export class Runtime {
     this.scheduler = null;
     this.memory = null;
     this.workspaceRuntimeConfig = null;
+    this.contextWindowManager = null;
+    this.candidatePlanner = null;
     this.agentBindings.clear();
+    this.agentFsms.clear();
+    this.agentBudgetAllocations.clear();
+    this.budgetMarket = null;
+    this.toolApprovalManager = null;
+    this.toolCallCounts.clear();
+    this.teams.clear();
     this.turnAgentCounts.clear();
     this.initialized = false;
     logger.info('Runtime shutdown complete');
@@ -535,12 +580,12 @@ export class Runtime {
   }
 
   private registerCoreSkills(): void {
-    if (!skillRegistry.has('delegate_to_subagent')) {
-      skillRegistry.register(new DelegateToSubagentSkill(() => this));
-    }
-    if (!skillRegistry.has('use_tool_when_needed')) {
-      skillRegistry.register(new UseToolWhenNeededSkill());
-    }
+    skillRegistry.unregister('delegate_to_subagent');
+    skillRegistry.unregister('use_tool_when_needed');
+    skillRegistry.register(new DelegateToSubagentSkill(() => this));
+    skillRegistry.register(new UseToolWhenNeededSkill(
+      (agentId, toolName, params, reason) => this.executeToolForAgent(agentId, toolName, params, { reason })
+    ));
   }
 
   getAgentArchetypeProfiles(): AgentArchetypeProfile[] {
@@ -648,7 +693,320 @@ export class Runtime {
       ctx.fsm.setBudget(limitTokens);
       this.emit({ type: 'budget.updated', data: { mode: 'limited', limitTokens } });
     }
+    this.budgetMarket?.configure(limitTokens);
     return this.getBudgetState();
+  }
+
+  getBudgetMarketState(): BudgetMarketState {
+    if (!this.budgetMarket) throw new Error('Budget market is not initialized');
+    return this.budgetMarket.getState();
+  }
+
+  getTeams(): TeamRuntimeState[] {
+    return this.teams.list();
+  }
+
+  getTeam(teamId: string): TeamRuntimeState | undefined {
+    return this.teams.get(teamId);
+  }
+
+  async createSubteam(input: {
+    parentId: string;
+    name: string;
+    purpose: string;
+    memberArchetypes: SubAgentArchetype[];
+    correlationId?: string;
+  }): Promise<TeamRuntimeState> {
+    if (this.workspaceRuntimeConfig?.teams.enabled === false) throw new Error('Subteams are disabled by workspace policy');
+    const ctx = this.getContext();
+    const parent = ctx.manager.getAgentById(input.parentId);
+    if (!parent) throw new Error(`Parent agent "${input.parentId}" not found`);
+    const request = await this.enqueueMessage({
+      kind: 'team.create.request',
+      sessionId: ctx.sessionId,
+      from: input.parentId,
+      to: 'runtime',
+      correlationId: input.correlationId,
+      payload: input,
+      metadata: { agentId: input.parentId },
+    });
+    await this.processQueuedMessage(request.id);
+    const team = this.teams.create({
+      name: input.name,
+      parentId: input.parentId,
+      purpose: input.purpose,
+      generation: parent.getIdentity().generation + 1,
+      correlationId: input.correlationId,
+    });
+    const teamKey = this.safeAgentKey(input.name);
+    await ctx.memory.ensureTeamMemory(teamKey, { name: input.name, purpose: input.purpose });
+    const pattern = await ctx.memory.upsertTeamPattern({
+      key: teamKey,
+      name: input.name,
+      purpose: input.purpose,
+      parentId: input.parentId,
+      memberArchetypes: input.memberArchetypes,
+    });
+    const approved = await this.enqueueMessage({
+      kind: 'team.create.approved',
+      sessionId: ctx.sessionId,
+      from: 'runtime',
+      to: input.parentId,
+      correlationId: input.correlationId,
+      parentMessageId: request.id,
+      payload: team,
+      metadata: { agentId: input.parentId, teamId: team.identity.id },
+    });
+    await this.processQueuedMessage(approved.id);
+    await ctx.queue.ack(request.id);
+    await ctx.queue.ack(approved.id);
+    this.teams.transition(team.identity.id, 'ready');
+    this.emit({
+      type: 'team.created',
+      agentId: input.parentId,
+      data: { teamId: team.identity.id, name: input.name, purpose: input.purpose, patternId: pattern.id, correlationId: input.correlationId },
+    });
+    return this.teams.get(team.identity.id)!;
+  }
+
+  getToolApprovals(status?: ToolApprovalRequest['status']): ToolApprovalRequest[] {
+    if (!this.toolApprovalManager) throw new Error('Tool approval manager is not initialized');
+    return this.toolApprovalManager.list(status);
+  }
+
+  async executeToolForAgent(
+    agentId: string,
+    toolName: string,
+    params: Record<string, unknown>,
+    options: { reason?: string; approvalId?: string; correlationId?: string } = {}
+  ): Promise<ToolResult> {
+    const ctx = this.getContext();
+    const agent = ctx.manager.getAgentById(agentId);
+    if (!agent) return { success: false, error: `Agent "${agentId}" not found` };
+    const binding = (this.agentBindings.get(agentId)?.tools ?? []).find(item => item.name === toolName && item.enabled);
+    if (!binding) return { success: false, error: `Tool "${toolName}" is not authorized for agent "${agentId}"` };
+    if (!toolRegistry.has(toolName)) return { success: false, error: `Tool "${toolName}" not found` };
+
+    const callKey = `${agentId}:${toolName}`;
+    const calls = this.toolCallCounts.get(callKey) ?? 0;
+    const maxCalls = binding.constraints?.maxCalls;
+    if (maxCalls !== undefined && calls >= maxCalls) {
+      return { success: false, error: `Tool call limit reached for ${toolName}`, metadata: { maxCalls } };
+    }
+
+    let approved = false;
+    if (options.approvalId) {
+      const prior = this.toolApprovalManager?.get(options.approvalId);
+      approved = prior?.status === 'approved' && prior.agentId === agentId && prior.toolName === toolName;
+    }
+    if (!approved) {
+      if (!this.toolApprovalManager) throw new Error('Tool approval manager is not initialized');
+      const authorization = this.toolApprovalManager.authorize({
+        agentId,
+        toolName,
+        permission: binding.permission,
+        params,
+        reason: options.reason,
+      });
+      const approvalMessage = await this.enqueueMessage({
+        kind: 'tool.approval.request',
+        sessionId: ctx.sessionId,
+        from: agentId,
+        to: 'runtime.approval',
+        correlationId: options.correlationId,
+        payload: authorization.request,
+        metadata: { agentId },
+      });
+      await this.processQueuedMessage(approvalMessage.id);
+      await ctx.queue.ack(approvalMessage.id);
+      this.emit({
+        type: 'tool.approval.requested',
+        agentId,
+        data: {
+          approvalId: authorization.request.id,
+          toolName,
+          permission: binding.permission,
+          decision: authorization.decision,
+          correlationId: options.correlationId,
+        },
+      });
+      if (authorization.decision !== 'pending') {
+        const resolvedMessage = await this.enqueueMessage({
+          kind: 'tool.approval.resolved',
+          sessionId: ctx.sessionId,
+          from: 'runtime.approval',
+          to: agentId,
+          correlationId: options.correlationId,
+          parentMessageId: approvalMessage.id,
+          payload: authorization.request,
+          metadata: { agentId },
+        });
+        await this.processQueuedMessage(resolvedMessage.id);
+        await ctx.queue.ack(resolvedMessage.id);
+      }
+      if (authorization.decision === 'pending') {
+        return {
+          success: false,
+          error: `Tool approval required for ${toolName}`,
+          metadata: { pendingApproval: true, approvalId: authorization.request.id },
+        };
+      }
+      if (authorization.decision === 'denied') {
+        return { success: false, error: `Tool policy denied ${toolName}`, metadata: { approvalId: authorization.request.id } };
+      }
+    }
+
+    const toolCall = await this.enqueueMessage({
+      kind: 'tool.call',
+      sessionId: ctx.sessionId,
+      from: agentId,
+      to: `tool.${toolName}`,
+      correlationId: options.correlationId,
+      payload: { toolName, params, reason: options.reason },
+      metadata: { agentId },
+    });
+    await this.processQueuedMessage(toolCall.id);
+    this.emit({ type: 'tool.call', agentId, data: { toolName, params, correlationId: options.correlationId } });
+    const result = await toolRegistry.execute(toolName, params);
+    this.toolCallCounts.set(callKey, calls + 1);
+    const resultMessage = await this.enqueueMessage({
+      kind: 'tool.result',
+      sessionId: ctx.sessionId,
+      from: `tool.${toolName}`,
+      to: agentId,
+      correlationId: options.correlationId,
+      parentMessageId: toolCall.id,
+      payload: result,
+      metadata: { agentId },
+    });
+    await this.processQueuedMessage(resultMessage.id);
+    if (result.success) await ctx.queue.ack(toolCall.id);
+    else await ctx.queue.fail(toolCall.id, new Error(result.error ?? 'tool_failed'));
+    await ctx.queue.ack(resultMessage.id);
+    this.emit({
+      type: result.success ? 'tool.result' : 'tool.error',
+      agentId,
+      data: { toolName, correlationId: options.correlationId, success: result.success, error: result.error },
+    });
+    return result;
+  }
+
+  async resolveToolApproval(id: string, decision: 'approved' | 'denied'): Promise<ToolApprovalRequest | undefined> {
+    if (!this.toolApprovalManager) throw new Error('Tool approval manager is not initialized');
+    const request = this.toolApprovalManager.resolve(id, decision);
+    if (request) {
+      const ctx = this.getContext();
+      const message = await this.enqueueMessage({
+        kind: 'tool.approval.resolved',
+        sessionId: ctx.sessionId,
+        from: 'runtime.approval',
+        to: request.agentId,
+        payload: request,
+        metadata: { agentId: request.agentId },
+      });
+      await this.processQueuedMessage(message.id);
+      await ctx.queue.ack(message.id);
+      this.emit({
+        type: 'tool.approval.resolved',
+        agentId: request.agentId,
+        data: { approvalId: id, decision, toolName: request.toolName },
+      });
+    }
+    return request;
+  }
+
+  private async requestAgentBudget(input: {
+    parentId: string;
+    archetype: SubAgentArchetype;
+    correlationId?: string;
+    requestedTokens?: number;
+    purpose: string;
+  }): Promise<BudgetAllocation | undefined> {
+    if (this.workspaceRuntimeConfig?.budgetMarket.enabled === false) return undefined;
+    if (!this.budgetMarket) throw new Error('Budget market is not initialized');
+    const requestedTokens = input.requestedTokens ?? this.estimateAgentBudget(input.archetype);
+    const requestMessage = await this.enqueueMessage({
+      kind: 'budget.request',
+      sessionId: this.getContext().sessionId,
+      from: input.parentId,
+      to: 'budget.market',
+      correlationId: input.correlationId,
+      payload: { ...input, requestedTokens },
+      metadata: { agentId: input.parentId, budgetTokens: requestedTokens },
+    });
+    await this.processQueuedMessage(requestMessage.id);
+    this.emit({
+      type: 'budget.requested',
+      agentId: input.parentId,
+      data: { correlationId: input.correlationId, archetype: input.archetype, requestedTokens, purpose: input.purpose },
+    });
+    const allocation = this.budgetMarket.request({
+      requesterId: `${input.parentId}:${input.archetype}`,
+      parentId: input.parentId,
+      correlationId: input.correlationId,
+      requestedTokens,
+      minimumTokens: this.workspaceRuntimeConfig?.budgetMarket.minimumGrantTokens ?? 256,
+      purpose: input.purpose,
+    });
+    const responseMessage = await this.enqueueMessage({
+      kind: allocation.status === 'granted' ? 'budget.grant' : 'budget.denied',
+      sessionId: this.getContext().sessionId,
+      from: 'budget.market',
+      to: input.parentId,
+      correlationId: input.correlationId,
+      parentMessageId: requestMessage.id,
+      payload: allocation,
+      metadata: { agentId: input.parentId, budgetTokens: allocation.grantedTokens },
+    });
+    await this.processQueuedMessage(responseMessage.id);
+    await this.getContext().queue.ack(requestMessage.id);
+    await this.getContext().queue.ack(responseMessage.id);
+    this.emit({
+      type: allocation.status === 'granted' ? 'budget.granted' : 'budget.denied',
+      agentId: input.parentId,
+      data: {
+        correlationId: input.correlationId,
+        allocationId: allocation.id,
+        requestedTokens,
+        grantedTokens: allocation.grantedTokens,
+        reason: allocation.reason,
+      },
+    });
+    return allocation;
+  }
+
+  private settleAgentBudget(agentId: string, actualTokens: number): void {
+    const allocationId = this.agentBudgetAllocations.get(agentId);
+    if (!allocationId || !this.budgetMarket) return;
+    const allocation = this.budgetMarket.settle(allocationId, actualTokens);
+    this.agentBudgetAllocations.delete(agentId);
+    if (allocation) {
+      this.emit({
+        type: 'budget.settled',
+        agentId,
+        data: { allocationId, grantedTokens: allocation.grantedTokens, actualTokens },
+      });
+    }
+  }
+
+  private releaseAgentBudget(agentId: string, reason: string): void {
+    const allocationId = this.agentBudgetAllocations.get(agentId);
+    if (!allocationId || !this.budgetMarket) return;
+    const allocation = this.budgetMarket.release(allocationId, reason);
+    this.agentBudgetAllocations.delete(agentId);
+    if (allocation) this.emit({ type: 'budget.released', agentId, data: { allocationId, reason } });
+  }
+
+  private estimateAgentBudget(archetype: SubAgentArchetype): number {
+    return {
+      researcher: 2200,
+      critic: 1600,
+      planner: 1400,
+      coder: 2600,
+      summarizer: 1000,
+      tester: 1800,
+      custom: 1800,
+    }[archetype];
   }
 
   private getRootToolBindings(): ToolBinding[] {
@@ -740,7 +1098,9 @@ export class Runtime {
       maxTotalAgentsPerTurn: delegation?.maxTotalAgentsPerTurn ?? 10,
       allowCustomAgents: isRoot && (delegation?.allowCustomAgents ?? true),
       budgetAware: delegation?.budgetAware ?? true,
-      allowedStates: ['idle', 'thinking', 'waiting', 'done'],
+      allowedStates: isRoot
+        ? ['S_solo', 'S_delegate_planning', 'S_spawn_subagents']
+        : ['S_planning', 'S_delegating'],
     };
   }
 
@@ -833,10 +1193,17 @@ export class Runtime {
     const depth = this.getAgentDepth(input.parentId);
     const nextDepth = depth + 1;
 
+    if (parentInfo.state === 'failed' || parentInfo.state === 'stopped') {
+      return { allowed: false, reason: 'invalid_fsm_state', currentChildren, allowedChildren, depth };
+    }
+
     if (!parentBindings.spawnPolicy.canSpawn) {
       return { allowed: false, reason: 'spawn_disabled_for_parent', currentChildren, allowedChildren, depth };
     }
-    if (!parentBindings.spawnPolicy.allowedStates.includes(parentInfo.state)) {
+    const parentFsmState = input.parentId === 'root'
+      ? ctx.fsm.getState()
+      : this.agentFsms.get(input.parentId)?.getState();
+    if (!parentFsmState || !parentBindings.spawnPolicy.allowedStates.includes(parentFsmState)) {
       return { allowed: false, reason: 'invalid_fsm_state', currentChildren, allowedChildren, depth };
     }
     if (currentChildren >= allowedChildren) {
@@ -933,6 +1300,10 @@ export class Runtime {
   async readAgentMemoryDoc(agentKey: string, doc = 'memory'): Promise<string> {
     const ctx = this.getContext();
     return ctx.memory.readAgentDoc(agentKey, doc);
+  }
+
+  async readTeamMemoryDoc(teamKey: string, doc = 'memory'): Promise<string> {
+    return this.getContext().memory.readTeamDoc(teamKey, doc);
   }
 
   async getMemoryMode(): Promise<MemoryMode> {
@@ -1061,6 +1432,10 @@ export class Runtime {
     return ctx.memory.getCachePatterns(kind);
   }
 
+  async getEvolutionHistory(limit = 50): Promise<Array<Record<string, unknown>>> {
+    return this.getContext().memory.readEvolutionHistory(limit);
+  }
+
   async acceptMemoryProposal(id: string): Promise<MemoryUpdateRecord | undefined> {
     const ctx = this.getContext();
     const record = await ctx.memory.acceptMemoryProposal(id);
@@ -1162,8 +1537,9 @@ export class Runtime {
       },
     });
 
-    let finalResponse = '';
+    let finalResponse: string;
     const subagents: RootMediatedSpawnResult[] = [];
+    let delegationTeamId: string | undefined;
 
     if (decision.action === 'ask_clarification') {
       await this.transitionRootTurnState('S_solo_reasoning', { correlationId, reason: decision.reason });
@@ -1190,6 +1566,28 @@ export class Runtime {
       });
       finalResponse = await this.runRootSoloReasoning(userInput, correlationId);
     } else {
+      if (decision.agents.length > 1 && this.workspaceRuntimeConfig?.teams.createForMultipleAgents !== false) {
+        const team = await this.createSubteam({
+          parentId: 'root',
+          name: `Delegation-${correlationId}`,
+          purpose: userInput,
+          memberArchetypes: decision.agents.map(agent => agent.archetype),
+          correlationId,
+        });
+        delegationTeamId = team.identity.id;
+        this.teams.transition(delegationTeamId, 'running');
+        const teamTask = await this.enqueueMessage({
+          kind: 'team.task',
+          sessionId: ctx.sessionId,
+          from: 'root',
+          to: delegationTeamId,
+          correlationId,
+          payload: { task: userInput, plans: decision.agents },
+          metadata: { agentId: 'root', teamId: delegationTeamId },
+        });
+        await this.processQueuedMessage(teamTask.id);
+        await ctx.queue.ack(teamTask.id);
+      }
       await this.transitionRootTurnState('S_delegate_planning', { correlationId, count: decision.agents.length });
       this.emit({
         type: 'delegation.plan.created',
@@ -1237,7 +1635,8 @@ export class Runtime {
           source: 'root',
           requireRootSynthesis: false,
           showSubagentOutput: false,
-          disableRecursiveDelegation: decision.agents.length > 1,
+          disableRecursiveDelegation: decision.agents.length > 1 || this.getBudgetState().mode === 'limited',
+          teamId: delegationTeamId,
         });
         subagents.push(result);
       }
@@ -1245,8 +1644,27 @@ export class Runtime {
         correlationId,
         completed: subagents.length,
       });
+      if (delegationTeamId) this.teams.transition(delegationTeamId, 'waiting');
       await this.transitionRootTurnState('S_synthesize', { correlationId, completed: subagents.length });
+      if (delegationTeamId) this.teams.transition(delegationTeamId, 'synthesizing');
       finalResponse = await this.synthesizeDelegatedResults(userInput, subagents, correlationId);
+      if (delegationTeamId) {
+        const totalTokens = subagents.reduce((sum, result) => sum + result.subagentResult.usage.totalTokens, 0);
+        this.teams.recordUsage(delegationTeamId, totalTokens);
+        this.teams.transition(delegationTeamId, 'done');
+        const teamResult = await this.enqueueMessage({
+          kind: 'team.result',
+          sessionId: ctx.sessionId,
+          from: delegationTeamId,
+          to: 'root',
+          correlationId,
+          payload: { teamId: delegationTeamId, finalResponse, memberIds: subagents.map(result => result.agent.identity.id) },
+          metadata: { agentId: 'root', teamId: delegationTeamId },
+        });
+        await this.processQueuedMessage(teamResult.id);
+        await ctx.queue.ack(teamResult.id);
+        this.emit({ type: 'team.completed', agentId: 'root', data: { teamId: delegationTeamId, correlationId, totalTokens } });
+      }
       this.emit({
         type: 'delegation.completed',
         agentId: 'root',
@@ -1368,7 +1786,11 @@ export class Runtime {
     await this.processQueuedMessage(command.id);
     await ctx.queue.ack(command.id);
 
-    const tomProfile = this.createSubagentToMProfile(payload.archetype, '', payload.task);
+    if (parentId !== 'root') {
+      await this.prepareParentForDelegation(parentId, correlationId, payload.task);
+    }
+
+    const tomProfile = this.createSubagentToMProfile(payload.archetype, '', payload.task, parentId);
     if (payload.tomLevel !== undefined && [0, 1, 2, 3].includes(payload.tomLevel)) {
       tomProfile.level = payload.tomLevel as ToMProfile['level'];
     }
@@ -1388,7 +1810,19 @@ export class Runtime {
       correlationId,
       tomProfile,
       cacheHits,
+      teamId: payload.teamId,
     });
+    if (payload.teamId) {
+      const team = this.teams.addMember(payload.teamId, agent.identity.id);
+      await ctx.memory.writeTeamTopology(this.safeAgentKey(team.identity.name), {
+        type: 'parent-child',
+        teamId: team.identity.id,
+        parentId: team.identity.parentId,
+        members: team.memberIds,
+        updatedAt: new Date().toISOString(),
+      });
+      this.emit({ type: 'team.member.added', agentId: agent.identity.id, data: { teamId: payload.teamId, parentId } });
+    }
     const delegationPattern = await ctx.memory.upsertDelegationPattern({
       archetype: payload.archetype,
       task: payload.task,
@@ -1569,13 +2003,16 @@ export class Runtime {
     }
 
     const parentIdentity = parent.getIdentity();
+    const creationCorrelationId = spec.correlationId ?? this.createCorrelationId();
+    if (spec.parentId !== 'root') {
+      await this.prepareParentForDelegation(spec.parentId, creationCorrelationId, spec.task ?? spec.description);
+    }
     const toolBindings = this.normalizeToolBindings(spec.tools, spec.archetype)
       .filter(binding => binding.enabled);
     const skillBindings = this.normalizeSkillBindings(spec.skills, spec.archetype)
       .filter(binding => binding.enabled);
     const memoryScope = spec.memoryScope ?? this.getDefaultMemoryScope('subagent');
     const spawnPolicy = this.mergeSpawnPolicy(this.getDefaultSpawnPolicy('subagent', spec.archetype), spec.spawnPolicy);
-    const creationCorrelationId = spec.correlationId ?? this.createCorrelationId();
     const createRequestMessage = await this.enqueueMessage({
       kind: 'agent.create.request',
       sessionId: ctx.sessionId,
@@ -1676,6 +2113,23 @@ export class Runtime {
       throw new Error(`Spawn rejected: ${policyResult.reason}`);
     }
 
+    const budgetAllocation = await this.requestAgentBudget({
+      parentId: spec.parentId,
+      archetype: spec.archetype,
+      correlationId: creationCorrelationId,
+      requestedTokens: spec.budgetTokens,
+      purpose: spec.task ?? spec.description,
+    });
+    if (budgetAllocation?.status === 'denied') {
+      await ctx.queue.fail(createRequestMessage.id, new Error('budget_request_denied'));
+      this.emit({
+        type: 'agent.create.rejected',
+        agentId: spec.parentId,
+        data: { parentId: spec.parentId, archetype: spec.archetype, reason: 'budget_request_denied' },
+      });
+      throw new Error('Spawn rejected: budget_request_denied');
+    }
+
     const agentMemoryKey = spec.archetype === 'custom' && spec.name
       ? this.safeAgentKey(spec.name)
       : spec.archetype;
@@ -1698,7 +2152,8 @@ export class Runtime {
     const generation = parentIdentity.generation + 1;
 
     const fsm = new FSM({
-      initialState: 'S_solo',
+      initialState: 'S_created',
+      strict: true,
       signalBus,
       onTransition: (from, to) => {
         logger.debug(`FSM transition for ${id}: ${from} -> ${to}`);
@@ -1708,9 +2163,24 @@ export class Runtime {
         logger.debug(`FSM state for ${id}: ${state}`);
         this.emit({ type: 'fsm.state.changed', agentId: id, data: { state } });
       },
+      onInvalidTransition: (from, to) => {
+        this.emit({ type: 'fsm.invalid_transition', agentId: id, data: { from, to } });
+      },
     });
 
     const cacheHits = spec.cacheHits ?? [];
+    const resolvedTomProfile = spec.tomProfile
+      ? { ...spec.tomProfile, subjectAgentId: id }
+      : this.createSubagentToMProfile(spec.archetype, id, spec.task ?? '', spec.parentId);
+    const contextWindow = await this.requireContextWindowManager().build({
+      sessionId: ctx.sessionId,
+      agentId: id,
+      agentKey: agentMemoryKey,
+      role: 'subagent',
+      task: spec.task ?? '',
+      parentContext: `Parent agent ${parentIdentity.name} (${parentIdentity.id}) spawned this agent for: ${spec.description}`,
+      memoryScope,
+    });
     const goal = this.buildAgentPromptFromMemory({
       name,
       role: spec.customRole ?? spec.archetype,
@@ -1723,13 +2193,15 @@ export class Runtime {
       ].filter(Boolean).join('\n'),
       systemPrompt: spec.systemPrompt,
       bundle: agentMemory,
-      publicContext: cacheHits.length > 0
-        ? this.formatCachedPublicContext(cacheHits)
-        : this.formatPublicContext(await ctx.memory.loadRootContext()),
-      tomProfile: spec.tomProfile ? { ...spec.tomProfile, subjectAgentId: id } : this.createSubagentToMProfile(spec.archetype, id, spec.task ?? ''),
+      publicContext: [
+        contextWindow.publicContext,
+        contextWindow.sessionContext,
+        cacheHits.length > 0 ? this.formatCachedPublicContext(cacheHits) : '',
+      ].filter(Boolean).join('\n\n'),
+      tomProfile: resolvedTomProfile,
       availableSkills: skillBindings.map(binding => binding.name),
       availableTools: toolBindings.map(binding => binding.name),
-      parentContext: `Parent agent ${parentIdentity.name} (${parentIdentity.id}) spawned this agent for: ${spec.description}`,
+      parentContext: contextWindow.parentContext,
     });
     const renderedPromptTokens = this.estimateTextTokens(goal);
     const definitionText = [
@@ -1749,9 +2221,10 @@ export class Runtime {
       name,
       role: 'subagent',
       parentId: spec.parentId,
+      teamId: spec.teamId,
       generation,
       tomLevel: spec.tomLevel,
-      tomProfile: spec.tomProfile ? { ...spec.tomProfile, subjectAgentId: id } : undefined,
+      tomProfile: resolvedTomProfile,
       description: spec.description,
       goal,
       llm: ctx.llm ?? undefined,
@@ -1766,6 +2239,10 @@ export class Runtime {
       memoryScope,
       spawnPolicy,
     });
+    this.agentFsms.set(id, fsm);
+    if (budgetAllocation?.status === 'granted') {
+      this.agentBudgetAllocations.set(id, budgetAllocation.id);
+    }
     ctx.manager.addAgent(agent);
     await ctx.manager.attachAgentToSessions(agent);
     await ctx.memory.upsertAgentPattern({
@@ -1781,7 +2258,15 @@ export class Runtime {
 
     const info = agent.getInfo();
     this.recordTurnAgentCreated(creationCorrelationId);
-    this.emitAgentFsmState(id, 'S_created', { parentId: spec.parentId, archetype: spec.archetype });
+    this.emit({
+      type: 'context.loaded',
+      agentId: id,
+      data: {
+        sources: contextWindow.sources,
+        tokenUsage: contextWindow.tokenUsage,
+        sessionWindowTurns: memoryScope.sessionWindowTurns,
+      },
+    });
     this.emit({
       type: cacheHits.length > 0 ? 'agent.definition.loaded_from_cache' : 'agent.definition.generated',
       agentId: id,
@@ -1881,9 +2366,13 @@ export class Runtime {
       },
     });
     this.emit({ type: 'agent.status.changed', agentId: id, data: { from: 'none', to: info.state } });
-    this.emitAgentFsmState(id, 'S_solo', { runtimeState: info.state });
-    if (spec.budgetTokens !== undefined) {
-      this.emit({ type: 'budget.allocated', agentId: id, data: { budgetTokens: spec.budgetTokens } });
+    await this.transitionAgentFsm(id, 'S_ready', { runtimeState: info.state });
+    if (budgetAllocation?.status === 'granted') {
+      this.emit({
+        type: 'budget.allocated',
+        agentId: id,
+        data: { allocationId: budgetAllocation.id, budgetTokens: budgetAllocation.grantedTokens },
+      });
     }
 
     return info;
@@ -1907,13 +2396,17 @@ export class Runtime {
 
     const usageBefore = agent.getUsage();
     const from = agent.getState();
+    const actorFsm = this.requireAgentFsm(agentId);
+    if (actorFsm.getState() === 'S_done' || actorFsm.getState() === 'S_failed') {
+      await this.transitionAgentFsm(agentId, 'S_ready', { reason: 'new_task' });
+    }
     agent.setRuntimeState('thinking');
-    this.emitAgentFsmState(agentId, 'S_input_received', { task, correlationId: options.correlationId });
+    await this.transitionAgentFsm(agentId, 'S_task_received', { task, correlationId: options.correlationId });
     this.emit({ type: 'agent.run.started', agentId, data: { task, correlationId: options.correlationId } });
     this.emit({ type: 'agent.status.changed', agentId, data: { from, to: 'thinking' } });
 
     try {
-      this.emitAgentFsmState(agentId, 'S_assess_task', { task, correlationId: options.correlationId });
+      await this.transitionAgentFsm(agentId, 'S_context_loading', { task, correlationId: options.correlationId });
       const recursiveDelegation = options.disableRecursiveDelegation
         ? { action: 'solve_directly', reason: 'Recursive delegation disabled for this run.' } satisfies DelegationDecision
         : await this.decideAgentDelegation(agent.getInfo(), task, options.correlationId ?? this.createCorrelationId());
@@ -1944,16 +2437,16 @@ export class Runtime {
       }
       const grounding = await this.runGroundingCheck(agentId, task, options);
       if (grounding.toolCalls.length > 0) {
-        this.emitAgentFsmState(agentId, 'S_execute', {
+        await this.transitionAgentFsm(agentId, 'S_tool_calling', {
           toolCalls: grounding.toolCalls.map(call => call.toolName),
           correlationId: options.correlationId,
         });
       }
-      this.emitAgentFsmState(agentId, 'S_solo_reasoning', { task, correlationId: options.correlationId });
+      await this.transitionAgentFsm(agentId, 'S_reasoning', { task, correlationId: options.correlationId });
       this.emit({ type: 'agent.llm.called', agentId, data: { task } });
       await agent.step(this.buildGroundedTask(task, grounding));
       agent.setRuntimeState('done');
-      this.emitAgentFsmState(agentId, 'S_respond', { correlationId: options.correlationId });
+      await this.transitionAgentFsm(agentId, 'S_responding', { correlationId: options.correlationId });
 
       const usageAfter = agent.getUsage();
       const usageDelta = this.toTokenUsage({
@@ -1970,7 +2463,7 @@ export class Runtime {
       const evidence: RunEvidence = {
         ...grounding.evidence,
         outputGrounded: grounding.evidence.toolGrounded
-          ? this.resultIncludesObservedPath(result || agent.getInfo().lastResult || '', grounding.evidence.observedPaths)
+          ? this.resultIncludesEvidence(result || agent.getInfo().lastResult || '', grounding.evidence)
           : grounding.evidence.outputGrounded,
       };
       const warnings = [...grounding.warnings];
@@ -1996,7 +2489,13 @@ export class Runtime {
           warnings,
         },
       });
-      this.emitAgentFsmState(agentId, 'S_turn_done', { correlationId: options.correlationId });
+      await this.transitionAgentFsm(agentId, 'S_done', { correlationId: options.correlationId });
+      this.settleAgentBudget(agentId, usageDelta.totalTokens);
+      await ctx.memory.recordAgentPatternOutcome(options.archetype ?? this.inferAgentArchetype(agent.getInfo()), {
+        success: true,
+        grounded: grounding.grounded && evidence.outputGrounded,
+        totalTokens: usageDelta.totalTokens,
+      });
 
       return {
         agent: agent.getInfo(),
@@ -2012,8 +2511,16 @@ export class Runtime {
       agent.addToMemory('result', `Error: ${message}`);
       agent.setRuntimeState('failed');
       this.emit({ type: 'agent.status.changed', agentId, data: { from: 'thinking', to: 'failed' } });
-      this.emitAgentFsmState(agentId, 'S_final', { failed: true, error: message, correlationId: options.correlationId });
+      if (this.requireAgentFsm(agentId).getState() !== 'S_failed') {
+        await this.transitionAgentFsm(agentId, 'S_failed', { failed: true, error: message, correlationId: options.correlationId });
+      }
       this.emit({ type: 'agent.run.failed', agentId, data: { task, error: message } });
+      this.releaseAgentBudget(agentId, 'agent_run_failed');
+      await ctx.memory.recordAgentPatternOutcome(options.archetype ?? this.inferAgentArchetype(agent.getInfo()), {
+        success: false,
+        grounded: false,
+        totalTokens: 0,
+      });
       throw error;
     }
   }
@@ -2051,8 +2558,68 @@ export class Runtime {
     return ctx.queue.dequeue({ to: message.to, kind: [message.kind], readyOnly: true });
   }
 
-  private emitAgentFsmState(agentId: string, state: string, data: Record<string, unknown> = {}): void {
-    this.emit({ type: 'agent.fsm.state', agentId, data: { state, ...data } });
+  private async transitionAgentFsm(
+    agentId: string,
+    state: Parameters<FSM['transition']>[0],
+    data: Record<string, unknown> = {}
+  ): Promise<void> {
+    if (!state) return;
+    const fsm = this.requireAgentFsm(agentId);
+    const from = fsm.getState();
+    try {
+      await fsm.transition(state);
+      this.emit({ type: 'agent.fsm.state', agentId, data: { from, state, ...data } });
+    } catch (error) {
+      this.emit({
+        type: 'delegation.rejected',
+        agentId,
+        data: {
+          reason: 'invalid_fsm_state',
+          from,
+          to: state,
+          error: error instanceof Error ? error.message : String(error),
+          ...data,
+        },
+      });
+      throw error;
+    }
+  }
+
+  private requireAgentFsm(agentId: string): FSM {
+    const fsm = this.agentFsms.get(agentId);
+    if (!fsm) throw new Error(`FSM for agent "${agentId}" not found`);
+    return fsm;
+  }
+
+  private requireContextWindowManager(): ContextWindowManager {
+    if (!this.contextWindowManager) throw new Error('ContextWindowManager is not initialized');
+    return this.contextWindowManager;
+  }
+
+  private requireCandidatePlanner(): DefaultDelegationCandidatePlanner {
+    if (!this.candidatePlanner) throw new Error('Delegation candidate planner is not initialized');
+    return this.candidatePlanner;
+  }
+
+  private async prepareParentForDelegation(parentId: string, correlationId: string, task: string): Promise<void> {
+    const parent = this.getContext().manager.getAgentById(parentId);
+    if (!parent || parent.getState() === 'failed' || parent.getState() === 'stopped') return;
+    const fsm = this.requireAgentFsm(parentId);
+    if (fsm.getState() === 'S_done') {
+      await this.transitionAgentFsm(parentId, 'S_ready', { correlationId, reason: 'manual_child_delegation' });
+    }
+    if (fsm.getState() === 'S_ready') {
+      await this.transitionAgentFsm(parentId, 'S_task_received', { correlationId, task });
+    }
+    if (fsm.getState() === 'S_task_received') {
+      await this.transitionAgentFsm(parentId, 'S_context_loading', { correlationId, task });
+    }
+    if (fsm.getState() === 'S_context_loading') {
+      await this.transitionAgentFsm(parentId, 'S_planning', { correlationId, task });
+    }
+    if (fsm.getState() === 'S_planning') {
+      await this.transitionAgentFsm(parentId, 'S_delegating', { correlationId, task });
+    }
   }
 
   private async buildDelegationDecisionMetadata(decision: DelegationDecision): Promise<Record<string, unknown>> {
@@ -2108,7 +2675,11 @@ export class Runtime {
       ]);
       return Boolean(agentPattern || delegationPattern);
     }));
-    const selection = this.candidatePlanner.select({
+    const [agentPatterns, delegationPatterns] = await Promise.all([
+      ctx.memory.getCachePatterns('agents'),
+      ctx.memory.getCachePatterns('delegations'),
+    ]);
+    const selection = await this.requireCandidatePlanner().select({
       parentId,
       task,
       decision,
@@ -2117,8 +2688,11 @@ export class Runtime {
       budgetMode: budget.mode,
       remainingBudgetTokens: budget.remainingTokens,
       cacheUsed: cacheHits.some(Boolean),
+      cachedPatterns: [...agentPatterns, ...delegationPatterns],
+      parentToMProfile: ctx.manager.getAgentById(parentId)?.getIdentity().tomProfile,
     });
 
+    await this.recordEvolutionLifecycle(parentId, correlationId, scope, selection);
     this.emitDelegationCandidateEvents(parentId, correlationId, scope, selection);
     return selection.decision;
   }
@@ -2142,6 +2716,8 @@ export class Runtime {
           expectedUtility: candidate.expectedUtility,
           expectedCostTokens: candidate.expectedCostTokens,
           score: candidate.score,
+          scoreBreakdown: candidate.scoreBreakdown,
+          lineage: candidate.lineage,
           rationale: candidate.rationale,
         },
       });
@@ -2159,6 +2735,8 @@ export class Runtime {
           expectedUtility: selection.selected.expectedUtility,
           expectedCostTokens: selection.selected.expectedCostTokens,
           score: selection.selected.score,
+          scoreBreakdown: selection.selected.scoreBreakdown,
+          lineage: selection.selected.lineage,
           rationale: selection.selected.rationale,
         },
       });
@@ -2171,6 +2749,74 @@ export class Runtime {
           scope,
           reason: selection.rejectedReason,
         },
+      });
+    }
+  }
+
+  private async recordEvolutionLifecycle(
+    parentId: string,
+    correlationId: string,
+    scope: 'root' | 'agent',
+    selection: DelegationCandidateSelection
+  ): Promise<void> {
+    const ctx = this.getContext();
+    const proposed = await this.enqueueMessage({
+      kind: 'evo.propose',
+      sessionId: ctx.sessionId,
+      from: parentId,
+      to: 'delegation.evolution',
+      correlationId,
+      payload: { scope, candidates: selection.candidates.map(candidate => ({ id: candidate.id, source: candidate.source, lineage: candidate.lineage })) },
+      metadata: { agentId: parentId },
+    });
+    await this.processQueuedMessage(proposed.id);
+    const evaluated = await this.enqueueMessage({
+      kind: 'evo.evaluate',
+      sessionId: ctx.sessionId,
+      from: 'delegation.evolution',
+      to: parentId,
+      correlationId,
+      parentMessageId: proposed.id,
+      payload: { candidates: selection.candidates.map(candidate => ({ id: candidate.id, score: candidate.score, scoreBreakdown: candidate.scoreBreakdown })) },
+      metadata: { agentId: parentId },
+    });
+    await this.processQueuedMessage(evaluated.id);
+    const selected = await this.enqueueMessage({
+      kind: 'evo.select',
+      sessionId: ctx.sessionId,
+      from: 'delegation.evolution',
+      to: parentId,
+      correlationId,
+      parentMessageId: evaluated.id,
+      payload: { selected: selection.selected?.id, rejectedReason: selection.rejectedReason },
+      metadata: { agentId: parentId },
+    });
+    await this.processQueuedMessage(selected.id);
+    await ctx.queue.ack(proposed.id);
+    await ctx.queue.ack(evaluated.id);
+    await ctx.queue.ack(selected.id);
+    await ctx.memory.recordEvolutionRun({
+      correlationId,
+      parentId,
+      scope,
+      proposed: selection.candidates.map(candidate => ({
+        id: candidate.id,
+        source: candidate.source,
+        score: candidate.score,
+        scoreBreakdown: candidate.scoreBreakdown,
+        lineage: candidate.lineage,
+      })),
+      selected: selection.selected?.id,
+      rejectedReason: selection.rejectedReason,
+    });
+    this.emit({ type: 'evo.proposed', agentId: parentId, data: { correlationId, count: selection.candidates.length, scope } });
+    this.emit({ type: 'evo.evaluated', agentId: parentId, data: { correlationId, count: selection.candidates.length, scope } });
+    this.emit({ type: 'evo.selected', agentId: parentId, data: { correlationId, candidateId: selection.selected?.id, scope } });
+    if (selection.selected?.source === 'mutated_from_cache') {
+      this.emit({
+        type: 'cache.mutated',
+        agentId: parentId,
+        data: { correlationId, candidateId: selection.selected.id, lineage: selection.selected.lineage },
       });
     }
   }
@@ -2579,8 +3225,9 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     const usageBefore = ctx.agent.getUsage();
     ctx.agent.setRuntimeState('thinking');
     this.emit({ type: 'agent.status.changed', agentId: 'root', data: { to: 'thinking', correlationId } });
+    const grounding = await this.runGroundingCheck('root', userInput, { correlationId, archetype: 'custom' });
     this.emit({ type: 'agent.llm.called', agentId: 'root', data: { purpose: 'root.solo_reasoning', correlationId } });
-    const response = await this.completeAsRoot(userInput, 'root.solo_reasoning', correlationId);
+    const response = await this.completeAsRoot(this.buildGroundedTask(userInput, grounding), 'root.solo_reasoning', correlationId);
     const usageAfter = ctx.agent.getUsage();
     const usageDelta = this.toTokenUsage({
       llmCalls: usageAfter.llmCalls - usageBefore.llmCalls,
@@ -2765,6 +3412,9 @@ Produce the final response to the user as Roy, the root agent.`;
       throw new Error(`Parent agent "${parentId}" not found`);
     }
     const parentIdentity = parent.getIdentity();
+    if (this.requireAgentFsm(parentId).getState() === 'S_delegating') {
+      await this.transitionAgentFsm(parentId, 'S_waiting_children', { correlationId, childId: childAgent.identity.id });
+    }
     const synthesisMessage = await this.enqueueMessage({
       kind: 'agent.synthesis',
       sessionId: ctx.sessionId,
@@ -2787,7 +3437,7 @@ Produce the final response to the user as Roy, the root agent.`;
     const usageBefore = parent.getUsage();
     const from = parent.getState();
     parent.setRuntimeState('synthesizing');
-    this.emitAgentFsmState(parentId, 'S_synthesize', { correlationId, childId: childAgent.identity.id });
+    await this.transitionAgentFsm(parentId, 'S_synthesizing', { correlationId, childId: childAgent.identity.id });
     this.emit({
       type: 'agent.synthesis.started',
       agentId: parentId,
@@ -2817,7 +3467,8 @@ Produce the final response to the user as Roy, the root agent.`;
 
     parent.setRuntimeState('done');
     this.emit({ type: 'agent.status.changed', agentId: parentId, data: { from: 'synthesizing', to: 'done', correlationId } });
-    this.emitAgentFsmState(parentId, 'S_turn_done', { correlationId, childId: childAgent.identity.id });
+    await this.transitionAgentFsm(parentId, 'S_responding', { correlationId, childId: childAgent.identity.id });
+    await this.transitionAgentFsm(parentId, 'S_done', { correlationId, childId: childAgent.identity.id });
     this.emit({
       type: 'agent.synthesis.completed',
       agentId: parentId,
@@ -2881,7 +3532,7 @@ Produce the final response to the user as Roy, the root agent.`;
     const usageBefore = parent.getUsage();
     const from = parent.getState();
     parent.setRuntimeState('synthesizing');
-    this.emitAgentFsmState(parentId, 'S_synthesize', {
+    await this.transitionAgentFsm(parentId, 'S_synthesizing', {
       correlationId,
       childIds: childResults.map(result => result.agent.identity.id),
     });
@@ -2914,7 +3565,8 @@ Produce the final response to the user as Roy, the root agent.`;
 
     parent.setRuntimeState('done');
     this.emit({ type: 'agent.status.changed', agentId: parentId, data: { from: 'synthesizing', to: 'done', correlationId } });
-    this.emitAgentFsmState(parentId, 'S_turn_done', { correlationId, childIds: childResults.map(result => result.agent.identity.id) });
+    await this.transitionAgentFsm(parentId, 'S_responding', { correlationId, childIds: childResults.map(result => result.agent.identity.id) });
+    await this.transitionAgentFsm(parentId, 'S_done', { correlationId, childIds: childResults.map(result => result.agent.identity.id) });
     this.emit({
       type: 'agent.synthesis.completed',
       agentId: parentId,
@@ -2941,7 +3593,7 @@ Produce the final response to the user as Roy, the root agent.`;
       throw new Error(`Agent "${agentId}" not found`);
     }
     const correlationId = options.correlationId ?? this.createCorrelationId();
-    this.emitAgentFsmState(agentId, 'S_delegate_planning', { correlationId, count: plans.length });
+    await this.transitionAgentFsm(agentId, 'S_planning', { correlationId, count: plans.length });
     this.emit({
       type: 'delegation.plan.created',
       agentId,
@@ -2952,7 +3604,20 @@ Produce the final response to the user as Roy, the root agent.`;
         agents: plans,
       },
     });
-    this.emitAgentFsmState(agentId, 'S_spawn_subagents', { correlationId, count: plans.length });
+    await this.transitionAgentFsm(agentId, 'S_delegating', { correlationId, count: plans.length });
+
+    let delegationTeamId: string | undefined;
+    if (plans.length > 1 && this.workspaceRuntimeConfig?.teams.createForMultipleAgents !== false) {
+      const team = await this.createSubteam({
+        parentId: agentId,
+        name: `${parent.name}-Delegation-${correlationId}`,
+        purpose: task,
+        memberArchetypes: plans.map(plan => plan.archetype),
+        correlationId,
+      });
+      delegationTeamId = team.identity.id;
+      this.teams.transition(delegationTeamId, 'running');
+    }
 
     const childResults: RootMediatedSpawnResult[] = [];
     for (const plan of plans) {
@@ -2993,15 +3658,18 @@ Produce the final response to the user as Roy, the root agent.`;
         requireRootSynthesis: false,
         showSubagentOutput: false,
         disableRecursiveDelegation: plans.length > 1,
+        teamId: delegationTeamId,
       });
       childResults.push(result);
     }
 
-    this.emitAgentFsmState(agentId, 'S_wait_subagents', { correlationId, completed: childResults.length });
+    await this.transitionAgentFsm(agentId, 'S_waiting_children', { correlationId, completed: childResults.length });
+    if (delegationTeamId) this.teams.transition(delegationTeamId, 'waiting');
     if (childResults.length === 0) {
       return this.runAgent(agentId, task, { ...options, disableRecursiveDelegation: true });
     }
 
+    if (delegationTeamId) this.teams.transition(delegationTeamId, 'synthesizing');
     const synthesis = await this.synthesizeDirectChildResults(
       agentId,
       task,
@@ -3018,6 +3686,11 @@ Produce the final response to the user as Roy, the root agent.`;
     });
     const evidence = this.mergeChildEvidence(childResults.map(result => result.subagentResult));
     const warnings = childResults.flatMap(result => result.subagentResult.warnings);
+    if (delegationTeamId) {
+      this.teams.recordUsage(delegationTeamId, childResults.reduce((sum, result) => sum + result.subagentResult.usage.totalTokens, 0));
+      this.teams.transition(delegationTeamId, 'done');
+      this.emit({ type: 'team.completed', agentId, data: { teamId: delegationTeamId, correlationId } });
+    }
     this.emit({
       type: 'agent.run.completed',
       agentId,
@@ -3040,6 +3713,12 @@ Produce the final response to the user as Roy, the root agent.`;
         subagentIds: childResults.map(result => result.agent.identity.id),
         totalSubagents: childResults.length,
       },
+    });
+    this.settleAgentBudget(agentId, usageDelta.totalTokens);
+    await ctx.memory.recordAgentPatternOutcome(options.archetype ?? this.inferAgentArchetype(parent.getInfo()), {
+      success: true,
+      grounded: childResults.every(result => result.subagentResult.grounded),
+      totalTokens: usageDelta.totalTokens,
     });
 
     return {
@@ -3349,8 +4028,15 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
     const bundle = await ctx.memory.loadAgentMemory(agentKey);
     const parent = options.parentId ? ctx.manager.getAgentById(options.parentId)?.getIdentity() : ctx.agent.getIdentity();
     const role = options.role ?? options.archetype ?? agentKey;
+    const contextWindow = await this.renderAgentContext({
+      agentKey,
+      agentId: agentKey === 'roy' ? 'root' : agentKey,
+      role: agentKey === 'roy' ? 'root' : 'subagent',
+      parentId: options.parentId,
+      task: options.task ?? '',
+    });
     const tomProfile = options.archetype
-      ? this.createSubagentToMProfile(options.archetype, agentKey, options.task ?? '')
+      ? this.createSubagentToMProfile(options.archetype, agentKey, options.task ?? '', options.parentId ?? 'root')
       : this.createRootToMProfile();
     const prompt = this.buildAgentPromptFromMemory({
       name: options.name ?? this.capitalize(agentKey),
@@ -3359,21 +4045,50 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
       task: options.task ?? '',
       description: `Rendered prompt preview for ${agentKey}.`,
       bundle,
-      publicContext: this.formatPublicContext(await ctx.memory.loadRootContext()),
+      publicContext: [contextWindow.publicContext, contextWindow.sessionContext].filter(Boolean).join('\n\n'),
       tomProfile,
       availableSkills: skillRegistry.list().map(skill => skill.name),
       availableTools: toolRegistry.list().map(tool => tool.name),
-      parentContext: `Parent agent: ${parent?.name ?? 'Roy'} (${parent?.id ?? 'root'})`,
+      parentContext: contextWindow.parentContext || `Parent agent: ${parent?.name ?? 'Roy'} (${parent?.id ?? 'root'})`,
     });
     return {
       prompt,
       estimatedTokens: this.estimateTextTokens(prompt),
       sources: {
-        public: ['.roy/public/project.md', '.roy/public/constraints.md', '.roy/public/decisions.md'],
-        private: [`.roy/agents/${bundle.key}/prompt.md`, `.roy/agents/${bundle.key}/memory.md`, `.roy/agents/${bundle.key}/context.md`],
-        session: 'compact recent session context is reserved for ContextWindowManager',
+        ...contextWindow.sources,
+        prompt: [`.roy/agents/${bundle.key}/prompt.md`],
+        tokenUsage: contextWindow.tokenUsage,
       },
     };
+  }
+
+  async renderAgentContext(options: {
+    agentKey: string;
+    agentId?: string;
+    role?: 'root' | 'subagent';
+    parentId?: string;
+    task?: string;
+  }): Promise<ContextWindow> {
+    const ctx = this.getContext();
+    const role = options.role ?? (options.agentKey === 'roy' ? 'root' : 'subagent');
+    const parent = options.parentId
+      ? ctx.manager.getAgentById(options.parentId)?.getIdentity()
+      : role === 'subagent'
+        ? ctx.agent.getIdentity()
+        : undefined;
+    const runtimeAgent = options.agentId ? ctx.manager.getAgentById(options.agentId) : undefined;
+    const memoryScope = runtimeAgent
+      ? this.getAgentPolicy(runtimeAgent.id)?.memoryScope ?? this.getDefaultMemoryScope(role)
+      : this.getDefaultMemoryScope(role);
+    return this.requireContextWindowManager().build({
+      sessionId: ctx.sessionId,
+      agentId: options.agentId ?? (role === 'root' ? 'root' : options.agentKey),
+      agentKey: options.agentKey,
+      role,
+      task: options.task ?? '',
+      parentContext: parent ? `Parent agent: ${parent.name} (${parent.id})` : undefined,
+      memoryScope,
+    });
   }
 
   private renderPromptSlots(template: string, slots: Record<string, string>): string {
@@ -3437,8 +4152,10 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
     task: string,
     options: { correlationId?: string; parentMessageId?: string; archetype?: SubAgentArchetype }
   ): Promise<{ toolCalls: ToolCallRecord[]; grounded: boolean; warnings: string[]; context: string; evidence: RunEvidence }> {
-    const required = this.requiresProjectInspection(options.archetype, task);
-    if (!required) {
+    const bindings = this.agentBindings.get(agentId)?.tools ?? [];
+    const inspectionRoot = this.resolveInspectionRoot(task);
+    const plans = this.toolPlanner.plan({ task, workspacePath: inspectionRoot, bindings });
+    if (plans.length === 0) {
       return {
         toolCalls: [],
         grounded: true,
@@ -3448,92 +4165,60 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
       };
     }
 
-    const ctx = this.getContext();
-    const inspectionRoot = this.resolveInspectionRoot(task);
-    const toolCall = await this.enqueueMessage({
-      kind: 'tool.call',
-      sessionId: ctx.sessionId,
-      from: agentId,
-      to: 'tool.fs.list',
-      correlationId: options.correlationId,
-      parentMessageId: options.parentMessageId,
-      payload: { path: inspectionRoot, maxDepth: 2 },
-      metadata: { agentId },
-    });
-    await this.processQueuedMessage(toolCall.id);
+    const toolCalls: ToolCallRecord[] = [];
+    const warnings: string[] = [];
+    const observedPaths: string[] = [];
+    const summaries: string[] = [];
+    const contexts: string[] = [];
 
-    try {
-      const files = await this.listProjectFiles(inspectionRoot, 2);
-      const observedPaths = files.slice(0, 80);
-      const toolResultSummary = observedPaths.join('\n');
-      const record: ToolCallRecord = {
-        toolName: 'fs.list',
-        params: { path: inspectionRoot, maxDepth: 2 },
-        result: files,
-        success: true,
-      };
-
-      const toolResult = await this.enqueueMessage({
-        kind: 'tool.result',
-        sessionId: ctx.sessionId,
-        from: 'tool.fs.list',
-        to: agentId,
+    for (const plan of plans) {
+      const result = await this.executeToolForAgent(agentId, plan.toolName, plan.params, {
+        reason: plan.reason,
         correlationId: options.correlationId,
-        parentMessageId: toolCall.id,
-        payload: record,
-        metadata: { agentId },
       });
-      await this.processQueuedMessage(toolResult.id);
-      await ctx.queue.ack(toolCall.id);
-      await ctx.queue.ack(toolResult.id);
-      this.emit({ type: 'tool.call', agentId, data: { toolName: 'fs.list', correlationId: options.correlationId } });
-      this.emit({ type: 'tool.result', agentId, data: { toolName: 'fs.list', count: files.length, correlationId: options.correlationId } });
+      toolCalls.push({ toolName: plan.toolName, params: plan.params, result: result.result, success: result.success });
 
-      return {
-        toolCalls: [record],
-        grounded: true,
-        warnings: [],
-        evidence: {
-          toolGrounded: true,
-          outputGrounded: false,
-          observedPaths,
-          toolResultSummary,
-        },
-        context: `Project file listing from fs.list:\n${files.join('\n')}`,
-      };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      await ctx.queue.fail(toolCall.id, new Error(message));
-      const warning = `Project inspection tool fs.list failed: ${message}`;
-      this.emit({
-        type: 'tool.error',
-        agentId,
-        data: {
-          toolName: 'fs.list',
-          path: inspectionRoot,
-          error: message,
-          correlationId: options.correlationId,
-        },
-      });
-      this.emit({ type: 'agent.grounding.warning', agentId, data: { warning, correlationId: options.correlationId } });
-      return {
-        toolCalls: [{
-          toolName: 'fs.list',
-          params: { path: inspectionRoot, maxDepth: 2 },
-          success: false,
-          result: message,
-        }],
-        grounded: false,
-        warnings: [warning],
-        evidence: {
-          toolGrounded: false,
-          outputGrounded: false,
-          observedPaths: [],
-          toolResultSummary: '',
-        },
-        context: '',
-      };
+      if (!result.success) {
+        const warning = `${plan.toolName === 'fs.list' ? 'Project inspection tool ' : 'Tool '}${plan.toolName} failed: ${result.error ?? 'unknown error'}`;
+        warnings.push(warning);
+        this.emit({ type: 'agent.grounding.warning', agentId, data: { warning, correlationId: options.correlationId } });
+        continue;
+      }
+
+      if (plan.toolName === 'fs.list') {
+        const entries = Array.isArray((result.result as { entries?: unknown } | undefined)?.entries)
+          ? (result.result as { entries: unknown[] }).entries.filter((item): item is string => typeof item === 'string')
+          : [];
+        observedPaths.push(...entries.slice(0, 80));
+        summaries.push(entries.slice(0, 80).join('\n'));
+        contexts.push(`Filesystem listing:\n${entries.join('\n')}`);
+      } else if (plan.toolName === 'fs.read') {
+        const read = result.result as { path?: unknown; content?: unknown } | undefined;
+        if (typeof read?.path === 'string') observedPaths.push(read.path);
+        const content = typeof read?.content === 'string' ? read.content.slice(0, 8000) : '';
+        summaries.push(`${String(read?.path ?? 'file')}: ${content.slice(0, 1000)}`);
+        contexts.push(`File read result for ${String(read?.path ?? 'file')}:\n${content}`);
+      } else if (plan.toolName === 'shell.exec') {
+        const shell = result.result as { command?: unknown; stdout?: unknown; stderr?: unknown } | undefined;
+        const output = [shell?.stdout, shell?.stderr].filter(value => typeof value === 'string' && value).join('\n');
+        summaries.push(`${String(shell?.command ?? 'command')}: ${output.slice(0, 1600)}`);
+        contexts.push(`Command result for ${String(shell?.command ?? 'command')}:\n${output.slice(0, 8000)}`);
+      }
     }
+
+    const successful = toolCalls.filter(call => call.success);
+    return {
+      toolCalls,
+      grounded: plans.every((plan, index) => !plan.groundingRequired || toolCalls[index]?.success),
+      warnings,
+      evidence: {
+        toolGrounded: successful.length > 0,
+        outputGrounded: false,
+        observedPaths: Array.from(new Set(observedPaths)),
+        toolResultSummary: summaries.filter(Boolean).join('\n\n'),
+      },
+      context: contexts.join('\n\n'),
+    };
   }
 
   private buildGroundedTask(task: string, grounding: { context: string; warnings: string[] }): string {
@@ -3545,15 +4230,16 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
     ].filter(Boolean).join('\n');
   }
 
-  private resultIncludesObservedPath(result: string, observedPaths: string[]): boolean {
-    if (!result.trim() || observedPaths.length === 0) return false;
+  private resultIncludesEvidence(result: string, evidence: RunEvidence): boolean {
+    if (!result.trim()) return false;
     const normalized = result.toLowerCase();
-    return observedPaths.slice(0, 80).some(item => normalized.includes(item.toLowerCase()));
-  }
-
-  private requiresProjectInspection(archetype: SubAgentArchetype | undefined, task: string): boolean {
-    if (archetype !== 'researcher') return false;
-    return /\b(inspect|analy[sz]e|review|read|list|structure|project|codebase|file|repo|repository)\b/i.test(task);
+    if (evidence.observedPaths.slice(0, 80).some(item => normalized.includes(item.toLowerCase()))) return true;
+    const evidenceTerms = (evidence.toolResultSummary ?? '')
+      .toLowerCase()
+      .split(/[^a-z0-9._/-]+/)
+      .filter(term => term.length >= 4)
+      .slice(0, 30);
+    return evidenceTerms.some(term => normalized.includes(term));
   }
 
   private resolveInspectionRoot(task: string): string {
@@ -3566,31 +4252,6 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
       return process.cwd();
     }
     return candidate;
-  }
-
-  private async listProjectFiles(root: string, maxDepth: number): Promise<string[]> {
-    const ignored = new Set(['.git', 'node_modules', 'dist', '.roy', '.cache', 'coverage']);
-    const results: string[] = [];
-
-    const walk = async (dir: string, depth: number): Promise<void> => {
-      if (depth > maxDepth || results.length >= 200) return;
-      const entries = await readdir(dir, { withFileTypes: true });
-      for (const entry of entries) {
-        if (ignored.has(entry.name) || results.length >= 200) continue;
-        const fullPath = path.join(dir, entry.name);
-        const relativePath = path.relative(root, fullPath);
-        results.push(entry.isDirectory() ? `${relativePath}/` : relativePath);
-        if (entry.isDirectory()) {
-          const entryStat = await stat(fullPath);
-          if (entryStat.isDirectory()) {
-            await walk(fullPath, depth + 1);
-          }
-        }
-      }
-    };
-
-    await walk(root, 0);
-    return results.sort();
   }
 
   private buildAgentTree(agent: AgentInfo): AgentTreeNode {
@@ -3633,12 +4294,37 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
     };
   }
 
-  private createSubagentToMProfile(archetype: SubAgentArchetype, subjectAgentId: string, task: string): ToMProfile {
+  private createSubagentToMProfile(archetype: SubAgentArchetype, subjectAgentId: string, task: string, parentId = 'root'): ToMProfile {
     const level = this.defaultToMLevel(archetype);
+    const models: ToMProfile['models'] = [];
+    const recursiveModels: NonNullable<ToMProfile['recursiveModels']> = [];
+    if (level >= 1) {
+      models.push({
+        targetId: parentId,
+        targetType: 'agent',
+        goalModel: ['receive a reliable result that advances the delegated task'],
+        intentModel: ['delegate a bounded specialist task and synthesize the result upward'],
+      });
+    }
+    if (archetype === 'critic') {
+      models.push({
+        targetId: 'user',
+        targetType: 'user',
+        goalModel: ['receive a grounded result with explicit limitations'],
+        uncertaintyModel: ['the delegated report may omit evidence or overstate conclusions'],
+      });
+      recursiveModels.push({
+        observerId: parentId,
+        targetId: subjectAgentId || 'critic',
+        relation: 'parent expects evidence-aware critique',
+        description: 'Evaluate whether the candidate result satisfies the parent goal and user intent.',
+      });
+    }
     return {
       level,
       subjectAgentId,
-      models: [],
+      models,
+      recursiveModels: recursiveModels.length > 0 ? recursiveModels : undefined,
       purpose: this.defaultToMPurpose(archetype, task),
     };
   }

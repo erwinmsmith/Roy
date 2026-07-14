@@ -83,8 +83,12 @@ describe('delegate_to_subagent skill', () => {
     expect(messages.map(message => message.kind)).toEqual([
       'user.command.spawn',
       'agent.create.request',
+      'budget.request',
+      'budget.grant',
       'agent.create.approved',
       'agent.task',
+      'tool.approval.request',
+      'tool.approval.resolved',
       'tool.call',
       'tool.result',
       'agent.result',

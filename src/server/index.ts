@@ -229,6 +229,24 @@ async function main(): Promise<void> {
     res.json(runtime.getBudgetState());
   });
 
+  app.get('/v1/budget/market', (req, res) => {
+    res.json(runtime.getBudgetMarketState());
+  });
+
+  app.get('/v1/cache/:kind', async (req, res) => {
+    const kind = req.params.kind;
+    if (kind === 'evolution') {
+      const limit = req.query.limit ? Number(req.query.limit) : 50;
+      res.json(await runtime.getEvolutionHistory(Number.isFinite(limit) && limit > 0 ? limit : 50));
+      return;
+    }
+    if (kind !== 'agents' && kind !== 'delegations' && kind !== 'teams') {
+      res.status(400).json({ error: 'Cache kind must be agents, delegations, teams, or evolution' });
+      return;
+    }
+    res.json(await runtime.getCachePatterns(kind));
+  });
+
   app.post('/v1/budget', (req, res) => {
     const limitTokens = req.body?.limitTokens;
     if (limitTokens === null) {
@@ -253,6 +271,53 @@ async function main(): Promise<void> {
     res.json(events);
   });
 
+  app.get('/v1/teams', (req, res) => {
+    res.json(runtime.getTeams());
+  });
+
+  app.get('/v1/teams/:id', (req, res) => {
+    const team = runtime.getTeam(req.params.id);
+    if (!team) {
+      res.status(404).json({ error: `Team "${req.params.id}" not found` });
+      return;
+    }
+    res.json(team);
+  });
+
+  app.get('/v1/tools/approvals', (req, res) => {
+    const status = typeof req.query.status === 'string' ? req.query.status : undefined;
+    const normalized = status === 'pending' || status === 'approved' || status === 'denied' ? status : undefined;
+    res.json(runtime.getToolApprovals(normalized));
+  });
+
+  app.post('/v1/tools/approvals/:id', async (req, res) => {
+    const decision = req.body?.decision;
+    if (decision !== 'approved' && decision !== 'denied') {
+      res.status(400).json({ error: 'Expected body { "decision": "approved" | "denied" }' });
+      return;
+    }
+    const approval = await runtime.resolveToolApproval(req.params.id, decision);
+    if (!approval) {
+      res.status(404).json({ error: `Pending tool approval "${req.params.id}" not found` });
+      return;
+    }
+    res.json(approval);
+  });
+
+  app.post('/v1/tools/:name/execute', async (req, res) => {
+    const agentId = req.body?.agentId ?? 'root';
+    try {
+      const result = await runtime.executeToolForAgent(agentId, req.params.name, req.body?.params ?? {}, {
+        reason: req.body?.reason,
+        approvalId: req.body?.approvalId,
+        correlationId: req.body?.correlationId,
+      });
+      res.status(result.metadata?.pendingApproval ? 202 : result.success ? 200 : 400).json(result);
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
   app.get('/v1/messages', async (req, res) => {
     const correlationId = typeof req.query.correlationId === 'string' ? req.query.correlationId : undefined;
     const limit = req.query.limit ? Number(req.query.limit) : 50;
@@ -270,6 +335,21 @@ async function main(): Promise<void> {
 
   app.get('/v1/memory/root', async (req, res) => {
     res.json(await runtime.loadRootMemoryContext());
+  });
+
+  app.post('/v1/context/render', async (req, res) => {
+    const agentKey = req.body?.agentKey ?? 'roy';
+    try {
+      res.json(await runtime.renderAgentContext({
+        agentKey,
+        agentId: req.body?.agentId,
+        role: req.body?.role,
+        parentId: req.body?.parentId,
+        task: req.body?.task,
+      }));
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
   });
 
   app.get('/v1/traces', async (req, res) => {

@@ -1,5 +1,6 @@
 import { toolRegistry } from '../tools/index.js';
 import type { Skill, SkillContext, SkillInput, SkillManifest, SkillOutput } from './types.js';
+import type { ToolResult } from '../tools/types.js';
 
 export interface UseToolWhenNeededParams {
   needed?: boolean;
@@ -12,6 +13,15 @@ export class UseToolWhenNeededSkill implements Skill {
   readonly name = 'use_tool_when_needed';
   readonly description = 'Call a registered runtime tool only when the task needs external evidence or execution.';
   readonly version = '0.1.0';
+
+  constructor(
+    private readonly executeTool: (
+      agentId: string,
+      toolName: string,
+      params: Record<string, unknown>,
+      reason?: string
+    ) => Promise<ToolResult> = (_agentId, toolName, params) => toolRegistry.execute(toolName, params)
+  ) {}
 
   getManifest(): SkillManifest {
     return {
@@ -81,7 +91,7 @@ export class UseToolWhenNeededSkill implements Skill {
       };
     }
 
-    const result = await toolRegistry.execute(toolName, params.params ?? {});
+    const result = await this.executeTool(context.agentId, toolName, params.params ?? {}, params.reason);
     return {
       success: result.success,
       result: result.result,

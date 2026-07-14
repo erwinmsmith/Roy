@@ -342,6 +342,10 @@ export class Roy {
         await this.runAgent(parts);
         break;
 
+      case '/teams':
+        this.printTeams();
+        break;
+
       case '/exit':
       case '/quit':
       case '/q':
@@ -392,7 +396,7 @@ export class Roy {
         break;
 
       case '/tools':
-        this.printTools();
+        await this.handleTools(parts);
         break;
 
       case '/memory':
@@ -455,6 +459,7 @@ export class Roy {
     ${this.bold('Chat & History')}
       /clear, /cls        Clear (note: history managed by agent)
       /context            Show conversation context from memory
+      /context render <agent> --task "..." Show compact context sources and token usage
       /traces             Show persisted trace files
       /traces latest      Show latest persisted trace events
 
@@ -466,6 +471,7 @@ export class Roy {
       /budget             Show token budget and usage
       /budget set <n>     Set token budget
       /budget unlimited   Remove token budget limit
+      /budget market      Show budget allocations and reservations
       /events             Show recent runtime events
       /events --agent <id> Filter events by agent
       /events --type <type> Filter events by event type
@@ -473,6 +479,8 @@ export class Roy {
       /queue              Show runtime message queue state
       /cache agents       Show cached agent patterns
       /cache delegations  Show cached delegation patterns
+      /cache teams        Show cached team patterns
+      /cache evolution    Show delegation evolution history
       /messages --correlation <id> Show messages for a delegation chain
       /memory             Show workspace memory state
       /memory public      Show public memory docs
@@ -509,6 +517,10 @@ export class Roy {
       /skills             List registered skills
       /actions            List available actions
       /tools              List available tools
+      /tools approvals    List pending tool approvals
+      /tools approve <id> Approve a pending tool request
+      /tools deny <id>    Deny a pending tool request
+      /teams              Show runtime subteams
       /memory             Show workspace memory and agent memory statistics
 
     ${this.bold('Configuration')}
@@ -668,6 +680,20 @@ export class Roy {
       return;
     }
 
+    if (subcommand === 'market') {
+      const market = runtime.getBudgetMarketState();
+      console.log('\n  ' + this.bold('Budget Market'));
+      console.log(`    Mode:       ${market.mode}`);
+      console.log(`    Used:       ${market.usedTokens}`);
+      console.log(`    Reserved:   ${market.reservedTokens}`);
+      console.log(`    Available:  ${market.availableTokens ?? 'unlimited'}`);
+      for (const allocation of market.allocations.slice(-10)) {
+        console.log(`    - ${this.cyan(allocation.id)} ${allocation.status} ${allocation.grantedTokens}/${allocation.request.requestedTokens} ${allocation.request.purpose}`);
+      }
+      console.log('');
+      return;
+    }
+
     this.printBudget();
   }
 
@@ -793,6 +819,42 @@ export class Roy {
     console.log('');
   }
 
+  private async handleTools(parts: string[]): Promise<void> {
+    const command = parts[1];
+    if (command === 'approvals') {
+      const approvals = runtime.getToolApprovals();
+      console.log('\n  ' + this.bold('Tool Approvals'));
+      if (approvals.length === 0) console.log('    ' + this.dim('No tool approval requests'));
+      for (const approval of approvals) {
+        console.log(`    - ${this.cyan(approval.id)} ${approval.status} ${approval.agentId} -> ${approval.toolName} (${approval.permission})`);
+      }
+      console.log('');
+      return;
+    }
+    if ((command === 'approve' || command === 'deny') && parts[2]) {
+      const resolved = await runtime.resolveToolApproval(parts[2], command === 'approve' ? 'approved' : 'denied');
+      console.log(resolved
+        ? `\n  ${this.green(`Tool request ${resolved.id} ${resolved.status}`)}\n`
+        : `\n  ${this.red(`Pending tool request not found: ${parts[2]}`)}\n`);
+      return;
+    }
+    this.printTools();
+  }
+
+  private printTeams(): void {
+    const teams = runtime.getTeams();
+    console.log('\n  ' + this.bold('Runtime Teams'));
+    if (teams.length === 0) {
+      console.log('    ' + this.dim('No runtime teams'));
+    } else {
+      for (const team of teams) {
+        console.log(`    - ${this.cyan(team.identity.id)} ${team.identity.name} [${team.state}] parent=${team.identity.parentId}`);
+        console.log(`      members=${team.memberIds.join(', ') || 'none'} tokens=${team.tokenUsage.totalTokens}`);
+      }
+    }
+    console.log('');
+  }
+
   private printMemory(): void {
     if (!this.ctx) return;
 
@@ -829,8 +891,14 @@ export class Roy {
     }
 
     if (scope === 'team') {
+      if (!key) {
+        console.log('\n  Usage: /memory team <team-key>\n');
+        return;
+      }
+      const memory = await runtime.readTeamMemoryDoc(key, 'memory');
       console.log('\n  ' + this.bold(`Team Memory: ${key ?? ''}`));
-      console.log('    ' + this.dim('Team memory storage is reserved; no team instances exist yet.') + '\n');
+      console.log(memory.trim() || this.dim('No team memory content'));
+      console.log('');
       return;
     }
 
@@ -1141,12 +1209,18 @@ export class Roy {
     if (parts[1] === 'render') {
       const agentKey = parts[2] ?? 'roy';
       const task = this.optionValue(parts, '--task') ?? this.trailingTask(parts, 3);
-      const rendered = await runtime.renderAgentPrompt({ agentKey, task, archetype: agentKey as any });
+      const rendered = await runtime.renderAgentContext({
+        agentKey,
+        role: agentKey === 'roy' ? 'root' : 'subagent',
+        task,
+      });
       console.log('\n  ' + this.bold(`Context Render: ${agentKey}`));
       console.log('  ' + this.bold('Context Sources:'));
       console.log('    ' + this.dim(JSON.stringify(rendered.sources, null, 2).replace(/\n/g, '\n    ')));
       console.log('  ' + this.bold('Estimated Tokens:'));
-      console.log(`    prompt: ${this.cyan(String(rendered.estimatedTokens))}`);
+      for (const [key, value] of Object.entries(rendered.tokenUsage)) {
+        console.log(`    ${key}: ${this.cyan(String(value))}`);
+      }
       console.log('');
       return;
     }
@@ -1208,7 +1282,7 @@ export class Roy {
 
   private completer(line: string): [string[], string] {
     const commands = [
-      '/help', '/h', '/clear', '/cls', '/reset', '/agents', '/spawn', '/run', '/exit', '/quit', '/q',
+      '/help', '/h', '/clear', '/cls', '/reset', '/agents', '/spawn', '/run', '/teams', '/exit', '/quit', '/q',
       '/api', '/status', '/skills', '/actions', '/tools', '/memory', '/session',
       '/system', '/fsm', '/budget', '/events', '/queue', '/cache', '/messages', '/traces', '/config', '/prompt', '/context', '/conversation', '/verbose', '/color'
     ];
@@ -1301,6 +1375,16 @@ export class Roy {
 
   private async printCache(parts: string[]): Promise<void> {
     const scope = parts[1] ?? 'agents';
+    if (scope === 'evolution') {
+      const records = await runtime.getEvolutionHistory(20);
+      console.log('\n  ' + this.bold('Cache: evolution'));
+      if (records.length === 0) console.log('    ' + this.dim('No evolution runs recorded.'));
+      for (const record of records) {
+        console.log(`    - ${this.cyan(String(record.correlationId ?? 'run'))} parent=${record.parentId ?? '-'} selected=${record.selected ?? 'none'}`);
+      }
+      console.log('');
+      return;
+    }
     const kind = scope === 'delegations' || scope === 'teams' ? scope : 'agents';
     const patterns = await runtime.getCachePatterns(kind);
     console.log('\n  ' + this.bold(`Cache: ${kind}`));

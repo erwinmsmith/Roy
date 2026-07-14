@@ -1,6 +1,6 @@
 // Executor - Execution engine interface
 
-import type { SignalBus } from './SignalBus.js';
+import { signalBus as defaultSignalBus, type SignalBus } from './SignalBus.js';
 
 export interface ExecutorConfig {
   maxConcurrentActivities?: number;
@@ -70,6 +70,31 @@ export interface Executor {
   cleanup(): Promise<void>;
 }
 
+class AsyncSemaphore {
+  private active = 0;
+  private readonly waiters: Array<() => void> = [];
+
+  constructor(private readonly limit: number) {
+    if (!Number.isInteger(limit) || limit < 1) {
+      throw new Error('Concurrency limit must be a positive integer');
+    }
+  }
+
+  async acquire(): Promise<() => void> {
+    if (this.active >= this.limit) {
+      await new Promise<void>(resolve => this.waiters.push(resolve));
+    }
+    this.active += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.active -= 1;
+      this.waiters.shift()?.();
+    };
+  }
+}
+
 /**
  * Asyncio-based executor implementation
  */
@@ -77,16 +102,14 @@ export class AsyncioExecutor implements Executor {
   readonly engine = 'asyncio';
   private config: ExecutorConfig;
   private signalBus: SignalBus;
-  private semaphore?: { permit: () => void };
+  private semaphore?: AsyncSemaphore;
 
   constructor(config: ExecutorConfig = {}, signalBus?: SignalBus) {
     this.config = config;
-    this.signalBus = signalBus!;
+    this.signalBus = signalBus ?? defaultSignalBus;
 
     if (config.maxConcurrentActivities) {
-      this.semaphore = {
-        permit: () => { /* placeholder */ }
-      };
+      this.semaphore = new AsyncSemaphore(config.maxConcurrentActivities);
     }
   }
 
@@ -95,27 +118,33 @@ export class AsyncioExecutor implements Executor {
     options?: { timeout?: number }
   ): Promise<ActivityResult<T>> {
     const timeoutMs = options?.timeout || this.config.timeoutMs;
+    const release = await this.semaphore?.acquire();
+    const retry = this.config.retryPolicy;
+    const maxAttempts = Math.max(1, retry?.maxAttempts ?? 1);
+    let delayMs = retry?.initialDelayMs ?? 0;
 
     try {
-      let result: T;
-
-      if (timeoutMs) {
-        result = await Promise.race([
-          Promise.resolve(activity()),
-          new Promise<T>((_, reject) =>
-            setTimeout(() => reject(new Error('Activity timeout')), timeoutMs)
-          ),
-        ]);
-      } else {
-        result = await Promise.resolve(activity());
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        try {
+          const result = await this.runWithTimeout(activity, timeoutMs);
+          return { success: true, value: result, metadata: { attempts: attempt } };
+        } catch (error) {
+          if (attempt === maxAttempts) {
+            return {
+              success: false,
+              error: error instanceof Error ? error.message : String(error),
+              metadata: { attempts: attempt },
+            };
+          }
+          if (delayMs > 0) {
+            await new Promise(resolve => setTimeout(resolve, delayMs));
+            delayMs *= retry?.backoffMultiplier ?? 1;
+          }
+        }
       }
-
-      return { success: true, value: result };
-    } catch (error) {
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : String(error),
-      };
+      return { success: false, error: 'Activity did not execute', metadata: { attempts: 0 } };
+    } finally {
+      release?.();
     }
   }
 
@@ -125,22 +154,19 @@ export class AsyncioExecutor implements Executor {
   ): Promise<ActivityResult<T>[]> {
     const maxConcurrent = options?.maxConcurrent || this.config.maxConcurrentActivities;
 
-    if (maxConcurrent) {
-      // Execute with concurrency limit
-      const results: ActivityResult<T>[] = [];
-      const chunks: Array<() => T | Promise<T>>[] = [];
-
-      for (let i = 0; i < activities.length; i += maxConcurrent) {
-        chunks.push(activities.slice(i, i + maxConcurrent));
-      }
-
-      for (const chunk of chunks) {
-        const chunkResults = await Promise.all(
-          chunk.map(activity => this.execute(activity))
-        );
-        results.push(...chunkResults);
-      }
-
+    if (maxConcurrent && maxConcurrent > 0) {
+      const results = new Array<ActivityResult<T>>(activities.length);
+      let nextIndex = 0;
+      const workers = Array.from(
+        { length: Math.min(maxConcurrent, activities.length) },
+        async () => {
+          while (nextIndex < activities.length) {
+            const index = nextIndex++;
+            results[index] = await this.execute(activities[index]);
+          }
+        }
+      );
+      await Promise.all(workers);
       return results;
     }
 
@@ -177,6 +203,25 @@ export class AsyncioExecutor implements Executor {
 
   async cleanup(): Promise<void> {
     // Cleanup resources
+  }
+
+  private async runWithTimeout<T>(
+    activity: () => T | Promise<T>,
+    timeoutMs?: number
+  ): Promise<T> {
+    if (!timeoutMs) return Promise.resolve().then(activity);
+
+    let timeoutId: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        Promise.resolve().then(activity),
+        new Promise<T>((_, reject) => {
+          timeoutId = setTimeout(() => reject(new Error('Activity timeout')), timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
+    }
   }
 }
 
