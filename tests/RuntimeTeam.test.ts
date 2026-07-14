@@ -39,6 +39,16 @@ class TeamTestLLM implements LLMProvider {
   }
 }
 
+class PartialFailureTeamLLM extends TeamTestLLM {
+  override async *stream(messages: LLMMessage[]): AsyncGenerator<LLMStreamChunk, void, unknown> {
+    const systemPrompt = messages.find(message => message.role === 'system')?.content ?? '';
+    if (systemPrompt.includes('Name: Critic-1') || systemPrompt.includes('You are Critic-1')) {
+      throw new Error('critic execution failed');
+    }
+    yield* super.stream(messages);
+  }
+}
+
 describe('Phase 3 subteam runtime', () => {
   it('enforces the formal team FSM', () => {
     const registry = new TeamRegistry();
@@ -60,7 +70,6 @@ describe('Phase 3 subteam runtime', () => {
     registry.transitionFsm(team.identity.id, 'S_team_synthesize');
     const completed = registry.transitionFsm(team.identity.id, 'S_team_done');
     expect(completed.status).toBe('done');
-    expect(completed.state).toBe('done');
   });
 
   it('runs a three-member team through team messages, synthesis, budget, and persistence', async () => {
@@ -147,6 +156,7 @@ describe('Phase 3 subteam runtime', () => {
     expect(patterns.patterns[0].usage.averageTokens).toBe(120);
 
     const rerun = await runtime.runTeam(team.identity.id, 'Re-run the architecture review with the same members.');
+    expect(rerun.correlationId).not.toBe(result.correlationId);
     expect(rerun.team.memberAgentIds).toEqual(result.team.memberAgentIds);
     expect(rerun.team.status).toBe('done');
     expect(rerun.usage.totalTokens).toBe(120);
@@ -191,6 +201,17 @@ describe('Phase 3 subteam runtime', () => {
       description: 'Reject malformed ToM input.',
       tomLevel: 4,
     })).rejects.toThrow('Team tomLevel must be an integer from 0 to 3');
+    await expect(runtime.spawnTeam({
+      name: 'InvalidExecutionTeam',
+      description: 'Reject malformed execution policy.',
+      executionPolicy: { mode: 'unsupported' as 'sequential' },
+    })).rejects.toThrow('Unsupported team execution mode');
+    await expect(runtime.spawnTeam({
+      name: 'ImpossibleMinimumTeam',
+      description: 'Reject an impossible success threshold.',
+      executionPolicy: { minimumSuccessfulMembers: 2 },
+      members: [{ archetype: 'researcher', task: 'Inspect one bounded area.' }],
+    })).rejects.toThrow('exceeds planned members');
 
     await runtime.shutdown();
   });
@@ -210,6 +231,72 @@ describe('Phase 3 subteam runtime', () => {
     expect(patterns).toHaveLength(1);
     expect((patterns[0].usage as { count: number }).count).toBe(2);
     expect(patterns[0].status).toBe('active');
+    await runtime.shutdown();
+  });
+
+  it('hydrates members and execution policy from a cached team pattern', async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), 'roy-phase3-team-cache-hydration-'));
+    const runtime = new Runtime();
+    await runtime.initialize({ sessionId: 'phase3-team-cache-hydration', workspaceCwd: cwd, llmProvider: new TeamTestLLM() });
+
+    const first = await runtime.spawnTeam({
+      name: 'HydratedReviewTeam',
+      description: 'Reusable bounded review.',
+      executionPolicy: { failureMode: 'fail_fast', minimumSuccessfulMembers: 2 },
+      members: [
+        { archetype: 'researcher', task: 'Inspect the bounded structure.', tools: ['fs.list'], lead: true },
+        { archetype: 'critic', task: 'Critique the bounded structure.', tools: ['fs.read'] },
+      ],
+    });
+    const second = await runtime.spawnTeam({
+      name: 'HydratedReviewTeam',
+      description: 'Reusable bounded review.',
+    });
+
+    expect(second.identity.id).not.toBe(first.identity.id);
+    expect(second.executionPolicy.failureMode).toBe('fail_fast');
+    expect(second.executionPolicy.minimumSuccessfulMembers).toBe(2);
+    const result = await runtime.runTeam(second.identity.id, 'Run the cached team definition.');
+    expect(result.members).toHaveLength(2);
+    expect(result.team.leadAgentId).toBe(result.team.memberAgentIds[0]);
+    expect(runtime.getEvents().some(event =>
+      event.type === 'cache.hit'
+      && event.correlationId === second.correlationId
+      && event.data?.cacheType === 'team-pattern'
+    )).toBe(true);
+    await runtime.shutdown();
+  });
+
+  it('synthesizes successful member results under best-effort policy and records failures', async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), 'roy-phase3-team-partial-'));
+    const runtime = new Runtime();
+    await runtime.initialize({ sessionId: 'phase3-team-partial', workspaceCwd: cwd, llmProvider: new PartialFailureTeamLLM() });
+    const team = await runtime.spawnTeam({
+      name: 'PartialReviewTeam',
+      description: 'Continue with explicit limitations when one member fails.',
+      executionPolicy: { failureMode: 'best_effort', minimumSuccessfulMembers: 1 },
+      members: [
+        { archetype: 'researcher', name: 'Researcher-1', task: 'Inspect the bounded structure.', lead: true },
+        { archetype: 'critic', name: 'Critic-1', task: 'Critique the bounded structure.' },
+      ],
+    });
+
+    const result = await runtime.runTeam(team.identity.id, 'Review the bounded structure.');
+    expect(result.team.status).toBe('done');
+    expect(result.members).toHaveLength(1);
+    expect(result.memberOutcomes.map(outcome => outcome.status)).toEqual(['completed', 'failed']);
+    const failed = result.memberOutcomes[1];
+    expect(failed.agentId).toBeDefined();
+    expect(result.team.memberStatuses[failed.agentId!]).toBe('failed');
+    expect(result.team.memberErrors[failed.agentId!]).toContain('critic execution failed');
+    expect(runtime.getEvents().find(event => event.type === 'team.completed' && event.correlationId === result.correlationId)?.data)
+      .toMatchObject({ partial: true, failedMembers: 1 });
+    expect(runtime.getEvents().some(event => event.type === 'team.member.failed')).toBe(true);
+    const pattern = (await runtime.getCachePatterns('teams'))[0];
+    expect(pattern.usage).toMatchObject({ partialSuccessCount: 1, failedMemberRuns: 1, lastFailedMemberCount: 1 });
+    const teamSession = await readFile(path.join(cwd, '.roy', 'teams', 'partialreviewteam', 'sessions.jsonl'), 'utf8');
+    expect(teamSession).toContain('"partial":true');
+    expect(teamSession).toContain('critic execution failed');
     await runtime.shutdown();
   });
 

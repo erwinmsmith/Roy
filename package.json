@@ -4,6 +4,39 @@
   "description": "Observable, budget-aware Theory-of-Mind multi-agent runtime",
   "type": "module",
   "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./runtime": {
+      "types": "./dist/core/runtime/index.d.ts",
+      "import": "./dist/core/runtime/index.js"
+    },
+    "./team": {
+      "types": "./dist/core/team/index.d.ts",
+      "import": "./dist/core/team/index.js"
+    },
+    "./queue": {
+      "types": "./dist/core/queue/index.d.ts",
+      "import": "./dist/core/queue/index.js"
+    },
+    "./memory": {
+      "types": "./dist/core/memory/index.d.ts",
+      "import": "./dist/core/memory/index.js"
+    }
+  },
+  "bin": {
+    "roy": "dist/cli/Roy.js",
+    "roy-server": "dist/server/index.js"
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    ".env.example",
+    "roy.config.example.yaml"
+  ],
   "scripts": {
     "dev": "npm run dev:server",
     "dev:server": "tsx src/server/index.ts",
@@ -17,7 +50,8 @@
     "lint": "eslint src --ext .ts",
     "lint:fix": "eslint src --ext .ts --fix",
     "format": "prettier --write \"src/**/*.ts\"",
-    "check": "tsc --noEmit && eslint src --ext .ts"
+    "check": "tsc --noEmit && eslint src --ext .ts",
+    "prepack": "npm run build"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.52.0",

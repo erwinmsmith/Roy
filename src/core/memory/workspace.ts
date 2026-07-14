@@ -1,4 +1,4 @@
-import { mkdir, readFile, readdir, stat, writeFile, appendFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { RuntimeEvent } from '../runtime/Runtime.js';
 
@@ -187,6 +187,10 @@ export interface WorkspaceRuntimeConfig {
     enabled: boolean;
     createForMultipleAgents: boolean;
     maxMembersPerTeam: number;
+    executionMode: 'sequential' | 'parallel';
+    failureMode: 'fail_fast' | 'best_effort';
+    maxConcurrency: number;
+    minimumSuccessfulMembers: number;
   };
 }
 
@@ -206,6 +210,7 @@ export interface TeamPatternInput {
   tomLevel?: number;
   leadArchetype?: string;
   members?: Array<Record<string, unknown>>;
+  executionPolicy?: Record<string, unknown>;
 }
 
 export interface MemorySignals {
@@ -462,6 +467,10 @@ const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
     enabled: true,
     createForMultipleAgents: true,
     maxMembersPerTeam: 5,
+    executionMode: 'sequential',
+    failureMode: 'best_effort',
+    maxConcurrency: 3,
+    minimumSuccessfulMembers: 1,
   },
 };
 
@@ -582,7 +591,7 @@ export class WorkspaceMemoryManager {
 
   async writeTrace(event: RuntimeEvent): Promise<void> {
     if (!this.initialized || !this.tracePath) return;
-    await appendFile(this.tracePath, JSON.stringify(event) + '\n', 'utf8');
+    await this.appendLocked(this.tracePath, JSON.stringify(event) + '\n');
   }
 
   async ensureAgentMemory(agentKey: string, options: { name?: string; role?: string; description?: string } = {}): Promise<void> {
@@ -690,14 +699,18 @@ Keep this agent identity separate from the model provider identity.
     const safeKey = this.safeKey(teamKey);
     const teamPath = path.join(this.rootPath, 'teams', safeKey);
     await mkdir(teamPath, { recursive: true });
-    await writeFile(path.join(teamPath, 'topology.json'), JSON.stringify(topology, null, 2) + '\n', 'utf8');
+    const topologyPath = path.join(teamPath, 'topology.json');
+    await this.withFileLock(topologyPath, () => this.writeAtomic(
+      topologyPath,
+      JSON.stringify(topology, null, 2) + '\n'
+    ));
   }
 
   async appendTeamSession(teamKey: string, record: Record<string, unknown>): Promise<void> {
     const safeKey = this.safeKey(teamKey);
     const teamPath = path.join(this.rootPath, 'teams', safeKey);
     await mkdir(teamPath, { recursive: true });
-    await appendFile(path.join(teamPath, 'sessions.jsonl'), JSON.stringify(record) + '\n', 'utf8');
+    await this.appendLocked(path.join(teamPath, 'sessions.jsonl'), JSON.stringify(record) + '\n');
   }
 
   async getMemoryMode(): Promise<MemoryMode> {
@@ -714,9 +727,11 @@ Keep this agent identity separate from the model provider identity.
 
   async setMemoryMode(mode: MemoryMode): Promise<MemoryMode> {
     const configPath = path.join(this.rootPath, 'config.json');
-    const config = await this.readJson<Record<string, unknown>>(configPath, {});
-    config.memoryUpdates = mode;
-    await writeFile(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    await this.withFileLock(configPath, async () => {
+      const config = await this.readJson<Record<string, unknown>>(configPath, {});
+      config.memoryUpdates = mode;
+      await this.writeAtomic(configPath, JSON.stringify(config, null, 2) + '\n');
+    });
     return mode;
   }
 
@@ -735,15 +750,17 @@ Keep this agent identity separate from the model provider identity.
 
   async recordAutoPropose(source: string, summary: MemoryProposalSummary, reason?: string): Promise<void> {
     const configPath = path.join(this.rootPath, 'config.json');
-    const config = await this.readJson<Record<string, unknown>>(configPath, {});
-    config.lastAutoPropose = {
-      source,
-      sessionId: this.sessionId,
-      ...summary,
-      reason,
-      updatedAt: Date.now(),
-    };
-    await writeFile(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    await this.withFileLock(configPath, async () => {
+      const config = await this.readJson<Record<string, unknown>>(configPath, {});
+      config.lastAutoPropose = {
+        source,
+        sessionId: this.sessionId,
+        ...summary,
+        reason,
+        updatedAt: Date.now(),
+      };
+      await this.writeAtomic(configPath, JSON.stringify(config, null, 2) + '\n');
+    });
   }
 
   async listMemoryProposals(): Promise<MemoryUpdateProposal[]> {
@@ -1008,7 +1025,7 @@ Keep this agent identity separate from the model provider identity.
     const updatesPath = path.join(this.rootPath, 'cache', 'memory-updates.json');
     await this.withFileLock(updatesPath, async () => {
       const updates = await this.listMemoryUpdates();
-      await writeFile(updatesPath, JSON.stringify({ updates: [...updates, record] }, null, 2) + '\n', 'utf8');
+      await this.writeAtomic(updatesPath, JSON.stringify({ updates: [...updates, record] }, null, 2) + '\n');
     });
     return record;
   }
@@ -1168,6 +1185,7 @@ Keep this agent identity separate from the model provider identity.
         tomLevel: input.tomLevel ?? 2,
         leadArchetype: input.leadArchetype,
         members: input.members ?? input.memberArchetypes.map(archetype => ({ archetype })),
+        executionPolicy: input.executionPolicy,
         memoryPath: `.roy/teams/${key}/memory.md`,
         topologyPath: `.roy/teams/${key}/topology.json`,
         status: usageCount >= 2 ? 'active' : 'candidate',
@@ -1182,7 +1200,7 @@ Keep this agent identity separate from the model provider identity.
 
   async recordTeamPatternOutcome(
     teamKey: string,
-    outcome: { success: boolean; totalTokens: number; memberCount: number }
+    outcome: { success: boolean; totalTokens: number; memberCount: number; failedMemberCount?: number }
   ): Promise<void> {
     const key = this.safeKey(teamKey);
     const cachePath = path.join(this.rootPath, 'cache', 'team-patterns.json');
@@ -1196,9 +1214,13 @@ Keep this agent identity separate from the model provider identity.
         ...usage,
         completedCount,
         successCount: Number(usage.successCount ?? 0) + (outcome.success ? 1 : 0),
+        partialSuccessCount: Number(usage.partialSuccessCount ?? 0)
+          + (outcome.success && (outcome.failedMemberCount ?? 0) > 0 ? 1 : 0),
+        failedMemberRuns: Number(usage.failedMemberRuns ?? 0) + (outcome.failedMemberCount ?? 0),
         totalTokens,
         averageTokens: Math.round(totalTokens / completedCount),
         lastMemberCount: outcome.memberCount,
+        lastFailedMemberCount: outcome.failedMemberCount ?? 0,
         lastCompletedAt: new Date().toISOString(),
       };
       pattern.status = outcome.success && completedCount >= 2 ? 'active' : pattern.status;
@@ -1245,10 +1267,9 @@ Keep this agent identity separate from the model provider identity.
   }
 
   async recordEvolutionRun(record: Record<string, unknown>): Promise<void> {
-    await appendFile(
+    await this.appendLocked(
       path.join(this.rootPath, 'cache', 'evolution-history.jsonl'),
-      JSON.stringify({ ...record, recordedAt: Date.now() }) + '\n',
-      'utf8'
+      JSON.stringify({ ...record, recordedAt: Date.now() }) + '\n'
     );
   }
 
@@ -1313,17 +1334,17 @@ Keep this agent identity separate from the model provider identity.
     };
 
     const sessionPath = this.getConversationPath(entry.sessionId);
-    await appendFile(sessionPath, JSON.stringify(fullEntry) + '\n', 'utf8');
+    await this.appendLocked(sessionPath, JSON.stringify(fullEntry) + '\n');
     await this.appendAgentSession(fullEntry);
-    await writeFile(
-      path.join(this.rootPath, 'sessions', 'latest.json'),
+    const latestPath = path.join(this.rootPath, 'sessions', 'latest.json');
+    await this.withFileLock(latestPath, () => this.writeAtomic(
+      latestPath,
       JSON.stringify({
         sessionId: entry.sessionId,
         path: sessionPath,
         updatedAt: fullEntry.timestamp,
-      }, null, 2) + '\n',
-      'utf8'
-    );
+      }, null, 2) + '\n'
+    ));
 
     return fullEntry;
   }
@@ -1429,10 +1450,9 @@ Keep this agent identity separate from the model provider identity.
   }
 
   private async writeProposalFile(proposals: MemoryUpdateProposal[]): Promise<void> {
-    await writeFile(
+    await this.writeAtomic(
       path.join(this.rootPath, 'cache', 'memory-proposals.json'),
-      JSON.stringify({ proposals }, null, 2) + '\n',
-      'utf8'
+      JSON.stringify({ proposals }, null, 2) + '\n'
     );
   }
 
@@ -1568,47 +1588,47 @@ Keep this agent identity separate from the model provider identity.
   }
 
   private async ensurePromptSlots(filePath: string): Promise<void> {
-    const requiredSlots = [
-      '{{public_context}}',
-      '{{agent_private_memory}}',
-      '{{agent_identity}}',
-      '{{tom_profile}}',
-      '{{available_skills}}',
-      '{{available_tools}}',
-      '{{parent_context}}',
-      '{{task}}',
-    ];
-    const existing = await this.readOptional(filePath);
-    const missing = requiredSlots.filter(slot => !existing.includes(slot));
-    if (missing.length === 0) return;
-    await appendFile(
-      filePath,
-      `\n\n## Runtime Slots\n\n\`\`\`txt\n${missing.join('\n\n')}\n\`\`\`\n`,
-      'utf8'
-    );
+    await this.withFileLock(filePath, async () => {
+      const requiredSlots = [
+        '{{public_context}}',
+        '{{agent_private_memory}}',
+        '{{agent_identity}}',
+        '{{tom_profile}}',
+        '{{available_skills}}',
+        '{{available_tools}}',
+        '{{parent_context}}',
+        '{{task}}',
+      ];
+      const existing = await this.readOptional(filePath);
+      const missing = requiredSlots.filter(slot => !existing.includes(slot));
+      if (missing.length === 0) return;
+      await appendFile(filePath, `\n\n## Runtime Slots\n\n\`\`\`txt\n${missing.join('\n\n')}\n\`\`\`\n`, 'utf8');
+    });
   }
 
   private async ensureResearcherPolicy(filePath: string): Promise<void> {
-    const existing = await this.readOptional(filePath);
-    const required = [
-      '- For project inspection tasks, call `fs.list` and include concrete file or directory names observed from the tool result.',
-      '- If the user asks to list files/directories, do not produce a reasoning-trace diagnosis, bottleneck analysis, or meta-evaluation.',
-      '- The final report must contain concrete observed paths.',
-    ];
-    const missing = required.filter(line => !existing.includes(line));
-    if (missing.length === 0) return;
-    const begin = '<!-- ROY:BEGIN:tool-policy -->';
-    const end = '<!-- ROY:END:tool-policy -->';
-    if (!existing.includes(begin) || !existing.includes(end)) {
-      await appendFile(filePath, `\n\n## Tool Policy\n\n${missing.join('\n')}\n`, 'utf8');
-      return;
-    }
-    const pattern = new RegExp(`${this.escapeRegExp(begin)}([\\s\\S]*?)${this.escapeRegExp(end)}`);
-    const updated = existing.replace(pattern, (_match, body: string) => {
-      const nextBody = `${body.trim() ? `${body.trim()}\n` : ''}${missing.join('\n')}`;
-      return `${begin}\n${nextBody}\n${end}`;
+    await this.withFileLock(filePath, async () => {
+      const existing = await this.readOptional(filePath);
+      const required = [
+        '- For project inspection tasks, call `fs.list` and include concrete file or directory names observed from the tool result.',
+        '- If the user asks to list files/directories, do not produce a reasoning-trace diagnosis, bottleneck analysis, or meta-evaluation.',
+        '- The final report must contain concrete observed paths.',
+      ];
+      const missing = required.filter(line => !existing.includes(line));
+      if (missing.length === 0) return;
+      const begin = '<!-- ROY:BEGIN:tool-policy -->';
+      const end = '<!-- ROY:END:tool-policy -->';
+      if (!existing.includes(begin) || !existing.includes(end)) {
+        await appendFile(filePath, `\n\n## Tool Policy\n\n${missing.join('\n')}\n`, 'utf8');
+        return;
+      }
+      const pattern = new RegExp(`${this.escapeRegExp(begin)}([\\s\\S]*?)${this.escapeRegExp(end)}`);
+      const updated = existing.replace(pattern, (_match, body: string) => {
+        const nextBody = `${body.trim() ? `${body.trim()}\n` : ''}${missing.join('\n')}`;
+        return `${begin}\n${nextBody}\n${end}`;
+      });
+      await this.writeAtomic(filePath, updated);
     });
-    await writeFile(filePath, updated, 'utf8');
   }
 
   private async readJson<T>(filePath: string, fallback: T): Promise<T> {
@@ -1642,7 +1662,7 @@ Keep this agent identity separate from the model provider identity.
     const key = this.agentSessionKey(entry);
     if (!key) return;
     await this.ensureAgentMemory(key);
-    await appendFile(path.join(this.rootPath, 'agents', key, 'sessions.jsonl'), JSON.stringify(entry) + '\n', 'utf8');
+    await this.appendLocked(path.join(this.rootPath, 'agents', key, 'sessions.jsonl'), JSON.stringify(entry) + '\n');
   }
 
   private agentSessionKey(entry: ConversationEntry): string | undefined {
@@ -1783,7 +1803,7 @@ Keep this agent identity separate from the model provider identity.
       const file = await this.readJson<{ patterns?: Array<Record<string, unknown>> }>(filePath, { patterns: [] });
       const patterns = file.patterns ?? [];
       const result = await mutate(patterns);
-      await writeFile(filePath, JSON.stringify({ patterns }, null, 2) + '\n', 'utf8');
+      await this.writeAtomic(filePath, JSON.stringify({ patterns }, null, 2) + '\n');
       return result;
     });
   }
@@ -1806,11 +1826,25 @@ Keep this agent identity separate from the model provider identity.
     }
   }
 
+  private async appendLocked(filePath: string, content: string): Promise<void> {
+    await this.withFileLock(filePath, () => appendFile(filePath, content, 'utf8'));
+  }
+
   private async writeIfMissing(filePath: string, content: string): Promise<void> {
     try {
-      await stat(filePath);
-    } catch {
-      await writeFile(filePath, content, 'utf8');
+      await writeFile(filePath, content, { encoding: 'utf8', flag: 'wx' });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    }
+  }
+
+  private async writeAtomic(filePath: string, content: string): Promise<void> {
+    const tempPath = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
+    try {
+      await writeFile(tempPath, content, 'utf8');
+      await rename(tempPath, filePath);
+    } finally {
+      await rm(tempPath, { force: true }).catch(() => undefined);
     }
   }
 
@@ -1820,9 +1854,11 @@ Keep this agent identity separate from the model provider identity.
 
   private async ensureWorkspaceConfigDefaults(): Promise<void> {
     const configPath = path.join(this.rootPath, 'config.json');
-    const current = await this.readJson<Record<string, unknown>>(configPath, {});
-    const merged = this.mergeDefaults(DEFAULT_WORKSPACE_CONFIG, current);
-    await writeFile(configPath, JSON.stringify(merged, null, 2) + '\n', 'utf8');
+    await this.withFileLock(configPath, async () => {
+      const current = await this.readJson<Record<string, unknown>>(configPath, {});
+      const merged = this.mergeDefaults(DEFAULT_WORKSPACE_CONFIG, current);
+      await this.writeAtomic(configPath, JSON.stringify(merged, null, 2) + '\n');
+    });
   }
 
   private mergeDefaults(defaults: unknown, current: unknown): unknown {

@@ -1,7 +1,16 @@
 import type { TokenUsage } from '../runtime/Runtime.js';
 
-export type TeamState = 'created' | 'ready' | 'running' | 'waiting' | 'synthesizing' | 'done' | 'failed' | 'cancelled';
 export type TeamStatus = 'idle' | 'running' | 'waiting' | 'synthesizing' | 'done' | 'failed';
+export type TeamExecutionMode = 'sequential' | 'parallel';
+export type TeamFailureMode = 'fail_fast' | 'best_effort';
+export type TeamMemberExecutionStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
+
+export interface TeamExecutionPolicy {
+  mode: TeamExecutionMode;
+  failureMode: TeamFailureMode;
+  maxConcurrency: number;
+  minimumSuccessfulMembers: number;
+}
 export type TeamFSMState =
   | 'S_team_created'
   | 'S_team_plan'
@@ -20,24 +29,22 @@ export interface TeamIdentity {
   generation: number;
   tomLevel: number;
   description: string;
-  // Compatibility aliases for Phase 2 callers.
-  parentId: string;
-  purpose: string;
 }
 
 export interface TeamRuntimeState {
   identity: TeamIdentity;
-  state: TeamState;
   status: TeamStatus;
   fsmState: TeamFSMState;
   memberAgentIds: string[];
-  memberIds: string[];
   leadAgentId?: string;
   tokenUsage: TokenUsage;
   synthesisUsage: TokenUsage;
   memberUsage: Record<string, TokenUsage>;
   memberTasks: Record<string, string>;
   memberResults: Record<string, string>;
+  memberStatuses: Record<string, TeamMemberExecutionStatus>;
+  memberErrors: Record<string, string>;
+  executionPolicy: TeamExecutionPolicy;
   task?: string;
   result?: string;
   correlationId?: string;
@@ -48,13 +55,12 @@ export interface TeamRuntimeState {
 
 export interface CreateTeamSpec {
   name: string;
-  parentAgentId?: string;
-  parentId?: string;
-  description?: string;
-  purpose?: string;
+  parentAgentId: string;
+  description: string;
   generation: number;
   tomLevel?: number;
   leadAgentId?: string;
   task?: string;
   correlationId?: string;
+  executionPolicy?: Partial<TeamExecutionPolicy>;
 }

@@ -44,6 +44,8 @@ Roy [root]
 
 A subteam has its own identity, FSM, task/result boundary, synthesis call, token usage, message flow, memory directory, topology snapshot, session log, and reusable cache pattern. Member tasks flow `parent -> team -> member`; member results flow `member -> team -> parent`.
 
+Team execution is policy controlled. A team can run sequentially or with bounded concurrency, stop on the first failure or continue in best-effort mode, and require a minimum number of successful members before synthesis. Cached team patterns restore member tasks, tools, skills, lead assignment, ToM levels, and execution policy into a new runtime team instance.
+
 ## Core Architecture
 
 ```text
@@ -172,6 +174,17 @@ npm run build
 npm test
 ```
 
+Use Roy as a library:
+
+```ts
+import { Runtime } from 'roy';
+
+const runtime = new Runtime();
+await runtime.initialize({ sessionId: 'my-session', workspaceCwd: process.cwd() });
+```
+
+The package also exposes `roy/runtime`, `roy/team`, `roy/queue`, and `roy/memory` subpaths. Installed binaries are `roy` and `roy-server`.
+
 ## CLI Commands
 
 ```text
@@ -184,7 +197,7 @@ npm test
 /teams
 /teams --tree
 /team <teamId>
-/team create --name "AnalysisTeam" --description "Inspect architecture and risks"
+/team create --name "AnalysisTeam" --description "Inspect architecture and risks" --failure best_effort --concurrency 2
 /team add <teamId> researcher "Inspect the project structure"
 /team run <teamId> "Analyze the project architecture"
 /budget
@@ -223,6 +236,8 @@ GET  /v1/teams/:id
 POST /v1/teams
 POST /v1/teams/:id/agents
 POST /v1/teams/:id/run
+GET  /v1/runtime/sessions
+DELETE /v1/runtime/session
 GET  /v1/budget
 GET  /v1/budget/market
 GET  /v1/cache/:kind

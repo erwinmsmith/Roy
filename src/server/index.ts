@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 // Server entry point with Socket.IO - Unified via bootstrap
 
 import 'dotenv/config';
@@ -101,6 +102,12 @@ async function main(): Promise<void> {
     defaultContext: ctx,
     workspaceCwd: process.cwd(),
   });
+  const sessionSweepTimer = setInterval(() => {
+    runtimePool.sweepIdle().then(expired => {
+      if (expired.length > 0) logger.info(`Closed ${expired.length} idle runtime session(s)`);
+    }).catch(error => logger.error('Runtime session sweep failed:', error));
+  }, 60_000);
+  sessionSweepTimer.unref();
   const runtime = new Proxy(defaultRuntime, {
     get(target, property) {
       const selected = runtimeStorage.getStore() ?? target;
@@ -113,6 +120,10 @@ async function main(): Promise<void> {
   const httpServer = createServer(app);
   app.use(express.json());
   app.use('/v1', async (req, res, next) => {
+    if (req.method === 'DELETE' && req.path === '/runtime/session') {
+      next();
+      return;
+    }
     const requestedSessionId = req.header('x-roy-session-id')
       ?? (typeof req.query.runtimeSessionId === 'string' ? req.query.runtimeSessionId : undefined)
       ?? req.body?.runtimeSessionId;
@@ -185,6 +196,10 @@ async function main(): Promise<void> {
 
   app.get('/v1/status', (req, res) => {
     res.json(runtime.getState());
+  });
+
+  app.get('/v1/runtime/sessions', (_req, res) => {
+    res.json({ sessions: runtimePool.list() });
   });
 
   app.delete('/v1/runtime/session', async (req, res) => {
@@ -358,7 +373,7 @@ async function main(): Promise<void> {
   app.post('/v1/teams', async (req, res) => {
     const body = req.body ?? {};
     if (typeof body.name !== 'string' || typeof body.description !== 'string') {
-      res.status(400).json({ error: 'Expected body { name, description, parentAgentId?, tomLevel?, task?, members? }' });
+      res.status(400).json({ error: 'Expected body { name, description, parentAgentId?, tomLevel?, task?, members?, executionPolicy? }' });
       return;
     }
     try {
@@ -547,6 +562,7 @@ async function main(): Promise<void> {
   const shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
+    clearInterval(sessionSweepTimer);
     console.log(yellow('\nShutting down...'));
     await Promise.allSettled([runtimePool.shutdown(), cleanup(ctx)]);
     io.close();

@@ -4,22 +4,40 @@ interface RuntimeSessionEntry {
   runtime: Runtime;
 }
 
+interface RuntimeSessionSlot {
+  entry: Promise<RuntimeSessionEntry>;
+  createdAt: number;
+  lastAccessedAt: number;
+}
+
+export interface RuntimeSessionInfo {
+  sessionId: string;
+  isDefault: boolean;
+  createdAt: number;
+  lastAccessedAt: number;
+}
+
 export interface RuntimeSessionPoolOptions {
   defaultSessionId: string;
   defaultRuntime: Runtime;
   defaultContext: RuntimeContext;
   workspaceCwd: string;
   maxSessions?: number;
+  idleTimeoutMs?: number;
   runtimeFactory?: () => Runtime;
 }
 
 export class RuntimeSessionPool {
-  private readonly sessions = new Map<string, Promise<RuntimeSessionEntry>>();
+  private readonly sessions = new Map<string, RuntimeSessionSlot>();
   private readonly maxSessions: number;
+  private readonly idleTimeoutMs: number;
   private readonly runtimeFactory: () => Runtime;
+  private readonly defaultCreatedAt = Date.now();
+  private defaultLastAccessedAt = this.defaultCreatedAt;
 
   constructor(private readonly options: RuntimeSessionPoolOptions) {
     this.maxSessions = Math.max(1, Math.floor(options.maxSessions ?? 100));
+    this.idleTimeoutMs = Math.max(1_000, Math.floor(options.idleTimeoutMs ?? 30 * 60 * 1_000));
     this.runtimeFactory = options.runtimeFactory ?? (() => new Runtime());
   }
 
@@ -35,35 +53,72 @@ export class RuntimeSessionPool {
 
   async get(sessionIdInput: unknown): Promise<Runtime> {
     const sessionId = this.normalizeSessionId(sessionIdInput);
-    if (sessionId === this.options.defaultSessionId) return this.options.defaultRuntime;
-    let entryPromise = this.sessions.get(sessionId);
-    if (!entryPromise) {
+    const now = Date.now();
+    if (sessionId === this.options.defaultSessionId) {
+      this.defaultLastAccessedAt = now;
+      return this.options.defaultRuntime;
+    }
+    let slot = this.sessions.get(sessionId);
+    if (!slot) {
       if (this.sessions.size >= this.maxSessions) {
         throw new Error(`Runtime session limit exceeded: maximum ${this.maxSessions}`);
       }
-      entryPromise = this.create(sessionId);
-      this.sessions.set(sessionId, entryPromise);
-      entryPromise.catch(() => this.sessions.delete(sessionId));
+      const entry = this.create(sessionId);
+      slot = { entry, createdAt: now, lastAccessedAt: now };
+      this.sessions.set(sessionId, slot);
+      entry.catch(() => {
+        if (this.sessions.get(sessionId)?.entry === entry) this.sessions.delete(sessionId);
+      });
+    } else {
+      slot.lastAccessedAt = now;
     }
-    return (await entryPromise).runtime;
+    return (await slot.entry).runtime;
   }
 
   async close(sessionIdInput: unknown): Promise<boolean> {
     const sessionId = this.normalizeSessionId(sessionIdInput);
     if (sessionId === this.options.defaultSessionId) return false;
-    const entryPromise = this.sessions.get(sessionId);
-    if (!entryPromise) return false;
+    const slot = this.sessions.get(sessionId);
+    if (!slot) return false;
     this.sessions.delete(sessionId);
-    const entry = await entryPromise;
+    const entry = await slot.entry;
     await entry.runtime.shutdown();
     return true;
+  }
+
+  list(): RuntimeSessionInfo[] {
+    return [
+      {
+        sessionId: this.options.defaultSessionId,
+        isDefault: true,
+        createdAt: this.defaultCreatedAt,
+        lastAccessedAt: this.defaultLastAccessedAt,
+      },
+      ...[...this.sessions.entries()].map(([sessionId, slot]) => ({
+        sessionId,
+        isDefault: false,
+        createdAt: slot.createdAt,
+        lastAccessedAt: slot.lastAccessedAt,
+      })),
+    ];
+  }
+
+  async sweepIdle(now = Date.now()): Promise<string[]> {
+    const expired = [...this.sessions.entries()]
+      .filter(([, slot]) => now - slot.lastAccessedAt >= this.idleTimeoutMs);
+    for (const [sessionId] of expired) this.sessions.delete(sessionId);
+    await Promise.allSettled(expired.map(async ([, slot]) => {
+      const entry = await slot.entry;
+      await entry.runtime.shutdown();
+    }));
+    return expired.map(([sessionId]) => sessionId);
   }
 
   async shutdown(): Promise<void> {
     const entries = [...this.sessions.values()];
     this.sessions.clear();
-    await Promise.allSettled(entries.map(async entryPromise => {
-      const entry = await entryPromise;
+    await Promise.allSettled(entries.map(async slot => {
+      const entry = await slot.entry;
       await entry.runtime.shutdown();
     }));
   }

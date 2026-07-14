@@ -61,6 +61,13 @@ describe('Workspace memory initialization', () => {
     });
     expect(workspaceConfig.agents.defaultToolsByArchetype.researcher).toEqual(['fs.list', 'fs.read']);
     expect(workspaceConfig.agents.defaultSkillsByArchetype.researcher).toEqual(['use_tool_when_needed', 'delegate_to_subagent']);
+    expect(workspaceConfig.teams).toMatchObject({
+      enabled: true,
+      executionMode: 'sequential',
+      failureMode: 'best_effort',
+      maxConcurrency: 3,
+      minimumSuccessfulMembers: 1,
+    });
 
     runtime.emit({ type: 'turn.started', agentId: 'root', data: { turnId: 'turn_test' } });
     await new Promise(resolve => setTimeout(resolve, 10));
@@ -193,5 +200,31 @@ describe('Workspace memory initialization', () => {
     const patterns = await first.getCachePatterns('agents');
     expect(patterns).toHaveLength(1);
     expect((patterns[0].usage as { count: number }).count).toBe(20);
+
+    await Promise.all(Array.from({ length: 20 }, (_, index) => {
+      const manager = index % 2 === 0 ? first : second;
+      return manager.appendConversation({
+        sessionId: 'shared-conversation',
+        role: 'agent',
+        speaker: `Researcher-${index + 1}`,
+        content: `bounded result ${index + 1}`,
+        metadata: { archetype: 'researcher', agentId: `agent_researcher_${index + 1}` },
+      });
+    }));
+    const sharedSession = await readFile(
+      path.join(workspaceCwd, '.roy', 'sessions', 'shared-conversation.jsonl'),
+      'utf8'
+    );
+    expect(sharedSession.trim().split('\n')).toHaveLength(20);
+    const researcherSessions = await readFile(
+      path.join(workspaceCwd, '.roy', 'agents', 'researcher', 'sessions.jsonl'),
+      'utf8'
+    );
+    expect(researcherSessions.trim().split('\n')).toHaveLength(20);
+    const researcherMemory = await readFile(
+      path.join(workspaceCwd, '.roy', 'agents', 'researcher', 'memory.md'),
+      'utf8'
+    );
+    expect(researcherMemory.match(/For project inspection tasks, call `fs\.list`/g)).toHaveLength(1);
   });
 });

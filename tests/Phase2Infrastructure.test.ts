@@ -98,13 +98,13 @@ describe('Phase 2 engineering infrastructure', () => {
 
   it('enforces formal subteam lifecycle transitions', () => {
     const teams = new TeamRegistry();
-    const team = teams.create({ name: 'Review Team', parentId: 'root', purpose: 'review', generation: 1 });
+    const team = teams.create({ name: 'Review Team', parentAgentId: 'root', description: 'review', generation: 1 });
     teams.transitionFsm(team.identity.id, 'S_team_plan');
     expect(() => teams.transitionFsm(team.identity.id, 'S_team_done')).toThrow(InvalidTeamTransitionError);
     teams.transitionFsm(team.identity.id, 'S_member_execute');
     teams.transitionFsm(team.identity.id, 'S_member_aggregate');
     teams.transitionFsm(team.identity.id, 'S_team_synthesize');
-    expect(teams.transitionFsm(team.identity.id, 'S_team_done').state).toBe('done');
+    expect(teams.transitionFsm(team.identity.id, 'S_team_done').status).toBe('done');
   });
 
   it('uses LLM scoring and cache mutation through the pluggable planner', async () => {
@@ -145,10 +145,10 @@ describe('Phase 2 engineering infrastructure', () => {
     expect(result.teams).toHaveLength(1);
     const teams = runtime.getTeams();
     expect(teams).toHaveLength(1);
-    expect(teams[0].state).toBe('done');
+    expect(teams[0].status).toBe('done');
     expect(teams[0].fsmState).toBe('S_team_done');
     expect(teams[0].identity.name).toBe('ReviewTeam');
-    expect(teams[0].memberIds).toHaveLength(2);
+    expect(teams[0].memberAgentIds).toHaveLength(2);
     const events = runtime.getEvents().map(event => event.type);
     expect(events).toContain('team.created');
     expect(events).toContain('team.completed');

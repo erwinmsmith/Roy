@@ -48,6 +48,7 @@ describe('RuntimeSessionPool', () => {
       defaultContext,
       workspaceCwd: cwd,
       maxSessions: 2,
+      idleTimeoutMs: 1000,
     });
 
     const alpha = await pool.get('client-alpha');
@@ -57,6 +58,7 @@ describe('RuntimeSessionPool', () => {
     expect(beta).not.toBe(alpha);
     expect(alpha.getState().sessionId).toBe('client-alpha');
     expect(beta.getState().sessionId).toBe('client-beta');
+    expect(pool.list().map(session => session.sessionId)).toEqual(['server-main', 'client-alpha', 'client-beta']);
 
     alpha.setBudget(1200);
     expect(alpha.getBudgetState().limitTokens).toBe(1200);
@@ -69,6 +71,12 @@ describe('RuntimeSessionPool', () => {
     const replacement = await pool.get('client-alpha');
     expect(replacement).not.toBe(alpha);
     expect(replacement.getBudgetState().mode).toBe('unlimited');
+
+    const expired = await pool.sweepIdle(Date.now() + 1001);
+    expect(expired.sort()).toEqual(['client-alpha', 'client-beta']);
+    expect(pool.list().map(session => session.sessionId)).toEqual(['server-main']);
+    const afterSweep = await pool.get('client-beta');
+    expect(afterSweep).not.toBe(beta);
 
     await pool.shutdown();
     await defaultRuntime.shutdown();

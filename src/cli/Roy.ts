@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 // Roy CLI - Terminal Interface for the Agent System
 
 import * as readline from 'readline';
@@ -533,7 +534,7 @@ export class Roy {
       /teams              Show runtime subteams
       /teams --tree       Show root, team, and member actor tree
       /team <team-id>     Show one team and its member tree
-      /team create --name <name> --description <text>
+      /team create --name <name> --description <text> [--mode sequential|parallel] [--failure fail_fast|best_effort]
       /team add <team-id> <archetype> "task"
       /team run <team-id> "task"
       /memory             Show workspace memory and agent memory statistics
@@ -649,6 +650,8 @@ export class Roy {
     console.log('    GET  /v1/teams/tree - Team actor tree');
     console.log('    POST /v1/teams - Create subteam');
     console.log('    POST /v1/teams/:id/run - Run subteam');
+    console.log('    GET  /v1/runtime/sessions - Active HTTP runtime sessions');
+    console.log('    DELETE /v1/runtime/session - Close the selected HTTP runtime session');
     console.log('    GET  /v1/budget  - Token budget');
     console.log('    GET  /v1/events  - Runtime events');
     console.log('    GET  /v1/queue   - Runtime message queue');
@@ -885,6 +888,9 @@ export class Roy {
       for (const team of teams) {
         console.log(`    - ${this.cyan(team.identity.id)} ${team.identity.name} [${team.status}] parent=${team.identity.parentAgentId}`);
         console.log(`      fsm=${team.fsmState} members=${team.memberAgentIds.length} tokens=${team.tokenUsage.totalTokens}`);
+        console.log(`      execution=${team.executionPolicy.mode}/${team.executionPolicy.failureMode} concurrency=${team.executionPolicy.maxConcurrency} minSuccess=${team.executionPolicy.minimumSuccessfulMembers}`);
+        const failedMembers = Object.entries(team.memberErrors);
+        if (failedMembers.length > 0) console.log(`      failures=${failedMembers.map(([id, error]) => `${id}: ${error}`).join('; ')}`);
       }
     }
     console.log('');
@@ -919,10 +925,24 @@ export class Roy {
         const name = this.optionValue(parts, '--name');
         const description = this.optionValue(parts, '--description') ?? this.optionValue(parts, '--role');
         if (!name || !description) {
-          console.log('\n  Usage: /team create --name <name> --description <description>\n');
+          console.log('\n  Usage: /team create --name <name> --description <description> [--mode sequential|parallel] [--failure fail_fast|best_effort] [--concurrency <n>] [--min-success <n>]\n');
           return;
         }
-        const team = await runtime.spawnTeam({ name, description, parentAgentId: this.optionValue(parts, '--parent') ?? 'root' });
+        const mode = this.optionValue(parts, '--mode');
+        const failureMode = this.optionValue(parts, '--failure');
+        const maxConcurrency = this.optionValue(parts, '--concurrency');
+        const minimumSuccessfulMembers = this.optionValue(parts, '--min-success');
+        const team = await runtime.spawnTeam({
+          name,
+          description,
+          parentAgentId: this.optionValue(parts, '--parent') ?? 'root',
+          executionPolicy: {
+            ...(mode ? { mode: mode as 'sequential' | 'parallel' } : {}),
+            ...(failureMode ? { failureMode: failureMode as 'fail_fast' | 'best_effort' } : {}),
+            ...(maxConcurrency ? { maxConcurrency: Number(maxConcurrency) } : {}),
+            ...(minimumSuccessfulMembers ? { minimumSuccessfulMembers: Number(minimumSuccessfulMembers) } : {}),
+          },
+        });
         console.log(`\n  ${this.green(`Created ${team.identity.name}`)} ${this.dim(team.identity.id)}\n`);
         return;
       }
@@ -963,9 +983,15 @@ export class Roy {
       console.log(`    FSM:    ${team.fsmState}`);
       console.log(`    ToM:    ${team.identity.tomLevel}`);
       console.log(`    Lead:   ${team.leadAgentId ?? 'none'}`);
+      console.log(`    Policy: ${team.executionPolicy.mode}, ${team.executionPolicy.failureMode}, concurrency=${team.executionPolicy.maxConcurrency}, minSuccess=${team.executionPolicy.minimumSuccessfulMembers}`);
       console.log(`    Tokens: ${team.tokenUsage.totalTokens} (members ${team.tokenUsage.totalTokens - team.synthesisUsage.totalTokens}, synthesis ${team.synthesisUsage.totalTokens})`);
       console.log(`    Task:   ${team.task ?? 'none'}`);
       console.log(`    Result: ${team.result ?? 'none'}`);
+      const failedMembers = Object.entries(team.memberErrors);
+      if (failedMembers.length > 0) {
+        console.log('    Member failures:');
+        for (const [agentId, error] of failedMembers) console.log(`      - ${agentId}: ${error}`);
+      }
       tree.members.forEach((member, index) => {
         this.printTeamMemberTree(member, '    ', index === tree.members.length - 1);
       });
