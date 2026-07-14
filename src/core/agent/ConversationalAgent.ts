@@ -157,7 +157,7 @@ export class ConversationalAgent extends BaseAgent {
 
     logger.info(`Agent ${this.name} started running`);
 
-    while (true) {
+    while (this.state !== 'stopped') {
       try {
         // Receive message from queue
         const message = await this.messageQueue.receive(this.name);

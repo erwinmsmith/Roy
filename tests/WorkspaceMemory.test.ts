@@ -33,8 +33,21 @@ describe('Workspace memory initialization', () => {
     const context = await runtime.loadRootMemoryContext();
     expect(context.rootMemory).toContain('# Agent Memory');
     expect(context.projectMemory).toContain('# Project Context');
+    expect(context.projectMemory).toContain(path.basename(workspaceCwd));
+    expect(context.projectMemory).toContain(workspaceCwd);
     expect(await runtime.readPublicMemoryDoc('context')).toContain('# Public Context');
     expect(await runtime.readAgentMemoryDoc('roy', 'prompt')).toContain('# Roy Prompt');
+    const rootState = JSON.parse(await readFile(path.join(workspaceCwd, '.roy', 'agents', 'roy', 'state.json'), 'utf8'));
+    expect(rootState).toMatchObject({
+      version: 1,
+      id: 'roy',
+      name: 'Roy',
+      role: 'root',
+      status: 'available',
+      memoryPath: '.roy/agents/roy/memory.md',
+      promptPath: '.roy/agents/roy/prompt.md',
+    });
+    expect(rootState.updatedAt).toEqual(expect.any(String));
     const workspaceConfig = JSON.parse(await readFile(path.join(workspaceCwd, '.roy', 'config.json'), 'utf8'));
     expect(workspaceConfig.delegation).toMatchObject({
       enabled: true,

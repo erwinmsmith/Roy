@@ -72,7 +72,8 @@ export interface Executor {
 
 class AsyncSemaphore {
   private active = 0;
-  private readonly waiters: Array<() => void> = [];
+  private closed = false;
+  private readonly waiters: Array<{ resolve: () => void; reject: (error: Error) => void }> = [];
 
   constructor(private readonly limit: number) {
     if (!Number.isInteger(limit) || limit < 1) {
@@ -81,17 +82,26 @@ class AsyncSemaphore {
   }
 
   async acquire(): Promise<() => void> {
+    if (this.closed) throw new Error('Executor is closed');
     if (this.active >= this.limit) {
-      await new Promise<void>(resolve => this.waiters.push(resolve));
+      await new Promise<void>((resolve, reject) => this.waiters.push({ resolve, reject }));
     }
+    if (this.closed) throw new Error('Executor is closed');
     this.active += 1;
     let released = false;
     return () => {
       if (released) return;
       released = true;
       this.active -= 1;
-      this.waiters.shift()?.();
+      this.waiters.shift()?.resolve();
     };
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    const error = new Error('Executor is closed');
+    for (const waiter of this.waiters.splice(0)) waiter.reject(error);
   }
 }
 
@@ -103,6 +113,7 @@ export class AsyncioExecutor implements Executor {
   private config: ExecutorConfig;
   private signalBus: SignalBus;
   private semaphore?: AsyncSemaphore;
+  private closed = false;
 
   constructor(config: ExecutorConfig = {}, signalBus?: SignalBus) {
     this.config = config;
@@ -117,8 +128,14 @@ export class AsyncioExecutor implements Executor {
     activity: () => T | Promise<T>,
     options?: { timeout?: number }
   ): Promise<ActivityResult<T>> {
+    if (this.closed) return { success: false, error: 'Executor is closed', metadata: { attempts: 0 } };
     const timeoutMs = options?.timeout || this.config.timeoutMs;
-    const release = await this.semaphore?.acquire();
+    let release: (() => void) | undefined;
+    try {
+      release = await this.semaphore?.acquire();
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error), metadata: { attempts: 0 } };
+    }
     const retry = this.config.retryPolicy;
     const maxAttempts = Math.max(1, retry?.maxAttempts ?? 1);
     let delayMs = retry?.initialDelayMs ?? 0;
@@ -202,7 +219,9 @@ export class AsyncioExecutor implements Executor {
   }
 
   async cleanup(): Promise<void> {
-    // Cleanup resources
+    if (this.closed) return;
+    this.closed = true;
+    this.semaphore?.close();
   }
 
   private async runWithTimeout<T>(

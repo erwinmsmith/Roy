@@ -568,11 +568,13 @@ Tool-use policy:
   /**
    * Cleanup
    */
-  async cleanup(): Promise<void> {
-    if (this.sessionId && this.useContextManager) {
-      contextManager.delete(this.name, this.sessionId);
+  async cleanup(sessionId?: string): Promise<void> {
+    const targetSessionId = sessionId ?? this.sessionId;
+    if (targetSessionId && this.useContextManager) {
+      contextManager.delete(this.name, targetSessionId);
     }
-    await super.cleanup();
+    if (!sessionId || this.sessionId === targetSessionId) this.sessionId = '';
+    await super.cleanup(targetSessionId || undefined);
   }
 
   /**

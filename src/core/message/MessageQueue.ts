@@ -14,6 +14,7 @@ export interface QueueMessage {
 export class MessageQueue {
   private queues: Map<string, AsyncQueue<QueueMessage>> = new Map();
   private receivers: string[];
+  private closed = false;
 
   constructor(receivers: string[] = ['env']) {
     // Ensure 'env' is always in receivers
@@ -34,6 +35,7 @@ export class MessageQueue {
    * Add a new receiver
    */
   addReceiver(receiver: string): void {
+    this.assertOpen();
     if (!this.receivers.includes(receiver)) {
       this.receivers.push(receiver);
       this.queues.set(receiver, new AsyncQueue<QueueMessage>());
@@ -47,7 +49,7 @@ export class MessageQueue {
     if (receiver === 'env') return false; // Cannot remove env
     const queue = this.queues.get(receiver);
     if (queue) {
-      queue.clear();
+      queue.close();
       this.queues.delete(receiver);
       this.receivers = this.receivers.filter(r => r !== receiver);
       return true;
@@ -59,6 +61,7 @@ export class MessageQueue {
    * Send a message to a recipient
    */
   async send(sender: string, recipient: string, content: unknown, metadata?: Record<string, unknown>): Promise<string> {
+    this.assertOpen();
     if (!this.queues.has(recipient)) {
       this.addReceiver(recipient);
     }
@@ -80,6 +83,7 @@ export class MessageQueue {
    * Send a message to multiple recipients
    */
   async broadcast(sender: string, recipients: string[], content: unknown, metadata?: Record<string, unknown>): Promise<string[]> {
+    this.assertOpen();
     return Promise.all(
       recipients.map(recipient => this.send(sender, recipient, content, metadata))
     );
@@ -103,10 +107,12 @@ export class MessageQueue {
     const queue = this.queues.get(recipient);
     if (!queue) return;
 
-    while (true) {
+    while (!queue.isClosed()) {
       const message = await queue.shift();
       if (message) {
         yield message;
+      } else if (queue.isClosed()) {
+        return;
       }
     }
   }
@@ -164,9 +170,19 @@ export class MessageQueue {
    * Cleanup and destroy the message queue
    */
   async cleanup(): Promise<void> {
-    this.clearAll();
+    if (this.closed) return;
+    this.closed = true;
+    for (const queue of this.queues.values()) queue.close();
     this.queues.clear();
     this.receivers = [];
+  }
+
+  isClosed(): boolean {
+    return this.closed;
+  }
+
+  private assertOpen(): void {
+    if (this.closed) throw new Error('Message queue is closed');
   }
 }
 
@@ -176,8 +192,10 @@ export class MessageQueue {
 class AsyncQueue<T> {
   private queue: T[] = [];
   private resolvers: Array<(value: T | undefined) => void> = [];
+  private closed = false;
 
   async push(item: T): Promise<void> {
+    if (this.closed) throw new Error('Queue is closed');
     const resolver = this.resolvers.shift();
     if (resolver) {
       resolver(item);
@@ -191,6 +209,7 @@ class AsyncQueue<T> {
     if (item !== undefined) {
       return item;
     }
+    if (this.closed) return undefined;
 
     // No items available, wait for one
     return new Promise<T | undefined>(resolve => {
@@ -203,16 +222,25 @@ class AsyncQueue<T> {
   }
 
   size(): number {
-    return this.queue.length + this.resolvers.length;
+    return this.queue.length;
   }
 
   clear(): void {
     this.queue = [];
-    // Reject pending resolvers
     for (const resolver of this.resolvers) {
       resolver(undefined);
     }
     this.resolvers = [];
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.clear();
+  }
+
+  isClosed(): boolean {
+    return this.closed;
   }
 }
 

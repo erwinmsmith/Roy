@@ -111,6 +111,7 @@ export abstract class BaseAgent {
   protected messageQueue?: MessageQueue;
   protected shortTermMemory!: ReturnType<typeof memoryRegistry.getShortTerm>;
   protected longTermMemory!: ReturnType<typeof memoryRegistry.getLongTerm>;
+  private activeSessionId?: string;
   protected actions: Map<string, Action> = new Map();
   protected tools: Map<string, Tool> = new Map();
   protected createdAt: number = Date.now();
@@ -427,6 +428,7 @@ export abstract class BaseAgent {
    * Initialize the agent
    */
   async initialize(sessionId: string): Promise<void> {
+    this.activeSessionId = sessionId;
     this.shortTermMemory = memoryRegistry.getShortTerm(this.name, sessionId);
     this.state = 'idle';
     this.updatedAt = Date.now();
@@ -436,10 +438,15 @@ export abstract class BaseAgent {
   /**
    * Cleanup the agent
    */
-  async cleanup(): Promise<void> {
-    this.state = 'stopped';
+  async cleanup(sessionId?: string): Promise<void> {
+    const targetSessionId = sessionId ?? this.activeSessionId;
+    if (targetSessionId) memoryRegistry.clearSession(this.name, targetSessionId);
+    if (!sessionId || this.activeSessionId === targetSessionId) {
+      this.state = 'stopped';
+      this.activeSessionId = undefined;
+    }
     this.updatedAt = Date.now();
-    logger.info(`Agent ${this.name} cleaned up`);
+    logger.info(`Agent ${this.name} cleaned up${targetSessionId ? ` for session ${targetSessionId}` : ''}`);
   }
 }
 

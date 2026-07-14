@@ -10,6 +10,7 @@ interface Session {
   id: string;
   agents: BaseAgent[];
   messageQueue: MessageQueue;
+  ready: Promise<void>;
 }
 
 export class AgentManager {
@@ -106,16 +107,19 @@ export class AgentManager {
       id: sessionId,
       agents: [],
       messageQueue,
+      ready: Promise.resolve(),
     };
 
-    // Initialize all agents with this session
+    const initialization: Promise<void>[] = [];
     for (const [, agent] of this.agents) {
       agent.setMessageQueue(messageQueue);
-      agent.initialize(sessionId).catch(err => {
-        logger.error(`Failed to initialize agent ${agent.name}:`, err);
-      });
+      initialization.push(agent.initialize(sessionId));
       session.agents.push(agent);
     }
+    session.ready = Promise.all(initialization).then(() => undefined).catch(error => {
+      logger.error(`Failed to initialize session ${sessionId}:`, error);
+      throw error;
+    });
 
     this.sessions.set(sessionId, session);
     logger.info(`Session ${sessionId} created`);
@@ -137,9 +141,11 @@ export class AgentManager {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
+    await session.ready.catch(() => undefined);
+
     // Cleanup agents
     for (const agent of session.agents) {
-      await agent.cleanup();
+      await agent.cleanup(sessionId);
     }
 
     // Cleanup message queue
@@ -162,7 +168,16 @@ export class AgentManager {
       throw new Error('No agent configured to interact with env');
     }
 
-    await session.messageQueue.send('env', this.interactWithEnv, message);
+    const agent = this.agents.get(this.interactWithEnv);
+    if (!agent) throw new Error(`Agent ${this.interactWithEnv} not found`);
+    const interactive = agent as BaseAgent & { step?: (observation: string) => Promise<void> };
+    if (typeof interactive.step !== 'function') {
+      throw new Error(`Agent ${agent.name} does not support interactive steps`);
+    }
+    await session.ready;
+    await agent.initialize(sessionId);
+    agent.setMessageQueue(session.messageQueue);
+    await interactive.step(message);
   }
 
   /**
@@ -181,25 +196,10 @@ export class AgentManager {
       throw new Error('No agent configured to interact with env');
     }
 
-    // Send message to env
-    await session.messageQueue.send('env', this.interactWithEnv, message);
-
-    // Stream messages from agent
-    const agent = this.agents.get(this.interactWithEnv);
-    if (!agent) {
-      throw new Error(`Agent ${this.interactWithEnv} not found`);
-    }
-
-    // Agent responses are emitted to the environment receiver through the session queue.
-    let done = false;
-    while (!done) {
-      const msg = await session.messageQueue.receive('env');
-      if (msg) {
-        yield String(msg.content);
-        done = msg.metadata?.done === true;
-      }
-      // Small delay to prevent tight loop
-      await new Promise(resolve => setTimeout(resolve, 50));
+    await this.sendToEnv(sessionId, message);
+    while (!session.messageQueue.isEmpty('env')) {
+      const response = await session.messageQueue.receive('env');
+      if (response) yield String(response.content);
     }
   }
 

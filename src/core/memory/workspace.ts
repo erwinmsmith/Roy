@@ -228,12 +228,20 @@ interface PatternFile {
   patterns: unknown[];
 }
 
-const PUBLIC_MEMORY_TEMPLATES: Record<string, string> = {
+const createPublicMemoryTemplates = (cwd: string): Record<string, string> => ({
   'project.md': `# Project Context
 
 ## Project Name
 
+${path.basename(cwd)}
+
+## Workspace
+
+${cwd}
+
 ## Purpose
+
+This document contains stable, grounded facts about the current project. Roy updates managed sections through the memory proposal workflow.
 
 ## Architecture
 
@@ -289,6 +297,8 @@ This document stores shared runtime context visible to Roy, subagents, teams, an
   'glossary.md': `# Glossary
 
 ## Terms
+
+Project-specific terms accepted through memory proposals are recorded here.
 `,
   'user.md': `# User Context
 
@@ -302,10 +312,12 @@ This document stores shared runtime context visible to Roy, subagents, teams, an
 <!-- ROY:BEGIN:recurring-goals -->
 <!-- ROY:END:recurring-goals -->
 `,
-};
+});
 
 const AGENT_MEMORY_TEMPLATES: Record<string, string> = {
   'memory.md': `# Agent Memory
+
+This file stores reusable private lessons for this agent archetype. Managed sections are updated through reviewed memory proposals.
 
 ## Stable Lessons
 
@@ -329,6 +341,8 @@ const AGENT_MEMORY_TEMPLATES: Record<string, string> = {
 `,
   'context.md': `# Agent Context
 
+This file stores reusable role context that is private to this agent archetype.
+
 ## Current Role
 
 ## Reusable Context
@@ -338,11 +352,15 @@ const AGENT_MEMORY_TEMPLATES: Record<string, string> = {
 `,
   'user.md': `# User Context
 
+Agent-specific user preferences belong here only when they are relevant to this role.
+
 ## Preferences
 
 ## Recurring Goals
 `,
   'decisions.md': `# Design Decisions
+
+Decisions that affect this agent archetype are recorded here.
 
 ## Accepted Decisions
 
@@ -351,6 +369,8 @@ const AGENT_MEMORY_TEMPLATES: Record<string, string> = {
 ## Pending Decisions
 `,
   'constraints.md': `# Constraints
+
+Runtime and user-approved constraints specific to this agent archetype are recorded here.
 
 ## Engineering Constraints
 
@@ -363,6 +383,8 @@ const AGENT_MEMORY_TEMPLATES: Record<string, string> = {
   'glossary.md': `# Glossary
 
 ## Terms
+
+Role-specific terms are recorded here.
 `,
 };
 
@@ -456,7 +478,7 @@ export class WorkspaceMemoryManager {
       mkdir(queuePath, { recursive: true }),
     ]);
 
-    for (const [fileName, content] of Object.entries(PUBLIC_MEMORY_TEMPLATES)) {
+    for (const [fileName, content] of Object.entries(createPublicMemoryTemplates(cwd))) {
       await this.writeIfMissing(path.join(publicPath, fileName), content);
     }
 
@@ -605,7 +627,16 @@ Keep this agent identity separate from the model provider identity.
     await this.ensurePromptSlots(path.join(agentPath, 'prompt.md'));
     await this.writeIfMissing(
       path.join(agentPath, 'state.json'),
-      JSON.stringify({ id: safeKey, name: options.name ?? safeKey, role: options.role ?? safeKey, updatedAt: null }, null, 2) + '\n'
+      JSON.stringify({
+        version: 1,
+        id: safeKey,
+        name: options.name ?? safeKey,
+        role: options.role ?? safeKey,
+        status: 'available',
+        memoryPath: `.roy/agents/${safeKey}/memory.md`,
+        promptPath: `.roy/agents/${safeKey}/prompt.md`,
+        updatedAt: new Date().toISOString(),
+      }, null, 2) + '\n'
     );
     await this.writeIfMissing(path.join(agentPath, 'sessions.jsonl'), '');
   }

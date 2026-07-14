@@ -44,4 +44,25 @@ describe('AsyncioExecutor', () => {
 
     expect(result).toMatchObject({ success: false, error: 'Activity timeout' });
   });
+
+  it('rejects queued and future activities after cleanup', async () => {
+    const executor = new AsyncioExecutor({ maxConcurrentActivities: 1 });
+    let releaseFirst!: () => void;
+    const first = executor.execute(() => new Promise<string>(resolve => {
+      releaseFirst = () => resolve('first');
+    }));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const queued = executor.execute(() => 'queued');
+
+    await executor.cleanup();
+    releaseFirst();
+
+    expect(await first).toMatchObject({ success: true, value: 'first' });
+    expect(await queued).toMatchObject({ success: false, error: 'Executor is closed' });
+    expect(await executor.execute(() => 'late')).toMatchObject({
+      success: false,
+      error: 'Executor is closed',
+      metadata: { attempts: 0 },
+    });
+  });
 });

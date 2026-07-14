@@ -4,6 +4,7 @@ import type {
   EnqueueMessageInput,
   MessageFilter,
   MessagePriority,
+  MessageStatus,
   MessageQueue,
   QueueStats,
   QueueTransition,
@@ -76,6 +77,7 @@ export class InMemoryMessageQueue implements MessageQueue {
 
   async ack(messageId: string): Promise<void> {
     const message = this.requireMessage(messageId);
+    this.assertStatus(message, ['processing'], 'acknowledge');
     message.status = 'completed';
     message.updatedAt = Date.now();
     this.emit({ type: 'message.completed', message });
@@ -83,14 +85,28 @@ export class InMemoryMessageQueue implements MessageQueue {
 
   async fail(messageId: string, error: Error): Promise<void> {
     const message = this.requireMessage(messageId);
+    this.assertStatus(message, ['pending', 'processing'], 'fail');
     message.status = 'failed';
     message.error = error.message;
     message.updatedAt = Date.now();
     this.emit({ type: 'message.failed', message, error: error.message });
   }
 
+  async retry(messageId: string, availableAt = Date.now()): Promise<void> {
+    const message = this.requireMessage(messageId);
+    this.assertStatus(message, ['processing', 'failed'], 'retry');
+    const retryCount = (message.metadata?.retryCount ?? 0) + 1;
+    message.status = 'pending';
+    message.error = undefined;
+    message.availableAt = availableAt;
+    message.metadata = { ...message.metadata, retryCount };
+    message.updatedAt = Date.now();
+    this.emit({ type: 'message.retried', message });
+  }
+
   async cancel(messageId: string, reason?: string): Promise<void> {
     const message = this.requireMessage(messageId);
+    this.assertStatus(message, ['pending', 'processing'], 'cancel');
     message.status = 'cancelled';
     message.error = reason;
     message.updatedAt = Date.now();
@@ -147,6 +163,12 @@ export class InMemoryMessageQueue implements MessageQueue {
     return message;
   }
 
+  private assertStatus(message: RuntimeMessage, allowed: MessageStatus[], operation: string): void {
+    if (!allowed.includes(message.status)) {
+      throw new Error(`Cannot ${operation} message "${message.id}" while status is ${message.status}`);
+    }
+  }
+
   private expireMessages(now: number): void {
     for (const message of this.messages.values()) {
       if (message.status === 'pending' && message.expiresAt && message.expiresAt <= now) {
@@ -164,4 +186,3 @@ export class InMemoryMessageQueue implements MessageQueue {
 }
 
 export default InMemoryMessageQueue;
-

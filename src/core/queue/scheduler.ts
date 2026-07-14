@@ -4,31 +4,39 @@ import type { MessageWorker } from './worker.js';
 export interface MessageSchedulerOptions {
   pollIntervalMs?: number;
   concurrency?: number;
+  retryDelayMs?: number;
 }
 
 export class MessageScheduler {
   private workers: MessageWorker[] = [];
   private running = false;
-  private loop?: Promise<void>;
+  private loops: Promise<void>[] = [];
   private readonly pollIntervalMs: number;
+  private readonly concurrency: number;
+  private readonly retryDelayMs: number;
 
   constructor(
     private readonly queue: MessageQueue,
     options: MessageSchedulerOptions = {}
   ) {
     this.pollIntervalMs = options.pollIntervalMs ?? 20;
+    this.concurrency = options.concurrency ?? 1;
+    this.retryDelayMs = options.retryDelayMs ?? 100;
+    if (!Number.isInteger(this.concurrency) || this.concurrency < 1) {
+      throw new Error('Scheduler concurrency must be a positive integer');
+    }
   }
 
   async start(): Promise<void> {
     if (this.running) return;
     this.running = true;
-    this.loop = this.runLoop();
+    this.loops = Array.from({ length: this.concurrency }, (_, index) => this.runLoop(index));
   }
 
   async stop(): Promise<void> {
     this.running = false;
-    await this.loop;
-    this.loop = undefined;
+    await Promise.all(this.loops);
+    this.loops = [];
   }
 
   registerWorker(worker: MessageWorker): void {
@@ -53,13 +61,20 @@ export class MessageScheduler {
       await worker.handle(message);
       await this.queue.ack(message.id);
     } catch (error) {
-      await this.queue.fail(message.id, error instanceof Error ? error : new Error(String(error)));
+      const retryCount = message.metadata?.retryCount ?? 0;
+      const maxRetries = message.metadata?.maxRetries ?? 0;
+      if (retryCount < maxRetries) {
+        const availableAt = Date.now() + this.retryDelayMs * (2 ** retryCount);
+        await this.queue.retry(message.id, availableAt);
+      } else {
+        await this.queue.fail(message.id, error instanceof Error ? error : new Error(String(error)));
+      }
     }
 
     return true;
   }
 
-  private async runLoop(): Promise<void> {
+  private async runLoop(_workerIndex: number): Promise<void> {
     while (this.running) {
       const processed = await this.processNext();
       if (!processed) {
@@ -70,4 +85,3 @@ export class MessageScheduler {
 }
 
 export default MessageScheduler;
-

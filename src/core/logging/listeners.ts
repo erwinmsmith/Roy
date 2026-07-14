@@ -27,12 +27,14 @@ export interface EventListener {
  */
 export class LoggingListener implements EventListener {
   private filter: EventFilter | null;
+  private closed = false;
 
   constructor(filter: EventFilter | null = null) {
     this.filter = filter;
   }
 
   async handle(events: LogEvent[]): Promise<void> {
+    if (this.closed) throw new Error('LoggingListener is closed');
     for (const event of events) {
       if (this.filter && !this.matchesFilter(event)) {
         continue;
@@ -53,7 +55,7 @@ export class LoggingListener implements EventListener {
 
   private logEvent(event: LogEvent): void {
     const timestamp = new Date(event.timestamp).toISOString();
-    const prefix = `[${event.type.toUpperCase()}] [${event.namespace}]`;
+    const prefix = `[${event.type.toUpperCase()}] ${timestamp} [${event.namespace}]`;
 
     switch (event.type) {
       case 'debug':
@@ -76,11 +78,11 @@ export class LoggingListener implements EventListener {
   }
 
   async flush(): Promise<void> {
-    // No buffering
+    return;
   }
 
   async close(): Promise<void> {
-    // Nothing to close
+    this.closed = true;
   }
 }
 
@@ -193,8 +195,10 @@ export class BatchingListener implements EventListener {
  */
 export class ProgressListener implements EventListener {
   private activeProgress: Map<string, { message: string; percentage: number }> = new Map();
+  private closed = false;
 
   async handle(events: LogEvent[]): Promise<void> {
+    if (this.closed) throw new Error('ProgressListener is closed');
     for (const event of events) {
       if (event.type === 'progress') {
         this.updateProgress(event);
@@ -208,8 +212,10 @@ export class ProgressListener implements EventListener {
     const message = event.message;
 
     if (percentage !== undefined) {
-      this.activeProgress.set(id, { message, percentage });
-      this.renderProgress(id, message, percentage);
+      const bounded = Math.max(0, Math.min(100, percentage));
+      this.activeProgress.set(id, { message, percentage: bounded });
+      this.renderProgress(id, message, bounded);
+      if (bounded >= 100) this.activeProgress.delete(id);
     } else {
       this.activeProgress.delete(id);
     }
@@ -227,11 +233,12 @@ export class ProgressListener implements EventListener {
   }
 
   async flush(): Promise<void> {
-    // Progress is immediate, no buffering
+    return;
   }
 
   async close(): Promise<void> {
     this.activeProgress.clear();
+    this.closed = true;
   }
 }
 

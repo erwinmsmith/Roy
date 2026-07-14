@@ -110,8 +110,7 @@ Return a JSON object with the action and parameters.`;
       const response = await this.llm.completeJSON<Plan>(messages, {
         temperature: this.temperature,
       });
-
-      return response;
+      return this.normalizePlan(response, context.availableActions);
     } catch (error) {
       console.error(`Planner ${this.name} error:`, error);
       return null;
@@ -150,13 +149,7 @@ Return a JSON object with the action and parameters.`;
 
         if (chunk.done && fullResponse) {
           try {
-            const parsed = JSON.parse(fullResponse);
-            lastPlan = {
-              action: parsed.action,
-              params: parsed.params || {},
-              reasoning: parsed.reasoning,
-              confidence: parsed.confidence,
-            };
+            lastPlan = this.normalizePlan(this.parsePlan(fullResponse), context.availableActions);
           } catch {
             // Not valid JSON yet
           }
@@ -167,6 +160,24 @@ Return a JSON object with the action and parameters.`;
     }
 
     return lastPlan;
+  }
+
+  private parsePlan(content: string): Plan {
+    const fenced = content.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1] ?? content;
+    return JSON.parse(fenced.trim()) as Plan;
+  }
+
+  private normalizePlan(plan: Plan, availableActions: string[]): Plan | null {
+    if (!plan || typeof plan.action !== 'string' || !availableActions.includes(plan.action)) return null;
+    const confidence = plan.confidence === undefined
+      ? undefined
+      : Math.max(0, Math.min(1, Number(plan.confidence)));
+    return {
+      action: plan.action,
+      params: plan.params && typeof plan.params === 'object' ? plan.params : {},
+      reasoning: typeof plan.reasoning === 'string' ? plan.reasoning : undefined,
+      confidence: Number.isFinite(confidence) ? confidence : undefined,
+    };
   }
 }
 
@@ -244,7 +255,7 @@ export class CompositePlanner implements Planner {
   }
 
   async plan(context: PlanContext): Promise<Plan | null> {
-    for (const planner of this.planners) {
+    for (const planner of this.activePlanners()) {
       try {
         const plan = await planner.plan(context);
         if (plan) {
@@ -261,17 +272,25 @@ export class CompositePlanner implements Planner {
   async *planStream(
     context: PlanContext
   ): AsyncGenerator<string, Plan | null, unknown> {
-    for (const planner of this.planners) {
+    for (const planner of this.activePlanners()) {
       try {
-        for await (const chunk of planner.planStream(context)) {
-          yield chunk;
+        const iterator = planner.planStream(context);
+        let step = await iterator.next();
+        while (!step.done) {
+          yield step.value;
+          step = await iterator.next();
         }
+        if (step.value) return step.value;
       } catch (error) {
         console.error(`Planner ${planner.name} stream failed:`, error);
       }
     }
 
     return null;
+  }
+
+  private activePlanners(): Planner[] {
+    return this.fallbackEnabled ? this.planners : this.planners.slice(0, 1);
   }
 }
 

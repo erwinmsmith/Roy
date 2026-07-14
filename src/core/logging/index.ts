@@ -5,14 +5,15 @@ import type { LogEvent, EventType, EventContext } from './events.js';
 import { createEventFilter } from './events.js';
 import type { EventTransport } from './transport.js';
 import {
+  BatchingTransport,
+  CompositeTransport,
   ConsoleTransport,
   FileTransport,
+  FilteredTransport,
   HttpTransport,
   NullTransport,
 } from './transport.js';
 import {
-  LoggingListener,
-  BatchingListener,
   ProgressListener,
   type EventListener,
 } from './listeners.js';
@@ -27,7 +28,7 @@ class AsyncEventBus {
   private transport: EventTransport | null = null;
   private started = false;
   private eventQueue: LogEvent[] = [];
-  private processing = false;
+  private processingPromise: Promise<void> | null = null;
 
   private constructor() {}
 
@@ -48,10 +49,10 @@ class AsyncEventBus {
   /**
    * Remove a listener
    */
-  removeListener(name: string): void {
+  async removeListener(name: string): Promise<void> {
     const listener = this.listeners.get(name);
     if (listener) {
-      listener.close();
+      await listener.close();
       this.listeners.delete(name);
     }
   }
@@ -69,7 +70,7 @@ class AsyncEventBus {
   async start(): Promise<void> {
     if (this.started) return;
     this.started = true;
-    this.processQueue();
+    await this.ensureProcessing();
   }
 
   /**
@@ -77,6 +78,7 @@ class AsyncEventBus {
    */
   async stop(): Promise<void> {
     this.started = false;
+    await this.processingPromise;
     await this.flush();
     await this.closeListeners();
   }
@@ -86,57 +88,47 @@ class AsyncEventBus {
    */
   async emit(event: LogEvent): Promise<void> {
     this.eventQueue.push(event);
-    if (!this.processing) {
-      this.processQueue();
-    }
+    if (this.started) await this.ensureProcessing();
   }
 
   /**
    * Flush queued events
    */
   async flush(): Promise<void> {
-    const events = [...this.eventQueue];
-    this.eventQueue = [];
+    await this.processingPromise;
+    while (this.eventQueue.length > 0) {
+      await this.processBatch(this.eventQueue.splice(0, 100));
+    }
+    await Promise.all(Array.from(this.listeners.values()).map(listener => listener.flush()));
+    await this.transport?.flush();
+  }
 
-    if (events.length === 0) return;
-
-    // Process through listeners
-    const promises = Array.from(this.listeners.values()).map(listener =>
-      listener.handle(events).catch(err => console.error('Listener error:', err))
-    );
-    await Promise.all(promises);
-
-    // Send to transport
-    if (this.transport) {
-      try {
-        await this.transport.send(events);
-      } catch (err: unknown) {
-        console.error('Transport error:', err);
-      }
+  private async drainQueue(): Promise<void> {
+    while (this.eventQueue.length > 0 && this.started) {
+      await this.processBatch(this.eventQueue.splice(0, 100));
     }
   }
 
-  private async processQueue(): Promise<void> {
-    if (this.processing || !this.started) return;
-    this.processing = true;
-
-    while (this.eventQueue.length > 0 && this.started) {
-      const events = this.eventQueue.splice(0, 100);
-      const promises = Array.from(this.listeners.values()).map(listener =>
-        listener.handle(events).catch(err => console.error('Listener error:', err))
-      );
-      await Promise.all(promises);
-
-      if (this.transport) {
-        try {
-          await this.transport.send(events);
-        } catch (err: unknown) {
-          console.error('Transport error:', err);
-        }
-      }
+  private ensureProcessing(): Promise<void> {
+    if (!this.processingPromise) {
+      this.processingPromise = this.drainQueue().finally(() => {
+        this.processingPromise = null;
+        if (this.started && this.eventQueue.length > 0) void this.ensureProcessing();
+      });
     }
+    return this.processingPromise;
+  }
 
-    this.processing = false;
+  private async processBatch(events: LogEvent[]): Promise<void> {
+    await Promise.all(Array.from(this.listeners.values()).map(listener =>
+      listener.handle(events).catch(error => console.error('Listener error:', error))
+    ));
+    if (!this.transport) return;
+    try {
+      await this.transport.send(events);
+    } catch (error) {
+      console.error('Transport error:', error);
+    }
   }
 
   private async closeListeners(): Promise<void> {
@@ -148,6 +140,7 @@ class AsyncEventBus {
 
     if (this.transport) {
       await this.transport.close();
+      this.transport = null;
     }
   }
 
@@ -331,25 +324,24 @@ export async function configureLogging(
   const bus = AsyncEventBus.get();
   const filter = createEventFilter(level);
 
-  // Add logging listener
-  bus.addListener('logging', new LoggingListener(filter));
+  await bus.stop();
 
   // Add progress listener if enabled
   if (progressDisplay) {
     bus.addListener('progress', new ProgressListener());
   }
 
-  // Configure transport
   const transports = options?.transports || config?.transports || ['console'];
+  const configuredTransports: EventTransport[] = [];
   for (const transportType of transports) {
     if (transportType === 'console') {
-      bus.setTransport(new ConsoleTransport());
+      configuredTransports.push(new ConsoleTransport());
     } else if (transportType === 'file') {
       const filePath = options?.filePath || config?.path || 'roy.jsonl';
-      bus.setTransport(new FileTransport(filePath));
+      configuredTransports.push(new FileTransport(filePath));
     } else if (transportType === 'http') {
       if (options?.httpEndpoint || config?.httpEndpoint) {
-        bus.setTransport(
+        configuredTransports.push(
           new HttpTransport(
             options!.httpEndpoint || config!.httpEndpoint!,
             options?.httpHeaders || config?.httpHeaders,
@@ -360,21 +352,16 @@ export async function configureLogging(
     }
   }
 
-  // Add batching listener
-  bus.addListener(
-    'batching',
-    new BatchingListener(
-      async (_events) => {
-        // Batch transport implementation
-      },
-      {
-        filter,
-        batchSize,
-        flushInterval,
-        onError: (err) => console.error('Batch error:', err),
-      }
-    )
-  );
+  const baseTransport = configuredTransports.length === 0
+    ? new NullTransport()
+    : configuredTransports.length === 1
+      ? configuredTransports[0]
+      : new CompositeTransport(configuredTransports);
+  bus.setTransport(new BatchingTransport(
+    new FilteredTransport(baseTransport, filter),
+    batchSize,
+    flushInterval * 1000
+  ));
 
   await bus.start();
 }

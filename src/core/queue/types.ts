@@ -109,6 +109,7 @@ export type QueueTransitionType =
   | 'message.processing'
   | 'message.completed'
   | 'message.failed'
+  | 'message.retried'
   | 'message.cancelled'
   | 'message.expired';
 
@@ -124,6 +125,7 @@ export interface MessageQueue {
   dequeue(options?: DequeueOptions): Promise<RuntimeMessage | undefined>;
   ack(messageId: string): Promise<void>;
   fail(messageId: string, error: Error): Promise<void>;
+  retry(messageId: string, availableAt?: number): Promise<void>;
   cancel(messageId: string, reason?: string): Promise<void>;
   getMessage(messageId: string): Promise<RuntimeMessage | undefined>;
   listMessages(filter?: MessageFilter): Promise<RuntimeMessage[]>;

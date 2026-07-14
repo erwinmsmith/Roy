@@ -36,7 +36,11 @@ export abstract class Workflow<T = unknown> {
    * Get current state
    */
   getState(): WorkflowState {
-    return { ...this.state };
+    return {
+      ...this.state,
+      metadata: { ...this.state.metadata },
+      error: this.state.error ? { ...this.state.error } : undefined,
+    };
   }
 
   /**
@@ -57,12 +61,17 @@ export abstract class Workflow<T = unknown> {
    * Wait for input/signal
    */
   async waitForInput(description: string = 'Provide input'): Promise<string> {
-    this.updateState({ status: 'waiting' });
+    this.updateState({
+      status: 'waiting',
+      metadata: { ...this.state.metadata, waitingFor: description },
+    });
 
     const signalName = `human_input:${this.name}`;
     const input = await this.executor.waitForSignal<string>(signalName, 60000);
 
-    this.updateState({ status: 'running' });
+    const metadata = { ...this.state.metadata };
+    delete metadata.waitingFor;
+    this.updateState({ status: 'running', metadata });
     return input;
   }
 
@@ -98,8 +107,7 @@ export abstract class Workflow<T = unknown> {
    * Set workflow metadata
    */
   setMetadata(key: string, value: unknown): void {
-    this.state.metadata[key] = value;
-    this.updateState({ metadata: this.state.metadata });
+    this.updateState({ metadata: { ...this.state.metadata, [key]: value } });
   }
 }
 
