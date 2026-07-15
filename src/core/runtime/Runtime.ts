@@ -34,10 +34,31 @@ import type {
 import { UseToolWhenNeededSkill } from '../skills/toolUse.js';
 import {
   DefaultDelegationCandidatePlanner,
+  HashTaskEmbeddingProvider,
   type DelegationCandidateInput,
   type DelegationCandidateSelection,
   type LLMDelegationScorerInvocation,
 } from '../delegation/index.js';
+import {
+  CompositeEvolutionEvaluator,
+  EvolutionLifecycleEngine,
+  TeamFirstGenomePlanner,
+  WeightedTopKSelectionPolicy,
+  defaultMutationOperators,
+  type EvolutionAblations,
+  type EvolutionCandidate,
+  type EvolutionEvaluationDimensions,
+  type EvolutionEvaluationResult,
+  type EvolutionExecutionArtifact,
+  type EvolutionLifecycleResult,
+  type EvolutionJudge,
+  type EvolutionPattern,
+  type EvolutionProfile,
+  type EvolutionRunOptions,
+  type EvolutionRunResult,
+  type EvolutionSeedAgent,
+  type GenomeToMProfile,
+} from '../evolution/index.js';
 import {
   normalizeToMProfile,
   ToMDelegationPlanner,
@@ -288,6 +309,7 @@ export interface TeamMemberSpec {
   existenceReason?: string;
   lead?: boolean;
   communicationProtocol?: string;
+  systemPrompt?: string;
 }
 
 export interface SpawnTeamSpec {
@@ -396,6 +418,7 @@ export interface SpawnCommandPayload {
   cognitiveGapIds?: string[];
   existenceReason?: string;
   communicationProtocol?: string;
+  systemPrompt?: string;
 }
 
 export type DelegationDecision =
@@ -443,6 +466,7 @@ export interface RootTurnResult {
   finalResponse: string;
   subagents: RootMediatedSpawnResult[];
   teams: TeamRunResult[];
+  evolution?: EvolutionRunResult;
   messages: RuntimeMessage[];
   usage: {
     root: TokenUsage;
@@ -450,6 +474,33 @@ export interface RootTurnResult {
     teamSynthesis: Record<string, TokenUsage>;
     total: TokenUsage;
   };
+}
+
+export interface RunEvolutionInput {
+  task: string;
+  parentId?: string;
+  correlationId?: string;
+  seedAgents?: EvolutionSeedAgent[];
+  profile?: EvolutionProfile;
+  options?: Partial<Omit<EvolutionRunOptions, 'ablations'>> & {
+    ablations?: Partial<EvolutionAblations>;
+  };
+}
+
+export interface EvolutionBenchmarkResult {
+  task: string;
+  profiles: EvolutionProfile[];
+  runs: EvolutionRunResult[];
+  comparison: Array<{
+    profile: EvolutionProfile;
+    success: boolean;
+    score: number;
+    totalTokens: number;
+    thinkingTokens: number | null;
+    wallClockMs: number;
+    agentsSpawned: number;
+    teamsSpawned: number;
+  }>;
 }
 
 export interface AgentCreationUsage {
@@ -515,6 +566,10 @@ export class Runtime {
   private reasoningInvestmentModel: ReasoningInvestmentModel = new WeightedReasoningInvestmentModel();
   private readonly tomAnalyses = new Map<string, ToMTaskAnalysis>();
   private communicationManager: AgentCommunicationManager | null = null;
+  private evolutionSequence = 0;
+  private readonly evolutionRuns: EvolutionRunResult[] = [];
+  private readonly archivedAgentUsage = new Map<string, TokenUsage>();
+  private readonly evolutionBudgetBypassCorrelations = new Set<string>();
 
   static getInstance(): Runtime {
     if (!Runtime.instance) {
@@ -737,6 +792,10 @@ export class Runtime {
     this.teamMemberPlans.clear();
     this.turnAgentCounts.clear();
     this.tomAnalyses.clear();
+    this.evolutionRuns.length = 0;
+    this.archivedAgentUsage.clear();
+    this.evolutionBudgetBypassCorrelations.clear();
+    this.evolutionSequence = 0;
     this.initialized = false;
     logger.info('Runtime shutdown complete');
   }
@@ -924,6 +983,10 @@ export class Runtime {
     for (const agent of agents) {
       const usage = this.toTokenUsage(agent.usage);
       perAgent[agent.identity.id] = usage;
+      usedTokens += usage.totalTokens;
+    }
+    for (const [agentId, usage] of this.archivedAgentUsage) {
+      perAgent[agentId] = { ...usage };
       usedTokens += usage.totalTokens;
     }
     for (const team of this.teams.list()) {
@@ -1325,6 +1388,7 @@ export class Runtime {
           tomProfile: member.tomProfile,
           cognitiveGapIds: member.cognitiveGapIds,
           existenceReason: member.existenceReason,
+          systemPrompt: member.systemPrompt,
           lead: member.lead ?? false,
         })),
         executionPolicy: { ...executionPolicy },
@@ -1528,6 +1592,7 @@ export class Runtime {
         tomProfileMode: 'runtime_assignment',
         cognitiveGapIds: spec.cognitiveGapIds,
         existenceReason: spec.existenceReason,
+        systemPrompt: spec.systemPrompt,
         execution: {
           requireParentSynthesis: false,
           showSubagentOutput: false,
@@ -1993,6 +2058,15 @@ export class Runtime {
     expectedUtility?: number;
     purpose: string;
   }): Promise<BudgetAllocation | undefined> {
+    if (input.correlationId && this.evolutionBudgetBypassCorrelations.has(input.correlationId)) {
+      this.emit({
+        type: 'budget.bypassed',
+        agentId: input.requesterId ?? input.parentId,
+        correlationId: input.correlationId,
+        data: { reason: 'evolution_ablation_without_budget_market', requestedTokens: input.requestedTokens, purpose: input.purpose },
+      });
+      return undefined;
+    }
     if (this.workspaceRuntimeConfig?.budgetMarket.enabled === false) return undefined;
     if (!this.budgetMarket) throw new Error('Budget market is not initialized');
     const requestedTokens = input.requestedTokens ?? this.estimateAgentBudget(input.archetype);
@@ -3009,6 +3083,253 @@ export class Runtime {
     return this.getContext().memory.readEvolutionHistory(limit);
   }
 
+  async getEvolutionPatterns(): Promise<EvolutionPattern[]> {
+    return this.getContext().memory.getEvolutionPatterns();
+  }
+
+  getEvolutionRuns(limit = 20): EvolutionRunResult[] {
+    return this.evolutionRuns.slice(-Math.max(1, limit)).map(run => structuredClone(run));
+  }
+
+  getEvolutionConfig(): WorkspaceRuntimeConfig['evolution'] {
+    if (!this.workspaceRuntimeConfig) throw new Error('Runtime workspace config is not initialized');
+    return structuredClone(this.workspaceRuntimeConfig.evolution);
+  }
+
+  async updateEvolutionConfig(
+    patch: Partial<Omit<WorkspaceRuntimeConfig['evolution'], 'ablations'>> & {
+      ablations?: Partial<WorkspaceRuntimeConfig['evolution']['ablations']>;
+    }
+  ): Promise<WorkspaceRuntimeConfig['evolution']> {
+    this.validateEvolutionConfigPatch(patch);
+    const next = await this.getContext().memory.updateEvolutionConfig(patch);
+    if (!this.workspaceRuntimeConfig) throw new Error('Runtime workspace config is not initialized');
+    this.workspaceRuntimeConfig.evolution = next;
+    this.emit({ type: 'evo.config.updated', agentId: 'root', data: next as unknown as Record<string, unknown> });
+    return structuredClone(next);
+  }
+
+  async runEvolution(input: RunEvolutionInput): Promise<EvolutionRunResult> {
+    const ctx = this.getContext();
+    if (!input.task?.trim()) throw new Error('Evolution task is required');
+    if (this.workspaceRuntimeConfig?.evolution.enabled === false) throw new Error('Evolution is disabled by workspace policy');
+    const parentId = input.parentId ?? 'root';
+    const parent = ctx.manager.getAgentById(parentId);
+    if (!parent) throw new Error(`Evolution parent agent "${parentId}" not found`);
+    const correlationId = input.correlationId ?? this.createCorrelationId();
+    const runId = `evo_run_${Date.now()}_${(++this.evolutionSequence).toString(36)}`;
+    const options = this.resolveEvolutionRunOptions(input.profile, input.options);
+    if (options.profile === 'solo' || options.ablations.withoutSubagents) {
+      return this.runSoloEvolutionBaseline(runId, correlationId, input.task, options);
+    }
+
+    const startedAt = Date.now();
+    if (options.ablations.withoutBudgetMarket) this.evolutionBudgetBypassCorrelations.add(correlationId);
+    const initialBudgetMarket = this.getBudgetMarketState();
+    const patterns = options.ablations.withoutPatternMemory
+      ? []
+      : await this.findRelevantEvolutionPatterns(input.task, options.patternSimilarityThreshold);
+    for (const pattern of patterns) {
+      this.emit({
+        type: 'cache.hit',
+        agentId: parentId,
+        sessionId: ctx.sessionId,
+        correlationId,
+        data: { cacheType: 'evolution-pattern', patternId: pattern.id, similarityThreshold: options.patternSimilarityThreshold },
+      });
+    }
+    const seedAgents = input.seedAgents?.length
+      ? input.seedAgents
+      : await this.createEvolutionSeeds(input.task, parentId, correlationId, options);
+    const policy = this.getAgentPolicy(parentId);
+    const availableAgentSlots = Math.max(0, Math.min(
+      policy?.allowedChildren ?? 0,
+      this.getRemainingTotalAgentsForTurn(parentId, correlationId)
+    ));
+    if (availableAgentSlots <= 0) throw new Error('Evolution cannot execute because no agent slots remain for the parent or turn');
+    const proposalInput = {
+      runId,
+      task: input.task,
+      parentId,
+      agents: seedAgents,
+      patterns,
+      availableTokens: options.ablations.withoutBudgetMarket ? undefined : this.getBudgetState().remainingTokens,
+      availableAgentSlots,
+      options,
+    };
+
+    const instantiated = new Map<string, { kind: 'agent' | 'team'; actorId?: string; error?: string }>();
+    const details = new Map<string, { agent?: RunAgentResult; team?: TeamRunResult }>();
+    let evaluationUsage = this.sumUsage([]);
+    const judge = options.useLlmJudge && ctx.llm
+      ? this.createEvolutionJudge(parentId, correlationId, (usage: TokenUsage) => {
+        evaluationUsage = this.sumUsage([evaluationUsage, usage]);
+      })
+      : undefined;
+    const engine = new EvolutionLifecycleEngine(
+      new TeamFirstGenomePlanner(),
+      new CompositeEvolutionEvaluator(judge),
+      new WeightedTopKSelectionPolicy(),
+      defaultMutationOperators(),
+      {
+        onTransition: async (from, to, data) => {
+          this.emit({ type: 'evo.fsm.transition', agentId: parentId, sessionId: ctx.sessionId, correlationId, data: { runId, from, to, ...data } });
+          await this.recordEvolutionLifecycleMessage(to, parentId, correlationId, { runId, from, to, ...data });
+        },
+        instantiate: async candidate => {
+          try {
+            const actor = await this.instantiateEvolutionCandidate(candidate, parentId, correlationId, options);
+            instantiated.set(candidate.id, actor);
+            this.emit({
+              type: 'evo.candidate.spawned', agentId: actor.actorId ?? parentId, sessionId: ctx.sessionId, correlationId,
+              data: {
+                runId, candidateId: candidate.id, genomeId: candidate.genome.id,
+                actorKind: actor.kind, actorId: actor.actorId, memberCount: candidate.genome.members.length,
+                degeneratedToAgent: candidate.genome.members.length === 1, source: candidate.source,
+              },
+            });
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            instantiated.set(candidate.id, { kind: candidate.genome.members.length === 1 ? 'agent' : 'team', error: message });
+            this.emit({ type: 'evo.candidate.instantiate.failed', agentId: parentId, sessionId: ctx.sessionId, correlationId, data: { runId, candidateId: candidate.id, error: message } });
+          }
+        },
+        execute: async candidate => {
+          const actor = instantiated.get(candidate.id);
+          if (!actor || actor.error || !actor.actorId) {
+            return this.failedEvolutionArtifact(candidate, actor?.actorId ?? 'not-created', actor?.error ?? 'candidate_not_instantiated');
+          }
+          const artifact = await this.executeEvolutionCandidate(candidate, actor, correlationId, details);
+          this.emit({
+            type: artifact.success ? 'evo.candidate.executed' : 'evo.candidate.failed',
+            agentId: artifact.actorId,
+            sessionId: ctx.sessionId,
+            correlationId,
+            data: {
+              runId, candidateId: candidate.id, actorKind: artifact.actorKind,
+              totalTokens: artifact.usage.totalTokens, wallClockMs: artifact.wallClockMs,
+              toolSuccessRate: artifact.toolCalls > 0 ? artifact.successfulToolCalls / artifact.toolCalls : null,
+              failedActors: artifact.failedActors,
+            },
+          });
+          this.archiveEvolutionCandidateAgents(artifact.agentIds, runId, candidate.id);
+          return artifact;
+        },
+        integrate: async (selected, evaluation, execution) => {
+          if (options.ablations.withoutPatternMemory) return undefined;
+          return this.integrateEvolutionPattern(selected, evaluation, execution);
+        },
+      }
+    );
+
+    try {
+      const lifecycle = await engine.run(proposalInput);
+      for (const evaluation of lifecycle.evaluations) {
+        this.emit({
+          type: 'evo.candidate.evaluated', agentId: parentId, sessionId: ctx.sessionId, correlationId,
+          data: { runId, candidateId: evaluation.candidateId, score: evaluation.score, dimensions: evaluation.dimensions, evaluator: evaluation.evaluator },
+        });
+      }
+      if (lifecycle.selected) {
+        this.emit({
+          type: 'evo.candidate.selected', agentId: parentId, sessionId: ctx.sessionId, correlationId,
+          data: {
+            runId, candidateId: lifecycle.selected.id, genomeId: lifecycle.selected.genome.id,
+            score: lifecycle.selectedEvaluation?.score, source: lifecycle.selected.source,
+            lineage: lifecycle.selected.lineage,
+          },
+        });
+      }
+      const completedAt = Date.now();
+      const executionsUsage = this.sumUsage(lifecycle.executions.map(execution => this.evolutionUsageToTokenUsage(execution.usage)));
+      const totalUsage = this.sumUsage([executionsUsage, evaluationUsage]);
+      const finalBudgetMarket = this.getBudgetMarketState();
+      const runAllocations = finalBudgetMarket.allocations.filter(allocation => allocation.request.correlationId === correlationId);
+      const metrics = this.buildEvolutionMetrics({
+        lifecycle,
+        usage: totalUsage,
+        startedAt,
+        completedAt,
+        cacheHits: patterns.length,
+        budgetRequested: runAllocations.reduce((sum, allocation) => sum + allocation.request.requestedTokens, 0),
+        budgetAllocated: runAllocations.reduce((sum, allocation) => sum + allocation.allocatedTokens, 0),
+      });
+      const run: EvolutionRunResult = {
+        id: runId,
+        correlationId,
+        task: input.task,
+        profile: options.profile,
+        state: lifecycle.state,
+        candidates: lifecycle.candidates,
+        executions: lifecycle.executions,
+        evaluations: lifecycle.evaluations,
+        selected: lifecycle.selected,
+        selectedExecution: lifecycle.selectedExecution,
+        selectedEvaluation: lifecycle.selectedEvaluation,
+        integratedPatternId: lifecycle.integratedPatternId,
+        metrics,
+        ablations: options.ablations,
+        startedAt,
+        completedAt,
+      };
+      this.evolutionRuns.push(run);
+      if (this.evolutionRuns.length > 100) this.evolutionRuns.splice(0, this.evolutionRuns.length - 100);
+      await ctx.memory.recordEvolutionRun({ ...run, initialBudgetMarket, finalBudgetMarket });
+      this.emit({
+        type: 'evo.run.completed', agentId: parentId, sessionId: ctx.sessionId, correlationId,
+        data: { runId, profile: options.profile, selected: run.selected?.id, score: run.selectedEvaluation?.score, metrics },
+      });
+      this.evolutionBudgetBypassCorrelations.delete(correlationId);
+      return structuredClone(run);
+    } catch (error) {
+      const completedAt = Date.now();
+      const failed: EvolutionRunResult = {
+        id: runId, correlationId, task: input.task, profile: options.profile, state: 'S_evo_failed',
+        candidates: [], executions: [], evaluations: [], selected: undefined,
+        selectedExecution: undefined, selectedEvaluation: undefined,
+        metrics: {
+          taskSuccess: false, answerQuality: 0, toolSuccessRate: 0, agentsSpawned: 0, teamsSpawned: 0,
+          totalTokens: evaluationUsage.totalTokens, thinkingTokens: evaluationUsage.thinkingTokens,
+          wallClockMs: completedAt - startedAt, budgetRequested: 0, budgetAllocated: 0,
+          failureRecoveryCount: 0, candidateCount: 0, executedCandidateCount: 0,
+          cacheHits: patterns.length, mutationsApplied: 0,
+        },
+        ablations: options.ablations, startedAt, completedAt,
+        error: error instanceof Error ? error.message : String(error),
+      };
+      this.evolutionRuns.push(failed);
+      await ctx.memory.recordEvolutionRun(failed as unknown as Record<string, unknown>);
+      this.emit({ type: 'evo.run.failed', agentId: parentId, sessionId: ctx.sessionId, correlationId, data: { runId, error: failed.error } });
+      this.evolutionBudgetBypassCorrelations.delete(correlationId);
+      throw error;
+    }
+  }
+
+  async runEvolutionBenchmark(
+    task: string,
+    profiles: EvolutionProfile[] = ['solo', 'fixed_subagents', 'tom_subteam', 'budget_market', 'evo_team']
+  ): Promise<EvolutionBenchmarkResult> {
+    const runs: EvolutionRunResult[] = [];
+    for (const profile of profiles) {
+      runs.push(await this.runEvolution({ task, profile }));
+    }
+    return {
+      task,
+      profiles,
+      runs,
+      comparison: runs.map(run => ({
+        profile: run.profile,
+        success: run.metrics.taskSuccess,
+        score: run.selectedEvaluation?.score ?? run.metrics.answerQuality,
+        totalTokens: run.metrics.totalTokens,
+        thinkingTokens: run.metrics.thinkingTokens,
+        wallClockMs: run.metrics.wallClockMs,
+        agentsSpawned: run.metrics.agentsSpawned,
+        teamsSpawned: run.metrics.teamsSpawned,
+      })),
+    };
+  }
+
   async acceptMemoryProposal(id: string): Promise<MemoryUpdateRecord | undefined> {
     const ctx = this.getContext();
     const record = await ctx.memory.acceptMemoryProposal(id);
@@ -3113,6 +3434,7 @@ export class Runtime {
     let finalResponse: string;
     const subagents: RootMediatedSpawnResult[] = [];
     const teamResults: TeamRunResult[] = [];
+    let evolution: EvolutionRunResult | undefined;
 
     if (decision.action === 'ask_clarification') {
       await this.transitionRootTurnState('S_solo_reasoning', { correlationId, reason: decision.reason });
@@ -3180,7 +3502,27 @@ export class Runtime {
         });
       }
       const plans = decision.agents.slice(0, 3);
-      if (plans.length > 1 && this.workspaceRuntimeConfig?.teams.createForMultipleAgents !== false) {
+      if (this.workspaceRuntimeConfig?.evolution.enabled
+        && this.workspaceRuntimeConfig.evolution.mode === 'auto') {
+        evolution = await this.runEvolution({
+          task: userInput,
+          parentId: 'root',
+          correlationId,
+          profile: this.workspaceRuntimeConfig.evolution.profile,
+          seedAgents: plans.map(plan => ({
+            archetype: plan.archetype,
+            name: plan.name,
+            role: plan.existenceReason ?? plan.archetype,
+            task: plan.task,
+            tools: plan.tools,
+            skills: plan.skills,
+            budgetTokens: plan.budgetTokens,
+            tomLevel: plan.tomLevel,
+            perspective: plan.tomProfile?.perspective,
+            groundingRequired: plan.archetype === 'researcher' || plan.archetype === 'tester',
+          })),
+        });
+      } else if (plans.length > 1 && this.workspaceRuntimeConfig?.teams.createForMultipleAgents !== false) {
         const team = await this.spawnTeam({
           parentAgentId: 'root',
           name: this.deriveTeamName(plans),
@@ -3218,17 +3560,24 @@ export class Runtime {
       }
       await this.transitionRootTurnState('S_wait_subagents', {
         correlationId,
-        completed: subagents.length,
+        completed: evolution?.metrics.agentsSpawned ?? subagents.length,
       });
-      await this.transitionRootTurnState('S_synthesize', { correlationId, completed: subagents.length });
-      finalResponse = await this.synthesizeDelegatedResults(userInput, subagents, correlationId, teamResults);
+      await this.transitionRootTurnState('S_synthesize', {
+        correlationId,
+        completed: evolution?.metrics.agentsSpawned ?? subagents.length,
+      });
+      finalResponse = evolution
+        ? await this.synthesizeEvolutionResult(userInput, evolution, correlationId)
+        : await this.synthesizeDelegatedResults(userInput, subagents, correlationId, teamResults);
       this.emit({
         type: 'delegation.completed',
         agentId: 'root',
         data: {
           correlationId,
           subagentIds: subagents.map(result => result.agent.identity.id),
-          totalSubagents: subagents.length,
+          totalSubagents: evolution?.metrics.agentsSpawned ?? subagents.length,
+          evolutionRunId: evolution?.id,
+          selectedGenomeId: evolution?.selected?.genome.id,
         },
       });
     }
@@ -3249,10 +3598,13 @@ export class Runtime {
       content: finalResponse,
       correlationId,
       metadata: {
-        kind: subagents.length > 0 ? 'root.delegated_final_response' : 'root.chat_response',
+        kind: subagents.length > 0 || evolution ? 'root.delegated_final_response' : 'root.chat_response',
         decision: decision.action,
         subagentIds: subagents.map(result => result.agent.identity.id),
-        grounded: subagents.length === 0 ? undefined : subagents.every(result => result.subagentResult.grounded),
+        grounded: evolution
+          ? Boolean(evolution.selectedExecution && evolution.selectedExecution.groundedResults > 0)
+          : subagents.length === 0 ? undefined : subagents.every(result => result.subagentResult.grounded),
+        evolutionRunId: evolution?.id,
       },
     });
     await this.processQueuedMessage(finalMessage.id);
@@ -3277,12 +3629,18 @@ export class Runtime {
       finalResponse,
       subagents,
       teams: teamResults,
+      evolution,
       messages: await this.getMessages({ correlationId }),
       usage: {
         root: rootUsage,
         subagents: subagentUsage,
         teamSynthesis: teamSynthesisUsage,
-        total: this.sumUsage([rootUsage, ...Object.values(subagentUsage), ...Object.values(teamSynthesisUsage)]),
+        total: this.sumUsage([
+          rootUsage,
+          ...Object.values(subagentUsage),
+          ...Object.values(teamSynthesisUsage),
+          ...(evolution ? [this.sumUsage(evolution.executions.map(item => this.evolutionUsageToTokenUsage(item.usage)))] : []),
+        ]),
       },
     };
   }
@@ -3481,6 +3839,7 @@ export class Runtime {
       || request.role !== undefined
       || request.style !== undefined
       || request.description !== undefined
+      || request.systemPrompt !== undefined
       || toolsOverrideDefinition
       || skillsOverrideDefinition
       || request.memoryScope !== undefined
@@ -3506,6 +3865,7 @@ export class Runtime {
       role: request.role ?? request.archetype,
       style: request.style,
       description,
+      systemPrompt: request.systemPrompt,
       tools,
       skills,
       memoryScope,
@@ -3542,6 +3902,7 @@ export class Runtime {
         role: request.role ?? request.archetype,
         style: request.style,
         description,
+        systemPrompt: request.systemPrompt,
         tomProfile: request.tomProfile,
         tomProfileMode: request.tomProfileMode ?? 'definition_override',
         cognitiveGapIds: [...(request.cognitiveGapIds ?? [])],
@@ -3613,6 +3974,7 @@ export class Runtime {
       tomProfile: node.identity.tomProfile,
       cognitiveGapIds: node.identity.cognitiveGapIds,
       existenceReason: node.identity.existenceReason,
+      systemPrompt: node.identity.systemPrompt,
       communicationProtocol: node.context.communicationProtocol,
       outputContract: node.assignment.outputContract,
       correlationId: node.correlationId,
@@ -3673,7 +4035,7 @@ export class Runtime {
       memoryScope: node.context.memoryScope,
       spawnPolicy: node.governance.spawnPolicy,
       budgetTokens: payload.budgetTokens,
-      systemPrompt: undefined,
+      systemPrompt: payload.systemPrompt,
       outputContract: node.assignment.outputContract,
       correlationId,
       tomProfile,
@@ -4600,6 +4962,40 @@ export class Runtime {
       if (stepError) {
         throw new Error(stepError.replace(/^Error:\s*/, ''));
       }
+      let result = session ? await this.drainAgentOutput(session.messageQueue, agent.name) : agent.getInfo().lastResult ?? '';
+      if (this.containsUnresolvedToolIntent(result)) {
+        if (!grounding.evidence.toolGrounded) {
+          throw new Error('Agent returned an unexecuted tool request without runtime grounding evidence');
+        }
+        this.emit({
+          type: 'agent.output.repair.started',
+          agentId,
+          sessionId: ctx.sessionId,
+          correlationId: options.correlationId,
+          data: { reason: 'unexecuted_tool_intent', task },
+        });
+        result = await this.completeAsAgent(
+          agent,
+          [
+            `Task:\n${task}`,
+            `Runtime-provided evidence:\n${grounding.evidence.toolResultSummary ?? grounding.context}`,
+            'Produce the final task result from the evidence above.',
+            'Do not emit tool-call markup, JSON tool requests, or claim that a tool still needs to run.',
+          ].join('\n\n'),
+          'agent.output_repair',
+          options.correlationId ?? this.createCorrelationId()
+        );
+        if (this.containsUnresolvedToolIntent(result)) {
+          throw new Error('Agent output repair still contained an unexecuted tool request');
+        }
+        this.emit({
+          type: 'agent.output.repair.completed',
+          agentId,
+          sessionId: ctx.sessionId,
+          correlationId: options.correlationId,
+          data: { task },
+        });
+      }
       agent.setRuntimeState('done');
       await this.transitionAgentFsm(agentId, 'S_responding', { correlationId: options.correlationId });
 
@@ -4609,7 +5005,6 @@ export class Runtime {
       this.emit({ type: 'budget.updated', agentId, data: { ...usageDelta } });
       this.emit({ type: 'agent.status.changed', agentId, data: { from: 'thinking', to: 'done' } });
 
-      const result = session ? await this.drainAgentOutput(session.messageQueue, agent.name) : agent.getInfo().lastResult ?? '';
       const evidence: RunEvidence = {
         ...grounding.evidence,
         outputGrounded: grounding.evidence.toolGrounded
@@ -6092,6 +6487,598 @@ ${teamReports ? `The following subteam reports have already aggregated their dir
 ${reports}
 
 Produce the final response to the user as Roy, the root agent.`;
+  }
+
+  private async synthesizeEvolutionResult(
+    task: string,
+    run: EvolutionRunResult,
+    correlationId: string
+  ): Promise<string> {
+    const selected = run.selected;
+    const execution = run.selectedExecution;
+    const evaluation = run.selectedEvaluation;
+    if (!execution) {
+      return `Roy could not complete the evolutionary delegation run. Run ${run.id} produced no executable result.`;
+    }
+    return this.completeAsRoot(
+      [
+        'Synthesize the selected evolutionary agent/team result into the final answer to the user.',
+        'Do not expose hidden chain-of-thought. Explain observable evidence, limitations, and relevant disagreements.',
+        `<user_task>${task}</user_task>`,
+        `<evolution_run>${JSON.stringify({
+          runId: run.id,
+          profile: run.profile,
+          candidateCount: run.metrics.candidateCount,
+          selectedGenome: selected?.genome,
+          evaluation,
+          metrics: run.metrics,
+        }, null, 2)}</evolution_run>`,
+        `<selected_result>${execution.result}</selected_result>`,
+        `<warnings>${execution.warnings.join('\n') || 'none'}</warnings>`,
+      ].join('\n\n'),
+      'root.evolution_synthesis',
+      correlationId
+    );
+  }
+
+  private resolveEvolutionRunOptions(
+    profileOverride?: EvolutionProfile,
+    override?: RunEvolutionInput['options']
+  ): EvolutionRunOptions {
+    const configured = this.workspaceRuntimeConfig?.evolution;
+    if (!configured) throw new Error('Evolution workspace configuration is unavailable');
+    const profile = profileOverride ?? override?.profile ?? configured.profile;
+    const profileAblations: Record<EvolutionProfile, EvolutionAblations> = {
+      solo: {
+        withoutSubagents: true, withoutToMProfile: true, withoutBudgetMarket: true,
+        withoutEvoMutation: true, withoutPatternMemory: true,
+      },
+      fixed_subagents: {
+        withoutSubagents: false, withoutToMProfile: true, withoutBudgetMarket: true,
+        withoutEvoMutation: true, withoutPatternMemory: true,
+      },
+      tom_subteam: {
+        withoutSubagents: false, withoutToMProfile: false, withoutBudgetMarket: true,
+        withoutEvoMutation: true, withoutPatternMemory: true,
+      },
+      budget_market: {
+        withoutSubagents: false, withoutToMProfile: false, withoutBudgetMarket: false,
+        withoutEvoMutation: true, withoutPatternMemory: true,
+      },
+      evo_team: { ...configured.ablations },
+    };
+    const ablations = { ...profileAblations[profile], ...override?.ablations };
+    return {
+      profile,
+      populationSize: clampInteger(override?.populationSize ?? configured.populationSize, 1, 10),
+      generations: ablations.withoutEvoMutation ? 0 : clampInteger(override?.generations ?? configured.generations, 0, 5),
+      topK: clampInteger(override?.topK ?? configured.topK, 1, 5),
+      maxExecutedCandidates: clampInteger(override?.maxExecutedCandidates ?? configured.maxExecutedCandidates, 1, 10),
+      integrationMinimumScore: clamp01(override?.integrationMinimumScore ?? configured.integrationMinimumScore),
+      patternSimilarityThreshold: clamp01(override?.patternSimilarityThreshold ?? configured.patternSimilarityThreshold),
+      useLlmJudge: override?.useLlmJudge ?? configured.useLlmJudge,
+      ablations,
+    };
+  }
+
+  private validateEvolutionConfigPatch(
+    patch: Partial<Omit<WorkspaceRuntimeConfig['evolution'], 'ablations'>> & {
+      ablations?: Partial<WorkspaceRuntimeConfig['evolution']['ablations']>;
+    }
+  ): void {
+    if (patch.enabled !== undefined && typeof patch.enabled !== 'boolean') throw new Error('Evolution enabled must be boolean');
+    if (patch.mode !== undefined && patch.mode !== 'manual' && patch.mode !== 'auto') throw new Error('Evolution mode must be manual or auto');
+    if (patch.profile !== undefined
+      && !['solo', 'fixed_subagents', 'tom_subteam', 'budget_market', 'evo_team'].includes(patch.profile)) {
+      throw new Error('Unsupported evolution profile');
+    }
+    for (const key of ['populationSize', 'generations', 'topK', 'maxExecutedCandidates'] as const) {
+      const value = patch[key];
+      if (value !== undefined && (!Number.isInteger(value) || value < (key === 'generations' ? 0 : 1))) {
+        throw new Error(`Evolution ${key} must be ${key === 'generations' ? 'a non-negative' : 'a positive'} integer`);
+      }
+    }
+    for (const key of ['integrationMinimumScore', 'patternSimilarityThreshold'] as const) {
+      const value = patch[key];
+      if (value !== undefined && (!Number.isFinite(value) || value < 0 || value > 1)) {
+        throw new Error(`Evolution ${key} must be between 0 and 1`);
+      }
+    }
+    if (patch.useLlmJudge !== undefined && typeof patch.useLlmJudge !== 'boolean') {
+      throw new Error('Evolution useLlmJudge must be boolean');
+    }
+    if (patch.ablations) {
+      for (const [key, value] of Object.entries(patch.ablations)) {
+        if (!['withoutSubagents', 'withoutToMProfile', 'withoutBudgetMarket', 'withoutEvoMutation', 'withoutPatternMemory'].includes(key)
+          || typeof value !== 'boolean') {
+          throw new Error(`Invalid evolution ablation ${key}`);
+        }
+      }
+    }
+  }
+
+  private async runSoloEvolutionBaseline(
+    runId: string,
+    correlationId: string,
+    task: string,
+    options: EvolutionRunOptions
+  ): Promise<EvolutionRunResult> {
+    const ctx = this.getContext();
+    const startedAt = Date.now();
+    if (options.ablations.withoutBudgetMarket) this.evolutionBudgetBypassCorrelations.add(correlationId);
+    const usageBefore = ctx.agent.getUsage();
+    this.emit({ type: 'evo.fsm.transition', agentId: 'root', correlationId, data: { runId, from: 'S_evo_idle', to: 'S_evo_execute', profile: 'solo' } });
+    try {
+      const result = await this.completeAsRoot(
+        `Solve the following task directly as Roy without creating subagents or teams. Return a concrete answer and state limitations.\n\n${task}`,
+        'evo.solo_baseline',
+        correlationId
+      );
+      const usage = this.usageDifference(usageBefore, ctx.agent.getUsage());
+      const completedAt = Date.now();
+      const artifact: EvolutionExecutionArtifact = {
+        candidateId: 'solo_root', actorKind: 'agent', actorId: 'root', success: Boolean(result.trim()), result,
+        usage: this.tokenUsageToEvolutionUsage(usage), wallClockMs: completedAt - startedAt,
+        agentIds: [], teamIds: [], toolCalls: 0, successfulToolCalls: 0, unresolvedToolIntents: 0,
+        groundedResults: 0, totalResults: 1, failedActors: result.trim() ? 0 : 1,
+        recoveredFailures: 0, warnings: [],
+      };
+      const answerQuality = result.trim() ? Math.min(1, 0.5 + Math.log10(result.length + 1) / 5) : 0;
+      const run: EvolutionRunResult = {
+        id: runId, correlationId, task, profile: 'solo', state: 'S_evo_done',
+        candidates: [], executions: [artifact], evaluations: [], selected: undefined,
+        selectedExecution: artifact, selectedEvaluation: undefined,
+        metrics: {
+          taskSuccess: Boolean(result.trim()), answerQuality, toolSuccessRate: 0,
+          agentsSpawned: 0, teamsSpawned: 0, totalTokens: usage.totalTokens,
+          thinkingTokens: usage.thinkingTokens, wallClockMs: completedAt - startedAt,
+          budgetRequested: 0, budgetAllocated: 0, failureRecoveryCount: 0,
+          candidateCount: 0, executedCandidateCount: 1, cacheHits: 0, mutationsApplied: 0,
+        },
+        ablations: options.ablations, startedAt, completedAt,
+      };
+      this.evolutionRuns.push(run);
+      await ctx.memory.recordEvolutionRun(run as unknown as Record<string, unknown>);
+      this.emit({ type: 'evo.run.completed', agentId: 'root', correlationId, data: { runId, profile: 'solo', metrics: run.metrics } });
+      return structuredClone(run);
+    } finally {
+      this.evolutionBudgetBypassCorrelations.delete(correlationId);
+    }
+  }
+
+  private async findRelevantEvolutionPatterns(task: string, threshold: number): Promise<EvolutionPattern[]> {
+    const patterns = await this.getContext().memory.getEvolutionPatterns();
+    const embeddings = new HashTaskEmbeddingProvider();
+    return patterns
+      .map(pattern => ({ pattern, similarity: embeddings.similarity(task, pattern.taskSignature) }))
+      .filter(item => item.pattern.status !== 'deprecated' && item.similarity >= threshold)
+      .sort((left, right) => {
+        const leftScore = left.similarity * 0.7 + left.pattern.averageScore * 0.3;
+        const rightScore = right.similarity * 0.7 + right.pattern.averageScore * 0.3;
+        return rightScore - leftScore;
+      })
+      .map(item => item.pattern);
+  }
+
+  private async createEvolutionSeeds(
+    task: string,
+    parentId: string,
+    correlationId: string,
+    options: EvolutionRunOptions
+  ): Promise<EvolutionSeedAgent[]> {
+    let decision: DelegationDecision;
+    if (parentId === 'root') {
+      decision = await this.decideDelegation(task, correlationId);
+      decision = await this.selectDelegationCandidate(parentId, task, decision, correlationId, 'root');
+    } else {
+      const parent = this.getContext().manager.getAgentById(parentId)?.getInfo();
+      if (!parent) throw new Error(`Evolution parent agent "${parentId}" not found`);
+      decision = await this.decideAgentDelegation(parent, task, correlationId);
+    }
+    const plans = decision.action === 'spawn_subagents' && decision.agents.length > 0
+      ? decision.agents
+      : this.defaultEvolutionPlans(task);
+    const limit = Math.max(1, Math.min(options.populationSize, this.workspaceRuntimeConfig?.teams.maxMembersPerTeam ?? 5));
+    return plans.slice(0, limit).map(plan => ({
+      archetype: plan.archetype,
+      name: plan.name,
+      role: plan.existenceReason ?? plan.archetype,
+      task: plan.task,
+      tools: plan.tools ?? this.getDefaultToolBindings(plan.archetype).map(binding => binding.name),
+      skills: plan.skills ?? this.getDefaultSkillBindings(plan.archetype).map(binding => binding.name),
+      budgetTokens: plan.budgetTokens,
+      tomLevel: options.ablations.withoutToMProfile ? 0 : plan.tomLevel,
+      perspective: options.ablations.withoutToMProfile ? undefined : plan.tomProfile?.perspective,
+      groundingRequired: plan.archetype === 'researcher' || plan.archetype === 'tester',
+    }));
+  }
+
+  private defaultEvolutionPlans(task: string): DelegationAgentPlan[] {
+    const lower = task.toLowerCase();
+    if (/\b(implement|code|fix|patch|refactor)\b/.test(lower)) {
+      return [
+        { archetype: 'planner', task: `Decompose the implementation and its dependencies: ${task}`, tomLevel: 1, existenceReason: 'implementation planning' },
+        { archetype: 'coder', task: `Produce the bounded implementation analysis or change: ${task}`, tomLevel: 0, existenceReason: 'implementation capability' },
+        { archetype: 'tester', task: `Verify behavior, regressions, and failure paths for: ${task}`, tomLevel: 0, existenceReason: 'verification capability' },
+      ];
+    }
+    if (/\b(inspect|analy[sz]e|review|risk|architecture|project|repo|structure)\b/.test(lower)) {
+      return [
+        { archetype: 'researcher', task: `Collect grounded project evidence for: ${task}`, tomLevel: 0, existenceReason: 'missing project evidence' },
+        { archetype: 'critic', task: `Stress-test claims, risks, and evidence gaps for: ${task}`, tomLevel: 2, existenceReason: 'missing failure-mode perspective' },
+      ];
+    }
+    return [{ archetype: 'custom', name: 'TaskSpecialist', task, tomLevel: 1, existenceReason: 'bounded specialist capability not covered by a built-in role' }];
+  }
+
+  private async instantiateEvolutionCandidate(
+    candidate: EvolutionCandidate,
+    parentId: string,
+    correlationId: string,
+    options: EvolutionRunOptions
+  ): Promise<{ kind: 'agent' | 'team'; actorId: string }> {
+    const members = candidate.genome.members;
+    if (members.length === 1) {
+      const member = members[0];
+      const agent = await this.spawnAgent({
+        parentId,
+        name: member.name,
+        customRole: member.role,
+        archetype: member.archetype,
+        tomLevel: member.tomProfile.level,
+        description: candidate.genome.purpose,
+        task: member.task,
+        tools: member.toolPolicy.map(tool => tool.name),
+        skills: member.skills,
+        budgetTokens: options.ablations.withoutBudgetMarket ? undefined : member.budgetPolicy.requestedTokens,
+        systemPrompt: member.rolePrompt,
+        outputContract: {
+          format: member.outputContract.format,
+          requiredFields: member.outputContract.requiredFields,
+          groundingRequired: member.outputContract.groundingRequired,
+        },
+        correlationId,
+        tomProfile: this.genomeToRuntimeToM(member.tomProfile, member.id, parentId, member.role, member.toolPolicy.map(tool => tool.name)),
+        cacheHits: candidate.lineage.parentPatternIds,
+        cognitiveGapIds: member.tomProfile.uncertainty.map((_, index) => `${member.id}_gap_${index + 1}`),
+        existenceReason: candidate.rationale,
+      });
+      return { kind: 'agent', actorId: agent.identity.id };
+    }
+    const team = await this.spawnTeam({
+      parentAgentId: parentId,
+      name: candidate.genome.name,
+      description: candidate.genome.purpose,
+      task: candidate.genome.taskSignature,
+      tomLevel: options.ablations.withoutToMProfile ? 0 : candidate.genome.tomLevel,
+      correlationId,
+      members: members.map((member, index) => ({
+        archetype: member.archetype,
+        name: member.name,
+        role: member.role,
+        task: member.task,
+        tools: member.toolPolicy.map(tool => tool.name),
+        skills: member.skills,
+        budgetTokens: options.ablations.withoutBudgetMarket ? undefined : member.budgetPolicy.requestedTokens,
+        tomLevel: member.tomProfile.level,
+        tomProfile: this.genomeToRuntimeToM(member.tomProfile, member.id, parentId, member.role, member.toolPolicy.map(tool => tool.name)),
+        systemPrompt: member.rolePrompt,
+        existenceReason: candidate.rationale,
+        lead: index === 0,
+      })),
+      executionPolicy: {
+        mode: candidate.genome.coordinationPolicy === 'parallel' ? 'parallel' : 'sequential',
+        failureMode: 'best_effort',
+        maxConcurrency: Math.min(3, members.length),
+        minimumSuccessfulMembers: 1,
+      },
+    });
+    return { kind: 'team', actorId: team.identity.id };
+  }
+
+  private async executeEvolutionCandidate(
+    candidate: EvolutionCandidate,
+    actor: { kind: 'agent' | 'team'; actorId?: string },
+    correlationId: string,
+    details: Map<string, { agent?: RunAgentResult; team?: TeamRunResult }>
+  ): Promise<EvolutionExecutionArtifact> {
+    const startedAt = Date.now();
+    try {
+      if (!actor.actorId) throw new Error('Evolution candidate actor id is missing');
+      if (actor.kind === 'agent') {
+        const member = candidate.genome.members[0];
+        const result = await this.runAgent(actor.actorId, member.task, {
+          correlationId,
+          archetype: member.archetype,
+          disableRecursiveDelegation: true,
+        });
+        details.set(candidate.id, { agent: result });
+        return {
+          candidateId: candidate.id, actorKind: 'agent', actorId: actor.actorId,
+          success: Boolean(result.result.trim()), result: result.result,
+          usage: this.tokenUsageToEvolutionUsage(result.usage), wallClockMs: Date.now() - startedAt,
+          agentIds: [actor.actorId], teamIds: [], toolCalls: result.toolCalls.length,
+          successfulToolCalls: result.toolCalls.filter(call => call.success).length,
+          unresolvedToolIntents: this.containsUnresolvedToolIntent(result.result) ? 1 : 0,
+          groundedResults: result.grounded ? 1 : 0, totalResults: 1,
+          failedActors: result.agent.state === 'failed' ? 1 : 0, recoveredFailures: 0,
+          warnings: [...result.warnings],
+        };
+      }
+      const result = await this.runTeam(actor.actorId, candidate.genome.taskSignature, { correlationId });
+      details.set(candidate.id, { team: result });
+      const toolCalls = result.members.flatMap(member => member.toolCalls);
+      const unresolvedToolIntents = result.members.filter(member => this.containsUnresolvedToolIntent(member.result)).length
+        + (this.containsUnresolvedToolIntent(result.result) ? 1 : 0);
+      const failedActors = result.memberOutcomes.filter(outcome => outcome.status === 'failed').length;
+      return {
+        candidateId: candidate.id, actorKind: 'team', actorId: actor.actorId,
+        success: result.team.status === 'done' && Boolean(result.result.trim()), result: result.result,
+        usage: this.tokenUsageToEvolutionUsage(result.usage), wallClockMs: Date.now() - startedAt,
+        agentIds: result.members.map(member => member.agent.identity.id), teamIds: [actor.actorId],
+        toolCalls: toolCalls.length, successfulToolCalls: toolCalls.filter(call => call.success).length,
+        unresolvedToolIntents,
+        groundedResults: result.members.filter(member => member.grounded).length,
+        totalResults: result.members.length, failedActors,
+        recoveredFailures: result.team.status === 'done' ? failedActors : 0,
+        warnings: result.members.flatMap(member => member.warnings),
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const team = actor.actorId ? this.getTeamState(actor.actorId) : undefined;
+      const agent = actor.actorId ? this.getContext().manager.getAgentById(actor.actorId)?.getInfo() : undefined;
+      return {
+        ...this.failedEvolutionArtifact(candidate, actor.actorId ?? 'execution-failed', message),
+        actorKind: actor.kind,
+        wallClockMs: Date.now() - startedAt,
+        agentIds: team?.memberAgentIds ?? (agent ? [agent.identity.id] : []),
+        teamIds: team ? [team.identity.id] : [],
+      };
+    }
+  }
+
+  private failedEvolutionArtifact(candidate: EvolutionCandidate, actorId: string, error: string): EvolutionExecutionArtifact {
+    return {
+      candidateId: candidate.id,
+      actorKind: candidate.genome.members.length === 1 ? 'agent' : 'team',
+      actorId,
+      success: false,
+      result: '',
+      usage: this.tokenUsageToEvolutionUsage(this.sumUsage([])),
+      wallClockMs: 0,
+      agentIds: [], teamIds: [], toolCalls: 0, successfulToolCalls: 0, unresolvedToolIntents: 0,
+      groundedResults: 0, totalResults: candidate.genome.members.length,
+      failedActors: candidate.genome.members.length, recoveredFailures: 0,
+      warnings: [error],
+    };
+  }
+
+  private archiveEvolutionCandidateAgents(agentIds: string[], runId: string, candidateId: string): void {
+    const ctx = this.getContext();
+    for (const agentId of agentIds) {
+      const agent = ctx.manager.getAgentById(agentId);
+      if (!agent || agentId === 'root') continue;
+      const info = agent.getInfo();
+      this.archivedAgentUsage.set(agentId, this.toTokenUsage(info.usage));
+      ctx.manager.removeAgent(info.name);
+      this.agentBindings.delete(agentId);
+      this.agentFsms.delete(agentId);
+      this.agentBudgetAllocations.delete(agentId);
+      this.agentBudgetLimits.delete(agentId);
+      this.toolCallCounts.delete(agentId);
+      this.emit({
+        type: 'evo.candidate.actor.archived', agentId, sessionId: ctx.sessionId,
+        data: { runId, candidateId, name: info.identity.name, totalTokens: info.usage.totalTokens },
+      });
+    }
+  }
+
+  private createEvolutionJudge(
+    parentId: string,
+    correlationId: string,
+    onUsage: (usage: TokenUsage) => void
+  ): EvolutionJudge {
+    return {
+      name: 'llm_judge',
+      evaluate: async (task, candidate, execution) => {
+        const agent = this.getContext().manager.getAgentById(parentId) ?? this.getContext().agent;
+        const usageBefore = agent.getUsage();
+        this.emit({ type: 'evo.judge.started', agentId: agent.id, correlationId, data: { candidateId: candidate.id } });
+        const judged = await this.completeJSONAsAgent<Partial<EvolutionEvaluationDimensions> & { rationale?: string }>(
+          agent,
+          [
+            {
+              role: 'system',
+              content: 'Evaluate an executed agent/team candidate. Return strict JSON with optional 0..1 fields taskSuccess, answerQuality, completeness, costEfficiency, novelty, toolUse, consistency, tomCoverage, plus rationale. Judge only observable output and metrics.',
+            },
+            {
+              role: 'user',
+              content: JSON.stringify({ task, genome: candidate.genome, execution: { ...execution, result: execution.result.slice(0, 8000) } }),
+            },
+          ],
+          { temperature: 0, maxTokens: 600 },
+          'evo.candidate_evaluation',
+          correlationId
+        );
+        const usage = this.usageDifference(usageBefore, agent.getUsage());
+        onUsage(usage);
+        this.emit({ type: 'evo.judge.completed', agentId: agent.id, correlationId, data: { candidateId: candidate.id, usage } });
+        return this.normalizeEvolutionJudgeResult(judged);
+      },
+    };
+  }
+
+  private normalizeEvolutionJudgeResult(
+    value: Partial<EvolutionEvaluationDimensions> & { rationale?: string }
+  ): Partial<EvolutionEvaluationDimensions> & { rationale?: string } {
+    const result: Partial<EvolutionEvaluationDimensions> & { rationale?: string } = {};
+    for (const key of ['taskSuccess', 'answerQuality', 'completeness', 'costEfficiency', 'novelty', 'toolUse', 'consistency', 'tomCoverage'] as const) {
+      const score = value[key];
+      if (typeof score === 'number' && Number.isFinite(score)) result[key] = clamp01(score);
+    }
+    if (typeof value.rationale === 'string') result.rationale = value.rationale;
+    return result;
+  }
+
+  private async integrateEvolutionPattern(
+    selected: EvolutionCandidate,
+    evaluation: EvolutionEvaluationResult,
+    execution: EvolutionExecutionArtifact
+  ): Promise<string> {
+    const ctx = this.getContext();
+    const structure = selected.genome.members.map(member => ({
+      archetype: member.archetype,
+      role: member.role,
+      tools: member.toolPolicy.map(tool => tool.name),
+    }));
+    const patternId = `evo_pattern_${this.fingerprint({ task: selected.genome.taskSignature, structure }).slice(0, 16)}_v1`;
+    const [agentPatterns, teamPatterns] = await Promise.all([
+      ctx.memory.getCachePatterns('agents'),
+      ctx.memory.getCachePatterns('teams'),
+    ]);
+    const agentPatternIds = agentPatterns
+      .filter(pattern => selected.genome.members.some(member => pattern.archetype === member.archetype))
+      .map(pattern => String(pattern.id ?? ''))
+      .filter(Boolean);
+    const teamPatternIds = execution.actorKind === 'team'
+      ? teamPatterns
+        .filter(pattern => pattern.name === selected.genome.name || pattern.key === this.safeAgentKey(selected.genome.name))
+        .map(pattern => String(pattern.id ?? ''))
+        .filter(Boolean)
+      : [];
+    const links = { agentPatternIds, teamPatternIds };
+    const pattern = await ctx.memory.upsertEvolutionPattern({
+      id: patternId,
+      name: selected.genome.name,
+      taskSignature: selected.genome.taskSignature,
+      genome: selected.genome,
+      historicalScores: [],
+      lineage: selected.lineage,
+      linkedPatterns: links,
+      evaluation,
+      tokenCost: execution.usage.totalTokens,
+    });
+    await ctx.memory.linkEvolutionPattern(pattern.id, links);
+    this.emit({
+      type: 'evo.candidate.integrated', agentId: execution.actorId,
+      data: { candidateId: selected.id, patternId: pattern.id, score: evaluation.score, linkedPatterns: links },
+    });
+    return pattern.id;
+  }
+
+  private async recordEvolutionLifecycleMessage(
+    state: string,
+    parentId: string,
+    correlationId: string,
+    payload: Record<string, unknown>
+  ): Promise<void> {
+    const kind = state === 'S_evo_propose' ? 'evo.propose'
+      : state === 'S_evo_instantiate' ? 'evo.instantiate'
+        : state === 'S_evo_execute' ? 'evo.execute'
+          : state === 'S_evo_evaluate' ? 'evo.evaluate'
+            : state === 'S_evo_select' ? 'evo.select'
+              : state === 'S_evo_mutate' ? 'evo.mutate'
+                : state === 'S_evo_integrate' || state === 'S_evo_done' ? 'evo.integrate'
+                  : undefined;
+    if (!kind) return;
+    const message = await this.enqueueMessage({
+      kind,
+      sessionId: this.getContext().sessionId,
+      from: parentId,
+      to: 'runtime.evolution',
+      correlationId,
+      payload,
+      metadata: { agentId: parentId, tags: ['evolution'] },
+    });
+    await this.processQueuedMessage(message.id);
+    await this.getContext().queue.ack(message.id);
+  }
+
+  private genomeToRuntimeToM(
+    profile: GenomeToMProfile,
+    subjectAgentId: string,
+    parentId: string,
+    purpose: string,
+    capabilities: string[]
+  ): ToMProfile {
+    return normalizeToMProfile({
+      level: profile.level,
+      subjectAgentId,
+      beliefScope: [...profile.beliefScope],
+      goalModel: [...profile.goalModel],
+      uncertainty: [...profile.uncertainty],
+      perspective: profile.perspective,
+      observesAgents: [...profile.observesAgents ?? []],
+      modelsAgents: [...profile.modelsAgents ?? []],
+      capabilityScope: [...capabilities],
+      cognitiveGaps: profile.uncertainty.map((_, index) => `${subjectAgentId}_gap_${index + 1}`),
+      models: profile.level >= 1 ? [{
+        targetId: parentId,
+        targetType: 'agent',
+        goalModel: [...profile.goalModel],
+        uncertaintyModel: [...profile.uncertainty],
+      }] : [],
+      purpose,
+    }, { level: profile.level, subjectAgentId, purpose });
+  }
+
+  private buildEvolutionMetrics(input: {
+    lifecycle: EvolutionLifecycleResult;
+    usage: TokenUsage;
+    startedAt: number;
+    completedAt: number;
+    cacheHits: number;
+    budgetRequested: number;
+    budgetAllocated: number;
+  }): EvolutionRunResult['metrics'] {
+    const selectedEvaluation = input.lifecycle.selectedEvaluation;
+    const toolCalls = input.lifecycle.executions.reduce((sum, execution) => sum + execution.toolCalls, 0);
+    const successfulToolCalls = input.lifecycle.executions.reduce((sum, execution) => sum + execution.successfulToolCalls, 0);
+    return {
+      taskSuccess: selectedEvaluation?.success ?? false,
+      answerQuality: selectedEvaluation?.dimensions.answerQuality ?? 0,
+      toolSuccessRate: toolCalls > 0 ? successfulToolCalls / toolCalls : 0,
+      agentsSpawned: input.lifecycle.executions.reduce((sum, execution) => sum + execution.agentIds.length, 0),
+      teamsSpawned: input.lifecycle.executions.reduce((sum, execution) => sum + execution.teamIds.length, 0),
+      totalTokens: input.usage.totalTokens,
+      thinkingTokens: input.usage.thinkingTokens,
+      wallClockMs: input.completedAt - input.startedAt,
+      budgetRequested: input.budgetRequested,
+      budgetAllocated: input.budgetAllocated,
+      failureRecoveryCount: input.lifecycle.executions.reduce((sum, execution) => sum + execution.recoveredFailures, 0),
+      candidateCount: input.lifecycle.candidates.length,
+      executedCandidateCount: input.lifecycle.executions.length,
+      selectedGenomeId: input.lifecycle.selected?.genome.id,
+      selectedGenomeScore: selectedEvaluation?.score,
+      cacheHits: input.cacheHits,
+      mutationsApplied: input.lifecycle.candidates.filter(candidate => candidate.lineage.operators.length > 0).length,
+    };
+  }
+
+  private tokenUsageToEvolutionUsage(usage: TokenUsage): EvolutionExecutionArtifact['usage'] {
+    return {
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      thinkingTokens: usage.thinkingTokens,
+      totalTokens: usage.totalTokens,
+      cachedInputTokens: usage.cachedInputTokens,
+      cacheCreationInputTokens: usage.cacheCreationInputTokens,
+    };
+  }
+
+  private evolutionUsageToTokenUsage(usage: EvolutionExecutionArtifact['usage']): TokenUsage {
+    return {
+      llmCalls: usage.totalTokens > 0 ? 1 : 0,
+      promptTokens: usage.inputTokens,
+      completionTokens: usage.outputTokens,
+      totalTokens: usage.totalTokens,
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      thinkingTokens: usage.thinkingTokens,
+      thinkingAccountingTokens: usage.thinkingTokens ?? usage.totalTokens,
+      cachedInputTokens: usage.cachedInputTokens ?? null,
+      cacheCreationInputTokens: usage.cacheCreationInputTokens ?? null,
+    };
   }
 
   private sumUsage(items: TokenUsage[]): TokenUsage {
@@ -7688,6 +8675,13 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
     return evidenceTerms.some(term => normalized.includes(term));
   }
 
+  private containsUnresolvedToolIntent(result: string): boolean {
+    if (!result.trim()) return false;
+    return /<tool_call>[\s\S]*?<\/tool_call>/i.test(result)
+      || /<tool_name>[\s\S]*?<\/tool_name>/i.test(result)
+      || /\{\s*"(?:tool_name|tool|function)"\s*:\s*"[^"\n]+"[\s\S]*?\}/i.test(result);
+  }
+
   private resolveInspectionRoot(task: string): string {
     const match = task.match(/(?:\.{1,2}\/|\/)[A-Za-z0-9._/@-]+/);
     if (!match) return process.cwd();
@@ -7913,6 +8907,15 @@ function finiteRatio(value: unknown): number | undefined {
 function averageDefined(values: Array<number | undefined>): number | undefined {
   const defined = values.filter((value): value is number => value !== undefined);
   return defined.length > 0 ? defined.reduce((sum, value) => sum + value, 0) / defined.length : undefined;
+}
+
+function clamp01(value: number): number {
+  return Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0));
+}
+
+function clampInteger(value: number, minimum: number, maximum: number): number {
+  if (!Number.isFinite(value)) return minimum;
+  return Math.max(minimum, Math.min(maximum, Math.floor(value)));
 }
 
 function teamCompletionRatio(team: TeamRuntimeState): number {

@@ -2,6 +2,7 @@ import { appendFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } fro
 import path from 'node:path';
 import type { ToMProfile, ToMTaskAnalysis } from '../tom/index.js';
 import type { RuntimeEvent } from '../runtime/Runtime.js';
+import type { EvolutionPattern, EvolutionRunOptions } from '../evolution/index.js';
 
 const WORKSPACE_FILE_LOCKS = new Map<string, Promise<void>>();
 
@@ -15,6 +16,7 @@ export interface PatternCacheState {
   agents: number;
   teams: number;
   delegations: number;
+  evolution: number;
 }
 
 export interface WorkspaceMemoryState {
@@ -41,6 +43,7 @@ export interface RootMemoryContext {
   agentPatterns: unknown[];
   teamPatterns: unknown[];
   delegationPatterns: unknown[];
+  evolutionPatterns: unknown[];
 }
 
 export interface ConversationEntry {
@@ -216,6 +219,19 @@ export interface WorkspaceRuntimeConfig {
     failureMode: 'fail_fast' | 'best_effort';
     maxConcurrency: number;
     minimumSuccessfulMembers: number;
+  };
+  evolution: {
+    enabled: boolean;
+    mode: 'manual' | 'auto';
+    profile: EvolutionRunOptions['profile'];
+    populationSize: number;
+    generations: number;
+    topK: number;
+    maxExecutedCandidates: number;
+    integrationMinimumScore: number;
+    patternSimilarityThreshold: number;
+    useLlmJudge: boolean;
+    ablations: EvolutionRunOptions['ablations'];
   };
 }
 
@@ -437,7 +453,7 @@ Role-specific terms are recorded here.
 };
 
 const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
-  version: 4,
+  version: 5,
   traceEvents: true,
   memoryUpdates: 'suggest',
   delegation: {
@@ -538,6 +554,25 @@ const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
     maxConcurrency: 3,
     minimumSuccessfulMembers: 1,
   },
+  evolution: {
+    enabled: true,
+    mode: 'manual',
+    profile: 'evo_team',
+    populationSize: 3,
+    generations: 1,
+    topK: 1,
+    maxExecutedCandidates: 3,
+    integrationMinimumScore: 0.55,
+    patternSimilarityThreshold: 0.35,
+    useLlmJudge: false,
+    ablations: {
+      withoutSubagents: false,
+      withoutToMProfile: false,
+      withoutBudgetMarket: false,
+      withoutEvoMutation: false,
+      withoutPatternMemory: false,
+    },
+  },
 };
 
 export class WorkspaceMemoryManager {
@@ -580,6 +615,7 @@ export class WorkspaceMemoryManager {
     await this.writeIfMissing(path.join(cachePath, 'agent-patterns.json'), JSON.stringify({ patterns: [] }, null, 2) + '\n');
     await this.writeIfMissing(path.join(cachePath, 'team-patterns.json'), JSON.stringify({ patterns: [] }, null, 2) + '\n');
     await this.writeIfMissing(path.join(cachePath, 'delegation-patterns.json'), JSON.stringify({ patterns: [] }, null, 2) + '\n');
+    await this.writeIfMissing(path.join(cachePath, 'evolution-patterns.json'), JSON.stringify({ patterns: [] }, null, 2) + '\n');
     await this.writeIfMissing(path.join(cachePath, 'tool-results.json'), JSON.stringify({ results: [] }, null, 2) + '\n');
     await this.writeIfMissing(path.join(cachePath, 'memory-proposals.json'), JSON.stringify({ proposals: [] }, null, 2) + '\n');
     await this.writeIfMissing(path.join(cachePath, 'memory-updates.json'), JSON.stringify({ updates: [] }, null, 2) + '\n');
@@ -617,7 +653,7 @@ export class WorkspaceMemoryManager {
         memoryDocs: [],
         publicMemoryDocs: [],
         agentMemories: [],
-        patterns: { agents: 0, teams: 0, delegations: 0 },
+        patterns: { agents: 0, teams: 0, delegations: 0, evolution: 0 },
         traces: 0,
         queuePath: this.rootPath ? path.join(this.rootPath, 'queue') : '',
       };
@@ -652,6 +688,7 @@ export class WorkspaceMemoryManager {
       agentPatterns: await this.readPatterns('agent-patterns.json'),
       teamPatterns: await this.readPatterns('team-patterns.json'),
       delegationPatterns: await this.readPatterns('delegation-patterns.json'),
+      evolutionPatterns: await this.readPatterns('evolution-patterns.json'),
     };
   }
 
@@ -798,6 +835,30 @@ Keep this agent identity separate from the model provider identity.
       await this.withFileLock(configPath, () => this.writeAtomic(configPath, JSON.stringify(merged, null, 2) + '\n'));
     }
     return merged;
+  }
+
+  async updateEvolutionConfig(
+    patch: Partial<Omit<WorkspaceRuntimeConfig['evolution'], 'ablations'>> & {
+      ablations?: Partial<WorkspaceRuntimeConfig['evolution']['ablations']>;
+    }
+  ): Promise<WorkspaceRuntimeConfig['evolution']> {
+    const configPath = path.join(this.rootPath, 'config.json');
+    return this.withFileLock(configPath, async () => {
+      const current = await this.readJson<Record<string, unknown>>(configPath, {});
+      const merged = this.mergeDefaults(DEFAULT_WORKSPACE_CONFIG, current) as WorkspaceRuntimeConfig;
+      const evolution = {
+        ...merged.evolution,
+        ...patch,
+        ablations: {
+          ...merged.evolution.ablations,
+          ...patch.ablations,
+        },
+      };
+      merged.evolution = evolution;
+      merged.version = Math.max(DEFAULT_WORKSPACE_CONFIG.version, Number(merged.version ?? 0));
+      await this.writeAtomic(configPath, JSON.stringify(merged, null, 2) + '\n');
+      return evolution;
+    });
   }
 
   async setMemoryMode(mode: MemoryMode): Promise<MemoryMode> {
@@ -1350,6 +1411,71 @@ Keep this agent identity separate from the model provider identity.
     return this.readPatterns(fileName) as Promise<Array<Record<string, unknown>>>;
   }
 
+  async getEvolutionPatterns(): Promise<EvolutionPattern[]> {
+    return this.readPatterns('evolution-patterns.json') as Promise<EvolutionPattern[]>;
+  }
+
+  async upsertEvolutionPattern(
+    input: Omit<EvolutionPattern, 'usageCount' | 'successCount' | 'averageScore' | 'averageTokenCost' | 'status' | 'createdAt' | 'updatedAt'> & {
+      evaluation: EvolutionPattern['historicalScores'][number];
+      tokenCost: number;
+    }
+  ): Promise<EvolutionPattern> {
+    const cachePath = path.join(this.rootPath, 'cache', 'evolution-patterns.json');
+    return this.updatePatternFile(cachePath, patterns => {
+      const existing = patterns.find(pattern => pattern.id === input.id) as unknown as EvolutionPattern | undefined;
+      const now = new Date().toISOString();
+      const historicalScores = [...(existing?.historicalScores ?? []), input.evaluation].slice(-50);
+      const usageCount = (existing?.usageCount ?? 0) + 1;
+      const successCount = (existing?.successCount ?? 0) + (input.evaluation.success ? 1 : 0);
+      const previousTokenTotal = (existing?.averageTokenCost ?? 0) * (existing?.usageCount ?? 0);
+      const averageTokenCost = Math.round((previousTokenTotal + Math.max(0, input.tokenCost)) / usageCount);
+      const averageScore = historicalScores.reduce((sum, item) => sum + item.score, 0) / historicalScores.length;
+      const pattern: EvolutionPattern = {
+        id: input.id,
+        name: input.name,
+        taskSignature: input.taskSignature,
+        genome: input.genome,
+        historicalScores,
+        usageCount,
+        successCount,
+        averageScore: Number(averageScore.toFixed(4)),
+        averageTokenCost,
+        status: usageCount >= 2 && averageScore >= 0.6 ? 'active' : 'candidate',
+        lineage: input.lineage,
+        linkedPatterns: input.linkedPatterns,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+      };
+      if (existing) Object.assign(existing, pattern);
+      else patterns.push(pattern as unknown as Record<string, unknown>);
+      return pattern;
+    }) as Promise<EvolutionPattern>;
+  }
+
+  async linkEvolutionPattern(
+    evolutionPatternId: string,
+    links: { agentPatternIds: string[]; teamPatternIds: string[] }
+  ): Promise<void> {
+    const update = async (fileName: string, ids: string[]) => {
+      if (ids.length === 0) return;
+      await this.updatePatternFile(path.join(this.rootPath, 'cache', fileName), patterns => {
+        for (const pattern of patterns) {
+          if (!ids.includes(String(pattern.id ?? ''))) continue;
+          const evolutionPatternIds = Array.isArray(pattern.evolutionPatternIds)
+            ? pattern.evolutionPatternIds.filter((item): item is string => typeof item === 'string')
+            : [];
+          pattern.evolutionPatternIds = [...new Set([...evolutionPatternIds, evolutionPatternId])];
+          pattern.updatedAt = new Date().toISOString();
+        }
+      });
+    };
+    await Promise.all([
+      update('agent-patterns.json', links.agentPatternIds),
+      update('team-patterns.json', links.teamPatternIds),
+    ]);
+  }
+
   async recordEvolutionRun(record: Record<string, unknown>): Promise<void> {
     await this.appendLocked(
       path.join(this.rootPath, 'cache', 'evolution-history.jsonl'),
@@ -1635,6 +1761,7 @@ Keep this agent identity separate from the model provider identity.
       agents: (await this.readPatterns('agent-patterns.json')).length,
       teams: (await this.readPatterns('team-patterns.json')).length,
       delegations: (await this.readPatterns('delegation-patterns.json')).length,
+      evolution: (await this.readPatterns('evolution-patterns.json')).length,
     };
   }
 

@@ -132,7 +132,7 @@ describe('Runtime controlled subagent spawning', () => {
 
     const budget = runtime.getBudgetState();
     expect(budget.perAgent.root.totalTokens).toBe(9);
-    expect(budget.perAgent[result.agent.identity.id].totalTokens).toBe(13);
+    expect(budget.perAgent[result.agent.identity.id].totalTokens).toBe(9);
 
     const eventTypes = runtime.getEvents().map(event => event.type);
     expect(eventTypes).toContain('root.synthesis.started');

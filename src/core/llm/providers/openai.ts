@@ -143,10 +143,14 @@ export class OpenAIProvider implements LLMProvider {
       response_format: { type: 'json_object' },
     });
 
-    const content = response.choices[0].message.content || '';
+    const message = response.choices[0].message as unknown as {
+      content?: string | null;
+      reasoning_content?: string | null;
+    };
+    const content = message.content || message.reasoning_content || '';
     try {
       return {
-        value: JSON.parse(content) as T,
+        value: parseJSONResponse<T>(content),
         completion: {
           content,
           usage: tokenUsageRegistry.normalize({ provider: this.name, model, usage: response.usage, messages, output: content }),
@@ -164,6 +168,47 @@ export class DeepSeekProvider extends OpenAIProvider {
   constructor(config?: ProviderConfig) {
     super(config, 'deepseek', 'deepseek-v4-flash');
   }
+}
+
+function parseJSONResponse<T>(content: string): T {
+  const trimmed = content.trim();
+  if (!trimmed) throw new Error('Empty JSON response');
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]?.trim();
+  const candidates = [trimmed, fenced, extractJSONObject(trimmed)].filter(
+    (value): value is string => Boolean(value)
+  );
+  for (const candidate of candidates) {
+    try {
+      return JSON.parse(candidate) as T;
+    } catch {
+      // Try the next structured representation.
+    }
+  }
+  throw new Error(`Failed to parse JSON response: ${content}`);
+}
+
+function extractJSONObject(content: string): string | undefined {
+  const start = content.indexOf('{');
+  if (start < 0) return undefined;
+  let depth = 0;
+  let quoted = false;
+  let escaped = false;
+  for (let index = start; index < content.length; index += 1) {
+    const char = content[index];
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') quoted = false;
+      continue;
+    }
+    if (char === '"') quoted = true;
+    else if (char === '{') depth += 1;
+    else if (char === '}') {
+      depth -= 1;
+      if (depth === 0) return content.slice(start, index + 1);
+    }
+  }
+  return undefined;
 }
 
 /**

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   BudgetMarket,
+  EvolutionLifecycleEngine,
   Runtime,
   TeamRegistry,
   ToMDelegationPlanner,
@@ -15,6 +16,7 @@ describe('public package API', () => {
     expect(ToMDelegationPlanner).toBeTypeOf('function');
     expect(WorkspaceMemoryManager).toBeTypeOf('function');
     expect(BudgetMarket).toBeTypeOf('function');
+    expect(EvolutionLifecycleEngine).toBeTypeOf('function');
     expect(executeTeamItems).toBeTypeOf('function');
   });
 });

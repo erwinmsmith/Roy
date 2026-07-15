@@ -25,6 +25,7 @@ export interface AgentComputeNodeRequest {
   role?: string;
   style?: string;
   description?: string;
+  systemPrompt?: string;
   tools?: string[];
   skills?: string[];
   budgetTokens?: number;
@@ -69,6 +70,7 @@ export interface AgentComputeNodeDefinition {
     role: string;
     style?: string;
     description: string;
+    systemPrompt?: string;
     tomProfile?: ToMProfile;
     tomProfileMode: 'runtime_assignment' | 'definition_override';
     cognitiveGapIds: string[];

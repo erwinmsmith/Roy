@@ -105,9 +105,9 @@ describe('Phase 3 subteam runtime', () => {
     expect(result.team.memberAgentIds).toHaveLength(3);
     expect(result.team.leadAgentId).toBe(result.team.memberAgentIds[0]);
     expect(result.result).toContain('AnalysisTeam consolidated');
-    expect(result.usage.totalTokens).toBe(125);
+    expect(result.usage.totalTokens).toBe(120);
     expect(result.team.synthesisUsage.totalTokens).toBe(30);
-    expect(Object.values(result.team.memberUsage).map(usage => usage.totalTokens)).toEqual([35, 30, 30]);
+    expect(Object.values(result.team.memberUsage).map(usage => usage.totalTokens)).toEqual([30, 30, 30]);
 
     const tree = runtime.getTeamTree(team.identity.id);
     expect(tree?.team.identity.parentAgentId).toBe('root');
@@ -133,8 +133,8 @@ describe('Phase 3 subteam runtime', () => {
     expect(runtime.getEvents().find(event => event.type === 'team.context.loaded')?.agentId).toBe(team.identity.id);
 
     const budget = runtime.getBudgetState();
-    expect(budget.perTeam[team.identity.id].totalTokens).toBe(125);
-    expect(budget.perAgent[result.team.memberAgentIds[0]].totalTokens).toBe(35);
+    expect(budget.perTeam[team.identity.id].totalTokens).toBe(120);
+    expect(budget.perAgent[result.team.memberAgentIds[0]].totalTokens).toBe(30);
 
     const topology = JSON.parse(await readFile(path.join(cwd, '.roy', 'teams', 'analysisteam', 'topology.json'), 'utf8')) as {
       status: string;
@@ -157,18 +157,18 @@ describe('Phase 3 subteam runtime', () => {
     expect(patterns.patterns[0].members[0].tools).toEqual(['fs.list', 'fs.read']);
     expect(patterns.patterns[0].members[0].skills).toContain('delegate_to_subagent');
     expect(patterns.patterns[0].usage.completedCount).toBe(1);
-    expect(patterns.patterns[0].usage.averageTokens).toBe(125);
+    expect(patterns.patterns[0].usage.averageTokens).toBe(120);
 
     const rerun = await runtime.runTeam(team.identity.id, 'Re-run the architecture review with the same members.');
     expect(rerun.correlationId).not.toBe(result.correlationId);
     expect(rerun.team.memberAgentIds).toEqual(result.team.memberAgentIds);
     expect(rerun.team.status).toBe('done');
-    expect(rerun.usage.totalTokens).toBe(125);
-    expect(rerun.team.tokenUsage.totalTokens).toBe(250);
+    expect(rerun.usage.totalTokens).toBe(120);
+    expect(rerun.team.tokenUsage.totalTokens).toBe(240);
     const updatedPatterns = await runtime.getCachePatterns('teams');
     const updatedUsage = updatedPatterns[0].usage as { completedCount: number; averageTokens: number };
     expect(updatedUsage.completedCount).toBe(2);
-    expect(updatedUsage.averageTokens).toBe(125);
+    expect(updatedUsage.averageTokens).toBe(120);
     expect(updatedPatterns[0].status).toBe('active');
 
     await runtime.shutdown();

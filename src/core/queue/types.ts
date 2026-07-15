@@ -26,8 +26,12 @@ export type MessageKind =
   | 'memory.load'
   | 'memory.update'
   | 'evo.propose'
+  | 'evo.instantiate'
+  | 'evo.execute'
   | 'evo.evaluate'
-  | 'evo.select';
+  | 'evo.select'
+  | 'evo.mutate'
+  | 'evo.integrate';
 
 export type MessagePriority = 'low' | 'normal' | 'high' | 'critical';
 export type MessageStatus = 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled';

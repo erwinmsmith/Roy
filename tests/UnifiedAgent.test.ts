@@ -18,8 +18,9 @@ class PlanningLLM implements LLMProvider {
     return { content: 'unused' };
   }
 
-  async *stream(_messages: LLMMessage[], _options?: LLMCompletionOptions): AsyncGenerator<LLMStreamChunk, void, unknown> {
-    yield { content: 'unused', done: true };
+  async *stream(messages: LLMMessage[], _options?: LLMCompletionOptions): AsyncGenerator<LLMStreamChunk, void, unknown> {
+    const result = messages.findLast(message => message.content.includes('Capability result:'))?.content ?? '';
+    yield { content: `synthesized:${result}`, done: true };
   }
 
   async completeJSON<T>(_messages: LLMMessage[], _options?: LLMCompletionOptions): Promise<T> {
@@ -102,7 +103,7 @@ describe('UnifiedAgent capability execution', () => {
     await agent.step('run the echo tool');
 
     const output = await queue.receive('env');
-    expect(output?.content).toBe('tool:hello');
+    expect(output?.content).toContain('tool:hello');
     expect(output?.metadata?.done).toBe(true);
   });
 
@@ -122,7 +123,7 @@ describe('UnifiedAgent capability execution', () => {
     await agent.step('run the echo skill');
 
     const output = await queue.receive('env');
-    expect(output?.content).toBe('skill:hello');
+    expect(output?.content).toContain('skill:hello');
     expect(output?.metadata?.done).toBe(true);
   });
 
@@ -143,7 +144,7 @@ describe('UnifiedAgent capability execution', () => {
 
     await agent.step('delegate a child task');
 
-    expect((await queue.receive('env'))?.content).toBe('agent_researcher_001');
+    expect((await queue.receive('env'))?.content).toContain('agent_researcher_001');
   });
 
   it('rejects globally registered skills that were not authorized for the agent', async () => {
@@ -163,5 +164,22 @@ describe('UnifiedAgent capability execution', () => {
     await agent.step('attempt an unauthorized skill');
 
     expect((await queue.receive('env'))?.content).toContain('is not authorized');
+  });
+
+  it('does not treat cognitive stress-testing as a command to execute a tool', async () => {
+    toolRegistry.register(new EchoTool());
+    const agent = new UnifiedAgent({
+      name: 'critic',
+      goal: 'critique evidence',
+      llm: new PlanningLLM('echo-tool'),
+      mode: 'hybrid',
+    });
+    const queue = new MessageQueue(['env', 'critic']);
+    agent.setMessageQueue(queue);
+    await agent.initialize('critic-session');
+
+    await agent.step('Stress-test the evidence and proposed conclusions.');
+
+    expect((await queue.receive('env'))?.content).not.toContain('tool:hello');
   });
 });

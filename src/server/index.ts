@@ -456,6 +456,53 @@ async function main(): Promise<void> {
     res.json(await runtime.getCachePatterns(kind));
   });
 
+  app.get('/v1/evolution', (_req, res) => {
+    res.json({ config: runtime.getEvolutionConfig(), runs: runtime.getEvolutionRuns(20) });
+  });
+
+  app.get('/v1/evolution/patterns', async (_req, res) => {
+    res.json(await runtime.getEvolutionPatterns());
+  });
+
+  app.get('/v1/evolution/history', async (req, res) => {
+    const limit = req.query.limit ? Number(req.query.limit) : 50;
+    res.json(await runtime.getEvolutionHistory(Number.isFinite(limit) && limit > 0 ? limit : 50));
+  });
+
+  app.patch('/v1/evolution/config', async (req, res) => {
+    try {
+      res.json(await runtime.updateEvolutionConfig(req.body ?? {}));
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post('/v1/evolution/run', async (req, res) => {
+    const task = req.body?.task;
+    if (typeof task !== 'string' || !task.trim()) {
+      res.status(400).json({ error: 'Expected body { task, parentId?, profile?, options?, seedAgents? }' });
+      return;
+    }
+    try {
+      res.json(await runtime.runEvolution(req.body));
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post('/v1/evolution/benchmark', async (req, res) => {
+    const task = req.body?.task;
+    if (typeof task !== 'string' || !task.trim()) {
+      res.status(400).json({ error: 'Expected body { task, profiles? }' });
+      return;
+    }
+    try {
+      res.json(await runtime.runEvolutionBenchmark(task, req.body?.profiles));
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
   app.post('/v1/budget', (req, res) => {
     const limitTokens = req.body?.limitTokens;
     if (limitTokens === null) {

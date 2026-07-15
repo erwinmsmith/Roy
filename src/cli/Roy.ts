@@ -118,7 +118,7 @@ export class Roy {
     console.log('Tokens: ' + this.cyan(`${state.budget.usedTokens} total`));
     console.log('Workspace: ' + this.cyan(path.relative(process.cwd(), memory.rootPath) || memory.rootPath));
     console.log('Memory: ' + this.cyan(`${memory.memoryDocs.length} docs loaded`));
-    console.log('Patterns: ' + this.cyan(`${memory.patterns.agents} agents, ${memory.patterns.teams} teams`));
+    console.log('Patterns: ' + this.cyan(`${memory.patterns.agents} agents, ${memory.patterns.teams} teams, ${memory.patterns.evolution} evolution`));
     console.log('API: ' + this.dim('http://localhost:' + (this.ctx.config.server?.port ?? 3000)));
     console.log('Type ' + this.cyan('/help') + ' for commands.');
   }
@@ -390,6 +390,10 @@ export class Roy {
         await this.printCache(parts);
         break;
 
+      case '/evo':
+        await this.handleEvolution(parts);
+        break;
+
       case '/messages':
         await this.printMessages(parts);
         break;
@@ -501,6 +505,12 @@ export class Roy {
       /cache delegations  Show cached delegation patterns
       /cache teams        Show cached team patterns
       /cache evolution    Show delegation evolution history
+      /evo                Show Phase 6 evolution config and latest run
+      /evo run [--profile <profile>] "task" Run team-first evolution
+      /evo benchmark "task" Compare solo, fixed, ToM, market, and evo profiles
+      /evo mode manual|auto Control normal-chat evolution
+      /evo ablate <feature> on|off Toggle subagents, tom, budget, mutation, or memory ablation
+      /evo patterns       Show reusable evolution genomes
       /messages --correlation <id> Show messages for a delegation chain
       /memory             Show workspace memory state
       /memory public      Show public memory docs
@@ -1296,7 +1306,7 @@ export class Roy {
     console.log(`    Proposals: ${proposals.length} pending`);
     console.log(`    Traces:    ${state.traces}`);
     console.log(`    Queue:     ${path.relative(process.cwd(), state.queuePath) || state.queuePath}`);
-    console.log(`    Patterns:  ${state.patterns.agents} agents, ${state.patterns.teams} teams, ${state.patterns.delegations} delegations`);
+    console.log(`    Patterns:  ${state.patterns.agents} agents, ${state.patterns.teams} teams, ${state.patterns.delegations} delegations, ${state.patterns.evolution} evolution`);
 
     if (state.publicMemoryDocs.length > 0) {
       console.log('\n  ' + this.bold('Public Memory:'));
@@ -1550,7 +1560,7 @@ export class Roy {
 
   private completer(line: string): [string[], string] {
     const commands = [
-      '/help', '/h', '/clear', '/cls', '/reset', '/agents', '/spawn', '/run', '/teams', '/team', '/tom', '/communication', '/exit', '/quit', '/q',
+      '/help', '/h', '/clear', '/cls', '/reset', '/agents', '/spawn', '/run', '/teams', '/team', '/tom', '/communication', '/evo', '/exit', '/quit', '/q',
       '/api', '/status', '/skills', '/actions', '/tools', '/memory', '/session',
       '/system', '/fsm', '/budget', '/events', '/queue', '/cache', '/messages', '/traces', '/config', '/prompt', '/context', '/conversation', '/verbose', '/color'
     ];
@@ -1644,6 +1654,152 @@ export class Roy {
     }
   }
 
+  private async handleEvolution(parts: string[]): Promise<void> {
+    const command = parts[1] ?? 'status';
+    const profiles = ['solo', 'fixed_subagents', 'tom_subteam', 'budget_market', 'evo_team'] as const;
+    if (command === 'run') {
+      const profileValue = this.optionValue(parts, '--profile') ?? runtime.getEvolutionConfig().profile;
+      if (!profiles.includes(profileValue as typeof profiles[number])) {
+        console.log(`\n  ${this.red('Invalid evolution profile:')} ${profileValue}\n`);
+        return;
+      }
+      const task = this.optionValue(parts, '--task') ?? this.trailingTask(parts, 2);
+      if (!task) {
+        console.log('\n  Usage: /evo run [--profile solo|fixed_subagents|tom_subteam|budget_market|evo_team] "task"\n');
+        return;
+      }
+      console.log(`\n  ${this.yellow(`roy[root] evolving with ${profileValue}...`)}\n`);
+      try {
+        const run = await runtime.runEvolution({ task, profile: profileValue as typeof profiles[number] });
+        this.printEvolutionRun(run);
+      } catch (error) {
+        console.log(`\n  ${this.red('Evolution error:')} ${error instanceof Error ? error.message : String(error)}\n`);
+      }
+      return;
+    }
+    if (command === 'benchmark') {
+      const task = this.optionValue(parts, '--task') ?? this.trailingTask(parts, 2);
+      if (!task) {
+        console.log('\n  Usage: /evo benchmark "task"\n');
+        return;
+      }
+      console.log(`\n  ${this.yellow('Running five-profile evolution benchmark...')}\n`);
+      try {
+        const benchmark = await runtime.runEvolutionBenchmark(task);
+        console.log('  ' + this.bold('Evolution Benchmark'));
+        console.log('    Profile              Success  Score  Tokens  Time(ms)  Agents  Teams');
+        for (const row of benchmark.comparison) {
+          console.log(
+            `    ${row.profile.padEnd(20)} ${String(row.success).padEnd(8)} ${row.score.toFixed(3).padStart(5)} ${String(row.totalTokens).padStart(7)} ${String(row.wallClockMs).padStart(9)} ${String(row.agentsSpawned).padStart(7)} ${String(row.teamsSpawned).padStart(6)}`
+          );
+        }
+        console.log('');
+      } catch (error) {
+        console.log(`\n  ${this.red('Benchmark error:')} ${error instanceof Error ? error.message : String(error)}\n`);
+      }
+      return;
+    }
+    if (command === 'mode') {
+      const mode = parts[2];
+      if (mode !== 'manual' && mode !== 'auto') {
+        console.log(`\n  Evolution mode: ${this.cyan(runtime.getEvolutionConfig().mode)}\n`);
+        return;
+      }
+      const next = await runtime.updateEvolutionConfig({ mode });
+      console.log(`\n  Evolution mode: ${this.cyan(next.mode)}\n`);
+      return;
+    }
+    if (command === 'profile') {
+      const profile = parts[2];
+      if (!profiles.includes(profile as typeof profiles[number])) {
+        console.log(`\n  Evolution profile: ${this.cyan(runtime.getEvolutionConfig().profile)}\n`);
+        return;
+      }
+      const next = await runtime.updateEvolutionConfig({ profile: profile as typeof profiles[number] });
+      console.log(`\n  Evolution profile: ${this.cyan(next.profile)}\n`);
+      return;
+    }
+    if (command === 'ablate') {
+      const feature = parts[2];
+      const enabled = parts[3];
+      const keyByFeature = {
+        subagents: 'withoutSubagents',
+        tom: 'withoutToMProfile',
+        budget: 'withoutBudgetMarket',
+        mutation: 'withoutEvoMutation',
+        memory: 'withoutPatternMemory',
+      } as const;
+      const key = keyByFeature[feature as keyof typeof keyByFeature];
+      if (!key || (enabled !== 'on' && enabled !== 'off')) {
+        console.log('\n  Usage: /evo ablate <subagents|tom|budget|mutation|memory> <on|off>\n');
+        return;
+      }
+      const next = await runtime.updateEvolutionConfig({ ablations: { [key]: enabled === 'on' } });
+      console.log(`\n  Ablation ${feature}: ${enabled === 'on' ? this.yellow('enabled') : this.green('disabled')}\n`);
+      console.log('  ' + this.dim(JSON.stringify(next.ablations)) + '\n');
+      return;
+    }
+    if (command === 'patterns') {
+      const patterns = await runtime.getEvolutionPatterns();
+      console.log('\n  ' + this.bold('Evolution Patterns'));
+      if (patterns.length === 0) console.log('    ' + this.dim('No integrated evolution patterns.'));
+      for (const pattern of patterns) {
+        console.log(`    - ${this.cyan(pattern.id)} ${pattern.name} [${pattern.status}]`);
+        console.log(`      members=${pattern.genome.members.map(member => member.archetype).join(',')} score=${pattern.averageScore.toFixed(3)} tokens=${pattern.averageTokenCost} uses=${pattern.usageCount}`);
+        console.log(`      linked agents=${pattern.linkedPatterns.agentPatternIds.length} teams=${pattern.linkedPatterns.teamPatternIds.length}`);
+      }
+      console.log('');
+      return;
+    }
+    if (command === 'history') {
+      const records = await runtime.getEvolutionHistory(20);
+      console.log('\n  ' + this.bold('Evolution Run History'));
+      if (records.length === 0) console.log('    ' + this.dim('No evolution runs recorded.'));
+      for (const record of records) {
+        const metrics = record.metrics && typeof record.metrics === 'object' ? record.metrics as Record<string, unknown> : {};
+        console.log(`    - ${this.cyan(String(record.id ?? record.correlationId ?? 'run'))} profile=${record.profile ?? '-'} score=${metrics.selectedGenomeScore ?? '-'} tokens=${metrics.totalTokens ?? '-'}`);
+      }
+      console.log('');
+      return;
+    }
+
+    const config = runtime.getEvolutionConfig();
+    const latest = runtime.getEvolutionRuns(1)[0];
+    console.log('\n  ' + this.bold('Evolution Runtime'));
+    console.log(`    Enabled:       ${config.enabled}`);
+    console.log(`    Mode:          ${this.cyan(config.mode)}`);
+    console.log(`    Profile:       ${this.cyan(config.profile)}`);
+    console.log(`    Population:    ${config.populationSize}`);
+    console.log(`    Generations:   ${config.generations}`);
+    console.log(`    Executed/run:  ${config.maxExecutedCandidates}`);
+    console.log(`    LLM judge:     ${config.useLlmJudge}`);
+    console.log(`    Ablations:     ${JSON.stringify(config.ablations)}`);
+    if (latest) {
+      console.log(`    Latest run:    ${latest.id} [${latest.state}]`);
+      console.log(`    Latest score:  ${latest.selectedEvaluation?.score ?? '-'}`);
+      console.log(`    Latest tokens: ${latest.metrics.totalTokens}`);
+    }
+    console.log('');
+  }
+
+  private printEvolutionRun(run: Awaited<ReturnType<typeof runtime.runEvolution>>): void {
+    console.log('  ' + this.bold(`Evolution Run: ${run.id}`));
+    console.log(`    profile:     ${run.profile}`);
+    console.log(`    state:       ${run.state}`);
+    console.log(`    candidates:  ${run.metrics.candidateCount} (${run.metrics.executedCandidateCount} executed)`);
+    console.log(`    selected:    ${run.selected?.id ?? 'solo root'}`);
+    console.log(`    genome:      ${run.selected?.genome.id ?? '-'}`);
+    console.log(`    score:       ${run.selectedEvaluation?.score ?? run.metrics.answerQuality}`);
+    console.log(`    tokens:      ${run.metrics.totalTokens} (thinking ${run.metrics.thinkingTokens ?? 'unavailable'})`);
+    console.log(`    actors:      ${run.metrics.agentsSpawned} agents, ${run.metrics.teamsSpawned} teams`);
+    console.log(`    cache/mutate:${run.metrics.cacheHits} hits, ${run.metrics.mutationsApplied} mutations`);
+    if (run.integratedPatternId) console.log(`    integrated:  ${run.integratedPatternId}`);
+    if (run.selectedExecution?.result) {
+      console.log('\n  ' + this.green('selected[result] > ') + run.selectedExecution.result);
+    }
+    console.log('');
+  }
+
   private async printCache(parts: string[]): Promise<void> {
     const scope = parts[1] ?? 'agents';
     if (scope === 'evolution') {
@@ -1719,7 +1875,7 @@ export class Roy {
   }
 
   private trailingTask(parts: string[], startIndex: number): string {
-    const optionsWithValues = new Set(['--parent', '--name', '--role', '--style', '--task', '--tools', '--skills', '--protocol']);
+    const optionsWithValues = new Set(['--parent', '--name', '--role', '--style', '--task', '--tools', '--skills', '--protocol', '--profile']);
     const taskParts: string[] = [];
     for (let index = startIndex; index < parts.length; index += 1) {
       const part = parts[index];

@@ -249,15 +249,12 @@ export class UnifiedAgent extends BaseAgent {
    * Decide whether to execute an action
    */
   private async shouldExecuteAction(observation: string): Promise<boolean> {
-    const actionIndicators = [
-      'do', 'run', 'execute', 'perform', 'search', 'find',
-      'calculate', 'create', 'update', 'delete', 'fetch', 'get me',
-      'inspect', 'list', 'read', 'status', 'test', 'check',
-    ];
+    if (/\nGrounding context:\n/.test(observation)) return false;
     const task = this.extractPrimaryTask(observation);
     const lowerObs = task.toLowerCase();
-
-    const hasActionIndicator = actionIndicators.some(ind => lowerObs.includes(ind));
+    const hasActionIndicator = /\b(?:run|execute|perform|search|find|calculate|create|update|delete|fetch|inspect|list|read|status|check)\b/.test(lowerObs)
+      || /\bget me\b/.test(lowerObs)
+      || /\brun\s+(?:the\s+)?(?:tests?|build)\b/.test(lowerObs);
     const hasCapabilities = this.getCapabilityNames().length > 0;
 
     return (hasActionIndicator && hasCapabilities) || this.mode === 'action';
@@ -305,12 +302,17 @@ export class UnifiedAgent extends BaseAgent {
         const response = this.formatCapabilityResult(result.result);
         this.addToMemory('action', `${plan.action}: ${response}`);
         this.fsm?.addToTrace(`Action executed: ${plan.action}`);
-
-        if (this.messageQueue) {
-          await this.messageQueue.send(this.name, 'env', response, { done: true });
-        } else {
-          process.stdout.write(response);
-        }
+        await this.executeConversationalMode([
+          ...messages,
+          {
+            role: 'assistant',
+            content: `Authorized capability "${plan.action}" completed.\nCapability result:\n${response.slice(0, 12000)}`,
+          },
+          {
+            role: 'user',
+            content: 'Use the capability result to answer the original task. Return a user-facing conclusion, not raw tool output or another tool request.',
+          },
+        ]);
       } else {
         const errorMsg = `Action error: ${result.error}`;
         this.addToMemory('result', errorMsg);
@@ -378,7 +380,7 @@ Tool-use policy:
         action: string;
         params: Record<string, unknown>;
         reasoning?: string;
-      }>(decisionMessages, { temperature: 0, maxTokens: 160 });
+      }>(decisionMessages, { temperature: 0, maxTokens: 512 });
 
       if (response.action === 'none' || !response.action) {
         return null;

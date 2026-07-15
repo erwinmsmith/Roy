@@ -34,6 +34,10 @@
       "types": "./dist/core/budget/index.d.ts",
       "import": "./dist/core/budget/index.js"
     },
+    "./evolution": {
+      "types": "./dist/core/evolution/index.d.ts",
+      "import": "./dist/core/evolution/index.js"
+    },
     "./llm": {
       "types": "./dist/core/llm/index.d.ts",
       "import": "./dist/core/llm/index.js"

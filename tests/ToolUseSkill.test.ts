@@ -18,8 +18,9 @@ class ToolPlanningLLM implements LLMProvider {
     return { content: 'unused' };
   }
 
-  async *stream(_messages: LLMMessage[], _options?: LLMCompletionOptions): AsyncGenerator<LLMStreamChunk, void, unknown> {
-    yield { content: 'unused', done: true };
+  async *stream(messages: LLMMessage[], _options?: LLMCompletionOptions): AsyncGenerator<LLMStreamChunk, void, unknown> {
+    const result = messages.findLast(message => message.content.includes('Capability result:'))?.content ?? '';
+    yield { content: `Synthesized tool evidence:\n${result}`, done: true };
   }
 
   async completeJSON<T>(_messages: LLMMessage[], _options?: LLMCompletionOptions): Promise<T> {

@@ -91,7 +91,7 @@ Workspace policy is stored in `.roy/config.json`:
 }
 ```
 
-Existing workspace configs are migrated to schema version 4 without discarding user overrides.
+Existing workspace configs are migrated to schema version 5 without discarding user overrides.
 
 ## Core Architecture
 
@@ -104,7 +104,7 @@ src/core/
   delegation/   Candidate generation and pluggable scorers
   tom/          Cognitive-gap analysis, ToM profiles, and coverage evaluation
   communication/ Replaceable message protocols and multi-party trace delivery
-  evolution/    Propose/evaluate/select execution pipeline
+  evolution/    Team-first genomes, lifecycle FSM, operators, evaluation, and selection
   budget/       Token allocation market and settlement
   team/         Formal subteam actor registry
   queue/        Runtime message queue and scheduler
@@ -129,7 +129,43 @@ Delegation candidates are evaluated by replaceable scorers:
 - cache reuse and mutation lineage
 - LLM-based candidate evaluation
 
-Candidate generation and selection run through an explicit `propose -> evaluate -> select` pipeline. Evaluations are written to `.roy/cache/evolution-history.jsonl` for inspection and later reuse.
+Delegation candidate scoring remains a lightweight control-plane step. Phase 6 evolution is a separate, full runtime lifecycle:
+
+```text
+propose -> instantiate -> execute -> evaluate -> select -> mutate -> integrate -> done
+```
+
+Every evolution candidate is represented as a `TeamGenome`. A one-member genome is compiled directly to an agent; larger genomes are compiled to formal subteams. Candidate actors run through the existing message queue, strict agent/team FSMs, tool policies, ToM profiles, budget market, memory, and traces. Rejected candidates are retained in history but are not integrated into pattern memory.
+
+Authorized capability execution is always followed by an agent synthesis step. Raw command results and unresolved tool-call markup are not valid candidate answers; unresolved tool intents fail evaluation and cannot enter evolution pattern memory.
+
+Selected genomes are stored in `.roy/cache/evolution-patterns.json` and linked back to their concrete agent/team patterns. Full runs and metrics are appended to `.roy/cache/evolution-history.jsonl`. Evolution defaults to `manual` mode so normal chat does not unexpectedly execute a candidate population. Set `/evo mode auto` to route complex delegated turns through evolution.
+
+The workspace defaults can be changed in `.roy/config.json` or through `/evo` and the evolution config API:
+
+```json
+{
+  "evolution": {
+    "enabled": true,
+    "mode": "manual",
+    "profile": "evo_team",
+    "populationSize": 3,
+    "generations": 1,
+    "topK": 1,
+    "maxExecutedCandidates": 3,
+    "integrationMinimumScore": 0.55,
+    "patternSimilarityThreshold": 0.35,
+    "useLlmJudge": false,
+    "ablations": {
+      "withoutSubagents": false,
+      "withoutToMProfile": false,
+      "withoutBudgetMarket": false,
+      "withoutEvoMutation": false,
+      "withoutPatternMemory": false
+    }
+  }
+}
+```
 
 The LLM scorer is also a metered control-plane call. Before scoring, the runtime either reserves a dedicated root allocation or reuses the active parent-agent allocation. The provider response is attributed to that parent actor, including reported thinking/cache tokens, and the allocation is settled or released on failure. Custom planners and scorer hooks are available through the `roy/delegation` package export.
 
@@ -313,6 +349,15 @@ The package also exposes `roy/runtime`, `roy/team`, `roy/tom`, `roy/communicatio
 /cache delegations
 /cache teams
 /cache evolution
+/evo
+/evo run --profile evo_team "Analyze this repository architecture and identify risks"
+/evo benchmark "Analyze this repository architecture and identify risks"
+/evo patterns
+/evo history
+/evo mode manual
+/evo mode auto
+/evo ablate tom on
+/evo ablate tom off
 /traces latest
 /communication
 /communication use structured
@@ -338,6 +383,12 @@ GET  /v1/teams/:id
 POST /v1/teams
 POST /v1/teams/:id/agents
 POST /v1/teams/:id/run
+GET  /v1/evolution
+GET  /v1/evolution/patterns
+GET  /v1/evolution/history
+PATCH /v1/evolution/config
+POST /v1/evolution/run
+POST /v1/evolution/benchmark
 GET  /v1/runtime/sessions
 DELETE /v1/runtime/session
 GET  /v1/budget
