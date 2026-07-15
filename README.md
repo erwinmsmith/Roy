@@ -48,6 +48,10 @@ Team execution is policy controlled. A team can run sequentially or with bounded
 
 ## ToM-Aware Delegation
 
+ToM is the default agent communication protocol, not a mandatory wire format. The communication layer is replaceable: `tom` renders beliefs, goals, uncertainty, perspectives, and participant models; `structured` renders a simpler provider-neutral message envelope. Applications can register additional `AgentCommunicationProtocol` implementations without changing the queue, runtime actor, or agent implementation.
+
+This communication protocol is separate from the ToM delegation planner. The planner may use ToM semantics for cognitive-gap analysis, while a message can still be delivered through `structured` or another registered protocol.
+
 Delegation is driven by explicit cognitive gaps rather than role labels alone. Before candidate selection, `ToMDelegationPlanner` models the parent actor's current beliefs, goals, and uncertainty, then derives bounded gaps such as missing evidence, adversarial perspective, planning, implementation, verification, or belief reconciliation.
 
 Each delegated agent receives a full `ToMProfile`:
@@ -77,11 +81,17 @@ Workspace policy is stored in `.roy/config.json`:
     "minimumCoverage": 0.6,
     "requireExistenceReason": true,
     "higherOrderForMultiplePerspectives": true
+  },
+  "communication": {
+    "defaultProtocol": "tom",
+    "allowMessageOverride": true,
+    "traceWindowSize": 200,
+    "includeCompletedMessages": true
   }
 }
 ```
 
-Existing workspace configs are migrated to schema version 2 without discarding user overrides.
+Existing workspace configs are migrated to schema version 3 without discarding user overrides.
 
 ## Core Architecture
 
@@ -93,6 +103,7 @@ src/core/
   executor/     Strict FSM and signal control
   delegation/   Candidate generation and pluggable scorers
   tom/          Cognitive-gap analysis, ToM profiles, and coverage evaluation
+  communication/ Replaceable message protocols and multi-party trace delivery
   evolution/    Propose/evaluate/select execution pipeline
   budget/       Token allocation market and settlement
   team/         Formal subteam actor registry
@@ -145,11 +156,17 @@ Agent prompt templates support these runtime slots:
 {{agent_private_memory}}
 {{agent_identity}}
 {{tom_profile}}
+{{communication_context}}
+{{multi_party_traces}}
 {{available_skills}}
 {{available_tools}}
 {{parent_context}}
 {{task}}
 ```
+
+Every `BaseAgent` implements the same trace receiver contract: `receiveSystemTrace`, `receiveSystemTraces`, `getSystemTraces`, and `receiveCommunicationContext`. Traces are observable runtime facts such as messages, tools, results, and state transitions; hidden model chain-of-thought is never treated as a trace. `ContextWindowManager` accepts the same protocol context and trace records with bounded token allocation.
+
+Protocol extensions implement `AgentCommunicationProtocol` and can be registered through `runtime.registerCommunicationProtocol(...)`. The runtime supports a global default, per-agent selection during creation, and explicit per-message override.
 
 ## Tools And Approvals
 
@@ -221,7 +238,7 @@ const runtime = new Runtime();
 await runtime.initialize({ sessionId: 'my-session', workspaceCwd: process.cwd() });
 ```
 
-The package also exposes `roy/runtime`, `roy/team`, `roy/queue`, and `roy/memory` subpaths. Installed binaries are `roy` and `roy-server`.
+The package also exposes `roy/runtime`, `roy/team`, `roy/tom`, `roy/communication`, `roy/queue`, and `roy/memory` subpaths. Installed binaries are `roy` and `roy-server`.
 
 ## CLI Commands
 
@@ -231,6 +248,7 @@ The package also exposes `roy/runtime`, `roy/team`, `roy/queue`, and `roy/memory
 /agents archetypes
 /agents policy <agentId>
 /spawn researcher "Inspect the project structure"
+/spawn researcher --protocol structured "Inspect the project structure"
 /spawn critic --parent <agentId> "Review the parent result"
 /teams
 /teams --tree
@@ -253,6 +271,9 @@ The package also exposes `roy/runtime`, `roy/team`, `roy/queue`, and `roy/memory
 /cache teams
 /cache evolution
 /traces latest
+/communication
+/communication use structured
+/communication traces 20
 ```
 
 Normal chat input uses root-controlled delegation. `/spawn` remains available for controlled testing and explicit actor creation.
@@ -281,6 +302,10 @@ GET  /v1/budget/market
 GET  /v1/cache/:kind
 GET  /v1/events
 GET  /v1/messages
+GET  /v1/communication
+GET  /v1/communication/traces
+POST /v1/communication/traces
+POST /v1/communication/default
 GET  /v1/queue
 POST /v1/context/render
 GET  /v1/tools/approvals

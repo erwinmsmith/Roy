@@ -30,6 +30,12 @@ import {
   ToMDelegationPlanner,
   type ToMTaskAnalysis,
 } from '../tom/index.js';
+import {
+  AgentCommunicationManager,
+  type AgentCommunicationProtocol,
+  type CommunicationState,
+  type MultiPartyTrace,
+} from '../communication/index.js';
 import { ContextWindowManager, type ContextWindow } from '../context/index.js';
 import { BudgetMarket, type BudgetAllocation, type BudgetMarketState } from '../budget/index.js';
 import {
@@ -77,6 +83,7 @@ export interface RuntimeConfig {
   mode?: 'conversational' | 'action' | 'hybrid';
   llmProvider?: LLMProvider;
   workspaceCwd?: string;
+  communicationProtocols?: AgentCommunicationProtocol[];
 }
 
 export interface RuntimeContext {
@@ -90,6 +97,7 @@ export interface RuntimeContext {
   queue: MessageQueue;
   scheduler: MessageScheduler;
   memory: WorkspaceMemoryManager;
+  communication: AgentCommunicationManager;
   capabilities: {
     skills: number;
     actions: number;
@@ -218,6 +226,7 @@ export interface SpawnAgentSpec {
   nodeDefinition?: AgentComputeNodeDefinition;
   cognitiveGapIds?: string[];
   existenceReason?: string;
+  communicationProtocol?: string;
 }
 
 export interface AgentTreeNode {
@@ -239,6 +248,7 @@ export interface TeamMemberSpec {
   cognitiveGapIds?: string[];
   existenceReason?: string;
   lead?: boolean;
+  communicationProtocol?: string;
 }
 
 export interface SpawnTeamSpec {
@@ -346,6 +356,7 @@ export interface SpawnCommandPayload {
   teamId?: string;
   cognitiveGapIds?: string[];
   existenceReason?: string;
+  communicationProtocol?: string;
 }
 
 export type DelegationDecision =
@@ -463,6 +474,7 @@ export class Runtime {
   private turnAgentCounts = new Map<string, number>();
   private readonly tomPlanner = new ToMDelegationPlanner();
   private readonly tomAnalyses = new Map<string, ToMTaskAnalysis>();
+  private communicationManager: AgentCommunicationManager | null = null;
 
   static getInstance(): Runtime {
     if (!Runtime.instance) {
@@ -523,6 +535,11 @@ export class Runtime {
     const memory = new WorkspaceMemoryManager();
     await memory.initWorkspace(options.workspaceCwd ?? process.cwd(), options.sessionId ?? 'main');
     this.workspaceRuntimeConfig = await memory.getWorkspaceConfig();
+    const communication = new AgentCommunicationManager(
+      this.workspaceRuntimeConfig.communication,
+      options.communicationProtocols
+    );
+    this.communicationManager = communication;
     this.candidatePlanner = new DefaultDelegationCandidatePlanner({
       llm,
       enabledScorers: this.workspaceRuntimeConfig.delegation.candidateScoring.enabledScorers,
@@ -571,6 +588,7 @@ export class Runtime {
       generation: 0,
       tomLevel: 1,
       tomProfile: this.createRootToMProfile(),
+      communicationProtocol: communication.getDefaultProtocolId(),
       description: 'Root agent of the Roy autonomous agent system',
       mode: options.mode ?? 'hybrid',
     });
@@ -608,6 +626,7 @@ export class Runtime {
       queue,
       scheduler,
       memory,
+      communication,
       capabilities,
     };
     this.queue = queue;
@@ -651,6 +670,7 @@ export class Runtime {
     this.memory = null;
     this.workspaceRuntimeConfig = null;
     this.contextWindowManager = null;
+    this.communicationManager = null;
     this.candidatePlanner = null;
     this.agentBindings.clear();
     this.agentFsms.clear();
@@ -2235,7 +2255,80 @@ export class Runtime {
 
   async enqueueMessage<TPayload>(message: EnqueueMessageInput<TPayload>): Promise<RuntimeMessage<TPayload>> {
     const ctx = this.getContext();
-    return ctx.queue.enqueue(message);
+    const recipientProtocol = ctx.manager.getAgentById(message.to)?.getIdentity().communicationProtocol;
+    return ctx.queue.enqueue({
+      ...message,
+      metadata: {
+        ...message.metadata,
+        communicationProtocol:
+          message.metadata?.communicationProtocol ?? recipientProtocol ?? ctx.communication.getDefaultProtocolId(),
+      },
+    });
+  }
+
+  registerCommunicationProtocol(protocol: AgentCommunicationProtocol): void {
+    this.requireCommunicationManager().registerProtocol(protocol);
+    this.emit({
+      type: 'communication.protocol.registered',
+      agentId: 'runtime',
+      data: { protocolId: protocol.id, version: protocol.version },
+    });
+  }
+
+  setDefaultCommunicationProtocol(protocolId: string): void {
+    const ctx = this.getContext();
+    const previous = ctx.communication.getDefaultProtocolId();
+    ctx.communication.setDefaultProtocol(protocolId);
+    for (const info of ctx.manager.listAgentInfo()) {
+      if (info.identity.communicationProtocol !== previous) continue;
+      ctx.manager.getAgentById(info.identity.id)?.setCommunicationProtocol(protocolId);
+    }
+    this.emit({
+      type: 'communication.protocol.default.changed',
+      agentId: 'runtime',
+      data: { protocolId },
+    });
+  }
+
+  getCommunicationState(): CommunicationState {
+    return this.requireCommunicationManager().getState();
+  }
+
+  getCommunicationTraces(options: {
+    correlationId?: string;
+    agentId?: string;
+    limit?: number;
+  } = {}): MultiPartyTrace[] {
+    const ctx = this.getContext();
+    return ctx.communication.traces.list({
+      sessionId: ctx.sessionId,
+      correlationId: options.correlationId,
+      actorId: options.agentId,
+      limit: options.limit,
+    });
+  }
+
+  injectSystemTrace(agentId: string | 'broadcast', trace: MultiPartyTrace): void {
+    const ctx = this.getContext();
+    if (!ctx.communication.registry.get(trace.protocolId)) {
+      throw new Error(`Communication protocol "${trace.protocolId}" is not registered`);
+    }
+    if (trace.sessionId !== ctx.sessionId) {
+      throw new Error(`Trace session "${trace.sessionId}" does not match active session "${ctx.sessionId}"`);
+    }
+    ctx.communication.traces.append(trace);
+    const targets = agentId === 'broadcast'
+      ? ctx.manager.listAgentInfo().map(info => ctx.manager.getAgentById(info.identity.id)!).filter(Boolean)
+      : [ctx.manager.getAgentById(agentId)].filter((agent): agent is BaseAgent => Boolean(agent));
+    if (targets.length === 0) throw new Error(`Agent "${agentId}" not found`);
+    for (const agent of targets) agent.receiveSystemTrace(trace);
+    this.emit({
+      type: 'communication.trace.injected',
+      agentId: agentId === 'broadcast' ? 'runtime' : agentId,
+      sessionId: trace.sessionId,
+      correlationId: trace.correlationId,
+      data: { traceId: trace.id, kind: trace.kind, protocolId: trace.protocolId },
+    });
   }
 
   async getQueueState(limit = 20): Promise<QueueState> {
@@ -2725,6 +2818,7 @@ export class Runtime {
         : 'definition_override',
       cognitiveGapIds: payload.cognitiveGapIds,
       existenceReason: payload.existenceReason,
+      communicationProtocol: payload.communicationProtocol,
       reuse: { mode: payload.reuseMode ?? 'prefer_cache' },
       outputContract: payload.outputContract,
       execution: {
@@ -2880,6 +2974,15 @@ export class Runtime {
     const memoryScope = this.constrainMemoryScope(
       request.memoryScope ?? cachedMemoryScope ?? this.getDefaultMemoryScope('subagent')
     );
+    const cachedCommunicationProtocol = typeof cachedAgentPattern?.communicationProtocol === 'string'
+      ? cachedAgentPattern.communicationProtocol
+      : undefined;
+    const communicationProtocol = request.communicationProtocol
+      ?? cachedCommunicationProtocol
+      ?? ctx.communication.getDefaultProtocolId();
+    if (!ctx.communication.registry.get(communicationProtocol)) {
+      throw new Error(`Communication protocol "${communicationProtocol}" is not registered`);
+    }
     const requestedSpawnPolicy = this.mergeSpawnPolicy(
       this.getDefaultSpawnPolicy('subagent', request.archetype),
       { ...cachedSpawnPolicy, ...request.spawnPolicy }
@@ -2897,6 +3000,7 @@ export class Runtime {
       || request.memoryScope !== undefined
       || request.spawnPolicy !== undefined
       || (request.tomProfile !== undefined && request.tomProfileMode !== 'runtime_assignment')
+      || (request.communicationProtocol !== undefined && request.communicationProtocol !== cachedCommunicationProtocol)
       || request.outputContract !== undefined;
     const creationMode: AgentNodeCreationMode = cachedAgentPattern && (reuseMode === 'mutate_cache' || hasDefinitionOverrides)
       ? 'mutated_from_cache'
@@ -2921,6 +3025,7 @@ export class Runtime {
       memoryScope,
       spawnPolicy,
       tomProfile: request.tomProfileMode === 'definition_override' ? request.tomProfile : undefined,
+      communicationProtocol,
       outputContract,
     };
     const definitionFingerprint = this.fingerprint(definitionSeed);
@@ -2958,7 +3063,7 @@ export class Runtime {
       },
       assignment: { task: request.task, outputContract },
       capabilities: { tools: [...tools], skills: [...skills] },
-      context: { memoryScope },
+      context: { memoryScope, communicationProtocol },
       resources: { budgetTokens: request.budgetTokens },
       governance: { spawnPolicy },
       execution: {
@@ -3022,6 +3127,7 @@ export class Runtime {
       tomProfile: node.identity.tomProfile,
       cognitiveGapIds: node.identity.cognitiveGapIds,
       existenceReason: node.identity.existenceReason,
+      communicationProtocol: node.context.communicationProtocol,
       outputContract: node.assignment.outputContract,
       correlationId: node.correlationId,
       source: node.source,
@@ -3565,6 +3671,7 @@ export class Runtime {
           .filter(Boolean)
           .join('\n\n'),
         tomProfile: resolvedTomProfile,
+        communicationProtocol: spec.communicationProtocol ?? ctx.communication.getDefaultProtocolId(),
         availableSkills: skillBindings.map((binding) => binding.name),
         availableTools: toolBindings.map((binding) => binding.name),
         parentContext: contextWindow.parentContext,
@@ -3594,6 +3701,7 @@ export class Runtime {
       generation,
       tomLevel: resolvedTomProfile.level,
       tomProfile: resolvedTomProfile,
+      communicationProtocol: spec.communicationProtocol ?? ctx.communication.getDefaultProtocolId(),
       description: spec.description,
       goal,
         llm: ctx.llm ?? undefined,
@@ -3633,6 +3741,7 @@ export class Runtime {
         spawnPolicy,
         memoryScope,
         outputContract: spec.outputContract,
+        communicationProtocol: spec.communicationProtocol ?? ctx.communication.getDefaultProtocolId(),
       definitionFingerprint: spec.nodeDefinition?.definitionFingerprint,
       creationMode,
     });
@@ -3956,7 +4065,14 @@ export class Runtime {
       }
       await this.transitionAgentFsm(agentId, 'S_reasoning', { task, correlationId: options.correlationId });
       this.emit({ type: 'agent.llm.called', agentId, data: { task } });
-      await agent.step(this.buildGroundedTask(task, grounding));
+      const communicationContext = agent.getCommunicationContext();
+      const observation = [
+        this.buildGroundedTask(task, grounding),
+        communicationContext
+          ? `<system_communication_context protocol="${communicationContext.protocolId}">\n${communicationContext.rendered}\n</system_communication_context>`
+          : '',
+      ].filter(Boolean).join('\n\n');
+      await agent.step(observation);
       const stepError = agent.getInfo().error;
       if (stepError) {
         throw new Error(stepError.replace(/^Error:\s*/, ''));
@@ -4082,7 +4198,52 @@ export class Runtime {
     const ctx = this.getContext();
     const message = await ctx.queue.getMessage(messageId);
     if (!message) return undefined;
-    return ctx.queue.dequeue({ to: message.to, kind: [message.kind], readyOnly: true });
+    const dequeued = await ctx.queue.dequeue({ to: message.to, kind: [message.kind], readyOnly: true });
+    if (dequeued) this.deliverCommunicationContext(dequeued);
+    return dequeued;
+  }
+
+  private deliverCommunicationContext(message: RuntimeMessage): void {
+    const ctx = this.getContext();
+    const recipient = ctx.manager.getAgentById(message.to);
+    if (!recipient) return;
+    const participantIds = new Set<string>([message.from, message.to]);
+    for (const trace of ctx.communication.traces.list({
+      sessionId: message.sessionId,
+      correlationId: message.correlationId,
+    })) {
+      participantIds.add(trace.from.id);
+      for (const actor of trace.to) participantIds.add(actor.id);
+    }
+    const participants = ctx.manager.listAgentInfo().filter(agent => participantIds.has(agent.identity.id));
+    const task = this.extractMessageTask(message);
+    const communicationContext = ctx.communication.buildContext({
+      message,
+      recipient: recipient.getInfo(),
+      participants,
+      task,
+    });
+    recipient.receiveCommunicationContext(communicationContext);
+    this.emit({
+      type: 'communication.context.delivered',
+      agentId: recipient.id,
+      sessionId: message.sessionId,
+      correlationId: message.correlationId,
+      nodeId: message.metadata?.nodeId,
+      data: {
+        messageId: message.id,
+        protocolId: communicationContext.protocolId,
+        traceCount: communicationContext.traces.length,
+        participantIds: participants.map(agent => agent.identity.id),
+      },
+    });
+  }
+
+  private extractMessageTask(message: RuntimeMessage): string | undefined {
+    if (!message.payload || typeof message.payload !== 'object') return undefined;
+    const payload = message.payload as Record<string, unknown>;
+    const value = payload.task ?? payload.input ?? payload.userTask;
+    return typeof value === 'string' ? value : undefined;
   }
 
   private async transitionAgentFsm(
@@ -4121,6 +4282,11 @@ export class Runtime {
   private requireContextWindowManager(): ContextWindowManager {
     if (!this.contextWindowManager) throw new Error('ContextWindowManager is not initialized');
     return this.contextWindowManager;
+  }
+
+  private requireCommunicationManager(): AgentCommunicationManager {
+    if (!this.communicationManager) throw new Error('AgentCommunicationManager is not initialized');
+    return this.communicationManager;
   }
 
   private requireCandidatePlanner(): DefaultDelegationCandidatePlanner {
@@ -4877,6 +5043,7 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
           'The model provider is only your inference backend.',
           `Purpose: ${purpose}.`,
           `Correlation: ${correlationId}.`,
+          ctx.agent.getCommunicationContext()?.rendered,
         ].join('\n'),
       },
       { role: 'user', content: prompt },
@@ -5720,6 +5887,7 @@ Produce the final response to the user as Roy, the root agent.`;
           'You are not the model provider. The provider is only your inference backend.',
           `Purpose: ${purpose}.`,
           `Correlation: ${correlationId}.`,
+          agent.getCommunicationContext()?.rendered,
         ].join('\n'),
       },
       { role: 'user', content: prompt },
@@ -5957,12 +6125,21 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
     availableSkills?: string[];
     availableTools?: string[];
     parentContext?: string;
+    communicationProtocol?: string;
+    communicationContext?: string;
+    multiPartyTraces?: MultiPartyTrace[];
+    multiPartyTraceContext?: string;
   }): string {
     const slots: Record<string, string> = {
       public_context: input.publicContext ?? '',
       agent_private_memory: input.bundle.memory.trim(),
       agent_identity: input.bundle.identity.trim() || `You are ${input.name}, a ${input.role} agent in the Roy runtime.`,
       tom_profile: input.tomProfile ? JSON.stringify(input.tomProfile, null, 2) : '',
+      communication_context: input.communicationContext
+        ?? `Protocol: ${input.communicationProtocol ?? this.communicationManager?.getDefaultProtocolId() ?? 'tom'}. Runtime messages are rendered through the selected communication protocol.`,
+      multi_party_traces: input.multiPartyTraceContext ?? (input.multiPartyTraces?.length
+        ? input.multiPartyTraces.map(trace => `[${trace.phase}] ${trace.from.id} -> ${trace.to.map(actor => actor.id).join(',')}: ${trace.kind}`).join('\n')
+        : 'Observable multi-party traces are injected by the runtime for each message.'),
       available_skills: (input.availableSkills ?? []).map(skill => `- ${skill}`).join('\n') || '- none',
       available_tools: (input.availableTools ?? []).map(tool => `- ${tool}`).join('\n') || '- none',
       parent_context: input.parentContext ?? `Parent agent: ${input.parentName}`,
@@ -5995,6 +6172,7 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
     const agentKey = options.agentKey;
     const bundle = await ctx.memory.loadAgentMemory(agentKey);
     const parent = options.parentId ? ctx.manager.getAgentById(options.parentId)?.getIdentity() : ctx.agent.getIdentity();
+    const runtimeAgent = agentKey === 'roy' ? ctx.agent : ctx.manager.getAgentById(agentKey);
     const role = options.role ?? options.archetype ?? agentKey;
     const contextWindow = await this.renderAgentContext({
       agentKey,
@@ -6015,6 +6193,9 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
       bundle,
       publicContext: [contextWindow.publicContext, contextWindow.sessionContext].filter(Boolean).join('\n\n'),
       tomProfile,
+      communicationProtocol: runtimeAgent?.getIdentity().communicationProtocol ?? ctx.communication.getDefaultProtocolId(),
+      communicationContext: contextWindow.communicationContext,
+      multiPartyTraceContext: contextWindow.multiPartyTraceContext,
       availableSkills: skillRegistry.list().map(skill => skill.name),
       availableTools: toolRegistry.list().map(tool => tool.name),
       parentContext: contextWindow.parentContext || `Parent agent: ${parent?.name ?? 'Roy'} (${parent?.id ?? 'root'})`,
@@ -6056,6 +6237,8 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
       task: options.task ?? '',
       parentContext: parent ? `Parent agent: ${parent.name} (${parent.id})` : undefined,
       memoryScope,
+      communicationContext: runtimeAgent?.getCommunicationContext()?.rendered,
+      systemTraces: runtimeAgent?.getSystemTraces({ limit: 50 }),
     });
   }
 
@@ -6572,6 +6755,22 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
 
   private handleQueueTransition(transition: QueueTransition): void {
     const message = transition.message;
+    const communicationTrace = this.communicationManager?.recordTransition(transition);
+    if (communicationTrace && this.ctx) {
+      for (const actor of [communicationTrace.from, ...communicationTrace.to]) {
+        const info = this.ctx.manager.getAgentById(actor.id)?.getInfo();
+        if (!info) continue;
+        actor.name = info.identity.name;
+        actor.parentId = info.identity.parentId;
+        actor.teamId = info.identity.teamId;
+        actor.type = info.identity.role === 'subteam' ? 'team' : 'agent';
+      }
+      const participantIds = new Set([communicationTrace.from.id, ...communicationTrace.to.map(actor => actor.id)]);
+      for (const info of this.ctx.manager.listAgentInfo()) {
+        const agent = this.ctx.manager.getAgentById(info.identity.id);
+        if (agent && participantIds.has(agent.id)) agent.receiveSystemTrace(communicationTrace);
+      }
+    }
     this.emit({
       type: transition.type,
       agentId: message.metadata?.agentId,
@@ -6591,6 +6790,8 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
         parentMessageId: message.parentMessageId,
         error: transition.error,
         reason: transition.reason,
+        communicationProtocol: message.metadata?.communicationProtocol,
+        communicationTraceId: communicationTrace?.id,
       },
     });
   }

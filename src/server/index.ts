@@ -9,6 +9,7 @@ import { Server } from 'socket.io';
 import { bootstrap, cleanup, type BootstrapContext } from '../bootstrap.js';
 import { runtime as defaultRuntime } from '../core/runtime/Runtime.js';
 import type Runtime from '../core/runtime/Runtime.js';
+import type { MultiPartyTrace, TraceActorRef } from '../core/communication/index.js';
 import { logger } from '../core/utils/logger.js';
 import { RuntimeSessionPool } from './RuntimeSessionPool.js';
 
@@ -283,6 +284,7 @@ async function main(): Promise<void> {
         spawnPolicy: body.spawnPolicy,
         tomProfile: body.tomProfile,
         tomProfileMode: body.tomProfileMode,
+        communicationProtocol: body.communicationProtocol,
         reuse: body.reuse,
         execution: body.execution,
         outputContract: body.outputContract,
@@ -462,6 +464,81 @@ async function main(): Promise<void> {
     const correlationId = typeof req.query.correlationId === 'string' ? req.query.correlationId : undefined;
     const limit = req.query.limit ? Number(req.query.limit) : 50;
     res.json(await runtime.getMessages({ correlationId, limit: Number.isFinite(limit) && limit > 0 ? limit : 50 }));
+  });
+
+  app.get('/v1/communication', (_req, res) => {
+    res.json(runtime.getCommunicationState());
+  });
+
+  app.get('/v1/communication/traces', (req, res) => {
+    const limit = req.query.limit ? Number(req.query.limit) : 50;
+    res.json(runtime.getCommunicationTraces({
+      correlationId: typeof req.query.correlationId === 'string' ? req.query.correlationId : undefined,
+      agentId: typeof req.query.agentId === 'string' ? req.query.agentId : undefined,
+      limit: Number.isFinite(limit) && limit > 0 ? limit : 50,
+    }));
+  });
+
+  app.post('/v1/communication/traces', (req, res) => {
+    const body = req.body ?? {};
+    const actor = (value: unknown): TraceActorRef | undefined => {
+      if (!value || typeof value !== 'object') return undefined;
+      const record = value as Record<string, unknown>;
+      if (typeof record.id !== 'string' || typeof record.type !== 'string') return undefined;
+      if (!['user', 'agent', 'team', 'runtime', 'tool', 'adapter'].includes(record.type)) return undefined;
+      return {
+        id: record.id,
+        type: record.type as TraceActorRef['type'],
+        name: typeof record.name === 'string' ? record.name : undefined,
+        parentId: typeof record.parentId === 'string' ? record.parentId : undefined,
+        teamId: typeof record.teamId === 'string' ? record.teamId : undefined,
+      };
+    };
+    const from = actor(body.from);
+    const recipients: TraceActorRef[] = Array.isArray(body.to)
+      ? (body.to as unknown[]).map(actor).filter((item: TraceActorRef | undefined): item is TraceActorRef => Boolean(item))
+      : [];
+    const targetAgentId = typeof body.agentId === 'string' ? body.agentId : 'broadcast';
+    if (!from || recipients.length === 0 || typeof body.kind !== 'string') {
+      res.status(400).json({ error: 'Expected body { agentId?, id?, kind, from: actor, to: actor[], content?, protocolId?, correlationId? }' });
+      return;
+    }
+    const trace: MultiPartyTrace = {
+      id: typeof body.id === 'string' ? body.id : `trace_external_${Date.now()}`,
+      sessionId: runtime.getState().sessionId,
+      timestamp: typeof body.timestamp === 'number' ? body.timestamp : Date.now(),
+      protocolId: typeof body.protocolId === 'string' ? body.protocolId : runtime.getCommunicationState().defaultProtocol,
+      kind: body.kind,
+      phase: 'system',
+      from,
+      to: recipients,
+      content: typeof body.content === 'string' ? body.content : undefined,
+      correlationId: typeof body.correlationId === 'string' ? body.correlationId : undefined,
+      visibility: ['participants', 'parent_chain', 'team', 'public'].includes(body.visibility)
+        ? body.visibility
+        : 'participants',
+      metadata: body.metadata && typeof body.metadata === 'object' ? body.metadata : undefined,
+    };
+    try {
+      runtime.injectSystemTrace(targetAgentId, trace);
+      res.status(201).json(trace);
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post('/v1/communication/default', (req, res) => {
+    const protocolId = req.body?.protocolId;
+    if (typeof protocolId !== 'string' || !protocolId.trim()) {
+      res.status(400).json({ error: 'Expected body { "protocolId": string }' });
+      return;
+    }
+    try {
+      runtime.setDefaultCommunicationProtocol(protocolId);
+      res.json(runtime.getCommunicationState());
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
   });
 
   app.get('/v1/queue', async (req, res) => {

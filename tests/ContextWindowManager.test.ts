@@ -43,6 +43,19 @@ describe('ContextWindowManager', () => {
       task: 'Inspect the repository',
       parentContext: 'Roy delegated a bounded inspection task.',
       memoryScope: { public: true, private: true, parentContext: true, sessionWindowTurns: 2 },
+      communicationContext: '<agent_communication protocol="structured">task</agent_communication>',
+      systemTraces: [{
+        id: 'trace_context_1',
+        sessionId: 'context-session',
+        timestamp: Date.now(),
+        protocolId: 'structured',
+        kind: 'agent.task',
+        phase: 'processing',
+        from: { id: 'root', type: 'agent' },
+        to: [{ id: 'agent-researcher', type: 'agent' }],
+        visibility: 'participants',
+        content: 'Inspect context behavior.',
+      }],
     });
 
     expect(context.sessionContext).not.toContain('User request 1');
@@ -50,6 +63,8 @@ describe('ContextWindowManager', () => {
     expect(context.sessionContext).toContain('Roy response 4');
     expect(context.privateMemory).toContain('# Agent Memory');
     expect(context.parentContext).toContain('Roy delegated');
+    expect(context.communicationContext).toContain('protocol="structured"');
+    expect(context.multiPartyTraceContext).toContain('root -> agent-researcher');
     expect(context.tokenUsage.total).toBeLessThanOrEqual(1200);
     expect(context.sources.session).toContain('last 2 turns');
   });

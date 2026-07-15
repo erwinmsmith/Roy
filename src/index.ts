@@ -4,6 +4,7 @@ export { AgentManager, Runtime, runtime } from './core/runtime/index.js';
 export type { RuntimeConfig, RuntimeContext, ToMRuntimeState } from './core/runtime/index.js';
 export * from './core/team/index.js';
 export * from './core/tom/index.js';
+export * from './core/communication/index.js';
 export {
   InMemoryMessageQueue,
   MessageScheduler,

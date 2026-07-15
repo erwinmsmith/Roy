@@ -1,4 +1,5 @@
 import type { AgentRole } from '../agent/BaseAgent.js';
+import type { MultiPartyTrace } from '../communication/index.js';
 
 export interface ContextWindowPolicy {
   sessionWindowTurns: number;
@@ -24,6 +25,8 @@ export interface ContextWindowRequest {
   task: string;
   parentContext?: string;
   memoryScope: ContextMemoryScope;
+  communicationContext?: string;
+  systemTraces?: MultiPartyTrace[];
 }
 
 export interface ContextTokenBreakdown {
@@ -32,6 +35,8 @@ export interface ContextTokenBreakdown {
   sessionWindow: number;
   parentContext: number;
   task: number;
+  communicationContext: number;
+  multiPartyTraces: number;
   total: number;
 }
 
@@ -41,11 +46,15 @@ export interface ContextWindow {
   sessionContext: string;
   parentContext: string;
   task: string;
+  communicationContext: string;
+  multiPartyTraceContext: string;
   tokenUsage: ContextTokenBreakdown;
   sources: {
     public: string[];
     private: string[];
     session: string;
     parent: string;
+    communication: string;
+    traces: string;
   };
 }

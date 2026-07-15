@@ -10,6 +10,11 @@ import { buildPrompt } from '../prompts/builder.js';
 import { conversationalTemplate } from '../prompts/templates/conversational.js';
 import { logger } from '../utils/logger.js';
 import { normalizeToMProfile, type ToMProfile } from '../tom/index.js';
+import type {
+  AgentCommunicationContext,
+  AgentTraceReceiver,
+  MultiPartyTrace,
+} from '../communication/index.js';
 
 export type { ToMProfile } from '../tom/index.js';
 
@@ -26,6 +31,7 @@ export interface AgentIdentity {
   tomLevel: number;
   description?: string;
   tomProfile: ToMProfile;
+  communicationProtocol: string;
 }
 
 export interface AgentUsage {
@@ -49,6 +55,7 @@ export interface AgentConfig {
   tomLevel?: number;
   description?: string;
   tomProfile?: ToMProfile;
+  communicationProtocol?: string;
 }
 
 export interface AgentInfo {
@@ -70,7 +77,7 @@ export interface AgentInfo {
 /**
  * Base Agent class - all agents should extend this
  */
-export abstract class BaseAgent {
+export abstract class BaseAgent implements AgentTraceReceiver {
   readonly id: string;
   readonly name: string;
   protected goal: string;
@@ -84,6 +91,7 @@ export abstract class BaseAgent {
   protected tomLevel: number;
   protected description?: string;
   protected tomProfile: ToMProfile;
+  protected communicationProtocol: string;
   protected state: AgentState = 'idle';
   protected usage: AgentUsage = {
     llmCalls: 0,
@@ -102,6 +110,8 @@ export abstract class BaseAgent {
   protected lastTask?: string;
   protected lastResult?: string;
   protected error?: string;
+  private systemTraces: MultiPartyTrace[] = [];
+  private communicationContext?: AgentCommunicationContext;
 
   constructor(config: AgentConfig) {
     this.id = config.id ?? (config.role === 'root' || !config.role ? 'root' : config.name);
@@ -119,6 +129,7 @@ export abstract class BaseAgent {
     const defaultProfile = this.createDefaultToMProfile();
     this.tomProfile = normalizeToMProfile(config.tomProfile, defaultProfile);
     this.tomLevel = this.tomProfile.level;
+    this.communicationProtocol = config.communicationProtocol ?? 'tom';
     this.shortTermMemory = memoryRegistry.getShortTerm(this.name, '');
     this.longTermMemory = memoryRegistry.getLongTerm(this.name);
   }
@@ -165,6 +176,7 @@ export abstract class BaseAgent {
       tomLevel: this.tomLevel,
       description: this.description,
       tomProfile: this.tomProfile,
+      communicationProtocol: this.communicationProtocol,
     };
   }
 
@@ -257,6 +269,63 @@ export abstract class BaseAgent {
    */
   setMessageQueue(queue: MessageQueue): void {
     this.messageQueue = queue;
+  }
+
+  /** Receive an observable runtime trace from any participant in the current system flow. */
+  receiveSystemTrace(trace: MultiPartyTrace): void {
+    const existingIndex = this.systemTraces.findIndex(item => item.id === trace.id);
+    if (existingIndex >= 0) this.systemTraces[existingIndex] = trace;
+    else this.systemTraces.push(trace);
+    if (this.systemTraces.length > 200) this.systemTraces = this.systemTraces.slice(-200);
+    this.updatedAt = Date.now();
+  }
+
+  receiveSystemTraces(traces: MultiPartyTrace[]): void {
+    for (const trace of traces) this.receiveSystemTrace(trace);
+  }
+
+  getSystemTraces(options: { correlationId?: string; limit?: number } = {}): MultiPartyTrace[] {
+    const filtered = options.correlationId
+      ? this.systemTraces.filter(trace => trace.correlationId === options.correlationId)
+      : this.systemTraces;
+    return filtered.slice(-Math.max(1, options.limit ?? 100)).map(trace => ({
+      ...trace,
+      from: { ...trace.from },
+      to: trace.to.map(actor => ({ ...actor })),
+      metadata: trace.metadata ? { ...trace.metadata } : undefined,
+    }));
+  }
+
+  receiveCommunicationContext(context: AgentCommunicationContext): void {
+    this.communicationContext = {
+      ...context,
+      traces: context.traces.map(trace => ({
+        ...trace,
+        from: { ...trace.from },
+        to: trace.to.map(actor => ({ ...actor })),
+      })),
+      metadata: context.metadata ? { ...context.metadata } : undefined,
+    };
+    this.receiveSystemTraces(context.traces);
+    this.updatedAt = Date.now();
+  }
+
+  getCommunicationContext(): AgentCommunicationContext | undefined {
+    if (!this.communicationContext) return undefined;
+    return {
+      ...this.communicationContext,
+      traces: this.getSystemTraces({
+        correlationId: this.communicationContext.correlationId,
+        limit: this.communicationContext.traces.length || 100,
+      }),
+      metadata: this.communicationContext.metadata ? { ...this.communicationContext.metadata } : undefined,
+    };
+  }
+
+  setCommunicationProtocol(protocolId: string): void {
+    if (!protocolId.trim()) throw new Error('Communication protocol id must not be empty');
+    this.communicationProtocol = protocolId;
+    this.updatedAt = Date.now();
   }
 
   /**
@@ -447,6 +516,15 @@ export abstract class BaseAgent {
       this.activeSessionId = undefined;
     }
     this.updatedAt = Date.now();
+    if (targetSessionId) {
+      this.systemTraces = this.systemTraces.filter(trace => trace.sessionId !== targetSessionId);
+      if (this.communicationContext?.traces.some(trace => trace.sessionId === targetSessionId)) {
+        this.communicationContext = undefined;
+      }
+    } else {
+      this.systemTraces = [];
+      this.communicationContext = undefined;
+    }
     logger.info(`Agent ${this.name} cleaned up${targetSessionId ? ` for session ${targetSessionId}` : ''}`);
   }
 }

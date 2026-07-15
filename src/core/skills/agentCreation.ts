@@ -34,6 +34,7 @@ export interface AgentComputeNodeRequest {
   tomProfileMode?: 'runtime_assignment' | 'definition_override';
   cognitiveGapIds?: string[];
   existenceReason?: string;
+  communicationProtocol?: string;
   reuse?: {
     mode?: AgentNodeReuseMode;
     agentPatternId?: string;
@@ -83,6 +84,7 @@ export interface AgentComputeNodeDefinition {
   };
   context: {
     memoryScope: AgentMemoryScope;
+    communicationProtocol: string;
   };
   resources: {
     budgetTokens?: number;

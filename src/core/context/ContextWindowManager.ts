@@ -1,4 +1,5 @@
 import type { AgentRole } from '../agent/BaseAgent.js';
+import type { MultiPartyTrace } from '../communication/index.js';
 import type { ConversationEntry, RootMemoryContext, WorkspaceMemoryManager } from '../memory/index.js';
 import type {
   ContextWindow,
@@ -49,6 +50,8 @@ export class ContextWindowManager {
       effectiveTurns
     );
     const parentContext = request.memoryScope.parentContext ? request.parentContext?.trim() ?? '' : '';
+    const communicationContext = request.communicationContext?.trim() ?? '';
+    const multiPartyTraceContext = this.compactSystemTraces(request.systemTraces ?? []);
 
     const bounded = this.fitToBudget({
       publicContext,
@@ -56,6 +59,8 @@ export class ContextWindowManager {
       sessionContext,
       parentContext,
       task: request.task,
+      communicationContext,
+      multiPartyTraceContext,
     });
 
     return {
@@ -66,6 +71,8 @@ export class ContextWindowManager {
         sessionWindow: this.estimateTokens(bounded.sessionContext),
         parentContext: this.estimateTokens(bounded.parentContext),
         task: this.estimateTokens(bounded.task),
+        communicationContext: this.estimateTokens(bounded.communicationContext),
+        multiPartyTraces: this.estimateTokens(bounded.multiPartyTraceContext),
         total: this.estimateTokens(Object.values(bounded).join('\n')),
       },
       sources: {
@@ -77,6 +84,8 @@ export class ContextWindowManager {
           : [],
         session: `.roy/sessions/${request.sessionId}.jsonl (last ${effectiveTurns} turns, compacted)`,
         parent: parentContext ? `approved context from ${request.agentId === 'root' ? 'runtime' : 'parent agent'}` : 'none',
+        communication: communicationContext ? 'runtime communication protocol context' : 'none',
+        traces: request.systemTraces?.length ? `${request.systemTraces.length} observable system trace(s)` : 'none',
       },
     };
   }
@@ -137,6 +146,8 @@ export class ContextWindowManager {
     sessionContext: string;
     parentContext: string;
     task: string;
+    communicationContext: string;
+    multiPartyTraceContext: string;
   }): typeof parts {
     const maxChars = Math.max(800, this.policy.maxContextTokens * 4);
     const taskReserve = Math.min(parts.task.length, Math.floor(maxChars * 0.25));
@@ -149,10 +160,12 @@ export class ContextWindowManager {
     };
 
     return {
-      publicContext: allocate(parts.publicContext, 0.32),
-      privateMemory: allocate(parts.privateMemory, 0.2),
-      sessionContext: allocate(parts.sessionContext, 0.3),
-      parentContext: allocate(parts.parentContext, 0.18),
+      publicContext: allocate(parts.publicContext, 0.24),
+      privateMemory: allocate(parts.privateMemory, 0.15),
+      communicationContext: allocate(parts.communicationContext, 0.16),
+      multiPartyTraceContext: allocate(parts.multiPartyTraceContext, 0.16),
+      sessionContext: allocate(parts.sessionContext, 0.18),
+      parentContext: allocate(parts.parentContext, 0.11),
       task: this.truncate(parts.task, taskReserve || maxChars),
     };
   }
@@ -178,6 +191,19 @@ export class ContextWindowManager {
   private estimateTokens(value: string): number {
     if (!value.trim()) return 0;
     return Math.max(1, Math.ceil(value.length / 4));
+  }
+
+  private compactSystemTraces(traces: MultiPartyTrace[]): string {
+    if (traces.length === 0) return '';
+    return [
+      '<multi_party_traces>',
+      ...traces.slice(-50).map(trace => {
+        const recipients = trace.to.map(actor => actor.id).join(', ') || 'none';
+        const content = trace.content ? `: ${this.truncate(trace.content.replace(/\s+/g, ' '), 320)}` : '';
+        return `- [${trace.phase}] ${trace.from.id} -> ${recipients} ${trace.kind}${content}`;
+      }),
+      '</multi_party_traces>',
+    ].join('\n');
   }
 }
 

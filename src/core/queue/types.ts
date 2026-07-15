@@ -59,6 +59,8 @@ export interface RuntimeMessage<TPayload = unknown> {
     retryCount?: number;
     maxRetries?: number;
     tags?: string[];
+    communicationProtocol?: string;
+    traceVisibility?: 'participants' | 'parent_chain' | 'team' | 'public';
   };
 }
 

@@ -22,6 +22,10 @@
       "types": "./dist/core/tom/index.d.ts",
       "import": "./dist/core/tom/index.js"
     },
+    "./communication": {
+      "types": "./dist/core/communication/index.d.ts",
+      "import": "./dist/core/communication/index.js"
+    },
     "./queue": {
       "types": "./dist/core/queue/index.d.ts",
       "import": "./dist/core/queue/index.js"

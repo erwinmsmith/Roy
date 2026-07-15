@@ -144,6 +144,7 @@ export interface AgentPatternInput {
   outputContract?: unknown;
   definitionFingerprint?: string;
   creationMode?: string;
+  communicationProtocol?: string;
 }
 
 export interface WorkspaceRuntimeConfig {
@@ -170,6 +171,12 @@ export interface WorkspaceRuntimeConfig {
     minimumCoverage: number;
     requireExistenceReason: boolean;
     higherOrderForMultiplePerspectives: boolean;
+  };
+  communication: {
+    defaultProtocol: string;
+    allowMessageOverride: boolean;
+    traceWindowSize: number;
+    includeCompletedMessages: boolean;
   };
   agents: {
     defaultToolsByArchetype: Record<string, string[]>;
@@ -424,7 +431,7 @@ Role-specific terms are recorded here.
 };
 
 const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
-  version: 2,
+  version: 3,
   traceEvents: true,
   memoryUpdates: 'suggest',
   delegation: {
@@ -447,6 +454,12 @@ const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
     minimumCoverage: 0.6,
     requireExistenceReason: true,
     higherOrderForMultiplePerspectives: true,
+  },
+  communication: {
+    defaultProtocol: 'tom',
+    allowMessageOverride: true,
+    traceWindowSize: 200,
+    includeCompletedMessages: true,
   },
   agents: {
     defaultToolsByArchetype: {
@@ -657,6 +670,10 @@ Keep this agent identity separate from the model provider identity.
 {{agent_identity}}
 
 {{tom_profile}}
+
+{{communication_context}}
+
+{{multi_party_traces}}
 
 {{public_context}}
 
@@ -1102,6 +1119,7 @@ Keep this agent identity separate from the model provider identity.
         definitionFingerprint: input.definitionFingerprint,
         creationMode: existing?.creationMode ?? input.creationMode,
         lastCreationMode: input.creationMode,
+        communicationProtocol: input.communicationProtocol ?? existing?.communicationProtocol ?? 'tom',
         basePatternId: input.basePatternId,
         status: input.status ?? existing?.status ?? 'candidate',
         usage: {
@@ -1632,6 +1650,8 @@ Keep this agent identity separate from the model provider identity.
         '{{agent_private_memory}}',
         '{{agent_identity}}',
         '{{tom_profile}}',
+        '{{communication_context}}',
+        '{{multi_party_traces}}',
         '{{available_skills}}',
         '{{available_tools}}',
         '{{parent_context}}',

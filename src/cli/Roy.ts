@@ -357,6 +357,10 @@ export class Roy {
         this.printToMState(parts[1]);
         break;
 
+      case '/communication':
+        this.handleCommunication(parts);
+        break;
+
       case '/team':
         await this.handleTeam(parts);
         break;
@@ -522,6 +526,9 @@ export class Roy {
       /agents archetypes  Show built-in archetype skills/tools
       /agents policy <id> Show spawn policy for an agent
       /tom [correlation-id] Show cognitive gaps and ToM profiles
+      /communication      Show registered agent communication protocols
+      /communication use <id> Select the default protocol
+      /communication traces [n] Show observable multi-party traces
       /spawn <type> "task" Spawn and run a controlled subagent
       /spawn <type> --parent <id> "task" Spawn below another agent
       /spawn custom --name <name> [--role <role>] [--style <style>] "task"
@@ -941,6 +948,43 @@ export class Roy {
     line('observes', profile.observesAgents);
     line('models', profile.modelsAgents.length > 0 ? profile.modelsAgents : profile.models.map(model => model.targetId));
     line('gaps', profile.cognitiveGaps);
+  }
+
+  private handleCommunication(parts: string[]): void {
+    if (parts[1] === 'use') {
+      const protocolId = parts[2];
+      if (!protocolId) {
+        console.log('\n  Usage: /communication use <protocol>\n');
+        return;
+      }
+      try {
+        runtime.setDefaultCommunicationProtocol(protocolId);
+        console.log(`\n  Communication protocol: ${this.cyan(protocolId)}\n`);
+      } catch (error) {
+        console.log(`\n  ${this.red(error instanceof Error ? error.message : String(error))}\n`);
+      }
+      return;
+    }
+    if (parts[1] === 'traces') {
+      const requested = Number(parts[2] ?? 20);
+      const traces = runtime.getCommunicationTraces({ limit: Number.isFinite(requested) ? requested : 20 });
+      console.log('\n  ' + this.bold('Multi-party Traces'));
+      if (traces.length === 0) console.log('    ' + this.dim('No traces'));
+      for (const trace of traces) {
+        console.log(`    [${trace.phase}] ${trace.from.id} -> ${trace.to.map(actor => actor.id).join(', ')} ${trace.kind} ${this.dim(`(${trace.protocolId})`)}`);
+      }
+      console.log('');
+      return;
+    }
+    const state = runtime.getCommunicationState();
+    console.log('\n  ' + this.bold('Agent Communication'));
+    console.log(`    Default:   ${this.cyan(state.defaultProtocol)}`);
+    console.log(`    Traces:    ${state.traces}`);
+    console.log('    Protocols:');
+    for (const protocol of state.registeredProtocols) {
+      console.log(`      - ${protocol.id} v${protocol.version}: ${protocol.description}`);
+    }
+    console.log('');
   }
 
   private printToMState(correlationId?: string): void {
@@ -1473,7 +1517,7 @@ export class Roy {
 
   private completer(line: string): [string[], string] {
     const commands = [
-      '/help', '/h', '/clear', '/cls', '/reset', '/agents', '/spawn', '/run', '/teams', '/team', '/tom', '/exit', '/quit', '/q',
+      '/help', '/h', '/clear', '/cls', '/reset', '/agents', '/spawn', '/run', '/teams', '/team', '/tom', '/communication', '/exit', '/quit', '/q',
       '/api', '/status', '/skills', '/actions', '/tools', '/memory', '/session',
       '/system', '/fsm', '/budget', '/events', '/queue', '/cache', '/messages', '/traces', '/config', '/prompt', '/context', '/conversation', '/verbose', '/color'
     ];
@@ -1505,6 +1549,7 @@ export class Roy {
     const customStyle = this.optionValue(parts, '--style');
     const tools = this.optionList(parts, '--tools');
     const skills = this.optionList(parts, '--skills');
+    const communicationProtocol = this.optionValue(parts, '--protocol');
     const task = this.trailingTask(parts, 2);
     const allowed = ['researcher', 'critic', 'planner', 'coder', 'summarizer', 'tester', 'custom'];
 
@@ -1523,6 +1568,7 @@ export class Roy {
         customStyle,
         tools,
         skills,
+        communicationProtocol,
         requireRootSynthesis: true,
         showSubagentOutput: !quiet,
       });
@@ -1611,6 +1657,7 @@ export class Roy {
     /spawn custom --name <agentName> [--role <role>] [--style <style>] "task"
     /spawn custom --name <agentName> [--tools fs.read,fs.list] [--skills use_tool_when_needed] "task"
     /spawn <archetype> --parent <agentId> "task"
+    /spawn <archetype> --protocol <tom|structured|extension-id> "task"
 
   Examples:
     /spawn researcher "Inspect the project structure"
@@ -1621,6 +1668,7 @@ export class Roy {
     - The first argument is an agent archetype, not an agent name.
     - Custom names must be passed with --name.
     - --tools and --skills are parent-approved bindings for the child agent.
+    - --protocol selects the message/trace interpretation protocol for the new runtime agent.
     - A cache hit reuses agent pattern/config, but still creates a new runtime agent instance.
 `);
   }
@@ -1638,7 +1686,7 @@ export class Roy {
   }
 
   private trailingTask(parts: string[], startIndex: number): string {
-    const optionsWithValues = new Set(['--parent', '--name', '--role', '--style', '--task', '--tools', '--skills']);
+    const optionsWithValues = new Set(['--parent', '--name', '--role', '--style', '--task', '--tools', '--skills', '--protocol']);
     const taskParts: string[] = [];
     for (let index = startIndex; index < parts.length; index += 1) {
       const part = parts[index];
