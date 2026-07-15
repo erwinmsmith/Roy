@@ -26,6 +26,10 @@
       "types": "./dist/core/communication/index.d.ts",
       "import": "./dist/core/communication/index.js"
     },
+    "./delegation": {
+      "types": "./dist/core/delegation/index.d.ts",
+      "import": "./dist/core/delegation/index.js"
+    },
     "./budget": {
       "types": "./dist/core/budget/index.d.ts",
       "import": "./dist/core/budget/index.js"

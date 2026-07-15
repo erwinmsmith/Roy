@@ -131,6 +131,8 @@ Delegation candidates are evaluated by replaceable scorers:
 
 Candidate generation and selection run through an explicit `propose -> evaluate -> select` pipeline. Evaluations are written to `.roy/cache/evolution-history.jsonl` for inspection and later reuse.
 
+The LLM scorer is also a metered control-plane call. Before scoring, the runtime either reserves a dedicated root allocation or reuses the active parent-agent allocation. The provider response is attributed to that parent actor, including reported thinking/cache tokens, and the allocation is settled or released on failure. Custom planners and scorer hooks are available through the `roy/delegation` package export.
+
 ## Context And Memory
 
 Roy initializes a project-local `.roy/` workspace:
@@ -213,6 +215,10 @@ Workspace policy is configured in `.roy/config.json`:
 ```
 
 `accountingDimension` can be `total_tokens`, `output_tokens`, or `thinking_tokens`. When a model does not report thinking tokens, thinking-based accounting falls back to total tokens rather than fabricating a reasoning count.
+
+The selected accounting dimension controls reservation consumption, overrun detection, remaining supply, and rebalancing. Each allocation still retains the full normalized model usage so input, output, total, thinking, and cache metrics remain inspectable independently of the market dimension.
+
+Under `total_tokens` accounting, Roy reserves completion capacity before each call and deterministically truncates oversized agent prompts, observations, communication context, and recursive synthesis input. Capability selection uses a separate compact control-plane prompt containing only the task and parent-approved capabilities, so tool routing does not duplicate the full agent memory/context charge.
 
 The runtime enforces:
 

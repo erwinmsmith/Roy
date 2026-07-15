@@ -29,6 +29,7 @@ export interface DelegationCandidate {
 
 export interface DelegationCandidateInput {
   parentId: string;
+  correlationId?: string;
   task: string;
   decision: DelegationDecision;
   allowedChildren: number;

@@ -179,8 +179,8 @@ export class BudgetMarket {
     });
     const changed: BudgetAllocation[] = [];
     let releasedTokens = 0;
-    for (const allocation of active) {
-      const decision = decisions.find(item => item.request.requesterId === allocation.request.requesterId && item.request.purpose === allocation.request.purpose);
+    for (const [index, allocation] of active.entries()) {
+      const decision = decisions[index];
       if (!decision) continue;
       const next = Math.max(allocation.consumedTokens, decision.allocatedTokens);
       if (next === allocation.allocatedTokens) continue;

@@ -1,4 +1,4 @@
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -94,6 +94,23 @@ describe('Phase 5 budget market', () => {
     );
   });
 
+  it('settles against the configured accounting dimension while retaining full model usage', () => {
+    const market = new BudgetMarket(() => 0, { mode: 'fixed', accountingDimension: 'thinking_tokens' });
+    market.configure(1000);
+    const allocation = market.request({
+      requesterId: 'reasoner-1', parentId: 'root', requestedTokens: 200, minimumTokens: 50,
+      purpose: 'reasoning allocation',
+    });
+    const settled = market.settle(allocation.id, {
+      promptTokens: 250, completionTokens: 200, totalTokens: 450,
+      inputTokens: 250, outputTokens: 200, thinkingTokens: 75,
+    });
+    expect(settled?.consumedTokens).toBe(75);
+    expect(settled?.usage?.totalTokens).toBe(450);
+    expect(settled?.usage?.thinkingTokens).toBe(75);
+    expect(market.getState().usedTokens).toBe(0);
+  });
+
   it('rebalances active allocations after the available session supply changes', () => {
     const market = new BudgetMarket(() => 0, { mode: 'market', minimumGrantTokens: 100 });
     market.configure(2000);
@@ -106,6 +123,21 @@ describe('Phase 5 budget market', () => {
     expect(result.changed.length).toBeGreaterThan(0);
     expect(result.reservedTokens).toBeLessThanOrEqual(1200);
     expect(market.getState().ledger.some(entry => entry.type === 'rebalanced')).toBe(true);
+  });
+
+  it('rebalances duplicate requester purposes by allocation order instead of conflating bids', () => {
+    const market = new BudgetMarket(() => 0, { mode: 'market', minimumGrantTokens: 100 });
+    market.configure(2000);
+    const allocations = market.requestMany([
+      { requesterId: 'same-agent', parentId: 'root', requestedTokens: 500, minimumTokens: 100, purpose: 'same-purpose' },
+      { requesterId: 'same-agent', parentId: 'root', requestedTokens: 1500, minimumTokens: 100, purpose: 'same-purpose' },
+    ]);
+    market.configure(1000);
+    market.rebalance();
+    const first = market.getAllocation(allocations[0].id);
+    const second = market.getAllocation(allocations[1].id);
+    expect(first?.allocatedTokens).not.toBe(second?.allocatedTokens);
+    expect((first?.allocatedTokens ?? 0) + (second?.allocatedTokens ?? 0)).toBeLessThanOrEqual(1000);
   });
 
   it('counts externally consumed runtime allocations without double-counting agent usage', () => {
@@ -161,6 +193,35 @@ describe('Phase 5 budget market', () => {
     expect(events).toEqual(expect.arrayContaining(['budget.requested', 'budget.allocated', 'budget.consumed', 'budget.settled']));
     expect(llm.lastMaxTokens).toBeGreaterThan(0);
     expect(llm.lastMaxTokens).toBeLessThanOrEqual(2400);
+    await runtime.shutdown();
+  });
+
+  it('uses thinking tokens for runtime supply and completion capacity when configured', async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), 'roy-thinking-budget-'));
+    const bootstrapRuntime = new Runtime();
+    await bootstrapRuntime.initialize({ sessionId: 'thinking-config-bootstrap', workspaceCwd: cwd, llmProvider: new MeteredLLM() });
+    await bootstrapRuntime.shutdown();
+
+    const configPath = path.join(cwd, '.roy', 'config.json');
+    const workspaceConfig = JSON.parse(await readFile(configPath, 'utf8')) as {
+      budgetMarket: { accountingDimension: string };
+    };
+    workspaceConfig.budgetMarket.accountingDimension = 'thinking_tokens';
+    await writeFile(configPath, `${JSON.stringify(workspaceConfig, null, 2)}\n`, 'utf8');
+
+    const runtime = new Runtime();
+    const llm = new MeteredLLM();
+    await runtime.initialize({ sessionId: 'thinking-budget-runtime', workspaceCwd: cwd, llmProvider: llm });
+    await runtime.handleUserTurn('Reply directly and briefly.');
+
+    const soloAllocation = runtime.getBudgetMarketState().allocations.find(
+      allocation => allocation.request.purpose === 'root.solo_reasoning'
+    );
+    expect(runtime.getBudgetMarketState().accountingDimension).toBe('thinking_tokens');
+    expect(soloAllocation?.consumedTokens).toBe(30);
+    expect(soloAllocation?.usage?.totalTokens).toBe(200);
+    expect(runtime.getBudgetMarketState().usedTokens).toBeGreaterThan(30);
+    expect(llm.lastMaxTokens).toBe(2400);
     await runtime.shutdown();
   });
 });

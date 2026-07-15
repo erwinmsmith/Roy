@@ -48,6 +48,8 @@ export interface AgentUsage {
   inputTokens?: number;
   outputTokens?: number;
   thinkingTokens?: number | null;
+  /** Thinking-budget consumption, including total-token fallback for calls without a reported thinking count. */
+  thinkingAccountingTokens?: number;
   cachedInputTokens?: number | null;
   cacheCreationInputTokens?: number | null;
 }
@@ -112,6 +114,7 @@ export abstract class BaseAgent implements AgentTraceReceiver {
     inputTokens: 0,
     outputTokens: 0,
     thinkingTokens: null,
+    thinkingAccountingTokens: 0,
     cachedInputTokens: null,
     cacheCreationInputTokens: null,
   };
@@ -129,6 +132,7 @@ export abstract class BaseAgent implements AgentTraceReceiver {
   private systemTraces: MultiPartyTrace[] = [];
   private communicationContext?: AgentCommunicationContext;
   private completionTokenLimit?: number;
+  private completionTokenAccountingDimension: 'total_tokens' | 'output_tokens' | 'thinking_tokens' = 'total_tokens';
 
   constructor(config: AgentConfig) {
     this.id = config.id ?? (config.role === 'root' || !config.role ? 'root' : config.name);
@@ -275,6 +279,8 @@ export abstract class BaseAgent implements AgentTraceReceiver {
     if (result.usage.thinkingTokens !== null && result.usage.thinkingTokens !== undefined) {
       this.usage.thinkingTokens = (this.usage.thinkingTokens ?? 0) + result.usage.thinkingTokens;
     }
+    this.usage.thinkingAccountingTokens = (this.usage.thinkingAccountingTokens ?? 0)
+      + (result.usage.thinkingTokens ?? result.usage.totalTokens);
     if (result.usage.cachedInputTokens !== null && result.usage.cachedInputTokens !== undefined) {
       this.usage.cachedInputTokens = (this.usage.cachedInputTokens ?? 0) + result.usage.cachedInputTokens;
     }
@@ -282,7 +288,12 @@ export abstract class BaseAgent implements AgentTraceReceiver {
       this.usage.cacheCreationInputTokens = (this.usage.cacheCreationInputTokens ?? 0) + result.usage.cacheCreationInputTokens;
     }
     if (this.completionTokenLimit !== undefined) {
-      this.completionTokenLimit = Math.max(1, this.completionTokenLimit - result.usage.totalTokens);
+      const consumedTokens = this.completionTokenAccountingDimension === 'output_tokens'
+        ? result.usage.outputTokens ?? result.usage.completionTokens
+        : this.completionTokenAccountingDimension === 'thinking_tokens'
+          ? result.usage.thinkingTokens ?? result.usage.totalTokens
+          : result.usage.totalTokens;
+      this.completionTokenLimit = Math.max(0, this.completionTokenLimit - consumedTokens);
     }
     this.updatedAt = Date.now();
   }
@@ -300,23 +311,43 @@ export abstract class BaseAgent implements AgentTraceReceiver {
     this.recordUsage(result);
   }
 
-  setCompletionTokenLimit(limit?: number): void {
-    this.completionTokenLimit = limit === undefined ? undefined : Math.max(1, Math.floor(limit));
+  setCompletionTokenLimit(
+    limit?: number,
+    accountingDimension: 'total_tokens' | 'output_tokens' | 'thinking_tokens' = 'total_tokens'
+  ): void {
+    this.completionTokenLimit = limit === undefined ? undefined : Math.max(0, Math.floor(limit));
+    this.completionTokenAccountingDimension = accountingDimension;
   }
 
-  protected completionOptions(options: LLMCompletionOptions = {}): LLMCompletionOptions {
+  getCompletionTokenLimit(): number | undefined {
+    return this.completionTokenLimit;
+  }
+
+  protected completionOptions(options: LLMCompletionOptions = {}, estimatedInputTokens = 0): LLMCompletionOptions {
     if (this.completionTokenLimit === undefined) return options;
+    const completionCapacity = this.completionTokenAccountingDimension === 'total_tokens'
+      ? this.completionTokenLimit - Math.max(0, estimatedInputTokens)
+      : this.completionTokenLimit;
+    if (completionCapacity <= 0) {
+      throw new Error(
+        `Agent ${this.name} has exhausted its active token allocation `
+        + `(dimension=${this.completionTokenAccountingDimension}, remaining=${this.completionTokenLimit}, estimatedInput=${estimatedInputTokens})`
+      );
+    }
     return {
       ...options,
       maxTokens: options.maxTokens === undefined
-        ? this.completionTokenLimit
-        : Math.min(options.maxTokens, this.completionTokenLimit),
+        ? completionCapacity
+        : Math.min(options.maxTokens, completionCapacity),
     };
   }
 
   protected async completeJSONWithAccounting<T>(messages: LLMMessage[], options: LLMCompletionOptions = {}): Promise<T> {
     if (!this.llm) throw new Error(`Agent ${this.name} has no LLM configured`);
-    const bounded = this.completionOptions(options);
+    const estimatedInputTokens = Math.ceil(
+      messages.map(message => `${message.role}:${message.content}`).join('\n').length / 4
+    );
+    const bounded = this.completionOptions(options, estimatedInputTokens);
     if (this.llm.completeJSONWithUsage) {
       const result = await this.llm.completeJSONWithUsage<T>(messages, bounded);
       this.recordUsage(result.completion);

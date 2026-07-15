@@ -1,4 +1,10 @@
-import type { LLMProvider } from '../llm/types.js';
+import type {
+  LLMCompletionOptions,
+  LLMCompletionResult,
+  LLMMessage,
+  LLMProvider,
+} from '../llm/types.js';
+import { tokenUsageRegistry } from '../llm/usage.js';
 import type {
   DelegationCandidate,
   DelegationCandidateInput,
@@ -106,15 +112,36 @@ interface LLMScoreResponse {
   scores?: Array<{ candidateId: string; score: number; reason?: string }>;
 }
 
+export interface LLMDelegationScorerInvocation {
+  options?: LLMCompletionOptions;
+  context?: unknown;
+  skip?: boolean;
+}
+
+export interface LLMDelegationScorerHooks {
+  before?: (
+    input: DelegationCandidateInput,
+    messages: LLMMessage[],
+    options: LLMCompletionOptions
+  ) => Promise<LLMDelegationScorerInvocation | undefined>;
+  after?: (
+    completion: LLMCompletionResult,
+    input: DelegationCandidateInput,
+    context?: unknown
+  ) => Promise<void> | void;
+  failed?: (error: unknown, input: DelegationCandidateInput, context?: unknown) => Promise<void> | void;
+}
+
 export class LLMDelegationScorer implements DelegationCandidateScorer {
   readonly name = 'llm';
 
-  constructor(private readonly llm: LLMProvider) {}
+  constructor(private readonly llm: LLMProvider, private readonly hooks: LLMDelegationScorerHooks = {}) {}
 
   async score(candidates: DelegationCandidate[], input: DelegationCandidateInput): Promise<Map<string, number>> {
     if (candidates.length === 0) return new Map();
+    let invocation: LLMDelegationScorerInvocation | undefined;
     try {
-      const response = await this.llm.completeJSON<LLMScoreResponse>([
+      const messages: LLMMessage[] = [
         {
           role: 'system',
           content: `You are Roy's delegation candidate evaluator. Score each candidate from 0 to 1 for task fit, role complementarity, grounding, recursive delegation safety, and expected value. Return strict JSON: {"scores":[{"candidateId":"...","score":0.0,"reason":"..."}]}`,
@@ -135,12 +162,41 @@ export class LLMDelegationScorer implements DelegationCandidateScorer {
             })),
           }),
         },
-      ], { temperature: 0, maxTokens: 700 });
+      ];
+      const baseOptions: LLMCompletionOptions = {
+        temperature: 0,
+        maxTokens: input.remainingBudgetTokens === undefined ? 700 : Math.max(1, Math.min(700, input.remainingBudgetTokens)),
+      };
+      invocation = await this.hooks.before?.(input, messages, baseOptions);
+      if (invocation?.skip) return new Map();
+      const options = { ...baseOptions, ...invocation?.options };
+      let response: LLMScoreResponse;
+      let completion: LLMCompletionResult;
+      if (this.llm.completeJSONWithUsage) {
+        const result = await this.llm.completeJSONWithUsage<LLMScoreResponse>(messages, options);
+        response = result.value;
+        completion = result.completion;
+      } else {
+        response = await this.llm.completeJSON<LLMScoreResponse>(messages, options);
+        const content = JSON.stringify(response);
+        completion = {
+          content,
+          usage: tokenUsageRegistry.normalize({
+            provider: this.llm.name,
+            model: this.llm.defaultModel,
+            messages,
+            output: content,
+          }),
+          model: this.llm.defaultModel,
+        };
+      }
+      await this.hooks.after?.(completion, input, invocation?.context);
       const scores = Array.isArray(response?.scores) ? response.scores : [];
       return new Map(scores
         .filter(item => candidates.some(candidate => candidate.id === item.candidateId) && Number.isFinite(item.score))
         .map(item => [item.candidateId, Math.max(0, Math.min(1, item.score))]));
-    } catch {
+    } catch (error) {
+      await this.hooks.failed?.(error, input, invocation?.context);
       return new Map();
     }
   }

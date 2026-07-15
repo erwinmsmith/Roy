@@ -9,6 +9,7 @@ export {
   LLMDelegationScorer,
   ToMDelegationScorer,
 } from './scorers.js';
+export type { LLMDelegationScorerHooks, LLMDelegationScorerInvocation } from './scorers.js';
 export type {
   DelegationCandidate,
   DelegationCandidateInput,

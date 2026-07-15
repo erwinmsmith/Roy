@@ -8,7 +8,14 @@ import { ToolApprovalManager } from '../src/core/tools/approval.js';
 import { InvalidTeamTransitionError, TeamRegistry } from '../src/core/team/index.js';
 import { DefaultDelegationCandidatePlanner } from '../src/core/delegation/index.js';
 import Runtime, { type DelegationDecision } from '../src/core/runtime/Runtime.js';
-import type { LLMCompletionOptions, LLMCompletionResult, LLMMessage, LLMProvider, LLMStreamChunk } from '../src/core/llm/types.js';
+import type {
+  LLMCompletionOptions,
+  LLMCompletionResult,
+  LLMJSONCompletionResult,
+  LLMMessage,
+  LLMProvider,
+  LLMStreamChunk,
+} from '../src/core/llm/types.js';
 
 class EngineeringLLM implements LLMProvider {
   readonly name = 'engineering-test';
@@ -53,6 +60,37 @@ class EngineeringLLM implements LLMProvider {
       return { action: 'solve_directly', reason: 'Complete the bounded child task directly.' } satisfies DelegationDecision as T;
     }
     return {} as T;
+  }
+
+  async completeJSONWithUsage<T>(messages: LLMMessage[]): Promise<LLMJSONCompletionResult<T>> {
+    const value = await this.completeJSON<T>(messages);
+    return {
+      value,
+      completion: {
+        content: JSON.stringify(value),
+        model: this.defaultModel,
+        usage: {
+          promptTokens: 7,
+          completionTokens: 4,
+          totalTokens: 13,
+          inputTokens: 7,
+          outputTokens: 4,
+          thinkingTokens: 2,
+          cachedInputTokens: 1,
+          cacheCreationInputTokens: 0,
+          provider: this.name,
+          model: this.defaultModel,
+          source: 'provider',
+          availability: {
+            input: 'reported',
+            output: 'reported',
+            thinking: 'reported',
+            cachedInput: 'reported',
+            cacheCreationInput: 'reported',
+          },
+        },
+      },
+    };
   }
 
   isConfigured(): boolean {
@@ -160,6 +198,19 @@ describe('Phase 2 engineering infrastructure', () => {
     expect(events).toContain('budget.granted');
     expect(events).toContain('budget.settled');
     expect(events).toContain('context.loaded');
+    const scorerAllocation = runtime.getBudgetMarketState().allocations.find(
+      allocation => allocation.request.purpose === 'delegation.candidate_scoring'
+    );
+    expect(scorerAllocation?.status).toBe('settled');
+    expect(scorerAllocation?.request.requesterId).toBe('root');
+    expect(scorerAllocation?.usage?.inputTokens).toBe(7);
+    expect(scorerAllocation?.usage?.outputTokens).toBe(4);
+    expect(scorerAllocation?.usage?.thinkingTokens).toBe(2);
+    expect(runtime.getEvents().some(event =>
+      event.type === 'agent.llm.called'
+      && event.agentId === 'root'
+      && event.data?.purpose === 'delegation.candidate_scoring'
+    )).toBe(true);
     const messages = await runtime.getMessages({ correlationId: result.correlationId });
     expect(messages.map(message => message.kind)).toContain('team.task');
     expect(messages.map(message => message.kind)).toContain('team.result');

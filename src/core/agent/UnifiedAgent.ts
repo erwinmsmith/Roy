@@ -235,9 +235,12 @@ export class UnifiedAgent extends BaseAgent {
    */
   private buildMessages(systemPrompt: string, observation: string): LLMMessage[] {
     const history = this.getHistory();
+    const priorHistory = history.at(-1)?.role === 'user' && history.at(-1)?.content === observation
+      ? history.slice(0, -1)
+      : history;
     return [
       { role: 'system', content: systemPrompt },
-      ...history,
+      ...priorHistory,
       { role: 'user', content: observation },
     ];
   }
@@ -251,14 +254,13 @@ export class UnifiedAgent extends BaseAgent {
       'calculate', 'create', 'update', 'delete', 'fetch', 'get me',
       'inspect', 'list', 'read', 'status', 'test', 'check',
     ];
-    const lowerObs = observation.toLowerCase();
+    const task = this.extractPrimaryTask(observation);
+    const lowerObs = task.toLowerCase();
 
     const hasActionIndicator = actionIndicators.some(ind => lowerObs.includes(ind));
-    const hasActions = actionRegistry.list().length > 0;
-    const hasTools = toolRegistry.list().length > 0;
-    const hasSkills = skillRegistry.list().length > 0;
+    const hasCapabilities = this.getCapabilityNames().length > 0;
 
-    return (hasActionIndicator && (hasActions || hasTools || hasSkills)) || this.mode === 'action';
+    return (hasActionIndicator && hasCapabilities) || this.mode === 'action';
   }
 
   /**
@@ -343,14 +345,15 @@ export class UnifiedAgent extends BaseAgent {
    */
   private async decideActionWithLLM(
     observation: string,
-    messages: LLMMessage[]
+    _messages: LLMMessage[]
   ): Promise<Plan | null> {
+    const task = this.extractPrimaryTask(observation);
     const prompt = `Based on the observation, choose the best action to execute.
 
 Available capabilities:
 ${this.formatCapabilitiesForPrompt()}
 
-Observation: ${observation}
+Observation: ${task}
 
 Return a JSON object with:
 - action: the name of the action, tool, or skill to execute (or "none" if no action needed)
@@ -363,7 +366,10 @@ Tool-use policy:
 - Do not call tools just to appear active.`;
 
     const decisionMessages: LLMMessage[] = [
-      ...messages.slice(0, 1),
+      {
+        role: 'system',
+        content: `You are the capability selector for ${this.name}. Choose only from the explicitly authorized capabilities below.`,
+      },
       { role: 'user', content: prompt },
     ];
 
@@ -372,7 +378,7 @@ Tool-use policy:
         action: string;
         params: Record<string, unknown>;
         reasoning?: string;
-      }>(decisionMessages);
+      }>(decisionMessages, { temperature: 0, maxTokens: 160 });
 
       if (response.action === 'none' || !response.action) {
         return null;
@@ -388,6 +394,12 @@ Tool-use policy:
       logger.error('LLM action decision error:', error);
       return null;
     }
+  }
+
+  private extractPrimaryTask(observation: string): string {
+    return observation
+      .split(/\n(?:Grounding context:|Grounding warnings:)|\n\n<system_communication_context/)[0]
+      .trim();
   }
 
   /**
@@ -498,7 +510,10 @@ Tool-use policy:
       let fullResponse = '';
       this.state = 'synthesizing';
 
-      for await (const chunk of this.llm!.stream(messages, this.completionOptions())) {
+      const estimatedInputTokens = Math.ceil(
+        messages.map(message => `${message.role}:${message.content}`).join('\n').length / 4
+      );
+      for await (const chunk of this.llm!.stream(messages, this.completionOptions({}, estimatedInputTokens))) {
         if (chunk.usage) {
           this.recordUsage(chunk);
         }

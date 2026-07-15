@@ -486,6 +486,11 @@ describe('Runtime controlled subagent spawning', () => {
     expect(eventTypes).toContain('delegation.plan.created');
     expect(eventTypes).toContain('delegation.completed');
     expect(eventTypes).toContain('agent.synthesis.completed');
+    expect(runtime.getEvents().some(event =>
+      event.type === 'budget.context.truncated'
+      && event.agentId === researcher.identity.id
+      && event.data?.purpose === 'agent.multi_child_synthesis'
+    )).toBe(true);
 
     await runtime.shutdown();
   });

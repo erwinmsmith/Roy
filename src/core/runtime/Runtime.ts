@@ -8,7 +8,9 @@ import { logger } from '../utils/logger.js';
 import { configureLogging, shutdownLogging } from '../logging/index.js';
 import {
   llmFactory,
+  tokenUsageRegistry,
   type LLMCompletionOptions,
+  type LLMCompletionResult,
   type LLMMessage,
   type LLMProvider,
   type ModelTokenUsage,
@@ -30,7 +32,12 @@ import type {
   AgentNodeCreationMode,
 } from '../skills/agentCreation.js';
 import { UseToolWhenNeededSkill } from '../skills/toolUse.js';
-import { DefaultDelegationCandidatePlanner, type DelegationCandidateSelection } from '../delegation/index.js';
+import {
+  DefaultDelegationCandidatePlanner,
+  type DelegationCandidateInput,
+  type DelegationCandidateSelection,
+  type LLMDelegationScorerInvocation,
+} from '../delegation/index.js';
 import {
   normalizeToMProfile,
   ToMDelegationPlanner,
@@ -135,6 +142,14 @@ export interface BudgetState {
   perAgent: Record<string, TokenUsage>;
   perTeam: Record<string, TokenUsage>;
   perTurn: TokenUsage[];
+}
+
+interface DelegationScorerBudgetContext {
+  parentId: string;
+  correlationId?: string;
+  usageBefore: AgentUsage;
+  allocation?: BudgetAllocation;
+  ownsAllocation: boolean;
 }
 
 export interface RuntimeEvent {
@@ -562,8 +577,13 @@ export class Runtime {
       enabledScorers: this.workspaceRuntimeConfig.delegation.candidateScoring.enabledScorers,
       minimumScore: this.workspaceRuntimeConfig.delegation.candidateScoring.minimumScore,
       minimumToMCoverage: this.workspaceRuntimeConfig.tom.minimumCoverage,
+      llmHooks: {
+        before: (input, messages, completionOptions) => this.beforeDelegationScorerCall(input, messages, completionOptions),
+        after: (completion, input, hookContext) => this.afterDelegationScorerCall(completion, input, hookContext),
+        failed: (_error, _input, hookContext) => this.releaseDelegationScorerBudget(hookContext),
+      },
     });
-    this.budgetMarket = new BudgetMarket(() => this.ctx ? this.getBudgetState().usedTokens : 0, {
+    this.budgetMarket = new BudgetMarket(() => this.ctx ? this.getAccountedRuntimeUsedTokens() : 0, {
       mode: this.workspaceRuntimeConfig.budgetMarket.mode,
       minimumGrantTokens: this.workspaceRuntimeConfig.budgetMarket.minimumGrantTokens,
       accountingDimension: this.workspaceRuntimeConfig.budgetMarket.accountingDimension,
@@ -926,6 +946,24 @@ export class Runtime {
   getBudgetMarketState(): BudgetMarketState {
     if (!this.budgetMarket) throw new Error('Budget market is not initialized');
     return this.budgetMarket.getState();
+  }
+
+  private getAccountedRuntimeUsedTokens(): number {
+    const budget = this.getBudgetState();
+    const dimension = this.workspaceRuntimeConfig?.budgetMarket.accountingDimension ?? 'total_tokens';
+    // Team tokenUsage includes member usage, which is already present in perAgent.
+    // Only team synthesis is an additional model call at this aggregation level.
+    const usage = [
+      ...Object.values(budget.perAgent),
+      ...this.teams.list().map(team => team.synthesisUsage),
+    ];
+    return usage.reduce((sum, item) => {
+      if (dimension === 'output_tokens') return sum + item.outputTokens;
+      if (dimension === 'thinking_tokens') {
+        return sum + (item.thinkingAccountingTokens ?? item.thinkingTokens ?? item.totalTokens);
+      }
+      return sum + item.totalTokens;
+    }, 0);
   }
 
   rebalanceBudgetMarket(): BudgetRebalanceResult {
@@ -2007,6 +2045,26 @@ export class Runtime {
     return allocation;
   }
 
+  private budgetAccountingDimension(): 'total_tokens' | 'output_tokens' | 'thinking_tokens' {
+    return this.workspaceRuntimeConfig?.budgetMarket.accountingDimension ?? 'total_tokens';
+  }
+
+  private budgetRequestTokens(inputTokens: number, completionTokens: number): number {
+    return this.budgetAccountingDimension() === 'total_tokens'
+      ? inputTokens + completionTokens
+      : completionTokens;
+  }
+
+  private budgetMinimumTokens(inputTokens: number): number {
+    return this.budgetAccountingDimension() === 'total_tokens' ? inputTokens + 1 : 1;
+  }
+
+  private completionCapacity(allocatedTokens: number, inputTokens: number): number {
+    return this.budgetAccountingDimension() === 'total_tokens'
+      ? Math.max(0, allocatedTokens - inputTokens)
+      : Math.max(0, allocatedTokens);
+  }
+
   private async requestTeamSynthesisBudget(input: {
     team: TeamRuntimeState;
     correlationId: string;
@@ -2015,11 +2073,8 @@ export class Runtime {
   }): Promise<BudgetAllocation | undefined> {
     if (this.workspaceRuntimeConfig?.budgetMarket.enabled === false) return undefined;
     if (!this.budgetMarket) throw new Error('Budget market is not initialized');
-    const requestedTokens = input.promptTokens + input.completionTokens;
-    const minimumTokens = Math.max(
-      input.promptTokens + 1,
-      this.workspaceRuntimeConfig?.budgetMarket.minimumGrantTokens ?? 256
-    );
+    const requestedTokens = this.budgetRequestTokens(input.promptTokens, input.completionTokens);
+    const minimumTokens = this.budgetMinimumTokens(input.promptTokens);
     const requestMessage = await this.enqueueMessage({
       kind: 'budget.request',
       sessionId: this.getContext().sessionId,
@@ -2101,7 +2156,7 @@ export class Runtime {
     correlationId: string
   ): void {
     if (!allocation || allocation.status !== 'granted' || !this.budgetMarket) return;
-    const actualTokens = typeof actual === 'number' ? actual : actual.totalTokens;
+    const modelTotalTokens = typeof actual === 'number' ? actual : actual.totalTokens;
     const settled = this.budgetMarket.settle(allocation.id, actual);
     if (!settled) return;
     this.emit({
@@ -2112,7 +2167,8 @@ export class Runtime {
         teamId,
         allocationId: allocation.id,
         grantedTokens: allocation.grantedTokens,
-        actualTokens,
+        actualTokens: settled.consumedTokens,
+        modelTotalTokens,
       },
     });
     this.emit({
@@ -2122,14 +2178,15 @@ export class Runtime {
       data: {
         teamId,
         allocationId: allocation.id,
-        consumedTokens: actualTokens,
+        consumedTokens: settled.consumedTokens,
+        modelTotalTokens,
         inputTokens: typeof actual === 'number' ? undefined : actual.inputTokens,
         outputTokens: typeof actual === 'number' ? undefined : actual.outputTokens,
         thinkingTokens: typeof actual === 'number' ? undefined : actual.thinkingTokens,
         utilization: settled.utilization,
       },
     });
-    if (actualTokens > allocation.grantedTokens) {
+    if (settled.status === 'exceeded') {
       this.emit({
         type: 'budget.overrun',
         agentId: teamId,
@@ -2138,14 +2195,15 @@ export class Runtime {
           teamId,
           allocationId: allocation.id,
           grantedTokens: allocation.grantedTokens,
-          actualTokens,
+          actualTokens: settled.consumedTokens,
+          modelTotalTokens,
         },
       });
       this.emit({
         type: 'budget.exceeded',
         agentId: teamId,
         correlationId,
-        data: { allocationId: allocation.id, allocatedTokens: allocation.allocatedTokens, consumedTokens: actualTokens },
+        data: { allocationId: allocation.id, allocatedTokens: allocation.allocatedTokens, consumedTokens: settled.consumedTokens, modelTotalTokens },
       });
     }
   }
@@ -2175,34 +2233,35 @@ export class Runtime {
     this.agentBudgetAllocations.delete(agentId);
     this.getContext().manager.getAgentById(agentId)?.setCompletionTokenLimit(undefined);
     if (allocation) {
-      const actualTokens = typeof actual === 'number' ? actual : actual.totalTokens;
+      const modelTotalTokens = typeof actual === 'number' ? actual : actual.totalTokens;
       this.emit({
         type: 'budget.settled',
         agentId,
-        data: { allocationId, grantedTokens: allocation.grantedTokens, actualTokens },
+        data: { allocationId, grantedTokens: allocation.grantedTokens, actualTokens: allocation.consumedTokens, modelTotalTokens },
       });
       this.emit({
         type: 'budget.consumed',
         agentId,
         data: {
           allocationId,
-          consumedTokens: actualTokens,
+          consumedTokens: allocation.consumedTokens,
+          modelTotalTokens,
           inputTokens: typeof actual === 'number' ? undefined : actual.inputTokens,
           outputTokens: typeof actual === 'number' ? undefined : actual.outputTokens,
           thinkingTokens: typeof actual === 'number' ? undefined : actual.thinkingTokens,
           utilization: allocation.utilization,
         },
       });
-      if (actualTokens > allocation.grantedTokens) {
+      if (allocation.status === 'exceeded') {
         this.emit({
           type: 'budget.overrun',
           agentId,
-          data: { allocationId, grantedTokens: allocation.grantedTokens, actualTokens },
+          data: { allocationId, grantedTokens: allocation.grantedTokens, actualTokens: allocation.consumedTokens, modelTotalTokens },
         });
         this.emit({
           type: 'budget.exceeded',
           agentId,
-          data: { allocationId, allocatedTokens: allocation.allocatedTokens, consumedTokens: actualTokens },
+          data: { allocationId, allocatedTokens: allocation.allocatedTokens, consumedTokens: allocation.consumedTokens, modelTotalTokens },
         });
       }
     }
@@ -2218,7 +2277,8 @@ export class Runtime {
       correlationId,
       data: {
         allocationId: allocation.id,
-        consumedTokens: usage.totalTokens,
+        consumedTokens: settled.consumedTokens,
+        modelTotalTokens: usage.totalTokens,
         inputTokens: usage.inputTokens,
         outputTokens: usage.outputTokens,
         thinkingTokens: usage.thinkingTokens,
@@ -2230,7 +2290,12 @@ export class Runtime {
       type: 'budget.settled',
       agentId,
       correlationId,
-      data: { allocationId: allocation.id, allocatedTokens: allocation.allocatedTokens, actualTokens: usage.totalTokens },
+      data: {
+        allocationId: allocation.id,
+        allocatedTokens: allocation.allocatedTokens,
+        actualTokens: settled.consumedTokens,
+        modelTotalTokens: usage.totalTokens,
+      },
     });
     if (settled.status === 'exceeded') {
       this.emit({
@@ -2243,7 +2308,56 @@ export class Runtime {
         type: 'budget.overrun',
         agentId,
         correlationId,
-        data: { allocationId: allocation.id, grantedTokens: allocation.grantedTokens, actualTokens: usage.totalTokens },
+        data: {
+          allocationId: allocation.id,
+          grantedTokens: allocation.grantedTokens,
+          actualTokens: settled.consumedTokens,
+          modelTotalTokens: usage.totalTokens,
+        },
+      });
+    }
+  }
+
+  private consumeActiveAgentBudget(
+    agentId: string,
+    usage: TokenUsage,
+    correlationId?: string,
+    purpose?: string
+  ): void {
+    const allocationId = this.agentBudgetAllocations.get(agentId);
+    if (!allocationId || !this.budgetMarket) return;
+    const before = this.budgetMarket.getAllocation(allocationId);
+    const consumed = this.budgetMarket.consume(allocationId, usage);
+    if (!consumed) return;
+    const consumedDelta = Math.max(0, consumed.consumedTokens - (before?.consumedTokens ?? 0));
+    this.emit({
+      type: 'budget.consumed',
+      agentId,
+      correlationId,
+      data: {
+        allocationId,
+        purpose,
+        consumedTokens: consumedDelta,
+        cumulativeConsumedTokens: consumed.consumedTokens,
+        modelTotalTokens: usage.totalTokens,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        thinkingTokens: usage.thinkingTokens,
+        utilization: consumed.utilization,
+      },
+    });
+    if (consumed.status === 'exceeded') {
+      this.emit({
+        type: 'budget.exceeded',
+        agentId,
+        correlationId,
+        data: {
+          allocationId,
+          purpose,
+          allocatedTokens: consumed.allocatedTokens,
+          consumedTokens: consumed.consumedTokens,
+          modelTotalTokens: usage.totalTokens,
+        },
       });
     }
   }
@@ -3912,7 +4026,7 @@ export class Runtime {
       parentContext: `Parent agent ${parentIdentity.name} (${parentIdentity.id}) spawned this agent for: ${spec.description}`,
       memoryScope,
     });
-    const goal = this.buildAgentPromptFromMemory({
+    let goal = this.buildAgentPromptFromMemory({
       name,
       role: spec.customRole ?? spec.archetype,
       parentName: parentIdentity.name,
@@ -3942,6 +4056,30 @@ export class Runtime {
         availableTools: toolBindings.map((binding) => binding.name),
         parentContext: contextWindow.parentContext,
       });
+      const originalRenderedPromptTokens = this.estimateTextTokens(goal);
+      if (budgetAllocation?.status === 'granted' && this.budgetAccountingDimension() === 'total_tokens') {
+        const outputReserve = Math.min(512, Math.max(128, Math.floor(budgetAllocation.allocatedTokens * 0.2)));
+        const executionOverhead = Math.min(512, Math.max(128, Math.floor(budgetAllocation.allocatedTokens * 0.15)));
+        const promptBudget = Math.max(64, budgetAllocation.allocatedTokens - outputReserve - executionOverhead);
+        if (originalRenderedPromptTokens > promptBudget) {
+          goal = this.truncateTextToTokenBudget(goal, promptBudget);
+          this.emit({
+            type: 'budget.context.truncated',
+            agentId: id,
+            sessionId: ctx.sessionId,
+            correlationId: creationCorrelationId,
+            nodeId: spec.nodeDefinition?.nodeId,
+            data: {
+              purpose: 'agent.system_prompt',
+              contextType: 'rendered_agent_prompt',
+              originalTokens: originalRenderedPromptTokens,
+              allowedTokens: promptBudget,
+              outputReserve,
+              executionOverhead,
+            },
+          });
+        }
+      }
       const renderedPromptTokens = this.estimateTextTokens(goal);
     const definitionText = [
       name,
@@ -4271,7 +4409,7 @@ export class Runtime {
 
     const activeAllocationId = this.agentBudgetAllocations.get(agentId);
     const activeAllocation = activeAllocationId ? this.budgetMarket?.getAllocation(activeAllocationId) : undefined;
-    agent.setCompletionTokenLimit(activeAllocation?.allocatedTokens);
+    agent.setCompletionTokenLimit(activeAllocation?.allocatedTokens, this.budgetAccountingDimension());
 
     const session = ctx.manager.getSession(ctx.sessionId);
     if (session) {
@@ -4336,12 +4474,18 @@ export class Runtime {
       await this.transitionAgentFsm(agentId, 'S_reasoning', { task, correlationId: options.correlationId });
       this.emit({ type: 'agent.llm.called', agentId, data: { task } });
       const communicationContext = agent.getCommunicationContext();
-      const observation = [
+      const rawObservation = [
         this.buildGroundedTask(task, grounding),
         communicationContext
           ? `<system_communication_context protocol="${communicationContext.protocolId}">\n${communicationContext.rendered}\n</system_communication_context>`
           : '',
       ].filter(Boolean).join('\n\n');
+      const observation = this.constrainAgentObservation(
+        agent,
+        rawObservation,
+        options.correlationId,
+        'agent.task_execution'
+      );
       await agent.step(observation);
       const stepError = agent.getInfo().error;
       if (stepError) {
@@ -4477,6 +4621,11 @@ export class Runtime {
       inputTokens: (after.inputTokens ?? after.promptTokens) - (before.inputTokens ?? before.promptTokens),
       outputTokens: (after.outputTokens ?? after.completionTokens) - (before.outputTokens ?? before.completionTokens),
       thinkingTokens: nullableDelta(before.thinkingTokens, after.thinkingTokens),
+      thinkingAccountingTokens: Math.max(
+        0,
+        (after.thinkingAccountingTokens ?? after.thinkingTokens ?? after.totalTokens)
+          - (before.thinkingAccountingTokens ?? before.thinkingTokens ?? before.totalTokens)
+      ),
       cachedInputTokens: nullableDelta(before.cachedInputTokens, after.cachedInputTokens),
       cacheCreationInputTokens: nullableDelta(before.cacheCreationInputTokens, after.cacheCreationInputTokens),
     });
@@ -4724,6 +4873,7 @@ export class Runtime {
     ]);
     const selection = await this.requireCandidatePlanner().select({
       parentId,
+      correlationId,
       task,
       decision: enrichedDecision,
       allowedChildren: policy ? Math.max(0, policy.allowedChildren - policy.currentChildren) : 0,
@@ -4752,6 +4902,156 @@ export class Runtime {
       });
     }
     return selection.decision;
+  }
+
+  private async beforeDelegationScorerCall(
+    input: DelegationCandidateInput,
+    messages: LLMMessage[],
+    options: LLMCompletionOptions
+  ): Promise<LLMDelegationScorerInvocation> {
+    const parent = this.getContext().manager.getAgentById(input.parentId);
+    if (!parent) return { skip: true };
+
+    const estimatedInputTokens = this.estimateTextTokens(
+      messages.map(message => `${message.role}:${message.content}`).join('\n')
+    );
+    const activeAllocationId = this.agentBudgetAllocations.get(parent.id);
+    const activeAllocation = activeAllocationId
+      ? this.budgetMarket?.getAllocation(activeAllocationId)
+      : undefined;
+    const ownsAllocation = !activeAllocation || activeAllocation.status !== 'granted';
+    const allocation = ownsAllocation
+      ? await this.requestAgentBudget({
+        parentId: parent.getIdentity().parentId ?? parent.id,
+        requesterId: parent.id,
+        archetype: parent.id === 'root' ? 'custom' : this.inferAgentArchetype(parent.getInfo()),
+        correlationId: input.correlationId,
+        requestedTokens: this.budgetRequestTokens(estimatedInputTokens, options.maxTokens ?? 700),
+        minimumTokens: this.budgetMinimumTokens(estimatedInputTokens),
+        priority: 'high',
+        expectedUtility: 0.84,
+        purpose: 'delegation.candidate_scoring',
+      })
+      : activeAllocation;
+
+    if (allocation?.status === 'denied') {
+      this.emit({
+        type: 'delegation.candidate.scoring.skipped',
+        agentId: parent.id,
+        correlationId: input.correlationId,
+        data: { reason: 'budget_request_denied', allocationId: allocation.id },
+      });
+      return { skip: true };
+    }
+
+    const allocationRemaining = allocation?.status === 'granted'
+      ? Math.max(0, allocation.allocatedTokens - allocation.consumedTokens)
+      : undefined;
+    const agentRemaining = parent.getCompletionTokenLimit();
+    const availableTokens = [allocationRemaining, agentRemaining]
+      .filter((value): value is number => value !== undefined)
+      .reduce<number | undefined>((minimum, value) => minimum === undefined ? value : Math.min(minimum, value), undefined);
+    if (availableTokens !== undefined && availableTokens <= 0) {
+      if (ownsAllocation && allocation?.status === 'granted') {
+        this.budgetMarket?.release(allocation.id, 'delegation_scorer_allocation_exhausted');
+      }
+      this.emit({
+        type: 'delegation.candidate.scoring.skipped',
+        agentId: parent.id,
+        correlationId: input.correlationId,
+        data: { reason: 'allocation_exhausted', availableTokens },
+      });
+      return { skip: true };
+    }
+    if (this.budgetAccountingDimension() === 'total_tokens'
+      && availableTokens !== undefined
+      && availableTokens <= estimatedInputTokens) {
+      if (ownsAllocation && allocation?.status === 'granted') {
+        this.budgetMarket?.release(allocation.id, 'delegation_scorer_input_exceeds_allocation');
+      }
+      this.emit({
+        type: 'delegation.candidate.scoring.skipped',
+        agentId: parent.id,
+        correlationId: input.correlationId,
+        data: { reason: 'insufficient_tokens_for_input', estimatedInputTokens, availableTokens },
+      });
+      return { skip: true };
+    }
+
+    const maxTokens = availableTokens === undefined
+      ? options.maxTokens
+      : Math.max(1, Math.min(
+        options.maxTokens ?? 700,
+        this.completionCapacity(availableTokens, estimatedInputTokens)
+      ));
+    return {
+      options: { ...options, maxTokens },
+      context: {
+        parentId: parent.id,
+        correlationId: input.correlationId,
+        usageBefore: parent.getUsage(),
+        allocation,
+        ownsAllocation,
+      } satisfies DelegationScorerBudgetContext,
+    };
+  }
+
+  private afterDelegationScorerCall(
+    completion: LLMCompletionResult,
+    input: DelegationCandidateInput,
+    hookContext?: unknown
+  ): void {
+    const context = hookContext as DelegationScorerBudgetContext | undefined;
+    if (!context) return;
+    const parent = this.getContext().manager.getAgentById(context.parentId);
+    if (!parent) {
+      this.releaseDelegationScorerBudget(context);
+      return;
+    }
+
+    parent.recordRuntimeUsage(completion);
+    const usage = this.usageDifference(context.usageBefore, parent.getUsage());
+    if (context.ownsAllocation) {
+      this.settleDirectBudget(parent.id, context.allocation, usage, context.correlationId);
+    } else {
+      this.consumeActiveAgentBudget(parent.id, usage, context.correlationId, 'delegation.candidate_scoring');
+    }
+    if (parent.id === 'root') this.recordTurnUsage(usage);
+    this.emit({
+      type: 'agent.llm.called',
+      agentId: parent.id,
+      correlationId: context.correlationId,
+      data: {
+        purpose: 'delegation.candidate_scoring',
+        provider: this.getContext().llm?.name,
+        model: completion.model ?? this.getContext().llm?.defaultModel,
+        source: completion.usage?.source ?? 'estimated',
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        thinkingTokens: usage.thinkingTokens,
+        totalTokens: usage.totalTokens,
+      },
+    });
+    this.emit({
+      type: 'budget.updated',
+      agentId: parent.id,
+      correlationId: input.correlationId,
+      data: { purpose: 'delegation.candidate_scoring', ...usage },
+    });
+  }
+
+  private releaseDelegationScorerBudget(hookContext?: unknown): void {
+    const context = hookContext as DelegationScorerBudgetContext | undefined;
+    if (!context?.ownsAllocation || context.allocation?.status !== 'granted' || !this.budgetMarket) return;
+    const released = this.budgetMarket.release(context.allocation.id, 'delegation_candidate_scoring_failed');
+    if (released) {
+      this.emit({
+        type: 'budget.released',
+        agentId: context.parentId,
+        correlationId: context.correlationId,
+        data: { allocationId: context.allocation.id, reason: 'delegation_candidate_scoring_failed' },
+      });
+    }
   }
 
   private emitDelegationCandidateEvents(
@@ -5336,7 +5636,7 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     ].join('\n');
     let effectivePrompt = prompt;
     const availableTokens = this.budgetMarket?.getState().availableTokens;
-    if (availableTokens !== undefined) {
+    if (availableTokens !== undefined && this.budgetAccountingDimension() === 'total_tokens') {
       const outputReserve = Math.min(512, Math.max(64, Math.floor(availableTokens * 0.2)));
       const systemEstimate = this.estimateTextTokens(systemContent);
       const promptBudget = Math.max(0, availableTokens - outputReserve - systemEstimate);
@@ -5364,10 +5664,10 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
       archetype: 'custom',
       correlationId,
       requestedTokens: Math.max(
-        estimatedInputTokens + 512,
+        this.budgetRequestTokens(estimatedInputTokens, 512),
         this.workspaceRuntimeConfig?.budgetMarket.defaultRequestsByArchetype.root ?? 2400
       ),
-      minimumTokens: estimatedInputTokens + 1,
+      minimumTokens: this.budgetMinimumTokens(estimatedInputTokens),
       priority: purpose.includes('synthesis') ? 'high' : 'medium',
       expectedUtility: purpose.includes('synthesis') ? 0.9 : 0.78,
       purpose,
@@ -5378,7 +5678,7 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     let usageChunk: { usage?: ModelTokenUsage } | undefined;
     try {
       const maxTokens = allocation?.status === 'granted'
-        ? Math.max(1, allocation.allocatedTokens - estimatedInputTokens)
+        ? Math.max(1, this.completionCapacity(allocation.allocatedTokens, estimatedInputTokens))
         : undefined;
       for await (const chunk of ctx.llm.stream([...messages], { temperature: 0.2, maxTokens })) {
         if (chunk.content) chunks.push(chunk.content);
@@ -5391,11 +5691,7 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     const content = chunks.join('');
     ctx.agent.recordRuntimeCompletion(content, {
       content,
-      usage: usageChunk?.usage ?? {
-        promptTokens: this.estimateTextTokens(effectivePrompt),
-        completionTokens: this.estimateTextTokens(content),
-        totalTokens: this.estimateTextTokens(effectivePrompt) + this.estimateTextTokens(content),
-      },
+      usage: usageChunk?.usage ?? this.estimateModelUsage(messages, content),
     });
     this.settleDirectBudget('root', allocation, this.usageDifference(usageBefore, ctx.agent.getUsage()), correlationId);
     return content;
@@ -5419,8 +5715,8 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
         requesterId: agent.id,
         archetype: agent.id === 'root' ? 'custom' : this.inferAgentArchetype(agent.getInfo()),
         correlationId,
-        requestedTokens: estimatedInput + (options.maxTokens ?? 512),
-        minimumTokens: estimatedInput + 1,
+        requestedTokens: this.budgetRequestTokens(estimatedInput, options.maxTokens ?? 512),
+        minimumTokens: this.budgetMinimumTokens(estimatedInput),
         priority: purpose.includes('delegation') ? 'high' : 'medium',
         expectedUtility: 0.82,
         purpose,
@@ -5428,41 +5724,63 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
       : undefined;
     if (allocation?.status === 'denied') throw new Error(`JSON completion rejected by budget market: ${allocation.reason}`);
 
+    const activeAllocationId = this.agentBudgetAllocations.get(agent.id);
+    const activeAllocation = activeAllocationId ? this.budgetMarket?.getAllocation(activeAllocationId) : undefined;
+    const effectiveAllocation = allocation ?? activeAllocation;
+    const allocationRemaining = effectiveAllocation?.status === 'granted'
+      ? Math.max(0, effectiveAllocation.allocatedTokens - effectiveAllocation.consumedTokens)
+      : undefined;
+    const agentRemaining = agent.getCompletionTokenLimit();
+    const availableTokens = [allocationRemaining, agentRemaining]
+      .filter((value): value is number => value !== undefined)
+      .reduce<number | undefined>(
+        (minimum, value) => minimum === undefined ? value : Math.min(minimum, value),
+        undefined
+      );
+    if (availableTokens !== undefined && availableTokens <= 0) {
+      if (ownsAllocation && allocation?.status === 'granted') {
+        this.budgetMarket?.release(allocation.id, 'json_completion_allocation_exhausted');
+      }
+      throw new Error('JSON completion rejected: active allocation is exhausted');
+    }
+    if (this.budgetAccountingDimension() === 'total_tokens'
+      && availableTokens !== undefined
+      && availableTokens <= estimatedInput) {
+      if (ownsAllocation && allocation?.status === 'granted') {
+        this.budgetMarket?.release(allocation.id, 'json_completion_input_exceeds_allocation');
+      }
+      throw new Error(`JSON completion rejected: estimated input ${estimatedInput} exceeds remaining allocation ${availableTokens}`);
+    }
+    const boundedOptions: LLMCompletionOptions = {
+      ...options,
+      maxTokens: availableTokens === undefined
+        ? options.maxTokens
+        : Math.max(1, Math.min(
+          options.maxTokens ?? availableTokens,
+          this.completionCapacity(availableTokens, estimatedInput)
+        )),
+    };
+
     try {
       let value: T;
       if (ctx.llm.completeJSONWithUsage) {
-        const result = await ctx.llm.completeJSONWithUsage<T>(messages, options);
+        const result = await ctx.llm.completeJSONWithUsage<T>(messages, boundedOptions);
         value = result.value;
         agent.recordRuntimeUsage(result.completion);
       } else {
-        value = await ctx.llm.completeJSON<T>(messages, options);
+        value = await ctx.llm.completeJSON<T>(messages, boundedOptions);
         const output = JSON.stringify(value);
         agent.recordRuntimeUsage({
           content: output,
-          usage: {
-            promptTokens: estimatedInput,
-            completionTokens: this.estimateTextTokens(output),
-            totalTokens: estimatedInput + this.estimateTextTokens(output),
-            inputTokens: estimatedInput,
-            outputTokens: this.estimateTextTokens(output),
-            thinkingTokens: null,
-            cachedInputTokens: null,
-            cacheCreationInputTokens: null,
-            provider: ctx.llm.name,
-            model: ctx.llm.defaultModel,
-            source: 'estimated',
-            availability: {
-              input: 'estimated',
-              output: 'estimated',
-              thinking: 'unavailable',
-              cachedInput: 'unavailable',
-              cacheCreationInput: 'unavailable',
-            },
-          },
+          usage: this.estimateModelUsage(messages, output),
         });
       }
       const usage = this.usageDifference(usageBefore, agent.getUsage());
-      if (ownsAllocation) this.settleDirectBudget(agent.id, allocation, usage, correlationId);
+      if (ownsAllocation) {
+        this.settleDirectBudget(agent.id, allocation, usage, correlationId);
+      } else {
+        this.consumeActiveAgentBudget(agent.id, usage, correlationId, purpose);
+      }
       if (agent.id === 'root') {
         this.recordTurnUsage(usage);
         this.emit({ type: 'budget.updated', agentId: agent.id, correlationId, data: { purpose, ...usage } });
@@ -5594,6 +5912,7 @@ Produce the final response to the user as Roy, the root agent.`;
       thinkingTokens: total.thinkingTokens === null && item.thinkingTokens === null
         ? null
         : Number(total.thinkingTokens ?? 0) + Number(item.thinkingTokens ?? 0),
+      thinkingAccountingTokens: (total.thinkingAccountingTokens ?? 0) + (item.thinkingAccountingTokens ?? item.thinkingTokens ?? item.totalTokens),
       cachedInputTokens: total.cachedInputTokens === null && item.cachedInputTokens === null
         ? null
         : Number(total.cachedInputTokens ?? 0) + Number(item.cachedInputTokens ?? 0),
@@ -5608,6 +5927,7 @@ Produce the final response to the user as Roy, the root agent.`;
       inputTokens: 0,
       outputTokens: 0,
       thinkingTokens: null,
+      thinkingAccountingTokens: 0,
       cachedInputTokens: null,
       cacheCreationInputTokens: null,
     });
@@ -5626,6 +5946,11 @@ Produce the final response to the user as Roy, the root agent.`;
       inputTokens: Math.max(0, after.inputTokens - before.inputTokens),
       outputTokens: Math.max(0, after.outputTokens - before.outputTokens),
       thinkingTokens,
+      thinkingAccountingTokens: Math.max(
+        0,
+        (after.thinkingAccountingTokens ?? after.thinkingTokens ?? after.totalTokens)
+          - (before.thinkingAccountingTokens ?? before.thinkingTokens ?? before.totalTokens)
+      ),
       cachedInputTokens: after.cachedInputTokens === null && before.cachedInputTokens === null
         ? null
         : Math.max(0, Number(after.cachedInputTokens ?? 0) - Number(before.cachedInputTokens ?? 0)),
@@ -6233,7 +6558,7 @@ Produce the final response to the user as Roy, the root agent.`;
       throw new Error(`Team synthesis rejected: ${allocation.reason}`);
     }
     const maxCompletionTokens = allocation
-      ? Math.max(1, allocation.grantedTokens - estimatedPromptTokens)
+      ? Math.max(1, this.completionCapacity(allocation.grantedTokens, estimatedPromptTokens))
       : 1024;
     const chunks: string[] = [];
     let providerUsage: ModelTokenUsage | undefined;
@@ -6250,17 +6575,20 @@ Produce the final response to the user as Roy, the root agent.`;
       throw error;
     }
     const content = chunks.join('');
+    const normalizedUsage = providerUsage ?? this.estimateModelUsage([
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: prompt },
+    ], content);
     const usage = this.toTokenUsage({
       llmCalls: 1,
-      promptTokens: providerUsage?.promptTokens ?? estimatedPromptTokens,
-      completionTokens: providerUsage?.completionTokens ?? this.estimateTextTokens(content),
-      totalTokens: providerUsage?.totalTokens
-        ?? estimatedPromptTokens + this.estimateTextTokens(content),
-      inputTokens: providerUsage?.inputTokens ?? providerUsage?.promptTokens ?? estimatedPromptTokens,
-      outputTokens: providerUsage?.outputTokens ?? providerUsage?.completionTokens ?? this.estimateTextTokens(content),
-      thinkingTokens: providerUsage?.thinkingTokens ?? null,
-      cachedInputTokens: providerUsage?.cachedInputTokens ?? null,
-      cacheCreationInputTokens: providerUsage?.cacheCreationInputTokens ?? null,
+      promptTokens: normalizedUsage.promptTokens,
+      completionTokens: normalizedUsage.completionTokens,
+      totalTokens: normalizedUsage.totalTokens,
+      inputTokens: normalizedUsage.inputTokens ?? normalizedUsage.promptTokens,
+      outputTokens: normalizedUsage.outputTokens ?? normalizedUsage.completionTokens,
+      thinkingTokens: normalizedUsage.thinkingTokens ?? null,
+      cachedInputTokens: normalizedUsage.cachedInputTokens ?? null,
+      cacheCreationInputTokens: normalizedUsage.cacheCreationInputTokens ?? null,
     });
     this.settleTeamSynthesisBudget(team.identity.id, allocation, usage, correlationId);
     this.recordTurnUsage(usage);
@@ -6292,33 +6620,102 @@ Produce the final response to the user as Roy, the root agent.`;
       return message;
     }
 
-    const messages = [
-      {
-        role: 'system',
-        content: [
-          `You are ${agent.name}, a runtime agent in the Roy autonomous agent system.`,
-          'You are not the model provider. The provider is only your inference backend.',
-          `Purpose: ${purpose}.`,
-          `Correlation: ${correlationId}.`,
-          agent.getCommunicationContext()?.rendered,
-        ].join('\n'),
-      },
-      { role: 'user', content: prompt },
-    ] as const;
+    const remainingTokens = agent.getCompletionTokenLimit();
+    if (remainingTokens !== undefined && remainingTokens <= 0) {
+      this.emit({
+        type: 'budget.exceeded',
+        agentId: agent.id,
+        correlationId,
+        data: { purpose, remainingTokens, reason: 'agent_allocation_exhausted' },
+      });
+      throw new Error('Agent completion rejected: active allocation is exhausted');
+    }
+    const systemBase = [
+      `You are ${agent.name}, a runtime agent in the Roy autonomous agent system.`,
+      'You are not the model provider. The provider is only your inference backend.',
+      `Purpose: ${purpose}.`,
+      `Correlation: ${correlationId}.`,
+    ].join('\n');
+    let communicationContext = agent.getCommunicationContext()?.rendered ?? '';
+    let effectivePrompt = prompt;
+    if (remainingTokens !== undefined && this.budgetAccountingDimension() === 'total_tokens') {
+      const outputReserve = Math.min(512, Math.max(64, Math.floor(remainingTokens * 0.2)));
+      const inputBudget = Math.max(0, remainingTokens - outputReserve);
+      const baseSystemTokens = this.estimateTextTokens(`system:${systemBase}`);
+      const communicationTokens = communicationContext
+        ? this.estimateTextTokens(communicationContext)
+        : 0;
+      const communicationBudget = Math.max(0, Math.min(
+        communicationTokens,
+        Math.floor(Math.max(0, inputBudget - baseSystemTokens) * 0.25)
+      ));
+      if (communicationTokens > communicationBudget) {
+        communicationContext = communicationBudget > 0
+          ? this.truncateTextToTokenBudget(communicationContext, communicationBudget)
+          : '';
+        this.emit({
+          type: 'budget.context.truncated',
+          agentId: agent.id,
+          correlationId,
+          data: {
+            purpose,
+            contextType: 'communication',
+            originalTokens: communicationTokens,
+            allowedTokens: communicationBudget,
+            outputReserve,
+          },
+        });
+      }
+      const systemTokens = this.estimateTextTokens(`system:${systemBase}\n${communicationContext}`);
+      const promptBudget = Math.max(0, inputBudget - systemTokens);
+      const promptTokens = this.estimateTextTokens(`user:${effectivePrompt}`);
+      if (promptTokens > promptBudget && promptBudget > 0) {
+        effectivePrompt = this.truncateTextToTokenBudget(effectivePrompt, promptBudget);
+        this.emit({
+          type: 'budget.context.truncated',
+          agentId: agent.id,
+          correlationId,
+          data: { purpose, originalTokens: promptTokens, allowedTokens: promptBudget, outputReserve },
+        });
+      }
+    }
+    const systemContent = [systemBase, communicationContext].filter(Boolean).join('\n');
+    const messages: LLMMessage[] = [
+      { role: 'system', content: systemContent },
+      { role: 'user', content: effectivePrompt },
+    ];
+    const estimatedInputTokens = this.estimateTextTokens(
+      messages.map(message => `${message.role}:${message.content}`).join('\n')
+    );
+    if (this.budgetAccountingDimension() === 'total_tokens'
+      && remainingTokens !== undefined
+      && remainingTokens <= estimatedInputTokens) {
+      this.emit({
+        type: 'budget.exceeded',
+        agentId: agent.id,
+        correlationId,
+        data: {
+          purpose,
+          estimatedInputTokens,
+          remainingTokens,
+          reason: 'input_exceeds_remaining_agent_allocation',
+        },
+      });
+      throw new Error(`Agent completion rejected: estimated input ${estimatedInputTokens} exceeds remaining allocation ${remainingTokens}`);
+    }
+    const maxTokens = remainingTokens === undefined
+      ? undefined
+      : Math.max(1, this.completionCapacity(remainingTokens, estimatedInputTokens));
     const chunks: string[] = [];
     let usageChunk: { usage?: ModelTokenUsage } | undefined;
-    for await (const chunk of ctx.llm.stream([...messages], { temperature: 0.2 })) {
+    for await (const chunk of ctx.llm.stream(messages, { temperature: 0.2, maxTokens })) {
       if (chunk.content) chunks.push(chunk.content);
       if (chunk.usage) usageChunk = chunk;
     }
     const content = chunks.join('');
     agent.recordRuntimeCompletion(content, {
       content,
-      usage: usageChunk?.usage ?? {
-        promptTokens: this.estimateTextTokens(prompt),
-        completionTokens: this.estimateTextTokens(content),
-        totalTokens: this.estimateTextTokens(prompt) + this.estimateTextTokens(content),
-      },
+      usage: usageChunk?.usage ?? this.estimateModelUsage(messages, content),
     });
     return content;
   }
@@ -6434,6 +6831,7 @@ ${reports}`;
       inputTokens: 0,
       outputTokens: 0,
       thinkingTokens: null,
+      thinkingAccountingTokens: 0,
       cachedInputTokens: null,
       cacheCreationInputTokens: null,
     };
@@ -6893,6 +7291,81 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
 
   private estimateTextTokens(text: string): number {
     return Math.max(1, Math.ceil(text.length / 4));
+  }
+
+  private truncateTextToTokenBudget(text: string, tokenBudget: number): string {
+    const targetChars = Math.max(64, tokenBudget * 4);
+    if (text.length <= targetChars) return text;
+    const marker = '\n...[budget-constrained context truncation]...\n';
+    const availableChars = Math.max(32, targetChars - marker.length);
+    const headChars = Math.floor(availableChars * 0.4);
+    const tailChars = availableChars - headChars;
+    return `${text.slice(0, headChars)}${marker}${text.slice(-tailChars)}`;
+  }
+
+  private constrainAgentObservation(
+    agent: BaseAgent,
+    observation: string,
+    correlationId?: string,
+    purpose = 'agent.task_execution'
+  ): string {
+    const remainingTokens = agent.getCompletionTokenLimit();
+    if (remainingTokens === undefined || this.budgetAccountingDimension() !== 'total_tokens') return observation;
+    const outputReserve = Math.min(512, Math.max(128, Math.floor(remainingTokens * 0.2)));
+    const promptWrapperReserve = Math.min(512, Math.max(256, Math.floor(remainingTokens * 0.12)));
+    const goalTokens = this.estimateTextTokens(agent.getInfo().goal ?? '');
+    const observationBudget = Math.max(64, remainingTokens - outputReserve - promptWrapperReserve - goalTokens);
+    const observationTokens = this.estimateTextTokens(observation);
+    if (observationTokens <= observationBudget) return observation;
+    this.emit({
+      type: 'budget.context.truncated',
+      agentId: agent.id,
+      correlationId,
+      data: {
+        purpose,
+        contextType: 'agent_observation',
+        originalTokens: observationTokens,
+        allowedTokens: observationBudget,
+        outputReserve,
+        promptWrapperReserve,
+      },
+    });
+    return this.truncateTextToTokenBudget(observation, observationBudget);
+  }
+
+  private estimateModelUsage(messages: LLMMessage[], output: string): ModelTokenUsage {
+    const llm = this.getContext().llm;
+    const normalized = tokenUsageRegistry.normalize({
+      provider: llm?.name ?? 'unknown',
+      model: llm?.defaultModel,
+      messages,
+      output,
+    });
+    if (normalized) return normalized;
+
+    const prompt = messages.map(message => `${message.role}:${message.content}`).join('\n');
+    const promptTokens = this.estimateTextTokens(prompt);
+    const completionTokens = this.estimateTextTokens(output);
+    return {
+      promptTokens,
+      completionTokens,
+      totalTokens: promptTokens + completionTokens,
+      inputTokens: promptTokens,
+      outputTokens: completionTokens,
+      thinkingTokens: null,
+      cachedInputTokens: null,
+      cacheCreationInputTokens: null,
+      provider: llm?.name,
+      model: llm?.defaultModel,
+      source: 'estimated',
+      availability: {
+        input: 'estimated',
+        output: 'estimated',
+        thinking: 'unavailable',
+        cachedInput: 'unavailable',
+        cacheCreationInput: 'unavailable',
+      },
+    };
   }
 
   private measureAgentCreationUsage(agentId: string, node: AgentComputeNodeDefinition): AgentCreationUsage {

@@ -55,7 +55,7 @@ export class OpenAIProvider implements LLMProvider {
         content: m.content,
       })),
       temperature: options?.temperature ?? this.config.temperature ?? 0.5,
-      max_tokens: options?.maxTokens || this.config.maxTokens || 4096,
+      max_tokens: options?.maxTokens ?? this.config.maxTokens ?? 4096,
       top_p: options?.topP,
       stop: options?.stop,
     });
@@ -86,7 +86,7 @@ export class OpenAIProvider implements LLMProvider {
         content: m.content,
       })),
       temperature: options?.temperature ?? this.config.temperature ?? 0.5,
-      max_tokens: options?.maxTokens || this.config.maxTokens || 4096,
+      max_tokens: options?.maxTokens ?? this.config.maxTokens ?? 4096,
       top_p: options?.topP,
       stop: options?.stop,
       stream: true,
@@ -139,7 +139,7 @@ export class OpenAIProvider implements LLMProvider {
         content: m.content,
       })),
       temperature: options?.temperature ?? this.config.temperature ?? 0.5,
-      max_tokens: options?.maxTokens || this.config.maxTokens || 4096,
+      max_tokens: options?.maxTokens ?? this.config.maxTokens ?? 4096,
       response_format: { type: 'json_object' },
     });
 

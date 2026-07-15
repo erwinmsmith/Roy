@@ -12,6 +12,7 @@ import {
   CostDelegationScorer,
   HeuristicDelegationScorer,
   LLMDelegationScorer,
+  type LLMDelegationScorerHooks,
   ToMDelegationScorer,
 } from './scorers.js';
 import { ToMDelegationPlanner } from '../tom/index.js';
@@ -32,6 +33,7 @@ export interface DelegationCandidatePlannerOptions {
   minimumScore?: number;
   minimumToMCoverage?: number;
   enabledScorers?: string[];
+  llmHooks?: LLMDelegationScorerHooks;
 }
 
 export class DefaultDelegationCandidatePlanner {
@@ -46,7 +48,7 @@ export class DefaultDelegationCandidatePlanner {
       new CostDelegationScorer(),
       new ToMDelegationScorer(),
       new CacheEvolutionDelegationScorer(),
-      ...(options.llm ? [new LLMDelegationScorer(options.llm)] : []),
+      ...(options.llm ? [new LLMDelegationScorer(options.llm, options.llmHooks)] : []),
     ];
     this.scorers = options.scorers ?? defaultScorers.filter(scorer => !options.enabledScorers || options.enabledScorers.includes(scorer.name));
     this.minimumScore = options.minimumScore ?? 0.05;

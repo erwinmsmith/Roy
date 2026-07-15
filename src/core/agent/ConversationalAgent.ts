@@ -71,7 +71,10 @@ export class ConversationalAgent extends BaseAgent {
       let fullResponse = '';
 
       // Stream response
-      for await (const chunk of this.llm.stream(messages, this.completionOptions())) {
+      const estimatedInputTokens = Math.ceil(
+        messages.map(message => `${message.role}:${message.content}`).join('\n').length / 4
+      );
+      for await (const chunk of this.llm.stream(messages, this.completionOptions({}, estimatedInputTokens))) {
         if (chunk.usage) {
           this.recordUsage(chunk);
         }

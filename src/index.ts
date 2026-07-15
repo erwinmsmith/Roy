@@ -5,6 +5,7 @@ export type { RuntimeConfig, RuntimeContext, ToMRuntimeState } from './core/runt
 export * from './core/team/index.js';
 export * from './core/tom/index.js';
 export * from './core/communication/index.js';
+export * from './core/delegation/index.js';
 export {
   InMemoryMessageQueue,
   MessageScheduler,

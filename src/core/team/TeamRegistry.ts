@@ -27,6 +27,7 @@ const ZERO_USAGE: TokenUsage = {
   inputTokens: 0,
   outputTokens: 0,
   thinkingTokens: null,
+  thinkingAccountingTokens: 0,
   cachedInputTokens: null,
   cacheCreationInputTokens: null,
 };
@@ -212,6 +213,8 @@ export class TeamRegistry {
       inputTokens: current.inputTokens + delta.inputTokens,
       outputTokens: current.outputTokens + delta.outputTokens,
       thinkingTokens,
+      thinkingAccountingTokens: (current.thinkingAccountingTokens ?? 0)
+        + (delta.thinkingAccountingTokens ?? delta.thinkingTokens ?? delta.totalTokens),
       cachedInputTokens: current.cachedInputTokens === null && delta.cachedInputTokens === null
         ? null
         : (current.cachedInputTokens ?? 0) + (delta.cachedInputTokens ?? 0),
