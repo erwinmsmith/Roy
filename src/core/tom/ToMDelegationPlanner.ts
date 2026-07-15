@@ -3,9 +3,12 @@ import type {
   CognitiveGap,
   CognitiveGapKind,
   ToMCoverageResult,
+  ToMAnalysisSignals,
+  ToMDelegationEngine,
   ToMPlanAgent,
   ToMProfile,
   ToMTaskAnalysis,
+  ToMTaskAnalysisInput,
 } from './types.js';
 
 const ARCHETYPE_BY_GAP: Record<CognitiveGapKind, ToMPlanAgent['archetype']> = {
@@ -30,11 +33,27 @@ const ARCHETYPE_PERSPECTIVE: Record<ToMPlanAgent['archetype'], string> = {
   custom: 'task-specific specialist',
 };
 
-export class ToMDelegationPlanner {
+const EMPTY_SIGNALS: ToMAnalysisSignals = {
+  traceCount: 0,
+  participantCount: 0,
+  failedTraceCount: 0,
+  cancelledTraceCount: 0,
+  toolResultCount: 0,
+  evidenceTraceCount: 0,
+  conflictingTraceCount: 0,
+  evidenceCoverage: 0,
+  conflictLevel: 0,
+  uncertaintyLevel: 0,
+  observedKinds: [],
+  reliabilityConcerns: [],
+};
+
+export class ToMDelegationPlanner implements ToMDelegationEngine {
   private analysisSequence = 0;
 
-  analyzeTask(input: { task: string; parentId: string; parentProfile?: ToMProfile }): ToMTaskAnalysis {
+  analyzeTask(input: ToMTaskAnalysisInput): ToMTaskAnalysis {
     const lower = input.task.toLowerCase();
+    const signals = this.normalizeSignals(input.signals);
     const gaps: CognitiveGap[] = [];
     const add = (kind: CognitiveGapKind, values: Omit<CognitiveGap, 'id' | 'kind'>): void => {
       if (gaps.some(gap => gap.kind === kind)) return;
@@ -114,6 +133,55 @@ export class ToMDelegationPlanner {
       });
     }
 
+    if (signals.failedTraceCount > 0 || signals.cancelledTraceCount > 0) {
+      add('verification', {
+        description: 'Recent observable execution traces include failed or cancelled work that needs independent verification.',
+        requiredPerspective: ARCHETYPE_PERSPECTIVE.tester,
+        beliefScope: ['failed execution evidence', 'recovery conditions', 'observable behavior'],
+        goal: 'Verify the failure boundary and distinguish recoverable errors from invalid conclusions.',
+        uncertainty: ['Which conclusions remain valid after the observed execution failure?'],
+        requiredCapabilities: ['run_test', 'inspect_failure'],
+        modelsTargets: ['environment', input.parentId],
+        priority: Math.min(1, 0.72 + signals.failedTraceCount * 0.08),
+      });
+    }
+    if (signals.traceCount > 0 && signals.evidenceCoverage < 0.45) {
+      add('evidence', {
+        description: 'The observable trace contains insufficient grounded evidence for the current conclusion.',
+        requiredPerspective: ARCHETYPE_PERSPECTIVE.researcher,
+        beliefScope: ['observable message evidence', 'tool results', 'source facts'],
+        goal: 'Increase evidence coverage before the parent commits to a conclusion.',
+        uncertainty: ['Which claims are currently unsupported by observable tool or agent results?'],
+        requiredCapabilities: ['inspect_project', 'fs.list', 'fs.read'],
+        modelsTargets: ['environment'],
+        priority: Math.min(1, 0.65 + (1 - signals.evidenceCoverage) * 0.25),
+      });
+    }
+    if (signals.conflictLevel >= 0.25 || signals.conflictingTraceCount > 0) {
+      add('perspective', {
+        description: 'Observable actor traces contain conflicting claims or incompatible assumptions.',
+        requiredPerspective: ARCHETYPE_PERSPECTIVE.critic,
+        beliefScope: ['actor claims', 'conflicting assumptions', 'decision criteria'],
+        goal: 'Identify the source of disagreement and determine which belief is better supported.',
+        uncertainty: ['Which actor belief should the parent trust, and why?'],
+        requiredCapabilities: ['critique_report', 'check_grounding'],
+        modelsTargets: [input.parentId, 'peer:observable-trace'],
+        priority: Math.min(1, 0.7 + signals.conflictLevel * 0.25),
+      });
+    }
+    if (signals.reliabilityConcerns.length > 0) {
+      add('risk', {
+        description: `Observable execution reliability concerns require explicit review: ${signals.reliabilityConcerns.join('; ')}`,
+        requiredPerspective: ARCHETYPE_PERSPECTIVE.critic,
+        beliefScope: ['execution reliability', 'unsupported assumptions', 'failure propagation'],
+        goal: 'Prevent unreliable intermediate work from being promoted into the parent result.',
+        uncertainty: [...signals.reliabilityConcerns],
+        requiredCapabilities: ['critique_report', 'check_grounding'],
+        modelsTargets: [input.parentId, 'environment'],
+        priority: 0.88,
+      });
+    }
+
     for (const uncertainty of input.parentProfile?.uncertainty ?? []) {
       if (gaps.some(gap => gap.uncertainty.includes(uncertainty))) continue;
       add('knowledge', {
@@ -142,8 +210,10 @@ export class ToMDelegationPlanner {
     }
 
     const substantive = gaps.filter(gap => gap.kind !== 'synthesis');
-    const requiresHigherOrderToM = substantive.length >= 2
-      && new Set(substantive.map(gap => gap.requiredPerspective)).size >= 2;
+    const requiresHigherOrderToM = (
+      substantive.length >= 2
+      && new Set(substantive.map(gap => gap.requiredPerspective)).size >= 2
+    ) || signals.conflictLevel >= 0.5;
     if (requiresHigherOrderToM) {
       add('synthesis', {
         description: 'Multiple specialist belief sets must be compared and reconciled.',
@@ -157,6 +227,13 @@ export class ToMDelegationPlanner {
       });
     }
 
+    const traceAugmented = signals.traceCount > 0 || signals.reliabilityConcerns.length > 0;
+    const confidence = Math.max(0.35, Math.min(0.98,
+      0.58
+      + (traceAugmented ? 0.12 : 0)
+      + signals.evidenceCoverage * 0.18
+      - Math.min(0.18, signals.failedTraceCount * 0.03)
+    ));
     return {
       id: `tom_analysis_${Date.now()}_${String(++this.analysisSequence).padStart(4, '0')}`,
       parentId: input.parentId,
@@ -165,11 +242,37 @@ export class ToMDelegationPlanner {
       parentGoals: [...(input.parentProfile?.goalModel ?? [])],
       parentUncertainties: [...(input.parentProfile?.uncertainty ?? [])],
       gaps,
+      signals,
+      source: traceAugmented ? 'trace_augmented' : 'task_only',
+      confidence: Number(confidence.toFixed(4)),
       requiresHigherOrderToM,
-      rationale: requiresHigherOrderToM
+      rationale: `${requiresHigherOrderToM
         ? 'The task contains complementary cognitive gaps that require specialist beliefs and higher-order reconciliation.'
-        : 'The task contains a bounded cognitive gap that can be assigned to one specialist perspective.',
+        : 'The task contains a bounded cognitive gap that can be assigned to one specialist perspective.'}${traceAugmented
+        ? ` The diagnosis incorporates ${signals.traceCount} observable runtime trace(s).`
+        : ''}`,
       createdAt: Date.now(),
+    };
+  }
+
+  private normalizeSignals(input?: Partial<ToMAnalysisSignals>): ToMAnalysisSignals {
+    const numeric = (value: number | undefined): number => Math.max(0, Number.isFinite(value) ? value! : 0);
+    const ratio = (value: number | undefined): number => Math.min(1, numeric(value));
+    return {
+      ...EMPTY_SIGNALS,
+      ...input,
+      traceCount: Math.floor(numeric(input?.traceCount)),
+      participantCount: Math.floor(numeric(input?.participantCount)),
+      failedTraceCount: Math.floor(numeric(input?.failedTraceCount)),
+      cancelledTraceCount: Math.floor(numeric(input?.cancelledTraceCount)),
+      toolResultCount: Math.floor(numeric(input?.toolResultCount)),
+      evidenceTraceCount: Math.floor(numeric(input?.evidenceTraceCount)),
+      conflictingTraceCount: Math.floor(numeric(input?.conflictingTraceCount)),
+      evidenceCoverage: ratio(input?.evidenceCoverage),
+      conflictLevel: ratio(input?.conflictLevel),
+      uncertaintyLevel: ratio(input?.uncertaintyLevel),
+      observedKinds: unique(input?.observedKinds ?? []),
+      reliabilityConcerns: unique(input?.reliabilityConcerns ?? []),
     };
   }
 

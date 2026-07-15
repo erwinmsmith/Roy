@@ -48,6 +48,33 @@ describe('ToM-aware delegation', () => {
     expect(analysis.parentUncertainties).toContain('Whether the current runtime has hidden coupling.');
   });
 
+  it('uses observable trace signals to diagnose reliability and belief conflicts', () => {
+    const planner = new ToMDelegationPlanner();
+    const analysis = planner.analyzeTask({
+      parentId: 'root',
+      parentProfile: rootProfile,
+      task: 'Decide whether the current result is reliable.',
+      signals: {
+        traceCount: 8,
+        participantCount: 3,
+        failedTraceCount: 1,
+        evidenceTraceCount: 1,
+        evidenceCoverage: 0.25,
+        conflictingTraceCount: 2,
+        conflictLevel: 0.67,
+        observedKinds: ['agent.result', 'tool.result'],
+        reliabilityConcerns: ['one child result failed grounding validation'],
+      },
+    });
+    expect(analysis.source).toBe('trace_augmented');
+    expect(analysis.confidence).toBeGreaterThan(0.5);
+    expect(analysis.gaps.map(gap => gap.kind)).toEqual(expect.arrayContaining([
+      'evidence', 'verification', 'perspective', 'risk', 'synthesis',
+    ]));
+    expect(analysis.requiresHigherOrderToM).toBe(true);
+    expect(analysis.signals.observedKinds).toContain('tool.result');
+  });
+
   it('completes a partial role plan with gap-backed profiles and existence reasons', () => {
     const planner = new ToMDelegationPlanner();
     const analysis = planner.analyzeTask({

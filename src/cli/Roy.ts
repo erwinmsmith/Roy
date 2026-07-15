@@ -668,6 +668,7 @@ export class Roy {
     console.log('    GET  /v1/budget  - Token budget');
     console.log('    GET  /v1/budget/market - Market state and ledger');
     console.log('    POST /v1/budget/rebalance - Re-score active allocations');
+    console.log('    POST /v1/budget/allocations/:id/outcome - Record realized utility');
     console.log('    GET  /v1/events  - Runtime events');
     console.log('    GET  /v1/queue   - Runtime message queue');
     console.log('    GET  /v1/memory  - Workspace memory state');
@@ -744,22 +745,25 @@ export class Roy {
       console.log(`    Remaining:  ${market.availableTokens ?? 'unlimited'}`);
       console.log(`    Accounting: ${market.accountingDimension}`);
       console.log('\n  ' + this.bold('Allocations'));
-      console.log('    Actor                  Requested Allocated     Used   Input  Output Thinking   Eff. Status');
+      console.log('    Actor                  Requested Allocated     Used   Return Outcome   Eff. Status');
       for (const allocation of market.allocations.slice(-10)) {
-        const usage = allocation.usage;
         const efficiency = allocation.efficiency === null ? '-' : allocation.efficiency.toFixed(3);
+        const expectedReturn = allocation.request.investment?.expectedReturn?.toFixed(2) ?? '-';
+        const outcome = allocation.outcome
+          ? allocation.outcome.success ? 'success' : 'failed'
+          : '-';
         console.log(
           `    ${allocation.request.requesterId.slice(0, 22).padEnd(22)} ` +
           `${String(allocation.request.requestedTokens).padStart(9)} ` +
           `${String(allocation.allocatedTokens).padStart(9)} ` +
           `${String(allocation.consumedTokens).padStart(8)} ` +
-          `${String(usage?.inputTokens ?? '-').padStart(7)} ` +
-          `${String(usage?.outputTokens ?? '-').padStart(7)} ` +
-          `${String(usage?.thinkingTokens ?? '-').padStart(8)} ` +
+          `${expectedReturn.padStart(8)} ` +
+          `${outcome.padStart(7)} ` +
           `${efficiency.padStart(6)} ${allocation.status}`
         );
       }
       console.log(`\n    Ledger entries: ${market.ledger.length}`);
+      console.log(`    Outcome histories: ${market.outcomeHistory.length}`);
       console.log('');
       return;
     }

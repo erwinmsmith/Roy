@@ -1,6 +1,7 @@
 import type { DelegationAgentPlan, DelegationDecision } from '../runtime/Runtime.js';
 import type { ToMProfile } from '../agent/BaseAgent.js';
 import type { ToMCoverageResult, ToMTaskAnalysis } from '../tom/index.js';
+import type { ReasoningInvestmentEstimate } from '../budget/index.js';
 
 export type DelegationCandidateSource =
   | 'cache_hit'
@@ -19,6 +20,7 @@ export interface DelegationCandidate {
   expectedCostTokens: number;
   score: number;
   scoreBreakdown: Record<string, number>;
+  investment?: ReasoningInvestmentEstimate;
   rationale: string;
   tomCoverage?: ToMCoverageResult;
   lineage?: {

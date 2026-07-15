@@ -58,6 +58,28 @@ export interface CognitiveGap {
   priority: number;
 }
 
+export interface ToMAnalysisSignals {
+  traceCount: number;
+  participantCount: number;
+  failedTraceCount: number;
+  cancelledTraceCount: number;
+  toolResultCount: number;
+  evidenceTraceCount: number;
+  conflictingTraceCount: number;
+  evidenceCoverage: number;
+  conflictLevel: number;
+  uncertaintyLevel: number;
+  observedKinds: string[];
+  reliabilityConcerns: string[];
+}
+
+export interface ToMTaskAnalysisInput {
+  task: string;
+  parentId: string;
+  parentProfile?: ToMProfile;
+  signals?: Partial<ToMAnalysisSignals>;
+}
+
 export interface ToMTaskAnalysis {
   id: string;
   parentId: string;
@@ -66,9 +88,24 @@ export interface ToMTaskAnalysis {
   parentGoals: string[];
   parentUncertainties: string[];
   gaps: CognitiveGap[];
+  signals: ToMAnalysisSignals;
+  source: 'task_only' | 'trace_augmented' | 'extension';
+  confidence: number;
   requiresHigherOrderToM: boolean;
   rationale: string;
   createdAt: number;
+}
+
+export interface ToMDelegationEngine {
+  analyzeTask(input: ToMTaskAnalysisInput): ToMTaskAnalysis;
+  completePlans(analysis: ToMTaskAnalysis, inputPlans: ToMPlanAgent[], maxAgents: number): ToMPlanAgent[];
+  evaluateCoverage(analysis: ToMTaskAnalysis, plans: ToMPlanAgent[]): ToMCoverageResult;
+  createTeamProfile(input: {
+    teamId: string;
+    parentId: string;
+    task: string;
+    members: ToMPlanAgent[];
+  }): ToMProfile;
 }
 
 export interface ToMPlanAgent {

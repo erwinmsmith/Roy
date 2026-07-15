@@ -41,6 +41,8 @@ import {
 import {
   normalizeToMProfile,
   ToMDelegationPlanner,
+  type ToMAnalysisSignals,
+  type ToMDelegationEngine,
   type ToMTaskAnalysis,
 } from '../tom/index.js';
 import {
@@ -52,11 +54,14 @@ import {
 import { ContextWindowManager, type ContextWindow } from '../context/index.js';
 import {
   BudgetMarket,
+  WeightedReasoningInvestmentModel,
   type BudgetAllocation,
   type BudgetMarketState,
+  type BudgetOutcome,
   type BudgetPriority,
   type BudgetRebalanceResult,
   type BudgetRequest,
+  type ReasoningInvestmentModel,
 } from '../budget/index.js';
 import {
   executeTeamItems,
@@ -104,6 +109,8 @@ export interface RuntimeConfig {
   llmProvider?: LLMProvider;
   workspaceCwd?: string;
   communicationProtocols?: AgentCommunicationProtocol[];
+  tomPlanner?: ToMDelegationEngine;
+  reasoningInvestmentModel?: ReasoningInvestmentModel;
 }
 
 export interface RuntimeContext {
@@ -504,7 +511,8 @@ export class Runtime {
   private readonly toolPlanner = new AgentToolPlanner();
   private candidatePlanner: DefaultDelegationCandidatePlanner | null = null;
   private turnAgentCounts = new Map<string, number>();
-  private readonly tomPlanner = new ToMDelegationPlanner();
+  private tomPlanner: ToMDelegationEngine = new ToMDelegationPlanner();
+  private reasoningInvestmentModel: ReasoningInvestmentModel = new WeightedReasoningInvestmentModel();
   private readonly tomAnalyses = new Map<string, ToMTaskAnalysis>();
   private communicationManager: AgentCommunicationManager | null = null;
 
@@ -567,6 +575,8 @@ export class Runtime {
     const memory = new WorkspaceMemoryManager();
     await memory.initWorkspace(options.workspaceCwd ?? process.cwd(), options.sessionId ?? 'main');
     this.workspaceRuntimeConfig = await memory.getWorkspaceConfig();
+    this.tomPlanner = options.tomPlanner ?? new ToMDelegationPlanner();
+    this.reasoningInvestmentModel = options.reasoningInvestmentModel ?? new WeightedReasoningInvestmentModel();
     const communication = new AgentCommunicationManager(
       this.workspaceRuntimeConfig.communication,
       options.communicationProtocols
@@ -577,6 +587,7 @@ export class Runtime {
       enabledScorers: this.workspaceRuntimeConfig.delegation.candidateScoring.enabledScorers,
       minimumScore: this.workspaceRuntimeConfig.delegation.candidateScoring.minimumScore,
       minimumToMCoverage: this.workspaceRuntimeConfig.tom.minimumCoverage,
+      investmentModel: this.reasoningInvestmentModel,
       llmHooks: {
         before: (input, messages, completionOptions) => this.beforeDelegationScorerCall(input, messages, completionOptions),
         after: (completion, input, hookContext) => this.afterDelegationScorerCall(completion, input, hookContext),
@@ -588,6 +599,7 @@ export class Runtime {
       minimumGrantTokens: this.workspaceRuntimeConfig.budgetMarket.minimumGrantTokens,
       accountingDimension: this.workspaceRuntimeConfig.budgetMarket.accountingDimension,
       priorityWeights: this.workspaceRuntimeConfig.budgetMarket.priorityWeights,
+      investmentModel: this.reasoningInvestmentModel,
     });
     this.budgetMarket.configure(options.budget ?? null);
     this.toolApprovalManager = new ToolApprovalManager(this.workspaceRuntimeConfig.tools.approval);
@@ -1084,6 +1096,24 @@ export class Runtime {
         data: { allocationId, allocatedTokens: allocation.allocatedTokens, consumedTokens: allocation.consumedTokens },
       });
     }
+    return allocation;
+  }
+
+  recordBudgetOutcome(allocationId: string, outcome: BudgetOutcome): BudgetAllocation {
+    if (!this.budgetMarket) throw new Error('Budget market is not initialized');
+    const allocation = this.budgetMarket.recordOutcome(allocationId, outcome);
+    if (!allocation) throw new Error(`Budget allocation "${allocationId}" not found or cannot accept an outcome`);
+    this.emit({
+      type: 'budget.outcome.recorded',
+      agentId: allocation.request.requesterId,
+      correlationId: allocation.request.correlationId,
+      data: {
+        allocationId,
+        success: allocation.outcome?.success,
+        realizedUtility: allocation.outcome?.realizedUtility,
+        efficiency: allocation.efficiency,
+      },
+    });
     return allocation;
   }
 
@@ -1967,6 +1997,20 @@ export class Runtime {
     if (!this.budgetMarket) throw new Error('Budget market is not initialized');
     const requestedTokens = input.requestedTokens ?? this.estimateAgentBudget(input.archetype);
     const requesterId = input.requesterId ?? `${input.parentId}:${input.archetype}`;
+    const analysis = input.correlationId ? this.tomAnalyses.get(input.correlationId) : undefined;
+    const tools = this.getDefaultToolBindings(input.archetype).filter(binding => binding.enabled).length;
+    const cachedPattern = await this.getContext().memory.findAgentPattern(input.archetype);
+    const evaluation = cachedPattern?.evaluation && typeof cachedPattern.evaluation === 'object'
+      ? cachedPattern.evaluation as Record<string, unknown>
+      : undefined;
+    const historicalUtility = averageDefined([
+      finiteRatio(evaluation?.successRate),
+      finiteRatio(evaluation?.groundingRate),
+    ]) ?? 0.5;
+    const evaluationRuns = finiteNumber(evaluation?.runs) ?? 0;
+    const cacheConfidence = cachedPattern
+      ? Math.min(0.95, 0.5 + evaluationRuns * 0.08)
+      : 0;
     const requestMessage = await this.enqueueMessage({
       kind: 'budget.request',
       sessionId: this.getContext().sessionId,
@@ -1994,6 +2038,25 @@ export class Runtime {
       priority: input.priority ?? this.workspaceRuntimeConfig?.budgetMarket.defaultPriority ?? 'medium',
       expectedUtility: input.expectedUtility ?? this.defaultBudgetUtility(input.archetype),
       purpose: input.purpose,
+      resourceEstimate: {
+        tokens: requestedTokens,
+        contextTokens: Math.min(4000, Math.round(requestedTokens * 0.35)),
+        toolCalls: tools,
+      },
+      metadata: {
+        investmentKind: input.purpose,
+        evidenceGain: analysis?.gaps.some(gap => gap.kind === 'evidence') ? 0.82 : 0.25,
+        uncertaintyReduction: analysis ? Math.min(1, analysis.gaps.length / 4) : 0.4,
+        conflictResolution: analysis?.signals.conflictLevel ?? 0,
+        verificationGain: input.archetype === 'tester' ? 0.9 : 0,
+        historicalUtility,
+        cacheConfidence,
+        executionRisk: analysis ? Math.min(1, (1 - analysis.confidence) + analysis.signals.failedTraceCount * 0.08) : 0.25,
+        confidence: analysis?.confidence ?? 0.62,
+        investmentHistoryKey: typeof cachedPattern?.id === 'string'
+          ? `${cachedPattern.id}:${input.purpose}`
+          : `${input.archetype}:${input.purpose}`,
+      },
     });
     if (this.workspaceRuntimeConfig?.budgetMarket.rebalanceOnRequest && allocation.status === 'denied') {
       this.rebalanceBudgetMarket();
@@ -2116,6 +2179,20 @@ export class Runtime {
       priority: 'high',
       expectedUtility: 0.85,
       purpose: 'team_synthesis',
+      resourceEstimate: {
+        tokens: requestedTokens,
+        inputTokens: input.promptTokens,
+        outputTokens: input.completionTokens,
+        contextTokens: input.promptTokens,
+      },
+      metadata: {
+        investmentKind: 'team_synthesis',
+        parentUtility: teamCompletionRatio(input.team),
+        conflictResolution: input.team.identity.tomProfile.level >= 2 ? 0.9 : 0.55,
+        uncertaintyReduction: Math.min(1, input.team.memberAgentIds.length / 4),
+        executionRisk: Object.values(input.team.memberStatuses).some(status => status === 'failed') ? 0.65 : 0.2,
+        confidence: Object.values(input.team.memberStatuses).some(status => status === 'failed') ? 0.55 : 0.8,
+      },
     });
     const responseMessage = await this.enqueueMessage({
       kind: allocation.status === 'granted' ? 'budget.grant' : 'budget.denied',
@@ -2159,6 +2236,18 @@ export class Runtime {
     const modelTotalTokens = typeof actual === 'number' ? actual : actual.totalTokens;
     const settled = this.budgetMarket.settle(allocation.id, actual);
     if (!settled) return;
+    const latestTeam = this.teams.get(teamId);
+    const completedMembers = latestTeam
+      ? Object.values(latestTeam.memberStatuses).filter(status => status === 'completed').length
+      : 0;
+    this.recordBudgetOutcome(allocation.id, {
+      success: true,
+      conflictResolution: latestTeam?.memberAgentIds.length
+        ? completedMembers / latestTeam.memberAgentIds.length
+        : 0.5,
+      quality: latestTeam ? teamCompletionRatio(latestTeam) : undefined,
+      metadata: { teamId, phase: 'synthesis' },
+    });
     this.emit({
       type: 'budget.settled',
       agentId: teamId,
@@ -2217,6 +2306,11 @@ export class Runtime {
     if (!allocation || allocation.status !== 'granted' || !this.budgetMarket) return;
     const released = this.budgetMarket.release(allocation.id, reason);
     if (released) {
+      this.recordBudgetOutcome(allocation.id, {
+        success: false,
+        error: reason,
+        metadata: { teamId, phase: 'synthesis' },
+      });
       this.emit({
         type: 'budget.released',
         agentId: teamId,
@@ -2226,13 +2320,21 @@ export class Runtime {
     }
   }
 
-  private settleAgentBudget(agentId: string, actual: number | TokenUsage): void {
+  private settleAgentBudget(
+    agentId: string,
+    actual: number | TokenUsage,
+    outcome: BudgetOutcome = { success: true }
+  ): void {
     const allocationId = this.agentBudgetAllocations.get(agentId);
     if (!allocationId || !this.budgetMarket) return;
     const allocation = this.budgetMarket.settle(allocationId, actual);
     this.agentBudgetAllocations.delete(agentId);
     this.getContext().manager.getAgentById(agentId)?.setCompletionTokenLimit(undefined);
     if (allocation) {
+      this.recordBudgetOutcome(allocationId, {
+        ...outcome,
+        metadata: { ...outcome.metadata, agentId, phase: 'agent_run' },
+      });
       const modelTotalTokens = typeof actual === 'number' ? actual : actual.totalTokens;
       this.emit({
         type: 'budget.settled',
@@ -2271,6 +2373,10 @@ export class Runtime {
     if (!allocation || allocation.status !== 'granted' || !this.budgetMarket) return;
     const settled = this.budgetMarket.settle(allocation.id, usage);
     if (!settled) return;
+    this.recordBudgetOutcome(allocation.id, {
+      success: true,
+      metadata: { agentId, phase: 'direct_reasoning' },
+    });
     this.emit({
       type: 'budget.consumed',
       agentId,
@@ -2368,7 +2474,10 @@ export class Runtime {
     const allocation = this.budgetMarket.release(allocationId, reason);
     this.agentBudgetAllocations.delete(agentId);
     this.getContext().manager.getAgentById(agentId)?.setCompletionTokenLimit(undefined);
-    if (allocation) this.emit({ type: 'budget.released', agentId, data: { allocationId, reason } });
+    if (allocation) {
+      this.recordBudgetOutcome(allocationId, { success: false, error: reason, metadata: { agentId } });
+      this.emit({ type: 'budget.released', agentId, data: { allocationId, reason } });
+    }
   }
 
   private estimateAgentBudget(archetype: SubAgentArchetype): number {
@@ -4535,7 +4644,12 @@ export class Runtime {
         },
       });
       await this.transitionAgentFsm(agentId, 'S_done', { correlationId: options.correlationId });
-      this.settleAgentBudget(agentId, usageDelta);
+      this.settleAgentBudget(agentId, usageDelta, {
+        success: true,
+        evidenceGain: evidence.outputGrounded ? 0.95 : evidence.toolGrounded ? 0.5 : 0.15,
+        uncertaintyReduction: grounding.grounded && evidence.outputGrounded ? 0.8 : 0.35,
+        verificationGain: options.archetype === 'tester' ? (evidence.outputGrounded ? 0.9 : 0.45) : undefined,
+      });
       await ctx.memory.recordAgentPatternOutcome(options.archetype ?? this.inferAgentArchetype(agent.getInfo()), {
         success: true,
         grounded: grounding.grounded && evidence.outputGrounded,
@@ -4799,7 +4913,20 @@ export class Runtime {
     const budget = this.getBudgetState();
     const ctx = this.getContext();
     const parentToMProfile = ctx.manager.getAgentById(parentId)?.getIdentity().tomProfile;
-    const tomAnalysis = this.tomPlanner.analyzeTask({ task, parentId, parentProfile: parentToMProfile });
+    const tomSignals = this.deriveToMAnalysisSignals(parentId, correlationId, parentToMProfile);
+    this.emit({
+      type: 'tom.signals.collected',
+      agentId: parentId,
+      sessionId: ctx.sessionId,
+      correlationId,
+      data: { ...tomSignals },
+    });
+    const tomAnalysis = this.tomPlanner.analyzeTask({
+      task,
+      parentId,
+      parentProfile: parentToMProfile,
+      signals: tomSignals,
+    });
     const remainingAgentSlots = Math.min(
       policy ? Math.max(0, policy.allowedChildren - policy.currentChildren) : 0,
       this.getRemainingTotalAgentsForTurn(parentId, correlationId),
@@ -4839,6 +4966,9 @@ export class Runtime {
         parentBeliefs: tomAnalysis.parentBeliefs,
         parentGoals: tomAnalysis.parentGoals,
         parentUncertainties: tomAnalysis.parentUncertainties,
+        source: tomAnalysis.source,
+        confidence: tomAnalysis.confidence,
+        signals: tomAnalysis.signals,
       },
     });
     for (const gap of tomAnalysis.gaps) {
@@ -4902,6 +5032,59 @@ export class Runtime {
       });
     }
     return selection.decision;
+  }
+
+  private deriveToMAnalysisSignals(
+    parentId: string,
+    correlationId: string,
+    parentProfile?: ToMProfile
+  ): ToMAnalysisSignals {
+    const ctx = this.getContext();
+    const current = this.communicationManager?.traces.list({
+      sessionId: ctx.sessionId,
+      correlationId,
+      limit: this.workspaceRuntimeConfig?.communication.traceWindowSize ?? 200,
+    }) ?? [];
+    const traces = current;
+    const participants = new Set(traces.flatMap(trace => [trace.from.id, ...trace.to.map(actor => actor.id)]));
+    const failed = traces.filter(trace => trace.phase === 'failed');
+    const cancelled = traces.filter(trace => trace.phase === 'cancelled');
+    const toolResults = traces.filter(trace => trace.kind === 'tool.result' && trace.phase === 'completed');
+    const evidence = traces.filter(trace =>
+      trace.phase === 'completed'
+      && ['tool.result', 'agent.result', 'team.result'].includes(trace.kind)
+      && Boolean(trace.content?.trim())
+    );
+    const conflicting = traces.filter(trace =>
+      /\b(conflict|contradict|disagree|inconsistent|unsupported|mismatch)\b|冲突|矛盾|不一致/.test(trace.content?.toLowerCase() ?? '')
+    );
+    const reliabilityConcerns = [
+      ...(failed.length > 0 ? [`${failed.length} observable message(s) failed`] : []),
+      ...(cancelled.length > 0 ? [`${cancelled.length} observable message(s) were cancelled`] : []),
+    ];
+    const evidenceOpportunity = traces.filter(trace =>
+      ['agent.task', 'team.task', 'tool.call', 'tool.result', 'agent.result', 'team.result'].includes(trace.kind)
+    ).length;
+    const evidenceCoverage = evidenceOpportunity === 0
+      ? 1
+      : Math.min(1, (evidence.length + toolResults.length * 0.5) / evidenceOpportunity);
+    const conflictLevel = participants.size === 0 ? 0 : Math.min(1, conflicting.length / participants.size);
+    const profileUncertainty = parentProfile?.uncertainty.length ?? 0;
+    const uncertaintyLevel = Math.min(1, profileUncertainty * 0.2 + failed.length * 0.15 + (1 - evidenceCoverage) * 0.35);
+    return {
+      traceCount: traces.length,
+      participantCount: participants.size,
+      failedTraceCount: failed.length,
+      cancelledTraceCount: cancelled.length,
+      toolResultCount: toolResults.length,
+      evidenceTraceCount: evidence.length,
+      conflictingTraceCount: conflicting.length,
+      evidenceCoverage: Number(evidenceCoverage.toFixed(4)),
+      conflictLevel: Number(conflictLevel.toFixed(4)),
+      uncertaintyLevel: Number(uncertaintyLevel.toFixed(4)),
+      observedKinds: [...new Set(traces.map(trace => trace.kind))],
+      reliabilityConcerns,
+    };
   }
 
   private async beforeDelegationScorerCall(
@@ -5074,6 +5257,7 @@ export class Runtime {
           expectedCostTokens: candidate.expectedCostTokens,
           score: candidate.score,
           scoreBreakdown: candidate.scoreBreakdown,
+          investment: candidate.investment,
           lineage: candidate.lineage,
           rationale: candidate.rationale,
           tomCoverage: candidate.tomCoverage,
@@ -5097,6 +5281,7 @@ export class Runtime {
           lineage: selection.selected.lineage,
           rationale: selection.selected.rationale,
           tomCoverage: selection.selected.tomCoverage,
+          investment: selection.selected.investment,
         },
       });
     } else if (selection.rejectedReason) {
@@ -5136,7 +5321,14 @@ export class Runtime {
       to: parentId,
       correlationId,
       parentMessageId: proposed.id,
-      payload: { candidates: selection.candidates.map(candidate => ({ id: candidate.id, score: candidate.score, scoreBreakdown: candidate.scoreBreakdown })) },
+      payload: {
+        candidates: selection.candidates.map(candidate => ({
+          id: candidate.id,
+          score: candidate.score,
+          scoreBreakdown: candidate.scoreBreakdown,
+          investment: candidate.investment,
+        })),
+      },
       metadata: { agentId: parentId },
     });
     await this.processQueuedMessage(evaluated.id);
@@ -5163,6 +5355,7 @@ export class Runtime {
         source: candidate.source,
         score: candidate.score,
         scoreBreakdown: candidate.scoreBreakdown,
+        investment: candidate.investment,
         lineage: candidate.lineage,
       })),
       selected: selection.selected?.id,
@@ -6281,7 +6474,14 @@ Produce the final response to the user as Roy, the root agent.`;
         totalSubagents: childResults.length,
       },
     });
-    this.settleAgentBudget(agentId, usageDelta);
+    const groundedChildren = childResults.filter(result => result.subagentResult.grounded).length;
+    const groundedRatio = childResults.length > 0 ? groundedChildren / childResults.length : 0;
+    this.settleAgentBudget(agentId, usageDelta, {
+      success: true,
+      evidenceGain: evidence.outputGrounded ? 0.9 : evidence.toolGrounded ? 0.5 : 0.15,
+      uncertaintyReduction: groundedRatio,
+      conflictResolution: childResults.length > 1 ? groundedRatio : undefined,
+    });
     await ctx.memory.recordAgentPatternOutcome(options.archetype ?? this.inferAgentArchetype(parent.getInfo()), {
       success: true,
       grounded: childResults.every(result => result.subagentResult.grounded),
@@ -7699,6 +7899,26 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
     }
     return chunks.join('');
   }
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function finiteRatio(value: unknown): number | undefined {
+  const number = finiteNumber(value);
+  return number === undefined ? undefined : Math.max(0, Math.min(1, number));
+}
+
+function averageDefined(values: Array<number | undefined>): number | undefined {
+  const defined = values.filter((value): value is number => value !== undefined);
+  return defined.length > 0 ? defined.reduce((sum, value) => sum + value, 0) / defined.length : undefined;
+}
+
+function teamCompletionRatio(team: TeamRuntimeState): number {
+  if (team.memberAgentIds.length === 0) return 0;
+  const completed = Object.values(team.memberStatuses).filter(status => status === 'completed').length;
+  return completed / team.memberAgentIds.length;
 }
 
 export const runtime = Runtime.getInstance();

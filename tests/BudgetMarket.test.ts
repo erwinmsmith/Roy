@@ -2,7 +2,7 @@ import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { BudgetMarket } from '../src/core/budget/index.js';
+import { BudgetMarket, WeightedReasoningInvestmentModel } from '../src/core/budget/index.js';
 import {
   AnthropicUsageNormalizer,
   OpenAICompatibleUsageNormalizer,
@@ -62,6 +62,30 @@ class MeteredLLM implements LLMProvider {
 }
 
 describe('Phase 5 budget market', () => {
+  it('estimates multidimensional reasoning return through a replaceable utility model', () => {
+    const model = new WeightedReasoningInvestmentModel();
+    const strong = model.estimate({
+      kind: 'evidence_review', requesterId: 'researcher', parentId: 'root', purpose: 'inspect evidence',
+      resources: { tokens: 2000, contextTokens: 500, toolCalls: 2 },
+      signals: {
+        rootUtility: 0.85, parentUtility: 0.8, historicalUtility: 0.75,
+        evidenceGain: 0.95, uncertaintyReduction: 0.85, cacheConfidence: 0.7,
+        duplicationRisk: 0.05, executionRisk: 0.1, confidence: 0.9,
+      },
+    });
+    const risky = model.estimate({
+      kind: 'duplicate_review', requesterId: 'critic', parentId: 'root', purpose: 'duplicate work',
+      resources: { tokens: 6000, contextTokens: 3000, toolCalls: 6 },
+      signals: {
+        rootUtility: 0.6, parentUtility: 0.5, evidenceGain: 0.2,
+        duplicationRisk: 0.9, executionRisk: 0.8, confidence: 0.4,
+      },
+    });
+    expect(strong.riskAdjustedUtility).toBeGreaterThan(risky.riskAdjustedUtility);
+    expect(strong.expectedReturn).toBeGreaterThan(risky.expectedReturn);
+    expect(strong.components).toMatchObject({ evidenceGain: 0.95, toolCost: 0.2 });
+  });
+
   it('allocates competing bids by priority and utility through a pluggable market policy', () => {
     const market = new BudgetMarket(() => 0, { mode: 'market', minimumGrantTokens: 100 });
     market.configure(1000);
@@ -92,6 +116,36 @@ describe('Phase 5 budget market', () => {
     expect(market.getState().ledger.map(entry => entry.type)).toEqual(
       expect.arrayContaining(['requested', 'allocated', 'consumed', 'exceeded', 'settled'])
     );
+  });
+
+  it('records realized outcomes and recomputes efficiency from observed utility', () => {
+    const market = new BudgetMarket(() => 0, { mode: 'fixed' });
+    market.configure(1000);
+    const allocation = market.request({
+      requesterId: 'reviewer', parentId: 'root', requestedTokens: 500, minimumTokens: 100,
+      expectedUtility: 0.9, purpose: 'review',
+    });
+    market.settle(allocation.id, 400);
+    const before = market.getAllocation(allocation.id)!;
+    const after = market.recordOutcome(allocation.id, {
+      success: false,
+      quality: 0.2,
+      evidenceGain: 0.1,
+      error: 'unsupported conclusion',
+    })!;
+    expect(after.outcome).toMatchObject({ success: false, error: 'unsupported conclusion' });
+    expect(after.efficiency).toBeLessThan(before.efficiency!);
+    expect(market.getState().ledger.at(-1)?.type).toBe('outcome');
+
+    const next = market.request({
+      requesterId: 'reviewer-2', parentId: 'root', requestedTokens: 400, minimumTokens: 100,
+      expectedUtility: 0.9, purpose: 'review',
+    });
+    expect(next.request.investment?.components.historicalUtility).toBeLessThan(0.2);
+    expect(market.getState().outcomeHistory).toMatchObject([
+      { key: 'review', count: 1, successCount: 0 },
+    ]);
+    expect(() => market.recordOutcome(allocation.id, { success: true })).toThrow('already has a recorded outcome');
   });
 
   it('settles against the configured accounting dimension while retaining full model usage', () => {

@@ -16,6 +16,10 @@ import {
   ToMDelegationScorer,
 } from './scorers.js';
 import { ToMDelegationPlanner } from '../tom/index.js';
+import {
+  WeightedReasoningInvestmentModel,
+  type ReasoningInvestmentModel,
+} from '../budget/index.js';
 
 const ARCHETYPE_COST: Record<string, number> = {
   researcher: 2200,
@@ -34,6 +38,7 @@ export interface DelegationCandidatePlannerOptions {
   minimumToMCoverage?: number;
   enabledScorers?: string[];
   llmHooks?: LLMDelegationScorerHooks;
+  investmentModel?: ReasoningInvestmentModel;
 }
 
 export class DefaultDelegationCandidatePlanner {
@@ -41,6 +46,7 @@ export class DefaultDelegationCandidatePlanner {
   private readonly minimumScore: number;
   private readonly minimumToMCoverage: number;
   private readonly tomPlanner = new ToMDelegationPlanner();
+  private readonly investmentModel: ReasoningInvestmentModel;
 
   constructor(options: DelegationCandidatePlannerOptions = {}) {
     const defaultScorers = [
@@ -53,6 +59,7 @@ export class DefaultDelegationCandidatePlanner {
     this.scorers = options.scorers ?? defaultScorers.filter(scorer => !options.enabledScorers || options.enabledScorers.includes(scorer.name));
     this.minimumScore = options.minimumScore ?? 0.05;
     this.minimumToMCoverage = options.minimumToMCoverage ?? 0;
+    this.investmentModel = options.investmentModel ?? new WeightedReasoningInvestmentModel();
   }
 
   async select(input: DelegationCandidateInput): Promise<DelegationCandidateSelection> {
@@ -139,19 +146,76 @@ export class DefaultDelegationCandidatePlanner {
     })));
     return candidates.map(candidate => {
       const breakdown = Object.fromEntries(outputs.map(output => [output.name, Number((output.values.get(candidate.id) ?? 0).toFixed(4))]));
-      const score = Object.values(breakdown).reduce((sum, value) => sum + value, 0);
-      const expectedUtility = Math.max(0, (breakdown.heuristic ?? 0) + (breakdown.tom ?? 0) + (breakdown.cache_evolution ?? 0));
+      const tomCoverage = input.tomAnalysis
+        ? this.tomPlanner.evaluateCoverage(input.tomAnalysis, candidate.agents)
+        : undefined;
+      const investment = this.investmentModel.estimate({
+        kind: 'delegation_candidate',
+        requesterId: candidate.id,
+        parentId: candidate.parentId,
+        purpose: candidate.rationale,
+        resources: {
+          tokens: candidate.expectedCostTokens,
+          contextTokens: Math.min(4000, Math.round(candidate.expectedCostTokens * 0.35)),
+          toolCalls: candidate.agents.reduce((sum, agent) => sum + (agent.tools?.length ?? 0), 0),
+        },
+        signals: {
+          rootUtility: normalizePositive(breakdown.heuristic, Math.max(1, candidate.agents.length * 1.1)),
+          parentUtility: breakdown.llm === undefined ? 0.5 : clamp(breakdown.llm),
+          historicalUtility: normalizePositive(breakdown.cache_evolution, 0.75),
+          evidenceGain: tomCoverage?.coverageScore ?? 0,
+          uncertaintyReduction: tomCoverage?.coverageScore ?? 0,
+          conflictResolution: candidate.agents.some(agent => agent.archetype === 'summarizer' || agent.archetype === 'critic')
+            ? input.tomAnalysis?.signals.conflictLevel ?? 0.35
+            : 0,
+          verificationGain: candidate.agents.some(agent => agent.archetype === 'tester') ? 0.85 : 0,
+          cacheConfidence: candidate.source === 'cache_hit' ? 0.8 : candidate.source === 'mutated_from_cache' ? 0.65 : 0,
+          duplicationRisk: this.duplicationRisk(candidate),
+          executionRisk: this.executionRisk(candidate, input, tomCoverage),
+          confidence: input.tomAnalysis?.confidence ?? 0.62,
+        },
+        metadata: { source: candidate.source, lineage: candidate.lineage },
+      });
+      const normalizedReturn = investment.expectedReturn / (1 + investment.expectedReturn);
+      const score = investment.riskAdjustedUtility * 1.5
+        + normalizedReturn * 0.35
+        + clamp(breakdown.llm ?? 0) * 0.35
+        + normalizePositive(breakdown.cache_evolution, 0.75) * 0.1;
+      breakdown.investment_utility = investment.riskAdjustedUtility;
+      breakdown.investment_cost = -investment.costScore;
+      breakdown.investment_return = Number(normalizedReturn.toFixed(4));
+      breakdown.investment_confidence = investment.confidence;
       const evaluated = {
         ...candidate,
-        tomCoverage: input.tomAnalysis
-          ? this.tomPlanner.evaluateCoverage(input.tomAnalysis, candidate.agents)
-          : undefined,
-        expectedUtility: Number(expectedUtility.toFixed(4)),
+        tomCoverage,
+        investment,
+        expectedUtility: investment.riskAdjustedUtility,
         score: Number(score.toFixed(4)),
         scoreBreakdown: breakdown,
       };
       return { candidate: evaluated, score: evaluated.score, breakdown };
     });
+  }
+
+  private duplicationRisk(candidate: DelegationCandidate): number {
+    if (candidate.agents.length <= 1) return 0;
+    const uniqueArchetypes = new Set(candidate.agents.map(agent => agent.archetype)).size;
+    return clamp(1 - uniqueArchetypes / candidate.agents.length);
+  }
+
+  private executionRisk(
+    candidate: DelegationCandidate,
+    input: DelegationCandidateInput,
+    coverage?: DelegationCandidate['tomCoverage']
+  ): number {
+    const branchRisk = Math.max(0, candidate.agents.length - 1) * 0.12;
+    const uncoveredRisk = input.tomAnalysis && coverage
+      ? 1 - coverage.coverageScore
+      : 0;
+    const budgetRisk = input.budgetMode === 'limited' && input.remainingBudgetTokens !== undefined
+      ? Math.max(0, candidate.expectedCostTokens - input.remainingBudgetTokens) / Math.max(1, input.remainingBudgetTokens)
+      : 0;
+    return clamp(branchRisk + uncoveredRisk * 0.35 + budgetRisk * 0.5);
   }
 
   private createCandidate(
@@ -186,4 +250,12 @@ export class DefaultDelegationCandidatePlanner {
     const merged = Array.from(new Set([...(primary ?? []), ...cachedList]));
     return merged.length > 0 ? merged : undefined;
   }
+}
+
+function clamp(value: number): number {
+  return Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0));
+}
+
+function normalizePositive(value: number | undefined, scale: number): number {
+  return clamp(Math.max(0, value ?? 0) / Math.max(0.01, scale));
 }

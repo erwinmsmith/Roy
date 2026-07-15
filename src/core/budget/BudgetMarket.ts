@@ -1,15 +1,19 @@
 import type { ModelTokenUsage } from '../llm/types.js';
 import { FixedBudgetPolicy, MarketBudgetPolicy, UnlimitedBudgetPolicy } from './policies.js';
+import { WeightedReasoningInvestmentModel } from './utility.js';
 import type {
   BudgetAllocation,
   BudgetAllocationPolicy,
   BudgetLedgerEntry,
   BudgetMarketOptions,
   BudgetMarketState,
+  BudgetOutcome,
+  BudgetOutcomeSummary,
   BudgetPolicyMode,
   BudgetPriority,
   BudgetRebalanceResult,
   BudgetRequest,
+  ReasoningInvestmentModel,
 } from './types.js';
 
 const DEFAULT_WEIGHTS: Record<BudgetPriority, number> = {
@@ -25,9 +29,11 @@ export class BudgetMarket {
   private allocations = new Map<string, BudgetAllocation>();
   private policies = new Map<BudgetPolicyMode, BudgetAllocationPolicy>();
   private ledger: BudgetLedgerEntry[] = [];
+  private outcomeHistory = new Map<string, BudgetOutcomeSummary>();
   private sequence = 0;
   private ledgerSequence = 0;
-  private options: Required<Omit<BudgetMarketOptions, 'priorityWeights'>> & { priorityWeights: Record<BudgetPriority, number> };
+  private options: Required<Omit<BudgetMarketOptions, 'priorityWeights' | 'investmentModel'>> & { priorityWeights: Record<BudgetPriority, number> };
+  private investmentModel: ReasoningInvestmentModel;
 
   constructor(private readonly usedTokens: () => number, options: BudgetMarketOptions = {}) {
     this.options = {
@@ -36,6 +42,7 @@ export class BudgetMarket {
       accountingDimension: options.accountingDimension ?? 'total_tokens',
       priorityWeights: { ...DEFAULT_WEIGHTS, ...options.priorityWeights },
     };
+    this.investmentModel = options.investmentModel ?? new WeightedReasoningInvestmentModel();
     this.registerPolicy(new UnlimitedBudgetPolicy());
     this.registerPolicy(new FixedBudgetPolicy());
     this.registerPolicy(new MarketBudgetPolicy());
@@ -52,6 +59,7 @@ export class BudgetMarket {
       ...options,
       priorityWeights: { ...this.options.priorityWeights, ...options.priorityWeights },
     };
+    if (options.investmentModel) this.investmentModel = options.investmentModel;
   }
 
   request(input: BudgetRequest): BudgetAllocation {
@@ -60,10 +68,14 @@ export class BudgetMarket {
 
   requestMany(inputs: BudgetRequest[]): BudgetAllocation[] {
     if (inputs.length === 0) return [];
-    for (const input of inputs) this.appendLedger('requested', undefined, input.requesterId, input.requestedTokens, { purpose: input.purpose });
+    const enrichedInputs = inputs.map(input => this.enrichRequest(input));
+    for (const input of enrichedInputs) this.appendLedger('requested', undefined, input.requesterId, input.requestedTokens, {
+      purpose: input.purpose,
+      investment: input.investment,
+    });
     const policy = this.policies.get(this.options.mode);
     if (!policy) throw new Error(`Budget policy "${this.options.mode}" is not registered`);
-    const decisions = policy.allocate(inputs, this.policyContext());
+    const decisions = policy.allocate(enrichedInputs, this.policyContext());
     return decisions.map(decision => {
       const now = Date.now();
       const granted = decision.allocatedTokens >= (decision.request.minimumTokens ?? this.options.minimumGrantTokens);
@@ -89,6 +101,8 @@ export class BudgetMarket {
         policy: allocation.policy,
         score: allocation.score,
         rationale: allocation.rationale,
+        expectedReturn: allocation.request.investment?.expectedReturn,
+        riskAdjustedUtility: allocation.request.investment?.riskAdjustedUtility,
       });
       return this.clone(allocation);
     });
@@ -114,9 +128,7 @@ export class BudgetMarket {
     };
     allocation.actualTokens = allocation.consumedTokens;
     allocation.utilization = allocation.allocatedTokens === 0 ? 0 : allocation.consumedTokens / allocation.allocatedTokens;
-    allocation.efficiency = allocation.consumedTokens === 0
-      ? null
-      : (allocation.request.expectedUtility ?? 0.5) / allocation.consumedTokens * 1000;
+    allocation.efficiency = this.efficiency(allocation);
     if (allocation.consumedTokens > allocation.allocatedTokens) allocation.status = 'exceeded';
     allocation.updatedAt = Date.now();
     this.appendLedger('consumed', allocation.id, allocation.request.requesterId, tokens, {
@@ -146,12 +158,39 @@ export class BudgetMarket {
     current.consumedTokens = total;
     current.actualTokens = total;
     current.utilization = current.allocatedTokens === 0 ? 0 : total / current.allocatedTokens;
-    current.efficiency = total === 0 ? null : (current.request.expectedUtility ?? 0.5) / total * 1000;
+    current.efficiency = this.efficiency(current);
     current.status = total > current.allocatedTokens ? 'exceeded' : 'settled';
     current.settledAt = Date.now();
     current.updatedAt = current.settledAt;
     this.appendLedger('settled', current.id, current.request.requesterId, total, { status: current.status });
     return this.clone(current);
+  }
+
+  recordOutcome(allocationId: string, input: BudgetOutcome): BudgetAllocation | undefined {
+    const allocation = this.allocations.get(allocationId);
+    if (!allocation || allocation.status === 'denied') return undefined;
+    if (allocation.outcome) throw new Error(`Budget allocation "${allocationId}" already has a recorded outcome`);
+    allocation.outcome = {
+      ...input,
+      realizedUtility: input.realizedUtility === undefined ? undefined : clamp(input.realizedUtility),
+      quality: input.quality === undefined ? undefined : clamp(input.quality),
+      evidenceGain: input.evidenceGain === undefined ? undefined : clamp(input.evidenceGain),
+      uncertaintyReduction: input.uncertaintyReduction === undefined ? undefined : clamp(input.uncertaintyReduction),
+      conflictResolution: input.conflictResolution === undefined ? undefined : clamp(input.conflictResolution),
+      verificationGain: input.verificationGain === undefined ? undefined : clamp(input.verificationGain),
+      metadata: input.metadata ? { ...input.metadata } : undefined,
+      recordedAt: input.recordedAt ?? Date.now(),
+    };
+    allocation.efficiency = this.efficiency(allocation);
+    allocation.updatedAt = Date.now();
+    this.updateOutcomeHistory(allocation);
+    this.appendLedger('outcome', allocation.id, allocation.request.requesterId, allocation.consumedTokens, {
+      success: allocation.outcome.success,
+      realizedUtility: this.realizedUtility(allocation),
+      efficiency: allocation.efficiency,
+      error: allocation.outcome.error,
+    });
+    return this.clone(allocation);
   }
 
   release(allocationId: string, reason = 'released_without_execution'): BudgetAllocation | undefined {
@@ -217,6 +256,7 @@ export class BudgetMarket {
       availableTokens: this.limitTokens === null ? undefined : Math.max(0, this.limitTokens - usedTokens - reservedTokens),
       accountingDimension: this.options.accountingDimension,
       allocations: [...this.allocations.values()].map(item => this.clone(item)),
+      outcomeHistory: [...this.outcomeHistory.values()].map(item => ({ ...item })),
       ledger: this.ledger.map(item => ({ ...item, data: item.data ? { ...item.data } : undefined })),
     };
   }
@@ -260,6 +300,126 @@ export class BudgetMarket {
     return Math.floor(value);
   }
 
+  private enrichRequest(input: BudgetRequest): BudgetRequest {
+    this.validateRequest(input);
+    const historyKey = this.historyKey(input);
+    const history = this.outcomeHistory.get(historyKey);
+    const resourceEstimate = {
+      tokens: Math.max(0, Math.floor(input.resourceEstimate?.tokens ?? input.requestedTokens)),
+      ...input.resourceEstimate,
+    };
+    const investment = input.investment ?? this.investmentModel.estimate({
+      kind: String(input.metadata?.investmentKind ?? input.purpose),
+      requesterId: input.requesterId,
+      parentId: input.parentId,
+      purpose: input.purpose,
+      resources: resourceEstimate,
+      signals: {
+        rootUtility: input.expectedUtility ?? 0.5,
+        parentUtility: input.expectedUtility ?? 0.5,
+        historicalUtility: numberMetadata(input.metadata?.historicalUtility, history?.averageRealizedUtility ?? 0.5),
+        evidenceGain: numberMetadata(input.metadata?.evidenceGain, 0),
+        uncertaintyReduction: numberMetadata(input.metadata?.uncertaintyReduction, 0),
+        conflictResolution: numberMetadata(input.metadata?.conflictResolution, 0),
+        verificationGain: numberMetadata(input.metadata?.verificationGain, 0),
+        cacheConfidence: numberMetadata(input.metadata?.cacheConfidence, 0),
+        duplicationRisk: numberMetadata(input.metadata?.duplicationRisk, 0),
+        executionRisk: numberMetadata(input.metadata?.executionRisk, 0),
+        confidence: numberMetadata(input.metadata?.confidence, history ? Math.min(0.95, 0.55 + history.count * 0.08) : 0.65),
+      },
+      metadata: input.metadata,
+    });
+    this.validateInvestment(investment);
+    return {
+      ...input,
+      expectedUtility: investment.riskAdjustedUtility,
+      resourceEstimate,
+      investment,
+      metadata: input.metadata ? { ...input.metadata } : undefined,
+    };
+  }
+
+  private validateRequest(input: BudgetRequest): void {
+    if (!input.requesterId?.trim() || !input.parentId?.trim() || !input.purpose?.trim()) {
+      throw new Error('Budget request requesterId, parentId, and purpose must not be empty');
+    }
+    if (!Number.isFinite(input.requestedTokens) || input.requestedTokens < 0) {
+      throw new Error('Budget request requestedTokens must be a non-negative finite number');
+    }
+    if (input.minimumTokens !== undefined && (!Number.isFinite(input.minimumTokens) || input.minimumTokens < 0)) {
+      throw new Error('Budget request minimumTokens must be a non-negative finite number');
+    }
+    if (input.expectedUtility !== undefined && (!Number.isFinite(input.expectedUtility) || input.expectedUtility < 0 || input.expectedUtility > 1)) {
+      throw new Error('Budget request expectedUtility must be between 0 and 1');
+    }
+    for (const [key, value] of Object.entries(input.resourceEstimate ?? {})) {
+      if (value !== undefined && (!Number.isFinite(value) || value < 0)) {
+        throw new Error(`Budget resource estimate ${key} must be a non-negative finite number`);
+      }
+    }
+  }
+
+  private validateInvestment(investment: BudgetRequest['investment']): asserts investment is NonNullable<BudgetRequest['investment']> {
+    if (!investment || !investment.model?.trim()) throw new Error('Reasoning investment model id must not be empty');
+    for (const key of ['expectedUtility', 'riskAdjustedUtility', 'costScore', 'expectedReturn', 'confidence'] as const) {
+      const value = investment[key];
+      if (!Number.isFinite(value) || value < 0 || (key !== 'expectedReturn' && value > 1)) {
+        throw new Error(`Reasoning investment ${key} is invalid`);
+      }
+    }
+  }
+
+  private efficiency(allocation: BudgetAllocation): number | null {
+    if (allocation.consumedTokens === 0) return null;
+    return this.realizedUtility(allocation) / allocation.consumedTokens * 1000;
+  }
+
+  private realizedUtility(allocation: BudgetAllocation): number {
+    const outcome = allocation.outcome;
+    if (!outcome) return allocation.request.investment?.riskAdjustedUtility ?? allocation.request.expectedUtility ?? 0.5;
+    if (outcome.realizedUtility !== undefined) return outcome.realizedUtility;
+    const components = [
+      outcome.quality,
+      outcome.evidenceGain,
+      outcome.uncertaintyReduction,
+      outcome.conflictResolution,
+      outcome.verificationGain,
+    ].filter((value): value is number => value !== undefined);
+    const observed = components.length > 0 ? components.reduce((sum, value) => sum + value, 0) / components.length : undefined;
+    return clamp((observed ?? (outcome.success ? 0.7 : 0.1)) * (outcome.success ? 1 : 0.35));
+  }
+
+  private updateOutcomeHistory(allocation: BudgetAllocation): void {
+    const outcome = allocation.outcome;
+    if (!outcome) return;
+    const key = this.historyKey(allocation.request);
+    const previous = this.outcomeHistory.get(key);
+    const count = (previous?.count ?? 0) + 1;
+    const realized = this.realizedUtility(allocation);
+    const previousUtilityTotal = (previous?.averageRealizedUtility ?? 0) * (previous?.count ?? 0);
+    const previousEfficiencySamples = previous?.efficiencySamples ?? 0;
+    const efficiencySamples = previousEfficiencySamples + (allocation.efficiency === null ? 0 : 1);
+    const previousEfficiencyTotal = (previous?.averageEfficiency ?? 0) * previousEfficiencySamples;
+    this.outcomeHistory.set(key, {
+      key,
+      purpose: allocation.request.purpose,
+      count,
+      successCount: (previous?.successCount ?? 0) + (outcome.success ? 1 : 0),
+      successRate: Number((((previous?.successCount ?? 0) + (outcome.success ? 1 : 0)) / count).toFixed(4)),
+      averageRealizedUtility: Number(((previousUtilityTotal + realized) / count).toFixed(4)),
+      averageEfficiency: allocation.efficiency === null
+        ? previous?.averageEfficiency ?? null
+        : Number(((previousEfficiencyTotal + allocation.efficiency) / efficiencySamples).toFixed(6)),
+      efficiencySamples,
+      lastRecordedAt: outcome.recordedAt ?? Date.now(),
+    });
+  }
+
+  private historyKey(request: BudgetRequest): string {
+    const explicit = request.metadata?.investmentHistoryKey;
+    return typeof explicit === 'string' && explicit.trim() ? explicit.trim() : request.purpose;
+  }
+
   private appendLedger(type: BudgetLedgerEntry['type'], allocationId?: string, requesterId?: string, tokens?: number, data?: Record<string, unknown>): void {
     this.ledger.push({
       id: `budget_event_${Date.now()}_${String(++this.ledgerSequence).padStart(5, '0')}`,
@@ -276,11 +436,32 @@ export class BudgetMarket {
   private clone(allocation: BudgetAllocation): BudgetAllocation {
     return {
       ...allocation,
-      request: { ...allocation.request, metadata: allocation.request.metadata ? { ...allocation.request.metadata } : undefined },
+      request: {
+        ...allocation.request,
+        metadata: allocation.request.metadata ? { ...allocation.request.metadata } : undefined,
+        resourceEstimate: allocation.request.resourceEstimate ? { ...allocation.request.resourceEstimate } : undefined,
+        investment: allocation.request.investment ? {
+          ...allocation.request.investment,
+          components: { ...allocation.request.investment.components },
+          rationale: [...allocation.request.investment.rationale],
+        } : undefined,
+      },
+      outcome: allocation.outcome ? {
+        ...allocation.outcome,
+        metadata: allocation.outcome.metadata ? { ...allocation.outcome.metadata } : undefined,
+      } : undefined,
       usage: allocation.usage ? {
         ...allocation.usage,
         availability: allocation.usage.availability ? { ...allocation.usage.availability } : undefined,
       } : undefined,
     };
   }
+}
+
+function clamp(value: number): number {
+  return Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0));
+}
+
+function numberMetadata(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }

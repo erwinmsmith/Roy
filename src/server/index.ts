@@ -417,6 +417,27 @@ async function main(): Promise<void> {
     }
   });
 
+  app.post('/v1/budget/allocations/:id/outcome', (req, res) => {
+    const body = req.body ?? {};
+    if (typeof body.success !== 'boolean') {
+      res.status(400).json({ error: 'Expected body { success: boolean, realizedUtility?, quality?, evidenceGain?, uncertaintyReduction?, conflictResolution?, verificationGain?, error? }' });
+      return;
+    }
+    const ratios = ['realizedUtility', 'quality', 'evidenceGain', 'uncertaintyReduction', 'conflictResolution', 'verificationGain'];
+    if (ratios.some(key => body[key] !== undefined && (
+      typeof body[key] !== 'number' || !Number.isFinite(body[key]) || body[key] < 0 || body[key] > 1
+    ))) {
+      res.status(400).json({ error: 'Budget outcome utility fields must be finite numbers between 0 and 1' });
+      return;
+    }
+    try {
+      res.json(runtime.recordBudgetOutcome(req.params.id, body));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      res.status(message.includes('not found') ? 404 : 400).json({ error: message });
+    }
+  });
+
   app.post('/v1/budget/rebalance', (_req, res) => {
     res.json(runtime.rebalanceBudgetMarket());
   });

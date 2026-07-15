@@ -98,7 +98,18 @@ export class CacheEvolutionDelegationScorer implements DelegationCandidateScorer
     return new Map(candidates.map(candidate => {
       const similarities = patterns.map(pattern => {
         const signature = String(pattern.taskSignature ?? pattern.signature ?? pattern.description ?? '');
-        return signature ? this.embeddings.similarity(input.task, signature.replaceAll('_', ' ')) : 0;
+        const similarity = signature ? this.embeddings.similarity(input.task, signature.replaceAll('_', ' ')) : 0;
+        const usage = pattern.usage && typeof pattern.usage === 'object'
+          ? pattern.usage as Record<string, unknown>
+          : {};
+        const count = numeric(usage.count);
+        const successCount = numeric(usage.successCount);
+        const averageScore = numeric(usage.averageScore);
+        const confidence = numeric(pattern.confidence);
+        const observedQuality = averageScore > 0
+          ? clamp(averageScore)
+          : count > 0 ? clamp(successCount / count) : clamp(confidence);
+        return similarity * 0.7 + observedQuality * 0.3;
       });
       const similarity = similarities.length > 0 ? Math.max(...similarities) : 0;
       const reuseBonus = candidate.source === 'cache_hit' ? 0.14 : 0;
@@ -106,6 +117,14 @@ export class CacheEvolutionDelegationScorer implements DelegationCandidateScorer
       return [candidate.id, similarity * 0.35 + reuseBonus + mutationBonus];
     }));
   }
+}
+
+function numeric(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+function clamp(value: number): number {
+  return Math.max(0, Math.min(1, value));
 }
 
 interface LLMScoreResponse {

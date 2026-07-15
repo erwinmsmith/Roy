@@ -182,15 +182,19 @@ Agents plan tool use only when the task needs external evidence or execution. To
 
 ## Budget Control
 
-Token metering is always enabled. The default allocation policy is `market`; the session limit may still be unlimited. Agents and teams submit requests with purpose, priority, expected utility, requested tokens, and a minimum viable grant. The selected policy reserves capacity before execution and settles the allocation against provider-reported usage.
+Token metering is always enabled. The default allocation policy is `market`; the session limit may still be unlimited. Agents and teams submit requests with purpose, priority, resource estimates, requested tokens, and a minimum viable grant. A replaceable `ReasoningInvestmentModel` combines root/parent utility, historical outcomes, evidence gain, uncertainty reduction, conflict resolution, verification gain, cache confidence, execution risk, token/context cost, tool calls, and latency into a structured expected-return estimate.
 
 Three replaceable policies are included:
 
 - `unlimited`: grants every valid request while retaining the full ledger.
 - `fixed`: grants in request order from the remaining session supply.
-- `market`: scores competing requests by priority, expected utility, and cost, supports partial grants, and can rebalance active reservations.
+- `market`: scores competing requests by priority, risk-adjusted utility, expected return, confidence, and cost. It performs minimum-viable admission followed by iterative clearing, supports partial grants, and can rebalance active reservations.
+
+Execution can attach a realized outcome to an allocation. Success, quality, evidence gain, uncertainty reduction, conflict resolution, and verification gain update allocation efficiency and purpose-level outcome history. Later requests reuse this history instead of relying only on static archetype values.
 
 Usage is normalized into input, output, total, thinking, cached-input, and cache-creation tokens. OpenAI-compatible providers read reasoning and prompt-cache detail fields when present. Anthropic providers read input/output and cache read/creation fields. A missing thinking count is stored as `null`, never guessed. If a provider returns no usage, a provider/model-family estimator is used and marked `estimated`.
+
+The market is exposed through `GET /v1/budget/market`. External controllers can record observed value with `POST /v1/budget/allocations/:id/outcome`.
 
 Workspace policy is configured in `.roy/config.json`:
 

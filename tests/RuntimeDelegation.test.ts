@@ -157,6 +157,7 @@ describe('Runtime root-controlled delegation', () => {
     expect(eventTypes).toContain('root.synthesis.completed');
     expect(eventTypes).toContain('memory.update.propose.completed');
     expect(eventTypes).toContain('tom.task.analyzed');
+    expect(eventTypes).toContain('tom.signals.collected');
     expect(eventTypes).toContain('tom.gap.identified');
     expect(eventTypes).toContain('tom.delegation.coverage.evaluated');
     expect(eventTypes).toContain('tom.team.profile.created');
@@ -183,6 +184,11 @@ describe('Runtime root-controlled delegation', () => {
       'Critic-2',
     ]));
     expect(result.usage.total.totalTokens).toBeGreaterThan(0);
+    const selectedCandidate = runtime.getEvents().find(event => event.type === 'delegation.candidate.selected');
+    expect(selectedCandidate?.data?.investment).toMatchObject({
+      model: 'weighted_reasoning_investment_v1',
+    });
+    expect(runtime.getEvents().some(event => event.type === 'budget.outcome.recorded')).toBe(true);
 
     await runtime.shutdown();
   });

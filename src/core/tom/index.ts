@@ -12,4 +12,7 @@ export type {
   ToMTargetModel,
   ToMTargetType,
   ToMTaskAnalysis,
+  ToMAnalysisSignals,
+  ToMDelegationEngine,
+  ToMTaskAnalysisInput,
 } from './types.js';
