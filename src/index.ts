@@ -15,6 +15,19 @@ export type {
   RuntimeMessage,
 } from './core/queue/index.js';
 export { WorkspaceMemoryManager } from './core/memory/index.js';
-export { BudgetMarket } from './core/budget/index.js';
+export * from './core/budget/index.js';
+export {
+  AnthropicUsageNormalizer,
+  CharacterTokenEstimator,
+  OpenAICompatibleUsageNormalizer,
+  TokenUsageRegistry,
+  tokenUsageRegistry,
+} from './core/llm/index.js';
+export type {
+  ModelTokenUsage,
+  NormalizedModelTokenUsage,
+  TokenEstimator,
+  TokenUsageNormalizer,
+} from './core/llm/index.js';
 export { toolRegistry } from './core/tools/index.js';
 export { skillRegistry } from './core/skills/index.js';

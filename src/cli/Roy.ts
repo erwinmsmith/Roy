@@ -490,7 +490,8 @@ export class Roy {
       /budget             Show token budget and usage
       /budget set <n>     Set token budget
       /budget unlimited   Remove token budget limit
-      /budget market      Show budget allocations and reservations
+      /budget --market    Show market allocations, usage dimensions, and efficiency
+      /budget rebalance   Re-score active market reservations
       /events             Show recent runtime events
       /events --agent <id> Filter events by agent
       /events --type <type> Filter events by event type
@@ -665,6 +666,8 @@ export class Roy {
     console.log('    GET  /v1/runtime/sessions - Active HTTP runtime sessions');
     console.log('    DELETE /v1/runtime/session - Close the selected HTTP runtime session');
     console.log('    GET  /v1/budget  - Token budget');
+    console.log('    GET  /v1/budget/market - Market state and ledger');
+    console.log('    POST /v1/budget/rebalance - Re-score active allocations');
     console.log('    GET  /v1/events  - Runtime events');
     console.log('    GET  /v1/queue   - Runtime message queue');
     console.log('    GET  /v1/memory  - Workspace memory state');
@@ -686,7 +689,11 @@ export class Roy {
       console.log(`    Budget: ${budget.usedTokens} / ${budget.limitTokens} tokens`);
       console.log(`    Remaining: ${budget.remainingTokens ?? 0} tokens`);
     }
-    console.log('    Thinking Tokens: unavailable');
+    const thinking = Object.values(budget.perAgent).reduce<number | null>((sum, usage) => {
+      if (usage.thinkingTokens === null) return sum;
+      return (sum ?? 0) + usage.thinkingTokens;
+    }, null);
+    console.log(`    Thinking Tokens: ${thinking ?? 'unavailable'}`);
     console.log('\n  ' + this.bold('Per Agent:'));
     for (const agent of runtime.getState().agents) {
       const total = budget.perAgent[agent.identity.id]?.totalTokens ?? 0;
@@ -727,17 +734,39 @@ export class Roy {
       return;
     }
 
-    if (subcommand === 'market') {
+    if (subcommand === 'market' || subcommand === '--market') {
       const market = runtime.getBudgetMarketState();
       console.log('\n  ' + this.bold('Budget Market'));
-      console.log(`    Mode:       ${market.mode}`);
+      console.log(`    Mode:       ${market.policy}`);
+      console.log(`    Limit:      ${market.sessionLimit ?? 'unlimited'}`);
       console.log(`    Used:       ${market.usedTokens}`);
       console.log(`    Reserved:   ${market.reservedTokens}`);
-      console.log(`    Available:  ${market.availableTokens ?? 'unlimited'}`);
+      console.log(`    Remaining:  ${market.availableTokens ?? 'unlimited'}`);
+      console.log(`    Accounting: ${market.accountingDimension}`);
+      console.log('\n  ' + this.bold('Allocations'));
+      console.log('    Actor                  Requested Allocated     Used   Input  Output Thinking   Eff. Status');
       for (const allocation of market.allocations.slice(-10)) {
-        console.log(`    - ${this.cyan(allocation.id)} ${allocation.status} ${allocation.grantedTokens}/${allocation.request.requestedTokens} ${allocation.request.purpose}`);
+        const usage = allocation.usage;
+        const efficiency = allocation.efficiency === null ? '-' : allocation.efficiency.toFixed(3);
+        console.log(
+          `    ${allocation.request.requesterId.slice(0, 22).padEnd(22)} ` +
+          `${String(allocation.request.requestedTokens).padStart(9)} ` +
+          `${String(allocation.allocatedTokens).padStart(9)} ` +
+          `${String(allocation.consumedTokens).padStart(8)} ` +
+          `${String(usage?.inputTokens ?? '-').padStart(7)} ` +
+          `${String(usage?.outputTokens ?? '-').padStart(7)} ` +
+          `${String(usage?.thinkingTokens ?? '-').padStart(8)} ` +
+          `${efficiency.padStart(6)} ${allocation.status}`
+        );
       }
+      console.log(`\n    Ledger entries: ${market.ledger.length}`);
       console.log('');
+      return;
+    }
+
+    if (subcommand === 'rebalance') {
+      const result = runtime.rebalanceBudgetMarket();
+      console.log(`\n  Rebalanced ${result.changed.length} allocation(s); released ${result.releasedTokens} tokens.\n`);
       return;
     }
 

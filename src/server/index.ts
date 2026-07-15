@@ -332,6 +332,95 @@ async function main(): Promise<void> {
     res.json(runtime.getBudgetMarketState());
   });
 
+  app.get('/v1/budget/allocations/:id', (req, res) => {
+    const allocation = runtime.getBudgetAllocation(req.params.id);
+    if (!allocation) {
+      res.status(404).json({ error: `Budget allocation "${req.params.id}" not found` });
+      return;
+    }
+    res.json(allocation);
+  });
+
+  app.post('/v1/budget/allocations', (req, res) => {
+    const body = req.body ?? {};
+    if (typeof body.requesterId !== 'string' || typeof body.parentId !== 'string' ||
+      typeof body.purpose !== 'string' || typeof body.requestedTokens !== 'number') {
+      res.status(400).json({ error: 'Expected body { requesterId, parentId, purpose, requestedTokens, minimumTokens?, priority?, expectedUtility? }' });
+      return;
+    }
+    if (!Number.isFinite(body.requestedTokens) || body.requestedTokens <= 0 ||
+      (body.minimumTokens !== undefined && (!Number.isFinite(body.minimumTokens) || body.minimumTokens < 0)) ||
+      (body.expectedUtility !== undefined && (!Number.isFinite(body.expectedUtility) || body.expectedUtility < 0 || body.expectedUtility > 1)) ||
+      (body.priority !== undefined && !['low', 'medium', 'normal', 'high', 'critical'].includes(body.priority))) {
+      res.status(400).json({ error: 'Budget request values or priority are invalid' });
+      return;
+    }
+    try {
+      res.status(201).json(runtime.allocateBudget(body));
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post('/v1/budget/allocations/batch', (req, res) => {
+    const requests = req.body?.requests;
+    if (!Array.isArray(requests) || requests.length === 0 || requests.some(item =>
+      !item || typeof item.requesterId !== 'string' || typeof item.parentId !== 'string' ||
+      typeof item.purpose !== 'string' || typeof item.requestedTokens !== 'number' ||
+      !Number.isFinite(item.requestedTokens) || item.requestedTokens <= 0
+    )) {
+      res.status(400).json({ error: 'Expected body { "requests": BudgetRequest[] } with valid positive requestedTokens' });
+      return;
+    }
+    try {
+      res.status(201).json(runtime.allocateBudgets(requests));
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post('/v1/budget/allocations/:id/consume', (req, res) => {
+    const usage = req.body?.usage ?? req.body?.tokens;
+    if (typeof usage !== 'number' && (!usage || typeof usage !== 'object')) {
+      res.status(400).json({ error: 'Expected body { "tokens": number } or { "usage": ModelTokenUsage }' });
+      return;
+    }
+    if (typeof usage === 'number' && (!Number.isFinite(usage) || usage < 0)) {
+      res.status(400).json({ error: 'Consumed tokens must be a non-negative finite number' });
+      return;
+    }
+    try {
+      res.json(runtime.consumeBudget(req.params.id, usage));
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post('/v1/budget/allocations/:id/settle', (req, res) => {
+    const usage = req.body?.usage ?? req.body?.tokens;
+    if (typeof usage !== 'number' && (!usage || typeof usage !== 'object')) {
+      res.status(400).json({ error: 'Expected body { "tokens": number } or { "usage": ModelTokenUsage }' });
+      return;
+    }
+    try {
+      res.json(runtime.settleBudget(req.params.id, usage));
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post('/v1/budget/allocations/:id/release', (req, res) => {
+    try {
+      res.json(runtime.releaseBudget(req.params.id, typeof req.body?.reason === 'string' ? req.body.reason : undefined));
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post('/v1/budget/rebalance', (_req, res) => {
+    res.json(runtime.rebalanceBudgetMarket());
+  });
+
   app.get('/v1/cache/:kind', async (req, res) => {
     const kind = req.params.kind;
     if (kind === 'evolution') {

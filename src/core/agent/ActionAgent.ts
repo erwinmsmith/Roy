@@ -76,7 +76,7 @@ Return a JSON object with:
     ];
 
     try {
-      const response = await this.llm.completeJSON<{
+      const response = await this.completeJSONWithAccounting<{
         action: string;
         params: Record<string, unknown>;
       }>(messages);

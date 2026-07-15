@@ -91,7 +91,7 @@ Workspace policy is stored in `.roy/config.json`:
 }
 ```
 
-Existing workspace configs are migrated to schema version 3 without discarding user overrides.
+Existing workspace configs are migrated to schema version 4 without discarding user overrides.
 
 ## Core Architecture
 
@@ -180,7 +180,39 @@ Agents plan tool use only when the task needs external evidence or execution. To
 
 ## Budget Control
 
-Token metering is always enabled. Without a configured limit, the budget is unlimited. With a limit, the budget market reserves tokens before agent creation, grants or denies requests, and settles allocations against actual usage.
+Token metering is always enabled. The default allocation policy is `market`; the session limit may still be unlimited. Agents and teams submit requests with purpose, priority, expected utility, requested tokens, and a minimum viable grant. The selected policy reserves capacity before execution and settles the allocation against provider-reported usage.
+
+Three replaceable policies are included:
+
+- `unlimited`: grants every valid request while retaining the full ledger.
+- `fixed`: grants in request order from the remaining session supply.
+- `market`: scores competing requests by priority, expected utility, and cost, supports partial grants, and can rebalance active reservations.
+
+Usage is normalized into input, output, total, thinking, cached-input, and cache-creation tokens. OpenAI-compatible providers read reasoning and prompt-cache detail fields when present. Anthropic providers read input/output and cache read/creation fields. A missing thinking count is stored as `null`, never guessed. If a provider returns no usage, a provider/model-family estimator is used and marked `estimated`.
+
+Workspace policy is configured in `.roy/config.json`:
+
+```json
+{
+  "budgetMarket": {
+    "enabled": true,
+    "mode": "market",
+    "minimumGrantTokens": 256,
+    "accountingDimension": "total_tokens",
+    "rebalanceOnRequest": false,
+    "defaultPriority": "medium",
+    "priorityWeights": {
+      "low": 0.6,
+      "medium": 1,
+      "normal": 1,
+      "high": 1.5,
+      "critical": 2.2
+    }
+  }
+}
+```
+
+`accountingDimension` can be `total_tokens`, `output_tokens`, or `thinking_tokens`. When a model does not report thinking tokens, thinking-based accounting falls back to total tokens rather than fabricating a reasoning count.
 
 The runtime enforces:
 
@@ -257,7 +289,8 @@ The package also exposes `roy/runtime`, `roy/team`, `roy/tom`, `roy/communicatio
 /team add <teamId> researcher "Inspect the project structure"
 /team run <teamId> "Analyze the project architecture"
 /budget
-/budget market
+/budget --market
+/budget rebalance
 /events --latest 50
 /messages --correlation <id>
 /context render researcher --task "Inspect the repository"
@@ -299,6 +332,13 @@ GET  /v1/runtime/sessions
 DELETE /v1/runtime/session
 GET  /v1/budget
 GET  /v1/budget/market
+GET  /v1/budget/allocations/:id
+POST /v1/budget/allocations
+POST /v1/budget/allocations/batch
+POST /v1/budget/allocations/:id/consume
+POST /v1/budget/allocations/:id/settle
+POST /v1/budget/allocations/:id/release
+POST /v1/budget/rebalance
 GET  /v1/cache/:kind
 GET  /v1/events
 GET  /v1/messages
@@ -317,7 +357,7 @@ GET  /v1/traces
 
 ## Validation
 
-The test suite covers root-controlled and recursive delegation, strict nested FSM transitions, context boundaries, subteam lifecycle, candidate scoring, cache mutation, budget allocation, tool approval, memory persistence, queue transitions, and CLI-facing runtime behavior.
+The test suite covers root-controlled and recursive delegation, strict nested FSM transitions, context boundaries, subteam lifecycle, candidate scoring, cache mutation, competitive budget allocation and rebalancing, provider-specific token normalization, tool approval, memory persistence, queue transitions, and CLI-facing runtime behavior.
 
 ## Contact
 

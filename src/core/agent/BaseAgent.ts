@@ -1,6 +1,12 @@
 // Base Agent interface and implementation
 
-import type { LLMProvider, LLMMessage, LLMCompletionResult, LLMStreamChunk } from '../llm/types.js';
+import type {
+  LLMProvider,
+  LLMMessage,
+  LLMCompletionOptions,
+  LLMCompletionResult,
+  LLMStreamChunk,
+} from '../llm/types.js';
 import type { MessageQueue } from '../message/MessageQueue.js';
 import type { FSM } from '../executor/FSM.js';
 import type { Action } from '../actions/Action.js';
@@ -39,6 +45,11 @@ export interface AgentUsage {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  thinkingTokens?: number | null;
+  cachedInputTokens?: number | null;
+  cacheCreationInputTokens?: number | null;
 }
 
 export interface AgentConfig {
@@ -98,6 +109,11 @@ export abstract class BaseAgent implements AgentTraceReceiver {
     promptTokens: 0,
     completionTokens: 0,
     totalTokens: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    thinkingTokens: null,
+    cachedInputTokens: null,
+    cacheCreationInputTokens: null,
   };
   protected messageQueue?: MessageQueue;
   protected shortTermMemory!: ReturnType<typeof memoryRegistry.getShortTerm>;
@@ -112,6 +128,7 @@ export abstract class BaseAgent implements AgentTraceReceiver {
   protected error?: string;
   private systemTraces: MultiPartyTrace[] = [];
   private communicationContext?: AgentCommunicationContext;
+  private completionTokenLimit?: number;
 
   constructor(config: AgentConfig) {
     this.id = config.id ?? (config.role === 'root' || !config.role ? 'root' : config.name);
@@ -253,6 +270,20 @@ export abstract class BaseAgent implements AgentTraceReceiver {
     this.usage.promptTokens += result.usage.promptTokens;
     this.usage.completionTokens += result.usage.completionTokens;
     this.usage.totalTokens += result.usage.totalTokens;
+    this.usage.inputTokens = (this.usage.inputTokens ?? 0) + (result.usage.inputTokens ?? result.usage.promptTokens);
+    this.usage.outputTokens = (this.usage.outputTokens ?? 0) + (result.usage.outputTokens ?? result.usage.completionTokens);
+    if (result.usage.thinkingTokens !== null && result.usage.thinkingTokens !== undefined) {
+      this.usage.thinkingTokens = (this.usage.thinkingTokens ?? 0) + result.usage.thinkingTokens;
+    }
+    if (result.usage.cachedInputTokens !== null && result.usage.cachedInputTokens !== undefined) {
+      this.usage.cachedInputTokens = (this.usage.cachedInputTokens ?? 0) + result.usage.cachedInputTokens;
+    }
+    if (result.usage.cacheCreationInputTokens !== null && result.usage.cacheCreationInputTokens !== undefined) {
+      this.usage.cacheCreationInputTokens = (this.usage.cacheCreationInputTokens ?? 0) + result.usage.cacheCreationInputTokens;
+    }
+    if (this.completionTokenLimit !== undefined) {
+      this.completionTokenLimit = Math.max(1, this.completionTokenLimit - result.usage.totalTokens);
+    }
     this.updatedAt = Date.now();
   }
 
@@ -262,6 +293,62 @@ export abstract class BaseAgent implements AgentTraceReceiver {
   recordRuntimeCompletion(content: string, result: LLMCompletionResult | LLMStreamChunk): void {
     this.recordUsage(result);
     this.addToMemory('result', content);
+  }
+
+  /** Record a control-plane LLM call without treating its JSON as conversational memory. */
+  recordRuntimeUsage(result: LLMCompletionResult | LLMStreamChunk): void {
+    this.recordUsage(result);
+  }
+
+  setCompletionTokenLimit(limit?: number): void {
+    this.completionTokenLimit = limit === undefined ? undefined : Math.max(1, Math.floor(limit));
+  }
+
+  protected completionOptions(options: LLMCompletionOptions = {}): LLMCompletionOptions {
+    if (this.completionTokenLimit === undefined) return options;
+    return {
+      ...options,
+      maxTokens: options.maxTokens === undefined
+        ? this.completionTokenLimit
+        : Math.min(options.maxTokens, this.completionTokenLimit),
+    };
+  }
+
+  protected async completeJSONWithAccounting<T>(messages: LLMMessage[], options: LLMCompletionOptions = {}): Promise<T> {
+    if (!this.llm) throw new Error(`Agent ${this.name} has no LLM configured`);
+    const bounded = this.completionOptions(options);
+    if (this.llm.completeJSONWithUsage) {
+      const result = await this.llm.completeJSONWithUsage<T>(messages, bounded);
+      this.recordUsage(result.completion);
+      return result.value;
+    }
+    const value = await this.llm.completeJSON<T>(messages, bounded);
+    const promptTokens = Math.ceil(messages.map(message => `${message.role}:${message.content}`).join('\n').length / 4);
+    const completionTokens = Math.ceil(JSON.stringify(value).length / 4);
+    this.recordUsage({
+      content: JSON.stringify(value),
+      usage: {
+        promptTokens,
+        completionTokens,
+        totalTokens: promptTokens + completionTokens,
+        inputTokens: promptTokens,
+        outputTokens: completionTokens,
+        thinkingTokens: null,
+        cachedInputTokens: null,
+        cacheCreationInputTokens: null,
+        provider: this.llm.name,
+        model: this.llm.defaultModel,
+        source: 'estimated',
+        availability: {
+          input: 'estimated',
+          output: 'estimated',
+          thinking: 'unavailable',
+          cachedInput: 'unavailable',
+          cacheCreationInput: 'unavailable',
+        },
+      },
+    });
+    return value;
   }
 
   /**

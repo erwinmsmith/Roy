@@ -26,6 +26,14 @@
       "types": "./dist/core/communication/index.d.ts",
       "import": "./dist/core/communication/index.js"
     },
+    "./budget": {
+      "types": "./dist/core/budget/index.d.ts",
+      "import": "./dist/core/budget/index.js"
+    },
+    "./llm": {
+      "types": "./dist/core/llm/index.d.ts",
+      "import": "./dist/core/llm/index.js"
+    },
     "./queue": {
       "types": "./dist/core/queue/index.d.ts",
       "import": "./dist/core/queue/index.js"

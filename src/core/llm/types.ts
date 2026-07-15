@@ -14,13 +14,51 @@ export interface LLMCompletionOptions {
   stream?: boolean;
 }
 
+export type TokenMetricAvailability = 'reported' | 'estimated' | 'unavailable';
+
+/** Canonical token accounting shared by every provider and the budget system. */
+export interface ModelTokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  thinkingTokens?: number | null;
+  cachedInputTokens?: number | null;
+  cacheCreationInputTokens?: number | null;
+  provider?: string;
+  model?: string;
+  source?: 'provider' | 'estimated';
+  availability?: {
+    input: TokenMetricAvailability;
+    output: TokenMetricAvailability;
+    thinking: TokenMetricAvailability;
+    cachedInput: TokenMetricAvailability;
+    cacheCreationInput: TokenMetricAvailability;
+  };
+}
+
+export interface NormalizedModelTokenUsage extends ModelTokenUsage {
+  inputTokens: number;
+  outputTokens: number;
+  thinkingTokens: number | null;
+  cachedInputTokens: number | null;
+  cacheCreationInputTokens: number | null;
+  provider?: string;
+  model?: string;
+  source: 'provider' | 'estimated';
+  availability: {
+    input: TokenMetricAvailability;
+    output: TokenMetricAvailability;
+    thinking: TokenMetricAvailability;
+    cachedInput: TokenMetricAvailability;
+    cacheCreationInput: TokenMetricAvailability;
+  };
+}
+
 export interface LLMCompletionResult {
   content: string;
-  usage?: {
-    promptTokens: number;
-    completionTokens: number;
-    totalTokens: number;
-  };
+  usage?: ModelTokenUsage;
   model?: string;
   finishReason?: string;
 }
@@ -28,11 +66,12 @@ export interface LLMCompletionResult {
 export interface LLMStreamChunk {
   content: string;
   done: boolean;
-  usage?: {
-    promptTokens: number;
-    completionTokens: number;
-    totalTokens: number;
-  };
+  usage?: ModelTokenUsage;
+}
+
+export interface LLMJSONCompletionResult<T> {
+  value: T;
+  completion: LLMCompletionResult;
 }
 
 /**
@@ -66,6 +105,12 @@ export interface LLMProvider {
     messages: LLMMessage[],
     options?: LLMCompletionOptions
   ): Promise<T>;
+
+  /** Optional richer JSON API used when callers need provider token accounting. */
+  completeJSONWithUsage?<T>(
+    messages: LLMMessage[],
+    options?: LLMCompletionOptions
+  ): Promise<LLMJSONCompletionResult<T>>;
 
   /**
    * Check if the provider is configured

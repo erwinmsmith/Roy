@@ -368,7 +368,7 @@ Tool-use policy:
     ];
 
     try {
-      const response = await this.llm!.completeJSON<{
+      const response = await this.completeJSONWithAccounting<{
         action: string;
         params: Record<string, unknown>;
         reasoning?: string;
@@ -498,7 +498,7 @@ Tool-use policy:
       let fullResponse = '';
       this.state = 'synthesizing';
 
-      for await (const chunk of this.llm!.stream(messages)) {
+      for await (const chunk of this.llm!.stream(messages, this.completionOptions())) {
         if (chunk.usage) {
           this.recordUsage(chunk);
         }

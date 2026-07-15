@@ -6,8 +6,22 @@ export type {
   LLMCompletionOptions,
   LLMCompletionResult,
   LLMStreamChunk,
+  LLMJSONCompletionResult,
   ProviderConfig,
+  ModelTokenUsage,
+  NormalizedModelTokenUsage,
+  TokenMetricAvailability,
 } from './types.js';
+
+export {
+  AnthropicUsageNormalizer,
+  CharacterTokenEstimator,
+  OpenAICompatibleUsageNormalizer,
+  TokenUsageRegistry,
+  emptyModelTokenUsage,
+  tokenUsageRegistry,
+} from './usage.js';
+export type { TokenEstimator, TokenUsageNormalizationInput, TokenUsageNormalizer } from './usage.js';
 
 export { AnthropicProvider, createAnthropicProvider } from './providers/anthropic.js';
 export { OpenAIProvider, DeepSeekProvider, createOpenAIProvider, createDeepSeekProvider } from './providers/openai.js';

@@ -7,8 +7,10 @@ import type {
   LLMCompletionOptions,
   LLMCompletionResult,
   LLMStreamChunk,
+  LLMJSONCompletionResult,
   ProviderConfig,
 } from '../types.js';
+import { tokenUsageRegistry } from '../usage.js';
 
 export class AnthropicProvider implements LLMProvider {
   readonly name = 'anthropic';
@@ -59,11 +61,7 @@ export class AnthropicProvider implements LLMProvider {
 
     return {
       content: response.content[0].type === 'text' ? response.content[0].text : '',
-      usage: {
-        promptTokens: response.usage.input_tokens,
-        completionTokens: response.usage.output_tokens,
-        totalTokens: response.usage.input_tokens + response.usage.output_tokens,
-      },
+      usage: tokenUsageRegistry.normalize({ provider: this.name, model, usage: response.usage, messages, output: response.content[0].type === 'text' ? response.content[0].text : '' }),
       model,
       finishReason: response.stop_reason ?? undefined,
     };
@@ -92,8 +90,6 @@ export class AnthropicProvider implements LLMProvider {
       })),
     });
 
-    let totalUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
-
     for await (const event of stream) {
       if (event.type === 'content_block_delta') {
         if (event.delta.type === 'text_delta') {
@@ -102,21 +98,15 @@ export class AnthropicProvider implements LLMProvider {
             done: false,
           };
         }
-      } else if (event.type === 'message_delta') {
-        if (event.usage && event.usage.input_tokens !== null && event.usage.output_tokens !== null) {
-          totalUsage = {
-            promptTokens: event.usage.input_tokens,
-            completionTokens: event.usage.output_tokens,
-            totalTokens: event.usage.input_tokens + event.usage.output_tokens,
-          };
-        }
       }
     }
+
+    const finalMessage = await stream.finalMessage();
 
     yield {
       content: '',
       done: true,
-      usage: totalUsage,
+      usage: tokenUsageRegistry.normalize({ provider: this.name, model, usage: finalMessage.usage, messages }),
     };
   }
 
@@ -124,9 +114,16 @@ export class AnthropicProvider implements LLMProvider {
     messages: LLMMessage[],
     options?: LLMCompletionOptions
   ): Promise<T> {
+    return (await this.completeJSONWithUsage<T>(messages, options)).value;
+  }
+
+  async completeJSONWithUsage<T>(
+    messages: LLMMessage[],
+    options?: LLMCompletionOptions
+  ): Promise<LLMJSONCompletionResult<T>> {
     const result = await this.complete(messages, options);
     try {
-      return JSON.parse(result.content) as T;
+      return { value: JSON.parse(result.content) as T, completion: result };
     } catch {
       throw new Error(`Failed to parse JSON response: ${result.content}`);
     }

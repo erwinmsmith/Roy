@@ -3,7 +3,7 @@ import { mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Runtime from '../src/core/runtime/Runtime.js';
-import type { LLMProvider, LLMMessage, LLMCompletionOptions, LLMCompletionResult, LLMStreamChunk } from '../src/core/llm/types.js';
+import type { LLMProvider, LLMMessage, LLMCompletionOptions, LLMCompletionResult, LLMJSONCompletionResult, LLMStreamChunk } from '../src/core/llm/types.js';
 
 class EchoLLM implements LLMProvider {
   readonly name = 'echo-test';
@@ -35,6 +35,11 @@ class EchoLLM implements LLMProvider {
 
   async completeJSON<T>(_messages: LLMMessage[], _options?: LLMCompletionOptions): Promise<T> {
     return { action: 'none', params: {} } as T;
+  }
+
+  async completeJSONWithUsage<T>(messages: LLMMessage[], options?: LLMCompletionOptions): Promise<LLMJSONCompletionResult<T>> {
+    const value = await this.completeJSON<T>(messages, options);
+    return { value, completion: { content: JSON.stringify(value), usage: { promptTokens: 3, completionTokens: 1, totalTokens: 4 } } };
   }
 
   isConfigured(): boolean {
@@ -71,11 +76,11 @@ describe('Runtime controlled subagent spawning', () => {
 
     const result = await runtime.runAgent(spawned.identity.id, 'Check token accounting');
     expect(result.result).toBe('subagent result');
-    expect(result.usage.totalTokens).toBe(9);
+    expect(result.usage.totalTokens).toBe(13);
 
     const budget = runtime.getBudgetState();
-    expect(budget.usedTokens).toBe(9);
-    expect(budget.perAgent[spawned.identity.id].totalTokens).toBe(9);
+    expect(budget.usedTokens).toBe(13);
+    expect(budget.perAgent[spawned.identity.id].totalTokens).toBe(13);
 
     const eventTypes = runtime.getEvents().map(event => event.type);
     expect(eventTypes).toContain('agent.spawned');
@@ -120,12 +125,14 @@ describe('Runtime controlled subagent spawning', () => {
       'tool.result',
       'agent.result',
       'root.synthesis',
+      'budget.request',
+      'budget.grant',
       'root.final_response',
     ]);
 
     const budget = runtime.getBudgetState();
     expect(budget.perAgent.root.totalTokens).toBe(9);
-    expect(budget.perAgent[result.agent.identity.id].totalTokens).toBe(9);
+    expect(budget.perAgent[result.agent.identity.id].totalTokens).toBe(13);
 
     const eventTypes = runtime.getEvents().map(event => event.type);
     expect(eventTypes).toContain('root.synthesis.started');

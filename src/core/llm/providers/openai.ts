@@ -7,8 +7,10 @@ import type {
   LLMCompletionOptions,
   LLMCompletionResult,
   LLMStreamChunk,
+  LLMJSONCompletionResult,
   ProviderConfig,
 } from '../types.js';
+import { tokenUsageRegistry } from '../usage.js';
 
 export class OpenAIProvider implements LLMProvider {
   readonly name: string;
@@ -61,11 +63,7 @@ export class OpenAIProvider implements LLMProvider {
     const choice = response.choices[0];
     return {
       content: choice.message.content || '',
-      usage: response.usage ? {
-        promptTokens: response.usage.prompt_tokens,
-        completionTokens: response.usage.completion_tokens,
-        totalTokens: response.usage.total_tokens,
-      } : undefined,
+      usage: tokenUsageRegistry.normalize({ provider: this.name, model, usage: response.usage, messages, output: choice.message.content || '' }),
       model,
       finishReason: choice.finish_reason ?? undefined,
     };
@@ -95,18 +93,12 @@ export class OpenAIProvider implements LLMProvider {
       stream_options: { include_usage: true },
     });
 
-    let totalUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+    let rawUsage: unknown;
 
     for await (const chunk of stream) {
       const content = chunk.choices[0]?.delta?.content || '';
 
-      if (chunk.usage) {
-        totalUsage = {
-          promptTokens: chunk.usage.prompt_tokens,
-          completionTokens: chunk.usage.completion_tokens,
-          totalTokens: chunk.usage.total_tokens,
-        };
-      }
+      if (chunk.usage) rawUsage = chunk.usage;
 
       if (content) {
         yield {
@@ -119,7 +111,7 @@ export class OpenAIProvider implements LLMProvider {
     yield {
       content: '',
       done: true,
-      usage: totalUsage,
+      usage: tokenUsageRegistry.normalize({ provider: this.name, model, usage: rawUsage, messages }),
     };
   }
 
@@ -127,6 +119,13 @@ export class OpenAIProvider implements LLMProvider {
     messages: LLMMessage[],
     options?: LLMCompletionOptions
   ): Promise<T> {
+    return (await this.completeJSONWithUsage<T>(messages, options)).value;
+  }
+
+  async completeJSONWithUsage<T>(
+    messages: LLMMessage[],
+    options?: LLMCompletionOptions
+  ): Promise<LLMJSONCompletionResult<T>> {
     if (!this.client) {
       throw new Error('OpenAI provider not configured');
     }
@@ -146,7 +145,15 @@ export class OpenAIProvider implements LLMProvider {
 
     const content = response.choices[0].message.content || '';
     try {
-      return JSON.parse(content) as T;
+      return {
+        value: JSON.parse(content) as T,
+        completion: {
+          content,
+          usage: tokenUsageRegistry.normalize({ provider: this.name, model, usage: response.usage, messages, output: content }),
+          model,
+          finishReason: response.choices[0].finish_reason ?? undefined,
+        },
+      };
     } catch {
       throw new Error(`Failed to parse JSON response: ${content}`);
     }

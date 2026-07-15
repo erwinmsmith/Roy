@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Runtime, { type DelegationDecision } from '../src/core/runtime/Runtime.js';
 import { InvalidTeamTransitionError, TeamRegistry } from '../src/core/team/index.js';
-import type { LLMCompletionOptions, LLMCompletionResult, LLMMessage, LLMProvider, LLMStreamChunk } from '../src/core/llm/types.js';
+import type { LLMCompletionOptions, LLMCompletionResult, LLMJSONCompletionResult, LLMMessage, LLMProvider, LLMStreamChunk } from '../src/core/llm/types.js';
 
 class TeamTestLLM implements LLMProvider {
   readonly name = 'team-test';
@@ -32,6 +32,11 @@ class TeamTestLLM implements LLMProvider {
       return { action: 'solve_directly', reason: 'The assigned team member task is bounded.' } satisfies DelegationDecision as T;
     }
     return {} as T;
+  }
+
+  async completeJSONWithUsage<T>(messages: LLMMessage[], options?: LLMCompletionOptions): Promise<LLMJSONCompletionResult<T>> {
+    const value = await this.completeJSON<T>(messages);
+    return { value, completion: { content: JSON.stringify(value), usage: { promptTokens: 4, completionTokens: 1, totalTokens: 5 } } };
   }
 
   isConfigured(): boolean {
@@ -101,9 +106,9 @@ describe('Phase 3 subteam runtime', () => {
     expect(result.team.memberAgentIds).toHaveLength(3);
     expect(result.team.leadAgentId).toBe(result.team.memberAgentIds[0]);
     expect(result.result).toContain('AnalysisTeam consolidated');
-    expect(result.usage.totalTokens).toBe(120);
+    expect(result.usage.totalTokens).toBe(135);
     expect(result.team.synthesisUsage.totalTokens).toBe(30);
-    expect(Object.values(result.team.memberUsage).map(usage => usage.totalTokens)).toEqual([30, 30, 30]);
+    expect(Object.values(result.team.memberUsage).map(usage => usage.totalTokens)).toEqual([35, 35, 35]);
 
     const tree = runtime.getTeamTree(team.identity.id);
     expect(tree?.team.identity.parentAgentId).toBe('root');
@@ -129,8 +134,8 @@ describe('Phase 3 subteam runtime', () => {
     expect(runtime.getEvents().find(event => event.type === 'team.context.loaded')?.agentId).toBe(team.identity.id);
 
     const budget = runtime.getBudgetState();
-    expect(budget.perTeam[team.identity.id].totalTokens).toBe(120);
-    expect(budget.perAgent[result.team.memberAgentIds[0]].totalTokens).toBe(30);
+    expect(budget.perTeam[team.identity.id].totalTokens).toBe(135);
+    expect(budget.perAgent[result.team.memberAgentIds[0]].totalTokens).toBe(35);
 
     const topology = JSON.parse(await readFile(path.join(cwd, '.roy', 'teams', 'analysisteam', 'topology.json'), 'utf8')) as {
       status: string;
@@ -153,18 +158,18 @@ describe('Phase 3 subteam runtime', () => {
     expect(patterns.patterns[0].members[0].tools).toEqual(['fs.list', 'fs.read']);
     expect(patterns.patterns[0].members[0].skills).toContain('delegate_to_subagent');
     expect(patterns.patterns[0].usage.completedCount).toBe(1);
-    expect(patterns.patterns[0].usage.averageTokens).toBe(120);
+    expect(patterns.patterns[0].usage.averageTokens).toBe(135);
 
     const rerun = await runtime.runTeam(team.identity.id, 'Re-run the architecture review with the same members.');
     expect(rerun.correlationId).not.toBe(result.correlationId);
     expect(rerun.team.memberAgentIds).toEqual(result.team.memberAgentIds);
     expect(rerun.team.status).toBe('done');
-    expect(rerun.usage.totalTokens).toBe(120);
-    expect(rerun.team.tokenUsage.totalTokens).toBe(240);
+    expect(rerun.usage.totalTokens).toBe(135);
+    expect(rerun.team.tokenUsage.totalTokens).toBe(270);
     const updatedPatterns = await runtime.getCachePatterns('teams');
     const updatedUsage = updatedPatterns[0].usage as { completedCount: number; averageTokens: number };
     expect(updatedUsage.completedCount).toBe(2);
-    expect(updatedUsage.averageTokens).toBe(120);
+    expect(updatedUsage.averageTokens).toBe(135);
     expect(updatedPatterns[0].status).toBe('active');
 
     await runtime.shutdown();
@@ -357,7 +362,7 @@ describe('Phase 3 subteam runtime', () => {
       members: [{ archetype: 'summarizer', task: 'Summarize the bounded input.', budgetTokens: 40 }],
     });
     await runtime.runTeam(team.identity.id, 'Create the initial bounded summary.');
-    runtime.setBudget(150);
+    runtime.setBudget(runtime.getBudgetState().usedTokens + 50);
     await expect(runtime.runTeam(team.identity.id, 'Summarize the bounded input again.'))
       .rejects.toThrow('Team synthesis rejected: insufficient_remaining_budget');
 

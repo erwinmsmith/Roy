@@ -132,6 +132,8 @@ describe('delegate_to_subagent skill', () => {
       'tool.result',
       'agent.result',
       'root.synthesis',
+      'budget.request',
+      'budget.grant',
       'root.final_response',
     ]);
     expect(messages.find(message => message.kind === 'agent.create.request')?.payload).toMatchObject({

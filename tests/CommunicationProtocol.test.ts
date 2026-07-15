@@ -12,10 +12,32 @@ import {
 } from '../src/core/communication/index.js';
 import type { RuntimeMessage } from '../src/core/queue/index.js';
 import { Runtime } from '../src/core/runtime/Runtime.js';
+import type {
+  LLMCompletionOptions,
+  LLMCompletionResult,
+  LLMMessage,
+  LLMProvider,
+  LLMStreamChunk,
+} from '../src/core/llm/types.js';
 
 class TraceAgent extends BaseAgent {
   async step(_observation: string): Promise<void> {}
   async run(): Promise<void> {}
+}
+
+class CommunicationTestLLM implements LLMProvider {
+  readonly name = 'communication-test';
+  readonly defaultModel = 'test-model';
+  async complete(): Promise<LLMCompletionResult> {
+    return { content: 'ok', usage: { promptTokens: 2, completionTokens: 1, totalTokens: 3 } };
+  }
+  async *stream(_messages: LLMMessage[], _options?: LLMCompletionOptions): AsyncGenerator<LLMStreamChunk> {
+    yield { content: 'Roy response.', done: true, usage: { promptTokens: 3, completionTokens: 2, totalTokens: 5 } };
+  }
+  async completeJSON<T>(): Promise<T> {
+    return { action: 'solve_directly', reason: 'Simple protocol test.' } as T;
+  }
+  isConfigured(): boolean { return true; }
 }
 
 const message = (protocol = 'tom'): RuntimeMessage => ({
@@ -121,7 +143,7 @@ describe('agent communication protocols', () => {
     const cwd = await mkdtemp(path.join(tmpdir(), 'roy-communication-runtime-'));
     const runtime = new Runtime();
     runtimes.push(runtime);
-    await runtime.initialize({ workspaceCwd: cwd, sessionId: 'communication-live' });
+    await runtime.initialize({ workspaceCwd: cwd, sessionId: 'communication-live', llmProvider: new CommunicationTestLLM() });
 
     await runtime.handleUserTurn('Who are you?');
     expect(runtime.getContext().agent.getCommunicationContext()?.protocolId).toBe('tom');

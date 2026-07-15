@@ -6,7 +6,13 @@ import { createHash } from 'node:crypto';
 import { config } from '../../config/index.js';
 import { logger } from '../utils/logger.js';
 import { configureLogging, shutdownLogging } from '../logging/index.js';
-import { llmFactory, type LLMProvider } from '../llm/index.js';
+import {
+  llmFactory,
+  type LLMCompletionOptions,
+  type LLMMessage,
+  type LLMProvider,
+  type ModelTokenUsage,
+} from '../llm/index.js';
 import { AgentManager } from './AgentManager.js';
 import { FSM } from '../executor/FSM.js';
 import { signalBus } from '../executor/SignalBus.js';
@@ -37,7 +43,14 @@ import {
   type MultiPartyTrace,
 } from '../communication/index.js';
 import { ContextWindowManager, type ContextWindow } from '../context/index.js';
-import { BudgetMarket, type BudgetAllocation, type BudgetMarketState } from '../budget/index.js';
+import {
+  BudgetMarket,
+  type BudgetAllocation,
+  type BudgetMarketState,
+  type BudgetPriority,
+  type BudgetRebalanceResult,
+  type BudgetRequest,
+} from '../budget/index.js';
 import {
   executeTeamItems,
   normalizeTeamExecutionPolicy,
@@ -106,7 +119,11 @@ export interface RuntimeContext {
 }
 
 export interface TokenUsage extends AgentUsage {
+  inputTokens: number;
+  outputTokens: number;
   thinkingTokens: number | null;
+  cachedInputTokens: number | null;
+  cacheCreationInputTokens: number | null;
   estimatedCostUsd?: number;
 }
 
@@ -546,7 +563,12 @@ export class Runtime {
       minimumScore: this.workspaceRuntimeConfig.delegation.candidateScoring.minimumScore,
       minimumToMCoverage: this.workspaceRuntimeConfig.tom.minimumCoverage,
     });
-    this.budgetMarket = new BudgetMarket(() => this.ctx ? this.getBudgetState().usedTokens : 0);
+    this.budgetMarket = new BudgetMarket(() => this.ctx ? this.getBudgetState().usedTokens : 0, {
+      mode: this.workspaceRuntimeConfig.budgetMarket.mode,
+      minimumGrantTokens: this.workspaceRuntimeConfig.budgetMarket.minimumGrantTokens,
+      accountingDimension: this.workspaceRuntimeConfig.budgetMarket.accountingDimension,
+      priorityWeights: this.workspaceRuntimeConfig.budgetMarket.priorityWeights,
+    });
     this.budgetMarket.configure(options.budget ?? null);
     this.toolApprovalManager = new ToolApprovalManager(this.workspaceRuntimeConfig.tools.approval);
     const contextWindowManager = new ContextWindowManager(memory, this.workspaceRuntimeConfig.context);
@@ -904,6 +926,140 @@ export class Runtime {
   getBudgetMarketState(): BudgetMarketState {
     if (!this.budgetMarket) throw new Error('Budget market is not initialized');
     return this.budgetMarket.getState();
+  }
+
+  rebalanceBudgetMarket(): BudgetRebalanceResult {
+    if (!this.budgetMarket) throw new Error('Budget market is not initialized');
+    const result = this.budgetMarket.rebalance();
+    this.emit({
+      type: 'budget.rebalanced',
+      data: {
+        changed: result.changed.map(item => item.id),
+        releasedTokens: result.releasedTokens,
+        reservedTokens: result.reservedTokens,
+      },
+    });
+    return result;
+  }
+
+  getBudgetAllocation(allocationId: string): BudgetAllocation | undefined {
+    if (!this.budgetMarket) throw new Error('Budget market is not initialized');
+    return this.budgetMarket.getAllocation(allocationId);
+  }
+
+  allocateBudget(request: BudgetRequest): BudgetAllocation {
+    if (!this.budgetMarket) throw new Error('Budget market is not initialized');
+    this.emit({
+      type: 'budget.requested',
+      agentId: request.requesterId,
+      correlationId: request.correlationId,
+      data: { ...request },
+    });
+    const allocation = this.budgetMarket.request(request);
+    this.emit({
+      type: allocation.status === 'granted' ? 'budget.allocated' : 'budget.denied',
+      agentId: request.requesterId,
+      correlationId: request.correlationId,
+      data: {
+        allocationId: allocation.id,
+        requestedTokens: request.requestedTokens,
+        allocatedTokens: allocation.allocatedTokens,
+        policy: allocation.policy,
+        score: allocation.score,
+        rationale: allocation.rationale,
+      },
+    });
+    return allocation;
+  }
+
+  allocateBudgets(requests: BudgetRequest[]): BudgetAllocation[] {
+    if (!this.budgetMarket) throw new Error('Budget market is not initialized');
+    for (const request of requests) {
+      this.emit({ type: 'budget.requested', agentId: request.requesterId, correlationId: request.correlationId, data: { ...request } });
+    }
+    const allocations = this.budgetMarket.requestMany(requests);
+    for (const allocation of allocations) {
+      this.emit({
+        type: allocation.status === 'granted' ? 'budget.allocated' : 'budget.denied',
+        agentId: allocation.request.requesterId,
+        correlationId: allocation.request.correlationId,
+        data: {
+          allocationId: allocation.id,
+          requestedTokens: allocation.request.requestedTokens,
+          allocatedTokens: allocation.allocatedTokens,
+          policy: allocation.policy,
+          score: allocation.score,
+          rationale: allocation.rationale,
+        },
+      });
+    }
+    return allocations;
+  }
+
+  consumeBudget(allocationId: string, usage: number | ModelTokenUsage): BudgetAllocation {
+    if (!this.budgetMarket) throw new Error('Budget market is not initialized');
+    const allocation = this.budgetMarket.consume(allocationId, usage);
+    if (!allocation) throw new Error(`Active budget allocation "${allocationId}" not found`);
+    this.emit({
+      type: 'budget.consumed',
+      agentId: allocation.request.requesterId,
+      correlationId: allocation.request.correlationId,
+      data: {
+        allocationId,
+        consumedTokens: allocation.consumedTokens,
+        utilization: allocation.utilization,
+      },
+    });
+    if (allocation.status === 'exceeded') {
+      this.emit({
+        type: 'budget.exceeded',
+        agentId: allocation.request.requesterId,
+        correlationId: allocation.request.correlationId,
+        data: { allocationId, allocatedTokens: allocation.allocatedTokens, consumedTokens: allocation.consumedTokens },
+      });
+    }
+    return allocation;
+  }
+
+  settleBudget(allocationId: string, usage: number | ModelTokenUsage): BudgetAllocation {
+    if (!this.budgetMarket) throw new Error('Budget market is not initialized');
+    const allocation = this.budgetMarket.settle(allocationId, usage);
+    if (!allocation) throw new Error(`Active budget allocation "${allocationId}" not found`);
+    this.emit({
+      type: 'budget.settled',
+      agentId: allocation.request.requesterId,
+      correlationId: allocation.request.correlationId,
+      data: {
+        allocationId,
+        allocatedTokens: allocation.allocatedTokens,
+        consumedTokens: allocation.consumedTokens,
+        utilization: allocation.utilization,
+        efficiency: allocation.efficiency,
+        status: allocation.status,
+      },
+    });
+    if (allocation.status === 'exceeded') {
+      this.emit({
+        type: 'budget.exceeded',
+        agentId: allocation.request.requesterId,
+        correlationId: allocation.request.correlationId,
+        data: { allocationId, allocatedTokens: allocation.allocatedTokens, consumedTokens: allocation.consumedTokens },
+      });
+    }
+    return allocation;
+  }
+
+  releaseBudget(allocationId: string, reason = 'released_by_controller'): BudgetAllocation {
+    if (!this.budgetMarket) throw new Error('Budget market is not initialized');
+    const allocation = this.budgetMarket.release(allocationId, reason);
+    if (!allocation) throw new Error(`Active budget allocation "${allocationId}" not found`);
+    this.emit({
+      type: 'budget.released',
+      agentId: allocation.request.requesterId,
+      correlationId: allocation.request.correlationId,
+      data: { allocationId, reason },
+    });
+    return allocation;
   }
 
   getTeams(): TeamRuntimeState[] {
@@ -1759,15 +1915,20 @@ export class Runtime {
 
   private async requestAgentBudget(input: {
     parentId: string;
+    requesterId?: string;
     archetype: SubAgentArchetype;
     correlationId?: string;
     nodeId?: string;
     requestedTokens?: number;
+    minimumTokens?: number;
+    priority?: BudgetPriority;
+    expectedUtility?: number;
     purpose: string;
   }): Promise<BudgetAllocation | undefined> {
     if (this.workspaceRuntimeConfig?.budgetMarket.enabled === false) return undefined;
     if (!this.budgetMarket) throw new Error('Budget market is not initialized');
     const requestedTokens = input.requestedTokens ?? this.estimateAgentBudget(input.archetype);
+    const requesterId = input.requesterId ?? `${input.parentId}:${input.archetype}`;
     const requestMessage = await this.enqueueMessage({
       kind: 'budget.request',
       sessionId: this.getContext().sessionId,
@@ -1786,13 +1947,19 @@ export class Runtime {
       data: { correlationId: input.correlationId, archetype: input.archetype, requestedTokens, purpose: input.purpose },
     });
     const allocation = this.budgetMarket.request({
-      requesterId: `${input.parentId}:${input.archetype}`,
+      requesterId,
       parentId: input.parentId,
+      actorType: 'agent',
       correlationId: input.correlationId,
       requestedTokens,
-      minimumTokens: this.workspaceRuntimeConfig?.budgetMarket.minimumGrantTokens ?? 256,
+      minimumTokens: input.minimumTokens ?? this.workspaceRuntimeConfig?.budgetMarket.minimumGrantTokens ?? 256,
+      priority: input.priority ?? this.workspaceRuntimeConfig?.budgetMarket.defaultPriority ?? 'medium',
+      expectedUtility: input.expectedUtility ?? this.defaultBudgetUtility(input.archetype),
       purpose: input.purpose,
     });
+    if (this.workspaceRuntimeConfig?.budgetMarket.rebalanceOnRequest && allocation.status === 'denied') {
+      this.rebalanceBudgetMarket();
+    }
     const responseMessage = await this.enqueueMessage({
       kind: allocation.status === 'granted' ? 'budget.grant' : 'budget.denied',
       sessionId: this.getContext().sessionId,
@@ -1816,9 +1983,27 @@ export class Runtime {
         allocationId: allocation.id,
         requestedTokens,
         grantedTokens: allocation.grantedTokens,
+        allocatedTokens: allocation.allocatedTokens,
+        policy: allocation.policy,
+        score: allocation.score,
         reason: allocation.reason,
       },
     });
+    if (allocation.status === 'granted') {
+      this.emit({
+        type: 'budget.allocated',
+        agentId: requesterId,
+        correlationId: input.correlationId,
+        nodeId: input.nodeId,
+        data: {
+          allocationId: allocation.id,
+          requestedTokens,
+          allocatedTokens: allocation.allocatedTokens,
+          policy: allocation.policy,
+          rationale: allocation.rationale,
+        },
+      });
+    }
     return allocation;
   }
 
@@ -1869,9 +2054,12 @@ export class Runtime {
     const allocation = this.budgetMarket.request({
       requesterId: input.team.identity.id,
       parentId: input.team.identity.parentAgentId,
+      actorType: 'team',
       correlationId: input.correlationId,
       requestedTokens,
       minimumTokens,
+      priority: 'high',
+      expectedUtility: 0.85,
       purpose: 'team_synthesis',
     });
     const responseMessage = await this.enqueueMessage({
@@ -1909,11 +2097,12 @@ export class Runtime {
   private settleTeamSynthesisBudget(
     teamId: string,
     allocation: BudgetAllocation | undefined,
-    actualTokens: number,
+    actual: number | TokenUsage,
     correlationId: string
   ): void {
     if (!allocation || allocation.status !== 'granted' || !this.budgetMarket) return;
-    const settled = this.budgetMarket.settle(allocation.id, actualTokens);
+    const actualTokens = typeof actual === 'number' ? actual : actual.totalTokens;
+    const settled = this.budgetMarket.settle(allocation.id, actual);
     if (!settled) return;
     this.emit({
       type: 'budget.settled',
@@ -1924,6 +2113,20 @@ export class Runtime {
         allocationId: allocation.id,
         grantedTokens: allocation.grantedTokens,
         actualTokens,
+      },
+    });
+    this.emit({
+      type: 'budget.consumed',
+      agentId: teamId,
+      correlationId,
+      data: {
+        teamId,
+        allocationId: allocation.id,
+        consumedTokens: actualTokens,
+        inputTokens: typeof actual === 'number' ? undefined : actual.inputTokens,
+        outputTokens: typeof actual === 'number' ? undefined : actual.outputTokens,
+        thinkingTokens: typeof actual === 'number' ? undefined : actual.thinkingTokens,
+        utilization: settled.utilization,
       },
     });
     if (actualTokens > allocation.grantedTokens) {
@@ -1937,6 +2140,12 @@ export class Runtime {
           grantedTokens: allocation.grantedTokens,
           actualTokens,
         },
+      });
+      this.emit({
+        type: 'budget.exceeded',
+        agentId: teamId,
+        correlationId,
+        data: { allocationId: allocation.id, allocatedTokens: allocation.allocatedTokens, consumedTokens: actualTokens },
       });
     }
   }
@@ -1959,16 +2168,30 @@ export class Runtime {
     }
   }
 
-  private settleAgentBudget(agentId: string, actualTokens: number): void {
+  private settleAgentBudget(agentId: string, actual: number | TokenUsage): void {
     const allocationId = this.agentBudgetAllocations.get(agentId);
     if (!allocationId || !this.budgetMarket) return;
-    const allocation = this.budgetMarket.settle(allocationId, actualTokens);
+    const allocation = this.budgetMarket.settle(allocationId, actual);
     this.agentBudgetAllocations.delete(agentId);
+    this.getContext().manager.getAgentById(agentId)?.setCompletionTokenLimit(undefined);
     if (allocation) {
+      const actualTokens = typeof actual === 'number' ? actual : actual.totalTokens;
       this.emit({
         type: 'budget.settled',
         agentId,
         data: { allocationId, grantedTokens: allocation.grantedTokens, actualTokens },
+      });
+      this.emit({
+        type: 'budget.consumed',
+        agentId,
+        data: {
+          allocationId,
+          consumedTokens: actualTokens,
+          inputTokens: typeof actual === 'number' ? undefined : actual.inputTokens,
+          outputTokens: typeof actual === 'number' ? undefined : actual.outputTokens,
+          thinkingTokens: typeof actual === 'number' ? undefined : actual.thinkingTokens,
+          utilization: allocation.utilization,
+        },
       });
       if (actualTokens > allocation.grantedTokens) {
         this.emit({
@@ -1976,7 +2199,52 @@ export class Runtime {
           agentId,
           data: { allocationId, grantedTokens: allocation.grantedTokens, actualTokens },
         });
+        this.emit({
+          type: 'budget.exceeded',
+          agentId,
+          data: { allocationId, allocatedTokens: allocation.allocatedTokens, consumedTokens: actualTokens },
+        });
       }
+    }
+  }
+
+  private settleDirectBudget(agentId: string, allocation: BudgetAllocation | undefined, usage: TokenUsage, correlationId?: string): void {
+    if (!allocation || allocation.status !== 'granted' || !this.budgetMarket) return;
+    const settled = this.budgetMarket.settle(allocation.id, usage);
+    if (!settled) return;
+    this.emit({
+      type: 'budget.consumed',
+      agentId,
+      correlationId,
+      data: {
+        allocationId: allocation.id,
+        consumedTokens: usage.totalTokens,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        thinkingTokens: usage.thinkingTokens,
+        cachedInputTokens: usage.cachedInputTokens,
+        utilization: settled.utilization,
+      },
+    });
+    this.emit({
+      type: 'budget.settled',
+      agentId,
+      correlationId,
+      data: { allocationId: allocation.id, allocatedTokens: allocation.allocatedTokens, actualTokens: usage.totalTokens },
+    });
+    if (settled.status === 'exceeded') {
+      this.emit({
+        type: 'budget.exceeded',
+        agentId,
+        correlationId,
+        data: { allocationId: allocation.id, allocatedTokens: allocation.allocatedTokens, consumedTokens: usage.totalTokens },
+      });
+      this.emit({
+        type: 'budget.overrun',
+        agentId,
+        correlationId,
+        data: { allocationId: allocation.id, grantedTokens: allocation.grantedTokens, actualTokens: usage.totalTokens },
+      });
     }
   }
 
@@ -1985,11 +2253,12 @@ export class Runtime {
     if (!allocationId || !this.budgetMarket) return;
     const allocation = this.budgetMarket.release(allocationId, reason);
     this.agentBudgetAllocations.delete(agentId);
+    this.getContext().manager.getAgentById(agentId)?.setCompletionTokenLimit(undefined);
     if (allocation) this.emit({ type: 'budget.released', agentId, data: { allocationId, reason } });
   }
 
   private estimateAgentBudget(archetype: SubAgentArchetype): number {
-    return {
+    return this.workspaceRuntimeConfig?.budgetMarket.defaultRequestsByArchetype[archetype] ?? ({
       researcher: 2200,
       critic: 1600,
       planner: 1400,
@@ -1997,7 +2266,11 @@ export class Runtime {
       summarizer: 1000,
       tester: 1800,
       custom: 1800,
-    }[archetype];
+    }[archetype]);
+  }
+
+  private defaultBudgetUtility(archetype: SubAgentArchetype): number {
+    return ({ researcher: 0.82, critic: 0.72, planner: 0.76, coder: 0.88, summarizer: 0.65, tester: 0.8, custom: 0.7 })[archetype];
   }
 
   private getRootToolBindings(): ToolBinding[] {
@@ -2766,12 +3039,7 @@ export class Runtime {
     await this.proposeMemoryUpdates('turn.completed');
 
     const rootUsageAfter = ctx.agent.getUsage();
-    const rootUsage = this.toTokenUsage({
-      llmCalls: rootUsageAfter.llmCalls - rootUsageBefore.llmCalls,
-      promptTokens: rootUsageAfter.promptTokens - rootUsageBefore.promptTokens,
-      completionTokens: rootUsageAfter.completionTokens - rootUsageBefore.completionTokens,
-      totalTokens: rootUsageAfter.totalTokens - rootUsageBefore.totalTokens,
-    });
+    const rootUsage = this.usageDifference(rootUsageBefore, rootUsageAfter);
     const subagentUsage: Record<string, TokenUsage> = {};
     for (const item of subagents) {
       subagentUsage[item.agent.identity.id] = item.subagentResult.usage;
@@ -2885,12 +3153,7 @@ export class Runtime {
     try {
       const delegation = await this.executeAgentComputeNode(node);
       const rootUsageAfter = ctx.agent.getUsage();
-      const rootUsage = this.toTokenUsage({
-        llmCalls: rootUsageAfter.llmCalls - rootUsageBefore.llmCalls,
-        promptTokens: rootUsageAfter.promptTokens - rootUsageBefore.promptTokens,
-        completionTokens: rootUsageAfter.completionTokens - rootUsageBefore.completionTokens,
-        totalTokens: rootUsageAfter.totalTokens - rootUsageBefore.totalTokens,
-      });
+      const rootUsage = this.usageDifference(rootUsageBefore, rootUsageAfter);
       const subagentUsage = delegation.subagentResult.usage;
       const totalUsage = this.sumUsage([rootUsage, subagentUsage]);
       this.emitNodeEvent('agent.node.execution.completed', node, delegation.agent.identity.id, {
@@ -3579,6 +3842,9 @@ export class Runtime {
 
     const sequence = ++this.agentSequence;
     const id = this.createAgentId(spec.archetype, sequence);
+    if (budgetAllocation?.status === 'granted') {
+      this.budgetMarket?.assignRequester(budgetAllocation.id, id, 'agent');
+    }
     const requestedName = spec.name ?? `${this.capitalize(spec.archetype)}-${sequence}`;
     const name = ctx.manager.getAgent(requestedName)
       ? this.createUniqueAgentName(spec.archetype, requestedName, sequence)
@@ -4003,6 +4269,10 @@ export class Runtime {
       }
     }
 
+    const activeAllocationId = this.agentBudgetAllocations.get(agentId);
+    const activeAllocation = activeAllocationId ? this.budgetMarket?.getAllocation(activeAllocationId) : undefined;
+    agent.setCompletionTokenLimit(activeAllocation?.allocatedTokens);
+
     const session = ctx.manager.getSession(ctx.sessionId);
     if (session) {
       session.messageQueue.clear('env');
@@ -4081,12 +4351,7 @@ export class Runtime {
       await this.transitionAgentFsm(agentId, 'S_responding', { correlationId: options.correlationId });
 
       const usageAfter = agent.getUsage();
-      const usageDelta = this.toTokenUsage({
-        llmCalls: usageAfter.llmCalls - usageBefore.llmCalls,
-        promptTokens: usageAfter.promptTokens - usageBefore.promptTokens,
-        completionTokens: usageAfter.completionTokens - usageBefore.completionTokens,
-        totalTokens: usageAfter.totalTokens - usageBefore.totalTokens,
-      });
+      const usageDelta = this.usageDifference(usageBefore, usageAfter);
       this.recordTurnUsage(usageDelta);
       this.emit({ type: 'budget.updated', agentId, data: { ...usageDelta } });
       this.emit({ type: 'agent.status.changed', agentId, data: { from: 'thinking', to: 'done' } });
@@ -4126,7 +4391,7 @@ export class Runtime {
         },
       });
       await this.transitionAgentFsm(agentId, 'S_done', { correlationId: options.correlationId });
-      this.settleAgentBudget(agentId, usageDelta.totalTokens);
+      this.settleAgentBudget(agentId, usageDelta);
       await ctx.memory.recordAgentPatternOutcome(options.archetype ?? this.inferAgentArchetype(agent.getInfo()), {
         success: true,
         grounded: grounding.grounded && evidence.outputGrounded,
@@ -4190,8 +4455,31 @@ export class Runtime {
   private toTokenUsage(usage: AgentUsage): TokenUsage {
     return {
       ...usage,
-      thinkingTokens: null,
+      inputTokens: usage.inputTokens ?? usage.promptTokens,
+      outputTokens: usage.outputTokens ?? usage.completionTokens,
+      thinkingTokens: usage.thinkingTokens ?? null,
+      cachedInputTokens: usage.cachedInputTokens ?? null,
+      cacheCreationInputTokens: usage.cacheCreationInputTokens ?? null,
     };
+  }
+
+  private usageDifference(before: AgentUsage, after: AgentUsage): TokenUsage {
+    const nullableDelta = (previous: number | null | undefined, current: number | null | undefined): number | null => {
+      if (previous === null && current === null) return null;
+      if (previous === undefined && current === undefined) return null;
+      return Math.max(0, (current ?? 0) - (previous ?? 0));
+    };
+    return this.toTokenUsage({
+      llmCalls: after.llmCalls - before.llmCalls,
+      promptTokens: after.promptTokens - before.promptTokens,
+      completionTokens: after.completionTokens - before.completionTokens,
+      totalTokens: after.totalTokens - before.totalTokens,
+      inputTokens: (after.inputTokens ?? after.promptTokens) - (before.inputTokens ?? before.promptTokens),
+      outputTokens: (after.outputTokens ?? after.completionTokens) - (before.outputTokens ?? before.completionTokens),
+      thinkingTokens: nullableDelta(before.thinkingTokens, after.thinkingTokens),
+      cachedInputTokens: nullableDelta(before.cachedInputTokens, after.cachedInputTokens),
+      cacheCreationInputTokens: nullableDelta(before.cacheCreationInputTokens, after.cacheCreationInputTokens),
+    });
   }
 
   private async processQueuedMessage(messageId: string): Promise<RuntimeMessage | undefined> {
@@ -4615,7 +4903,7 @@ export class Runtime {
     try {
       this.emit({ type: 'delegation.assess.started', agentId: 'root', data: { correlationId } });
       const rootContext = await ctx.memory.loadRootContext();
-      const decision = await ctx.llm.completeJSON<DelegationDecision>([
+      const decision = await this.completeJSONAsAgent<DelegationDecision>(ctx.agent, [
         {
           role: 'system',
           content: `You are Roy's root delegation controller.
@@ -4639,7 +4927,7 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
             '<runtime_policy>Subagents must be runtime actors with identity, state, budget, messages, and events. Each agent must fill a distinct cognitive gap, receive a concrete non-overlapping task, and expose why it exists. The runtime will validate and enrich the ToM profiles. If budget is limited, reduce the number of subagents or solve directly and explain the constraint.</runtime_policy>',
           ].join('\n\n'),
         },
-      ], { temperature: 0.1, maxTokens: 900 });
+      ], { temperature: 0.1, maxTokens: 900 }, 'root.delegation_decision', correlationId);
       const normalized = this.applyBudgetConstraints(this.normalizeDelegationDecision(decision, userInput));
       this.emit({
         type: 'delegation.assess.completed',
@@ -4692,7 +4980,9 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
 
     try {
       this.emit({ type: 'delegation.assess.started', agentId: agent.identity.id, data: { correlationId, scope: 'agent' } });
-      const decision = await ctx.llm.completeJSON<DelegationDecision>([
+      const decision = await this.completeJSONAsAgent<DelegationDecision>(
+        ctx.manager.getAgentById(agent.identity.id)!,
+        [
         {
           role: 'system',
           content: `You are ${agent.identity.name}'s delegation controller.
@@ -4712,7 +5002,11 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
             '<runtime_policy>Delegate only to a direct child. The parent must synthesize child results before passing anything upward.</runtime_policy>',
           ].join('\n\n'),
         },
-      ], { temperature: 0.1, maxTokens: 500 });
+        ],
+        { temperature: 0.1, maxTokens: 500 },
+        'agent.delegation_decision',
+        correlationId
+      );
       const normalized = this.normalizeAgentDelegationDecision(decision, task, fallback);
       const constrained = this.applyAgentBudgetAndPolicyConstraints(agent.identity.id, normalized);
       const selected = await this.selectDelegationCandidate(agent.identity.id, task, constrained, correlationId, 'agent');
@@ -5009,12 +5303,7 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     this.emit({ type: 'agent.llm.called', agentId: 'root', data: { purpose: 'root.solo_reasoning', correlationId } });
     const response = await this.completeAsRoot(this.buildGroundedTask(userInput, grounding), 'root.solo_reasoning', correlationId);
     const usageAfter = ctx.agent.getUsage();
-    const usageDelta = this.toTokenUsage({
-      llmCalls: usageAfter.llmCalls - usageBefore.llmCalls,
-      promptTokens: usageAfter.promptTokens - usageBefore.promptTokens,
-      completionTokens: usageAfter.completionTokens - usageBefore.completionTokens,
-      totalTokens: usageAfter.totalTokens - usageBefore.totalTokens,
-    });
+    const usageDelta = this.usageDifference(usageBefore, usageAfter);
     this.recordTurnUsage(usageDelta);
     this.emit({ type: 'budget.updated', agentId: 'root', data: { ...usageDelta } });
     ctx.agent.setRuntimeState('idle');
@@ -5034,36 +5323,155 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
       return message;
     }
 
-    const messages = [
-      {
-        role: 'system',
-        content: [
-          'You are Roy, the root agent of a Theory-of-Mind based autonomous agent system.',
-          'You are not DeepSeek, Claude, OpenAI, Anthropic, or any model provider.',
-          'The model provider is only your inference backend.',
-          `Purpose: ${purpose}.`,
-          `Correlation: ${correlationId}.`,
-          ctx.agent.getCommunicationContext()?.rendered,
-        ].join('\n'),
-      },
-      { role: 'user', content: prompt },
-    ] as const;
+    const communicationSummary = ctx.agent.getCommunicationContext()?.rendered;
+    const systemContent = [
+      'You are Roy, the root agent of a Theory-of-Mind based autonomous agent system.',
+      'You are not DeepSeek, Claude, OpenAI, Anthropic, or any model provider.',
+      'The model provider is only your inference backend.',
+      `Purpose: ${purpose}.`,
+      `Correlation: ${correlationId}.`,
+      communicationSummary && communicationSummary.length > 1200
+        ? `${communicationSummary.slice(0, 1200)}\n...[communication context truncated]`
+        : communicationSummary,
+    ].join('\n');
+    let effectivePrompt = prompt;
+    const availableTokens = this.budgetMarket?.getState().availableTokens;
+    if (availableTokens !== undefined) {
+      const outputReserve = Math.min(512, Math.max(64, Math.floor(availableTokens * 0.2)));
+      const systemEstimate = this.estimateTextTokens(systemContent);
+      const promptBudget = Math.max(0, availableTokens - outputReserve - systemEstimate);
+      const promptEstimate = this.estimateTextTokens(effectivePrompt);
+      if (promptEstimate > promptBudget && promptBudget > 0) {
+        const maxChars = Math.max(64, Math.floor(effectivePrompt.length * promptBudget / promptEstimate));
+        effectivePrompt = `${effectivePrompt.slice(0, maxChars)}\n...[budget-constrained context truncation]`;
+        this.emit({
+          type: 'budget.context.truncated',
+          agentId: 'root',
+          correlationId,
+          data: { purpose, originalTokens: promptEstimate, allowedTokens: promptBudget, outputReserve },
+        });
+      }
+    }
+
+    const messages: LLMMessage[] = [
+      { role: 'system', content: systemContent },
+      { role: 'user', content: effectivePrompt },
+    ];
+    const estimatedInputTokens = this.estimateTextTokens(messages.map(message => message.content).join('\n'));
+    const allocation = await this.requestAgentBudget({
+      parentId: 'root',
+      requesterId: 'root',
+      archetype: 'custom',
+      correlationId,
+      requestedTokens: Math.max(
+        estimatedInputTokens + 512,
+        this.workspaceRuntimeConfig?.budgetMarket.defaultRequestsByArchetype.root ?? 2400
+      ),
+      minimumTokens: estimatedInputTokens + 1,
+      priority: purpose.includes('synthesis') ? 'high' : 'medium',
+      expectedUtility: purpose.includes('synthesis') ? 0.9 : 0.78,
+      purpose,
+    });
+    if (allocation?.status === 'denied') throw new Error(`Root completion rejected by budget market: ${allocation.reason}`);
+    const usageBefore = ctx.agent.getUsage();
     const chunks: string[] = [];
-    let usageChunk: { usage?: { promptTokens: number; completionTokens: number; totalTokens: number } } | undefined;
-    for await (const chunk of ctx.llm.stream([...messages], { temperature: 0.2 })) {
-      if (chunk.content) chunks.push(chunk.content);
-      if (chunk.usage) usageChunk = chunk;
+    let usageChunk: { usage?: ModelTokenUsage } | undefined;
+    try {
+      const maxTokens = allocation?.status === 'granted'
+        ? Math.max(1, allocation.allocatedTokens - estimatedInputTokens)
+        : undefined;
+      for await (const chunk of ctx.llm.stream([...messages], { temperature: 0.2, maxTokens })) {
+        if (chunk.content) chunks.push(chunk.content);
+        if (chunk.usage) usageChunk = chunk;
+      }
+    } catch (error) {
+      if (allocation?.status === 'granted') this.budgetMarket?.release(allocation.id, 'root_completion_failed');
+      throw error;
     }
     const content = chunks.join('');
     ctx.agent.recordRuntimeCompletion(content, {
       content,
       usage: usageChunk?.usage ?? {
-        promptTokens: this.estimateTextTokens(prompt),
+        promptTokens: this.estimateTextTokens(effectivePrompt),
         completionTokens: this.estimateTextTokens(content),
-        totalTokens: this.estimateTextTokens(prompt) + this.estimateTextTokens(content),
+        totalTokens: this.estimateTextTokens(effectivePrompt) + this.estimateTextTokens(content),
       },
     });
+    this.settleDirectBudget('root', allocation, this.usageDifference(usageBefore, ctx.agent.getUsage()), correlationId);
     return content;
+  }
+
+  private async completeJSONAsAgent<T>(
+    agent: BaseAgent,
+    messages: LLMMessage[],
+    options: LLMCompletionOptions,
+    purpose: string,
+    correlationId: string
+  ): Promise<T> {
+    const ctx = this.getContext();
+    if (!ctx.llm) throw new Error('LLM not configured');
+    const usageBefore = agent.getUsage();
+    const estimatedInput = this.estimateTextTokens(messages.map(message => `${message.role}:${message.content}`).join('\n'));
+    const ownsAllocation = agent.id === 'root' || !this.agentBudgetAllocations.has(agent.id);
+    const allocation = ownsAllocation
+      ? await this.requestAgentBudget({
+        parentId: agent.getIdentity().parentId ?? agent.id,
+        requesterId: agent.id,
+        archetype: agent.id === 'root' ? 'custom' : this.inferAgentArchetype(agent.getInfo()),
+        correlationId,
+        requestedTokens: estimatedInput + (options.maxTokens ?? 512),
+        minimumTokens: estimatedInput + 1,
+        priority: purpose.includes('delegation') ? 'high' : 'medium',
+        expectedUtility: 0.82,
+        purpose,
+      })
+      : undefined;
+    if (allocation?.status === 'denied') throw new Error(`JSON completion rejected by budget market: ${allocation.reason}`);
+
+    try {
+      let value: T;
+      if (ctx.llm.completeJSONWithUsage) {
+        const result = await ctx.llm.completeJSONWithUsage<T>(messages, options);
+        value = result.value;
+        agent.recordRuntimeUsage(result.completion);
+      } else {
+        value = await ctx.llm.completeJSON<T>(messages, options);
+        const output = JSON.stringify(value);
+        agent.recordRuntimeUsage({
+          content: output,
+          usage: {
+            promptTokens: estimatedInput,
+            completionTokens: this.estimateTextTokens(output),
+            totalTokens: estimatedInput + this.estimateTextTokens(output),
+            inputTokens: estimatedInput,
+            outputTokens: this.estimateTextTokens(output),
+            thinkingTokens: null,
+            cachedInputTokens: null,
+            cacheCreationInputTokens: null,
+            provider: ctx.llm.name,
+            model: ctx.llm.defaultModel,
+            source: 'estimated',
+            availability: {
+              input: 'estimated',
+              output: 'estimated',
+              thinking: 'unavailable',
+              cachedInput: 'unavailable',
+              cacheCreationInput: 'unavailable',
+            },
+          },
+        });
+      }
+      const usage = this.usageDifference(usageBefore, agent.getUsage());
+      if (ownsAllocation) this.settleDirectBudget(agent.id, allocation, usage, correlationId);
+      if (agent.id === 'root') {
+        this.recordTurnUsage(usage);
+        this.emit({ type: 'budget.updated', agentId: agent.id, correlationId, data: { purpose, ...usage } });
+      }
+      return value;
+    } catch (error) {
+      if (allocation?.status === 'granted') this.budgetMarket?.release(allocation.id, 'json_completion_failed');
+      throw error;
+    }
   }
 
   private async synthesizeDelegatedResults(
@@ -5103,12 +5511,7 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
       correlationId
     );
     const usageAfter = ctx.agent.getUsage();
-    const usageDelta = this.toTokenUsage({
-      llmCalls: usageAfter.llmCalls - usageBefore.llmCalls,
-      promptTokens: usageAfter.promptTokens - usageBefore.promptTokens,
-      completionTokens: usageAfter.completionTokens - usageBefore.completionTokens,
-      totalTokens: usageAfter.totalTokens - usageBefore.totalTokens,
-    });
+    const usageDelta = this.usageDifference(usageBefore, usageAfter);
     this.recordTurnUsage(usageDelta);
     this.emit({ type: 'budget.updated', agentId: 'root', data: { ...usageDelta } });
     ctx.agent.setRuntimeState('idle');
@@ -5186,15 +5589,27 @@ Produce the final response to the user as Roy, the root agent.`;
       promptTokens: total.promptTokens + item.promptTokens,
       completionTokens: total.completionTokens + item.completionTokens,
       totalTokens: total.totalTokens + item.totalTokens,
+      inputTokens: total.inputTokens + item.inputTokens,
+      outputTokens: total.outputTokens + item.outputTokens,
       thinkingTokens: total.thinkingTokens === null && item.thinkingTokens === null
         ? null
         : Number(total.thinkingTokens ?? 0) + Number(item.thinkingTokens ?? 0),
+      cachedInputTokens: total.cachedInputTokens === null && item.cachedInputTokens === null
+        ? null
+        : Number(total.cachedInputTokens ?? 0) + Number(item.cachedInputTokens ?? 0),
+      cacheCreationInputTokens: total.cacheCreationInputTokens === null && item.cacheCreationInputTokens === null
+        ? null
+        : Number(total.cacheCreationInputTokens ?? 0) + Number(item.cacheCreationInputTokens ?? 0),
     }), {
       llmCalls: 0,
       promptTokens: 0,
       completionTokens: 0,
       totalTokens: 0,
+      inputTokens: 0,
+      outputTokens: 0,
       thinkingTokens: null,
+      cachedInputTokens: null,
+      cacheCreationInputTokens: null,
     });
   }
 
@@ -5208,7 +5623,15 @@ Produce the final response to the user as Roy, the root agent.`;
       promptTokens: Math.max(0, after.promptTokens - before.promptTokens),
       completionTokens: Math.max(0, after.completionTokens - before.completionTokens),
       totalTokens: Math.max(0, after.totalTokens - before.totalTokens),
+      inputTokens: Math.max(0, after.inputTokens - before.inputTokens),
+      outputTokens: Math.max(0, after.outputTokens - before.outputTokens),
       thinkingTokens,
+      cachedInputTokens: after.cachedInputTokens === null && before.cachedInputTokens === null
+        ? null
+        : Math.max(0, Number(after.cachedInputTokens ?? 0) - Number(before.cachedInputTokens ?? 0)),
+      cacheCreationInputTokens: after.cacheCreationInputTokens === null && before.cacheCreationInputTokens === null
+        ? null
+        : Math.max(0, Number(after.cacheCreationInputTokens ?? 0) - Number(before.cacheCreationInputTokens ?? 0)),
       estimatedCostUsd: estimatedCostUsd > 0 ? estimatedCostUsd : undefined,
     };
   }
@@ -5275,12 +5698,7 @@ Produce the final response to the user as Roy, the root agent.`;
       correlationId
     );
     const usageAfter = parent.getUsage();
-    const usageDelta = this.toTokenUsage({
-      llmCalls: usageAfter.llmCalls - usageBefore.llmCalls,
-      promptTokens: usageAfter.promptTokens - usageBefore.promptTokens,
-      completionTokens: usageAfter.completionTokens - usageBefore.completionTokens,
-      totalTokens: usageAfter.totalTokens - usageBefore.totalTokens,
-    });
+    const usageDelta = this.usageDifference(usageBefore, usageAfter);
     this.recordTurnUsage(usageDelta);
     this.emit({ type: 'budget.updated', agentId: parentId, data: { ...usageDelta } });
 
@@ -5374,12 +5792,7 @@ Produce the final response to the user as Roy, the root agent.`;
       correlationId
     );
     const usageAfter = parent.getUsage();
-    const usageDelta = this.toTokenUsage({
-      llmCalls: usageAfter.llmCalls - usageBefore.llmCalls,
-      promptTokens: usageAfter.promptTokens - usageBefore.promptTokens,
-      completionTokens: usageAfter.completionTokens - usageBefore.completionTokens,
-      totalTokens: usageAfter.totalTokens - usageBefore.totalTokens,
-    });
+    const usageDelta = this.usageDifference(usageBefore, usageAfter);
     this.recordTurnUsage(usageDelta);
     this.emit({ type: 'budget.updated', agentId: parentId, data: { ...usageDelta } });
 
@@ -5514,12 +5927,7 @@ Produce the final response to the user as Roy, the root agent.`;
       teamResult
     );
     const usageAfter = parent.getUsage();
-    const usageDelta = this.toTokenUsage({
-      llmCalls: usageAfter.llmCalls - usageBefore.llmCalls,
-      promptTokens: usageAfter.promptTokens - usageBefore.promptTokens,
-      completionTokens: usageAfter.completionTokens - usageBefore.completionTokens,
-      totalTokens: usageAfter.totalTokens - usageBefore.totalTokens,
-    });
+    const usageDelta = this.usageDifference(usageBefore, usageAfter);
     const evidence = this.mergeChildEvidence(childResults.map(result => result.subagentResult));
     const warnings = childResults.flatMap(result => result.subagentResult.warnings);
     this.emit({
@@ -5548,7 +5956,7 @@ Produce the final response to the user as Roy, the root agent.`;
         totalSubagents: childResults.length,
       },
     });
-    this.settleAgentBudget(agentId, usageDelta.totalTokens);
+    this.settleAgentBudget(agentId, usageDelta);
     await ctx.memory.recordAgentPatternOutcome(options.archetype ?? this.inferAgentArchetype(parent.getInfo()), {
       success: true,
       grounded: childResults.every(result => result.subagentResult.grounded),
@@ -5828,7 +6236,7 @@ Produce the final response to the user as Roy, the root agent.`;
       ? Math.max(1, allocation.grantedTokens - estimatedPromptTokens)
       : 1024;
     const chunks: string[] = [];
-    let providerUsage: { promptTokens: number; completionTokens: number; totalTokens: number } | undefined;
+    let providerUsage: ModelTokenUsage | undefined;
     try {
       for await (const chunk of ctx.llm.stream([
         { role: 'system', content: systemPrompt },
@@ -5848,8 +6256,13 @@ Produce the final response to the user as Roy, the root agent.`;
       completionTokens: providerUsage?.completionTokens ?? this.estimateTextTokens(content),
       totalTokens: providerUsage?.totalTokens
         ?? estimatedPromptTokens + this.estimateTextTokens(content),
+      inputTokens: providerUsage?.inputTokens ?? providerUsage?.promptTokens ?? estimatedPromptTokens,
+      outputTokens: providerUsage?.outputTokens ?? providerUsage?.completionTokens ?? this.estimateTextTokens(content),
+      thinkingTokens: providerUsage?.thinkingTokens ?? null,
+      cachedInputTokens: providerUsage?.cachedInputTokens ?? null,
+      cacheCreationInputTokens: providerUsage?.cacheCreationInputTokens ?? null,
     });
-    this.settleTeamSynthesisBudget(team.identity.id, allocation, usage.totalTokens, correlationId);
+    this.settleTeamSynthesisBudget(team.identity.id, allocation, usage, correlationId);
     this.recordTurnUsage(usage);
     this.emit({
       type: 'budget.updated',
@@ -5893,7 +6306,7 @@ Produce the final response to the user as Roy, the root agent.`;
       { role: 'user', content: prompt },
     ] as const;
     const chunks: string[] = [];
-    let usageChunk: { usage?: { promptTokens: number; completionTokens: number; totalTokens: number } } | undefined;
+    let usageChunk: { usage?: ModelTokenUsage } | undefined;
     for await (const chunk of ctx.llm.stream([...messages], { temperature: 0.2 })) {
       if (chunk.content) chunks.push(chunk.content);
       if (chunk.usage) usageChunk = chunk;
@@ -6018,7 +6431,11 @@ ${reports}`;
       promptTokens: 0,
       completionTokens: 0,
       totalTokens: 0,
+      inputTokens: 0,
+      outputTokens: 0,
       thinkingTokens: null,
+      cachedInputTokens: null,
+      cacheCreationInputTokens: null,
     };
   }
 
@@ -6058,12 +6475,7 @@ ${reports}`;
     );
 
     const usageAfter = ctx.agent.getUsage();
-    const usageDelta = this.toTokenUsage({
-      llmCalls: usageAfter.llmCalls - usageBefore.llmCalls,
-      promptTokens: usageAfter.promptTokens - usageBefore.promptTokens,
-      completionTokens: usageAfter.completionTokens - usageBefore.completionTokens,
-      totalTokens: usageAfter.totalTokens - usageBefore.totalTokens,
-    });
+    const usageDelta = this.usageDifference(usageBefore, usageAfter);
     this.recordTurnUsage(usageDelta);
     this.emit({ type: 'budget.updated', agentId: 'root', data: { ...usageDelta } });
 

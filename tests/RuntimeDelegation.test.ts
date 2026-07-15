@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Runtime, { type DelegationDecision } from '../src/core/runtime/Runtime.js';
-import type { LLMCompletionOptions, LLMCompletionResult, LLMMessage, LLMProvider, LLMStreamChunk } from '../src/core/llm/types.js';
+import type { LLMCompletionOptions, LLMCompletionResult, LLMJSONCompletionResult, LLMMessage, LLMProvider, LLMStreamChunk } from '../src/core/llm/types.js';
 
 class RootDelegationLLM implements LLMProvider {
   readonly name = 'root-delegation-test';
@@ -106,6 +106,11 @@ class RootDelegationLLM implements LLMProvider {
       action: 'solve_directly',
       reason: 'Simple conversational task.',
     } satisfies DelegationDecision as T;
+  }
+
+  async completeJSONWithUsage<T>(messages: LLMMessage[], options?: LLMCompletionOptions): Promise<LLMJSONCompletionResult<T>> {
+    const value = await this.completeJSON<T>(messages, options);
+    return { value, completion: { content: JSON.stringify(value), usage: { promptTokens: 4, completionTokens: 1, totalTokens: 5 } } };
   }
 
   isConfigured(): boolean {
@@ -290,7 +295,6 @@ describe('Runtime root-controlled delegation', () => {
     const decisionEvent = runtime.getEvents()
       .find(event => event.type === 'delegation.decision' && event.data?.correlationId === result.correlationId);
     expect(decisionEvent?.data?.budgetMode).toBe('limited');
-
     await runtime.shutdown();
   });
 

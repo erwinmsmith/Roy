@@ -24,7 +24,11 @@ const ZERO_USAGE: TokenUsage = {
   promptTokens: 0,
   completionTokens: 0,
   totalTokens: 0,
+  inputTokens: 0,
+  outputTokens: 0,
   thinkingTokens: null,
+  cachedInputTokens: null,
+  cacheCreationInputTokens: null,
 };
 
 export class InvalidTeamTransitionError extends Error {
@@ -205,7 +209,15 @@ export class TeamRegistry {
       promptTokens: current.promptTokens + delta.promptTokens,
       completionTokens: current.completionTokens + delta.completionTokens,
       totalTokens: current.totalTokens + delta.totalTokens,
+      inputTokens: current.inputTokens + delta.inputTokens,
+      outputTokens: current.outputTokens + delta.outputTokens,
       thinkingTokens,
+      cachedInputTokens: current.cachedInputTokens === null && delta.cachedInputTokens === null
+        ? null
+        : (current.cachedInputTokens ?? 0) + (delta.cachedInputTokens ?? 0),
+      cacheCreationInputTokens: current.cacheCreationInputTokens === null && delta.cacheCreationInputTokens === null
+        ? null
+        : (current.cacheCreationInputTokens ?? 0) + (delta.cacheCreationInputTokens ?? 0),
       estimatedCostUsd: (current.estimatedCostUsd ?? 0) + (delta.estimatedCostUsd ?? 0) || undefined,
     };
   }

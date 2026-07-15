@@ -192,7 +192,13 @@ export interface WorkspaceRuntimeConfig {
   };
   budgetMarket: {
     enabled: boolean;
+    mode: 'unlimited' | 'fixed' | 'market';
     minimumGrantTokens: number;
+    accountingDimension: 'total_tokens' | 'output_tokens' | 'thinking_tokens';
+    rebalanceOnRequest: boolean;
+    defaultPriority: 'low' | 'medium' | 'high' | 'critical';
+    priorityWeights: Record<'low' | 'medium' | 'normal' | 'high' | 'critical', number>;
+    defaultRequestsByArchetype: Record<string, number>;
   };
   tools: {
     approval: {
@@ -431,7 +437,7 @@ Role-specific terms are recorded here.
 };
 
 const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
-  version: 3,
+  version: 4,
   traceEvents: true,
   memoryUpdates: 'suggest',
   delegation: {
@@ -491,7 +497,29 @@ const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
   },
   budgetMarket: {
     enabled: true,
+    mode: 'market',
     minimumGrantTokens: 256,
+    accountingDimension: 'total_tokens',
+    rebalanceOnRequest: false,
+    defaultPriority: 'medium',
+    priorityWeights: {
+      low: 0.6,
+      medium: 1,
+      normal: 1,
+      high: 1.5,
+      critical: 2.2,
+    },
+    defaultRequestsByArchetype: {
+      root: 2400,
+      researcher: 2200,
+      critic: 1600,
+      planner: 1400,
+      coder: 2600,
+      summarizer: 1000,
+      tester: 1800,
+      custom: 1800,
+      team_synthesis: 1800,
+    },
   },
   tools: {
     approval: {

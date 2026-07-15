@@ -50,7 +50,7 @@ describe('Workspace memory initialization', () => {
     });
     expect(rootState.updatedAt).toEqual(expect.any(String));
     const workspaceConfig = JSON.parse(await readFile(path.join(workspaceCwd, '.roy', 'config.json'), 'utf8'));
-    expect(workspaceConfig.version).toBe(3);
+    expect(workspaceConfig.version).toBe(4);
     expect(workspaceConfig.tom).toMatchObject({
       enabled: true,
       autoCompleteGaps: true,
@@ -185,7 +185,7 @@ describe('Workspace memory initialization', () => {
     expect(researcher?.tools.map(tool => tool.name)).toEqual(['fs.read']);
     expect(researcher?.skills.map(skill => skill.name)).toEqual(['use_tool_when_needed']);
     const migratedConfig = JSON.parse(await readFile(path.join(workspaceCwd, '.roy', 'config.json'), 'utf8'));
-    expect(migratedConfig.version).toBe(3);
+    expect(migratedConfig.version).toBe(4);
     expect(migratedConfig.tom.minimumCoverage).toBe(0.6);
 
     await runtime.shutdown();
