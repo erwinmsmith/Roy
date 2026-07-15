@@ -235,6 +235,11 @@ async function main(): Promise<void> {
     res.json(runtime.getAgentTree());
   });
 
+  app.get('/v1/tom', (req, res) => {
+    const correlationId = typeof req.query.correlationId === 'string' ? req.query.correlationId : undefined;
+    res.json(runtime.getToMState(correlationId));
+  });
+
   app.post('/v1/agents', async (req, res) => {
     try {
       const body = req.body ?? {};
@@ -277,6 +282,7 @@ async function main(): Promise<void> {
         memoryScope: body.memoryScope,
         spawnPolicy: body.spawnPolicy,
         tomProfile: body.tomProfile,
+        tomProfileMode: body.tomProfileMode,
         reuse: body.reuse,
         execution: body.execution,
         outputContract: body.outputContract,

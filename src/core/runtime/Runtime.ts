@@ -25,6 +25,11 @@ import type {
 } from '../skills/agentCreation.js';
 import { UseToolWhenNeededSkill } from '../skills/toolUse.js';
 import { DefaultDelegationCandidatePlanner, type DelegationCandidateSelection } from '../delegation/index.js';
+import {
+  normalizeToMProfile,
+  ToMDelegationPlanner,
+  type ToMTaskAnalysis,
+} from '../tom/index.js';
 import { ContextWindowManager, type ContextWindow } from '../context/index.js';
 import { BudgetMarket, type BudgetAllocation, type BudgetMarketState } from '../budget/index.js';
 import {
@@ -127,6 +132,23 @@ export interface RuntimeState {
   budget: BudgetState;
 }
 
+export interface ToMRuntimeState {
+  analyses: ToMTaskAnalysis[];
+  agents: Array<{
+    agentId: string;
+    name: string;
+    parentId?: string;
+    teamId?: string;
+    profile: ToMProfile;
+  }>;
+  teams: Array<{
+    teamId: string;
+    name: string;
+    parentAgentId: string;
+    profile: ToMProfile;
+  }>;
+}
+
 export type SubAgentArchetype =
   | 'researcher'
   | 'critic'
@@ -194,6 +216,8 @@ export interface SpawnAgentSpec {
   correlationId?: string;
   teamId?: string;
   nodeDefinition?: AgentComputeNodeDefinition;
+  cognitiveGapIds?: string[];
+  existenceReason?: string;
 }
 
 export interface AgentTreeNode {
@@ -211,6 +235,9 @@ export interface TeamMemberSpec {
   skills?: string[];
   budgetTokens?: number;
   tomLevel?: number;
+  tomProfile?: ToMProfile;
+  cognitiveGapIds?: string[];
+  existenceReason?: string;
   lead?: boolean;
 }
 
@@ -219,6 +246,8 @@ export interface SpawnTeamSpec {
   name: string;
   description: string;
   tomLevel?: number;
+  tomProfile?: ToMProfile;
+  tomAnalysis?: ToMTaskAnalysis;
   leadAgentId?: string;
   task?: string;
   members?: TeamMemberSpec[];
@@ -315,6 +344,8 @@ export interface SpawnCommandPayload {
   showSubagentOutput?: boolean;
   disableRecursiveDelegation?: boolean;
   teamId?: string;
+  cognitiveGapIds?: string[];
+  existenceReason?: string;
 }
 
 export type DelegationDecision =
@@ -341,6 +372,9 @@ export interface DelegationAgentPlan {
   skills?: string[];
   tomLevel?: number;
   budgetTokens?: number;
+  tomProfile?: ToMProfile;
+  cognitiveGapIds?: string[];
+  existenceReason?: string;
 }
 
 export interface RootMediatedSpawnResult {
@@ -427,6 +461,8 @@ export class Runtime {
   private readonly toolPlanner = new AgentToolPlanner();
   private candidatePlanner: DefaultDelegationCandidatePlanner | null = null;
   private turnAgentCounts = new Map<string, number>();
+  private readonly tomPlanner = new ToMDelegationPlanner();
+  private readonly tomAnalyses = new Map<string, ToMTaskAnalysis>();
 
   static getInstance(): Runtime {
     if (!Runtime.instance) {
@@ -491,6 +527,7 @@ export class Runtime {
       llm,
       enabledScorers: this.workspaceRuntimeConfig.delegation.candidateScoring.enabledScorers,
       minimumScore: this.workspaceRuntimeConfig.delegation.candidateScoring.minimumScore,
+      minimumToMCoverage: this.workspaceRuntimeConfig.tom.minimumCoverage,
     });
     this.budgetMarket = new BudgetMarket(() => this.ctx ? this.getBudgetState().usedTokens : 0);
     this.budgetMarket.configure(options.budget ?? null);
@@ -625,6 +662,7 @@ export class Runtime {
     this.teams.clear();
     this.teamMemberPlans.clear();
     this.turnAgentCounts.clear();
+    this.tomAnalyses.clear();
     this.initialized = false;
     logger.info('Runtime shutdown complete');
   }
@@ -764,6 +802,41 @@ export class Runtime {
 
   getEvents(): RuntimeEvent[] {
     return [...this.events];
+  }
+
+  getToMState(correlationId?: string): ToMRuntimeState {
+    const ctx = this.getContext();
+    const analyses = correlationId
+      ? [this.tomAnalyses.get(correlationId)].filter((item): item is ToMTaskAnalysis => Boolean(item))
+      : [...this.tomAnalyses.values()];
+    return {
+      analyses: analyses.map(analysis => ({
+        ...analysis,
+        parentBeliefs: [...analysis.parentBeliefs],
+        parentGoals: [...analysis.parentGoals],
+        parentUncertainties: [...analysis.parentUncertainties],
+        gaps: analysis.gaps.map(gap => ({
+          ...gap,
+          beliefScope: [...gap.beliefScope],
+          uncertainty: [...gap.uncertainty],
+          requiredCapabilities: [...gap.requiredCapabilities],
+          modelsTargets: [...gap.modelsTargets],
+        })),
+      })),
+      agents: ctx.manager.listAgentInfo().map(agent => ({
+        agentId: agent.identity.id,
+        name: agent.identity.name,
+        parentId: agent.identity.parentId,
+        teamId: agent.identity.teamId,
+        profile: normalizeToMProfile(agent.identity.tomProfile, agent.identity.tomProfile),
+      })),
+      teams: this.teams.list().map(team => ({
+        teamId: team.identity.id,
+        name: team.identity.name,
+        parentAgentId: team.identity.parentAgentId,
+        profile: normalizeToMProfile(team.identity.tomProfile, team.identity.tomProfile),
+      })),
+    };
   }
 
   getBudgetState(): BudgetState {
@@ -931,6 +1004,12 @@ export class Runtime {
           member.task,
           parentAgentId
         ).level,
+        tomProfile: member.tomProfile ?? this.createSubagentToMProfile(
+          member.archetype,
+          member.name ?? member.archetype,
+          member.task,
+          parentAgentId
+        ),
       }));
       const maxMembers = this.workspaceRuntimeConfig?.teams.maxMembersPerTeam ?? 5;
       if (members.length > maxMembers) {
@@ -951,12 +1030,19 @@ export class Runtime {
       if (!parentFsmState || !parentPolicy.spawnPolicy.allowedStates.includes(parentFsmState)) {
         throw new Error(`Agent "${parentAgentId}" cannot create a subteam in FSM state "${parentFsmState ?? 'unknown'}"`);
       }
+      const teamTomProfile = spec.tomProfile ?? this.tomPlanner.createTeamProfile({
+        teamId: 'pending-team',
+        parentId: parentAgentId,
+        task: spec.task ?? spec.description,
+        members,
+      });
       const team = this.teams.create({
         name: spec.name,
         parentAgentId,
         description: spec.description,
         generation: parent.getIdentity().generation + 1,
-        tomLevel: spec.tomLevel ?? 2,
+        tomLevel: teamTomProfile.level,
+        tomProfile: teamTomProfile,
         leadAgentId: spec.leadAgentId,
         task: spec.task,
         correlationId,
@@ -980,7 +1066,9 @@ export class Runtime {
         purpose: spec.description,
         parentId: parentAgentId,
         memberArchetypes: members.map(member => member.archetype),
-        tomLevel: spec.tomLevel ?? 2,
+        tomLevel: team.identity.tomLevel,
+        tomProfile: team.identity.tomProfile,
+        tomAnalysis: spec.tomAnalysis,
         leadArchetype: members.find(member => member.lead)?.archetype,
         members: members.map(member => ({
           archetype: member.archetype,
@@ -990,6 +1078,9 @@ export class Runtime {
           tools: member.tools,
           skills: member.skills,
           tomLevel: member.tomLevel,
+          tomProfile: member.tomProfile,
+          cognitiveGapIds: member.cognitiveGapIds,
+          existenceReason: member.existenceReason,
           lead: member.lead ?? false,
         })),
         executionPolicy: { ...executionPolicy },
@@ -1002,6 +1093,8 @@ export class Runtime {
         members: [],
         plannedMembers: members,
         tomLevel: team.identity.tomLevel,
+        tomProfile: team.identity.tomProfile,
+        tomAnalysis: spec.tomAnalysis,
         executionPolicy,
         updatedAt: new Date().toISOString(),
       });
@@ -1028,10 +1121,25 @@ export class Runtime {
           name: spec.name,
           description: spec.description,
           tomLevel: team.identity.tomLevel,
+          tomProfile: team.identity.tomProfile,
           plannedMembers: members.length,
           patternId: pattern.id,
           parentAgentId,
           executionPolicy,
+          cognitiveGapIds: team.identity.tomProfile.cognitiveGaps,
+          perspective: team.identity.tomProfile.perspective,
+        },
+      });
+      this.emit({
+        type: 'tom.team.profile.created',
+        agentId: team.identity.id,
+        sessionId: ctx.sessionId,
+        correlationId,
+        data: {
+          teamId: team.identity.id,
+          parentAgentId,
+          profile: team.identity.tomProfile,
+          analysisId: spec.tomAnalysis?.id,
         },
       });
       return this.teams.get(team.identity.id)!;
@@ -1110,6 +1218,12 @@ export class Runtime {
         spec.task,
         team.identity.parentAgentId
       ).level,
+      tomProfile: spec.tomProfile ?? this.createSubagentToMProfile(
+        spec.archetype,
+        spec.name ?? spec.archetype,
+        spec.task,
+        team.identity.parentAgentId
+      ),
     };
     const nextPlans = [...plans, normalizedSpec];
     this.teamMemberPlans.set(teamId, nextPlans);
@@ -1125,6 +1239,9 @@ export class Runtime {
         tools: member.tools,
         skills: member.skills,
         tomLevel: member.tomLevel,
+        tomProfile: member.tomProfile,
+        cognitiveGapIds: member.cognitiveGapIds,
+        existenceReason: member.existenceReason,
         lead: member.lead ?? false,
       })),
     });
@@ -1158,12 +1275,15 @@ export class Runtime {
         tools: spec.tools,
         skills: spec.skills,
         budgetTokens: spec.budgetTokens,
-        tomProfile: spec.tomLevel === undefined
+        tomProfile: spec.tomProfile ?? (spec.tomLevel === undefined
           ? undefined
           : {
             ...this.createSubagentToMProfile(spec.archetype, '', spec.task, team.identity.parentAgentId),
             level: spec.tomLevel as ToMProfile['level'],
-          },
+          }),
+        tomProfileMode: 'runtime_assignment',
+        cognitiveGapIds: spec.cognitiveGapIds,
+        existenceReason: spec.existenceReason,
         execution: {
           requireParentSynthesis: false,
           showSubagentOutput: false,
@@ -2452,6 +2572,9 @@ export class Runtime {
             name: plan.name,
             tomLevel: plan.tomLevel,
             budgetTokens: plan.budgetTokens,
+            cognitiveGapIds: plan.cognitiveGapIds,
+            existenceReason: plan.existenceReason,
+            tomProfile: plan.tomProfile,
           },
         });
         this.emit({
@@ -2462,6 +2585,8 @@ export class Runtime {
             archetype: plan.archetype,
             name: plan.name,
             task: plan.task,
+            cognitiveGapIds: plan.cognitiveGapIds,
+            existenceReason: plan.existenceReason,
           },
         });
       }
@@ -2473,6 +2598,7 @@ export class Runtime {
           description: userInput,
           task: userInput,
           members: plans.map((plan, index) => ({ ...plan, lead: index === 0 })),
+          tomAnalysis: this.tomAnalyses.get(correlationId),
           correlationId,
         });
         const teamResult = await this.runTeam(team.identity.id, userInput, { correlationId });
@@ -2488,6 +2614,9 @@ export class Runtime {
             tools: plan.tools,
             skills: plan.skills,
             tomLevel: plan.tomLevel,
+            tomProfile: plan.tomProfile,
+            cognitiveGapIds: plan.cognitiveGapIds,
+            existenceReason: plan.existenceReason,
             budgetTokens: plan.budgetTokens,
             correlationId,
             source: 'root',
@@ -2591,6 +2720,11 @@ export class Runtime {
       tomProfile: payload.tomProfile ?? (payload.tomLevel === undefined
         ? undefined
         : { ...this.createSubagentToMProfile(payload.archetype, '', payload.task, payload.parentId ?? 'root'), level: payload.tomLevel as ToMProfile['level'] }),
+      tomProfileMode: payload.source && !['cli', 'server'].includes(payload.source)
+        ? 'runtime_assignment'
+        : 'definition_override',
+      cognitiveGapIds: payload.cognitiveGapIds,
+      existenceReason: payload.existenceReason,
       reuse: { mode: payload.reuseMode ?? 'prefer_cache' },
       outputContract: payload.outputContract,
       execution: {
@@ -2733,8 +2867,12 @@ export class Runtime {
 
     const cachedTools = this.stringArray(cachedAgentPattern?.tools);
     const cachedSkills = this.stringArray(cachedAgentPattern?.skills);
-    const tools = request.tools ?? (cachedTools.length > 0 ? cachedTools : this.getDefaultToolBindings(request.archetype).map(item => item.name));
-    const skills = request.skills ?? (cachedSkills.length > 0 ? cachedSkills : this.getDefaultSkillBindings(request.archetype).map(item => item.name));
+    const baseTools = cachedTools.length > 0 ? cachedTools : this.getDefaultToolBindings(request.archetype).map(item => item.name);
+    const baseSkills = cachedSkills.length > 0 ? cachedSkills : this.getDefaultSkillBindings(request.archetype).map(item => item.name);
+    const tools = request.tools ?? baseTools;
+    const skills = request.skills ?? baseSkills;
+    const toolsOverrideDefinition = request.tools !== undefined && !this.sameStringSet(request.tools, baseTools);
+    const skillsOverrideDefinition = request.skills !== undefined && !this.sameStringSet(request.skills, baseSkills);
     this.validateDelegatedCapabilities(parentId, tools, skills);
 
     const cachedMemoryScope = this.agentMemoryScope(cachedAgentPattern?.memoryScope);
@@ -2750,15 +2888,15 @@ export class Runtime {
     const agentPatternId = typeof cachedAgentPattern?.id === 'string' ? cachedAgentPattern.id : undefined;
     const delegationPatternId = typeof cachedDelegationPattern?.id === 'string' ? cachedDelegationPattern.id : undefined;
     const cacheHits = [agentPatternId, delegationPatternId].filter((item): item is string => Boolean(item));
-    const hasDefinitionOverrides = request.name !== undefined
+    const hasDefinitionOverrides = (request.archetype === 'custom' && request.name !== undefined)
       || request.role !== undefined
       || request.style !== undefined
       || request.description !== undefined
-      || request.tools !== undefined
-      || request.skills !== undefined
+      || toolsOverrideDefinition
+      || skillsOverrideDefinition
       || request.memoryScope !== undefined
       || request.spawnPolicy !== undefined
-      || request.tomProfile !== undefined
+      || (request.tomProfile !== undefined && request.tomProfileMode !== 'runtime_assignment')
       || request.outputContract !== undefined;
     const creationMode: AgentNodeCreationMode = cachedAgentPattern && (reuseMode === 'mutate_cache' || hasDefinitionOverrides)
       ? 'mutated_from_cache'
@@ -2774,7 +2912,7 @@ export class Runtime {
     const description = request.description ?? `Reusable ${request.archetype} agent compute node.`;
     const definitionSeed = {
       archetype: request.archetype,
-      name: request.name,
+      name: request.archetype === 'custom' ? request.name : undefined,
       role: request.role ?? request.archetype,
       style: request.style,
       description,
@@ -2782,7 +2920,7 @@ export class Runtime {
       skills,
       memoryScope,
       spawnPolicy,
-      tomProfile: request.tomProfile,
+      tomProfile: request.tomProfileMode === 'definition_override' ? request.tomProfile : undefined,
       outputContract,
     };
     const definitionFingerprint = this.fingerprint(definitionSeed);
@@ -2814,6 +2952,9 @@ export class Runtime {
         style: request.style,
         description,
         tomProfile: request.tomProfile,
+        tomProfileMode: request.tomProfileMode ?? 'definition_override',
+        cognitiveGapIds: [...(request.cognitiveGapIds ?? [])],
+        existenceReason: request.existenceReason,
       },
       assignment: { task: request.task, outputContract },
       capabilities: { tools: [...tools], skills: [...skills] },
@@ -2879,6 +3020,8 @@ export class Runtime {
       memoryScope: node.context.memoryScope,
       spawnPolicy: node.governance.spawnPolicy,
       tomProfile: node.identity.tomProfile,
+      cognitiveGapIds: node.identity.cognitiveGapIds,
+      existenceReason: node.identity.existenceReason,
       outputContract: node.assignment.outputContract,
       correlationId: node.correlationId,
       source: node.source,
@@ -2919,7 +3062,7 @@ export class Runtime {
     }
 
     const tomProfile = payload.tomProfile
-      ? { ...payload.tomProfile }
+      ? normalizeToMProfile(payload.tomProfile, payload.tomProfile)
       : this.createSubagentToMProfile(payload.archetype, '', payload.task, parentId);
     if (payload.tomLevel !== undefined && [0, 1, 2, 3].includes(payload.tomLevel)) {
       tomProfile.level = payload.tomLevel as ToMProfile['level'];
@@ -2942,6 +3085,8 @@ export class Runtime {
       outputContract: node.assignment.outputContract,
       correlationId,
       tomProfile,
+      cognitiveGapIds: payload.cognitiveGapIds,
+      existenceReason: payload.existenceReason,
       cacheHits,
       nodeDefinition: node,
       teamId: payload.teamId,
@@ -2971,6 +3116,9 @@ export class Runtime {
       task: payload.task,
       parentId,
       agentPatternId: node.reuse.targetPatternId,
+      tomProfile: agent.identity.tomProfile,
+      cognitiveGapIds: payload.cognitiveGapIds,
+      existenceReason: payload.existenceReason,
     });
     this.emit({
       type: 'memory.pattern.updated',
@@ -3377,7 +3525,11 @@ export class Runtime {
         spec.nodeDefinition?.reuse.creationMode ??
         (cacheHits.length > 0 ? 'cache_hit' : spec.archetype === 'custom' ? 'custom' : 'generated');
       const resolvedTomProfile = spec.tomProfile
-        ? { ...spec.tomProfile, subjectAgentId: id }
+        ? normalizeToMProfile({ ...spec.tomProfile, subjectAgentId: id }, {
+          level: spec.tomProfile.level,
+          subjectAgentId: id,
+          purpose: spec.tomProfile.purpose,
+        })
         : this.createSubagentToMProfile(spec.archetype, id, spec.task ?? '', spec.parentId);
     const contextWindow = await this.requireContextWindowManager().build({
       sessionId: ctx.sessionId,
@@ -3440,7 +3592,7 @@ export class Runtime {
       parentId: spec.parentId,
       teamId: spec.teamId,
       generation,
-      tomLevel: spec.tomLevel,
+      tomLevel: resolvedTomProfile.level,
       tomProfile: resolvedTomProfile,
       description: spec.description,
       goal,
@@ -3471,7 +3623,10 @@ export class Runtime {
         status: spec.nodeDefinition?.reuse.basePatternId ? 'candidate' : undefined,
         name: spec.name ?? this.capitalize(spec.archetype),
         archetype: spec.archetype,
-        tomLevel: spec.tomLevel,
+        tomLevel: resolvedTomProfile.level,
+        tomProfile: resolvedTomProfile,
+        cognitiveGapIds: spec.cognitiveGapIds ?? resolvedTomProfile.cognitiveGaps,
+        existenceReason: spec.existenceReason,
         description: spec.description,
         tools: toolBindings.map((binding) => binding.name),
         skills: skillBindings.map((binding) => binding.name),
@@ -3484,6 +3639,25 @@ export class Runtime {
 
     const info = agent.getInfo();
     this.recordTurnAgentCreated(creationCorrelationId);
+    this.emit({
+      type: 'tom.profile.assigned',
+      agentId: id,
+      sessionId: ctx.sessionId,
+      correlationId: creationCorrelationId,
+      nodeId: spec.nodeDefinition?.nodeId,
+      data: {
+        parentId: spec.parentId,
+        level: resolvedTomProfile.level,
+        perspective: resolvedTomProfile.perspective,
+        beliefScope: resolvedTomProfile.beliefScope,
+        goalModel: resolvedTomProfile.goalModel,
+        uncertainty: resolvedTomProfile.uncertainty,
+        observesAgents: resolvedTomProfile.observesAgents,
+        modelsAgents: resolvedTomProfile.modelsAgents,
+        cognitiveGapIds: spec.cognitiveGapIds ?? resolvedTomProfile.cognitiveGaps,
+        existenceReason: spec.existenceReason,
+      },
+    });
     this.emit({
       type: 'context.loaded',
       agentId: id,
@@ -3590,7 +3764,7 @@ export class Runtime {
         parentId: spec.parentId,
         name,
         archetype: spec.archetype,
-        tomLevel: spec.tomLevel,
+        tomLevel: resolvedTomProfile.level,
         description: spec.description,
         mode: creationMode,
         nodeId: spec.nodeDefinition?.nodeId,
@@ -4021,7 +4195,69 @@ export class Runtime {
     const policy = this.getAgentPolicy(parentId);
     const budget = this.getBudgetState();
     const ctx = this.getContext();
-    const cacheHits = await Promise.all(decision.agents.map(async agent => {
+    const parentToMProfile = ctx.manager.getAgentById(parentId)?.getIdentity().tomProfile;
+    const tomAnalysis = this.tomPlanner.analyzeTask({ task, parentId, parentProfile: parentToMProfile });
+    const remainingAgentSlots = Math.min(
+      policy ? Math.max(0, policy.allowedChildren - policy.currentChildren) : 0,
+      this.getRemainingTotalAgentsForTurn(parentId, correlationId),
+      this.workspaceRuntimeConfig?.tom.maxAgentsPerDecision ?? 3
+    );
+    const tomEnabled = this.workspaceRuntimeConfig?.tom.enabled !== false;
+    const completedPlans = tomEnabled
+      ? this.tomPlanner.completePlans(
+        tomAnalysis,
+        decision.agents,
+        this.workspaceRuntimeConfig?.tom.autoCompleteGaps === false
+          ? Math.min(decision.agents.length, remainingAgentSlots)
+          : remainingAgentSlots
+      )
+      : decision.agents.slice(0, remainingAgentSlots);
+    if (completedPlans.length === 0) {
+      return {
+        action: 'solve_directly',
+        reason: `${decision.reason} Delegation skipped because no policy-approved agent slots remain.`,
+      };
+    }
+    const enrichedDecision: DelegationDecision = {
+      ...decision,
+      agents: completedPlans,
+    };
+    this.tomAnalyses.set(correlationId, tomAnalysis);
+    this.emit({
+      type: 'tom.task.analyzed',
+      agentId: parentId,
+      sessionId: ctx.sessionId,
+      correlationId,
+      data: {
+        analysisId: tomAnalysis.id,
+        rationale: tomAnalysis.rationale,
+        requiresHigherOrderToM: tomAnalysis.requiresHigherOrderToM,
+        gapCount: tomAnalysis.gaps.length,
+        parentBeliefs: tomAnalysis.parentBeliefs,
+        parentGoals: tomAnalysis.parentGoals,
+        parentUncertainties: tomAnalysis.parentUncertainties,
+      },
+    });
+    for (const gap of tomAnalysis.gaps) {
+      this.emit({
+        type: 'tom.gap.identified',
+        agentId: parentId,
+        sessionId: ctx.sessionId,
+        correlationId,
+        data: { ...gap, analysisId: tomAnalysis.id },
+      });
+    }
+    if (tomAnalysis.requiresHigherOrderToM) {
+      this.emit({
+        type: 'tom.higher_order.required',
+        agentId: parentId,
+        sessionId: ctx.sessionId,
+        correlationId,
+        data: { analysisId: tomAnalysis.id, reason: tomAnalysis.rationale },
+      });
+    }
+
+    const cacheHits = await Promise.all(completedPlans.map(async agent => {
       const [agentPattern, delegationPattern] = await Promise.all([
         ctx.memory.findAgentPattern(agent.archetype),
         ctx.memory.findDelegationPattern(agent.archetype, agent.task),
@@ -4035,18 +4271,32 @@ export class Runtime {
     const selection = await this.requireCandidatePlanner().select({
       parentId,
       task,
-      decision,
+      decision: enrichedDecision,
       allowedChildren: policy ? Math.max(0, policy.allowedChildren - policy.currentChildren) : 0,
       remainingTotalAgentsForTurn: this.getRemainingTotalAgentsForTurn(parentId, correlationId),
       budgetMode: budget.mode,
       remainingBudgetTokens: budget.remainingTokens,
       cacheUsed: cacheHits.some(Boolean),
       cachedPatterns: [...agentPatterns, ...delegationPatterns],
-      parentToMProfile: ctx.manager.getAgentById(parentId)?.getIdentity().tomProfile,
+      parentToMProfile,
+      tomAnalysis,
     });
 
     await this.recordEvolutionLifecycle(parentId, correlationId, scope, selection);
     this.emitDelegationCandidateEvents(parentId, correlationId, scope, selection);
+    if (selection.selected?.tomCoverage) {
+      this.emit({
+        type: 'tom.delegation.coverage.evaluated',
+        agentId: parentId,
+        sessionId: ctx.sessionId,
+        correlationId,
+        data: {
+          analysisId: tomAnalysis.id,
+          candidateId: selection.selected.id,
+          ...selection.selected.tomCoverage,
+        },
+      });
+    }
     return selection.decision;
   }
 
@@ -4072,6 +4322,7 @@ export class Runtime {
           scoreBreakdown: candidate.scoreBreakdown,
           lineage: candidate.lineage,
           rationale: candidate.rationale,
+          tomCoverage: candidate.tomCoverage,
         },
       });
     }
@@ -4091,6 +4342,7 @@ export class Runtime {
           scoreBreakdown: selection.selected.scoreBreakdown,
           lineage: selection.selected.lineage,
           rationale: selection.selected.rationale,
+          tomCoverage: selection.selected.tomCoverage,
         },
       });
     } else if (selection.rejectedReason) {
@@ -4202,13 +4454,14 @@ export class Runtime {
           role: 'system',
           content: `You are Roy's root delegation controller.
 Decide whether the user request should be solved directly by Roy, clarified, or delegated to 1-3 subagents.
+Reason in terms of cognitive gaps: missing evidence, missing perspective, failure-mode uncertainty, implementation capability, verification, or belief reconciliation.
 Use delegation only when the task benefits from grounded inspection, critique, planning, coding, testing, or summarization.
 Do not spawn more than 3 subagents. Prefer 1-2 unless the task clearly needs more.
 Ask for clarification when the user request is too ambiguous to assign a concrete task safely.
 Return strict JSON matching one of:
 {"action":"solve_directly","reason":"..."}
 {"action":"ask_clarification","reason":"...","question":"..."}
-{"action":"spawn_subagents","reason":"...","agents":[{"archetype":"researcher","name":"Researcher-1","task":"...","tomLevel":0}]}
+{"action":"spawn_subagents","reason":"...","agents":[{"archetype":"researcher","name":"Researcher-1","task":"...","tomLevel":0,"existenceReason":"which cognitive gap this agent fills"}]}
 Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, custom.`,
         },
         {
@@ -4217,7 +4470,7 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
             `<user_task>${userInput}</user_task>`,
             `<memory_context>${this.formatPublicContext(rootContext).slice(0, 6000)}</memory_context>`,
             `<budget_state>${JSON.stringify(this.getBudgetState(), null, 2)}</budget_state>`,
-            '<runtime_policy>Subagents must be runtime actors with identity, state, budget, messages, and events. If spawning, assign concrete non-overlapping tasks. If budget is limited, reduce the number of subagents or solve directly and explain the constraint.</runtime_policy>',
+            '<runtime_policy>Subagents must be runtime actors with identity, state, budget, messages, and events. Each agent must fill a distinct cognitive gap, receive a concrete non-overlapping task, and expose why it exists. The runtime will validate and enrich the ToM profiles. If budget is limited, reduce the number of subagents or solve directly and explain the constraint.</runtime_policy>',
           ].join('\n\n'),
         },
       ], { temperature: 0.1, maxTokens: 900 });
@@ -4277,11 +4530,11 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
         {
           role: 'system',
           content: `You are ${agent.identity.name}'s delegation controller.
-Decide whether this non-root agent should solve directly or delegate to 1-3 direct child agents.
+Decide whether this non-root agent should solve directly or delegate to 1-3 direct child agents. Delegate only to close an explicit evidence, perspective, risk, planning, implementation, verification, or synthesis gap in the parent agent's current model.
 Only delegate when a child with a different specialty materially improves the result.
 Return strict JSON:
 {"action":"solve_directly","reason":"..."}
-{"action":"spawn_subagents","reason":"...","agents":[{"archetype":"critic","name":"Critic-1","task":"...","tomLevel":2}]}
+{"action":"spawn_subagents","reason":"...","agents":[{"archetype":"critic","name":"Critic-1","task":"...","tomLevel":2,"existenceReason":"which cognitive gap this child fills"}]}
 Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, custom.`,
         },
         {
@@ -4396,6 +4649,10 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
           skills: Array.isArray(plan.skills) ? plan.skills.filter((item): item is string => typeof item === 'string') : undefined,
           tomLevel: typeof plan.tomLevel === 'number' ? plan.tomLevel : undefined,
           budgetTokens: typeof plan.budgetTokens === 'number' ? plan.budgetTokens : undefined,
+      cognitiveGapIds: Array.isArray(plan.cognitiveGapIds)
+            ? plan.cognitiveGapIds.filter((item): item is string => typeof item === 'string')
+            : undefined,
+          existenceReason: typeof plan.existenceReason === 'string' ? plan.existenceReason : undefined,
         }));
       if (agents.length > 0) {
         return {
@@ -4466,6 +4723,10 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
             : userInput,
           tomLevel: typeof plan.tomLevel === 'number' ? plan.tomLevel : undefined,
           budgetTokens: typeof plan.budgetTokens === 'number' ? plan.budgetTokens : undefined,
+          cognitiveGapIds: Array.isArray(plan.cognitiveGapIds)
+            ? plan.cognitiveGapIds.filter((item): item is string => typeof item === 'string')
+            : undefined,
+          existenceReason: typeof plan.existenceReason === 'string' ? plan.existenceReason : undefined,
         }));
 
       if (agents.length > 0) {
@@ -4708,6 +4969,9 @@ id: ${result.agent.identity.id}
 name: ${result.agent.identity.name}
 archetype: ${result.agent.identity.role}
 tom: ToM-${result.agent.identity.tomProfile.level}
+tom_profile: ${JSON.stringify(result.agent.identity.tomProfile)}
+existence_reason: ${result.node.identity.existenceReason ?? 'bounded specialist contribution'}
+cognitive_gaps: ${result.node.identity.cognitiveGapIds.join(', ') || 'none'}
 tokens: ${result.subagentResult.usage.totalTokens}
 grounded: ${result.subagentResult.grounded}
 tool_grounded: ${result.subagentResult.evidence.toolGrounded}
@@ -4726,6 +4990,7 @@ ${result.subagentResult.result}
 id: ${result.team.identity.id}
 name: ${result.team.identity.name}
 tom: ToM-${result.team.identity.tomLevel}
+tom_profile: ${JSON.stringify(result.team.identity.tomProfile)}
 members: ${result.team.memberAgentIds.join(', ')}
 tokens: ${result.usage.totalTokens}
 content:
@@ -4739,6 +5004,7 @@ ${userTask}
 
 Roy delegated this task to ${results.length} subagent(s). Synthesize their results into one final user-facing response.
 Use concrete evidence from grounded reports. If a report is ungrounded or missing concrete tool output, say so and avoid overstating it.
+Compare each agent's belief scope and perspective against the cognitive gaps it was created to fill. Preserve unresolved uncertainty instead of forcing agreement.
 
 ${teamReports ? `The following subteam reports have already aggregated their direct members. Treat them as the primary delegation result.\n\n${teamReports}` : ''}
 
@@ -5010,6 +5276,9 @@ Produce the final response to the user as Roy, the root agent.`;
           archetype: plan.archetype,
           name: plan.name,
           tomLevel: plan.tomLevel,
+          tomProfile: plan.tomProfile,
+          cognitiveGapIds: plan.cognitiveGapIds,
+          existenceReason: plan.existenceReason,
           budgetTokens: plan.budgetTokens,
           scope: 'agent',
         },
@@ -5035,6 +5304,7 @@ Produce the final response to the user as Roy, the root agent.`;
         description: task,
         task,
         members: plans.map((plan, index) => ({ ...plan, lead: index === 0 })),
+        tomAnalysis: this.tomAnalyses.get(correlationId),
         correlationId,
       });
       teamResult = await this.runTeam(team.identity.id, task, { correlationId });
@@ -5049,6 +5319,9 @@ Produce the final response to the user as Roy, the root agent.`;
           tools: plan.tools,
           skills: plan.skills,
           tomLevel: plan.tomLevel,
+          tomProfile: plan.tomProfile,
+          cognitiveGapIds: plan.cognitiveGapIds,
+          existenceReason: plan.existenceReason,
           budgetTokens: plan.budgetTokens,
           correlationId,
           source: agentId,
@@ -5175,6 +5448,9 @@ Produce the final response to the user as Roy, the root agent.`;
       tools: member.tools,
       skills: member.skills,
       tomLevel: member.tomLevel,
+      tomProfile: member.tomProfile,
+      cognitiveGapIds: member.cognitiveGapIds,
+      existenceReason: member.existenceReason,
       lead: member.lead ?? false,
     }));
     const members = team.memberAgentIds.map(agentId => {
@@ -5194,6 +5470,7 @@ Produce the final response to the user as Roy, the root agent.`;
       parentAgentId: team.identity.parentAgentId,
       leadAgentId: team.leadAgentId,
       tomLevel: team.identity.tomLevel,
+      tomProfile: team.identity.tomProfile,
       status: team.status,
       fsmState: team.fsmState,
       members,
@@ -5311,6 +5588,7 @@ Produce the final response to the user as Roy, the root agent.`;
       `team_role: ${member.agent.identity.id === team.leadAgentId ? 'lead' : 'member'}`,
       `tokens: ${member.usage.totalTokens}`,
       `grounded: ${member.grounded}`,
+      `tom_profile: ${JSON.stringify(member.agent.identity.tomProfile)}`,
       member.result,
       '</member>',
     ].join('\n')).join('\n\n');
@@ -5324,11 +5602,13 @@ Produce the final response to the user as Roy, the root agent.`;
       `You are ${team.identity.name}, a subteam actor in Roy.`,
       `Description: ${team.identity.description}`,
       `ToM level: ${team.identity.tomLevel}`,
+      `ToM profile: ${JSON.stringify(team.identity.tomProfile, null, 2)}`,
       `Lead agent: ${team.leadAgentId ?? 'not assigned'}`,
       `<team_definition>\n${teamDefinition}\n</team_definition>`,
       `<team_private_memory>\n${teamMemory}\n</team_private_memory>`,
       `<public_context>\n${publicContext}\n</public_context>`,
       'Aggregate direct member reports into one grounded result for the parent agent.',
+      'Reconcile member beliefs explicitly, preserve unresolved uncertainty, and explain how the final result covers the team cognitive gaps.',
       'Give the lead report coordination priority, but verify it against all available member evidence.',
       'If member failures are present, state their impact and do not imply full team completion.',
       'Do not claim evidence that is absent from member reports.',
@@ -5643,6 +5923,7 @@ name: ${agent.identity.name}
 role: ${agent.identity.role}
 tom: ToM-${agent.identity.tomProfile.level}
 purpose: ${agent.identity.tomProfile.purpose}
+profile: ${JSON.stringify(agent.identity.tomProfile, null, 2)}
 </subagent>
 
 The subagent returned this report:
@@ -5833,6 +6114,11 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
     if (request.reuse?.mode && !reuseModes.has(request.reuse.mode)) {
       throw new Error(`Unsupported agent cache reuse mode "${String(request.reuse.mode)}"`);
     }
+    if (request.tomProfileMode
+      && request.tomProfileMode !== 'runtime_assignment'
+      && request.tomProfileMode !== 'definition_override') {
+      throw new Error(`Unsupported ToM profile mode "${String(request.tomProfileMode)}"`);
+    }
     if (request.budgetTokens !== undefined
       && (!Number.isFinite(request.budgetTokens) || request.budgetTokens <= 0)) {
       throw new Error('Agent node budgetTokens must be a positive finite number');
@@ -5840,6 +6126,24 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
     if (request.outputContract
       && !['markdown', 'json', 'structured_report'].includes(request.outputContract.format)) {
       throw new Error(`Unsupported agent output format "${String(request.outputContract.format)}"`);
+    }
+    if (request.tomProfile) {
+      if (!Number.isInteger(request.tomProfile.level) || request.tomProfile.level < 0 || request.tomProfile.level > 3) {
+        throw new Error('Agent ToM profile level must be an integer from 0 to 3');
+      }
+      for (const field of ['beliefScope', 'goalModel', 'uncertainty', 'observesAgents', 'modelsAgents', 'capabilityScope', 'cognitiveGaps'] as const) {
+        const value = request.tomProfile[field];
+        if (!Array.isArray(value) || value.some(item => typeof item !== 'string' || !item.trim())) {
+          throw new Error(`Agent ToM profile ${field} must be an array of non-empty strings`);
+        }
+      }
+      if (!request.tomProfile.purpose?.trim()) throw new Error('Agent ToM profile purpose is required');
+    }
+    if (request.cognitiveGapIds?.some(item => typeof item !== 'string' || !item.trim())) {
+      throw new Error('Agent cognitiveGapIds must contain non-empty strings');
+    }
+    if (request.existenceReason !== undefined && !request.existenceReason.trim()) {
+      throw new Error('Agent existenceReason must be a non-empty string when provided');
     }
     if (request.memoryScope
       && (!Number.isFinite(request.memoryScope.sessionWindowTurns) || request.memoryScope.sessionWindowTurns < 0)) {
@@ -5910,6 +6214,12 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
   private stringArray(value: unknown): string[] {
     if (!Array.isArray(value)) return [];
     return Array.from(new Set(value.filter((item): item is string => typeof item === 'string' && item.length > 0)));
+  }
+
+  private sameStringSet(left: string[], right: string[]): boolean {
+    const a = [...new Set(left)].sort();
+    const b = [...new Set(right)].sort();
+    return a.length === b.length && a.every((value, index) => value === b[index]);
   }
 
   private agentMemoryScope(value: unknown): AgentMemoryScope | undefined {
@@ -6176,9 +6486,17 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
   }
 
   private createRootToMProfile(): ToMProfile {
-    return {
+    return normalizeToMProfile({
       level: 1,
       subjectAgentId: 'root',
+      beliefScope: ['user intent', 'runtime state', 'available agent capabilities', 'budget and policy constraints'],
+      goalModel: ['Provide a reliable final response and delegate only when another perspective closes a cognitive gap.'],
+      uncertainty: ['Which evidence or specialist perspective is missing for the current task?'],
+      perspective: 'root coordinator and user-intent modeler',
+      observesAgents: [],
+      modelsAgents: [],
+      capabilityScope: ['task assessment', 'delegation', 'team synthesis', 'memory coordination'],
+      cognitiveGaps: [],
       models: [
         {
           targetId: 'user',
@@ -6188,42 +6506,27 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
         },
       ],
       purpose: 'Understand user intent and decide how to answer or delegate.',
-    };
+    }, {
+      level: 1,
+      subjectAgentId: 'root',
+      purpose: 'Understand user intent and decide how to answer or delegate.',
+    });
   }
 
   private createSubagentToMProfile(archetype: SubAgentArchetype, subjectAgentId: string, task: string, parentId = 'root'): ToMProfile {
-    const level = this.defaultToMLevel(archetype);
-    const models: ToMProfile['models'] = [];
-    const recursiveModels: NonNullable<ToMProfile['recursiveModels']> = [];
-    if (level >= 1) {
-      models.push({
-        targetId: parentId,
-        targetType: 'agent',
-        goalModel: ['receive a reliable result that advances the delegated task'],
-        intentModel: ['delegate a bounded specialist task and synthesize the result upward'],
-      });
-    }
-    if (archetype === 'critic') {
-      models.push({
-        targetId: 'user',
-        targetType: 'user',
-        goalModel: ['receive a grounded result with explicit limitations'],
-        uncertaintyModel: ['the delegated report may omit evidence or overstate conclusions'],
-      });
-      recursiveModels.push({
-        observerId: parentId,
-        targetId: subjectAgentId || 'critic',
-        relation: 'parent expects evidence-aware critique',
-        description: 'Evaluate whether the candidate result satisfies the parent goal and user intent.',
-      });
-    }
-    return {
-      level,
-      subjectAgentId,
-      models,
-      recursiveModels: recursiveModels.length > 0 ? recursiveModels : undefined,
+    const analysis = this.tomPlanner.analyzeTask({
+      task,
+      parentId,
+      parentProfile: this.ctx?.manager.getAgentById(parentId)?.getIdentity().tomProfile,
+    });
+    const plan = this.tomPlanner.completePlans(analysis, [{ archetype, task }], 1)[0];
+    const profile = normalizeToMProfile(plan?.tomProfile, {
+      level: this.defaultToMLevel(archetype),
+      subjectAgentId: subjectAgentId || archetype,
       purpose: this.defaultToMPurpose(archetype, task),
-    };
+    });
+    profile.subjectAgentId = subjectAgentId || archetype;
+    return profile;
   }
 
   private defaultToMLevel(archetype: SubAgentArchetype): ToMProfile['level'] {

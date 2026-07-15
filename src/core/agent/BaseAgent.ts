@@ -9,6 +9,9 @@ import { memoryRegistry } from '../memory/index.js';
 import { buildPrompt } from '../prompts/builder.js';
 import { conversationalTemplate } from '../prompts/templates/conversational.js';
 import { logger } from '../utils/logger.js';
+import { normalizeToMProfile, type ToMProfile } from '../tom/index.js';
+
+export type { ToMProfile } from '../tom/index.js';
 
 export type AgentState = 'idle' | 'thinking' | 'calling_tool' | 'synthesizing' | 'waiting' | 'done' | 'failed' | 'stopped';
 export type AgentRole = 'root' | 'subagent' | 'subteam';
@@ -23,26 +26,6 @@ export interface AgentIdentity {
   tomLevel: number;
   description?: string;
   tomProfile: ToMProfile;
-}
-
-export interface ToMProfile {
-  level: 0 | 1 | 2 | 3;
-  subjectAgentId: string;
-  models: Array<{
-    targetId: string;
-    targetType: 'user' | 'agent' | 'team' | 'environment';
-    beliefModel?: string[];
-    goalModel?: string[];
-    intentModel?: string[];
-    uncertaintyModel?: string[];
-  }>;
-  recursiveModels?: Array<{
-    observerId: string;
-    targetId: string;
-    relation: string;
-    description: string;
-  }>;
-  purpose: string;
 }
 
 export interface AgentUsage {
@@ -133,7 +116,9 @@ export abstract class BaseAgent {
     this.generation = config.generation ?? (this.role === 'root' ? 0 : 1);
     this.tomLevel = config.tomLevel ?? (this.role === 'root' ? 1 : 1);
     this.description = config.description;
-    this.tomProfile = config.tomProfile ?? this.createDefaultToMProfile();
+    const defaultProfile = this.createDefaultToMProfile();
+    this.tomProfile = normalizeToMProfile(config.tomProfile, defaultProfile);
+    this.tomLevel = this.tomProfile.level;
     this.shortTermMemory = memoryRegistry.getShortTerm(this.name, '');
     this.longTermMemory = memoryRegistry.getLongTerm(this.name);
   }
@@ -188,6 +173,14 @@ export abstract class BaseAgent {
       return {
         level: 1,
         subjectAgentId: this.id,
+        beliefScope: ['user intent', 'runtime state', 'delegation constraints'],
+        goalModel: ['Answer the user reliably and delegate only when cognitive gaps justify it.'],
+        uncertainty: [],
+        perspective: 'root coordinator',
+        observesAgents: [],
+        modelsAgents: [],
+        capabilityScope: ['reasoning', 'delegation', 'synthesis'],
+        cognitiveGaps: [],
         models: [
           {
             targetId: 'user',
@@ -203,6 +196,14 @@ export abstract class BaseAgent {
     return {
       level: 0,
       subjectAgentId: this.id,
+      beliefScope: [],
+      goalModel: ['Complete the assigned bounded task.'],
+      uncertainty: [],
+      perspective: 'bounded specialist',
+      observesAgents: this.parentId ? [this.parentId] : [],
+      modelsAgents: [],
+      capabilityScope: [],
+      cognitiveGaps: [],
       models: [],
       purpose: this.description ?? 'Complete the assigned task within its local scope.',
     };

@@ -14,6 +14,7 @@ import {
   LLMDelegationScorer,
   ToMDelegationScorer,
 } from './scorers.js';
+import { ToMDelegationPlanner } from '../tom/index.js';
 
 const ARCHETYPE_COST: Record<string, number> = {
   researcher: 2200,
@@ -29,12 +30,15 @@ export interface DelegationCandidatePlannerOptions {
   llm?: LLMProvider | null;
   scorers?: DelegationCandidateScorer[];
   minimumScore?: number;
+  minimumToMCoverage?: number;
   enabledScorers?: string[];
 }
 
 export class DefaultDelegationCandidatePlanner {
   private readonly scorers: DelegationCandidateScorer[];
   private readonly minimumScore: number;
+  private readonly minimumToMCoverage: number;
+  private readonly tomPlanner = new ToMDelegationPlanner();
 
   constructor(options: DelegationCandidatePlannerOptions = {}) {
     const defaultScorers = [
@@ -46,6 +50,7 @@ export class DefaultDelegationCandidatePlanner {
     ];
     this.scorers = options.scorers ?? defaultScorers.filter(scorer => !options.enabledScorers || options.enabledScorers.includes(scorer.name));
     this.minimumScore = options.minimumScore ?? 0.05;
+    this.minimumToMCoverage = options.minimumToMCoverage ?? 0;
   }
 
   async select(input: DelegationCandidateInput): Promise<DelegationCandidateSelection> {
@@ -63,11 +68,15 @@ export class DefaultDelegationCandidatePlanner {
     const run = await engine.run(input);
     const candidates = run.evaluated.map(item => item.candidate).sort((a, b) => b.score - a.score);
     const selected = run.selected?.candidate;
-    if (!selected || selected.score < this.minimumScore || selected.agents.length === 0) {
+    const coverageRejected = input.budgetMode === 'unlimited'
+      && Math.min(input.allowedChildren, input.remainingTotalAgentsForTurn) > 1
+      && selected?.tomCoverage
+      && selected.tomCoverage.coverageScore < this.minimumToMCoverage;
+    if (!selected || selected.score < this.minimumScore || selected.agents.length === 0 || coverageRejected) {
       return {
         candidates,
         decision: { action: 'solve_directly', reason: `${input.decision.reason} Delegation skipped because no candidate passed policy scoring.` },
-        rejectedReason: 'no_candidate_selected',
+        rejectedReason: coverageRejected ? 'tom_coverage_below_minimum' : 'no_candidate_selected',
       };
     }
     return {
@@ -132,6 +141,9 @@ export class DefaultDelegationCandidatePlanner {
       const expectedUtility = Math.max(0, (breakdown.heuristic ?? 0) + (breakdown.tom ?? 0) + (breakdown.cache_evolution ?? 0));
       const evaluated = {
         ...candidate,
+        tomCoverage: input.tomAnalysis
+          ? this.tomPlanner.evaluateCoverage(input.tomAnalysis, candidate.agents)
+          : undefined,
         expectedUtility: Number(expectedUtility.toFixed(4)),
         score: Number(score.toFixed(4)),
         scoreBreakdown: breakdown,

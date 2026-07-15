@@ -141,14 +141,16 @@ describe('Phase 2 engineering infrastructure', () => {
       llmProvider: new EngineeringLLM(),
     });
     const result = await runtime.handleUserTurn('Analyze this repo and find architectural risks');
-    expect(result.subagents).toHaveLength(2);
+    expect(result.subagents).toHaveLength(3);
     expect(result.teams).toHaveLength(1);
     const teams = runtime.getTeams();
     expect(teams).toHaveLength(1);
     expect(teams[0].status).toBe('done');
     expect(teams[0].fsmState).toBe('S_team_done');
-    expect(teams[0].identity.name).toBe('ReviewTeam');
-    expect(teams[0].memberAgentIds).toHaveLength(2);
+    expect(teams[0].identity.name).toBe('AnalysisTeam');
+    expect(teams[0].memberAgentIds).toHaveLength(3);
+    expect(teams[0].identity.tomProfile.level).toBe(2);
+    expect(teams[0].identity.tomProfile.cognitiveGaps.length).toBeGreaterThan(0);
     const events = runtime.getEvents().map(event => event.type);
     expect(events).toContain('team.created');
     expect(events).toContain('team.completed');
@@ -161,8 +163,8 @@ describe('Phase 2 engineering infrastructure', () => {
     const messages = await runtime.getMessages({ correlationId: result.correlationId });
     expect(messages.map(message => message.kind)).toContain('team.task');
     expect(messages.map(message => message.kind)).toContain('team.result');
-    expect(messages.filter(message => message.kind === 'agent.task' && message.from === teams[0].identity.id)).toHaveLength(2);
-    expect(messages.filter(message => message.kind === 'agent.result' && message.to === teams[0].identity.id)).toHaveLength(2);
+    expect(messages.filter(message => message.kind === 'agent.task' && message.from === teams[0].identity.id)).toHaveLength(3);
+    expect(messages.filter(message => message.kind === 'agent.result' && message.to === teams[0].identity.id)).toHaveLength(3);
     expect(messages.map(message => message.kind)).toContain('evo.select');
     expect(await runtime.getEvolutionHistory()).toHaveLength(1);
     expect(result.usage.teamSynthesis[teams[0].identity.id].totalTokens).toBeGreaterThan(0);

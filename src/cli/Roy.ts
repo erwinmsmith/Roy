@@ -350,7 +350,11 @@ export class Roy {
         break;
 
       case '/teams':
-        this.printTeams(parts.includes('--tree'));
+        this.printTeams(parts.includes('--tree'), parts.includes('--tom'));
+        break;
+
+      case '/tom':
+        this.printToMState(parts[1]);
         break;
 
       case '/team':
@@ -517,6 +521,7 @@ export class Roy {
       /agents --tree --tom Show agent tree with ToM profiles
       /agents archetypes  Show built-in archetype skills/tools
       /agents policy <id> Show spawn policy for an agent
+      /tom [correlation-id] Show cognitive gaps and ToM profiles
       /spawn <type> "task" Spawn and run a controlled subagent
       /spawn <type> --parent <id> "task" Spawn below another agent
       /spawn custom --name <name> [--role <role>] [--style <style>] "task"
@@ -533,6 +538,7 @@ export class Roy {
       /tools deny <id>    Deny a pending tool request
       /teams              Show runtime subteams
       /teams --tree       Show root, team, and member actor tree
+      /teams --tree --tom Show actor tree with team/agent ToM details
       /team <team-id>     Show one team and its member tree
       /team create --name <name> --description <text> [--mode sequential|parallel] [--failure fail_fast|best_effort]
       /team add <team-id> <archetype> "task"
@@ -574,7 +580,7 @@ export class Roy {
         console.log(`    - ${this.cyan(agent.identity.id)} ${agent.name} ${this.dim(agent.role)} ${isActive ? this.green('[active]') : ''}`);
         console.log(`      state=${agent.state}, tom=${agent.identity.tomLevel}, tokens=${usage.totalTokens}, calls=${usage.llmCalls}, parent=${parent}`);
         if (showTom) {
-          console.log(`      tomPurpose=${agent.identity.tomProfile.purpose}`);
+          this.printToMProfile(agent.identity.tomProfile, '      ');
         }
       }
     }
@@ -626,9 +632,7 @@ export class Roy {
     const label = `${agent.name} [${agent.role}, ToM-${agent.identity.tomProfile.level}, ${agent.state}, ${usage.totalTokens} tokens]`;
     console.log(prefix + (isRoot ? '' : '└── ') + this.cyan(label));
     if (showTom) {
-      const modelTargets = agent.identity.tomProfile.models.map(model => model.targetId).join(', ') || 'none';
-      console.log(prefix + (isRoot ? '  ' : '    ') + this.dim(`purpose: ${agent.identity.tomProfile.purpose}`));
-      console.log(prefix + (isRoot ? '  ' : '    ') + this.dim(`models: ${modelTargets}`));
+      this.printToMProfile(agent.identity.tomProfile, prefix + (isRoot ? '  ' : '    '));
     }
     const childPrefix = prefix + (isRoot ? '' : '    ');
     for (let i = 0; i < node.children.length; i++) {
@@ -644,6 +648,7 @@ export class Roy {
     console.log('    GET  /v1/status  - Runtime status');
     console.log('    GET  /v1/agents  - Agent states');
     console.log('    GET  /v1/agents/tree - Agent tree');
+    console.log('    GET  /v1/tom     - ToM analyses, gaps, and actor profiles');
     console.log('    POST /v1/agents  - Spawn subagent');
     console.log('    POST /v1/agents/:id/run - Run subagent');
     console.log('    GET  /v1/teams - Team states');
@@ -876,19 +881,20 @@ export class Roy {
     this.printTools();
   }
 
-  private printTeams(tree = false): void {
+  private printTeams(tree = false, showTom = false): void {
     const teams = runtime.getTeams();
     console.log('\n  ' + this.bold('Runtime Teams'));
     if (teams.length === 0) {
       console.log('    ' + this.dim('No runtime teams'));
     } else if (tree) {
       const actorTree = runtime.getTeamActorTree();
-      this.printRuntimeActorTree(actorTree.hierarchy, '    ', true, true);
+      this.printRuntimeActorTree(actorTree.hierarchy, '    ', true, true, showTom);
     } else {
       for (const team of teams) {
         console.log(`    - ${this.cyan(team.identity.id)} ${team.identity.name} [${team.status}] parent=${team.identity.parentAgentId}`);
         console.log(`      fsm=${team.fsmState} members=${team.memberAgentIds.length} tokens=${team.tokenUsage.totalTokens}`);
         console.log(`      execution=${team.executionPolicy.mode}/${team.executionPolicy.failureMode} concurrency=${team.executionPolicy.maxConcurrency} minSuccess=${team.executionPolicy.minimumSuccessfulMembers}`);
+        if (showTom) this.printToMProfile(team.identity.tomProfile, '      ');
         const failedMembers = Object.entries(team.memberErrors);
         if (failedMembers.length > 0) console.log(`      failures=${failedMembers.map(([id, error]) => `${id}: ${error}`).join('; ')}`);
       }
@@ -905,7 +911,7 @@ export class Roy {
     });
   }
 
-  private printRuntimeActorTree(node: RuntimeActorNode, prefix: string, last: boolean, root = false): void {
+  private printRuntimeActorTree(node: RuntimeActorNode, prefix: string, last: boolean, root = false, showTom = false): void {
     const branch = root ? '' : last ? '└── ' : '├── ';
     const continuation = root ? '' : last ? '    ' : '│   ';
     if (node.type === 'agent') {
@@ -913,9 +919,47 @@ export class Roy {
     } else {
       console.log(`${prefix}${branch}${this.cyan(node.team.identity.name)} [subteam, ToM-${node.team.identity.tomLevel}, ${node.team.status}, ${node.team.tokenUsage.totalTokens} tokens]`);
     }
+    if (showTom) {
+      const profile = node.type === 'agent' ? node.agent.identity.tomProfile : node.team.identity.tomProfile;
+      this.printToMProfile(profile, prefix + continuation + '  ');
+    }
     node.children.forEach((child, index) => {
-      this.printRuntimeActorTree(child, prefix + continuation, index === node.children.length - 1);
+      this.printRuntimeActorTree(child, prefix + continuation, index === node.children.length - 1, false, showTom);
     });
+  }
+
+  private printToMProfile(profile: ReturnType<typeof runtime.getState>['rootAgent']['identity']['tomProfile'], prefix: string): void {
+    const line = (label: string, values: string[] | string | undefined): void => {
+      const value = Array.isArray(values) ? values.join('; ') : values;
+      console.log(`${prefix}${this.dim(`${label}: ${value?.trim() || 'none'}`)}`);
+    };
+    line('purpose', profile.purpose);
+    line('perspective', profile.perspective);
+    line('belief', profile.beliefScope);
+    line('goal', profile.goalModel);
+    line('uncertainty', profile.uncertainty);
+    line('observes', profile.observesAgents);
+    line('models', profile.modelsAgents.length > 0 ? profile.modelsAgents : profile.models.map(model => model.targetId));
+    line('gaps', profile.cognitiveGaps);
+  }
+
+  private printToMState(correlationId?: string): void {
+    const state = runtime.getToMState(correlationId);
+    console.log('\n  ' + this.bold('Theory of Mind State'));
+    if (state.analyses.length === 0) {
+      console.log('    ' + this.dim(correlationId ? `No analysis found for ${correlationId}` : 'No delegation analyses recorded yet'));
+    }
+    for (const analysis of state.analyses.slice(-5)) {
+      console.log(`    - ${this.cyan(analysis.id)} parent=${analysis.parentId} higherOrder=${analysis.requiresHigherOrderToM ? 'yes' : 'no'}`);
+      console.log(`      rationale: ${analysis.rationale}`);
+      for (const gap of analysis.gaps) {
+        console.log(`      ${gap.id} [${gap.kind}, priority=${gap.priority}]`);
+        console.log(`        need: ${gap.description}`);
+        console.log(`        perspective: ${gap.requiredPerspective}`);
+      }
+    }
+    console.log(`    Actors: ${state.agents.length} agents, ${state.teams.length} teams`);
+    console.log('');
   }
 
   private async handleTeam(parts: string[]): Promise<void> {
@@ -982,6 +1026,7 @@ export class Roy {
       console.log(`    Status: ${team.status}`);
       console.log(`    FSM:    ${team.fsmState}`);
       console.log(`    ToM:    ${team.identity.tomLevel}`);
+      this.printToMProfile(team.identity.tomProfile, '    ');
       console.log(`    Lead:   ${team.leadAgentId ?? 'none'}`);
       console.log(`    Policy: ${team.executionPolicy.mode}, ${team.executionPolicy.failureMode}, concurrency=${team.executionPolicy.maxConcurrency}, minSuccess=${team.executionPolicy.minimumSuccessfulMembers}`);
       console.log(`    Tokens: ${team.tokenUsage.totalTokens} (members ${team.tokenUsage.totalTokens - team.synthesisUsage.totalTokens}, synthesis ${team.synthesisUsage.totalTokens})`);
@@ -1428,7 +1473,7 @@ export class Roy {
 
   private completer(line: string): [string[], string] {
     const commands = [
-      '/help', '/h', '/clear', '/cls', '/reset', '/agents', '/spawn', '/run', '/teams', '/team', '/exit', '/quit', '/q',
+      '/help', '/h', '/clear', '/cls', '/reset', '/agents', '/spawn', '/run', '/teams', '/team', '/tom', '/exit', '/quit', '/q',
       '/api', '/status', '/skills', '/actions', '/tools', '/memory', '/session',
       '/system', '/fsm', '/budget', '/events', '/queue', '/cache', '/messages', '/traces', '/config', '/prompt', '/context', '/conversation', '/verbose', '/color'
     ];

@@ -1,5 +1,6 @@
 import { appendFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import type { ToMProfile, ToMTaskAnalysis } from '../tom/index.js';
 import type { RuntimeEvent } from '../runtime/Runtime.js';
 
 const WORKSPACE_FILE_LOCKS = new Map<string, Promise<void>>();
@@ -132,6 +133,9 @@ export interface AgentPatternInput {
   name: string;
   archetype: string;
   tomLevel: number;
+  tomProfile?: ToMProfile;
+  cognitiveGapIds?: string[];
+  existenceReason?: string;
   description?: string;
   tools?: string[];
   skills?: string[];
@@ -158,6 +162,14 @@ export interface WorkspaceRuntimeConfig {
       enabledScorers: Array<'heuristic' | 'cost' | 'tom' | 'cache_evolution' | 'llm'>;
       minimumScore: number;
     };
+  };
+  tom: {
+    enabled: boolean;
+    autoCompleteGaps: boolean;
+    maxAgentsPerDecision: number;
+    minimumCoverage: number;
+    requireExistenceReason: boolean;
+    higherOrderForMultiplePerspectives: boolean;
   };
   agents: {
     defaultToolsByArchetype: Record<string, string[]>;
@@ -199,6 +211,9 @@ export interface DelegationPatternInput {
   task: string;
   parentId: string;
   agentPatternId: string;
+  tomProfile?: ToMProfile;
+  cognitiveGapIds?: string[];
+  existenceReason?: string;
 }
 
 export interface TeamPatternInput {
@@ -208,6 +223,8 @@ export interface TeamPatternInput {
   parentId: string;
   memberArchetypes: string[];
   tomLevel?: number;
+  tomProfile?: ToMProfile;
+  tomAnalysis?: ToMTaskAnalysis;
   leadArchetype?: string;
   members?: Array<Record<string, unknown>>;
   executionPolicy?: Record<string, unknown>;
@@ -407,7 +424,7 @@ Role-specific terms are recorded here.
 };
 
 const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
-  version: 1,
+  version: 2,
   traceEvents: true,
   memoryUpdates: 'suggest',
   delegation: {
@@ -422,6 +439,14 @@ const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
       enabledScorers: ['heuristic', 'cost', 'tom', 'cache_evolution', 'llm'],
       minimumScore: 0.05,
     },
+  },
+  tom: {
+    enabled: true,
+    autoCompleteGaps: true,
+    maxAgentsPerDecision: 3,
+    minimumCoverage: 0.6,
+    requireExistenceReason: true,
+    higherOrderForMultiplePerspectives: true,
   },
   agents: {
     defaultToolsByArchetype: {
@@ -722,7 +747,12 @@ Keep this agent identity separate from the model provider identity.
   async getWorkspaceConfig(): Promise<WorkspaceRuntimeConfig> {
     const configPath = path.join(this.rootPath, 'config.json');
     const current = await this.readJson<Record<string, unknown>>(configPath, {});
-    return this.mergeDefaults(DEFAULT_WORKSPACE_CONFIG, current) as WorkspaceRuntimeConfig;
+    const merged = this.mergeDefaults(DEFAULT_WORKSPACE_CONFIG, current) as WorkspaceRuntimeConfig;
+    merged.version = Math.max(DEFAULT_WORKSPACE_CONFIG.version, Number(current.version ?? 0));
+    if (JSON.stringify(current) !== JSON.stringify(merged)) {
+      await this.withFileLock(configPath, () => this.writeAtomic(configPath, JSON.stringify(merged, null, 2) + '\n'));
+    }
+    return merged;
   }
 
   async setMemoryMode(mode: MemoryMode): Promise<MemoryMode> {
@@ -1057,6 +1087,9 @@ Keep this agent identity separate from the model provider identity.
         name: input.name,
         archetype: input.archetype,
         tomLevel: input.tomLevel,
+        tomProfile: input.tomProfile,
+        cognitiveGapIds: input.cognitiveGapIds ?? [],
+        existenceReason: input.existenceReason,
         description: input.description ?? '',
         promptPath: `.roy/agents/${key}/prompt.md`,
         memoryPath: `.roy/agents/${key}/memory.md`,
@@ -1143,6 +1176,9 @@ Keep this agent identity separate from the model provider identity.
         archetype: input.archetype,
         parentId: input.parentId,
         agentPatternId: input.agentPatternId,
+        tomProfile: input.tomProfile,
+        cognitiveGapIds: input.cognitiveGapIds ?? [],
+        existenceReason: input.existenceReason,
         taskSignature: signature.replace(`${this.safeKey(input.archetype)}_`, ''),
         usage: {
           count: Number((existing?.usage as Record<string, unknown> | undefined)?.count ?? 0) + 1,
@@ -1183,6 +1219,8 @@ Keep this agent identity separate from the model provider identity.
         parentId: input.parentId,
         memberArchetypes: input.memberArchetypes,
         tomLevel: input.tomLevel ?? 2,
+        tomProfile: input.tomProfile,
+        tomAnalysis: input.tomAnalysis,
         leadArchetype: input.leadArchetype,
         members: input.members ?? input.memberArchetypes.map(archetype => ({ archetype })),
         executionPolicy: input.executionPolicy,

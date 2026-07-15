@@ -22,6 +22,9 @@ export interface DelegateToSubagentParams {
   memoryScope?: AgentComputeNodeRequest['memoryScope'];
   spawnPolicy?: AgentComputeNodeRequest['spawnPolicy'];
   tomProfile?: AgentComputeNodeRequest['tomProfile'];
+  tomProfileMode?: AgentComputeNodeRequest['tomProfileMode'];
+  cognitiveGapIds?: string[];
+  existenceReason?: string;
   reuseMode?: AgentNodeReuseMode;
   outputContract?: AgentNodeOutputContract;
   requireRootSynthesis?: boolean;
@@ -143,6 +146,9 @@ export class DelegateToSubagentSkill implements Skill {
       memoryScope: params.memoryScope,
       spawnPolicy: params.spawnPolicy,
       tomProfile: params.tomProfile,
+      tomProfileMode: params.tomProfileMode ?? 'definition_override',
+      cognitiveGapIds: params.cognitiveGapIds,
+      existenceReason: params.existenceReason,
       reuse: { mode: params.reuseMode ?? 'prefer_cache' },
       outputContract: params.outputContract,
       execution: {

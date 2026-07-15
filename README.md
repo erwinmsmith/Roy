@@ -36,7 +36,7 @@ When a delegation needs multiple cooperating actors, the runtime creates a forma
 
 ```text
 Roy [root]
-└── ReviewTeam [subteam, ToM-2]
+└── AnalysisTeam [subteam, ToM-2]
     ├── Researcher-1
     ├── Critic-1
     └── Summarizer-1
@@ -44,7 +44,44 @@ Roy [root]
 
 A subteam has its own identity, FSM, task/result boundary, synthesis call, token usage, message flow, memory directory, topology snapshot, session log, and reusable cache pattern. Member tasks flow `parent -> team -> member`; member results flow `member -> team -> parent`.
 
-Team execution is policy controlled. A team can run sequentially or with bounded concurrency, stop on the first failure or continue in best-effort mode, and require a minimum number of successful members before synthesis. Cached team patterns restore member tasks, tools, skills, lead assignment, ToM levels, and execution policy into a new runtime team instance.
+Team execution is policy controlled. A team can run sequentially or with bounded concurrency, stop on the first failure or continue in best-effort mode, and require a minimum number of successful members before synthesis. Cached team patterns restore member tasks, tools, skills, lead assignment, full ToM profiles, cognitive-gap assignments, and execution policy into a new runtime team instance.
+
+## ToM-Aware Delegation
+
+Delegation is driven by explicit cognitive gaps rather than role labels alone. Before candidate selection, `ToMDelegationPlanner` models the parent actor's current beliefs, goals, and uncertainty, then derives bounded gaps such as missing evidence, adversarial perspective, planning, implementation, verification, or belief reconciliation.
+
+Each delegated agent receives a full `ToMProfile`:
+
+```text
+beliefScope       facts or hypotheses the actor owns
+goalModel         the cognitive result it must produce
+uncertainty       unresolved questions it must reduce or preserve
+perspective       the distinct viewpoint that justifies the actor
+observesAgents    actors whose outputs it can observe
+modelsAgents      actors whose beliefs/goals it explicitly models
+cognitiveGaps     gap IDs that explain why the actor exists
+```
+
+When multiple perspectives are required, the runtime can complete a partial delegation plan with missing specialists and a higher-order synthesizer. Candidate scoring measures weighted gap coverage, perspective diversity, higher-order fit, cost, cache reuse, and task utility. Policy and budget limits can still select a deliberately partial plan; the uncovered gaps remain observable instead of being hidden.
+
+Use `/agents --tree --tom`, `/teams --tree --tom`, `/tom`, or `GET /v1/tom` to inspect the resulting epistemic structure. Events include `tom.task.analyzed`, `tom.gap.identified`, `tom.higher_order.required`, `tom.profile.assigned`, `tom.team.profile.created`, and `tom.delegation.coverage.evaluated`.
+
+Workspace policy is stored in `.roy/config.json`:
+
+```json
+{
+  "tom": {
+    "enabled": true,
+    "autoCompleteGaps": true,
+    "maxAgentsPerDecision": 3,
+    "minimumCoverage": 0.6,
+    "requireExistenceReason": true,
+    "higherOrderForMultiplePerspectives": true
+  }
+}
+```
+
+Existing workspace configs are migrated to schema version 2 without discarding user overrides.
 
 ## Core Architecture
 
@@ -55,6 +92,7 @@ src/core/
   context/      Bounded public/private/session context construction
   executor/     Strict FSM and signal control
   delegation/   Candidate generation and pluggable scorers
+  tom/          Cognitive-gap analysis, ToM profiles, and coverage evaluation
   evolution/    Propose/evaluate/select execution pipeline
   budget/       Token allocation market and settlement
   team/         Formal subteam actor registry
@@ -75,7 +113,7 @@ Delegation candidates are evaluated by replaceable scorers:
 
 - task/archetype fit
 - expected token cost and remaining budget
-- ToM role complementarity
+- weighted cognitive-gap coverage and perspective diversity
 - cache similarity using deterministic task embeddings
 - cache reuse and mutation lineage
 - LLM-based candidate evaluation

@@ -18,6 +18,10 @@
       "types": "./dist/core/team/index.d.ts",
       "import": "./dist/core/team/index.js"
     },
+    "./tom": {
+      "types": "./dist/core/tom/index.d.ts",
+      "import": "./dist/core/tom/index.js"
+    },
     "./queue": {
       "types": "./dist/core/queue/index.d.ts",
       "import": "./dist/core/queue/index.js"

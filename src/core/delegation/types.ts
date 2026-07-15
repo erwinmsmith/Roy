@@ -1,5 +1,6 @@
 import type { DelegationAgentPlan, DelegationDecision } from '../runtime/Runtime.js';
 import type { ToMProfile } from '../agent/BaseAgent.js';
+import type { ToMCoverageResult, ToMTaskAnalysis } from '../tom/index.js';
 
 export type DelegationCandidateSource =
   | 'cache_hit'
@@ -19,6 +20,7 @@ export interface DelegationCandidate {
   score: number;
   scoreBreakdown: Record<string, number>;
   rationale: string;
+  tomCoverage?: ToMCoverageResult;
   lineage?: {
     parentPatternIds: string[];
     mutation?: string;
@@ -36,6 +38,7 @@ export interface DelegationCandidateInput {
   cacheUsed: boolean;
   cachedPatterns?: Array<Record<string, unknown>>;
   parentToMProfile?: ToMProfile;
+  tomAnalysis?: ToMTaskAnalysis;
 }
 
 export interface DelegationCandidateScore {

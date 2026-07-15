@@ -6,6 +6,7 @@ import type {
 } from './types.js';
 import type { TokenUsage } from '../runtime/Runtime.js';
 import { normalizeTeamExecutionPolicy } from './execution.js';
+import { normalizeToMProfile, type ToMProfile } from '../tom/index.js';
 
 const TEAM_FSM_TRANSITIONS: Record<TeamFSMState, TeamFSMState[]> = {
   S_team_created: ['S_team_plan', 'S_team_failed'],
@@ -52,7 +53,12 @@ export class TeamRegistry {
         role: 'subteam',
         parentAgentId,
         generation: spec.generation,
-        tomLevel: spec.tomLevel ?? 2,
+        tomLevel: spec.tomProfile?.level ?? spec.tomLevel ?? 2,
+        tomProfile: normalizeToMProfile(spec.tomProfile ? { ...spec.tomProfile, subjectAgentId: id } : undefined, {
+          level: (spec.tomLevel ?? 2) as ToMProfile['level'],
+          subjectAgentId: id,
+          purpose: `Coordinate member perspectives for ${description}`,
+        }),
         description,
       },
       status: 'idle',
@@ -207,7 +213,10 @@ export class TeamRegistry {
   private clone(team: TeamRuntimeState): TeamRuntimeState {
     return {
       ...team,
-      identity: { ...team.identity },
+      identity: {
+        ...team.identity,
+        tomProfile: normalizeToMProfile(team.identity.tomProfile, team.identity.tomProfile),
+      },
       memberAgentIds: [...team.memberAgentIds],
       tokenUsage: { ...team.tokenUsage },
       synthesisUsage: { ...team.synthesisUsage },

@@ -1,4 +1,5 @@
 import type { TokenUsage } from '../runtime/Runtime.js';
+import type { ToMProfile } from '../tom/index.js';
 
 export type TeamStatus = 'idle' | 'running' | 'waiting' | 'synthesizing' | 'done' | 'failed';
 export type TeamExecutionMode = 'sequential' | 'parallel';
@@ -28,6 +29,7 @@ export interface TeamIdentity {
   parentAgentId: string;
   generation: number;
   tomLevel: number;
+  tomProfile: ToMProfile;
   description: string;
 }
 
@@ -59,6 +61,7 @@ export interface CreateTeamSpec {
   description: string;
   generation: number;
   tomLevel?: number;
+  tomProfile?: ToMProfile;
   leadAgentId?: string;
   task?: string;
   correlationId?: string;

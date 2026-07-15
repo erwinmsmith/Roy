@@ -5,6 +5,7 @@ import type {
   DelegationCandidateScorer,
 } from './types.js';
 import { HashTaskEmbeddingProvider, type TaskEmbeddingProvider } from './embedding.js';
+import { ToMDelegationPlanner } from '../tom/index.js';
 
 const ARCHETYPE_UTILITY: Record<string, number> = {
   researcher: 0.78,
@@ -55,8 +56,19 @@ export class CostDelegationScorer implements DelegationCandidateScorer {
 
 export class ToMDelegationScorer implements DelegationCandidateScorer {
   readonly name = 'tom';
+  private readonly planner = new ToMDelegationPlanner();
 
   score(candidates: DelegationCandidate[], input: DelegationCandidateInput): Map<string, number> {
+    if (input.tomAnalysis) {
+      return new Map(candidates.map(candidate => {
+        const coverage = this.planner.evaluateCoverage(input.tomAnalysis!, candidate.agents);
+        const score = coverage.coverageScore * 1.2
+          + coverage.perspectiveDiversity * 0.25
+          + coverage.higherOrderFit * 0.3
+          - coverage.unjustifiedAgentCount * 0.2;
+        return [candidate.id, Number(score.toFixed(4))];
+      }));
+    }
     const parentLevel = input.parentToMProfile?.level ?? 0;
     const modeledTargets = new Set(input.parentToMProfile?.models.map(model => model.targetId) ?? []);
     return new Map(candidates.map(candidate => {

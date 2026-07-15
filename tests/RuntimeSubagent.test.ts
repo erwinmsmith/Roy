@@ -460,8 +460,9 @@ describe('Runtime controlled subagent spawning', () => {
 
     const tree = runtime.getAgentTree();
     expect(tree.children[0].agent.identity.id).toBe(researcher.identity.id);
-    expect(tree.children[0].children).toHaveLength(1);
+    expect(tree.children[0].children).toHaveLength(3);
     expect(tree.children[0].children[0].agent.identity.id).toBe('agent_critic_002');
+    expect(tree.children[0].children.map(child => child.agent.identity.tomProfile.cognitiveGaps).flat().length).toBeGreaterThan(0);
 
     expect(result.agent.identity.id).toBe(researcher.identity.id);
     expect(result.result).toBe('subagent result');
@@ -510,18 +511,19 @@ describe('Runtime controlled subagent spawning', () => {
     expect(children.map(child => child.identity.id)).toEqual([
       'agent_critic_002',
       'agent_tester_003',
+      'agent_researcher_004',
     ]);
     expect(result.result).toBe('subagent result');
 
     const messages = await runtime.getMessages({ correlationId: 'del_multi_child_test' });
-    expect(messages.filter(message => message.kind === 'agent.task')).toHaveLength(2);
+    expect(messages.filter(message => message.kind === 'agent.task')).toHaveLength(3);
     const team = runtime.getTeams()[0];
-    expect(messages.filter(message => message.kind === 'agent.result' && message.to === team.identity.id)).toHaveLength(2);
+    expect(messages.filter(message => message.kind === 'agent.result' && message.to === team.identity.id)).toHaveLength(3);
     expect(messages.filter(message => message.kind === 'team.result' && message.to === researcher.identity.id)).toHaveLength(1);
     expect(messages.filter(message => message.kind === 'agent.synthesis')).toHaveLength(1);
 
     const synthesisEvent = runtime.getEvents().find(event => event.type === 'agent.synthesis.completed' && event.agentId === researcher.identity.id);
-    expect(synthesisEvent?.data?.childIds).toEqual(['agent_critic_002', 'agent_tester_003']);
+    expect(synthesisEvent?.data?.childIds).toEqual(['agent_critic_002', 'agent_tester_003', 'agent_researcher_004']);
     expect(runtime.getBudgetState().perAgent[researcher.identity.id].totalTokens).toBeGreaterThan(0);
 
     await runtime.shutdown();

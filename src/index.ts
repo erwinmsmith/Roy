@@ -1,8 +1,9 @@
 export { bootstrap, cleanup } from './bootstrap.js';
 export type { BootstrapContext, BootstrapOptions } from './bootstrap.js';
 export { AgentManager, Runtime, runtime } from './core/runtime/index.js';
-export type { RuntimeConfig, RuntimeContext } from './core/runtime/index.js';
+export type { RuntimeConfig, RuntimeContext, ToMRuntimeState } from './core/runtime/index.js';
 export * from './core/team/index.js';
+export * from './core/tom/index.js';
 export {
   InMemoryMessageQueue,
   MessageScheduler,

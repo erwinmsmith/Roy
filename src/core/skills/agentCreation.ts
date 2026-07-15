@@ -31,6 +31,9 @@ export interface AgentComputeNodeRequest {
   memoryScope?: AgentMemoryScope;
   spawnPolicy?: Partial<AgentSpawnPolicy>;
   tomProfile?: ToMProfile;
+  tomProfileMode?: 'runtime_assignment' | 'definition_override';
+  cognitiveGapIds?: string[];
+  existenceReason?: string;
   reuse?: {
     mode?: AgentNodeReuseMode;
     agentPatternId?: string;
@@ -66,6 +69,9 @@ export interface AgentComputeNodeDefinition {
     style?: string;
     description: string;
     tomProfile?: ToMProfile;
+    tomProfileMode: 'runtime_assignment' | 'definition_override';
+    cognitiveGapIds: string[];
+    existenceReason?: string;
   };
   assignment: {
     task: string;

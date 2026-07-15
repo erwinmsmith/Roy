@@ -127,16 +127,17 @@ describe('Runtime root-controlled delegation', () => {
     const result = await runtime.handleUserTurn('Analyze this repo and find architectural risks');
 
     expect(result.decision.action).toBe('spawn_subagents');
-    expect(result.subagents).toHaveLength(2);
+    expect(result.subagents).toHaveLength(3);
     expect(result.subagents.map(item => item.agent.identity.id)).toEqual([
       'agent_researcher_001',
       'agent_critic_002',
+      'agent_summarizer_003',
     ]);
     expect(result.finalResponse).toBe('Final synthesis from Researcher-1 and Critic-2.');
 
     const tree = runtime.getAgentTree();
-    expect(tree.children).toHaveLength(2);
-    expect(tree.children.map(child => child.agent.identity.parentId)).toEqual(['root', 'root']);
+    expect(tree.children).toHaveLength(3);
+    expect(tree.children.map(child => child.agent.identity.parentId)).toEqual(['root', 'root', 'root']);
 
     const eventTypes = runtime.getEvents().map(event => event.type);
     expect(eventTypes).toContain('delegation.decision');
@@ -150,11 +151,15 @@ describe('Runtime root-controlled delegation', () => {
     expect(eventTypes).toContain('root.synthesis.started');
     expect(eventTypes).toContain('root.synthesis.completed');
     expect(eventTypes).toContain('memory.update.propose.completed');
+    expect(eventTypes).toContain('tom.task.analyzed');
+    expect(eventTypes).toContain('tom.gap.identified');
+    expect(eventTypes).toContain('tom.delegation.coverage.evaluated');
+    expect(eventTypes).toContain('tom.team.profile.created');
 
     const messages = await runtime.getMessages({ correlationId: result.correlationId });
     expect(messages.map(message => message.kind)).toContain('user.input');
-    expect(messages.filter(message => message.kind === 'agent.task')).toHaveLength(2);
-    expect(messages.filter(message => message.kind === 'agent.result')).toHaveLength(2);
+    expect(messages.filter(message => message.kind === 'agent.task')).toHaveLength(3);
+    expect(messages.filter(message => message.kind === 'agent.result')).toHaveLength(3);
     expect(messages.map(message => message.kind)).toContain('root.synthesis');
     expect(messages.map(message => message.kind)).toContain('root.final_response');
 
@@ -162,6 +167,16 @@ describe('Runtime root-controlled delegation', () => {
     expect(budget.perAgent.root.totalTokens).toBeGreaterThan(0);
     expect(budget.perAgent.agent_researcher_001.totalTokens).toBeGreaterThan(0);
     expect(budget.perAgent.agent_critic_002.totalTokens).toBeGreaterThan(0);
+    expect(budget.perAgent.agent_summarizer_003.totalTokens).toBeGreaterThan(0);
+    expect(result.subagents.every(item => item.agent.identity.tomProfile.cognitiveGaps.length > 0)).toBe(true);
+    const tomState = runtime.getToMState(result.correlationId);
+    expect(tomState.analyses).toHaveLength(1);
+    expect(tomState.analyses[0].requiresHigherOrderToM).toBe(true);
+    expect(tomState.teams[0].profile.modelsAgents).toEqual(expect.arrayContaining([
+      'root',
+      'Researcher-1',
+      'Critic-2',
+    ]));
     expect(result.usage.total.totalTokens).toBeGreaterThan(0);
 
     await runtime.shutdown();
@@ -227,8 +242,10 @@ describe('Runtime root-controlled delegation', () => {
     const result = await runtime.handleUserTurn('Inspect the current project structure and summarize the risks.');
 
     expect(result.decision.action).toBe('spawn_subagents');
-    expect(result.subagents).toHaveLength(1);
+    expect(result.subagents).toHaveLength(3);
     expect(result.subagents[0].agent.identity.id).toBe('agent_researcher_002');
+    expect(result.subagents[0].creationUsage.mode).toBe('cache_hit');
+    expect(result.subagents[0].creationUsage.definitionTokens).toBe(0);
 
     const decisionEvent = runtime.getEvents()
       .find(event => event.type === 'delegation.decision' && event.data?.correlationId === result.correlationId);
@@ -236,6 +253,20 @@ describe('Runtime root-controlled delegation', () => {
     const hits = runtime.getEvents()
       .filter(event => event.type === 'cache.hit' && event.data?.correlationId === result.correlationId);
     expect(hits.map(event => event.data?.patternId)).toContain('agent_pattern_researcher_v1');
+
+    const agentPatterns = await runtime.getCachePatterns('agents');
+    const researcherPatterns = agentPatterns.filter(pattern => pattern.archetype === 'researcher');
+    expect(researcherPatterns.some(pattern => {
+      const profile = pattern.tomProfile as { beliefScope?: unknown[]; cognitiveGaps?: unknown[] } | undefined;
+      return (profile?.beliefScope?.length ?? 0) > 0 && (profile?.cognitiveGaps?.length ?? 0) > 0;
+    })).toBe(true);
+    const delegationPatterns = await runtime.getCachePatterns('delegations');
+    expect(delegationPatterns.some(pattern => {
+      const profile = pattern.tomProfile as { perspective?: string } | undefined;
+      return typeof profile?.perspective === 'string'
+        && Array.isArray(pattern.cognitiveGapIds)
+        && pattern.cognitiveGapIds.length > 0;
+    })).toBe(true);
 
     await runtime.shutdown();
   });
