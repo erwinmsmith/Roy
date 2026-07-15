@@ -147,11 +147,11 @@ describe('Runtime controlled subagent spawning', () => {
     const signals = await runtime.collectMemorySignals();
     expect(signals.counts.agentResults).toBe(1);
     expect(signals.candidateSignals).toContain('researcher.tool_policy');
-    expect(signals.candidateSignals).toContain('researcher.failure_case');
+    expect(signals.candidateSignals).toContain('public.project_structure');
     expect(signals.candidateSignals).toContain('roy.delegation_lesson');
     const proposals = await runtime.listMemoryProposals();
     expect(proposals.map(proposal => proposal.target.section)).toContain('tool-policy');
-    expect(proposals.map(proposal => proposal.target.section)).toContain('failure-cases');
+    expect(proposals.map(proposal => proposal.target.section)).toContain('project-structure');
     expect(proposals.map(proposal => proposal.target.section)).toContain('delegation-lessons');
     expect(proposals[0].id).toMatch(/^mem_prop_\d{17}_[a-f0-9]{4}$/);
 
@@ -165,7 +165,8 @@ describe('Runtime controlled subagent spawning', () => {
     expect(prompt).toContain('{{parent_context}}');
     expect(prompt).toContain('{{task}}');
     expect(result.subagentResult.evidence.toolGrounded).toBe(true);
-    expect(result.subagentResult.evidence.outputGrounded).toBe(false);
+    expect(result.subagentResult.evidence.outputGrounded).toBe(true);
+    expect(result.subagentResult.result).toContain('## Runtime-Verified Evidence');
     expect(result.creationUsage.mode).toBe('generated');
     expect(result.creationUsage.definitionTokens).toBeGreaterThan(0);
     expect(result.creationUsage.renderedPromptTokens).toBeGreaterThan(0);

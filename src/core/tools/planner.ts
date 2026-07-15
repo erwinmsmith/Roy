@@ -31,12 +31,18 @@ export class AgentToolPlanner {
       });
     }
 
-    const filePath = input.task.match(/(?:^|\s)(\.?\.?\/[A-Za-z0-9._/@-]+|[A-Za-z0-9_/-]+\.(?:ts|tsx|js|json|md|yaml|yml))(?:\s|$)/)?.[1];
+    const explicitFilePath = input.task.match(/(?:^|\s)(\.?\.?\/[A-Za-z0-9._/@-]+|[A-Za-z0-9_/-]+\.(?:ts|tsx|js|json|md|yaml|yml))(?:\s|$)/)?.[1];
+    const inferredFilePath = /\b(?:package exports?|export map|package manifest|package entr(?:y|ies))\b/.test(lower)
+      ? 'package.json'
+      : undefined;
+    const filePath = explicitFilePath ?? inferredFilePath;
     if (enabled.has('fs.read') && filePath && /\b(read|inspect|review|check|open)\b/.test(lower)) {
       plans.push({
         toolName: 'fs.read',
         params: { path: filePath },
-        reason: `The task explicitly references ${filePath}.`,
+        reason: explicitFilePath
+          ? `The task explicitly references ${filePath}.`
+          : `The package export request requires evidence from ${filePath}.`,
         groundingRequired: true,
       });
     }

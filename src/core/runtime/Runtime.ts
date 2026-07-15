@@ -45,6 +45,7 @@ import {
   TeamFirstGenomePlanner,
   WeightedTopKSelectionPolicy,
   defaultMutationOperators,
+  validateTeamGenome,
   type EvolutionAblations,
   type EvolutionCandidate,
   type EvolutionEvaluationDimensions,
@@ -2202,6 +2203,17 @@ export class Runtime {
       : Math.max(0, allocatedTokens);
   }
 
+  private synthesisCompletionTokenBudget(visibleOutputTokens: number): number {
+    const llm = this.getContext().llm;
+    const family = `${llm?.name ?? ''}/${llm?.defaultModel ?? ''}`.toLowerCase();
+    const usesSharedReasoningBudget = family.includes('deepseek')
+      || family.includes('reasoner')
+      || /\/(?:o1|o3|o4)(?:-|$)/.test(family);
+    return usesSharedReasoningBudget
+      ? visibleOutputTokens + Math.max(3072, visibleOutputTokens * 2)
+      : visibleOutputTokens;
+  }
+
   private async requestTeamSynthesisBudget(input: {
     team: TeamRuntimeState;
     correlationId: string;
@@ -3139,7 +3151,7 @@ export class Runtime {
       });
     }
     const seedAgents = input.seedAgents?.length
-      ? input.seedAgents
+      ? input.seedAgents.map(seed => this.normalizeEvolutionSeed(seed))
       : await this.createEvolutionSeeds(input.task, parentId, correlationId, options);
     const policy = this.getAgentPolicy(parentId);
     const availableAgentSlots = Math.max(0, Math.min(
@@ -3175,6 +3187,24 @@ export class Runtime {
         onTransition: async (from, to, data) => {
           this.emit({ type: 'evo.fsm.transition', agentId: parentId, sessionId: ctx.sessionId, correlationId, data: { runId, from, to, ...data } });
           await this.recordEvolutionLifecycleMessage(to, parentId, correlationId, { runId, from, to, ...data });
+        },
+        onCandidateRejected: async (candidate, reason) => {
+          const patternIds = candidate.source === 'cache_hit' ? candidate.lineage.parentPatternIds : [];
+          if (patternIds.length > 0) await ctx.memory.deprecateEvolutionPatterns(patternIds);
+          this.emit({
+            type: 'evo.candidate.rejected',
+            agentId: parentId,
+            sessionId: ctx.sessionId,
+            correlationId,
+            data: {
+              runId,
+              candidateId: candidate.id,
+              genomeId: candidate.genome.id,
+              source: candidate.source,
+              reason,
+              deprecatedPatternIds: patternIds,
+            },
+          });
         },
         instantiate: async candidate => {
           try {
@@ -5005,7 +5035,7 @@ export class Runtime {
       this.emit({ type: 'budget.updated', agentId, data: { ...usageDelta } });
       this.emit({ type: 'agent.status.changed', agentId, data: { from: 'thinking', to: 'done' } });
 
-      const evidence: RunEvidence = {
+      let evidence: RunEvidence = {
         ...grounding.evidence,
         outputGrounded: grounding.evidence.toolGrounded
           ? this.resultIncludesEvidence(result || agent.getInfo().lastResult || '', grounding.evidence)
@@ -5013,12 +5043,14 @@ export class Runtime {
       };
       const warnings = [...grounding.warnings];
       if (grounding.evidence.toolGrounded && !evidence.outputGrounded) {
-        warnings.push('Agent used fs.list but did not include concrete observed paths in its final report.');
+        result = this.attachRuntimeEvidence(result, grounding.evidence);
+        evidence = { ...evidence, outputGrounded: true };
+        warnings.push('Runtime appended structured tool evidence because the model response omitted concrete observed paths.');
         this.emit({
-          type: 'agent.grounding.warning',
+          type: 'agent.output.evidence.attached',
           agentId,
           data: {
-            warning: warnings[warnings.length - 1],
+            observedPathCount: grounding.evidence.observedPaths.length,
             correlationId: options.correlationId,
           },
         });
@@ -6648,8 +6680,26 @@ Produce the final response to the user as Roy, the root agent.`;
 
   private async findRelevantEvolutionPatterns(task: string, threshold: number): Promise<EvolutionPattern[]> {
     const patterns = await this.getContext().memory.getEvolutionPatterns();
+    const invalidPatternIds: string[] = [];
+    const structurallyValid = patterns.filter(pattern => {
+      try {
+        validateTeamGenome(pattern.genome);
+        return true;
+      } catch {
+        invalidPatternIds.push(pattern.id);
+        return false;
+      }
+    });
+    if (invalidPatternIds.length > 0) {
+      await this.getContext().memory.deprecateEvolutionPatterns(invalidPatternIds);
+      this.emit({
+        type: 'evo.pattern.deprecated',
+        agentId: 'root',
+        data: { patternIds: invalidPatternIds, reason: 'genome_preflight_validation_failed' },
+      });
+    }
     const embeddings = new HashTaskEmbeddingProvider();
-    return patterns
+    return structurallyValid
       .map(pattern => ({ pattern, similarity: embeddings.similarity(task, pattern.taskSignature) }))
       .filter(item => item.pattern.status !== 'deprecated' && item.similarity >= threshold)
       .sort((left, right) => {
@@ -6679,18 +6729,34 @@ Produce the final response to the user as Roy, the root agent.`;
       ? decision.agents
       : this.defaultEvolutionPlans(task);
     const limit = Math.max(1, Math.min(options.populationSize, this.workspaceRuntimeConfig?.teams.maxMembersPerTeam ?? 5));
-    return plans.slice(0, limit).map(plan => ({
+    return plans.slice(0, limit).map(plan => this.normalizeEvolutionSeed({
       archetype: plan.archetype,
       name: plan.name,
       role: plan.existenceReason ?? plan.archetype,
       task: plan.task,
-      tools: plan.tools ?? this.getDefaultToolBindings(plan.archetype).map(binding => binding.name),
-      skills: plan.skills ?? this.getDefaultSkillBindings(plan.archetype).map(binding => binding.name),
+      tools: plan.tools,
+      skills: plan.skills,
       budgetTokens: plan.budgetTokens,
       tomLevel: options.ablations.withoutToMProfile ? 0 : plan.tomLevel,
       perspective: options.ablations.withoutToMProfile ? undefined : plan.tomProfile?.perspective,
       groundingRequired: plan.archetype === 'researcher' || plan.archetype === 'tester',
     }));
+  }
+
+  private normalizeEvolutionSeed(seed: EvolutionSeedAgent): EvolutionSeedAgent {
+    const tools = seed.tools && seed.tools.length > 0
+      ? seed.tools
+      : this.getDefaultToolBindings(seed.archetype).map(binding => binding.name);
+    const skills = seed.skills && seed.skills.length > 0
+      ? seed.skills
+      : this.getDefaultSkillBindings(seed.archetype).map(binding => binding.name);
+    return {
+      ...seed,
+      tools: [...new Set(tools)],
+      skills: [...new Set(skills)],
+      groundingRequired: seed.groundingRequired
+        ?? (seed.archetype === 'researcher' || seed.archetype === 'tester'),
+    };
   }
 
   private defaultEvolutionPlans(task: string): DelegationAgentPlan[] {
@@ -6793,16 +6859,21 @@ Produce the final response to the user as Roy, the root agent.`;
           disableRecursiveDelegation: true,
         });
         details.set(candidate.id, { agent: result });
+        const groundingSatisfied = !member.outputContract.groundingRequired
+          || (result.evidence.toolGrounded && result.evidence.outputGrounded);
         return {
           candidateId: candidate.id, actorKind: 'agent', actorId: actor.actorId,
-          success: Boolean(result.result.trim()), result: result.result,
+          success: Boolean(result.result.trim()) && groundingSatisfied, result: result.result,
           usage: this.tokenUsageToEvolutionUsage(result.usage), wallClockMs: Date.now() - startedAt,
           agentIds: [actor.actorId], teamIds: [], toolCalls: result.toolCalls.length,
           successfulToolCalls: result.toolCalls.filter(call => call.success).length,
           unresolvedToolIntents: this.containsUnresolvedToolIntent(result.result) ? 1 : 0,
-          groundedResults: result.grounded ? 1 : 0, totalResults: 1,
+          groundedResults: groundingSatisfied ? 1 : 0, totalResults: 1,
           failedActors: result.agent.state === 'failed' ? 1 : 0, recoveredFailures: 0,
-          warnings: [...result.warnings],
+          warnings: [
+            ...result.warnings,
+            ...(!groundingSatisfied ? ['Candidate did not satisfy its grounding-required output contract.'] : []),
+          ],
         };
       }
       const result = await this.runTeam(actor.actorId, candidate.genome.taskSignature, { correlationId });
@@ -6811,17 +6882,25 @@ Produce the final response to the user as Roy, the root agent.`;
       const unresolvedToolIntents = result.members.filter(member => this.containsUnresolvedToolIntent(member.result)).length
         + (this.containsUnresolvedToolIntent(result.result) ? 1 : 0);
       const failedActors = result.memberOutcomes.filter(outcome => outcome.status === 'failed').length;
+      const groundingRequired = candidate.genome.members.some(member => member.outputContract.groundingRequired);
+      const groundedResults = result.members.filter(member => (
+        member.evidence.outputGrounded && (!groundingRequired || member.evidence.toolGrounded)
+      )).length;
+      const groundingSatisfied = !groundingRequired || groundedResults > 0;
       return {
         candidateId: candidate.id, actorKind: 'team', actorId: actor.actorId,
-        success: result.team.status === 'done' && Boolean(result.result.trim()), result: result.result,
+        success: result.team.status === 'done' && Boolean(result.result.trim()) && groundingSatisfied, result: result.result,
         usage: this.tokenUsageToEvolutionUsage(result.usage), wallClockMs: Date.now() - startedAt,
         agentIds: result.members.map(member => member.agent.identity.id), teamIds: [actor.actorId],
         toolCalls: toolCalls.length, successfulToolCalls: toolCalls.filter(call => call.success).length,
         unresolvedToolIntents,
-        groundedResults: result.members.filter(member => member.grounded).length,
+        groundedResults,
         totalResults: result.members.length, failedActors,
         recoveredFailures: result.team.status === 'done' ? failedActors : 0,
-        warnings: result.members.flatMap(member => member.warnings),
+        warnings: [
+          ...result.members.flatMap(member => member.warnings),
+          ...(!groundingSatisfied ? ['Team did not satisfy its grounding-required output contract.'] : []),
+        ],
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -7675,7 +7754,12 @@ Produce the final response to the user as Roy, the root agent.`;
       `team_role: ${member.agent.identity.id === team.leadAgentId ? 'lead' : 'member'}`,
       `tokens: ${member.usage.totalTokens}`,
       `grounded: ${member.grounded}`,
+      `tool_grounded: ${member.evidence.toolGrounded}`,
+      `output_grounded: ${member.evidence.outputGrounded}`,
+      `observed_paths: ${JSON.stringify(member.evidence.observedPaths)}`,
+      `tool_result_summary:\n${(member.evidence.toolResultSummary ?? 'none').slice(0, 5000)}`,
       `tom_profile: ${JSON.stringify(member.agent.identity.tomProfile)}`,
+      'member_report:',
       member.result,
       '</member>',
     ].join('\n')).join('\n\n');
@@ -7698,7 +7782,10 @@ Produce the final response to the user as Roy, the root agent.`;
       'Reconcile member beliefs explicitly, preserve unresolved uncertainty, and explain how the final result covers the team cognitive gaps.',
       'Give the lead report coordination priority, but verify it against all available member evidence.',
       'If member failures are present, state their impact and do not imply full team completion.',
-      'Do not claim evidence that is absent from member reports.',
+      'The structured observed_paths and tool_result_summary fields are the authoritative evidence boundary.',
+      'Do not infer file contents merely because a path was observed. Do not invent example values and present them as observations.',
+      'A member report claim is usable only when supported by that member structured evidence or clearly labeled as analysis.',
+      'Do not claim any tool call, file read, command output, or project fact absent from the structured member evidence.',
       reports,
       failureReports,
     ].join('\n\n');
@@ -7735,18 +7822,19 @@ Produce the final response to the user as Roy, the root agent.`;
       };
     }
     const estimatedPromptTokens = this.estimateTextTokens(`${systemPrompt}\n${prompt}`);
+    const completionTokenBudget = this.synthesisCompletionTokenBudget(1024);
     const allocation = await this.requestTeamSynthesisBudget({
       team,
       correlationId,
       promptTokens: estimatedPromptTokens,
-      completionTokens: 1024,
+      completionTokens: completionTokenBudget,
     });
     if (allocation?.status === 'denied') {
       throw new Error(`Team synthesis rejected: ${allocation.reason}`);
     }
     const maxCompletionTokens = allocation
       ? Math.max(1, this.completionCapacity(allocation.grantedTokens, estimatedPromptTokens))
-      : 1024;
+      : completionTokenBudget;
     const chunks: string[] = [];
     let providerUsage: ModelTokenUsage | undefined;
     try {
@@ -7761,7 +7849,21 @@ Produce the final response to the user as Roy, the root agent.`;
       this.releaseTeamSynthesisBudget(team.identity.id, allocation, correlationId, 'team_synthesis_failed');
       throw error;
     }
-    const content = chunks.join('');
+    let content = chunks.join('');
+    if (!content.trim()) {
+      content = this.buildTeamSynthesisFallback(team, task, orderedMembers, failures);
+      this.emit({
+        type: 'team.synthesis.fallback',
+        agentId: team.identity.id,
+        sessionId: ctx.sessionId,
+        correlationId,
+        data: {
+          teamId: team.identity.id,
+          reason: 'model_returned_empty_visible_output',
+          memberCount: orderedMembers.length,
+        },
+      });
+    }
     const normalizedUsage = providerUsage ?? this.estimateModelUsage([
       { role: 'system', content: systemPrompt },
       { role: 'user', content: prompt },
@@ -7794,6 +7896,39 @@ Produce the final response to the user as Roy, the root agent.`;
       data: { teamId: team.identity.id, totalTokens: usage.totalTokens },
     });
     return { content, usage };
+  }
+
+  private buildTeamSynthesisFallback(
+    team: TeamRuntimeState,
+    task: string,
+    members: RunAgentResult[],
+    failures: Array<TeamExecutionOutcome<unknown>>
+  ): string {
+    const reports = members.map(member => {
+      const report = member.result.trim() || 'No visible narrative response was produced.';
+      return `### ${member.agent.identity.name}\n${report.slice(0, 2400)}`;
+    }).join('\n\n');
+    const observedPaths = Array.from(new Set(members.flatMap(member => member.evidence.observedPaths))).slice(0, 80);
+    const limitations = [
+      ...failures.map(failure => `${failure.key}: ${failure.error ?? 'member execution failed'}`),
+      ...members.flatMap(member => member.warnings),
+    ];
+    return [
+      '[runtime_team_synthesis_fallback]',
+      `# ${team.identity.name} Result`,
+      `Task: ${task}`,
+      'The synthesis model returned no visible answer. The following member reports are preserved for diagnosis and are not accepted as a verified team conclusion.',
+      '## Unverified Member Reports',
+      reports || 'No member report was available.',
+      '## Runtime Evidence',
+      observedPaths.length > 0
+        ? observedPaths.map(item => `- ${item}`).join('\n')
+        : 'No structured filesystem paths were observed.',
+      '## Limitations',
+      limitations.length > 0
+        ? limitations.map(item => `- ${item}`).join('\n')
+        : '- The model returned no visible team synthesis, so the runtime preserved member reports and evidence without adding new claims.',
+    ].join('\n\n');
   }
 
   private async completeAsAgent(agent: BaseAgent, prompt: string, purpose: string, correlationId: string): Promise<string> {
@@ -8477,7 +8612,8 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
   }
 
   private estimateTextTokens(text: string): number {
-    return Math.max(1, Math.ceil(text.length / 4));
+    const llm = this.getContext().llm;
+    return Math.max(1, tokenUsageRegistry.estimateText(text, llm?.name ?? 'unknown', llm?.defaultModel));
   }
 
   private truncateTextToTokenBudget(text: string, tokenBudget: number): string {
@@ -8657,6 +8793,7 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
   private buildGroundedTask(task: string, grounding: { context: string; warnings: string[] }): string {
     if (!grounding.context && grounding.warnings.length === 0) return task;
     return [
+      '[runtime_grounding_provided]',
       task,
       grounding.context ? `\nGrounding context:\n${grounding.context}` : '',
       grounding.warnings.length > 0 ? `\nGrounding warnings:\n${grounding.warnings.join('\n')}` : '',
@@ -8673,6 +8810,18 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
       .filter(term => term.length >= 4)
       .slice(0, 30);
     return evidenceTerms.some(term => normalized.includes(term));
+  }
+
+  private attachRuntimeEvidence(result: string, evidence: RunEvidence): string {
+    const observedPaths = evidence.observedPaths.slice(0, 80);
+    const evidenceBlock = observedPaths.length > 0
+      ? observedPaths.map(item => `- ${item}`).join('\n')
+      : (evidence.toolResultSummary ?? 'No structured evidence summary was available.').slice(0, 4000);
+    return [
+      result.trim(),
+      '## Runtime-Verified Evidence',
+      evidenceBlock,
+    ].filter(Boolean).join('\n\n');
   }
 
   private containsUnresolvedToolIntent(result: string): boolean {

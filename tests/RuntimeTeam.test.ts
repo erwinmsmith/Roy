@@ -54,6 +54,21 @@ class PartialFailureTeamLLM extends TeamTestLLM {
   }
 }
 
+class EmptyVisibleTeamSynthesisLLM extends TeamTestLLM {
+  override async *stream(messages: LLMMessage[]): AsyncGenerator<LLMStreamChunk, void, unknown> {
+    const systemPrompt = messages.find(message => message.role === 'system')?.content ?? '';
+    if (systemPrompt.includes('formal subteam actor')) {
+      yield {
+        content: '',
+        done: true,
+        usage: { promptTokens: 20, completionTokens: 1024, totalTokens: 1044, thinkingTokens: 1024 },
+      };
+      return;
+    }
+    yield* super.stream(messages);
+  }
+}
+
 describe('Phase 3 subteam runtime', () => {
   it('enforces the formal team FSM', () => {
     const registry = new TeamRegistry();
@@ -171,6 +186,30 @@ describe('Phase 3 subteam runtime', () => {
     expect(updatedUsage.averageTokens).toBe(120);
     expect(updatedPatterns[0].status).toBe('active');
 
+    await runtime.shutdown();
+  });
+
+  it('falls back to structured member evidence when the model spends its output budget on reasoning', async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), 'roy-phase3-team-empty-synthesis-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'phase3-team-empty-synthesis',
+      workspaceCwd: cwd,
+      llmProvider: new EmptyVisibleTeamSynthesisLLM(),
+    });
+    const team = await runtime.spawnTeam({
+      name: 'FallbackTeam',
+      description: 'Preserve member results when visible synthesis is empty.',
+      members: [{ archetype: 'summarizer', task: 'Summarize the bounded input.' }],
+    });
+
+    const result = await runtime.runTeam(team.identity.id, 'Summarize the bounded input.');
+
+    expect(result.team.status).toBe('done');
+    expect(result.result).toContain('[runtime_team_synthesis_fallback]');
+    expect(result.result).toContain('# FallbackTeam Result');
+    expect(result.result).toContain('Summarizer produced a concise evidence-based report.');
+    expect(runtime.getEvents().some(event => event.type === 'team.synthesis.fallback')).toBe(true);
     await runtime.shutdown();
   });
 

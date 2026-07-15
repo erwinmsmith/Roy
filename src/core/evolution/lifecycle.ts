@@ -48,23 +48,36 @@ export class EvolutionLifecycleEngine {
       for (let generation = 0; generation <= input.options.generations; generation += 1) {
         if (generationCandidates.length === 0) break;
         const executable: EvolutionCandidate[] = [];
+        const preflightFailures: EvolutionExecutionArtifact[] = [];
         for (const candidate of generationCandidates) {
           if (executable.length >= input.options.maxExecutedCandidates) break;
+          try {
+            validateTeamGenome(candidate.genome);
+          } catch (error) {
+            const reason = error instanceof Error ? error.message : String(error);
+            preflightFailures.push(this.rejectedExecution(candidate, reason));
+            await this.hooks.onCandidateRejected?.(candidate, reason);
+            continue;
+          }
           const requiredSlots = candidate.genome.members.length;
           if (input.availableAgentSlots !== undefined
             && consumedAgentSlots + requiredSlots > input.availableAgentSlots) continue;
           executable.push(candidate);
           consumedAgentSlots += requiredSlots;
         }
-        if (executable.length === 0) break;
-        await this.transition(fsm, 'S_evo_instantiate', { generation, count: executable.length });
+        if (executable.length === 0 && preflightFailures.length === 0) break;
+        await this.transition(fsm, 'S_evo_instantiate', {
+          generation,
+          count: executable.length,
+          rejected: preflightFailures.length,
+        });
         for (const candidate of executable) {
-          validateTeamGenome(candidate.genome);
           await this.hooks.instantiate(candidate);
         }
 
         await this.transition(fsm, 'S_evo_execute', { generation, count: executable.length });
-        const generationExecutions: EvolutionExecutionArtifact[] = [];
+        const generationExecutions: EvolutionExecutionArtifact[] = [...preflightFailures];
+        executions.push(...preflightFailures);
         for (const candidate of executable) {
           const execution = await this.hooks.execute(candidate);
           executions.push(execution);
@@ -73,18 +86,25 @@ export class EvolutionLifecycleEngine {
 
         await this.transition(fsm, 'S_evo_evaluate', { generation, count: generationExecutions.length });
         const generationEvaluations = await Promise.all(generationExecutions.map(execution => {
-          const candidate = executable.find(item => item.id === execution.candidateId);
+          const candidate = generationCandidates.find(item => item.id === execution.candidateId);
           if (!candidate) throw new Error(`Missing candidate for execution ${execution.candidateId}`);
           return this.evaluator.evaluate(input.task, candidate, execution);
         }));
         evaluations.push(...generationEvaluations);
         for (const evaluation of generationEvaluations) {
-          const candidate = executable.find(item => item.id === evaluation.candidateId);
+          const candidate = generationCandidates.find(item => item.id === evaluation.candidateId);
           if (candidate) candidate.expectedUtility = evaluation.score;
         }
 
         await this.transition(fsm, 'S_evo_select', { generation, count: generationEvaluations.length });
-        const selectedGeneration = this.selector.select(executable, generationEvaluations, input.options.topK);
+        const successfulGenerationIds = new Set(
+          generationEvaluations.filter(evaluation => evaluation.success).map(evaluation => evaluation.candidateId)
+        );
+        const selectedGeneration = this.selector.select(
+          generationCandidates.filter(candidate => successfulGenerationIds.has(candidate.id)),
+          generationEvaluations.filter(evaluation => evaluation.success),
+          input.options.topK
+        );
         selected = selectedGeneration[0] ?? selected;
 
         if (generation >= input.options.generations || input.options.ablations.withoutEvoMutation) break;
@@ -94,13 +114,16 @@ export class EvolutionLifecycleEngine {
       }
 
       const executedIds = new Set(executions.map(execution => execution.candidateId));
+      const successfulIds = new Set(
+        evaluations.filter(evaluation => evaluation.success).map(evaluation => evaluation.candidateId)
+      );
       const globalSelection = this.selector.select(
-        candidates.filter(candidate => executedIds.has(candidate.id)),
-        evaluations,
+        candidates.filter(candidate => executedIds.has(candidate.id) && successfulIds.has(candidate.id)),
+        evaluations.filter(evaluation => evaluation.success),
         input.options.topK
       );
-      selected = globalSelection[0] ?? selected;
-      if (!selected) throw new Error('Evolution produced no selectable candidate');
+      selected = globalSelection[0];
+      if (!selected) throw new Error('Evolution produced no successful candidate');
       const selectedEvaluation = [...evaluations]
         .filter(item => item.candidateId === selected!.id)
         .sort((left, right) => right.score - left.score)[0];
@@ -131,5 +154,27 @@ export class EvolutionLifecycleEngine {
   ): Promise<void> {
     const { from, to } = fsm.transition(next);
     await this.hooks.onTransition?.(from, to, data);
+  }
+
+  private rejectedExecution(candidate: EvolutionCandidate, reason: string): EvolutionExecutionArtifact {
+    return {
+      candidateId: candidate.id,
+      actorKind: candidate.genome.members.length === 1 ? 'agent' : 'team',
+      actorId: 'preflight-rejected',
+      success: false,
+      result: '',
+      usage: { inputTokens: 0, outputTokens: 0, thinkingTokens: null, totalTokens: 0 },
+      wallClockMs: 0,
+      agentIds: [],
+      teamIds: [],
+      toolCalls: 0,
+      successfulToolCalls: 0,
+      unresolvedToolIntents: 0,
+      groundedResults: 0,
+      totalResults: candidate.genome.members.length,
+      failedActors: candidate.genome.members.length,
+      recoveredFailures: 0,
+      warnings: [`Genome preflight rejected: ${reason}`],
+    };
   }
 }

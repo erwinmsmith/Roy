@@ -509,5 +509,13 @@ export function validateTeamGenome(genome: TeamGenome): void {
     ids.add(member.id);
     if (!member.task.trim()) throw new Error(`Genome member ${member.id} requires a task`);
     if (member.budgetPolicy.requestedTokens <= 0) throw new Error(`Genome member ${member.id} requires a positive token request`);
+    if (member.outputContract.groundingRequired) {
+      const hasGroundingTool = member.toolPolicy.some(tool =>
+        (tool.name === 'fs.list' || tool.name === 'fs.read') && tool.permission === 'read_only'
+      );
+      if (!hasGroundingTool) {
+        throw new Error(`Genome member ${member.id} requires grounding but has no filesystem read tool`);
+      }
+    }
   }
 }

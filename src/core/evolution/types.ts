@@ -301,6 +301,7 @@ export interface GenomeMutationOperator {
 
 export interface EvolutionLifecycleHooks {
   onTransition?(from: EvolutionFSMState, to: EvolutionFSMState, data?: Record<string, unknown>): void | Promise<void>;
+  onCandidateRejected?(candidate: EvolutionCandidate, reason: string): void | Promise<void>;
   instantiate(candidate: EvolutionCandidate): Promise<void>;
   execute(candidate: EvolutionCandidate): Promise<EvolutionExecutionArtifact>;
   integrate(

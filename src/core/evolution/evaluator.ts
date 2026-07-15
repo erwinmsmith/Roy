@@ -19,6 +19,8 @@ export class CompositeEvolutionEvaluator implements EvolutionCandidateEvaluator 
     execution: EvolutionExecutionArtifact
   ): Promise<EvolutionEvaluationResult> {
     const validExecution = execution.success && execution.unresolvedToolIntents === 0;
+    const explicitNonCompletion = indicatesNonCompletion(execution.result);
+    const taskCompleted = validExecution && !explicitNonCompletion;
     const toolSuccessRate = execution.toolCalls > 0
       ? execution.successfulToolCalls / execution.toolCalls
       : candidate.genome.members.some(member => member.outputContract.groundingRequired) ? 0 : 0.75;
@@ -33,11 +35,13 @@ export class CompositeEvolutionEvaluator implements EvolutionCandidateEvaluator 
       ? 0
       : candidate.genome.members.reduce((sum, member) => sum + member.tomProfile.level / 3, 0) / candidate.genome.members.length;
     const base: EvolutionEvaluationDimensions = {
-      taskSuccess: validExecution ? Math.max(0.5, successRate) : 0,
+      taskSuccess: taskCompleted ? Math.max(0.5, successRate) : validExecution ? 0.25 : 0,
       answerQuality: validExecution && execution.result.trim().length > 0
         ? Math.min(1, 0.45 + Math.log10(execution.result.length + 1) / 5)
         : 0,
-      completeness: validExecution ? clamp((successRate + groundedRate + 1) / 3) : 0,
+      completeness: taskCompleted
+        ? clamp((successRate + groundedRate + 1) / 3)
+        : validExecution ? clamp((successRate + groundedRate) / 4) : 0,
       costEfficiency,
       novelty: candidate.source === 'mutated_from_cache' || candidate.lineage.operators.length > 0 ? 0.8 : candidate.source === 'cache_hit' ? 0.35 : 0.55,
       toolUse: clamp(toolSuccessRate * 0.55 + groundedRate * 0.45),
@@ -73,7 +77,9 @@ export class CompositeEvolutionEvaluator implements EvolutionCandidateEvaluator 
       dimensions,
       tokenUsed: execution.usage.totalTokens,
       success: validExecution && dimensions.taskSuccess >= 0.5,
-      rationale: judgeFailure
+      rationale: explicitNonCompletion
+        ? 'The execution explicitly reported that the requested result could not be verified or completed.'
+        : judgeFailure
         ? `LLM judge failed (${judgeFailure}); composite observable metrics were used.`
         : typeof judged.rationale === 'string'
         ? judged.rationale
@@ -111,4 +117,9 @@ export class WeightedTopKSelectionPolicy implements EvolutionSelectionPolicy {
 
 function clamp(value: number): number {
   return Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0));
+}
+
+function indicatesNonCompletion(result: string): boolean {
+  return result.includes('[runtime_team_synthesis_fallback]')
+    || /\b(?:no\s+(?:grounded|concrete|verified)\b[^.\n]{0,100}\b(?:identified|found|available|verified)|(?:cannot|could\s+not|unable\s+to)\s+(?:identify|provide|complete)\b[^.\n]{0,100}\b(?:requested|concrete|specific|task|answer|result)|insufficient\s+(?:grounded\s+)?evidence\s+to\s+(?:identify|provide|complete|answer)|no\s+concrete\s+(?:architecture\s+)?risk\s+can\s+be\s+verified)\b/i.test(result);
 }

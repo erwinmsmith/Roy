@@ -249,9 +249,12 @@ export class UnifiedAgent extends BaseAgent {
    * Decide whether to execute an action
    */
   private async shouldExecuteAction(observation: string): Promise<boolean> {
-    if (/\nGrounding context:\n/.test(observation)) return false;
+    if (observation.includes('[runtime_grounding_provided]') || /\nGrounding context:\n/.test(observation)) return false;
     const task = this.extractPrimaryTask(observation);
     const lowerObs = task.toLowerCase();
+    if (/^(?:stress-test|critique|evaluate|assess|challenge|reconcile|synthesize|summarize)\b/.test(lowerObs)) {
+      return false;
+    }
     const hasActionIndicator = /\b(?:run|execute|perform|search|find|calculate|create|update|delete|fetch|inspect|list|read|status|check)\b/.test(lowerObs)
       || /\bget me\b/.test(lowerObs)
       || /\brun\s+(?:the\s+)?(?:tests?|build)\b/.test(lowerObs);
@@ -302,17 +305,9 @@ export class UnifiedAgent extends BaseAgent {
         const response = this.formatCapabilityResult(result.result);
         this.addToMemory('action', `${plan.action}: ${response}`);
         this.fsm?.addToTrace(`Action executed: ${plan.action}`);
-        await this.executeConversationalMode([
-          ...messages,
-          {
-            role: 'assistant',
-            content: `Authorized capability "${plan.action}" completed.\nCapability result:\n${response.slice(0, 12000)}`,
-          },
-          {
-            role: 'user',
-            content: 'Use the capability result to answer the original task. Return a user-facing conclusion, not raw tool output or another tool request.',
-          },
-        ]);
+        await this.executeConversationalMode(
+          this.buildActionSynthesisMessages(observation, messages, plan.action, response)
+        );
       } else {
         const errorMsg = `Action error: ${result.error}`;
         this.addToMemory('result', errorMsg);
@@ -340,6 +335,33 @@ export class UnifiedAgent extends BaseAgent {
     } catch {
       return String(result);
     }
+  }
+
+  private buildActionSynthesisMessages(
+    observation: string,
+    messages: LLMMessage[],
+    action: string,
+    response: string
+  ): LLMMessage[] {
+    const limit = this.getCompletionTokenLimit();
+    const inputTokenBudget = limit === undefined ? 4000 : Math.max(64, Math.floor(limit * 0.62));
+    const inputCharBudget = inputTokenBudget * 3;
+    const systemSource = messages.find(message => message.role === 'system')?.content
+      ?? `You are ${this.name}.`;
+    const systemBudget = Math.min(1800, Math.max(160, Math.floor(inputCharBudget * 0.25)));
+    const task = this.extractPrimaryTask(observation);
+    const instruction = [
+      `Original task:\n${task}`,
+      `Authorized capability "${action}" completed.`,
+      'Capability result:',
+      'Use this evidence to answer the original task.',
+      'Return a user-facing conclusion, not raw tool output or another tool request.',
+    ].join('\n\n');
+    const resultBudget = Math.max(128, inputCharBudget - systemBudget - instruction.length - 64);
+    return [
+      { role: 'system', content: systemSource.slice(0, systemBudget) },
+      { role: 'user', content: `${instruction}\n\n${response.slice(0, resultBudget)}` },
+    ];
   }
 
   /**
@@ -512,10 +534,9 @@ Tool-use policy:
       let fullResponse = '';
       this.state = 'synthesizing';
 
-      const estimatedInputTokens = Math.ceil(
-        messages.map(message => `${message.role}:${message.content}`).join('\n').length / 4
-      );
-      for await (const chunk of this.llm!.stream(messages, this.completionOptions({}, estimatedInputTokens))) {
+      const boundedMessages = this.compactMessagesForActiveAllocation(messages);
+      const estimatedInputTokens = this.estimateMessageTokens(boundedMessages);
+      for await (const chunk of this.llm!.stream(boundedMessages, this.completionOptions({}, estimatedInputTokens))) {
         if (chunk.usage) {
           this.recordUsage(chunk);
         }
@@ -547,6 +568,36 @@ Tool-use policy:
         await this.messageQueue.send(this.name, 'env', errorMsg, { done: true });
       }
     }
+  }
+
+  private compactMessagesForActiveAllocation(messages: LLMMessage[]): LLMMessage[] {
+    const limit = this.getCompletionTokenLimit();
+    if (limit === undefined || messages.length === 0) return messages;
+    const outputReserve = Math.min(512, Math.max(128, Math.floor(limit * 0.25)));
+    const inputBudget = Math.max(32, limit - outputReserve);
+    const estimated = this.estimateMessageTokens(messages);
+    if (estimated <= inputBudget) return messages;
+
+    const system = messages.find(message => message.role === 'system');
+    const user = [...messages].reverse().find(message => message.role === 'user') ?? messages.at(-1);
+    if (!user) return messages;
+    const wrapperReserve = 16;
+    const contentBudget = Math.max(16, inputBudget - wrapperReserve);
+    const systemBudget = system ? Math.max(8, Math.floor(contentBudget * 0.42)) : 0;
+    const userBudget = Math.max(8, contentBudget - systemBudget);
+    const compact: LLMMessage[] = [];
+    if (system) compact.push({ role: 'system', content: this.truncateForTokenBudget(system.content, systemBudget) });
+    compact.push({ role: user.role, content: this.truncateForTokenBudget(user.content, userBudget) });
+    return compact;
+  }
+
+  private truncateForTokenBudget(content: string, tokenBudget: number): string {
+    const maxChars = Math.max(32, tokenBudget * 4);
+    if (content.length <= maxChars) return content;
+    const marker = '\n...[active allocation context truncation]...\n';
+    const available = Math.max(16, maxChars - marker.length);
+    const head = Math.floor(available * 0.65);
+    return `${content.slice(0, head)}${marker}${content.slice(-(available - head))}`;
   }
 
   /**

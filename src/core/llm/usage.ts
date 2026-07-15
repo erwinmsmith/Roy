@@ -153,16 +153,19 @@ export class TokenUsageRegistry {
     this.estimators.unshift(estimator);
   }
 
+  estimateText(text: string, provider: string, model?: string): number {
+    const estimator = this.estimators.find(item => item.supports(provider, model));
+    return estimator?.estimateText(text, provider, model) ?? Math.max(0, Math.ceil(text.length / 4));
+  }
+
   normalize(input: TokenUsageNormalizationInput): NormalizedModelTokenUsage | undefined {
     const provider = input.provider.toLowerCase();
     const normalizer = this.normalizers.get(provider) ?? new OpenAICompatibleUsageNormalizer(provider);
     const reported = normalizer.normalize(input);
     if (reported) return reported;
     if (!input.messages && input.output === undefined) return undefined;
-    const estimator = this.estimators.find(item => item.supports(provider, input.model));
-    if (!estimator) return undefined;
-    const prompt = estimator.estimateText((input.messages ?? []).map(message => `${message.role}:${message.content}`).join('\n'), provider, input.model);
-    const completion = estimator.estimateText(input.output ?? '', provider, input.model);
+    const prompt = this.estimateText((input.messages ?? []).map(message => `${message.role}:${message.content}`).join('\n'), provider, input.model);
+    const completion = this.estimateText(input.output ?? '', provider, input.model);
     return canonicalUsage({
       provider,
       model: input.model,

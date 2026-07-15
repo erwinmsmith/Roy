@@ -11,6 +11,7 @@ import type { Skill, SkillConfig, SkillInput, SkillContext, SkillOutput, SkillMa
 class PlanningLLM implements LLMProvider {
   readonly name = 'planning-test';
   readonly defaultModel = 'test-model';
+  jsonCalls = 0;
 
   constructor(private readonly action: string) {}
 
@@ -24,6 +25,7 @@ class PlanningLLM implements LLMProvider {
   }
 
   async completeJSON<T>(_messages: LLMMessage[], _options?: LLMCompletionOptions): Promise<T> {
+    this.jsonCalls += 1;
     return {
       action: this.action,
       params: { value: 'hello' },
@@ -45,6 +47,15 @@ class EchoTool implements Tool {
       success: true,
       result: `tool:${params.value}`,
     };
+  }
+}
+
+class LargeResultTool implements Tool {
+  readonly name = 'large-result-tool';
+  readonly description = 'Returns a large evidence payload';
+
+  async execute() {
+    return { success: true, result: `observed-evidence\n${'entry\n'.repeat(5000)}` };
   }
 }
 
@@ -181,5 +192,50 @@ describe('UnifiedAgent capability execution', () => {
     await agent.step('Stress-test the evidence and proposed conclusions.');
 
     expect((await queue.receive('env'))?.content).not.toContain('tool:hello');
+  });
+
+  it('compacts large capability results to fit the active synthesis allocation', async () => {
+    toolRegistry.register(new LargeResultTool());
+    const agent = new UnifiedAgent({
+      name: 'bounded-agent',
+      goal: 'summarize evidence',
+      llm: new PlanningLLM('large-result-tool'),
+      mode: 'action',
+    });
+    const queue = new MessageQueue(['env', 'bounded-agent']);
+    agent.setMessageQueue(queue);
+    agent.setCompletionTokenLimit(800, 'total_tokens');
+    await agent.initialize('bounded-session');
+
+    await expect(agent.step('run the evidence inspection')).resolves.toBeUndefined();
+    expect((await queue.receive('env'))?.content).toContain('observed-evidence');
+  });
+
+  it('uses runtime grounding directly and compacts an oversized system prompt within allocation', async () => {
+    toolRegistry.register(new EchoTool());
+    const llm = new PlanningLLM('echo-tool');
+    const agent = new UnifiedAgent({
+      name: 'grounded-agent',
+      goal: `preserve identity and constraints\n${'large cached context\n'.repeat(1200)}`,
+      llm,
+      mode: 'hybrid',
+    });
+    const queue = new MessageQueue(['env', 'grounded-agent']);
+    agent.setMessageQueue(queue);
+    agent.setCompletionTokenLimit(2200, 'total_tokens');
+    await agent.initialize('grounded-session');
+
+    await expect(agent.step([
+      '[runtime_grounding_provided]',
+      'Inspect the package exports.',
+      'Grounding context:',
+      'Filesystem listing:',
+      'package.json',
+      'src',
+    ].join('\n'))).resolves.toBeUndefined();
+
+    expect(llm.jsonCalls).toBe(0);
+    expect((await queue.receive('env'))?.content).not.toContain('tool:hello');
+    expect(agent.getInfo().error).toBeUndefined();
   });
 });

@@ -139,6 +139,10 @@ Every evolution candidate is represented as a `TeamGenome`. A one-member genome 
 
 Authorized capability execution is always followed by an agent synthesis step. Raw command results and unresolved tool-call markup are not valid candidate answers; unresolved tool intents fail evaluation and cannot enter evolution pattern memory.
 
+Grounding-required genomes must bind an approved filesystem evidence tool before instantiation. Runtime tool evidence is carried as structured paths and summaries, and is attached to an agent result when the model omits the concrete observations it used. Provider/model-aware token estimators drive budget requests; reasoning models receive a separate synthesis reserve so thinking does not consume the entire visible-answer allowance.
+
+Cached genomes are validated before population admission. Structurally stale patterns are marked `deprecated`, while an invalid individual candidate is rejected without consuming an execution or agent slot. A deterministic team fallback can preserve member diagnostics when a model returns no visible synthesis, but that fallback is explicitly ineligible for evolution selection or pattern integration.
+
 Selected genomes are stored in `.roy/cache/evolution-patterns.json` and linked back to their concrete agent/team patterns. Full runs and metrics are appended to `.roy/cache/evolution-history.jsonl`. Evolution defaults to `manual` mode so normal chat does not unexpectedly execute a candidate population. Set `/evo mode auto` to route complex delegated turns through evolution.
 
 The workspace defaults can be changed in `.roy/config.json` or through `/evo` and the evolution config API:

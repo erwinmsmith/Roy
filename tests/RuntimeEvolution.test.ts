@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Runtime from '../src/core/runtime/Runtime.js';
@@ -22,11 +22,13 @@ class EvolutionTestLLM implements LLMProvider {
 
   async *stream(messages: LLMMessage[]): AsyncGenerator<LLMStreamChunk, void, unknown> {
     const prompt = messages.map(message => message.content).join('\n');
-    const content = prompt.includes('subteam actor')
+    const content = prompt.includes('Filesystem listing:')
+      ? 'The specialist observed package.json and stated explicit limitations.'
+      : prompt.includes('subteam actor')
       ? 'The team synthesized concrete architecture evidence, risks, and limitations.'
       : prompt.includes('critic')
         ? 'The critic identified coupling, missing failure-path checks, and evidence limits.'
-        : 'The specialist returned concrete project evidence and explicit limitations.';
+        : 'The specialist observed package.json and stated explicit limitations.';
     yield { content, done: true, usage: { promptTokens: 30, completionTokens: 12, totalTokens: 42 } };
   }
 
@@ -168,6 +170,7 @@ describe('Phase 6 runtime evolution', () => {
 
   it('routes normal complex chat through evolution when auto mode is enabled', async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), 'roy-evolution-auto-'));
+    await writeFile(path.join(cwd, 'package.json'), '{"name":"evolution-fixture"}\n', 'utf8');
     const runtime = new Runtime();
     await runtime.initialize({ sessionId: 'evolution-auto', workspaceCwd: cwd, llmProvider: new EvolutionTestLLM() });
     await runtime.updateEvolutionConfig({
@@ -183,6 +186,8 @@ describe('Phase 6 runtime evolution', () => {
     expect(turn.decision.action).toBe('spawn_subagents');
     expect(turn.evolution?.state).toBe('S_evo_done');
     expect(turn.evolution?.selectedExecution?.result).toBeTruthy();
+    expect(turn.evolution?.selectedExecution?.groundedResults).toBeGreaterThan(0);
+    expect(turn.evolution?.selectedExecution?.toolCalls).toBeGreaterThan(0);
     expect(turn.finalResponse).toBeTruthy();
     expect(turn.usage.total.totalTokens).toBeGreaterThan(0);
     expect(runtime.getEvents().some(event => event.type === 'evo.run.completed' && event.correlationId === turn.correlationId)).toBe(true);

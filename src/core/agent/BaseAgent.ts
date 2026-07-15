@@ -15,6 +15,7 @@ import { memoryRegistry } from '../memory/index.js';
 import { buildPrompt } from '../prompts/builder.js';
 import { conversationalTemplate } from '../prompts/templates/conversational.js';
 import { logger } from '../utils/logger.js';
+import { tokenUsageRegistry } from '../llm/usage.js';
 import { normalizeToMProfile, type ToMProfile } from '../tom/index.js';
 import type {
   AgentCommunicationContext,
@@ -342,11 +343,21 @@ export abstract class BaseAgent implements AgentTraceReceiver {
     };
   }
 
+  protected estimateMessageTokens(messages: LLMMessage[]): number {
+    return tokenUsageRegistry.estimateText(
+      messages.map(message => `${message.role}:${message.content}`).join('\n'),
+      this.llm?.name ?? 'unknown',
+      this.llm?.defaultModel
+    );
+  }
+
+  protected estimateTextTokens(text: string): number {
+    return tokenUsageRegistry.estimateText(text, this.llm?.name ?? 'unknown', this.llm?.defaultModel);
+  }
+
   protected async completeJSONWithAccounting<T>(messages: LLMMessage[], options: LLMCompletionOptions = {}): Promise<T> {
     if (!this.llm) throw new Error(`Agent ${this.name} has no LLM configured`);
-    const estimatedInputTokens = Math.ceil(
-      messages.map(message => `${message.role}:${message.content}`).join('\n').length / 4
-    );
+    const estimatedInputTokens = this.estimateMessageTokens(messages);
     const bounded = this.completionOptions(options, estimatedInputTokens);
     if (this.llm.completeJSONWithUsage) {
       const result = await this.llm.completeJSONWithUsage<T>(messages, bounded);
@@ -354,8 +365,8 @@ export abstract class BaseAgent implements AgentTraceReceiver {
       return result.value;
     }
     const value = await this.llm.completeJSON<T>(messages, bounded);
-    const promptTokens = Math.ceil(messages.map(message => `${message.role}:${message.content}`).join('\n').length / 4);
-    const completionTokens = Math.ceil(JSON.stringify(value).length / 4);
+    const promptTokens = this.estimateMessageTokens(messages);
+    const completionTokens = this.estimateTextTokens(JSON.stringify(value));
     this.recordUsage({
       content: JSON.stringify(value),
       usage: {

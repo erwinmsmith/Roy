@@ -7,6 +7,7 @@ import {
   TeamFirstGenomePlanner,
   WeightedTopKSelectionPolicy,
   defaultMutationOperators,
+  validateTeamGenome,
   type EvolutionExecutionArtifact,
   type EvolutionProposalInput,
 } from '../src/core/evolution/index.js';
@@ -77,6 +78,71 @@ describe('Phase 6 evolution core', () => {
     expect(candidates[0].genome.coordinationPolicy).toBe('critic_refine');
     expect(candidates[1].genome.members).toHaveLength(1);
     expect(candidates[1].rationale).toContain('degenerates');
+  });
+
+  it('rejects grounding-required genomes without a filesystem evidence tool', () => {
+    const genome = structuredClone(new TeamFirstGenomePlanner().propose(proposalInput())[0].genome);
+    genome.members[0].toolPolicy = [];
+    expect(() => validateTeamGenome(genome)).toThrow('requires grounding but has no filesystem read tool');
+  });
+
+  it('rejects an invalid cached genome without consuming the valid execution slot', async () => {
+    class InvalidCacheFirstPlanner extends TeamFirstGenomePlanner {
+      override propose(input: EvolutionProposalInput) {
+        const valid = super.propose(input)[0];
+        const invalid = structuredClone(valid);
+        invalid.id = 'invalid_cached_candidate';
+        invalid.source = 'cache_hit';
+        invalid.lineage.parentPatternIds = ['stale_pattern'];
+        invalid.genome.members[0].toolPolicy = [];
+        return [invalid, valid];
+      }
+    }
+    const input = proposalInput();
+    input.options.maxExecutedCandidates = 1;
+    input.options.generations = 0;
+    const rejected: string[] = [];
+    const executed: string[] = [];
+    const engine = new EvolutionLifecycleEngine(
+      new InvalidCacheFirstPlanner(),
+      new CompositeEvolutionEvaluator(),
+      new WeightedTopKSelectionPolicy(),
+      defaultMutationOperators(),
+      {
+        onCandidateRejected: candidate => rejected.push(candidate.id),
+        instantiate: async () => undefined,
+        execute: async candidate => {
+          executed.push(candidate.id);
+          return {
+            candidateId: candidate.id,
+            actorKind: 'team',
+            actorId: 'valid_team',
+            success: true,
+            result: 'A grounded architecture risk with evidence and limitations.',
+            usage: { inputTokens: 10, outputTokens: 10, thinkingTokens: 2, totalTokens: 22 },
+            wallClockMs: 1,
+            agentIds: ['researcher', 'critic'],
+            teamIds: ['valid_team'],
+            toolCalls: 1,
+            successfulToolCalls: 1,
+            unresolvedToolIntents: 0,
+            groundedResults: 1,
+            totalResults: 2,
+            failedActors: 0,
+            recoveredFailures: 0,
+            warnings: [],
+          };
+        },
+        integrate: async () => undefined,
+      }
+    );
+
+    const result = await engine.run(input);
+
+    expect(result.state).toBe('S_evo_done');
+    expect(rejected).toEqual(['invalid_cached_candidate']);
+    expect(executed).toEqual([result.selected?.id]);
+    expect(result.executions.find(item => item.candidateId === 'invalid_cached_candidate')?.success).toBe(false);
   });
 
   it('executes, evaluates, mutates, selects, and integrates through the full lifecycle', async () => {
@@ -185,5 +251,130 @@ describe('Phase 6 evolution core', () => {
     expect(evaluation.success).toBe(false);
     expect(evaluation.score).toBeLessThanOrEqual(0.15);
     expect(evaluation.dimensions.answerQuality).toBe(0);
+  });
+
+  it('does not score an explicit evidence insufficiency as task success', async () => {
+    const candidate = new TeamFirstGenomePlanner().propose(proposalInput())[0];
+    const evaluation = await new CompositeEvolutionEvaluator().evaluate(
+      proposalInput().task,
+      candidate,
+      {
+        candidateId: candidate.id,
+        actorKind: 'team',
+        actorId: 'insufficient_team',
+        success: true,
+        result: 'No concrete architecture risk can be verified because the available evidence is insufficient.',
+        usage: { inputTokens: 100, outputTokens: 40, thinkingTokens: 10, totalTokens: 150 },
+        wallClockMs: 5,
+        agentIds: ['researcher', 'critic'],
+        teamIds: ['team_insufficient'],
+        toolCalls: 1,
+        successfulToolCalls: 1,
+        unresolvedToolIntents: 0,
+        groundedResults: 1,
+        totalResults: 2,
+        failedActors: 0,
+        recoveredFailures: 0,
+        warnings: [],
+      }
+    );
+    expect(evaluation.success).toBe(false);
+    expect(evaluation.dimensions.taskSuccess).toBeLessThan(0.5);
+    expect(evaluation.rationale).toContain('could not be verified');
+  });
+
+  it('allows a completed answer to preserve local uncertainty in its limitations', async () => {
+    const candidate = new TeamFirstGenomePlanner().propose(proposalInput())[0];
+    const evaluation = await new CompositeEvolutionEvaluator().evaluate(
+      proposalInput().task,
+      candidate,
+      {
+        candidateId: candidate.id,
+        actorKind: 'team',
+        actorId: 'bounded_uncertainty_team',
+        success: true,
+        result: 'Concrete risk: package subpath exports couple consumers to internal layout. Limitation: we cannot confirm whether every internal module is intentionally public.',
+        usage: { inputTokens: 100, outputTokens: 40, thinkingTokens: 10, totalTokens: 150 },
+        wallClockMs: 5,
+        agentIds: ['researcher'],
+        teamIds: ['bounded_uncertainty_team'],
+        toolCalls: 1,
+        successfulToolCalls: 1,
+        unresolvedToolIntents: 0,
+        groundedResults: 1,
+        totalResults: 1,
+        failedActors: 0,
+        recoveredFailures: 0,
+        warnings: [],
+      }
+    );
+    expect(evaluation.success).toBe(true);
+    expect(evaluation.dimensions.taskSuccess).toBeGreaterThanOrEqual(0.5);
+  });
+
+  it('does not select a deterministic team fallback as a completed evolution task', async () => {
+    const candidate = new TeamFirstGenomePlanner().propose(proposalInput())[0];
+    const evaluation = await new CompositeEvolutionEvaluator().evaluate(
+      proposalInput().task,
+      candidate,
+      {
+        candidateId: candidate.id,
+        actorKind: 'team',
+        actorId: 'fallback_team',
+        success: true,
+        result: '[runtime_team_synthesis_fallback]\nUnverified member reports.',
+        usage: { inputTokens: 100, outputTokens: 20, thinkingTokens: 100, totalTokens: 220 },
+        wallClockMs: 5,
+        agentIds: ['researcher'],
+        teamIds: ['fallback_team'],
+        toolCalls: 1,
+        successfulToolCalls: 1,
+        unresolvedToolIntents: 0,
+        groundedResults: 1,
+        totalResults: 1,
+        failedActors: 0,
+        recoveredFailures: 0,
+        warnings: [],
+      }
+    );
+    expect(evaluation.success).toBe(false);
+    expect(evaluation.dimensions.taskSuccess).toBe(0.25);
+  });
+
+  it('fails the lifecycle when every executed candidate is invalid', async () => {
+    const transitions: string[] = [];
+    const engine = new EvolutionLifecycleEngine(
+      new TeamFirstGenomePlanner(),
+      new CompositeEvolutionEvaluator(),
+      new WeightedTopKSelectionPolicy(),
+      defaultMutationOperators(),
+      {
+        onTransition: (_from, to) => transitions.push(to),
+        instantiate: async () => undefined,
+        execute: async candidate => ({
+          candidateId: candidate.id,
+          actorKind: candidate.genome.members.length === 1 ? 'agent' : 'team',
+          actorId: `failed_${candidate.id}`,
+          success: false,
+          result: '',
+          usage: { inputTokens: 10, outputTokens: 0, thinkingTokens: null, totalTokens: 10 },
+          wallClockMs: 1,
+          agentIds: candidate.genome.members.map(member => member.id),
+          teamIds: [],
+          toolCalls: 0,
+          successfulToolCalls: 0,
+          unresolvedToolIntents: 0,
+          groundedResults: 0,
+          totalResults: candidate.genome.members.length,
+          failedActors: candidate.genome.members.length,
+          recoveredFailures: 0,
+          warnings: ['candidate failed'],
+        }),
+        integrate: async () => undefined,
+      }
+    );
+
+    await expect(engine.run(proposalInput())).rejects.toThrow('no successful candidate');
+    expect(transitions.at(-1)).toBe('S_evo_failed');
   });
 });

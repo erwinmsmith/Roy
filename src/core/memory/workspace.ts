@@ -1415,6 +1415,18 @@ Keep this agent identity separate from the model provider identity.
     return this.readPatterns('evolution-patterns.json') as Promise<EvolutionPattern[]>;
   }
 
+  async deprecateEvolutionPatterns(patternIds: string[]): Promise<void> {
+    if (patternIds.length === 0) return;
+    await this.updatePatternFile(path.join(this.rootPath, 'cache', 'evolution-patterns.json'), patterns => {
+      const now = new Date().toISOString();
+      for (const pattern of patterns) {
+        if (!patternIds.includes(String(pattern.id ?? ''))) continue;
+        pattern.status = 'deprecated';
+        pattern.updatedAt = now;
+      }
+    });
+  }
+
   async upsertEvolutionPattern(
     input: Omit<EvolutionPattern, 'usageCount' | 'successCount' | 'averageScore' | 'averageTokenCost' | 'status' | 'createdAt' | 'updatedAt'> & {
       evaluation: EvolutionPattern['historicalScores'][number];
