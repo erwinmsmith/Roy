@@ -353,6 +353,10 @@ export class Roy {
         this.printTeams(parts.includes('--tree'), parts.includes('--tom'));
         break;
 
+      case '/lifecycle':
+        await this.handleLifecycle(parts);
+        break;
+
       case '/tom':
         this.printToMState(parts[1]);
         break;
@@ -544,6 +548,9 @@ export class Roy {
       /spawn <type> --parent <id> "task" Spawn below another agent
       /spawn custom --name <name> [--role <role>] [--style <style>] "task"
       /run <agent-id> "task" Run an existing subagent
+      /lifecycle          Show active, retained, persisted, and released actors
+      /lifecycle retain|persist|release <id> Apply an actor lifecycle action
+      /lifecycle restore <id> Restore a dormant persisted actor
       /session            Show current session info
       /reset              Reset FSM to initial state
 
@@ -673,6 +680,9 @@ export class Roy {
     console.log('    GET  /v1/teams/tree - Team actor tree');
     console.log('    POST /v1/teams - Create subteam');
     console.log('    POST /v1/teams/:id/run - Run subteam');
+    console.log('    GET  /v1/lifecycle - Active and dormant actor lifecycle state');
+    console.log('    POST /v1/lifecycle/:id - Retain, persist, or release an actor');
+    console.log('    POST /v1/lifecycle/:id/restore - Restore a dormant actor');
     console.log('    GET  /v1/runtime/sessions - Active HTTP runtime sessions');
     console.log('    DELETE /v1/runtime/session - Close the selected HTTP runtime session');
     console.log('    GET  /v1/budget  - Token budget');
@@ -1063,6 +1073,7 @@ export class Roy {
         const failureMode = this.optionValue(parts, '--failure');
         const maxConcurrency = this.optionValue(parts, '--concurrency');
         const minimumSuccessfulMembers = this.optionValue(parts, '--min-success');
+        const lifecycleMode = this.optionValue(parts, '--lifecycle');
         const team = await runtime.spawnTeam({
           name,
           description,
@@ -1073,6 +1084,9 @@ export class Roy {
             ...(maxConcurrency ? { maxConcurrency: Number(maxConcurrency) } : {}),
             ...(minimumSuccessfulMembers ? { minimumSuccessfulMembers: Number(minimumSuccessfulMembers) } : {}),
           },
+          lifecycle: lifecycleMode === 'release' || lifecycleMode === 'persist' || lifecycleMode === 'retain_session'
+            ? { mode: lifecycleMode }
+            : undefined,
         });
         console.log(`\n  ${this.green(`Created ${team.identity.name}`)} ${this.dim(team.identity.id)}\n`);
         return;
@@ -1593,6 +1607,7 @@ export class Roy {
     const tools = this.optionList(parts, '--tools');
     const skills = this.optionList(parts, '--skills');
     const communicationProtocol = this.optionValue(parts, '--protocol');
+    const lifecycleMode = this.optionValue(parts, '--lifecycle');
     const task = this.trailingTask(parts, 2);
     const allowed = ['researcher', 'critic', 'planner', 'coder', 'summarizer', 'tester', 'custom'];
 
@@ -1612,6 +1627,9 @@ export class Roy {
         tools,
         skills,
         communicationProtocol,
+        lifecycle: lifecycleMode === 'release' || lifecycleMode === 'persist' || lifecycleMode === 'retain_session'
+          ? { mode: lifecycleMode }
+          : undefined,
         requireRootSynthesis: true,
         showSubagentOutput: !quiet,
       });
@@ -1625,6 +1643,10 @@ export class Roy {
       }
       console.log(`  ${this.dim(`agent creation: mode=${result.creationUsage.mode}, definition=${result.creationUsage.definitionTokens} tokens, rendered=${result.creationUsage.renderedPromptTokens} tokens (${result.creationUsage.renderedPromptChars} chars), cache hits=${result.creationUsage.cacheHits.length}`)}`);
       console.log(`  ${this.dim(`node: ${result.node.nodeId}, definition=${result.node.definitionFingerprint.slice(0, 12)}, invocation=${result.node.invocationFingerprint.slice(0, 12)}`)}`);
+      const lifecycle = runtime.getActorLifecycle(result.agent.identity.id);
+      if (lifecycle && !Array.isArray(lifecycle)) {
+        console.log(`  ${this.dim(`lifecycle: ${lifecycle.status} (${lifecycle.lastDecision?.action ?? lifecycle.policy.mode})`)}`);
+      }
       console.log(`  ${this.yellow('roy[root] delegating...')}`);
       console.log(`  ├─ ${this.yellow(`${result.agent.name}[subagent] thinking...`)}`);
       if (result.subagentResult.toolCalls.length > 0) {
@@ -1652,6 +1674,57 @@ export class Roy {
     } catch (error) {
       console.log('\n  ' + this.red('Spawn error:') + ' ' + (error instanceof Error ? error.message : String(error)) + '\n');
     }
+  }
+
+  private async handleLifecycle(parts: string[]): Promise<void> {
+    const command = parts[1];
+    if (command === 'restore') {
+      const actorId = parts[2];
+      if (!actorId) {
+        console.log('\n  Usage: /lifecycle restore <actor-id>\n');
+        return;
+      }
+      try {
+        const actor = await runtime.restoreActor(actorId);
+        console.log(`\n  ${this.green(`Restored ${actor.identity.name}`)} ${this.dim(actorId)}\n`);
+      } catch (error) {
+        console.log(`\n  ${this.red('Lifecycle restore error:')} ${error instanceof Error ? error.message : String(error)}\n`);
+      }
+      return;
+    }
+    if (command === 'retain' || command === 'persist' || command === 'release' || command === 'close') {
+      const actorId = parts[2];
+      if (!actorId) {
+        console.log('\n  Usage: /lifecycle retain|persist|release <actor-id>\n');
+        return;
+      }
+      const action = command === 'retain' ? 'retain_session' : command === 'close' ? 'release' : command;
+      try {
+        const record = await runtime.setActorLifecycle(actorId, action);
+        console.log(`\n  ${this.green(`${actorId}: ${record.status}`)}${record.lastDecision?.snapshotPath ? ` ${this.dim(record.lastDecision.snapshotPath)}` : ''}\n`);
+      } catch (error) {
+        console.log(`\n  ${this.red('Lifecycle error:')} ${error instanceof Error ? error.message : String(error)}\n`);
+      }
+      return;
+    }
+
+    const records = runtime.getActorLifecycle();
+    const persisted = await runtime.getPersistedActors();
+    console.log('\n  ' + this.bold('Actor Lifecycle'));
+    if (!Array.isArray(records) || records.length === 0) console.log('    ' + this.dim('No derived actors'));
+    else {
+      console.log('    ID                         Kind   Origin                 Status     Decision');
+      for (const record of records) {
+        console.log(
+          `    ${record.actorId.slice(0, 26).padEnd(26)} ${record.actorKind.padEnd(6)} ${record.origin.padEnd(22)} ${record.status.padEnd(10)} ${record.lastDecision?.action ?? '-'}`
+        );
+      }
+    }
+    console.log(`\n    Dormant snapshots: ${persisted.length}`);
+    for (const snapshot of persisted.slice(0, 10)) {
+      console.log(`      - ${snapshot.actorId} [${snapshot.actorKind}] ${this.dim(snapshot.persistedAt)}`);
+    }
+    console.log('');
   }
 
   private async handleEvolution(parts: string[]): Promise<void> {

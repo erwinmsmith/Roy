@@ -120,6 +120,17 @@ import {
   type WorkspaceRuntimeConfig,
   type RootMemoryContext,
 } from '../memory/index.js';
+import {
+  ActorLifecycleRegistry,
+  type ActorKind,
+  type ActorLifecycleAction,
+  type ActorLifecycleMode,
+  type ActorLifecycleOrigin,
+  type ActorLifecycleOutcome,
+  type ActorLifecyclePolicy,
+  type ActorLifecycleRecord,
+  type PersistedActorSnapshot,
+} from '../lifecycle/index.js';
 
 export interface RuntimeConfig {
   agentName?: string;
@@ -288,6 +299,10 @@ export interface SpawnAgentSpec {
   cognitiveGapIds?: string[];
   existenceReason?: string;
   communicationProtocol?: string;
+  tomProfile?: ToMProfile;
+  lifecycle?: Partial<ActorLifecyclePolicy>;
+  lifecycleOrigin?: ActorLifecycleOrigin;
+  instanceId?: string;
 }
 
 export interface AgentTreeNode {
@@ -325,6 +340,9 @@ export interface SpawnTeamSpec {
   members?: TeamMemberSpec[];
   correlationId?: string;
   executionPolicy?: Partial<TeamExecutionPolicy>;
+  lifecycle?: Partial<ActorLifecyclePolicy>;
+  lifecycleOrigin?: ActorLifecycleOrigin;
+  instanceId?: string;
 }
 
 export interface TeamTreeNode {
@@ -420,6 +438,8 @@ export interface SpawnCommandPayload {
   existenceReason?: string;
   communicationProtocol?: string;
   systemPrompt?: string;
+  lifecycle?: Partial<ActorLifecyclePolicy>;
+  lifecycleOrigin?: ActorLifecycleOrigin;
 }
 
 export type DelegationDecision =
@@ -570,6 +590,13 @@ export class Runtime {
   private evolutionSequence = 0;
   private readonly evolutionRuns: EvolutionRunResult[] = [];
   private readonly archivedAgentUsage = new Map<string, TokenUsage>();
+  private readonly archivedTeamUsage = new Map<string, TokenUsage>();
+  private readonly archivedTeamSynthesisUsage = new Map<string, TokenUsage>();
+  private readonly archivedAgentInfo = new Map<string, AgentInfo>();
+  private readonly archivedTeamStates = new Map<string, TeamRuntimeState>();
+  private readonly lifecycle = new ActorLifecycleRegistry();
+  private readonly agentRestoreSpecs = new Map<string, SpawnAgentSpec>();
+  private readonly teamRestoreSpecs = new Map<string, SpawnTeamSpec>();
   private readonly evolutionBudgetBypassCorrelations = new Set<string>();
 
   static getInstance(): Runtime {
@@ -795,6 +822,13 @@ export class Runtime {
     this.tomAnalyses.clear();
     this.evolutionRuns.length = 0;
     this.archivedAgentUsage.clear();
+    this.archivedTeamUsage.clear();
+    this.archivedTeamSynthesisUsage.clear();
+    this.archivedAgentInfo.clear();
+    this.archivedTeamStates.clear();
+    this.lifecycle.clear();
+    this.agentRestoreSpecs.clear();
+    this.teamRestoreSpecs.clear();
     this.evolutionBudgetBypassCorrelations.clear();
     this.evolutionSequence = 0;
     this.initialized = false;
@@ -957,14 +991,20 @@ export class Runtime {
           modelsTargets: [...gap.modelsTargets],
         })),
       })),
-      agents: ctx.manager.listAgentInfo().map(agent => ({
+      agents: [...new Map([
+        ...this.archivedAgentInfo.entries(),
+        ...ctx.manager.listAgentInfo().map(agent => [agent.identity.id, agent] as const),
+      ]).values()].map(agent => ({
         agentId: agent.identity.id,
         name: agent.identity.name,
         parentId: agent.identity.parentId,
         teamId: agent.identity.teamId,
         profile: normalizeToMProfile(agent.identity.tomProfile, agent.identity.tomProfile),
       })),
-      teams: this.teams.list().map(team => ({
+      teams: [...new Map([
+        ...this.archivedTeamStates.entries(),
+        ...this.teams.list().map(team => [team.identity.id, team] as const),
+      ]).values()].map(team => ({
         teamId: team.identity.id,
         name: team.identity.name,
         parentAgentId: team.identity.parentAgentId,
@@ -987,12 +1027,20 @@ export class Runtime {
       usedTokens += usage.totalTokens;
     }
     for (const [agentId, usage] of this.archivedAgentUsage) {
-      perAgent[agentId] = { ...usage };
+      perAgent[agentId] = perAgent[agentId]
+        ? this.sumUsage([perAgent[agentId], usage])
+        : { ...usage };
       usedTokens += usage.totalTokens;
     }
     for (const team of this.teams.list()) {
       perTeam[team.identity.id] = { ...team.tokenUsage };
       usedTokens += team.synthesisUsage.totalTokens;
+    }
+    for (const [teamId, usage] of this.archivedTeamUsage) {
+      perTeam[teamId] = perTeam[teamId]
+        ? this.sumUsage([perTeam[teamId], usage])
+        : { ...usage };
+      usedTokens += this.archivedTeamSynthesisUsage.get(teamId)?.totalTokens ?? 0;
     }
 
     return {
@@ -1032,6 +1080,7 @@ export class Runtime {
     const usage = [
       ...Object.values(budget.perAgent),
       ...this.teams.list().map(team => team.synthesisUsage),
+      ...this.archivedTeamSynthesisUsage.values(),
     ];
     return usage.reduce((sum, item) => {
       if (dimension === 'output_tokens') return sum + item.outputTokens;
@@ -1345,6 +1394,7 @@ export class Runtime {
         members,
       });
       const team = this.teams.create({
+        id: spec.instanceId,
         name: spec.name,
         parentAgentId,
         description: spec.description,
@@ -1358,6 +1408,35 @@ export class Runtime {
       });
       createdTeamId = team.identity.id;
       this.teamMemberPlans.set(team.identity.id, members.map(member => ({ ...member })));
+      const lifecycleOrigin = spec.lifecycleOrigin ?? 'manual';
+      const lifecyclePolicy = this.resolveLifecyclePolicy(
+        lifecycleOrigin,
+        spec.lifecycle ?? this.inheritParentLifecyclePolicy(parentAgentId, lifecycleOrigin)
+      );
+      this.lifecycle.register({
+        actorId: team.identity.id,
+        actorKind: 'team',
+        origin: lifecycleOrigin,
+        parentId: parentAgentId,
+        policy: lifecyclePolicy,
+        createdAt: team.createdAt,
+      });
+      this.teamRestoreSpecs.set(team.identity.id, {
+        parentAgentId,
+        name: spec.name,
+        description: spec.description,
+        tomLevel: team.identity.tomLevel,
+        tomProfile: team.identity.tomProfile,
+        tomAnalysis: spec.tomAnalysis,
+        leadAgentId: spec.leadAgentId,
+        task: spec.task,
+        members: members.map(member => ({ ...member })),
+        correlationId: spec.correlationId,
+        executionPolicy: { ...executionPolicy },
+        lifecycle: { ...lifecyclePolicy },
+        lifecycleOrigin,
+        instanceId: team.identity.id,
+      });
       await ctx.memory.ensureTeamMemory(teamKey, { name: spec.name, purpose: spec.description });
       if (cachedTeamPattern) {
         this.emit({
@@ -1464,6 +1543,8 @@ export class Runtime {
         } catch {
           // The original creation failure is the actionable error.
         }
+        this.lifecycle.remove(createdTeamId);
+        this.teamRestoreSpecs.delete(createdTeamId);
       }
       const rejected = await this.enqueueMessage({
         kind: 'team.create.rejected',
@@ -1536,6 +1617,8 @@ export class Runtime {
     };
     const nextPlans = [...plans, normalizedSpec];
     this.teamMemberPlans.set(teamId, nextPlans);
+    const restoreSpec = this.teamRestoreSpecs.get(teamId);
+    if (restoreSpec) this.teamRestoreSpecs.set(teamId, { ...restoreSpec, members: nextPlans.map(member => ({ ...member })) });
     await this.getContext().memory.updateTeamPatternMembers(this.safeAgentKey(team.identity.name), {
       memberArchetypes: nextPlans.map(member => member.archetype),
       leadArchetype: nextPlans.find(member => member.lead)?.archetype,
@@ -1600,6 +1683,7 @@ export class Runtime {
           disableRecursiveDelegation: true,
           teamId,
         },
+        lifecycleOrigin: 'team_member',
       }, {
         agentId: team.identity.parentAgentId,
         sessionId: this.getContext().sessionId,
@@ -1644,6 +1728,7 @@ export class Runtime {
     const usageBefore = { ...initial.tokenUsage };
     // A team definition can run repeatedly, but every execution is a distinct trace.
     const correlationId = options.correlationId ?? this.createCorrelationId();
+    this.activateActorLifecycle(teamId, correlationId);
     this.teams.setTask(teamId, task, correlationId);
     await this.transitionTeamFsm(teamId, 'S_team_plan', { task });
     this.emit({
@@ -1843,7 +1928,7 @@ export class Runtime {
           partial: failedOutcomes.length > 0,
         },
       });
-      return {
+      const teamRunResult: TeamRunResult = {
         team: this.teams.get(teamId)!,
         result: synthesis.content,
         members,
@@ -1863,6 +1948,8 @@ export class Runtime {
         messages: await this.getMessages({ correlationId }),
         usage: runUsage,
       };
+      await this.finalizeActorLifecycle(teamId, 'success', correlationId);
+      return teamRunResult;
     } catch (error) {
       const current = await ctx.queue.getMessage(taskMessage.id);
       if (current?.status === 'pending' || current?.status === 'processing') {
@@ -1886,6 +1973,7 @@ export class Runtime {
         correlationId,
         data: { teamId, parentAgentId: initial.identity.parentAgentId, error: error instanceof Error ? error.message : String(error) },
       });
+      await this.finalizeActorLifecycle(teamId, 'failure', correlationId);
       throw error;
     }
   }
@@ -3242,7 +3330,7 @@ export class Runtime {
               failedActors: artifact.failedActors,
             },
           });
-          this.archiveEvolutionCandidateAgents(artifact.agentIds, runId, candidate.id);
+          await this.archiveEvolutionCandidateActors(artifact, runId, candidate.id, correlationId);
           return artifact;
         },
         integrate: async (selected, evaluation, execution) => {
@@ -3561,6 +3649,7 @@ export class Runtime {
           members: plans.map((plan, index) => ({ ...plan, lead: index === 0 })),
           tomAnalysis: this.tomAnalyses.get(correlationId),
           correlationId,
+          lifecycleOrigin: 'automatic_delegation',
         });
         const teamResult = await this.runTeam(team.identity.id, userInput, { correlationId });
         teamResults.push(teamResult);
@@ -3700,6 +3789,8 @@ export class Runtime {
       communicationProtocol: payload.communicationProtocol,
       reuse: { mode: payload.reuseMode ?? 'prefer_cache' },
       outputContract: payload.outputContract,
+      lifecycle: payload.lifecycle,
+      lifecycleOrigin: payload.lifecycleOrigin,
       execution: {
         requireParentSynthesis: payload.requireRootSynthesis ?? true,
         showSubagentOutput: payload.showSubagentOutput ?? false,
@@ -3942,7 +4033,11 @@ export class Runtime {
       capabilities: { tools: [...tools], skills: [...skills] },
       context: { memoryScope, communicationProtocol },
       resources: { budgetTokens: request.budgetTokens },
-      governance: { spawnPolicy },
+      governance: {
+        spawnPolicy,
+        lifecycle: request.lifecycle,
+        lifecycleOrigin: request.lifecycleOrigin,
+      },
       execution: {
         requireParentSynthesis: request.execution?.requireParentSynthesis ?? true,
         showSubagentOutput: request.execution?.showSubagentOutput ?? false,
@@ -4013,6 +4108,8 @@ export class Runtime {
       showSubagentOutput: node.execution.showSubagentOutput,
       disableRecursiveDelegation: node.execution.disableRecursiveDelegation,
       teamId: node.execution.teamId,
+      lifecycle: node.governance.lifecycle,
+      lifecycleOrigin: node.governance.lifecycleOrigin,
     };
     const correlationId = node.correlationId;
     const parentId = node.parentId;
@@ -4051,6 +4148,9 @@ export class Runtime {
     if (payload.tomLevel !== undefined && [0, 1, 2, 3].includes(payload.tomLevel)) {
       tomProfile.level = payload.tomLevel as ToMProfile['level'];
     }
+    const lifecycleOrigin = payload.lifecycleOrigin ?? this.lifecycleOriginForSource(payload.source, payload.teamId);
+    const lifecyclePolicy = payload.lifecycle
+      ?? this.inheritParentLifecyclePolicy(parentId, lifecycleOrigin);
     const agent = await this.spawnAgent({
       parentId,
       name: payload.name,
@@ -4074,6 +4174,8 @@ export class Runtime {
       cacheHits,
       nodeDefinition: node,
       teamId: payload.teamId,
+      lifecycle: lifecyclePolicy,
+      lifecycleOrigin,
     });
     if (payload.teamId) {
       const team = this.teams.addMember(payload.teamId, agent.identity.id);
@@ -4455,8 +4557,13 @@ export class Runtime {
       throw new Error('Spawn rejected: budget_request_denied');
     }
 
-    const sequence = ++this.agentSequence;
-    const id = this.createAgentId(spec.archetype, sequence);
+    const restoredSequence = Number(spec.instanceId?.match(/_(\d+)$/)?.[1] ?? 0);
+    const sequence = spec.instanceId
+      ? Math.max(restoredSequence, this.agentSequence + 1)
+      : this.agentSequence + 1;
+    this.agentSequence = Math.max(this.agentSequence, sequence);
+    const id = spec.instanceId ?? this.createAgentId(spec.archetype, sequence);
+    if (ctx.manager.getAgentById(id)) throw new Error(`Agent "${id}" already exists`);
     if (budgetAllocation?.status === 'granted') {
       this.budgetMarket?.assignRequester(budgetAllocation.id, id, 'agent');
     }
@@ -4629,6 +4736,41 @@ export class Runtime {
       this.agentFsms.set(id, fsm);
       ctx.manager.addAgent(agent);
       await ctx.manager.attachAgentToSessions(agent);
+      const lifecycleOrigin = spec.lifecycleOrigin ?? 'manual';
+      const lifecyclePolicy = this.resolveLifecyclePolicy(lifecycleOrigin, spec.lifecycle);
+      this.lifecycle.register({
+        actorId: id,
+        actorKind: 'agent',
+        origin: lifecycleOrigin,
+        parentId: spec.parentId,
+        policy: lifecyclePolicy,
+        createdAt: agent.getInfo().createdAt,
+      });
+      this.agentRestoreSpecs.set(id, {
+        parentId: spec.parentId,
+        name,
+        customRole: spec.customRole,
+        customStyle: spec.customStyle,
+        archetype: spec.archetype,
+        tomLevel: resolvedTomProfile.level,
+        description: spec.description,
+        task: spec.task,
+        tools: toolBindings.map(binding => ({ ...binding })),
+        skills: skillBindings.map(binding => ({ ...binding })),
+        memoryScope: { ...memoryScope },
+        spawnPolicy: { ...spawnPolicy },
+        budgetTokens: spec.budgetTokens,
+        systemPrompt: spec.systemPrompt,
+        outputContract: spec.outputContract,
+        teamId: spec.teamId,
+        cognitiveGapIds: [...(spec.cognitiveGapIds ?? [])],
+        existenceReason: spec.existenceReason,
+        communicationProtocol: spec.communicationProtocol,
+        tomProfile: resolvedTomProfile,
+        lifecycle: { ...lifecyclePolicy },
+        lifecycleOrigin,
+        instanceId: id,
+      });
       await ctx.memory.upsertAgentPattern({
         key: agentMemoryKey,
         patternId: spec.nodeDefinition?.reuse.targetPatternId,
@@ -4838,6 +4980,7 @@ export class Runtime {
       ctx.manager.removeAgent(name);
       this.agentBindings.delete(id);
       this.agentFsms.delete(id);
+      this.agentRestoreSpecs.delete(id);
       this.agentBudgetLimits.delete(id);
       this.releaseAgentBudget(id, 'agent_creation_failed');
       const currentRequest = await ctx.queue.getMessage(createRequestMessage.id);
@@ -4881,6 +5024,8 @@ export class Runtime {
     if (!agent) {
       throw new Error(`Agent "${agentId}" not found`);
     }
+
+    this.activateActorLifecycle(agentId, options.correlationId);
 
     if (!this.agentBudgetAllocations.has(agentId)) {
       const archetype = options.archetype ?? this.inferAgentArchetype(agent.getInfo());
@@ -5083,7 +5228,7 @@ export class Runtime {
         totalTokens: usageDelta.totalTokens,
       }, options.patternId);
 
-      return {
+      const runResult: RunAgentResult = {
         agent: agent.getInfo(),
         result: result || agent.getInfo().lastResult || '',
         usage: usageDelta,
@@ -5092,6 +5237,8 @@ export class Runtime {
         grounded: grounding.grounded,
         warnings,
       };
+      await this.finalizeActorLifecycle(agentId, 'success', options.correlationId);
+      return runResult;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       agent.addToMemory('result', `Error: ${message}`);
@@ -5114,6 +5261,7 @@ export class Runtime {
         grounded: false,
         totalTokens: 0,
       }, options.patternId);
+      await this.finalizeActorLifecycle(agentId, 'failure', options.correlationId);
       throw error;
     }
   }
@@ -5122,6 +5270,299 @@ export class Runtime {
     const ctx = this.getContext();
     return ctx.manager.listAgentInfo()
       .filter(agent => agent.identity.parentId === agentId);
+  }
+
+  getActorLifecycle(actorId?: string): ActorLifecycleRecord | ActorLifecycleRecord[] | undefined {
+    return actorId ? this.lifecycle.get(actorId) : this.lifecycle.list();
+  }
+
+  async getPersistedActors(actorKind?: ActorKind): Promise<PersistedActorSnapshot[]> {
+    return this.getContext().memory.listActorSnapshots(actorKind);
+  }
+
+  async setActorLifecycle(
+    actorId: string,
+    action: ActorLifecycleAction,
+    options: { cascade?: boolean; reason?: string; correlationId?: string } = {}
+  ): Promise<ActorLifecycleRecord> {
+    if (actorId === 'root') throw new Error('The root agent cannot be released or persisted as a derived actor');
+    const record = this.lifecycle.get(actorId);
+    if (!record) throw new Error(`Lifecycle actor "${actorId}" not found`);
+    this.assertActorLifecycleManageable(record.actorKind, actorId);
+    const decision = this.lifecycle.decide(actorId, 'manual', {
+      action,
+      correlationId: options.correlationId,
+      reason: options.reason ?? `Manual lifecycle action: ${action}.`,
+    });
+    if (options.cascade !== undefined) decision.cascade = options.cascade;
+    return this.applyActorLifecycleDecision(decision);
+  }
+
+  async restoreActor(actorId: string): Promise<AgentInfo | TeamRuntimeState> {
+    const ctx = this.getContext();
+    if (ctx.manager.getAgentById(actorId) || this.teams.get(actorId)) {
+      throw new Error(`Actor "${actorId}" is already active`);
+    }
+    const snapshot = await ctx.memory.readActorSnapshot(actorId);
+    if (!snapshot) throw new Error(`Persisted actor "${actorId}" not found`);
+    let restored: AgentInfo | TeamRuntimeState;
+    if (snapshot.actorKind === 'agent') {
+      const spec = snapshot.restore as unknown as SpawnAgentSpec;
+      restored = await this.spawnAgent({
+        ...spec,
+        instanceId: actorId,
+        lifecycle: { ...snapshot.policy },
+        lifecycleOrigin: 'restored',
+      });
+    } else {
+      const spec = snapshot.restore as unknown as SpawnTeamSpec;
+      restored = await this.spawnTeam({
+        ...spec,
+        instanceId: actorId,
+        lifecycle: { ...snapshot.policy },
+        lifecycleOrigin: 'restored',
+      });
+    }
+    await ctx.memory.deleteActorSnapshot(actorId, snapshot.actorKind);
+    this.lifecycle.markRestored(actorId);
+    this.emit({
+      type: 'actor.lifecycle.restored',
+      agentId: actorId,
+      sessionId: ctx.sessionId,
+      data: { actorId, actorKind: snapshot.actorKind, persistedAt: snapshot.persistedAt },
+    });
+    return restored;
+  }
+
+  private async finalizeActorLifecycle(
+    actorId: string,
+    outcome: ActorLifecycleOutcome,
+    correlationId?: string
+  ): Promise<ActorLifecycleRecord | undefined> {
+    const record = this.lifecycle.get(actorId);
+    if (!record) return undefined;
+    try {
+      const decision = this.lifecycle.decide(actorId, outcome, { correlationId });
+      return await this.applyActorLifecycleDecision(decision);
+    } catch (error) {
+      this.emit({
+        type: 'actor.lifecycle.failed',
+        agentId: actorId,
+        sessionId: this.getContext().sessionId,
+        correlationId,
+        data: { actorId, error: error instanceof Error ? error.message : String(error) },
+      });
+      return this.lifecycle.get(actorId);
+    }
+  }
+
+  private activateActorLifecycle(actorId: string, correlationId?: string): void {
+    const current = this.lifecycle.get(actorId);
+    if (!current || current.status === 'active') return;
+    const record = this.lifecycle.markActive(actorId);
+    this.emit({
+      type: 'actor.lifecycle.activated',
+      agentId: actorId,
+      sessionId: this.getContext().sessionId,
+      correlationId,
+      data: {
+        actorId,
+        actorKind: record.actorKind,
+        previousStatus: current.status,
+      },
+    });
+  }
+
+  private async applyActorLifecycleDecision(
+    decision: ReturnType<ActorLifecycleRegistry['decide']>
+  ): Promise<ActorLifecycleRecord> {
+    const ctx = this.getContext();
+    this.emit({
+      type: 'actor.lifecycle.decided',
+      agentId: decision.actorId,
+      sessionId: ctx.sessionId,
+      correlationId: decision.correlationId,
+      data: { ...decision },
+    });
+
+    let snapshotPath: string | undefined;
+    if (decision.action === 'persist') {
+      snapshotPath = await this.persistActorSnapshot(decision.actorId, decision.actorKind);
+    }
+
+    if (decision.action !== 'retain_session') {
+      if (decision.cascade) {
+        const children = decision.actorKind === 'agent'
+          ? [
+            ...this.getChildren(decision.actorId).map(agent => ({ id: agent.identity.id, kind: 'agent' as const })),
+            ...this.teams.list()
+              .filter(team => team.identity.parentAgentId === decision.actorId)
+              .map(team => ({ id: team.identity.id, kind: 'team' as const })),
+          ]
+          : (this.teams.get(decision.actorId)?.memberAgentIds ?? []).map(id => ({ id, kind: 'agent' as const }));
+        for (const child of children) {
+          const childRecord = this.lifecycle.get(child.id);
+          if (!childRecord || childRecord.status === 'released' || childRecord.status === 'persisted') continue;
+          const childAction = decision.actorKind === 'team' && decision.action === 'persist'
+            ? 'release'
+            : decision.action;
+          const childDecision = this.lifecycle.decide(child.id, decision.outcome, {
+            action: childAction,
+            correlationId: decision.correlationId,
+            reason: `${childAction === 'persist' ? 'Persisted' : 'Released'} with parent ${decision.actorId}.`,
+          });
+          childDecision.cascade = true;
+          await this.applyActorLifecycleDecision(childDecision);
+        }
+      }
+      if (decision.actorKind === 'agent') await this.releaseAgentRuntime(decision.actorId);
+      else this.releaseTeamRuntime(decision.actorId);
+    }
+
+    const record = this.lifecycle.markApplied(decision.actorId, decision, snapshotPath);
+    this.emit({
+      type: 'actor.lifecycle.applied',
+      agentId: decision.actorId,
+      sessionId: ctx.sessionId,
+      correlationId: decision.correlationId,
+      data: {
+        actorId: decision.actorId,
+        actorKind: decision.actorKind,
+        action: decision.action,
+        status: record.status,
+        snapshotPath,
+      },
+    });
+    return record;
+  }
+
+  private async persistActorSnapshot(actorId: string, actorKind: ActorKind): Promise<string> {
+    const ctx = this.getContext();
+    const record = this.lifecycle.get(actorId);
+    if (!record) throw new Error(`Lifecycle actor "${actorId}" not found`);
+    const snapshot: PersistedActorSnapshot = {
+      version: 1,
+      actorId,
+      actorKind,
+      status: 'dormant',
+      origin: record.origin,
+      parentId: record.parentId,
+      sessionId: ctx.sessionId,
+      persistedAt: new Date().toISOString(),
+      policy: { ...record.policy },
+      restore: actorKind === 'agent'
+        ? { ...(this.agentRestoreSpecs.get(actorId) ?? {}) }
+        : { ...(this.teamRestoreSpecs.get(actorId) ?? {}) },
+    };
+    if (actorKind === 'agent') {
+      const agent = ctx.manager.getAgentById(actorId);
+      if (!agent) throw new Error(`Active agent "${actorId}" not found`);
+      snapshot.agent = agent.getInfo();
+    } else {
+      const team = this.teams.get(actorId);
+      if (!team) throw new Error(`Active team "${actorId}" not found`);
+      snapshot.team = team;
+    }
+    const snapshotPath = await ctx.memory.writeActorSnapshot(snapshot);
+    this.emit({
+      type: 'actor.lifecycle.persisted',
+      agentId: actorId,
+      sessionId: ctx.sessionId,
+      data: { actorId, actorKind, snapshotPath },
+    });
+    return snapshotPath;
+  }
+
+  private async releaseAgentRuntime(agentId: string): Promise<void> {
+    const ctx = this.getContext();
+    const agent = ctx.manager.getAgentById(agentId);
+    if (!agent || agentId === 'root') return;
+    const info = agent.getInfo();
+    this.archivedAgentUsage.set(agentId, this.sumUsage([
+      ...(this.archivedAgentUsage.has(agentId) ? [this.archivedAgentUsage.get(agentId)!] : []),
+      this.toTokenUsage(info.usage),
+    ]));
+    this.archivedAgentInfo.set(agentId, info);
+    for (const sessionId of ctx.manager.listSessions()) await agent.cleanup(sessionId);
+    ctx.manager.removeAgent(info.name);
+    this.agentBindings.delete(agentId);
+    this.agentFsms.delete(agentId);
+    this.agentBudgetAllocations.delete(agentId);
+    this.agentBudgetLimits.delete(agentId);
+    this.toolCallCounts.delete(agentId);
+    this.agentRestoreSpecs.delete(agentId);
+  }
+
+  private releaseTeamRuntime(teamId: string): void {
+    const team = this.teams.remove(teamId);
+    if (!team) return;
+    this.archivedTeamUsage.set(teamId, this.sumUsage([
+      ...(this.archivedTeamUsage.has(teamId) ? [this.archivedTeamUsage.get(teamId)!] : []),
+      team.tokenUsage,
+    ]));
+    this.archivedTeamSynthesisUsage.set(teamId, this.sumUsage([
+      ...(this.archivedTeamSynthesisUsage.has(teamId) ? [this.archivedTeamSynthesisUsage.get(teamId)!] : []),
+      team.synthesisUsage,
+    ]));
+    this.archivedTeamStates.set(teamId, team);
+    this.teamMemberPlans.delete(teamId);
+    this.teamRestoreSpecs.delete(teamId);
+  }
+
+  private assertActorLifecycleManageable(actorKind: ActorKind, actorId: string): void {
+    if (actorKind === 'agent') {
+      const state = this.getContext().manager.getAgentById(actorId)?.getInfo().state;
+      if (!state) throw new Error(`Active agent "${actorId}" not found`);
+      if (state === 'thinking' || state === 'calling_tool' || state === 'synthesizing' || state === 'waiting') {
+        throw new Error(`Agent "${actorId}" cannot change lifecycle while state is ${state}`);
+      }
+      return;
+    }
+    const status = this.teams.get(actorId)?.status;
+    if (!status) throw new Error(`Active team "${actorId}" not found`);
+    if (status === 'running' || status === 'waiting' || status === 'synthesizing') {
+      throw new Error(`Team "${actorId}" cannot change lifecycle while status is ${status}`);
+    }
+  }
+
+  private resolveLifecyclePolicy(
+    origin: ActorLifecycleOrigin,
+    override?: Partial<ActorLifecyclePolicy>
+  ): ActorLifecyclePolicy {
+    const defaults = this.workspaceRuntimeConfig?.lifecycle;
+    const mode: ActorLifecycleMode = origin === 'automatic_delegation'
+      ? defaults?.automaticDelegation ?? 'release'
+      : origin === 'team_member'
+        ? defaults?.teamMember ?? 'retain_session'
+        : origin === 'evolution'
+          ? defaults?.evolutionCandidate ?? 'release'
+          : defaults?.manual ?? 'retain_session';
+    return {
+      mode: override?.mode ?? mode,
+      retainOnFailure: override?.retainOnFailure ?? defaults?.retainFailures ?? true,
+      cascade: override?.cascade ?? defaults?.cascade ?? true,
+    };
+  }
+
+  private lifecycleOriginForSource(source?: string, teamId?: string): ActorLifecycleOrigin {
+    if (teamId) return 'team_member';
+    if (source === 'cli' || source === 'server' || !source) return 'manual';
+    if (source.startsWith('evo')) return 'evolution';
+    return 'automatic_delegation';
+  }
+
+  private inheritParentLifecyclePolicy(
+    parentId: string,
+    origin: ActorLifecycleOrigin
+  ): Partial<ActorLifecyclePolicy> | undefined {
+    if (origin !== 'automatic_delegation' || parentId === 'root') return undefined;
+    const parent = this.lifecycle.get(parentId);
+    if (!parent) return undefined;
+    return {
+      mode: parent.policy.mode,
+      retainOnFailure: parent.policy.retainOnFailure,
+      cascade: parent.policy.cascade,
+    };
   }
 
   getParent(agentId: string): AgentInfo | undefined {
@@ -6808,6 +7249,8 @@ Produce the final response to the user as Roy, the root agent.`;
         cacheHits: candidate.lineage.parentPatternIds,
         cognitiveGapIds: member.tomProfile.uncertainty.map((_, index) => `${member.id}_gap_${index + 1}`),
         existenceReason: candidate.rationale,
+        lifecycle: { mode: 'retain_session' },
+        lifecycleOrigin: 'evolution',
       });
       return { kind: 'agent', actorId: agent.identity.id };
     }
@@ -6838,6 +7281,8 @@ Produce the final response to the user as Roy, the root agent.`;
         maxConcurrency: Math.min(3, members.length),
         minimumSuccessfulMembers: 1,
       },
+      lifecycle: { mode: 'retain_session' },
+      lifecycleOrigin: 'evolution',
     });
     return { kind: 'team', actorId: team.identity.id };
   }
@@ -6932,22 +7377,36 @@ Produce the final response to the user as Roy, the root agent.`;
     };
   }
 
-  private archiveEvolutionCandidateAgents(agentIds: string[], runId: string, candidateId: string): void {
+  private async archiveEvolutionCandidateActors(
+    artifact: EvolutionExecutionArtifact,
+    runId: string,
+    candidateId: string,
+    correlationId: string
+  ): Promise<void> {
     const ctx = this.getContext();
-    for (const agentId of agentIds) {
-      const agent = ctx.manager.getAgentById(agentId);
-      if (!agent || agentId === 'root') continue;
-      const info = agent.getInfo();
-      this.archivedAgentUsage.set(agentId, this.toTokenUsage(info.usage));
-      ctx.manager.removeAgent(info.name);
-      this.agentBindings.delete(agentId);
-      this.agentFsms.delete(agentId);
-      this.agentBudgetAllocations.delete(agentId);
-      this.agentBudgetLimits.delete(agentId);
-      this.toolCallCounts.delete(agentId);
+    const actorIds = [...artifact.teamIds, ...artifact.agentIds];
+    for (const actorId of actorIds) {
+      const lifecycle = this.lifecycle.get(actorId);
+      if (!lifecycle || lifecycle.status === 'released' || lifecycle.status === 'persisted') continue;
+      const record = await this.setActorLifecycle(actorId, 'release', {
+        cascade: true,
+        correlationId,
+        reason: `Evolution candidate ${candidateId} execution completed; runtime actor is no longer required.`,
+      });
       this.emit({
-        type: 'evo.candidate.actor.archived', agentId, sessionId: ctx.sessionId,
-        data: { runId, candidateId, name: info.identity.name, totalTokens: info.usage.totalTokens },
+        type: 'evo.candidate.actor.archived',
+        agentId: actorId,
+        sessionId: ctx.sessionId,
+        correlationId,
+        data: {
+          runId,
+          candidateId,
+          actorKind: lifecycle.actorKind,
+          lifecycleStatus: record.status,
+          totalTokens: lifecycle.actorKind === 'team'
+            ? artifact.usage.totalTokens
+            : artifact.agentIds.includes(actorId) ? artifact.usage.totalTokens : 0,
+        },
       });
     }
   }
@@ -7470,6 +7929,7 @@ Produce the final response to the user as Roy, the root agent.`;
         members: plans.map((plan, index) => ({ ...plan, lead: index === 0 })),
         tomAnalysis: this.tomAnalyses.get(correlationId),
         correlationId,
+        lifecycleOrigin: 'automatic_delegation',
       });
       teamResult = await this.runTeam(team.identity.id, task, { correlationId });
       childResults.push(...teamResult.memberExecutions);

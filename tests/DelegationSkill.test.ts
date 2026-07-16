@@ -86,6 +86,7 @@ describe('delegate_to_subagent skill', () => {
           task: 'Inspect the project structure',
           parentId: 'root',
           requireRootSynthesis: true,
+          lifecycle: { mode: 'retain_session' },
         },
       },
       {
@@ -108,6 +109,7 @@ describe('delegate_to_subagent skill', () => {
     expect(result.node.capabilities.tools).toEqual(['fs.list', 'fs.read']);
     expect(result.node.capabilities.skills).toEqual(['use_tool_when_needed', 'delegate_to_subagent']);
     expect(result.node.assignment.outputContract.groundingRequired).toBe(true);
+    expect(result.node.governance.lifecycle).toEqual({ mode: 'retain_session' });
     expect(result.agentResult.toolCalls.map((call: any) => call.toolName)).toContain('fs.list');
     expect(result.rootSynthesis).toBe('Roy synthesized the researcher result.');
     expect(result.tokenUsage.root.totalTokens).toBeGreaterThan(0);

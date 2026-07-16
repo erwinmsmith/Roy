@@ -45,7 +45,10 @@ export class TeamRegistry {
 
   create(spec: CreateTeamSpec): TeamRuntimeState {
     const now = Date.now();
-    const id = `team_${String(++this.sequence).padStart(3, '0')}`;
+    const id = spec.id ?? `team_${String(++this.sequence).padStart(3, '0')}`;
+    if (this.teams.has(id)) throw new Error(`Team "${id}" already exists`);
+    const restoredSequence = Number(id.match(/^team_(\d+)$/)?.[1] ?? 0);
+    this.sequence = Math.max(this.sequence, restoredSequence);
     const parentAgentId = spec.parentAgentId;
     const description = spec.description;
     if (!parentAgentId?.trim()) throw new Error('Team parentAgentId is required');
@@ -80,7 +83,7 @@ export class TeamRegistry {
       executionPolicy: normalizeTeamExecutionPolicy(spec.executionPolicy),
       task: spec.task,
       correlationId: spec.correlationId,
-      createdAt: now,
+      createdAt: spec.createdAt ?? now,
       updatedAt: now,
     };
     this.teams.set(id, team);
@@ -179,6 +182,13 @@ export class TeamRegistry {
 
   list(): TeamRuntimeState[] {
     return [...this.teams.values()].map(team => this.clone(team));
+  }
+
+  remove(teamId: string): TeamRuntimeState | undefined {
+    const team = this.teams.get(teamId);
+    if (!team) return undefined;
+    this.teams.delete(teamId);
+    return this.clone(team);
   }
 
   clear(): void {

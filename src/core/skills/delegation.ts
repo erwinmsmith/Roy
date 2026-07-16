@@ -29,6 +29,7 @@ export interface DelegateToSubagentParams {
   outputContract?: AgentNodeOutputContract;
   requireRootSynthesis?: boolean;
   showSubagentOutput?: boolean;
+  lifecycle?: AgentComputeNodeRequest['lifecycle'];
 }
 
 export interface DelegateToSubagentResult {
@@ -80,6 +81,14 @@ export class DelegateToSubagentSkill implements Skill {
     }
     if (params.name !== undefined && typeof params.name !== 'string') {
       errors.push('name must be a string when provided');
+    }
+    const lifecycleMode = params.lifecycle?.mode;
+    if (lifecycleMode !== undefined
+      && lifecycleMode !== 'adaptive'
+      && lifecycleMode !== 'release'
+      && lifecycleMode !== 'retain_session'
+      && lifecycleMode !== 'persist') {
+      errors.push('lifecycle.mode must be adaptive, release, retain_session, or persist');
     }
 
     return {
@@ -151,6 +160,7 @@ export class DelegateToSubagentSkill implements Skill {
       existenceReason: params.existenceReason,
       reuse: { mode: params.reuseMode ?? 'prefer_cache' },
       outputContract: params.outputContract,
+      lifecycle: params.lifecycle,
       execution: {
         requireParentSynthesis: params.requireRootSynthesis ?? true,
         showSubagentOutput: params.showSubagentOutput ?? false,

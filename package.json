@@ -38,6 +38,10 @@
       "types": "./dist/core/evolution/index.d.ts",
       "import": "./dist/core/evolution/index.js"
     },
+    "./lifecycle": {
+      "types": "./dist/core/lifecycle/index.d.ts",
+      "import": "./dist/core/lifecycle/index.js"
+    },
     "./llm": {
       "types": "./dist/core/llm/index.d.ts",
       "import": "./dist/core/llm/index.js"

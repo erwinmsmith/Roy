@@ -324,6 +324,39 @@ async function main(): Promise<void> {
     }
   });
 
+  app.get('/v1/lifecycle', async (_req, res) => {
+    res.json({
+      actors: runtime.getActorLifecycle(),
+      persisted: await runtime.getPersistedActors(),
+    });
+  });
+
+  app.post('/v1/lifecycle/:id', async (req, res) => {
+    const action = req.body?.action;
+    if (action !== 'release' && action !== 'retain_session' && action !== 'persist') {
+      res.status(400).json({ error: 'Expected body { "action": "release" | "retain_session" | "persist", "cascade"?: boolean }' });
+      return;
+    }
+    try {
+      res.json(await runtime.setActorLifecycle(req.params.id, action, {
+        cascade: typeof req.body?.cascade === 'boolean' ? req.body.cascade : undefined,
+        reason: typeof req.body?.reason === 'string' ? req.body.reason : undefined,
+      }));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      res.status(message.includes('not found') ? 404 : 400).json({ error: message });
+    }
+  });
+
+  app.post('/v1/lifecycle/:id/restore', async (req, res) => {
+    try {
+      res.status(201).json(await runtime.restoreActor(req.params.id));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      res.status(message.includes('not found') ? 404 : 400).json({ error: message });
+    }
+  });
+
   app.get('/v1/budget', (req, res) => {
     res.json(runtime.getBudgetState());
   });

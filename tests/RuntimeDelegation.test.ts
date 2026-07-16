@@ -141,8 +141,13 @@ describe('Runtime root-controlled delegation', () => {
     expect(result.finalResponse).toBe('Final synthesis from Researcher-1 and Critic-2.');
 
     const tree = runtime.getAgentTree();
-    expect(tree.children).toHaveLength(3);
-    expect(tree.children.map(child => child.agent.identity.parentId)).toEqual(['root', 'root', 'root']);
+    expect(tree.children).toHaveLength(0);
+    for (const item of result.subagents) {
+      expect(runtime.getActorLifecycle(item.agent.identity.id)).toMatchObject({
+        status: 'released',
+        lastDecision: { action: 'release' },
+      });
+    }
 
     const eventTypes = runtime.getEvents().map(event => event.type);
     expect(eventTypes).toContain('delegation.decision');
@@ -334,7 +339,8 @@ describe('Runtime root-controlled delegation', () => {
 
     expect(result.decision.action).toBe('spawn_subagents');
     expect(result.subagents).toHaveLength(1);
-    expect(runtime.getAgentTree().children).toHaveLength(1);
+    expect(runtime.getAgentTree().children).toHaveLength(0);
+    expect(runtime.getActorLifecycle(result.subagents[0].agent.identity.id)).toMatchObject({ status: 'released' });
     const eventTypes = runtime.getEvents().map(event => event.type);
     expect(eventTypes).toContain('delegation.candidate.generated');
     expect(eventTypes).toContain('delegation.candidate.selected');

@@ -7,6 +7,7 @@ import type {
   SubAgentArchetype,
   TokenUsage,
 } from '../runtime/Runtime.js';
+import type { ActorLifecycleOrigin, ActorLifecyclePolicy } from '../lifecycle/index.js';
 
 export type AgentNodeReuseMode = 'prefer_cache' | 'require_cache' | 'fresh' | 'mutate_cache';
 export type AgentNodeCreationMode = 'generated' | 'cache_hit' | 'custom' | 'mutated_from_cache';
@@ -48,6 +49,8 @@ export interface AgentComputeNodeRequest {
     teamId?: string;
   };
   outputContract?: AgentNodeOutputContract;
+  lifecycle?: Partial<ActorLifecyclePolicy>;
+  lifecycleOrigin?: ActorLifecycleOrigin;
 }
 
 export interface AgentCreationInvocation {
@@ -93,6 +96,8 @@ export interface AgentComputeNodeDefinition {
   };
   governance: {
     spawnPolicy: AgentSpawnPolicy;
+    lifecycle?: Partial<ActorLifecyclePolicy>;
+    lifecycleOrigin?: ActorLifecycleOrigin;
   };
   execution: {
     requireParentSynthesis: boolean;

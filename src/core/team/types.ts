@@ -56,6 +56,7 @@ export interface TeamRuntimeState {
 }
 
 export interface CreateTeamSpec {
+  id?: string;
   name: string;
   parentAgentId: string;
   description: string;
@@ -66,4 +67,5 @@ export interface CreateTeamSpec {
   task?: string;
   correlationId?: string;
   executionPolicy?: Partial<TeamExecutionPolicy>;
+  createdAt?: number;
 }

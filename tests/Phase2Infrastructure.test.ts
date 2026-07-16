@@ -181,14 +181,19 @@ describe('Phase 2 engineering infrastructure', () => {
     const result = await runtime.handleUserTurn('Analyze this repo and find architectural risks');
     expect(result.subagents).toHaveLength(3);
     expect(result.teams).toHaveLength(1);
+    const completedTeam = result.teams[0].team;
     const teams = runtime.getTeams();
-    expect(teams).toHaveLength(1);
-    expect(teams[0].status).toBe('done');
-    expect(teams[0].fsmState).toBe('S_team_done');
-    expect(teams[0].identity.name).toBe('AnalysisTeam');
-    expect(teams[0].memberAgentIds).toHaveLength(3);
-    expect(teams[0].identity.tomProfile.level).toBe(2);
-    expect(teams[0].identity.tomProfile.cognitiveGaps.length).toBeGreaterThan(0);
+    expect(teams).toHaveLength(0);
+    expect(completedTeam.status).toBe('done');
+    expect(completedTeam.fsmState).toBe('S_team_done');
+    expect(completedTeam.identity.name).toBe('AnalysisTeam');
+    expect(completedTeam.memberAgentIds).toHaveLength(3);
+    expect(completedTeam.identity.tomProfile.level).toBe(2);
+    expect(completedTeam.identity.tomProfile.cognitiveGaps.length).toBeGreaterThan(0);
+    expect(runtime.getActorLifecycle(completedTeam.identity.id)).toMatchObject({
+      status: 'released',
+      lastDecision: { action: 'release' },
+    });
     const events = runtime.getEvents().map(event => event.type);
     expect(events).toContain('team.created');
     expect(events).toContain('team.completed');
@@ -214,11 +219,11 @@ describe('Phase 2 engineering infrastructure', () => {
     const messages = await runtime.getMessages({ correlationId: result.correlationId });
     expect(messages.map(message => message.kind)).toContain('team.task');
     expect(messages.map(message => message.kind)).toContain('team.result');
-    expect(messages.filter(message => message.kind === 'agent.task' && message.from === teams[0].identity.id)).toHaveLength(3);
-    expect(messages.filter(message => message.kind === 'agent.result' && message.to === teams[0].identity.id)).toHaveLength(3);
+    expect(messages.filter(message => message.kind === 'agent.task' && message.from === completedTeam.identity.id)).toHaveLength(3);
+    expect(messages.filter(message => message.kind === 'agent.result' && message.to === completedTeam.identity.id)).toHaveLength(3);
     expect(messages.map(message => message.kind)).toContain('evo.select');
     expect(await runtime.getEvolutionHistory()).toHaveLength(1);
-    expect(result.usage.teamSynthesis[teams[0].identity.id].totalTokens).toBeGreaterThan(0);
+    expect(result.usage.teamSynthesis[completedTeam.identity.id].totalTokens).toBeGreaterThan(0);
     await runtime.shutdown();
   });
 

@@ -32,6 +32,41 @@ Roy [root]
 
 Each parent owns its direct children and synthesizes their results before returning a result upward.
 
+## Derived Actor Lifecycle
+
+Agent/team definitions, runtime instances, and persisted actors are separate resources:
+
+- agent/team patterns preserve reusable definitions, prompts, capabilities, and topology
+- retained instances remain addressable only for the current runtime session
+- persisted actors become dormant workspace snapshots and can be restored with the same actor ID
+- released instances are removed from active registries while their usage, events, messages, sessions, and patterns remain observable
+
+Every derived actor receives a parent-governed lifecycle policy. Manual actors default to `retain_session`; one-shot root-controlled delegation defaults to `release`; team members remain alive until the team finishes; evolution candidates remain alive through evaluation and are then released. A retained parent passes its retention policy to recursively delegated children, so the execution tree cannot disappear beneath a still-live parent.
+
+The completion decision is emitted as `actor.lifecycle.decided` and applied as `actor.lifecycle.applied`. Reusing a retained actor emits `actor.lifecycle.activated` before work resumes. Failed actors are retained by default for diagnosis. Explicit policy can select `release`, `retain_session`, or `persist`, with optional cascading to descendants. Persisting a team stores its composition and member plans; completed member instances are released and recreated when the team runs again.
+
+```text
+/lifecycle
+/lifecycle persist agent_researcher_001
+/lifecycle release team_001
+/lifecycle restore agent_researcher_001
+```
+
+HTTP uses `GET /v1/lifecycle`, `POST /v1/lifecycle/:id`, and `POST /v1/lifecycle/:id/restore`. Dormant snapshots are stored under `.roy/actors/agents/` and `.roy/actors/teams/`.
+
+```json
+{
+  "lifecycle": {
+    "manual": "retain_session",
+    "automaticDelegation": "release",
+    "teamMember": "retain_session",
+    "evolutionCandidate": "release",
+    "retainFailures": true,
+    "cascade": true
+  }
+}
+```
+
 When a delegation needs multiple cooperating actors, the runtime creates a formal subteam rather than treating the agents as a flat list:
 
 ```text
@@ -91,7 +126,7 @@ Workspace policy is stored in `.roy/config.json`:
 }
 ```
 
-Existing workspace configs are migrated to schema version 5 without discarding user overrides.
+Existing workspace configs are migrated to schema version 6 without discarding user overrides.
 
 ## Core Architecture
 
@@ -105,6 +140,7 @@ src/core/
   tom/          Cognitive-gap analysis, ToM profiles, and coverage evaluation
   communication/ Replaceable message protocols and multi-party trace delivery
   evolution/    Team-first genomes, lifecycle FSM, operators, evaluation, and selection
+  lifecycle/    Derived actor retention, release, persistence, and restoration policy
   budget/       Token allocation market and settlement
   team/         Formal subteam actor registry
   queue/        Runtime message queue and scheduler
@@ -179,6 +215,7 @@ Roy initializes a project-local `.roy/` workspace:
 
 ```text
 .roy/
+  actors/       Dormant, restorable agent and team instance snapshots
   public/       Shared project, context, decision, and constraint memory
   agents/       Private identity, prompt, context, memory, state, and sessions
   teams/        Team memory and topology
@@ -320,7 +357,7 @@ const runtime = new Runtime();
 await runtime.initialize({ sessionId: 'my-session', workspaceCwd: process.cwd() });
 ```
 
-The package also exposes `roy/runtime`, `roy/team`, `roy/tom`, `roy/communication`, `roy/queue`, and `roy/memory` subpaths. Installed binaries are `roy` and `roy-server`.
+The package also exposes `roy/runtime`, `roy/team`, `roy/tom`, `roy/communication`, `roy/lifecycle`, `roy/queue`, and `roy/memory` subpaths. Installed binaries are `roy` and `roy-server`.
 
 ## CLI Commands
 
@@ -328,6 +365,9 @@ The package also exposes `roy/runtime`, `roy/team`, `roy/tom`, `roy/communicatio
 /status
 /agents --tree --tom
 /agents archetypes
+/lifecycle
+/lifecycle retain|persist|release <actor-id>
+/lifecycle restore <actor-id>
 /agents policy <agentId>
 /spawn researcher "Inspect the project structure"
 /spawn researcher --protocol structured "Inspect the project structure"

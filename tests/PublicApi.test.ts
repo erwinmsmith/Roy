@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  ActorLifecycleRegistry,
   BudgetMarket,
   EvolutionLifecycleEngine,
   Runtime,
@@ -12,6 +13,7 @@ import {
 describe('public package API', () => {
   it('exports the runtime, team policy, budget, and memory entry points', () => {
     expect(Runtime).toBeTypeOf('function');
+    expect(ActorLifecycleRegistry).toBeTypeOf('function');
     expect(TeamRegistry).toBeTypeOf('function');
     expect(ToMDelegationPlanner).toBeTypeOf('function');
     expect(WorkspaceMemoryManager).toBeTypeOf('function');

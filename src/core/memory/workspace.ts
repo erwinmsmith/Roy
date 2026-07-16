@@ -3,6 +3,11 @@ import path from 'node:path';
 import type { ToMProfile, ToMTaskAnalysis } from '../tom/index.js';
 import type { RuntimeEvent } from '../runtime/Runtime.js';
 import type { EvolutionPattern, EvolutionRunOptions } from '../evolution/index.js';
+import type {
+  ActorKind,
+  LifecyclePolicyDefaults,
+  PersistedActorSnapshot,
+} from '../lifecycle/index.js';
 
 const WORKSPACE_FILE_LOCKS = new Map<string, Promise<void>>();
 
@@ -211,6 +216,7 @@ export interface WorkspaceRuntimeConfig {
       overrides: Record<string, 'auto' | 'ask' | 'deny'>;
     };
   };
+  lifecycle: LifecyclePolicyDefaults;
   teams: {
     enabled: boolean;
     createForMultipleAgents: boolean;
@@ -453,7 +459,7 @@ Role-specific terms are recorded here.
 };
 
 const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
-  version: 5,
+  version: 6,
   traceEvents: true,
   memoryUpdates: 'suggest',
   delegation: {
@@ -545,6 +551,14 @@ const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
       overrides: {},
     },
   },
+  lifecycle: {
+    manual: 'retain_session',
+    automaticDelegation: 'release',
+    teamMember: 'retain_session',
+    evolutionCandidate: 'release',
+    retainFailures: true,
+    cascade: true,
+  },
   teams: {
     enabled: true,
     createForMultipleAgents: true,
@@ -590,6 +604,8 @@ export class WorkspaceMemoryManager {
     const cachePath = path.join(this.rootPath, 'cache');
     const sessionsPath = path.join(this.rootPath, 'sessions');
     const queuePath = path.join(this.rootPath, 'queue');
+    const actorAgentsPath = path.join(this.rootPath, 'actors', 'agents');
+    const actorTeamsPath = path.join(this.rootPath, 'actors', 'teams');
     this.sessionId = sessionId;
 
     await Promise.all([
@@ -600,6 +616,8 @@ export class WorkspaceMemoryManager {
       mkdir(cachePath, { recursive: true }),
       mkdir(sessionsPath, { recursive: true }),
       mkdir(queuePath, { recursive: true }),
+      mkdir(actorAgentsPath, { recursive: true }),
+      mkdir(actorTeamsPath, { recursive: true }),
     ]);
 
     for (const [fileName, content] of Object.entries(createPublicMemoryTemplates(cwd))) {
@@ -635,6 +653,7 @@ export class WorkspaceMemoryManager {
         traces: 'traces/',
         cache: 'cache/',
         queue: 'queue/',
+        actors: 'actors/',
       }, null, 2) + '\n'
     );
 
@@ -811,6 +830,56 @@ Keep this agent identity separate from the model provider identity.
       topologyPath,
       JSON.stringify(topology, null, 2) + '\n'
     ));
+  }
+
+  async writeActorSnapshot(snapshot: PersistedActorSnapshot): Promise<string> {
+    const directory = snapshot.actorKind === 'agent' ? 'agents' : 'teams';
+    const filePath = path.join(this.rootPath, 'actors', directory, `${this.safeKey(snapshot.actorId)}.json`);
+    await mkdir(path.dirname(filePath), { recursive: true });
+    await this.withFileLock(filePath, () => this.writeAtomic(filePath, JSON.stringify(snapshot, null, 2) + '\n'));
+    return path.relative(path.dirname(this.rootPath), filePath);
+  }
+
+  async readActorSnapshot(actorId: string, actorKind?: ActorKind): Promise<PersistedActorSnapshot | undefined> {
+    const kinds: ActorKind[] = actorKind ? [actorKind] : ['agent', 'team'];
+    for (const kind of kinds) {
+      const directory = kind === 'agent' ? 'agents' : 'teams';
+      const filePath = path.join(this.rootPath, 'actors', directory, `${this.safeKey(actorId)}.json`);
+      const snapshot = await this.readJson<PersistedActorSnapshot | null>(filePath, null);
+      if (snapshot) return snapshot;
+    }
+    return undefined;
+  }
+
+  async listActorSnapshots(actorKind?: ActorKind): Promise<PersistedActorSnapshot[]> {
+    const kinds: ActorKind[] = actorKind ? [actorKind] : ['agent', 'team'];
+    const snapshots: PersistedActorSnapshot[] = [];
+    for (const kind of kinds) {
+      const directory = path.join(this.rootPath, 'actors', kind === 'agent' ? 'agents' : 'teams');
+      let files: string[];
+      try {
+        files = await readdir(directory);
+      } catch {
+        continue;
+      }
+      for (const fileName of files.filter(file => file.endsWith('.json')).sort()) {
+        const snapshot = await this.readJson<PersistedActorSnapshot | null>(path.join(directory, fileName), null);
+        if (snapshot) snapshots.push(snapshot);
+      }
+    }
+    return snapshots.sort((a, b) => b.persistedAt.localeCompare(a.persistedAt));
+  }
+
+  async deleteActorSnapshot(actorId: string, actorKind: ActorKind): Promise<boolean> {
+    const directory = actorKind === 'agent' ? 'agents' : 'teams';
+    const filePath = path.join(this.rootPath, 'actors', directory, `${this.safeKey(actorId)}.json`);
+    try {
+      await rm(filePath);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw error;
+    }
   }
 
   async appendTeamSession(teamKey: string, record: Record<string, unknown>): Promise<void> {
