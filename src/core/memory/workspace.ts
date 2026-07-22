@@ -2,6 +2,7 @@ import { appendFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } fro
 import path from 'node:path';
 import type { ToMProfile, ToMTaskAnalysis } from '../tom/index.js';
 import type { RuntimeEvent } from '../runtime/Runtime.js';
+import type { RootExecutionTreeState } from '../runtime/executionTree.js';
 import type { EvolutionPattern, EvolutionRunOptions } from '../evolution/index.js';
 import type {
   ActorKind,
@@ -172,6 +173,9 @@ export interface WorkspaceRuntimeConfig {
       maxStepsPerTurn: number;
       maxDelegationRounds: number;
       reassessAfterDelegation: boolean;
+      maxWallClockMs: number;
+      maxStalledIterations: number;
+      persistEveryStep: boolean;
     };
     candidateScoring: {
       enabledScorers: Array<'heuristic' | 'cost' | 'tom' | 'cache_evolution' | 'llm'>;
@@ -465,7 +469,7 @@ Role-specific terms are recorded here.
 };
 
 const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
-  version: 7,
+  version: 8,
   traceEvents: true,
   memoryUpdates: 'suggest',
   delegation: {
@@ -478,9 +482,12 @@ const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
     budgetAware: true,
     rootSteps: {
       enabled: true,
-      maxStepsPerTurn: 4,
-      maxDelegationRounds: 3,
+      maxStepsPerTurn: 12,
+      maxDelegationRounds: 8,
       reassessAfterDelegation: true,
+      maxWallClockMs: 15 * 60_000,
+      maxStalledIterations: 2,
+      persistEveryStep: true,
     },
     candidateScoring: {
       enabledScorers: ['heuristic', 'cost', 'tom', 'cache_evolution', 'llm'],
@@ -613,6 +620,7 @@ export class WorkspaceMemoryManager {
     const agentsRoyPath = path.join(this.rootPath, 'agents', 'roy');
     const teamsPath = path.join(this.rootPath, 'teams');
     const tracesPath = path.join(this.rootPath, 'traces');
+    const executionTreesPath = path.join(this.rootPath, 'execution-trees');
     const cachePath = path.join(this.rootPath, 'cache');
     const sessionsPath = path.join(this.rootPath, 'sessions');
     const queuePath = path.join(this.rootPath, 'queue');
@@ -625,6 +633,7 @@ export class WorkspaceMemoryManager {
       mkdir(agentsRoyPath, { recursive: true }),
       mkdir(teamsPath, { recursive: true }),
       mkdir(tracesPath, { recursive: true }),
+      mkdir(executionTreesPath, { recursive: true }),
       mkdir(cachePath, { recursive: true }),
       mkdir(sessionsPath, { recursive: true }),
       mkdir(queuePath, { recursive: true }),
@@ -663,6 +672,7 @@ export class WorkspaceMemoryManager {
         agents: 'agents/',
         teams: 'teams/',
         traces: 'traces/',
+        executionTrees: 'execution-trees/',
         cache: 'cache/',
         queue: 'queue/',
         actors: 'actors/',
@@ -726,6 +736,101 @@ export class WorkspaceMemoryManager {
   async writeTrace(event: RuntimeEvent): Promise<void> {
     if (!this.initialized || !this.tracePath) return;
     await this.appendLocked(this.tracePath, JSON.stringify(event) + '\n');
+  }
+
+  async writeExecutionTree(tree: RootExecutionTreeState): Promise<string> {
+    if (!this.initialized) throw new Error('Workspace memory is not initialized');
+    const sessionPath = path.join(this.rootPath, 'execution-trees', this.safeKey(tree.sessionId));
+    const filePath = path.join(sessionPath, `${this.safeKey(tree.correlationId)}.json`);
+    await mkdir(sessionPath, { recursive: true });
+    await this.withFileLock(filePath, () => this.writeAtomic(filePath, JSON.stringify(tree, null, 2) + '\n'));
+    await this.withFileLock(
+      path.join(this.rootPath, 'execution-trees', 'latest.json'),
+      () => this.writeAtomic(
+        path.join(this.rootPath, 'execution-trees', 'latest.json'),
+        JSON.stringify({
+          correlationId: tree.correlationId,
+          sessionId: tree.sessionId,
+          path: path.relative(this.rootPath, filePath),
+          status: tree.status,
+          currentStep: tree.currentStep,
+          updatedAt: tree.updatedAt,
+        }, null, 2) + '\n'
+      )
+    );
+    return filePath;
+  }
+
+  async readExecutionTree(correlationId: string, sessionId?: string): Promise<RootExecutionTreeState | undefined> {
+    if (sessionId) {
+      return this.readJson<RootExecutionTreeState | undefined>(
+        path.join(this.rootPath, 'execution-trees', this.safeKey(sessionId), `${this.safeKey(correlationId)}.json`),
+        undefined
+      );
+    }
+    const records = await this.listExecutionTrees();
+    const selected = records.find(record => record.correlationId === correlationId);
+    return selected
+      ? this.readJson<RootExecutionTreeState | undefined>(selected.path, undefined)
+      : undefined;
+  }
+
+  async readLatestExecutionTree(): Promise<RootExecutionTreeState | undefined> {
+    const latest = await this.readJson<{ path?: string }>(
+      path.join(this.rootPath, 'execution-trees', 'latest.json'),
+      {}
+    );
+    return latest.path
+      ? this.readJson<RootExecutionTreeState | undefined>(path.join(this.rootPath, latest.path), undefined)
+      : undefined;
+  }
+
+  async listExecutionTrees(sessionId?: string): Promise<Array<{
+    correlationId: string;
+    sessionId: string;
+    status: RootExecutionTreeState['status'];
+    steps: number;
+    updatedAt: number;
+    path: string;
+  }>> {
+    const root = path.join(this.rootPath, 'execution-trees');
+    let sessions: string[];
+    try {
+      sessions = sessionId ? [this.safeKey(sessionId)] : await readdir(root);
+    } catch {
+      return [];
+    }
+    const records: Array<{
+      correlationId: string;
+      sessionId: string;
+      status: RootExecutionTreeState['status'];
+      steps: number;
+      updatedAt: number;
+      path: string;
+    }> = [];
+    for (const session of sessions.filter(item => item !== 'latest.json')) {
+      const sessionPath = path.join(root, session);
+      let files: string[];
+      try {
+        files = await readdir(sessionPath);
+      } catch {
+        continue;
+      }
+      for (const file of files.filter(item => item.endsWith('.json'))) {
+        const filePath = path.join(sessionPath, file);
+        const tree = await this.readJson<RootExecutionTreeState | undefined>(filePath, undefined);
+        if (!tree) continue;
+        records.push({
+          correlationId: tree.correlationId,
+          sessionId: tree.sessionId,
+          status: tree.status,
+          steps: tree.steps.length,
+          updatedAt: tree.updatedAt,
+          path: filePath,
+        });
+      }
+    }
+    return records.sort((left, right) => right.updatedAt - left.updatedAt);
   }
 
   async ensureAgentMemory(agentKey: string, options: { name?: string; role?: string; description?: string } = {}): Promise<void> {

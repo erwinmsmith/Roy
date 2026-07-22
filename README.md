@@ -36,7 +36,7 @@ Each parent owns its direct children and synthesizes their results before return
 
 ## Dynamic Root Execution Tree
 
-A root turn is a bounded sequence of dependent execution steps, not a one-shot delegation plan. Each step stores its decision, dependencies, actors, teams, result summary, and a complete tree snapshot. After a delegated step completes, Roy reassesses the original task against accumulated evidence, warnings, budget, and prior results. Roy may add another dependent branch, ask for missing input, or finalize. Only Roy produces the user-facing result.
+A root turn is a bounded sequence of dependent execution steps, not a one-shot delegation plan. Each step stores its decision, dependencies, actors, teams, result summary, activity graph, checkpoint, and a complete tree snapshot. Activities distinguish conversation, context loading, root thinking, tool calls, agent/team work, delegation, synthesis, and control transitions. After every delegated step, Roy reassesses the original task against accumulated evidence, warnings, budget, and prior results. Roy may add another dependent branch, ask for missing input, or finalize. Only Roy produces the user-facing result.
 
 ```text
 Step 1: inspect
@@ -52,7 +52,9 @@ Step 3: finalize (depends on step 2)
 Roy -> final response
 ```
 
-The live registry and historical snapshots are deliberately separate from actor lifecycle. A completed child may be released while remaining visible in every relevant step snapshot. Use `/tree [correlation-id]`, `GET /v1/execution-tree`, or `GET /v1/execution-tree/:correlationId` to inspect this state. Queue messages `root.step.plan` and `root.step.result`, plus `root.step.*` events, expose the same control flow.
+The live registry and historical snapshots are deliberately separate from actor lifecycle. A completed child may be released while remaining visible in every relevant step snapshot. Trees are atomically persisted under `.roy/execution-trees/<session-id>/<correlation-id>.json` after each step and loaded again after runtime restart. Correlation IDs include the session and a random suffix, so histories from concurrent or restarted runtimes do not collide. Use `/tree`, `/tree <correlation-id>`, `/tree list`, `GET /v1/execution-tree`, `GET /v1/execution-tree/:correlationId`, or `GET /v1/execution-trees` to inspect this state. Queue messages `root.step.plan` and `root.step.result`, plus `root.step.*` events, expose the same control flow.
+
+The root task loop reserves a final synthesis step and applies four independent guards: step count, delegation rounds, wall-clock deadline, and repeated checkpoint fingerprints. Long-horizon or explicitly staged requests are promoted into an initial planning checkpoint even when a model initially classifies them as direct-answer tasks.
 
 Workspace limits prevent an unbounded reasoning loop:
 
@@ -61,9 +63,12 @@ Workspace limits prevent an unbounded reasoning loop:
   "delegation": {
     "rootSteps": {
       "enabled": true,
-      "maxStepsPerTurn": 4,
-      "maxDelegationRounds": 3,
-      "reassessAfterDelegation": true
+      "maxStepsPerTurn": 12,
+      "maxDelegationRounds": 8,
+      "reassessAfterDelegation": true,
+      "maxWallClockMs": 900000,
+      "maxStalledIterations": 2,
+      "persistEveryStep": true
     }
   }
 }
@@ -425,6 +430,7 @@ The package also exposes `roy/runtime`, `roy/team`, `roy/tom`, `roy/communicatio
 /events --latest 50
 /tree
 /tree <correlationId>
+/tree list
 /messages --correlation <id>
 /context render researcher --task "Inspect the repository"
 /prompt render researcher --task "Inspect the repository"
@@ -462,6 +468,7 @@ POST /v1/chat
 GET  /v1/status
 GET  /v1/execution-tree
 GET  /v1/execution-tree/:correlationId
+GET  /v1/execution-trees
 GET  /v1/agents
 GET  /v1/agents/tree
 POST /v1/agents

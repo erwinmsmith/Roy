@@ -2,7 +2,7 @@
 
 import 'dotenv/config';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { config } from '../../config/index.js';
 import { logger } from '../utils/logger.js';
 import { configureLogging, shutdownLogging } from '../logging/index.js';
@@ -24,6 +24,8 @@ import {
   type RootExecutionStepDecision,
   type RootExecutionTreeState,
 } from './executionTree.js';
+import { RootExecutionActivityProjector } from './executionActivity.js';
+import { RootTaskLoopController } from './taskLoop.js';
 import { FSM } from '../executor/FSM.js';
 import { signalBus } from '../executor/SignalBus.js';
 import { UnifiedAgent } from '../agent/UnifiedAgent.js';
@@ -631,6 +633,7 @@ export class Runtime {
   private readonly teamRestoreSpecs = new Map<string, SpawnTeamSpec>();
   private readonly evolutionBudgetBypassCorrelations = new Set<string>();
   private readonly executionTrees = new RootExecutionTreeRegistry();
+  private readonly executionActivityProjector = new RootExecutionActivityProjector();
 
   static getInstance(): Runtime {
     if (!Runtime.instance) {
@@ -1010,8 +1013,22 @@ export class Runtime {
     return correlationId ? this.executionTrees.get(correlationId) : this.executionTrees.latest();
   }
 
+  async loadRootExecutionTree(correlationId?: string): Promise<RootExecutionTreeState | undefined> {
+    const live = this.getRootExecutionTree(correlationId);
+    if (live) return live;
+    const memory = this.getContext().memory;
+    const persisted = correlationId
+      ? await memory.readExecutionTree(correlationId)
+      : await memory.readLatestExecutionTree();
+    return persisted ? this.executionTrees.restore(persisted) : undefined;
+  }
+
   listRootExecutionTrees(): RootExecutionTreeState[] {
     return this.executionTrees.list();
+  }
+
+  async listPersistedRootExecutionTrees(sessionId?: string): Promise<Awaited<ReturnType<WorkspaceMemoryManager['listExecutionTrees']>>> {
+    return this.getContext().memory.listExecutionTrees(sessionId);
   }
 
   getToMState(correlationId?: string): ToMRuntimeState {
@@ -3554,7 +3571,13 @@ export class Runtime {
     const correlationId = this.createCorrelationId();
     const rootUsageBefore = ctx.agent.getUsage();
     const rootStepConfig = this.workspaceRuntimeConfig?.delegation.rootSteps;
-    const maxSteps = Math.max(2, rootStepConfig?.maxStepsPerTurn ?? 4);
+    const maxSteps = Math.max(2, rootStepConfig?.maxStepsPerTurn ?? 12);
+    const loopController = new RootTaskLoopController({
+      maxIterations: maxSteps,
+      maxWallClockMs: Math.max(1, rootStepConfig?.maxWallClockMs ?? 15 * 60_000),
+      maxStalledIterations: Math.max(1, rootStepConfig?.maxStalledIterations ?? 2),
+      reserveFinalSteps: 1,
+    });
     this.executionTrees.begin({
       correlationId,
       sessionId: ctx.sessionId,
@@ -3562,7 +3585,10 @@ export class Runtime {
       rootAgentId: 'root',
       rootAgentName: ctx.agent.name,
       maxSteps,
+      maxWallClockMs: rootStepConfig?.maxWallClockMs,
+      maxStalledIterations: rootStepConfig?.maxStalledIterations,
     });
+    await this.persistRootExecutionTree(correlationId);
 
     const inputMessage = await this.enqueueMessage({
       kind: 'user.input',
@@ -3587,7 +3613,56 @@ export class Runtime {
     await this.transitionRootTurnState('S_input_received', { correlationId });
     await this.transitionRootTurnState('S_assess_task', { correlationId });
     let decision = await this.decideDelegation(userInput, correlationId);
-    decision = await this.selectDelegationCandidate('root', userInput, decision, correlationId, 'root');
+    const requiresLongHorizon = rootStepConfig?.enabled !== false && this.requiresLongHorizonLoop(userInput);
+    let requiredLongHorizonDecision: DelegationDecision | undefined;
+    if (decision.action === 'solve_directly'
+      && requiresLongHorizon) {
+      decision = {
+        action: 'spawn_subagents',
+        reason: 'The request describes a staged or long-running task, so Roy will establish an initial checkpoint before reassessing the next step.',
+        agents: [{
+          archetype: 'planner',
+          name: 'TaskPlanner-1',
+          task: `Establish the first executable checkpoint for this long-horizon task. Identify completed state, missing evidence, required tools, and the next bounded action: ${userInput}`,
+          tomLevel: 1,
+          existenceReason: 'Create explicit state that the root task loop can reassess after the first step.',
+        }],
+      };
+      requiredLongHorizonDecision = decision;
+      this.emit({
+        type: 'root.task_loop.promoted',
+        agentId: 'root',
+        correlationId,
+        data: { reason: 'long_horizon_task_detected' },
+      });
+    } else if (decision.action === 'spawn_subagents' && requiresLongHorizon) {
+      requiredLongHorizonDecision = decision;
+    }
+    decision = await this.selectDelegationCandidate(
+      'root',
+      userInput,
+      decision,
+      correlationId,
+      'root',
+      requiresLongHorizon
+    );
+    if (requiredLongHorizonDecision?.action === 'spawn_subagents' && decision.action !== 'spawn_subagents') {
+      const rootPolicy = this.getAgentPolicy('root');
+      const hasCapacity = Boolean(rootPolicy && rootPolicy.allowedChildren > rootPolicy.currentChildren)
+        && this.getRemainingTotalAgentsForTurn('root', correlationId) > 0;
+      if (hasCapacity) {
+        this.emit({
+          type: 'delegation.candidate.overridden',
+          agentId: 'root',
+          correlationId,
+          data: {
+            reason: 'explicit_long_horizon_loop_requires_initial_checkpoint',
+            rejectedAction: decision.action,
+          },
+        });
+        decision = requiredLongHorizonDecision;
+      }
+    }
     const decisionMetadata = await this.buildDelegationDecisionMetadata(decision);
     this.emit({
       type: 'delegation.decision',
@@ -3606,6 +3681,7 @@ export class Runtime {
     const teamResults: TeamRunResult[] = [];
     const evolutions: EvolutionRunResult[] = [];
     let evolution: EvolutionRunResult | undefined;
+    let loopStopReason: RootExecutionTreeState['loop']['stopReason'] = 'completed';
 
     if (decision.action === 'ask_clarification') {
       const step = await this.startRootExecutionStep(correlationId, {
@@ -3676,6 +3752,7 @@ export class Runtime {
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           this.executionTrees.failStep(correlationId, step.id, message);
+          await this.persistRootExecutionTree(correlationId);
           this.emit({
             type: 'root.step.failed',
             agentId: 'root',
@@ -3705,12 +3782,13 @@ export class Runtime {
         previousStepId = completedStep.id;
 
         const tree = this.executionTrees.get(correlationId)!;
-        const maxRounds = Math.max(1, rootStepConfig?.maxDelegationRounds ?? 3);
+        const maxRounds = Math.max(1, rootStepConfig?.maxDelegationRounds ?? 8);
+        const loopGuard = loopController.evaluate(tree);
         const canReassess = rootStepConfig?.enabled !== false
           && rootStepConfig?.reassessAfterDelegation !== false
           && !round.evolution
           && delegationRounds < maxRounds
-          && tree.steps.length < tree.maxSteps - 1;
+          && loopGuard.continue;
 
         await this.transitionRootTurnState('S_assess_task', {
           correlationId,
@@ -3718,11 +3796,22 @@ export class Runtime {
           delegationRounds,
         });
         if (!canReassess) {
+          if (!loopGuard.continue && loopGuard.reason !== 'continue') loopStopReason = loopGuard.reason;
+          else if (delegationRounds >= maxRounds) loopStopReason = 'max_iterations';
           this.emit({
             type: 'root.step.limit_reached',
             agentId: 'root',
             correlationId,
-            data: { stepId: step.id, delegationRounds, maxRounds, maxSteps: tree.maxSteps },
+            data: {
+              stepId: step.id,
+              delegationRounds,
+              maxRounds,
+              maxSteps: tree.maxSteps,
+              reason: loopGuard.continue ? 'max_delegation_rounds' : loopGuard.reason,
+              remainingSteps: loopGuard.remainingSteps,
+              elapsedMs: loopGuard.elapsedMs,
+              stalledIterations: tree.loop.stalledIterations,
+            },
           });
           break;
         }
@@ -3763,6 +3852,7 @@ export class Runtime {
         agentCount: 0,
       }, previousStepId ? [previousStepId] : []);
       if (clarification) {
+        loopStopReason = 'clarification';
         await this.transitionRootTurnState('S_solo_reasoning', { correlationId, stepId: finalStep.id });
         finalResponse = clarification;
       } else {
@@ -3821,7 +3911,8 @@ export class Runtime {
     await ctx.queue.ack(finalMessage.id);
     await this.transitionRootTurnState('S_turn_done', { correlationId });
     await this.transitionRootTurnState('S_solo', { correlationId });
-    const executionTree = this.executionTrees.finish(correlationId);
+    const executionTree = this.executionTrees.finish(correlationId, loopStopReason);
+    await this.persistRootExecutionTree(correlationId);
     this.emit({
       type: 'root.execution_tree.completed',
       agentId: 'root',
@@ -6416,6 +6507,7 @@ export class Runtime {
         decision: step.decision,
       },
     });
+    await this.persistRootExecutionTree(correlationId);
     return step;
   }
 
@@ -6425,7 +6517,43 @@ export class Runtime {
     input: CompleteRootExecutionStepInput
   ): Promise<RootExecutionStep> {
     const ctx = this.getContext();
-    const completed = this.executionTrees.completeStep(correlationId, step.id, input);
+    const tree = this.executionTrees.get(correlationId);
+    if (!tree) throw new Error(`Execution tree not found: ${correlationId}`);
+    const collectedActivities = input.activities ?? this.executionActivityProjector.project({
+      tree,
+      step,
+      messages: await this.getMessages({ correlationId }),
+      events: this.events,
+    });
+    const checkpoint = input.checkpoint ?? this.executionActivityProjector.checkpoint({
+      tree,
+      step,
+      resultSummary: input.resultSummary,
+      activities: collectedActivities,
+      actorIds: input.actorIds,
+      teamIds: input.teamIds,
+    });
+    const activities = [...collectedActivities, {
+      id: `${step.id}.checkpoint`,
+      kind: 'checkpoint' as const,
+      status: 'completed' as const,
+      label: 'Root state checkpoint',
+      actorId: 'root',
+      summary: checkpoint.decisionBasis,
+      startedAt: checkpoint.createdAt,
+      completedAt: checkpoint.createdAt,
+      data: {
+        completed: checkpoint.completed,
+        pending: checkpoint.pending,
+        evidence: checkpoint.evidence,
+        stateFingerprint: checkpoint.stateFingerprint,
+      },
+    }];
+    const completed = this.executionTrees.completeStep(correlationId, step.id, {
+      ...input,
+      activities,
+      checkpoint,
+    });
     const message = await this.enqueueMessage({
       kind: 'root.step.result',
       sessionId: ctx.sessionId,
@@ -6439,6 +6567,8 @@ export class Runtime {
         teamIds: completed.teamIds,
         resultSummary: completed.resultSummary,
         treeSnapshot: completed.treeSnapshot,
+        activities: completed.activities,
+        checkpoint: completed.checkpoint,
       },
       metadata: { agentId: 'root', tags: ['root-execution-step'] },
     });
@@ -6452,6 +6582,8 @@ export class Runtime {
         stepId: completed.id,
         index: completed.index,
         nodeCount: completed.treeSnapshot.length,
+        activityCount: completed.activities.length,
+        checkpointFingerprint: completed.checkpoint?.stateFingerprint,
       },
     });
     this.emit({
@@ -6465,7 +6597,15 @@ export class Runtime {
         teamIds: completed.teamIds,
       },
     });
+    await this.persistRootExecutionTree(correlationId);
     return completed;
+  }
+
+  private async persistRootExecutionTree(correlationId: string): Promise<void> {
+    const tree = this.executionTrees.get(correlationId);
+    if (!tree || !this.memory) return;
+    if (this.workspaceRuntimeConfig?.delegation.rootSteps.persistEveryStep === false && tree.status === 'running') return;
+    await this.memory.writeExecutionTree(tree);
   }
 
   private emitDelegationPlan(
@@ -7208,6 +7348,13 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     return /\b(after|once|based on|depending on)\b.{0,100}\b(result|finding|evidence|output|inspection)\b/.test(normalized)
       || /\b(first|initial)\b.{0,120}\b(then|next|afterward|subsequent)\b/.test(normalized)
       || /\b(then|next)\b.{0,100}\b(decide|determine|verify|delegate|spawn)\b/.test(normalized);
+  }
+
+  private requiresLongHorizonLoop(task: string): boolean {
+    const normalized = task.toLowerCase().replace(/\s+/g, ' ');
+    return this.requiresStagedDelegation(task)
+      || /\b(long[- ]?(?:running|horizon|term)|multi[- ]?(?:step|stage|phase)|iterate|iteration|checkpoint|until complete|continue until|progressively|recursive)\b/.test(normalized)
+      || /(长程|长期任务|多步骤|多阶段|逐步执行|持续执行|循环执行|直到完成|递归派生|检查点)/.test(normalized);
   }
 
   private applyBudgetConstraints(decision: DelegationDecision): DelegationDecision {
@@ -10122,8 +10269,11 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
 
   private createCorrelationId(): string {
     const sequence = ++this.delegationSequence;
-    const date = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-    return `del_${date}_${String(sequence).padStart(3, '0')}`;
+    const timestamp = new Date().toISOString().replace(/\D/g, '').slice(0, 17);
+    const session = (this.ctx?.sessionId ?? 'bootstrap')
+      .replace(/[^a-zA-Z0-9_-]/g, '_')
+      .slice(0, 32);
+    return `del_${timestamp}_${session}_${String(sequence).padStart(3, '0')}_${randomUUID().slice(0, 8)}`;
   }
 
   private createRootToMProfile(): ToMProfile {

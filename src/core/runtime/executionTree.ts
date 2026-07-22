@@ -1,6 +1,54 @@
 export type RootExecutionTreeStatus = 'running' | 'completed' | 'failed';
 export type RootExecutionStepStatus = 'running' | 'completed' | 'failed';
 export type RootExecutionNodeStatus = 'active' | 'waiting' | 'done' | 'failed' | 'released';
+export type RootExecutionActivityKind =
+  | 'conversation'
+  | 'context'
+  | 'thinking'
+  | 'tool'
+  | 'delegation'
+  | 'agent'
+  | 'team'
+  | 'synthesis'
+  | 'checkpoint'
+  | 'control';
+export type RootExecutionActivityStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
+
+export interface RootExecutionActivity {
+  id: string;
+  kind: RootExecutionActivityKind;
+  status: RootExecutionActivityStatus;
+  label: string;
+  actorId?: string;
+  parentActivityId?: string;
+  messageId?: string;
+  eventType?: string;
+  summary?: string;
+  tokenUsage?: number;
+  startedAt: number;
+  completedAt?: number;
+  data?: Record<string, unknown>;
+}
+
+export interface RootExecutionCheckpoint {
+  objective: string;
+  completed: string[];
+  pending: string[];
+  evidence: string[];
+  decisionBasis: string;
+  stateFingerprint: string;
+  createdAt: number;
+}
+
+export interface RootExecutionLoopState {
+  iteration: number;
+  maxIterations: number;
+  maxWallClockMs: number;
+  elapsedMs: number;
+  stalledIterations: number;
+  maxStalledIterations: number;
+  stopReason?: 'completed' | 'clarification' | 'max_iterations' | 'timeout' | 'stalled' | 'failed';
+}
 
 export interface RootExecutionNodeSnapshot {
   id: string;
@@ -31,6 +79,8 @@ export interface RootExecutionStep {
   teamIds: string[];
   resultSummary?: string;
   treeSnapshot: RootExecutionNodeSnapshot[];
+  activities: RootExecutionActivity[];
+  checkpoint?: RootExecutionCheckpoint;
   startedAt: number;
   completedAt?: number;
   error?: string;
@@ -46,6 +96,7 @@ export interface RootExecutionTreeState {
   maxSteps: number;
   nodes: RootExecutionNodeSnapshot[];
   steps: RootExecutionStep[];
+  loop: RootExecutionLoopState;
   createdAt: number;
   updatedAt: number;
   completedAt?: number;
@@ -62,6 +113,8 @@ export interface CompleteRootExecutionStepInput {
   teamIds?: string[];
   nodes?: RootExecutionNodeSnapshot[];
   resultSummary?: string;
+  activities?: RootExecutionActivity[];
+  checkpoint?: RootExecutionCheckpoint;
 }
 
 function cloneTree(tree: RootExecutionTreeState): RootExecutionTreeState {
@@ -78,6 +131,8 @@ export class RootExecutionTreeRegistry {
     rootAgentId?: string;
     rootAgentName?: string;
     maxSteps: number;
+    maxWallClockMs?: number;
+    maxStalledIterations?: number;
   }): RootExecutionTreeState {
     const now = Date.now();
     const rootAgentId = input.rootAgentId ?? 'root';
@@ -99,6 +154,14 @@ export class RootExecutionTreeRegistry {
         updatedAtStep: 0,
       }],
       steps: [],
+      loop: {
+        iteration: 0,
+        maxIterations: Math.max(1, input.maxSteps),
+        maxWallClockMs: Math.max(1, input.maxWallClockMs ?? 15 * 60_000),
+        elapsedMs: 0,
+        stalledIterations: 0,
+        maxStalledIterations: Math.max(1, input.maxStalledIterations ?? 2),
+      },
       createdAt: now,
       updatedAt: now,
     };
@@ -121,9 +184,11 @@ export class RootExecutionTreeRegistry {
       actorIds: [],
       teamIds: [],
       treeSnapshot: structuredClone(tree.nodes),
+      activities: [],
       startedAt: Date.now(),
     };
     tree.currentStep = index;
+    tree.loop.iteration = index;
     tree.steps.push(step);
     tree.updatedAt = step.startedAt;
     return structuredClone(step);
@@ -137,9 +202,26 @@ export class RootExecutionTreeRegistry {
     step.actorIds = [...(input.actorIds ?? [])];
     step.teamIds = [...(input.teamIds ?? [])];
     step.resultSummary = input.resultSummary;
+    step.activities = structuredClone(input.activities ?? step.activities);
+    step.checkpoint = input.checkpoint ? structuredClone(input.checkpoint) : step.checkpoint;
     step.treeSnapshot = structuredClone(tree.nodes);
     step.completedAt = Date.now();
     tree.updatedAt = step.completedAt;
+    tree.loop.elapsedMs = step.completedAt - tree.createdAt;
+    if (step.checkpoint) {
+      const previous = tree.steps.at(-2)?.checkpoint;
+      tree.loop.stalledIterations = previous?.stateFingerprint === step.checkpoint.stateFingerprint
+        ? tree.loop.stalledIterations + 1
+        : 0;
+    }
+    return structuredClone(step);
+  }
+
+  setStepActivities(correlationId: string, stepId: string, activities: RootExecutionActivity[]): RootExecutionStep {
+    const tree = this.requireTree(correlationId);
+    const step = this.requireStep(tree, stepId);
+    step.activities = structuredClone(activities);
+    tree.updatedAt = Date.now();
     return structuredClone(step);
   }
 
@@ -153,14 +235,21 @@ export class RootExecutionTreeRegistry {
     tree.status = 'failed';
     tree.error = error;
     tree.updatedAt = step.completedAt;
+    tree.loop.elapsedMs = step.completedAt - tree.createdAt;
+    tree.loop.stopReason = 'failed';
     return structuredClone(step);
   }
 
-  finish(correlationId: string): RootExecutionTreeState {
+  finish(
+    correlationId: string,
+    stopReason: RootExecutionLoopState['stopReason'] = 'completed'
+  ): RootExecutionTreeState {
     const tree = this.requireTree(correlationId);
     tree.status = tree.status === 'failed' ? 'failed' : 'completed';
     tree.completedAt = Date.now();
     tree.updatedAt = tree.completedAt;
+    tree.loop.elapsedMs = tree.completedAt - tree.createdAt;
+    tree.loop.stopReason = tree.status === 'failed' ? 'failed' : stopReason;
     const root = tree.nodes.find(node => node.id === tree.rootAgentId);
     if (root) {
       root.status = tree.status === 'failed' ? 'failed' : 'done';
@@ -183,6 +272,22 @@ export class RootExecutionTreeRegistry {
     return [...this.trees.values()]
       .sort((left, right) => right.updatedAt - left.updatedAt)
       .map(cloneTree);
+  }
+
+  restore(input: RootExecutionTreeState): RootExecutionTreeState {
+    const tree = cloneTree(input);
+    tree.steps = tree.steps.map(step => ({ ...step, activities: step.activities ?? [] }));
+    tree.loop = tree.loop ?? {
+      iteration: tree.currentStep,
+      maxIterations: tree.maxSteps,
+      maxWallClockMs: 15 * 60_000,
+      elapsedMs: Math.max(0, tree.updatedAt - tree.createdAt),
+      stalledIterations: 0,
+      maxStalledIterations: 2,
+      stopReason: tree.status === 'completed' ? 'completed' : tree.status === 'failed' ? 'failed' : undefined,
+    };
+    this.trees.set(tree.correlationId, tree);
+    return cloneTree(tree);
   }
 
   clear(): void {

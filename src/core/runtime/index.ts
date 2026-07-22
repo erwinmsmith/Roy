@@ -13,7 +13,22 @@ export { AgentManager } from './AgentManager.js';
 export {
   RootExecutionTreeRegistry,
   type RootExecutionNodeSnapshot,
+  type RootExecutionActivity,
+  type RootExecutionActivityKind,
+  type RootExecutionCheckpoint,
+  type RootExecutionLoopState,
   type RootExecutionStep,
   type RootExecutionStepDecision,
   type RootExecutionTreeState,
 } from './executionTree.js';
+export {
+  RootExecutionActivityProjector,
+  type BuildRootCheckpointInput,
+  type ExecutionObservableEvent,
+  type ProjectRootStepActivitiesInput,
+} from './executionActivity.js';
+export {
+  RootTaskLoopController,
+  type RootTaskLoopConfig,
+  type RootTaskLoopGuard,
+} from './taskLoop.js';

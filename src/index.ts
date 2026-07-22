@@ -1,6 +1,6 @@
 export { bootstrap, cleanup } from './bootstrap.js';
 export type { BootstrapContext, BootstrapOptions } from './bootstrap.js';
-export { AgentManager, Runtime, runtime } from './core/runtime/index.js';
+export { AgentManager, RootExecutionActivityProjector, Runtime, runtime } from './core/runtime/index.js';
 export type {
   RuntimeConfig,
   RuntimeContext,
@@ -8,9 +8,16 @@ export type {
   RunEvolutionInput,
   EvolutionBenchmarkResult,
   RootExecutionNodeSnapshot,
+  RootExecutionActivity,
+  RootExecutionActivityKind,
+  RootExecutionCheckpoint,
+  RootExecutionLoopState,
   RootExecutionStep,
   RootExecutionStepDecision,
   RootExecutionTreeState,
+  BuildRootCheckpointInput,
+  ExecutionObservableEvent,
+  ProjectRootStepActivitiesInput,
 } from './core/runtime/index.js';
 export * from './core/evolution/index.js';
 export * from './core/lifecycle/index.js';

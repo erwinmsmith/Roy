@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -97,6 +97,41 @@ class MalformedRootDecisionLLM extends DynamicStepLLM {
   }
 }
 
+class ContinuingStepLLM extends DynamicStepLLM {
+  private step = 0;
+
+  override async completeJSON<T>(messages: LLMMessage[]): Promise<T> {
+    const text = messages.map(message => String(message.content)).join('\n');
+    if (text.includes("Roy's dynamic root-step controller")) {
+      this.step += 1;
+      return {
+        action: 'delegate_more',
+        reason: `Continue bounded task iteration ${this.step}.`,
+        agents: [{
+          archetype: 'tester',
+          name: `Tester-${this.step}`,
+          task: `Verify unique checkpoint ${this.step}.`,
+          tomLevel: 0,
+        }],
+      } as T;
+    }
+    return super.completeJSON<T>(messages);
+  }
+}
+
+class DirectInitialDecisionLLM extends DynamicStepLLM {
+  override async completeJSON<T>(messages: LLMMessage[]): Promise<T> {
+    const text = messages.map(message => String(message.content)).join('\n');
+    if (text.includes("Roy's root delegation controller")) {
+      return { action: 'solve_directly', reason: 'Initially classified as direct.' } as T;
+    }
+    if (text.includes("Roy's dynamic root-step controller")) {
+      return { action: 'finalize', reason: 'The planning checkpoint is sufficient.' } as T;
+    }
+    return super.completeJSON<T>(messages);
+  }
+}
+
 describe('Root dynamic execution tree', () => {
   it('reassesses prior state, grows the tree in a dependent step, and lets Roy finalize', async () => {
     const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-dynamic-tree-'));
@@ -122,6 +157,7 @@ describe('Root dynamic execution tree', () => {
 
     const result = await runtime.handleUserTurn('Inspect this project, then verify any gap before answering.');
 
+    expect(result.correlationId).toContain('dynamic-tree-test');
     expect(result.finalResponse).toBe('Roy final answer based on staged research and verification.');
     expect(result.subagents.map(item => item.node.identity.archetype)).toEqual(expect.arrayContaining(['researcher', 'tester']));
     expect(result.executionTree.status).toBe('completed');
@@ -140,6 +176,19 @@ describe('Root dynamic execution tree', () => {
     ]));
     expect(result.executionTree.nodes.find(node => node.role === 'researcher')?.createdAtStep).toBe(1);
     expect(result.executionTree.nodes.find(node => node.role === 'tester')?.createdAtStep).toBe(2);
+    expect(result.executionTree.loop).toMatchObject({
+      iteration: 3,
+      stopReason: 'completed',
+      maxIterations: 4,
+    });
+    expect(result.executionTree.steps.every(step => step.activities.length > 0)).toBe(true);
+    expect(result.executionTree.steps.every(step => step.checkpoint?.stateFingerprint)).toBe(true);
+    expect(result.executionTree.steps[0].activities.map(activity => activity.kind)).toEqual(expect.arrayContaining([
+      'conversation',
+      'thinking',
+      'agent',
+      'checkpoint',
+    ]));
 
     const messages = await runtime.getMessages({ correlationId: result.correlationId });
     expect(messages.filter(message => message.kind === 'root.step.plan')).toHaveLength(3);
@@ -149,7 +198,25 @@ describe('Root dynamic execution tree', () => {
     expect(events.filter(event => event.type === 'root.step.tree.updated')).toHaveLength(3);
     expect(events).toContainEqual(expect.objectContaining({ type: 'root.execution_tree.completed' }));
 
+    const persisted = await runtime.listPersistedRootExecutionTrees('dynamic-tree-test');
+    expect(persisted).toHaveLength(1);
+    const persistedTree = JSON.parse(await readFile(persisted[0].path, 'utf8'));
+    expect(persistedTree.steps).toHaveLength(3);
+    expect(persistedTree.steps[1].dependsOn).toEqual([result.executionTree.steps[0].id]);
+
     await runtime.shutdown();
+
+    const resumedRuntime = new Runtime();
+    await resumedRuntime.initialize({
+      sessionId: 'dynamic-tree-test',
+      workspaceCwd,
+      fsmEnabled: true,
+      llmProvider: new DynamicStepLLM(),
+    });
+    const restored = await resumedRuntime.loadRootExecutionTree(result.correlationId);
+    expect(restored?.steps).toHaveLength(3);
+    expect(restored?.steps[0].activities.length).toBeGreaterThan(0);
+    await resumedRuntime.shutdown();
   });
 
   it('uses file-aware fallback and keeps staged work out of the initial ToM expansion', async () => {
@@ -170,11 +237,72 @@ describe('Root dynamic execution tree', () => {
     expect(result.executionTree.steps[0].decision).toMatchObject({ action: 'delegate', agentCount: 1 });
     expect(result.executionTree.steps[0].actorIds).toHaveLength(1);
     expect(result.subagents[0].node.identity.archetype).toBe('researcher');
+    expect(result.executionTree.steps[0].activities).toContainEqual(expect.objectContaining({
+      kind: 'tool',
+      status: 'completed',
+    }));
     expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
       type: 'delegation.decision.fallback',
       data: expect.objectContaining({ reason: 'llm_decision_failed' }),
     }));
 
+    await runtime.shutdown();
+  });
+
+  it('reserves a final step and stops a long task at the configured loop boundary', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-bounded-loop-'));
+    await mkdir(path.join(workspaceCwd, '.roy'), { recursive: true });
+    await writeFile(path.join(workspaceCwd, '.roy', 'config.json'), JSON.stringify({
+      tom: { autoCompleteGaps: false, minimumCoverage: 0 },
+      delegation: {
+        rootSteps: {
+          enabled: true,
+          maxStepsPerTurn: 4,
+          maxDelegationRounds: 10,
+          reassessAfterDelegation: true,
+          maxWallClockMs: 60000,
+          maxStalledIterations: 5,
+          persistEveryStep: true,
+        },
+      },
+    }));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'bounded-loop-test',
+      workspaceCwd,
+      fsmEnabled: true,
+      llmProvider: new ContinuingStepLLM(),
+    });
+
+    const result = await runtime.handleUserTurn('Inspect this project through several dependent verification steps.');
+
+    expect(result.executionTree.steps).toHaveLength(4);
+    expect(result.executionTree.steps.slice(0, 3).every(step => step.decision.action === 'delegate')).toBe(true);
+    expect(result.executionTree.steps[3].decision.action).toBe('finalize');
+    expect(result.executionTree.loop.stopReason).toBe('max_iterations');
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'root.step.limit_reached',
+      data: expect.objectContaining({ reason: 'max_iterations' }),
+    }));
+    await runtime.shutdown();
+  });
+
+  it('promotes an explicit long-horizon task into a checkpointed loop', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-long-horizon-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'long-horizon-test',
+      workspaceCwd,
+      fsmEnabled: true,
+      llmProvider: new DirectInitialDecisionLLM(),
+    });
+
+    const result = await runtime.handleUserTurn('Execute this multi-step task progressively with checkpoints until complete.');
+
+    expect(result.decision.action).toBe('spawn_subagents');
+    expect(result.subagents[0].node.identity.archetype).toBe('planner');
+    expect(result.executionTree.steps.map(step => step.decision.action)).toEqual(['delegate', 'finalize']);
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({ type: 'root.task_loop.promoted' }));
     await runtime.shutdown();
   });
 });

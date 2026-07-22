@@ -387,7 +387,7 @@ export class Roy {
         break;
 
       case '/tree':
-        this.printRootExecutionTree(parts[1]);
+        await this.printRootExecutionTree(parts[1]);
         break;
 
       case '/queue':
@@ -508,7 +508,8 @@ export class Roy {
       /events --agent <id> Filter events by agent
       /events --type <type> Filter events by event type
       /events --latest <n> Show latest N events
-      /tree [correlation-id] Show the root step history and dynamic actor tree
+      /tree [correlation-id] Show all root steps, activities, checkpoints, and actor snapshots
+      /tree list             List persisted execution trees across sessions
       /queue              Show runtime message queue state
       /cache agents       Show cached agent patterns
       /cache delegations  Show cached delegation patterns
@@ -2113,8 +2114,18 @@ export class Roy {
     console.log('  ' + this.green('roy[root] > ') + result.finalResponse + '\n');
   }
 
-  private printRootExecutionTree(correlationId?: string): void {
-    const tree = runtime.getRootExecutionTree(correlationId);
+  private async printRootExecutionTree(correlationId?: string): Promise<void> {
+    if (correlationId === 'list') {
+      const records = await runtime.listPersistedRootExecutionTrees();
+      console.log('\n  ' + this.bold('Persisted Execution Trees'));
+      if (records.length === 0) console.log('    ' + this.dim('No persisted execution trees'));
+      for (const record of records.slice(0, 50)) {
+        console.log(`    ${this.cyan(record.correlationId)}  session=${record.sessionId}  ${record.status}  steps=${record.steps}`);
+      }
+      console.log('');
+      return;
+    }
+    const tree = await runtime.loadRootExecutionTree(correlationId);
     console.log('\n  ' + this.bold('Root Execution Tree'));
     if (!tree) {
       console.log('    ' + this.dim(correlationId ? `No execution tree found for ${correlationId}` : 'No root turn has executed yet'));
@@ -2123,11 +2134,25 @@ export class Roy {
     }
     console.log(`    Correlation: ${this.cyan(tree.correlationId)}`);
     console.log(`    Status: ${tree.status}  Steps: ${tree.steps.length}/${tree.maxSteps}`);
+    console.log(`    Loop: iteration=${tree.loop.iteration}, elapsed=${tree.loop.elapsedMs}ms, stalled=${tree.loop.stalledIterations}/${tree.loop.maxStalledIterations}, stop=${tree.loop.stopReason ?? 'running'}`);
     for (const step of tree.steps) {
       console.log(`\n    ${this.cyan(`Step ${step.index}`)} [${step.decision.action}, ${step.status}]`);
       console.log(`      depends: ${step.dependsOn.join(', ') || 'user.input'}`);
       console.log(`      reason: ${step.decision.reason}`);
       this.printExecutionSnapshot(step.treeSnapshot, tree.rootAgentId, '      ');
+      if (step.activities.length > 0) {
+        console.log('      ' + this.bold('Activities'));
+        for (const activity of step.activities) {
+          const actor = activity.actorId ? ` ${activity.actorId}` : '';
+          const tokens = activity.tokenUsage === undefined ? '' : ` ${activity.tokenUsage} tokens`;
+          console.log(`        ${this.dim('├─')} [${activity.kind}] ${activity.label}${actor}${tokens} (${activity.status})`);
+          if (activity.summary) console.log(`        ${this.dim('│  ')}${activity.summary.replace(/\s+/g, ' ').slice(0, 220)}`);
+        }
+      }
+      if (step.checkpoint) {
+        console.log(`      ${this.bold('Checkpoint')} ${this.dim(step.checkpoint.stateFingerprint.slice(0, 12))}`);
+        console.log(`        completed=${step.checkpoint.completed.length} evidence=${step.checkpoint.evidence.length} pending=${step.checkpoint.pending.length}`);
+      }
       if (step.resultSummary) console.log(`      ${this.dim(`result: ${step.resultSummary.replace(/\s+/g, ' ').slice(0, 220)}`)}`);
     }
     console.log('');
