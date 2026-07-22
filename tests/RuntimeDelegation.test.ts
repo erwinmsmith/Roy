@@ -133,6 +133,17 @@ class EmptyVisibleRootSynthesisLLM extends RootDelegationLLM {
   }
 }
 
+class DeepSeekBudgetProbeLLM extends RootDelegationLLM {
+  override readonly name = 'deepseek';
+  override readonly defaultModel = 'deepseek-v4-flash';
+  lastStreamMaxTokens?: number;
+
+  override async *stream(messages: LLMMessage[], options?: LLMCompletionOptions): AsyncGenerator<LLMStreamChunk, void, unknown> {
+    this.lastStreamMaxTokens = options?.maxTokens;
+    yield* super.stream(messages, options);
+  }
+}
+
 describe('Runtime root-controlled delegation', () => {
   it('returns a delegated-result fallback when root synthesis has no visible output', async () => {
     const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-phase2-root-fallback-'));
@@ -251,6 +262,24 @@ describe('Runtime root-controlled delegation', () => {
     expect(runtime.getEvents().map(event => event.type)).toContain('root.solo.completed');
     expect(runtime.getEvents().map(event => event.type)).toContain('delegation.skipped');
 
+    await runtime.shutdown();
+  });
+
+  it('reserves reasoning capacity for visible output on direct reasoning models', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-phase2-reasoning-reserve-'));
+    const llm = new DeepSeekBudgetProbeLLM();
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'phase2-reasoning-reserve-test',
+      workspaceCwd,
+      fsmEnabled: true,
+      llmProvider: llm,
+    });
+
+    const result = await runtime.handleUserTurn('who are you?');
+
+    expect(result.finalResponse).toBe('Roy direct response.');
+    expect(llm.lastStreamMaxTokens).toBeGreaterThanOrEqual(3584);
     await runtime.shutdown();
   });
 

@@ -90,4 +90,226 @@ describe('AgentToolPlanner', () => {
       expect.objectContaining({ toolName: 'fs.list', params: { path: '.', maxDepth: 2 } }),
     ]);
   });
+
+  it('searches the web for current externally verifiable evidence', () => {
+    const plans = new AgentToolPlanner().plan({
+      task: 'Search the web for the latest official Node.js fetch documentation and cite sources.',
+      workspacePath: '.',
+      archetype: 'researcher',
+      bindings: [
+        { name: 'fs.list', enabled: true },
+        { name: 'fs.read', enabled: true },
+        { name: 'web.search', enabled: true },
+        { name: 'web.fetch', enabled: true },
+      ],
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({ toolName: 'web.search', groundingRequired: true }),
+    ]);
+    expect(plans[0].params.query).toBe('Node.js fetch documentation and cite sources.');
+  });
+
+  it('removes imperative web-source scaffolding from the search query', () => {
+    const plans = new AgentToolPlanner().plan({
+      task: 'Use public web sources to compare Node.js AbortSignal.timeout and MDN AbortSignal.timeout. Open at least two sources.',
+      workspacePath: '.',
+      archetype: 'researcher',
+      bindings: [{ name: 'web.search', enabled: true }],
+    });
+
+    expect(plans[0].params.query).toBe('Node.js AbortSignal.timeout and MDN AbortSignal.timeout');
+  });
+
+  it('fetches an explicitly supplied public URL instead of searching again', () => {
+    const plans = new AgentToolPlanner().plan({
+      task: 'Read https://nodejs.org/api/globals.html and summarize the fetch section.',
+      workspacePath: '.',
+      archetype: 'researcher',
+      bindings: [
+        { name: 'web.search', enabled: true },
+        { name: 'web.fetch', enabled: true },
+      ],
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'web.fetch',
+        params: { url: 'https://nodejs.org/api/globals.html' },
+      }),
+    ]);
+  });
+
+  it('prioritizes official API documentation links over unofficial downloads', () => {
+    const plans = new AgentToolPlanner().planWebFollowUps({
+      task: 'Find official Node.js documentation for the global fetch API and AbortSignal.timeout.',
+      bindings: [{ name: 'web.fetch', enabled: true }],
+      maxFetches: 2,
+      calls: [
+        {
+          toolName: 'web.fetch',
+          params: { url: 'https://nodejs.org/' },
+          success: true,
+          result: {
+            links: [
+              { text: 'Unofficial builds', url: 'https://unofficial-builds.nodejs.org/download/' },
+              { text: 'Docs', url: 'https://nodejs.org/docs/latest/api/' },
+              { text: 'Global objects', url: 'https://nodejs.org/api/globals.html' },
+            ],
+          },
+        },
+      ],
+    });
+
+    expect(plans.map(plan => plan.params.url)).toEqual([
+      'https://nodejs.org/docs/latest/api/',
+      'https://nodejs.org/api/globals.html',
+    ]);
+  });
+
+  it('treats a task-relevant fragment as focused evidence and hands control back to the agent planner', () => {
+    const plans = new AgentToolPlanner().planWebFollowUps({
+      task: 'Find official Node.js documentation for the global fetch API and AbortSignal.timeout.',
+      bindings: [{ name: 'web.fetch', enabled: true }],
+      maxFetches: 2,
+      calls: [{
+        toolName: 'web.fetch',
+        params: { url: 'https://nodejs.org/docs/latest/api/globals.html#static-method-abortsignaltimeoutdelay' },
+        success: true,
+        result: {
+          finalUrl: 'https://nodejs.org/docs/latest/api/globals.html#static-method-abortsignaltimeoutdelay',
+          title: 'Global objects - Static method: AbortSignal.timeout(delay)',
+          text: 'AbortSignal.timeout(delay) returns a signal that aborts after delay milliseconds.',
+        },
+      }],
+    });
+
+    expect(plans).toEqual([]);
+  });
+
+  it('does not follow another fragment from an already opened document', () => {
+    const plans = new AgentToolPlanner().planWebFollowUps({
+      task: 'Open and compare at least two official Node.js sources about AbortSignal.timeout.',
+      bindings: [{ name: 'web.fetch', enabled: true }],
+      maxFetches: 2,
+      calls: [{
+        toolName: 'web.fetch',
+        params: { url: 'https://nodejs.org/docs/latest/api/globals.html' },
+        success: true,
+        result: {
+          finalUrl: 'https://nodejs.org/docs/latest/api/globals.html',
+          title: 'Node.js globals introduction',
+          text: 'Node.js global API overview.',
+          links: [{
+            text: 'AbortSignal.timeout',
+            url: 'https://nodejs.org/docs/latest/api/globals.html#static-method-abortsignaltimeoutdelay',
+          }],
+        },
+      }],
+    });
+
+    expect(plans).toEqual([]);
+  });
+
+  it('does not create false relevance matches across unrelated token boundaries', () => {
+    const planner = new AgentToolPlanner();
+    const score = planner.webEvidenceScore(
+      'Find the Node.js global fetch API and AbortSignal.timeout documentation.',
+      {
+        toolName: 'web.fetch',
+        params: { url: 'https://earth.google.com/web/' },
+        success: true,
+        result: {
+          finalUrl: 'https://earth.google.com/web/',
+          title: 'Google Earth',
+          text: 'Aw snap. See system requirements for more information.',
+        },
+      }
+    );
+
+    expect(score).toBe(0);
+  });
+
+  it('does not fetch unrelated low-relevance search results', () => {
+    const plans = new AgentToolPlanner().planWebFollowUps({
+      task: 'Find the Node.js global fetch API and AbortSignal.timeout documentation.',
+      bindings: [{ name: 'web.fetch', enabled: true }],
+      maxFetches: 2,
+      calls: [{
+        toolName: 'web.search',
+        params: { query: 'AbortSignal.timeout documentation' },
+        success: true,
+        result: {
+          results: [
+            { title: 'Google Earth', url: 'https://earth.google.com/web/', snippet: 'Explore the world.' },
+            { title: 'Node.js Global objects', url: 'https://nodejs.org/docs/latest/api/globals.html#fetch', snippet: 'Global fetch API.' },
+          ],
+        },
+      }],
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({ params: { url: 'https://nodejs.org/docs/latest/api/globals.html#fetch' } }),
+    ]);
+  });
+
+  it('requires core API entities before following otherwise keyword-rich search results', () => {
+    const plans = new AgentToolPlanner().planWebFollowUps({
+      task: 'Use public web sources to compare Node.js AbortSignal.timeout and MDN AbortSignal.timeout.',
+      bindings: [{ name: 'web.fetch', enabled: true }],
+      maxFetches: 2,
+      calls: [{
+        toolName: 'web.search',
+        params: { query: 'compare Node.js AbortSignal.timeout MDN' },
+        success: true,
+        result: {
+          results: [
+            {
+              title: 'USE company information',
+              url: 'https://www.use-ebisu.co.jp/',
+              snippet: 'Public web information, current versions, availability, and comparison sources.',
+            },
+          ],
+        },
+      }],
+    });
+
+    expect(plans).toEqual([]);
+  });
+
+  it('stops web replanning after enough distinct relevant documents were opened', () => {
+    const planner = new AgentToolPlanner();
+    expect(planner.hasSufficientWebEvidence(
+      'Open and compare at least two relevant public sources about Node.js fetch and AbortSignal.timeout.',
+      [
+        {
+          toolName: 'web.fetch', params: { url: 'https://nodejs.org/docs/latest/api/globals.html#fetch' }, success: true,
+          result: { finalUrl: 'https://nodejs.org/docs/latest/api/globals.html#fetch', title: 'Node.js fetch API', text: 'Global fetch API.' },
+        },
+        {
+          toolName: 'web.fetch', params: { url: 'https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal/timeout_static' }, success: true,
+          result: { finalUrl: 'https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal/timeout_static', title: 'AbortSignal timeout API', text: 'AbortSignal.timeout documentation.' },
+        },
+      ]
+    )).toBe(true);
+  });
+
+  it('treats "both URLs" as a two-document evidence requirement', () => {
+    const planner = new AgentToolPlanner();
+    const oneDocument = [{
+      toolName: 'web.fetch',
+      params: { url: 'https://nodejs.org/docs/latest/api/globals.html#fetch' },
+      success: true,
+      result: {
+        finalUrl: 'https://nodejs.org/docs/latest/api/globals.html#fetch',
+        title: 'Node.js fetch API',
+        text: 'AbortSignal.timeout and global fetch API documentation.',
+      },
+    }];
+
+    expect(planner.hasSufficientWebEvidence(
+      'Open both URLs and compare Node.js AbortSignal.timeout with MDN.',
+      oneDocument
+    )).toBe(false);
+  });
 });

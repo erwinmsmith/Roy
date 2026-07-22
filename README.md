@@ -168,7 +168,46 @@ Workspace policy is stored in `.roy/config.json`:
 }
 ```
 
-Existing workspace configs are migrated to schema version 6 without discarding user overrides.
+Existing workspace configs are migrated to schema version 9 without discarding user overrides.
+
+## Web Tools And Continuous Execution
+
+Agents can receive parent-approved `web.search` and `web.fetch` bindings. Web tasks run through a bounded observe/act loop instead of a one-shot tool call:
+
+```text
+plan -> execute -> observe -> replan -> stop or continue -> synthesize
+```
+
+The loop has independent round, call-count, wall-clock, consecutive-failure, and duplicate-plan guards. Search results are discovery evidence only; source-backed claims require successful `web.fetch` calls. Runtime evidence separates discovered URLs, opened URLs, and task-relevant opened URLs. Roy validates final citations against the opened URL set and repairs unsupported citations before returning a response.
+
+`web.fetch` accepts public HTTPS pages by default, resolves and rejects private/link-local/loopback destinations (including IPv4-mapped IPv6), validates every redirect, independently limits raw response bytes and extracted text, removes executable HTML content, and can extract a specific document section from a URL fragment. Search uses Brave Search when `BRAVE_SEARCH_API_KEY` is configured and otherwise falls back to Bing RSS. Brave is recommended for reliable production search quality. The planner rejects search/fetch continuations that do not overlap the task's explicit API or product entities.
+
+Workspace controls live in `.roy/config.json`:
+
+```json
+{
+  "tools": {
+    "web": {
+      "enabled": true,
+      "searchProvider": "auto",
+      "braveApiKeyEnv": "BRAVE_SEARCH_API_KEY",
+      "timeoutMs": 15000,
+      "maxResults": 5,
+      "maxContentChars": 20000,
+      "allowHttp": false
+    },
+    "executionLoop": {
+      "enabled": true,
+      "maxRounds": 6,
+      "maxCallsPerRun": 10,
+      "maxConsecutiveFailures": 2,
+      "maxWallClockMs": 120000,
+      "maxFetchesAfterSearch": 2,
+      "llmReplanning": true
+    }
+  }
+}
+```
 
 ## Core Architecture
 
@@ -514,7 +553,7 @@ GET  /v1/traces
 
 ## Validation
 
-The test suite covers root-controlled and recursive delegation, strict nested FSM transitions, context boundaries, subteam lifecycle, candidate scoring, cache mutation, competitive budget allocation and rebalancing, provider-specific token normalization, tool approval, memory persistence, queue transitions, and CLI-facing runtime behavior.
+The test suite covers root-controlled and recursive delegation, strict nested FSM transitions, context boundaries, subteam lifecycle, candidate scoring, cache mutation, competitive budget allocation and rebalancing, provider-specific token normalization, tool approval, bounded continuous tool execution, real-provider web result parsing, SSRF defenses, evidence relevance, memory persistence, queue transitions, and CLI-facing runtime behavior.
 
 ## Contact
 

@@ -17,6 +17,8 @@ import {
   actionTemplate,
 } from '../prompts/index.js';
 import { logger } from '../utils/logger.js';
+import type { PlannedToolCall } from '../tools/planner.js';
+import type { ToolLoopCallRecord } from '../tools/executionLoop.js';
 
 export type AgentMode = 'conversational' | 'action' | 'hybrid';
 
@@ -27,6 +29,14 @@ export interface UnifiedAgentConfig extends AgentConfig {
   allowedActions?: string[];
   allowedTools?: string[];
   allowedSkills?: string[];
+}
+
+export interface AgentToolRoundPlanningInput {
+  task: string;
+  round: number;
+  remainingCalls: number;
+  tools: Array<{ name: string; description?: string; parameters?: Record<string, unknown> }>;
+  calls: ToolLoopCallRecord[];
 }
 
 export class UnifiedAgent extends BaseAgent {
@@ -61,6 +71,81 @@ export class UnifiedAgent extends BaseAgent {
     this.allowedActions = config.allowedActions ? new Set(config.allowedActions) : undefined;
     this.allowedTools = config.allowedTools ? new Set(config.allowedTools) : undefined;
     this.allowedSkills = config.allowedSkills ? new Set(config.allowedSkills) : undefined;
+  }
+
+  /**
+   * Plan another observe/act round after runtime tools have returned evidence.
+   * Runtime remains responsible for authorization and execution.
+   */
+  async planNextToolRound(input: AgentToolRoundPlanningInput): Promise<PlannedToolCall[]> {
+    if (!this.llm || input.remainingCalls <= 0 || input.tools.length === 0) return [];
+    const authorized = new Set(input.tools
+      .filter(tool => !this.allowedTools || this.allowedTools.has(tool.name))
+      .map(tool => tool.name));
+    if (authorized.size === 0) return [];
+    const observations = input.calls.slice(-4).map(call => ({
+      toolName: call.toolName,
+      params: call.params,
+      success: call.success,
+      error: call.error,
+      result: compactToolObservation(call.result, call.toolName),
+    }));
+    const messages: LLMMessage[] = [
+      {
+        role: 'system',
+        content: [
+          `You plan authorized tool calls for ${this.name}.`,
+          'Continue only when another tool call is necessary to answer the task with concrete evidence.',
+          'Never repeat an equivalent call. Search snippets are discovery evidence; fetch relevant result pages before making source-backed claims.',
+          'Reject search results that do not match the core entities and topic in the task. Never fetch an irrelevant result merely because it is available.',
+          'After two web.search calls, do not keep reformulating the same search. Fetch a likely official public URL if one can be identified, or finish with an explicit evidence limitation.',
+          'Return JSON only: {"action":"call_tools"|"finish","reason":"...","calls":[{"toolName":"...","params":{...}}]}.',
+        ].join('\n'),
+      },
+      {
+        role: 'user',
+        content: [
+          `Task:\n${input.task}`,
+          `Completed tool round: ${input.round}`,
+          `Remaining call capacity: ${input.remainingCalls}`,
+          `Authorized tools:\n${JSON.stringify(input.tools, null, 2)}`,
+          `Tool observations:\n${JSON.stringify(observations, null, 2)}`,
+        ].join('\n\n'),
+      },
+    ];
+    try {
+      const response = await this.completeJSONWithAccounting<{
+        action?: string;
+        reason?: string;
+        calls?: Array<{ toolName?: unknown; params?: unknown }>;
+      }>(messages, { temperature: 0, maxTokens: 640 });
+      if (response.action !== 'call_tools' || !Array.isArray(response.calls)) return [];
+      return response.calls
+        .filter(call => typeof call.toolName === 'string' && authorized.has(call.toolName))
+        .slice(0, input.remainingCalls)
+        .map(call => ({
+          toolName: String(call.toolName),
+          params: call.params && typeof call.params === 'object' && !Array.isArray(call.params)
+            ? call.params as Record<string, unknown>
+            : {},
+          reason: response.reason?.trim() || `Agent requested another tool round after observing round ${input.round}.`,
+          groundingRequired: true,
+        }));
+    } catch (error) {
+      logger.warn(`Agent ${this.name} could not plan another tool round:`, error);
+      if (authorized.has('web.fetch')) {
+        const urls = extractPlannerFallbackUrls(error instanceof Error ? error.message : String(error));
+        if (urls.length > 0) {
+          return urls.slice(0, input.remainingCalls).map(url => ({
+            toolName: 'web.fetch',
+            params: { url },
+            reason: 'Recovered a concrete public URL from a non-JSON tool-planning response.',
+            groundingRequired: true,
+          }));
+        }
+      }
+      return [];
+    }
   }
 
   /**
@@ -704,6 +789,71 @@ Tool-use policy:
     const doc = contextManager.get(this.name, this.sessionId);
     return doc?.content ?? '';
   }
+}
+
+function compactToolObservation(result: unknown, toolName: string): unknown {
+  if (result && typeof result === 'object' && toolName === 'web.search') {
+    const search = result as {
+      query?: unknown;
+      provider?: unknown;
+      results?: Array<{ title?: unknown; url?: unknown; snippet?: unknown }>;
+    };
+    return {
+      query: search.query,
+      provider: search.provider,
+      results: (search.results ?? []).slice(0, 5).map(item => ({
+        title: String(item.title ?? '').slice(0, 180),
+        url: String(item.url ?? '').slice(0, 500),
+        snippet: String(item.snippet ?? '').slice(0, 320),
+      })),
+    };
+  }
+  if (result && typeof result === 'object' && toolName === 'web.fetch') {
+    const page = result as {
+      finalUrl?: unknown;
+      title?: unknown;
+      text?: unknown;
+      links?: Array<{ text?: unknown; url?: unknown }>;
+    };
+    return {
+      finalUrl: page.finalUrl,
+      title: String(page.title ?? '').slice(0, 240),
+      text: String(page.text ?? '').slice(0, 1200),
+      links: (page.links ?? []).slice(0, 8).map(link => ({
+        text: String(link.text ?? '').slice(0, 120),
+        url: String(link.url ?? '').slice(0, 500),
+      })),
+    };
+  }
+  return compactObservationValue(result, 0);
+}
+
+function extractPlannerFallbackUrls(message: string): string[] {
+  const matches = message.match(/https?:\/\/[^\s<>'"`\])}]+/gi) ?? [];
+  return Array.from(new Set(matches
+    .map(url => url.replace(/[.,;:!?]+$/, ''))
+    .filter(url => {
+      try {
+        const parsed = new URL(url);
+        return parsed.protocol === 'https:' && !parsed.username && !parsed.password;
+      } catch {
+        return false;
+      }
+    })))
+    .slice(0, 3);
+}
+
+function compactObservationValue(value: unknown, depth: number): unknown {
+  if (value === undefined || value === null || typeof value === 'boolean' || typeof value === 'number') return value;
+  if (typeof value === 'string') return value.length > 500 ? `${value.slice(0, 500)}...[truncated]` : value;
+  if (depth >= 3) return '[nested value omitted]';
+  if (Array.isArray(value)) return value.slice(0, 6).map(item => compactObservationValue(item, depth + 1));
+  if (typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .slice(0, 12)
+      .map(([key, item]) => [key, compactObservationValue(item, depth + 1)]));
+  }
+  return String(value).slice(0, 500);
 }
 
 export default UnifiedAgent;

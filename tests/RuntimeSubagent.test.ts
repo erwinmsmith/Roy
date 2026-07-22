@@ -65,7 +65,75 @@ class FabricatedPathsLLM extends EchoLLM {
   }
 }
 
+class MarkdownToolIntentLLM extends EchoLLM {
+  override async *stream(messages: LLMMessage[], _options?: LLMCompletionOptions): AsyncGenerator<LLMStreamChunk, void, unknown> {
+    const prompt = messages.map(message => String(message.content)).join('\n');
+    const content = prompt.includes('Produce the final task result from the evidence above.')
+      ? 'The runtime evidence confirms package.json and the project source tree.'
+      : '```tool\nfs.read\n{"path":"package.json"}\n```';
+    yield { content, done: true, usage: { promptTokens: 20, completionTokens: 10, totalTokens: 30 } };
+  }
+}
+
 describe('Runtime controlled subagent spawning', () => {
+  it('keeps web tool enablement scoped to each runtime workspace', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-web-scope-'));
+    const bootstrap = new Runtime();
+    await bootstrap.initialize({
+      sessionId: 'web-scope-bootstrap',
+      llmProvider: new EchoLLM(),
+      workspaceCwd,
+    });
+    expect(bootstrap.getAgentPolicy('root')?.tools.map(tool => tool.name)).toEqual(expect.arrayContaining([
+      'web.search', 'web.fetch',
+    ]));
+    await bootstrap.shutdown();
+
+    const configPath = path.join(workspaceCwd, '.roy', 'config.json');
+    const workspaceConfig = JSON.parse(await readFile(configPath, 'utf8')) as { tools: { web: { enabled: boolean } } };
+    workspaceConfig.tools.web.enabled = false;
+    await writeFile(configPath, `${JSON.stringify(workspaceConfig, null, 2)}\n`, 'utf8');
+
+    const disabled = new Runtime();
+    await disabled.initialize({
+      sessionId: 'web-scope-disabled',
+      llmProvider: new EchoLLM(),
+      workspaceCwd,
+    });
+    expect(disabled.getAgentPolicy('root')?.tools.map(tool => tool.name)).not.toContain('web.search');
+    expect(disabled.getAgentPolicy('root')?.tools.map(tool => tool.name)).not.toContain('web.fetch');
+    await expect(disabled.executeToolForAgent('root', 'web.fetch', { url: 'https://example.com' })).resolves.toMatchObject({
+      success: false,
+      error: expect.stringContaining('not authorized'),
+    });
+    await disabled.shutdown();
+  });
+
+  it('repairs Markdown tool requests instead of presenting them as final output', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-markdown-tool-intent-'));
+    await writeFile(path.join(workspaceCwd, 'package.json'), '{"name":"tool-repair-test"}\n', 'utf8');
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'markdown-tool-intent-test',
+      llmProvider: new MarkdownToolIntentLLM(),
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+    const agent = await runtime.spawnAgent({
+      parentId: 'root', archetype: 'researcher', tomLevel: 0,
+      description: 'Inspect package exports.', task: 'Inspect package exports.',
+    });
+
+    const result = await runtime.runAgent(agent.identity.id, 'Inspect package exports.', {
+      archetype: 'researcher', disableRecursiveDelegation: true,
+    });
+
+    expect(result.result).not.toContain('```tool');
+    expect(result.result).toContain('package.json');
+    expect(runtime.getEvents().map(event => event.type)).toContain('agent.output.repair.completed');
+    await runtime.shutdown();
+  });
+
   it('rejects a model report that contradicts runtime filesystem evidence', async () => {
     const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-grounding-contradiction-'));
     await writeFile(path.join(workspaceCwd, 'package.json'), '{"name":"typescript-project"}\n', 'utf8');
@@ -365,6 +433,33 @@ describe('Runtime controlled subagent spawning', () => {
     expect(researcher?.spawnPolicy.maxChildren).toBe(5);
     expect(researcher?.spawnPolicy.maxDepth).toBe(3);
 
+    await runtime.shutdown();
+  });
+
+  it('grants web tools only to an agent whose assigned task requires web evidence', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-web-capability-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'web-capability-test',
+      llmProvider: new EchoLLM(),
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+
+    const localAgent = await runtime.spawnAgent({
+      parentId: 'root', archetype: 'researcher', tomLevel: 0,
+      description: 'Inspect local project files.', task: 'Inspect local project files.',
+    });
+    const webAgent = await runtime.spawnAgent({
+      parentId: 'root', archetype: 'researcher', tomLevel: 0,
+      description: 'Search the web for the latest official Node.js documentation.',
+      task: 'Search the web for the latest official Node.js documentation.',
+    });
+
+    expect(runtime.getAgentPolicy(localAgent.identity.id)?.tools.map(tool => tool.name)).toEqual(['fs.list', 'fs.read']);
+    expect(runtime.getAgentPolicy(webAgent.identity.id)?.tools.map(tool => tool.name)).toEqual([
+      'fs.list', 'fs.read', 'web.search', 'web.fetch',
+    ]);
     await runtime.shutdown();
   });
 

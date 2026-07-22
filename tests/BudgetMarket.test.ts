@@ -267,7 +267,7 @@ describe('Phase 5 budget market', () => {
     const events = runtime.getEvents().map(event => event.type);
     expect(events).toEqual(expect.arrayContaining(['budget.requested', 'budget.allocated', 'budget.consumed', 'budget.settled']));
     expect(llm.lastMaxTokens).toBeGreaterThan(0);
-    expect(llm.lastMaxTokens).toBeLessThanOrEqual(2400);
+    expect(llm.lastMaxTokens).toBe(3584);
     await runtime.shutdown();
   });
 
@@ -296,7 +296,7 @@ describe('Phase 5 budget market', () => {
     expect(soloAllocation?.consumedTokens).toBe(30);
     expect(soloAllocation?.usage?.totalTokens).toBe(200);
     expect(runtime.getBudgetMarketState().usedTokens).toBeGreaterThan(30);
-    expect(llm.lastMaxTokens).toBe(2400);
+    expect(llm.lastMaxTokens).toBe(3584);
     await runtime.shutdown();
   });
 });

@@ -38,6 +38,20 @@ class PlanningLLM implements LLMProvider {
   }
 }
 
+class NonJSONWebPlanningLLM extends PlanningLLM {
+  constructor() {
+    super('none');
+  }
+
+  override async completeJSON<T>(): Promise<T> {
+    throw new Error([
+      'Failed to parse JSON response. Fetch these likely official sources:',
+      'https://nodejs.org/docs/latest/api/globals.html#fetch',
+      'https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal/timeout_static',
+    ].join('\n'));
+  }
+}
+
 class EchoTool implements Tool {
   readonly name = 'echo-tool';
   readonly description = 'Echoes a value';
@@ -237,5 +251,37 @@ describe('UnifiedAgent capability execution', () => {
     expect(llm.jsonCalls).toBe(0);
     expect((await queue.receive('env'))?.content).not.toContain('tool:hello');
     expect(agent.getInfo().error).toBeUndefined();
+  });
+
+  it('recovers authorized public URLs from a non-JSON tool-planning response', async () => {
+    const agent = new UnifiedAgent({
+      name: 'web-researcher',
+      goal: 'collect web evidence',
+      llm: new NonJSONWebPlanningLLM(),
+      mode: 'hybrid',
+      allowedTools: ['web.search', 'web.fetch'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: 'Open official Node.js and MDN documentation.',
+      round: 1,
+      remainingCalls: 2,
+      tools: [{ name: 'web.search' }, { name: 'web.fetch' }],
+      calls: [{
+        toolName: 'web.search', params: { query: 'Node.js fetch' }, reason: 'search',
+        groundingRequired: true, success: true, result: { results: [] },
+      }],
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'web.fetch',
+        params: { url: 'https://nodejs.org/docs/latest/api/globals.html#fetch' },
+      }),
+      expect.objectContaining({
+        toolName: 'web.fetch',
+        params: { url: 'https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal/timeout_static' },
+      }),
+    ]);
   });
 });

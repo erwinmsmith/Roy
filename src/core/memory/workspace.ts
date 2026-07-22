@@ -225,6 +225,25 @@ export interface WorkspaceRuntimeConfig {
       execute: 'auto' | 'ask' | 'deny';
       overrides: Record<string, 'auto' | 'ask' | 'deny'>;
     };
+    web: {
+      enabled: boolean;
+      searchProvider: 'auto' | 'brave' | 'bing';
+      braveApiKeyEnv: string;
+      timeoutMs: number;
+      maxResults: number;
+      maxContentChars: number;
+      allowHttp: boolean;
+      userAgent: string;
+    };
+    executionLoop: {
+      enabled: boolean;
+      maxRounds: number;
+      maxCallsPerRun: number;
+      maxConsecutiveFailures: number;
+      maxWallClockMs: number;
+      maxFetchesAfterSearch: number;
+      llmReplanning: boolean;
+    };
   };
   lifecycle: LifecyclePolicyDefaults;
   teams: {
@@ -469,7 +488,7 @@ Role-specific terms are recorded here.
 };
 
 const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
-  version: 8,
+  version: 9,
   traceEvents: true,
   memoryUpdates: 'suggest',
   delegation: {
@@ -568,6 +587,25 @@ const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
       write: 'ask',
       execute: 'ask',
       overrides: {},
+    },
+    web: {
+      enabled: true,
+      searchProvider: 'auto',
+      braveApiKeyEnv: 'BRAVE_SEARCH_API_KEY',
+      timeoutMs: 15_000,
+      maxResults: 5,
+      maxContentChars: 20_000,
+      allowHttp: false,
+      userAgent: 'RoyRuntime/0.1 (+https://github.com/erwinmsmith/Roy)',
+    },
+    executionLoop: {
+      enabled: true,
+      maxRounds: 6,
+      maxCallsPerRun: 10,
+      maxConsecutiveFailures: 2,
+      maxWallClockMs: 120_000,
+      maxFetchesAfterSearch: 2,
+      llmReplanning: true,
     },
   },
   lifecycle: {

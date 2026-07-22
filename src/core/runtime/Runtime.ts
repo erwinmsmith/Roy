@@ -31,7 +31,15 @@ import { signalBus } from '../executor/SignalBus.js';
 import { UnifiedAgent } from '../agent/UnifiedAgent.js';
 import type { AgentInfo, AgentUsage, BaseAgent, ToMProfile } from '../agent/BaseAgent.js';
 import { actionRegistry } from '../actions/index.js';
-import { registerCoreTools, toolRegistry } from '../tools/index.js';
+import {
+  AgentToolExecutionLoop,
+  WebFetchTool,
+  WebSearchTool,
+  registerCoreTools,
+  toolRegistry,
+  type Tool,
+  type ToolLoopSummary,
+} from '../tools/index.js';
 import { skillRegistry } from '../skills/index.js';
 import { DelegateToSubagentSkill } from '../skills/delegation.js';
 import type {
@@ -106,7 +114,7 @@ import {
 } from '../team/index.js';
 import { ToolApprovalManager, type ToolApprovalRequest } from '../tools/approval.js';
 import type { ToolResult } from '../tools/types.js';
-import { AgentToolPlanner } from '../tools/planner.js';
+import { AgentToolPlanner, type PlannedToolCall } from '../tools/planner.js';
 import {
   InMemoryMessageQueue,
   MessageScheduler,
@@ -406,12 +414,16 @@ export interface RunAgentResult {
   evidence: RunEvidence;
   grounded: boolean;
   warnings: string[];
+  toolLoop?: ToolLoopSummary;
 }
 
 export interface RunEvidence {
   toolGrounded: boolean;
   outputGrounded: boolean;
   observedPaths: string[];
+  observedUrls?: string[];
+  relevantObservedUrls?: string[];
+  discoveredUrls?: string[];
   toolResultSummary?: string;
 }
 
@@ -420,6 +432,9 @@ export interface ToolCallRecord {
   params: Record<string, unknown>;
   result?: unknown;
   success: boolean;
+  error?: string;
+  reason?: string;
+  round?: number;
 }
 
 export interface SpawnCommandPayload {
@@ -612,6 +627,7 @@ export class Runtime {
   private agentBudgetLimits = new Map<string, number>();
   private toolApprovalManager: ToolApprovalManager | null = null;
   private toolCallCounts = new Map<string, number>();
+  private runtimeToolOverrides = new Map<string, Tool>();
   private readonly teams = new TeamRegistry();
   private teamMemberPlans = new Map<string, TeamMemberSpec[]>();
   private readonly toolPlanner = new AgentToolPlanner();
@@ -689,11 +705,17 @@ export class Runtime {
 
     // Create AgentManager
     const manager = new AgentManager();
-    registerCoreTools();
-    this.registerCoreSkills();
     const memory = new WorkspaceMemoryManager();
     await memory.initWorkspace(options.workspaceCwd ?? process.cwd(), options.sessionId ?? 'main');
     this.workspaceRuntimeConfig = await memory.getWorkspaceConfig();
+    registerCoreTools({ web: this.workspaceRuntimeConfig.tools.web });
+    this.runtimeToolOverrides.clear();
+    if (this.workspaceRuntimeConfig.tools.web.enabled) {
+      const webConfig = this.workspaceRuntimeConfig.tools.web;
+      this.runtimeToolOverrides.set('web.search', new WebSearchTool(webConfig));
+      this.runtimeToolOverrides.set('web.fetch', new WebFetchTool(webConfig));
+    }
+    this.registerCoreSkills();
     this.tomPlanner = options.tomPlanner ?? new ToMDelegationPlanner();
     this.reasoningInvestmentModel = options.reasoningInvestmentModel ?? new WeightedReasoningInvestmentModel();
     const communication = new AgentCommunicationManager(
@@ -851,6 +873,7 @@ export class Runtime {
     this.agentBudgetLimits.clear();
     this.budgetMarket = null;
     this.toolApprovalManager = null;
+    this.runtimeToolOverrides.clear();
     this.toolCallCounts.clear();
     this.teams.clear();
     this.teamMemberPlans.clear();
@@ -1659,7 +1682,7 @@ export class Runtime {
     if (!spec.task.trim()) throw new Error('Team member task is required');
     const normalizedSpec: TeamMemberSpec = {
       ...spec,
-      tools: spec.tools ?? this.getDefaultToolBindings(spec.archetype).map(binding => binding.name),
+      tools: spec.tools ?? this.getToolBindingsForTask(spec.archetype, spec.task).map(binding => binding.name),
       skills: spec.skills ?? this.getDefaultSkillBindings(spec.archetype).map(binding => binding.name),
       tomLevel: spec.tomLevel ?? this.createSubagentToMProfile(
         spec.archetype,
@@ -2053,7 +2076,8 @@ export class Runtime {
     if (!agent) return { success: false, error: `Agent "${agentId}" not found` };
     const binding = (this.agentBindings.get(agentId)?.tools ?? []).find(item => item.name === toolName && item.enabled);
     if (!binding) return { success: false, error: `Tool "${toolName}" is not authorized for agent "${agentId}"` };
-    if (!toolRegistry.has(toolName)) return { success: false, error: `Tool "${toolName}" not found` };
+    const runtimeTool = this.runtimeToolOverrides.get(toolName);
+    if (!runtimeTool && !toolRegistry.has(toolName)) return { success: false, error: `Tool "${toolName}" not found` };
 
     const callKey = `${agentId}:${toolName}`;
     const calls = this.toolCallCounts.get(callKey) ?? 0;
@@ -2143,7 +2167,9 @@ export class Runtime {
       nodeId: options.nodeId,
       data: { toolName, params, correlationId: options.correlationId },
     });
-    const result = await toolRegistry.execute(toolName, params);
+    const result = runtimeTool
+      ? await this.executeRuntimeTool(runtimeTool, params)
+      : await toolRegistry.execute(toolName, params);
     this.toolCallCounts.set(callKey, calls + 1);
     const resultMessage = await this.enqueueMessage({
       kind: 'tool.result',
@@ -2217,10 +2243,10 @@ export class Runtime {
     }
     if (this.workspaceRuntimeConfig?.budgetMarket.enabled === false) return undefined;
     if (!this.budgetMarket) throw new Error('Budget market is not initialized');
-    const requestedTokens = input.requestedTokens ?? this.estimateAgentBudget(input.archetype);
+    const requestedTokens = input.requestedTokens ?? this.estimateAgentBudget(input.archetype, input.purpose);
     const requesterId = input.requesterId ?? `${input.parentId}:${input.archetype}`;
     const analysis = input.correlationId ? this.tomAnalyses.get(input.correlationId) : undefined;
-    const tools = this.getDefaultToolBindings(input.archetype).filter(binding => binding.enabled).length;
+    const tools = this.getToolBindingsForTask(input.archetype, input.purpose).filter(binding => binding.enabled).length;
     const cachedPattern = await this.getContext().memory.findAgentPattern(input.archetype);
     const evaluation = cachedPattern?.evaluation && typeof cachedPattern.evaluation === 'object'
       ? cachedPattern.evaluation as Record<string, unknown>
@@ -2350,7 +2376,7 @@ export class Runtime {
       : Math.max(0, allocatedTokens);
   }
 
-  private synthesisCompletionTokenBudget(visibleOutputTokens: number): number {
+  private reasoningAwareCompletionTokenBudget(visibleOutputTokens: number): number {
     const llm = this.getContext().llm;
     const family = `${llm?.name ?? ''}/${llm?.defaultModel ?? ''}`.toLowerCase();
     const usesSharedReasoningBudget = family.includes('deepseek')
@@ -2713,8 +2739,8 @@ export class Runtime {
     }
   }
 
-  private estimateAgentBudget(archetype: SubAgentArchetype): number {
-    return this.workspaceRuntimeConfig?.budgetMarket.defaultRequestsByArchetype[archetype] ?? ({
+  private estimateAgentBudget(archetype: SubAgentArchetype, purpose = ''): number {
+    const configured = this.workspaceRuntimeConfig?.budgetMarket.defaultRequestsByArchetype[archetype] ?? ({
       researcher: 2200,
       critic: 1600,
       planner: 1400,
@@ -2723,6 +2749,10 @@ export class Runtime {
       tester: 1800,
       custom: 1800,
     }[archetype]);
+    if (!this.taskNeedsWebAccess(purpose)) return configured;
+    const requiredSources = Math.max(1, this.requiredWebFetchCount(purpose));
+    const webResearchFloor = 8000 + requiredSources * 4000;
+    return Math.max(configured, webResearchFloor);
   }
 
   private defaultBudgetUtility(archetype: SubAgentArchetype): number {
@@ -2730,7 +2760,22 @@ export class Runtime {
   }
 
   private getRootToolBindings(): ToolBinding[] {
-    return toolRegistry.list().map(tool => this.createToolBinding(tool.name));
+    const webEnabled = this.workspaceRuntimeConfig?.tools.web.enabled !== false;
+    return toolRegistry.list()
+      .filter(tool => webEnabled || !tool.name.startsWith('web.'))
+      .map(tool => this.createToolBinding(tool.name));
+  }
+
+  private async executeRuntimeTool(tool: Tool, params: Record<string, unknown>): Promise<ToolResult> {
+    try {
+      const validation = tool.validate?.(params);
+      if (validation && !validation.valid) {
+        return { success: false, error: `Validation failed: ${validation.errors?.join(', ')}` };
+      }
+      return await tool.execute(params);
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
   }
 
   private getRootSkillBindings(): SkillBinding[] {
@@ -2751,9 +2796,20 @@ export class Runtime {
     return (configured ?? namesByArchetype[archetype]).map(name => this.createToolBinding(name));
   }
 
-  private getAutomaticallyApprovedToolBindings(archetype: SubAgentArchetype): ToolBinding[] {
+  private getToolBindingsForTask(archetype: SubAgentArchetype, task: string): ToolBinding[] {
+    const bindings = this.getDefaultToolBindings(archetype);
+    if (!this.taskNeedsWebAccess(task) || this.workspaceRuntimeConfig?.tools.web.enabled === false) return bindings;
+    const names = new Set(bindings.map(binding => binding.name));
+    for (const name of ['web.search', 'web.fetch']) {
+      if (!names.has(name) && toolRegistry.has(name)) bindings.push(this.createToolBinding(name));
+    }
+    return bindings;
+  }
+
+  private getAutomaticallyApprovedToolBindings(archetype: SubAgentArchetype, task?: string): ToolBinding[] {
     const approval = this.workspaceRuntimeConfig?.tools.approval;
-    return this.getDefaultToolBindings(archetype).filter(binding => {
+    const bindings = task ? this.getToolBindingsForTask(archetype, task) : this.getDefaultToolBindings(archetype);
+    return bindings.filter(binding => {
       if (!approval) return binding.permission === 'read_only';
       const decision = approval.overrides[binding.name]
         ?? (binding.permission === 'read_only'
@@ -2761,6 +2817,14 @@ export class Runtime {
           : binding.permission === 'write' ? approval.write : approval.execute);
       return decision === 'auto';
     });
+  }
+
+  private taskNeedsWebAccess(task: string): boolean {
+    const lower = task.toLowerCase();
+    return /https?:\/\//.test(task)
+      || /\b(?:web|internet|online|website|search|browse|news|up-to-date|citations?|official documentation|public documentation)\b/.test(lower)
+      || /\blatest\b[\s\S]*\b(?:documentation|release|version|news|announcement|api)\b/.test(lower)
+      || /\b(?:research|compare|verify)\b[\s\S]*\b(?:external|official|independent)\s+sources?\b/.test(lower);
   }
 
   private getDefaultSkillBindings(archetype: SubAgentArchetype): SkillBinding[] {
@@ -3771,6 +3835,21 @@ export class Runtime {
             correlationId,
             data: { stepId: step.id, error: message },
           });
+          if (subagents.length > 0 || teamResults.length > 0) {
+            this.emit({
+              type: 'root.step.recovered',
+              agentId: 'root',
+              correlationId,
+              data: {
+                stepId: step.id,
+                error: message,
+                recovery: 'synthesize_completed_prior_steps',
+                completedSubagents: subagents.length,
+                completedTeams: teamResults.length,
+              },
+            });
+            break;
+          }
           throw error;
         }
         subagents.push(...round.subagents);
@@ -4129,7 +4208,7 @@ export class Runtime {
 
     const cachedTools = this.stringArray(cachedAgentPattern?.tools);
     const cachedSkills = this.stringArray(cachedAgentPattern?.skills);
-    const defaultToolBindings = this.getDefaultToolBindings(request.archetype);
+    const defaultToolBindings = this.getToolBindingsForTask(request.archetype, request.task);
     const defaultTools = defaultToolBindings.map(item => item.name);
     const defaultReadOnlyTools = defaultToolBindings
       .filter(item => item.permission === 'read_only')
@@ -4506,6 +4585,7 @@ export class Runtime {
         grounded: subagentResult.grounded,
         warnings: subagentResult.warnings,
         toolCalls: subagentResult.toolCalls.map(call => call.toolName),
+        toolLoop: subagentResult.toolLoop,
         evidence: subagentResult.evidence,
         nodeId: node.nodeId,
         definitionFingerprint: node.definitionFingerprint,
@@ -4629,7 +4709,10 @@ export class Runtime {
     if (spec.parentId !== 'root') {
       await this.prepareParentForDelegation(spec.parentId, creationCorrelationId, spec.task ?? spec.description);
     }
-    const toolBindings = this.normalizeToolBindings(spec.tools, spec.archetype)
+    const toolBindings = this.normalizeToolBindings(
+      spec.tools ?? this.getToolBindingsForTask(spec.archetype, spec.task ?? spec.description),
+      spec.archetype
+    )
       .filter(binding => binding.enabled);
     const skillBindings = this.normalizeSkillBindings(spec.skills, spec.archetype)
       .filter(binding => binding.enabled);
@@ -5328,13 +5411,15 @@ export class Runtime {
           },
         });
       }
-      const grounding = await this.runGroundingCheck(agentId, task, options);
-      if (grounding.toolCalls.length > 0) {
-        await this.transitionAgentFsm(agentId, 'S_tool_calling', {
-          toolCalls: grounding.toolCalls.map(call => call.toolName),
-          correlationId: options.correlationId,
-        });
-      }
+      const grounding = await this.runGroundingCheck(agentId, task, {
+        ...options,
+        onBeforeExecution: async initialPlans => {
+          await this.transitionAgentFsm(agentId, 'S_tool_calling', {
+            toolCalls: initialPlans.map(call => call.toolName),
+            correlationId: options.correlationId,
+          });
+        },
+      });
       await this.transitionAgentFsm(agentId, 'S_reasoning', { task, correlationId: options.correlationId });
       this.emit({ type: 'agent.llm.called', agentId, data: { task } });
       const communicationContext = agent.getCommunicationContext();
@@ -5446,6 +5531,7 @@ export class Runtime {
           grounded: grounding.grounded && evidence.outputGrounded,
           evidence,
           warnings,
+          toolLoop: grounding.toolLoop,
         },
       });
       await this.transitionAgentFsm(agentId, 'S_done', { correlationId: options.correlationId });
@@ -5469,6 +5555,7 @@ export class Runtime {
         evidence,
         grounded: grounding.grounded && evidence.outputGrounded,
         warnings,
+        toolLoop: grounding.toolLoop,
       };
       await this.finalizeActorLifecycle(agentId, 'success', options.correlationId);
       return runResult;
@@ -6120,7 +6207,10 @@ export class Runtime {
       cachedPatterns: [...agentPatterns, ...delegationPatterns],
       allowedToolsByArchetype: Object.fromEntries(archetypes.map(archetype => [
         archetype,
-        this.getAutomaticallyApprovedToolBindings(archetype).map(binding => binding.name),
+        this.getAutomaticallyApprovedToolBindings(
+          archetype,
+          completedPlans.filter(plan => plan.archetype === archetype).map(plan => plan.task).join('\n')
+        ).map(binding => binding.name),
       ])),
       allowedSkillsByArchetype: Object.fromEntries(archetypes.map(archetype => [
         archetype,
@@ -6844,13 +6934,22 @@ Do not repeat an existing agent task. Delegate only work that depends on prior-s
     }
     if (input.action === 'delegate_more' && Array.isArray((input as { agents?: unknown[] }).agents)) {
       const seen = new Set(completedTasks.map(item => item.toLowerCase()));
+      const webTask = this.taskNeedsWebAccess(userTask);
       const agents = (input as { agents: Array<Partial<DelegationAgentPlan>> }).agents
         .filter(item => this.isValidArchetype(String(item.archetype)))
         .map((item): DelegationAgentPlan => ({
           archetype: String(item.archetype) as SubAgentArchetype,
           name: typeof item.name === 'string' ? item.name : undefined,
-          task: typeof item.task === 'string' && item.task.trim() ? item.task.trim() : userTask,
-          tools: Array.isArray(item.tools) ? item.tools.filter((tool): tool is string => typeof tool === 'string') : undefined,
+          task: webTask
+            ? `${typeof item.task === 'string' && item.task.trim() ? item.task.trim() : userTask}\nThis is a continuation of the original public-web task. Use web.search/web.fetch rather than treating product or domain names as local file paths.`
+            : typeof item.task === 'string' && item.task.trim() ? item.task.trim() : userTask,
+          tools: webTask
+            ? Array.from(new Set([
+              ...(Array.isArray(item.tools) ? item.tools.filter((tool): tool is string => typeof tool === 'string' && !tool.startsWith('fs.')) : []),
+              'web.search',
+              'web.fetch',
+            ]))
+            : Array.isArray(item.tools) ? item.tools.filter((tool): tool is string => typeof tool === 'string') : undefined,
           skills: Array.isArray(item.skills) ? item.skills.filter((skill): skill is string => typeof skill === 'string') : undefined,
           tomLevel: typeof item.tomLevel === 'number' ? item.tomLevel : undefined,
           budgetTokens: typeof item.budgetTokens === 'number' ? item.budgetTokens : undefined,
@@ -6881,6 +6980,7 @@ Do not repeat an existing agent task. Delegate only work that depends on prior-s
     userTask: string,
     subagents: RootMediatedSpawnResult[]
   ): { target: string; reason: string; plan: DelegationAgentPlan } | undefined {
+    if (this.taskNeedsWebAccess(userTask)) return undefined;
     const targets = [...new Set(
       [...userTask.matchAll(/(?:^|\s|[`'"])([./]?[a-zA-Z0-9_-]+\.(?:json|ya?ml|toml|md|ts|tsx|js|jsx|mjs|cjs))(?=\s|[,.!?;:`'"]|$)/g)]
         .map(match => match[1])
@@ -7026,6 +7126,11 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
             `<user_task>${userInput}</user_task>`,
             `<memory_context>${this.formatPublicContext(rootContext).slice(0, 6000)}</memory_context>`,
             `<budget_state>${JSON.stringify(this.getBudgetState(), null, 2)}</budget_state>`,
+            `<runtime_capabilities>${JSON.stringify({
+              tools: toolRegistry.list().map(tool => tool.name),
+              skills: skillRegistry.list().map(skill => skill.name),
+              webEnabled: this.workspaceRuntimeConfig?.tools.web.enabled !== false,
+            }, null, 2)}</runtime_capabilities>`,
             '<runtime_policy>Subagents must be runtime actors with identity, state, budget, messages, and events. Each agent must fill a distinct cognitive gap, receive a concrete non-overlapping task, and expose why it exists. The runtime will validate and enrich the ToM profiles. If budget is limited, reduce the number of subagents or solve directly and explain the constraint.</runtime_policy>',
           ].join('\n\n'),
         },
@@ -7255,11 +7360,19 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
         && (item as { question: string }).question.trim()
         ? (item as { question: string }).question.trim()
         : 'What exactly would you like Roy to improve: code, architecture, documentation, tests, or runtime behavior?';
+      const reason = typeof item.reason === 'string' && item.reason.trim()
+        ? item.reason.trim()
+        : 'The task is too ambiguous to safely delegate.';
+      if (this.taskNeedsWebAccess(userInput)
+        && /\b(?:tool|internet|network|browser|curl|wget|web access|permission|available)\b/i.test(`${reason} ${question}`)
+        && this.workspaceRuntimeConfig?.tools.web.enabled !== false
+        && toolRegistry.get('web.search')
+        && toolRegistry.get('web.fetch')) {
+        return this.fallbackDelegationDecision(userInput);
+      }
       return {
         action: 'ask_clarification',
-        reason: typeof item.reason === 'string' && item.reason.trim()
-          ? item.reason.trim()
-          : 'The task is too ambiguous to safely delegate.',
+        reason,
         question,
       };
     }
@@ -7328,7 +7441,19 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     const asksCode = /\b(code|implement|fix|modify|change|patch)\b/.test(lower);
     const agents: DelegationAgentPlan[] = [];
 
-    if (asksProjectInspection) {
+    if (this.taskNeedsWebAccess(userInput)) {
+      agents.push({
+        archetype: 'researcher',
+        name: 'WebResearcher-1',
+        task: `Use web.search and web.fetch to collect task-relevant public evidence, then return a source-backed report for: ${userInput}`,
+        tools: ['web.search', 'web.fetch'],
+        skills: ['use_tool_when_needed'],
+        tomLevel: 0,
+        existenceReason: 'Collect and open current public-web evidence that Roy cannot establish from local memory.',
+      });
+    }
+
+    if (asksProjectInspection && !this.taskNeedsWebAccess(userInput)) {
       agents.push({
         archetype: 'researcher',
         name: 'Researcher-1',
@@ -7421,6 +7546,13 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     const grounding = await this.runGroundingCheck('root', userInput, { correlationId, archetype: 'custom' });
     this.emit({ type: 'agent.llm.called', agentId: 'root', data: { purpose: 'root.solo_reasoning', correlationId } });
     const response = await this.completeAsRoot(this.buildGroundedTask(userInput, grounding), 'root.solo_reasoning', correlationId);
+    const groundedResponse = await this.enforceRootEvidenceBoundary(
+      response,
+      userInput,
+      [grounding.evidence],
+      correlationId,
+      'root.solo_reasoning'
+    );
     const usageAfter = ctx.agent.getUsage();
     const usageDelta = this.usageDifference(usageBefore, usageAfter);
     this.recordTurnUsage(usageDelta);
@@ -7428,7 +7560,7 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     ctx.agent.setRuntimeState('idle');
     this.emit({ type: 'agent.status.changed', agentId: 'root', data: { to: 'idle', correlationId } });
     this.emit({ type: 'root.solo.completed', agentId: 'root', data: { correlationId, totalTokens: usageDelta.totalTokens } });
-    if (response.trim()) return response;
+    if (groundedResponse.trim()) return groundedResponse;
     this.emit({
       type: 'root.completion.fallback',
       agentId: 'root',
@@ -7484,10 +7616,7 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
       { role: 'user', content: effectivePrompt },
     ];
     const estimatedInputTokens = this.estimateTextTokens(messages.map(message => message.content).join('\n'));
-    const visibleCompletionTokens = 512;
-    const completionTokens = purpose.includes('synthesis')
-      ? this.synthesisCompletionTokenBudget(visibleCompletionTokens)
-      : visibleCompletionTokens;
+    const completionTokens = this.reasoningAwareCompletionTokenBudget(512);
     const allocation = await this.requestAgentBudget({
       parentId: 'root',
       requesterId: 'root',
@@ -7658,7 +7787,7 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
       'root.multi_agent_synthesis',
       correlationId
     );
-    const finalResponse = response.trim()
+    let finalResponse = response.trim()
       ? response
       : this.buildRootSynthesisFallback(
         userTask,
@@ -7677,6 +7806,13 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
         },
       });
     }
+    finalResponse = await this.enforceRootEvidenceBoundary(
+      finalResponse,
+      userTask,
+      results.map(result => result.subagentResult.evidence),
+      correlationId,
+      'root.multi_agent_synthesis'
+    );
     const usageAfter = ctx.agent.getUsage();
     const usageDelta = this.usageDifference(usageBefore, usageAfter);
     this.recordTurnUsage(usageDelta);
@@ -7716,6 +7852,12 @@ output_grounded: ${result.subagentResult.evidence.outputGrounded}
 tool_calls: ${result.subagentResult.toolCalls.map(call => call.toolName).join(', ') || 'none'}
 observed_paths:
 ${result.subagentResult.evidence.observedPaths.slice(0, 40).map(item => `- ${item}`).join('\n') || '- none'}
+observed_urls:
+${(result.subagentResult.evidence.observedUrls ?? []).slice(0, 20).map(item => `- ${item}`).join('\n') || '- none'}
+task_relevant_observed_urls:
+${(result.subagentResult.evidence.relevantObservedUrls ?? []).slice(0, 20).map(item => `- ${item}`).join('\n') || '- none'}
+discovered_urls:
+${(result.subagentResult.evidence.discoveredUrls ?? []).slice(0, 20).map(item => `- ${item}`).join('\n') || '- none'}
 tool_result_summary:
 ${result.subagentResult.evidence.toolResultSummary?.slice(0, 6000) || 'none'}
 warnings:
@@ -7744,6 +7886,7 @@ ${userTask}
 Roy delegated this task to ${results.length} subagent(s). Synthesize their results into one final user-facing response.
 Use concrete evidence from grounded reports. If a report is ungrounded or missing concrete tool output, say so and avoid overstating it.
 Compare each agent's belief scope and perspective against the cognitive gaps it was created to fill. Preserve unresolved uncertainty instead of forcing agreement.
+For web-grounded work, cite only observed_urls from the reports. Never introduce a URL or factual detail from model memory. Search-result discovered_urls are not opened evidence.
 
 ${teamReports ? `The following subteam reports have already aggregated their direct members. Treat them as the primary delegation result.\n\n${teamReports}` : ''}
 
@@ -9030,6 +9173,8 @@ Produce the final response to the user as Roy, the root agent.`;
       `tool_grounded: ${member.evidence.toolGrounded}`,
       `output_grounded: ${member.evidence.outputGrounded}`,
       `observed_paths: ${JSON.stringify(member.evidence.observedPaths)}`,
+      `observed_urls: ${JSON.stringify(member.evidence.observedUrls ?? [])}`,
+      `discovered_urls: ${JSON.stringify(member.evidence.discoveredUrls ?? [])}`,
       `tool_result_summary:\n${(member.evidence.toolResultSummary ?? 'none').slice(0, 5000)}`,
       `tom_profile: ${JSON.stringify(member.agent.identity.tomProfile)}`,
       'member_report:',
@@ -9055,7 +9200,7 @@ Produce the final response to the user as Roy, the root agent.`;
       'Reconcile member beliefs explicitly, preserve unresolved uncertainty, and explain how the final result covers the team cognitive gaps.',
       'Give the lead report coordination priority, but verify it against all available member evidence.',
       'If member failures are present, state their impact and do not imply full team completion.',
-      'The structured observed_paths and tool_result_summary fields are the authoritative evidence boundary.',
+      'The structured observed_paths, observed_urls, and tool_result_summary fields are the authoritative evidence boundary.',
       'Do not infer file contents merely because a path was observed. Do not invent example values and present them as observations.',
       'A member report claim is usable only when supported by that member structured evidence or clearly labeled as analysis.',
       'Do not claim any tool call, file read, command output, or project fact absent from the structured member evidence.',
@@ -9095,7 +9240,7 @@ Produce the final response to the user as Roy, the root agent.`;
       };
     }
     const estimatedPromptTokens = this.estimateTextTokens(`${systemPrompt}\n${prompt}`);
-    const completionTokenBudget = this.synthesisCompletionTokenBudget(1024);
+    const completionTokenBudget = this.reasoningAwareCompletionTokenBudget(1024);
     const allocation = await this.requestTeamSynthesisBudget({
       team,
       correlationId,
@@ -9332,7 +9477,7 @@ Produce the final response to the user as Roy, the root agent.`;
       communicationContext,
       `user:${prompt}`,
     ].filter(Boolean).join('\n'));
-    const requestedCompletionTokens = this.synthesisCompletionTokenBudget(512);
+    const requestedCompletionTokens = this.reasoningAwareCompletionTokenBudget(512);
     const requiredTokens = this.budgetRequestTokens(estimatedInputTokens, requestedCompletionTokens);
     const marketRemaining = Math.max(0, allocation.allocatedTokens - allocation.consumedTokens);
     const agentRemaining = agent.getCompletionTokenLimit();
@@ -9415,6 +9560,10 @@ Grounding:
 - tool calls: ${childResult.toolCalls.map(call => call.toolName).join(', ') || 'none'}
 - observed paths:
 ${childResult.evidence.observedPaths.slice(0, 30).map(item => `  - ${item}`).join('\n') || '  none'}
+- observed URLs:
+${(childResult.evidence.observedUrls ?? []).slice(0, 20).map(item => `  - ${item}`).join('\n') || '  none'}
+- discovered URLs (search results not necessarily fetched):
+${(childResult.evidence.discoveredUrls ?? []).slice(0, 20).map(item => `  - ${item}`).join('\n') || '  none'}
 - warnings:
 ${warnings}
 
@@ -9443,6 +9592,10 @@ output_grounded: ${result.subagentResult.evidence.outputGrounded}
 tool_calls: ${result.subagentResult.toolCalls.map(call => call.toolName).join(', ') || 'none'}
 observed_paths:
 ${result.subagentResult.evidence.observedPaths.slice(0, 30).map(item => `- ${item}`).join('\n') || '- none'}
+observed_urls:
+${(result.subagentResult.evidence.observedUrls ?? []).slice(0, 20).map(item => `- ${item}`).join('\n') || '- none'}
+discovered_urls:
+${(result.subagentResult.evidence.discoveredUrls ?? []).slice(0, 20).map(item => `- ${item}`).join('\n') || '- none'}
 warnings:
 ${warnings}
 content:
@@ -9531,7 +9684,7 @@ ${reports}`;
       'root.synthesis',
       correlationId
     );
-    const finalResponse = response.trim()
+    let finalResponse = response.trim()
       ? response
       : this.buildRootSynthesisFallback(userTask, [], [subagentResult.result]);
     if (!response.trim()) {
@@ -9542,6 +9695,13 @@ ${reports}`;
         data: { reason: 'model_returned_empty_visible_output', subagentId: agent.identity.id },
       });
     }
+    finalResponse = await this.enforceRootEvidenceBoundary(
+      finalResponse,
+      userTask,
+      [subagentResult.evidence],
+      correlationId,
+      'root.synthesis'
+    );
 
     const usageAfter = ctx.agent.getUsage();
     const usageDelta = this.usageDifference(usageBefore, usageAfter);
@@ -9587,10 +9747,17 @@ Grounding:
 - tool calls: ${subagentResult.toolCalls.map(call => call.toolName).join(', ') || 'none'}
 - observed paths:
 ${subagentResult.evidence.observedPaths.slice(0, 30).map(item => `  - ${item}`).join('\n') || '  none'}
+- observed URLs:
+${(subagentResult.evidence.observedUrls ?? []).slice(0, 20).map(item => `  - ${item}`).join('\n') || '  none'}
+- task-relevant observed URLs:
+${(subagentResult.evidence.relevantObservedUrls ?? []).slice(0, 20).map(item => `  - ${item}`).join('\n') || '  none'}
+- discovered URLs (search results not necessarily fetched):
+${(subagentResult.evidence.discoveredUrls ?? []).slice(0, 20).map(item => `  - ${item}`).join('\n') || '  none'}
 - warnings:
 ${warnings}
 
-Produce the final response to the user as Roy, the root agent. Do not claim you personally inspected files unless the report is grounded. Mention limitations if the report is ungrounded.`;
+Produce the final response to the user as Roy, the root agent. Do not claim you personally inspected files unless the report is grounded. Mention limitations if the report is ungrounded.
+For web-grounded work, use only facts present in the subagent report or runtime evidence. Cite only observed URLs listed above. Never add a URL or factual detail from model memory.`;
   }
 
   private buildAgentPromptFromMemory(input: {
@@ -10067,8 +10234,16 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
       archetype?: SubAgentArchetype;
       nodeId?: string;
       patternId?: string;
+      onBeforeExecution?: (plans: PlannedToolCall[]) => Promise<void>;
     }
-  ): Promise<{ toolCalls: ToolCallRecord[]; grounded: boolean; warnings: string[]; context: string; evidence: RunEvidence }> {
+  ): Promise<{
+    toolCalls: ToolCallRecord[];
+    grounded: boolean;
+    warnings: string[];
+    context: string;
+    evidence: RunEvidence;
+    toolLoop: ToolLoopSummary;
+  }> {
     const bindings = this.agentBindings.get(agentId)?.tools ?? [];
     const inspectionRoot = this.resolveInspectionRoot(task);
     const groundingRequired = this.agentRestoreSpecs.get(agentId)?.outputContract?.groundingRequired
@@ -10098,64 +10273,260 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
         warnings: warning ? [warning] : [],
         context: '',
         evidence: { toolGrounded: false, outputGrounded: !groundingRequired, observedPaths: [] },
+        toolLoop: {
+          rounds: [],
+          totalCalls: 0,
+          successfulCalls: 0,
+          failedCalls: 0,
+          stopReason: 'completed',
+          startedAt: Date.now(),
+          completedAt: Date.now(),
+        },
       };
     }
 
-    const toolCalls: ToolCallRecord[] = [];
+    await options.onBeforeExecution?.(plans);
+    const loopConfig = this.workspaceRuntimeConfig?.tools.executionLoop ?? {
+      enabled: true,
+      maxRounds: 6,
+      maxCallsPerRun: 10,
+      maxConsecutiveFailures: 2,
+      maxWallClockMs: 120_000,
+      maxFetchesAfterSearch: 2,
+      llmReplanning: true,
+    };
+    const loop = new AgentToolExecutionLoop({
+      maxRounds: loopConfig.enabled ? loopConfig.maxRounds : 1,
+      maxCalls: loopConfig.enabled ? loopConfig.maxCallsPerRun : Math.max(1, plans.length),
+      maxConsecutiveFailures: loopConfig.maxConsecutiveFailures,
+      maxWallClockMs: loopConfig.maxWallClockMs,
+    });
+    const actor = this.getContext().manager.getAgentById(agentId);
+    const toolLoop = await loop.run({
+      task,
+      initialPlans: plans,
+      fingerprint: plan => this.toolPlanFingerprint(plan),
+      execute: async (plan, _round) => {
+        const result = await this.executeToolForAgent(agentId, plan.toolName, plan.params, {
+          reason: plan.reason,
+          correlationId: options.correlationId,
+          nodeId: options.nodeId,
+        });
+        return { result: result.result, success: result.success, error: result.error };
+      },
+      planNext: async context => {
+        const deterministic = this.toolPlanner.planWebFollowUps({
+          task,
+          calls: context.calls,
+          bindings,
+          maxFetches: loopConfig.maxFetchesAfterSearch,
+        });
+        if (deterministic.length > 0) return deterministic.slice(0, context.remainingCalls);
+        if (this.toolPlanner.hasSufficientWebEvidence(task, context.calls)) return [];
+        if (!loopConfig.enabled || !loopConfig.llmReplanning || !(actor instanceof UnifiedAgent)) return [];
+        if (!this.shouldReplanToolLoop(task, context.calls)) return [];
+        const llmPlans = await actor.planNextToolRound({
+          task,
+          round: context.round,
+          remainingCalls: context.remainingCalls,
+          tools: bindings
+            .filter(binding => binding.enabled)
+            .map(binding => {
+              const metadata = toolRegistry.getMetadata(binding.name);
+              return {
+                name: binding.name,
+                description: metadata?.description,
+                parameters: metadata?.parameters as Record<string, unknown> | undefined,
+              };
+          }),
+          calls: context.calls,
+        });
+        return llmPlans.filter(plan => {
+          if (plan.toolName === 'web.fetch') {
+            return this.toolPlanner.isWebCandidateAligned(task, String(plan.params.url ?? ''));
+          }
+          if (plan.toolName === 'web.search') {
+            return this.toolPlanner.isWebCandidateAligned(task, String(plan.params.query ?? ''));
+          }
+          return true;
+        });
+      },
+      onRoundStarted: (round, roundPlans) => {
+        this.emit({
+          type: 'agent.tool_loop.round.started',
+          agentId,
+          sessionId: this.getContext().sessionId,
+          correlationId: options.correlationId,
+          nodeId: options.nodeId,
+          data: {
+            round,
+            plans: roundPlans.map(plan => ({ toolName: plan.toolName, params: plan.params, reason: plan.reason })),
+          },
+        });
+      },
+      onRoundCompleted: round => {
+        this.emit({
+          type: 'agent.tool_loop.round.completed',
+          agentId,
+          sessionId: this.getContext().sessionId,
+          correlationId: options.correlationId,
+          nodeId: options.nodeId,
+          data: {
+            round: round.round,
+            calls: round.calls.length,
+            successful: round.calls.filter(call => call.success).length,
+            failed: round.calls.filter(call => !call.success).length,
+          },
+        });
+      },
+    });
+    this.emit({
+      type: 'agent.tool_loop.completed',
+      agentId,
+      sessionId: this.getContext().sessionId,
+      correlationId: options.correlationId,
+      nodeId: options.nodeId,
+      data: {
+        rounds: toolLoop.rounds.length,
+        totalCalls: toolLoop.totalCalls,
+        successfulCalls: toolLoop.successfulCalls,
+        failedCalls: toolLoop.failedCalls,
+        stopReason: toolLoop.stopReason,
+        durationMs: toolLoop.completedAt - toolLoop.startedAt,
+      },
+    });
+
+    const toolCalls: ToolCallRecord[] = toolLoop.rounds.flatMap(round => round.calls.map(call => ({
+      toolName: call.toolName,
+      params: call.params,
+      result: call.result,
+      success: call.success,
+      error: call.error,
+      reason: call.reason,
+      round: round.round,
+    })));
     const warnings: string[] = [];
     const observedPaths: string[] = [];
+    const observedUrls: string[] = [];
+    const discoveredUrls: string[] = [];
     const summaries: string[] = [];
     const contexts: string[] = [];
 
-    for (const plan of plans) {
-      const result = await this.executeToolForAgent(agentId, plan.toolName, plan.params, {
-        reason: plan.reason,
-        correlationId: options.correlationId,
-        nodeId: options.nodeId,
-      });
-      toolCalls.push({ toolName: plan.toolName, params: plan.params, result: result.result, success: result.success });
-
-      if (!result.success) {
-        const warning = `${plan.toolName === 'fs.list' ? 'Project inspection tool ' : 'Tool '}${plan.toolName} failed: ${result.error ?? 'unknown error'}`;
+    for (const call of toolCalls) {
+      if (!call.success) {
+        const warning = `${call.toolName === 'fs.list' ? 'Project inspection tool ' : 'Tool '}${call.toolName} failed: ${call.error ?? 'unknown error'}`;
         warnings.push(warning);
         this.emit({ type: 'agent.grounding.warning', agentId, data: { warning, correlationId: options.correlationId } });
         continue;
       }
 
-      if (plan.toolName === 'fs.list') {
-        const entries = Array.isArray((result.result as { entries?: unknown } | undefined)?.entries)
-          ? (result.result as { entries: unknown[] }).entries.filter((item): item is string => typeof item === 'string')
+      if (call.toolName === 'fs.list') {
+        const entries = Array.isArray((call.result as { entries?: unknown } | undefined)?.entries)
+          ? (call.result as { entries: unknown[] }).entries.filter((item): item is string => typeof item === 'string')
           : [];
         observedPaths.push(...entries.slice(0, 80));
         summaries.push(entries.slice(0, 80).join('\n'));
         contexts.push(`Filesystem listing:\n${entries.join('\n')}`);
-      } else if (plan.toolName === 'fs.read') {
-        const read = result.result as { path?: unknown; content?: unknown } | undefined;
+      } else if (call.toolName === 'fs.read') {
+        const read = call.result as { path?: unknown; content?: unknown } | undefined;
         if (typeof read?.path === 'string') observedPaths.push(read.path);
         const content = typeof read?.content === 'string' ? read.content.slice(0, 8000) : '';
         summaries.push(`${String(read?.path ?? 'file')}: ${content.slice(0, 1000)}`);
         contexts.push(`File read result for ${String(read?.path ?? 'file')}:\n${content}`);
-      } else if (plan.toolName === 'shell.exec') {
-        const shell = result.result as { command?: unknown; stdout?: unknown; stderr?: unknown } | undefined;
+      } else if (call.toolName === 'shell.exec') {
+        const shell = call.result as { command?: unknown; stdout?: unknown; stderr?: unknown } | undefined;
         const output = [shell?.stdout, shell?.stderr].filter(value => typeof value === 'string' && value).join('\n');
         summaries.push(`${String(shell?.command ?? 'command')}: ${output.slice(0, 1600)}`);
         contexts.push(`Command result for ${String(shell?.command ?? 'command')}:\n${output.slice(0, 8000)}`);
+      } else if (call.toolName === 'web.search') {
+        const search = call.result as {
+          query?: unknown;
+          provider?: unknown;
+          results?: Array<{ title?: unknown; url?: unknown; snippet?: unknown; source?: unknown }>;
+        } | undefined;
+        const results = Array.isArray(search?.results) ? search.results : [];
+        const lines = results.slice(0, 10).map(item => {
+          const url = typeof item.url === 'string' ? item.url : '';
+          if (url) discoveredUrls.push(url);
+          return `- ${String(item.title ?? 'Untitled')} (${url})\n  ${String(item.snippet ?? '').slice(0, 700)}`;
+        });
+        summaries.push(`Web search (${String(search?.provider ?? 'unknown')}): ${String(search?.query ?? task)}\n${lines.join('\n')}`);
+        contexts.push(`Web search results:\n${lines.join('\n')}`);
+      } else if (call.toolName === 'web.fetch') {
+        const page = call.result as { finalUrl?: unknown; title?: unknown; text?: unknown; contentType?: unknown } | undefined;
+        const url = typeof page?.finalUrl === 'string' ? page.finalUrl : String(call.params.url ?? '');
+        if (url) observedUrls.push(url);
+        const text = typeof page?.text === 'string' ? page.text.slice(0, 8000) : '';
+        summaries.push(`Web page: ${String(page?.title ?? url)} (${url})\n${text.slice(0, 1800)}`);
+        contexts.push(`Web page evidence from ${url}:\nTitle: ${String(page?.title ?? 'unknown')}\n${text}`);
       }
     }
 
     const successful = toolCalls.filter(call => call.success);
+    const successfulWebFetchCalls = toolCalls.filter(call => call.toolName === 'web.fetch' && call.success);
+    const successfulWebFetches = successfulWebFetchCalls.length;
+    const requiredWebFetches = this.requiredWebFetchCount(task);
+    const relevantObservedUrls = successfulWebFetchCalls
+      .filter(call => this.toolPlanner.webEvidenceScore(task, call) >= 6)
+      .map(call => String(
+        (call.result as { finalUrl?: unknown } | undefined)?.finalUrl ?? call.params.url ?? ''
+      ))
+      .filter(Boolean);
+    const relevantWebDocuments = new Set(relevantObservedUrls.map(url => this.canonicalWebDocumentUrl(url)));
+    const groundedWebSourceCount = relevantWebDocuments.size;
+    if (groundedWebSourceCount < requiredWebFetches) {
+      const warning = `The task required ${requiredWebFetches} task-relevant opened web source(s), but only ${groundedWebSourceCount} distinct relevant document(s) were fetched successfully (${successfulWebFetches} total fetches).`;
+      warnings.push(warning);
+      this.emit({
+        type: 'agent.grounding.warning',
+        agentId,
+        sessionId: this.getContext().sessionId,
+        correlationId: options.correlationId,
+        data: {
+          warning,
+          reason: 'web_source_not_fetched',
+          requiredWebFetches,
+          successfulWebFetches,
+          groundedWebSourceCount,
+        },
+      });
+    }
     return {
       toolCalls,
-      grounded: plans.every((plan, index) => !plan.groundingRequired || toolCalls[index]?.success),
+      grounded: plans.every(plan => !plan.groundingRequired || toolCalls.some(call => call.toolName === plan.toolName && call.success))
+        && groundedWebSourceCount >= requiredWebFetches,
       warnings,
       evidence: {
         toolGrounded: successful.length > 0,
         outputGrounded: false,
         observedPaths: Array.from(new Set(observedPaths)),
+        observedUrls: Array.from(new Set(observedUrls)),
+        relevantObservedUrls: Array.from(new Set(relevantObservedUrls)),
+        discoveredUrls: Array.from(new Set(discoveredUrls)),
         toolResultSummary: summaries.filter(Boolean).join('\n\n'),
       },
       context: contexts.join('\n\n'),
+      toolLoop,
     };
+  }
+
+  private shouldReplanToolLoop(
+    task: string,
+    calls: Array<{ toolName: string }>
+  ): boolean {
+    return calls.some(call => call.toolName.startsWith('web.'))
+      || /\b(?:multi-step|continue|iterate|until|cross-check|multiple sources|independent sources)\b/i.test(task);
+  }
+
+  private toolPlanFingerprint(plan: PlannedToolCall): string {
+    if (plan.toolName === 'web.fetch') {
+      return `${plan.toolName}:${this.canonicalWebDocumentUrl(String(plan.params.url ?? ''))}`;
+    }
+    if (plan.toolName === 'web.search') {
+      const query = String(plan.params.query ?? '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+      return `${plan.toolName}:${query}`;
+    }
+    return `${plan.toolName}:${JSON.stringify(plan.params, Object.keys(plan.params).sort())}`;
   }
 
   private buildGroundedTask(task: string, grounding: { context: string; warnings: string[] }): string {
@@ -10163,7 +10534,7 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
     return [
       '[runtime_grounding_provided]',
       task,
-      '\nGrounding rules:\n- Treat the runtime-provided tool output as authoritative.\n- Mention only files, technologies, commands, and test results supported by that output.\n- If prior assumptions conflict with the tool output, discard the assumptions.\n- Label anything not established by the tool output as unverified; do not invent a replacement structure.',
+      '\nGrounding rules:\n- Treat the runtime-provided tool output as authoritative.\n- Mention only files, technologies, commands, test results, compatibility claims, and API semantics supported by that output.\n- A page title, URL, or navigation entry proves only that the page exists; it does not establish the page body, compatibility range, or API behavior.\n- If prior assumptions conflict with the tool output, discard the assumptions.\n- Label anything not established by the tool output as unverified; do not invent a replacement structure.',
       grounding.context ? `\nGrounding context:\n${grounding.context}` : '',
       grounding.warnings.length > 0 ? `\nGrounding warnings:\n${grounding.warnings.join('\n')}` : '',
     ].filter(Boolean).join('\n');
@@ -10173,6 +10544,14 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
     if (!result.trim()) return false;
     const normalized = result.toLowerCase();
     if (evidence.observedPaths.slice(0, 80).some(item => normalized.includes(item.toLowerCase()))) return true;
+    if ((evidence.observedUrls ?? []).slice(0, 30).some(item => {
+      try {
+        const url = new URL(item);
+        return normalized.includes(item.toLowerCase()) || normalized.includes(url.hostname.toLowerCase());
+      } catch {
+        return false;
+      }
+    })) return true;
     const evidenceTerms = (evidence.toolResultSummary ?? '')
       .toLowerCase()
       .split(/[^a-z0-9._/-]+/)
@@ -10184,6 +10563,119 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
   private taskRequiresGrounding(archetype: SubAgentArchetype, task: string): boolean {
     if (archetype === 'researcher' || archetype === 'tester') return true;
     return /\b(?:filesystem|repository|codebase|source|tool)[ -]?(?:grounded|evidence)\b|\busing (?:filesystem|source|tool) evidence\b/i.test(task);
+  }
+
+  private taskRequiresFetchedWebEvidence(task: string): boolean {
+    return this.taskNeedsWebAccess(task)
+      && /\b(?:open|fetch|read|inspect|compare|verify)\b[\s\S]*\b(?:pages?|websites?|urls?|sources?|documentation)\b/i.test(task);
+  }
+
+  private requiredWebFetchCount(task: string): number {
+    if (!this.taskRequiresFetchedWebEvidence(task)) return 0;
+    const explicitDocuments = new Set(
+      (task.match(/https?:\/\/[^\s`'"<>),]+/gi) ?? []).map(url => this.canonicalWebDocumentUrl(url))
+    );
+    if (explicitDocuments.size >= 2) return 2;
+    if (/\b(?:at least|minimum of)\s+(?:two|2)\b|\b(?:two|2)\s+(?:independent|relevant|public)?\s*(?:pages?|websites?|urls?|sources?)\b/i.test(task)) {
+      return 2;
+    }
+    if (/\bboth\s+(?:pages?|websites?|urls?|sources?|documents?)\b/i.test(task)) return 2;
+    return 1;
+  }
+
+  private canonicalWebDocumentUrl(input: string): string {
+    try {
+      const url = new URL(input);
+      url.hash = '';
+      return url.toString().replace(/\/$/, '');
+    } catch {
+      return input;
+    }
+  }
+
+  private async enforceRootEvidenceBoundary(
+    response: string,
+    task: string,
+    evidences: RunEvidence[],
+    correlationId: string,
+    purpose: string
+  ): Promise<string> {
+    const observedUrls = Array.from(new Set(evidences.flatMap(evidence => evidence.observedUrls ?? [])));
+    if (observedUrls.length === 0 && !this.taskNeedsWebAccess(task)) return response;
+    const unsupported = this.findUnsupportedResponseUrls(response, observedUrls);
+    if (unsupported.length === 0) return response;
+
+    this.emit({
+      type: 'root.synthesis.grounding.warning',
+      agentId: 'root',
+      correlationId,
+      data: { purpose, reason: 'unsupported_urls', unsupportedUrls: unsupported, observedUrls },
+    });
+    const evidenceSummary = evidences
+      .map(evidence => evidence.toolResultSummary ?? '')
+      .filter(Boolean)
+      .join('\n\n')
+      .slice(0, 16_000);
+    const repaired = await this.completeAsRoot(
+      [
+        'Rewrite the draft as a strictly evidence-grounded final answer.',
+        'Use only facts in the runtime evidence. Cite only URLs in <allowed_urls>.',
+        'Do not mention, cite, reconstruct, or replace unsupported URLs. Preserve explicit limitations.',
+        `<task>${task}</task>`,
+        `<allowed_urls>\n${observedUrls.map(url => `- ${url}`).join('\n')}\n</allowed_urls>`,
+        `<runtime_evidence>\n${evidenceSummary || 'No textual evidence summary was available.'}\n</runtime_evidence>`,
+        `<draft>\n${response}\n</draft>`,
+      ].join('\n\n'),
+      `${purpose}.grounding_repair`,
+      correlationId
+    );
+    const candidate = repaired.trim() || response;
+    const remainingUnsupported = this.findUnsupportedResponseUrls(candidate, observedUrls);
+    if (remainingUnsupported.length === 0) {
+      this.emit({
+        type: 'root.synthesis.grounding.repaired',
+        agentId: 'root',
+        correlationId,
+        data: { purpose, removedUnsupportedUrls: unsupported },
+      });
+      return candidate;
+    }
+
+    this.emit({
+      type: 'root.synthesis.grounding.repair_failed',
+      agentId: 'root',
+      correlationId,
+      data: { purpose, unsupportedUrls: remainingUnsupported },
+    });
+    return [
+      'Roy removed unverified citations from the generated synthesis. The remaining answer is limited to runtime-observed sources.',
+      this.removeUnsupportedUrls(candidate, remainingUnsupported),
+    ].join('\n\n').trim();
+  }
+
+  private findUnsupportedResponseUrls(response: string, observedUrls: string[]): string[] {
+    const allowed = new Set(observedUrls.map(url => this.normalizeEvidenceUrl(url)));
+    return Array.from(new Set(
+      (response.match(/https?:\/\/[^\s<>'"`\])}]+/gi) ?? [])
+        .map(url => url.replace(/[.,;:!?]+$/, ''))
+        .filter(url => !allowed.has(this.normalizeEvidenceUrl(url)))
+    ));
+  }
+
+  private normalizeEvidenceUrl(input: string): string {
+    try {
+      const url = new URL(input);
+      return url.toString().replace(/\/$/, '');
+    } catch {
+      return input.replace(/\/$/, '');
+    }
+  }
+
+  private removeUnsupportedUrls(response: string, unsupported: string[]): string {
+    return unsupported.reduce(
+      (current, url) => current.split(url).join('[unverified URL removed]'),
+      response
+    );
   }
 
   private detectEvidenceContradictions(result: string, evidence: RunEvidence): string[] {
@@ -10223,8 +10715,13 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
 
   private attachRuntimeEvidence(result: string, evidence: RunEvidence): string {
     const observedPaths = evidence.observedPaths.slice(0, 80);
-    const evidenceBlock = observedPaths.length > 0
-      ? observedPaths.map(item => `- ${item}`).join('\n')
+    const observedUrls = (evidence.observedUrls ?? []).slice(0, 30);
+    const structuredEvidence = [
+      ...observedPaths.map(item => `- path: ${item}`),
+      ...observedUrls.map(item => `- url: ${item}`),
+    ];
+    const evidenceBlock = structuredEvidence.length > 0
+      ? structuredEvidence.join('\n')
       : (evidence.toolResultSummary ?? 'No structured evidence summary was available.').slice(0, 4000);
     return [
       result.trim(),
@@ -10237,6 +10734,9 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
     if (!result.trim()) return false;
     return /<tool_call>[\s\S]*?<\/tool_call>/i.test(result)
       || /<tool_name>[\s\S]*?<\/tool_name>/i.test(result)
+      || /<function_calls>[\s\S]*?<\/function_calls>/i.test(result)
+      || /<invocation\s+name=["'](?:web\.(?:search|fetch)|fs\.(?:list|read)|shell\.exec)["'][\s\S]*?<\/invocation>/i.test(result)
+      || /```(?:tool|json)?\s*\n\s*(?:web\.(?:search|fetch)|fs\.(?:list|read)|shell\.exec)\b[\s\S]*?```/i.test(result)
       || /\{\s*"(?:tool_name|tool|function)"\s*:\s*"[^"\n]+"[\s\S]*?\}/i.test(result);
   }
 

@@ -176,7 +176,7 @@ export class RootExecutionActivityProjector {
   private kindForEvent(type: string): RootExecutionActivityKind | undefined {
     if (type === 'context.loaded' || type === 'team.context.loaded' || type.startsWith('memory.load')) return 'context';
     if (type === 'agent.llm.called' || type === 'delegation.decision' || type.startsWith('tom.')) return 'thinking';
-    if (type.startsWith('tool.')) return 'tool';
+    if (type.startsWith('tool.') || type.includes('.tool_loop')) return 'tool';
     if (type.startsWith('delegation.') || type.startsWith('spawn.') || type.startsWith('agent.create')) return 'delegation';
     if (type.startsWith('team.')) return 'team';
     if (type.startsWith('root.synthesis')) return 'synthesis';
@@ -198,7 +198,20 @@ export class RootExecutionActivityProjector {
       const payload = message.payload as {
         success?: unknown;
         error?: unknown;
-        result?: { root?: unknown; entries?: unknown; path?: unknown; content?: unknown; command?: unknown; stdout?: unknown };
+        result?: {
+          root?: unknown;
+          entries?: unknown;
+          path?: unknown;
+          content?: unknown;
+          command?: unknown;
+          stdout?: unknown;
+          query?: unknown;
+          provider?: unknown;
+          results?: Array<{ title?: unknown; url?: unknown }>;
+          finalUrl?: unknown;
+          title?: unknown;
+          text?: unknown;
+        };
       };
       if (payload.success === false) return `Tool failed: ${String(payload.error ?? 'unknown error')}`;
       if (Array.isArray(payload.result?.entries)) {
@@ -211,6 +224,15 @@ export class RootExecutionActivityProjector {
       if (typeof payload.result?.command === 'string') {
         return `Executed ${payload.result.command}: ${String(payload.result.stdout ?? '').replace(/\s+/g, ' ').slice(0, 700)}`;
       }
+      if (Array.isArray(payload.result?.results)) {
+        return `Searched ${String(payload.result.query ?? 'the web')} via ${String(payload.result.provider ?? 'provider')}: ${payload.result.results
+          .slice(0, 8)
+          .map(item => `${String(item.title ?? 'Untitled')} (${String(item.url ?? '')})`)
+          .join(', ')}`.slice(0, 1000);
+      }
+      if (typeof payload.result?.finalUrl === 'string') {
+        return `Fetched ${payload.result.finalUrl}: ${String(payload.result.title ?? '').trim()} ${String(payload.result.text ?? '').replace(/\s+/g, ' ').slice(0, 700)}`;
+      }
       return `${message.from} returned a successful tool result to ${message.to}`;
     }
     return `${message.from} sent ${message.kind} to ${message.to}`;
@@ -220,6 +242,9 @@ export class RootExecutionActivityProjector {
     if (typeof event.data?.reason === 'string') return event.data.reason.slice(0, 500);
     if (typeof event.data?.purpose === 'string') return event.data.purpose.slice(0, 500);
     if (typeof event.data?.toolName === 'string') return `${event.data.toolName}${event.data.success === false ? ' failed' : ''}`;
+    if (typeof event.data?.round === 'number' || typeof event.data?.rounds === 'number') {
+      return `round=${String(event.data.round ?? event.data.rounds)}, calls=${String(event.data.calls ?? event.data.totalCalls ?? 0)}, stop=${String(event.data.stopReason ?? 'continue')}`;
+    }
     return undefined;
   }
 
@@ -228,6 +253,7 @@ export class RootExecutionActivityProjector {
     const keys = [
       'reason', 'purpose', 'from', 'to', 'state', 'toolName', 'params', 'success', 'error',
       'parentId', 'teamId', 'archetype', 'name', 'totalTokens', 'action', 'count', 'nodeId',
+      'round', 'rounds', 'calls', 'totalCalls', 'successfulCalls', 'failedCalls', 'stopReason', 'durationMs',
     ];
     const compact = Object.fromEntries(keys.filter(key => data[key] !== undefined).map(key => [key, data[key]]));
     return Object.keys(compact).length > 0 ? compact : undefined;
