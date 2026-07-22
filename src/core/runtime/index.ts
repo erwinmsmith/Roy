@@ -10,3 +10,10 @@ export {
   type EvolutionBenchmarkResult,
 } from './Runtime.js';
 export { AgentManager } from './AgentManager.js';
+export {
+  RootExecutionTreeRegistry,
+  type RootExecutionNodeSnapshot,
+  type RootExecutionStep,
+  type RootExecutionStepDecision,
+  type RootExecutionTreeState,
+} from './executionTree.js';

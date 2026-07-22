@@ -13,7 +13,9 @@ User input
   -> Roy delegation assessment
   -> candidate propose / evaluate / select
   -> solve directly or create child agents/subteam
-  -> message-mediated execution
+  -> message-mediated execution step
+  -> root reassessment from the updated tree state
+  -> continue delegation or finalize
   -> tool policy and approval
   -> parent-level synthesis
   -> final response
@@ -31,6 +33,41 @@ Roy [root]
 ```
 
 Each parent owns its direct children and synthesizes their results before returning a result upward.
+
+## Dynamic Root Execution Tree
+
+A root turn is a bounded sequence of dependent execution steps, not a one-shot delegation plan. Each step stores its decision, dependencies, actors, teams, result summary, and a complete tree snapshot. After a delegated step completes, Roy reassesses the original task against accumulated evidence, warnings, budget, and prior results. Roy may add another dependent branch, ask for missing input, or finalize. Only Roy produces the user-facing result.
+
+```text
+Step 1: inspect
+Roy
+└── Researcher-1
+
+Step 2: verify (depends on step 1)
+Roy
+├── Researcher-1 [released, historical]
+└── Tester-1
+
+Step 3: finalize (depends on step 2)
+Roy -> final response
+```
+
+The live registry and historical snapshots are deliberately separate from actor lifecycle. A completed child may be released while remaining visible in every relevant step snapshot. Use `/tree [correlation-id]`, `GET /v1/execution-tree`, or `GET /v1/execution-tree/:correlationId` to inspect this state. Queue messages `root.step.plan` and `root.step.result`, plus `root.step.*` events, expose the same control flow.
+
+Workspace limits prevent an unbounded reasoning loop:
+
+```json
+{
+  "delegation": {
+    "rootSteps": {
+      "enabled": true,
+      "maxStepsPerTurn": 4,
+      "maxDelegationRounds": 3,
+      "reassessAfterDelegation": true
+    }
+  }
+}
+```
 
 ## Derived Actor Lifecycle
 
@@ -386,6 +423,8 @@ The package also exposes `roy/runtime`, `roy/team`, `roy/tom`, `roy/communicatio
 /budget --market
 /budget rebalance
 /events --latest 50
+/tree
+/tree <correlationId>
 /messages --correlation <id>
 /context render researcher --task "Inspect the repository"
 /prompt render researcher --task "Inspect the repository"
@@ -421,6 +460,8 @@ Primary endpoints:
 ```text
 POST /v1/chat
 GET  /v1/status
+GET  /v1/execution-tree
+GET  /v1/execution-tree/:correlationId
 GET  /v1/agents
 GET  /v1/agents/tree
 POST /v1/agents

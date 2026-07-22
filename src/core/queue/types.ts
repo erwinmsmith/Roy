@@ -10,6 +10,8 @@ export type MessageKind =
   | 'agent.control'
   | 'agent.synthesis'
   | 'root.synthesis'
+  | 'root.step.plan'
+  | 'root.step.result'
   | 'root.final_response'
   | 'team.task'
   | 'team.result'

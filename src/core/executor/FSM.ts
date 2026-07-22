@@ -275,6 +275,8 @@ export class FSM {
       ['S_delegate_planning', 'S_spawn_subagents'],
       ['S_spawn_subagents', 'S_wait_subagents'],
       ['S_wait_subagents', 'S_synthesize'],
+      ['S_wait_subagents', 'S_assess_task'],
+      ['S_assess_task', 'S_synthesize'],
       ['S_synthesize', 'S_respond'],
       ['S_respond', 'S_turn_done'],
       ['S_turn_done', 'S_solo'],

@@ -50,7 +50,13 @@ describe('Workspace memory initialization', () => {
     });
     expect(rootState.updatedAt).toEqual(expect.any(String));
     const workspaceConfig = JSON.parse(await readFile(path.join(workspaceCwd, '.roy', 'config.json'), 'utf8'));
-    expect(workspaceConfig.version).toBe(6);
+    expect(workspaceConfig.version).toBe(7);
+    expect(workspaceConfig.delegation.rootSteps).toEqual({
+      enabled: true,
+      maxStepsPerTurn: 4,
+      maxDelegationRounds: 3,
+      reassessAfterDelegation: true,
+    });
     expect(workspaceConfig.lifecycle).toMatchObject({
       manual: 'retain_session',
       automaticDelegation: 'release',
@@ -201,7 +207,13 @@ describe('Workspace memory initialization', () => {
     expect(researcher?.tools.map(tool => tool.name)).toEqual(['fs.read']);
     expect(researcher?.skills.map(skill => skill.name)).toEqual(['use_tool_when_needed']);
     const migratedConfig = JSON.parse(await readFile(path.join(workspaceCwd, '.roy', 'config.json'), 'utf8'));
-    expect(migratedConfig.version).toBe(6);
+    expect(migratedConfig.version).toBe(7);
+    expect(migratedConfig.delegation.rootSteps).toEqual({
+      enabled: true,
+      maxStepsPerTurn: 4,
+      maxDelegationRounds: 3,
+      reassessAfterDelegation: true,
+    });
     expect(migratedConfig.tom.minimumCoverage).toBe(0.6);
     expect(migratedConfig.evolution.ablations.withoutEvoMutation).toBe(false);
 

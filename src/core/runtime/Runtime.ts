@@ -16,6 +16,14 @@ import {
   type ModelTokenUsage,
 } from '../llm/index.js';
 import { AgentManager } from './AgentManager.js';
+import {
+  RootExecutionTreeRegistry,
+  type CompleteRootExecutionStepInput,
+  type RootExecutionNodeSnapshot,
+  type RootExecutionStep,
+  type RootExecutionStepDecision,
+  type RootExecutionTreeState,
+} from './executionTree.js';
 import { FSM } from '../executor/FSM.js';
 import { signalBus } from '../executor/SignalBus.js';
 import { UnifiedAgent } from '../agent/UnifiedAgent.js';
@@ -471,6 +479,28 @@ export interface DelegationAgentPlan {
   existenceReason?: string;
 }
 
+type RootContinuationDecision =
+  | {
+      action: 'finalize';
+      reason: string;
+    }
+  | {
+      action: 'ask_clarification';
+      reason: string;
+      question: string;
+    }
+  | {
+      action: 'delegate_more';
+      reason: string;
+      agents: DelegationAgentPlan[];
+    };
+
+interface RootDelegationRoundResult {
+  subagents: RootMediatedSpawnResult[];
+  teams: TeamRunResult[];
+  evolution?: EvolutionRunResult;
+}
+
 export interface RootMediatedSpawnResult {
   correlationId: string;
   node: AgentComputeNodeDefinition;
@@ -488,6 +518,8 @@ export interface RootTurnResult {
   subagents: RootMediatedSpawnResult[];
   teams: TeamRunResult[];
   evolution?: EvolutionRunResult;
+  evolutions: EvolutionRunResult[];
+  executionTree: RootExecutionTreeState;
   messages: RuntimeMessage[];
   usage: {
     root: TokenUsage;
@@ -598,6 +630,7 @@ export class Runtime {
   private readonly agentRestoreSpecs = new Map<string, SpawnAgentSpec>();
   private readonly teamRestoreSpecs = new Map<string, SpawnTeamSpec>();
   private readonly evolutionBudgetBypassCorrelations = new Set<string>();
+  private readonly executionTrees = new RootExecutionTreeRegistry();
 
   static getInstance(): Runtime {
     if (!Runtime.instance) {
@@ -830,6 +863,7 @@ export class Runtime {
     this.agentRestoreSpecs.clear();
     this.teamRestoreSpecs.clear();
     this.evolutionBudgetBypassCorrelations.clear();
+    this.executionTrees.clear();
     this.evolutionSequence = 0;
     this.initialized = false;
     logger.info('Runtime shutdown complete');
@@ -970,6 +1004,14 @@ export class Runtime {
 
   getEvents(): RuntimeEvent[] {
     return [...this.events];
+  }
+
+  getRootExecutionTree(correlationId?: string): RootExecutionTreeState | undefined {
+    return correlationId ? this.executionTrees.get(correlationId) : this.executionTrees.latest();
+  }
+
+  listRootExecutionTrees(): RootExecutionTreeState[] {
+    return this.executionTrees.list();
   }
 
   getToMState(correlationId?: string): ToMRuntimeState {
@@ -3511,6 +3553,16 @@ export class Runtime {
     const ctx = this.getContext();
     const correlationId = this.createCorrelationId();
     const rootUsageBefore = ctx.agent.getUsage();
+    const rootStepConfig = this.workspaceRuntimeConfig?.delegation.rootSteps;
+    const maxSteps = Math.max(2, rootStepConfig?.maxStepsPerTurn ?? 4);
+    this.executionTrees.begin({
+      correlationId,
+      sessionId: ctx.sessionId,
+      task: userInput,
+      rootAgentId: 'root',
+      rootAgentName: ctx.agent.name,
+      maxSteps,
+    });
 
     const inputMessage = await this.enqueueMessage({
       kind: 'user.input',
@@ -3552,9 +3604,15 @@ export class Runtime {
     let finalResponse: string;
     const subagents: RootMediatedSpawnResult[] = [];
     const teamResults: TeamRunResult[] = [];
+    const evolutions: EvolutionRunResult[] = [];
     let evolution: EvolutionRunResult | undefined;
 
     if (decision.action === 'ask_clarification') {
+      const step = await this.startRootExecutionStep(correlationId, {
+        action: 'ask_clarification',
+        reason: decision.reason,
+        agentCount: 0,
+      });
       await this.transitionRootTurnState('S_solo_reasoning', { correlationId, reason: decision.reason });
       this.emit({
         type: 'delegation.skipped',
@@ -3566,7 +3624,13 @@ export class Runtime {
         },
       });
       finalResponse = decision.question;
+      await this.completeRootExecutionStep(correlationId, step, { resultSummary: finalResponse });
     } else if (decision.action === 'solve_directly') {
+      const step = await this.startRootExecutionStep(correlationId, {
+        action: 'solve_directly',
+        reason: decision.reason,
+        agentCount: 0,
+      });
       await this.transitionRootTurnState('S_solo_reasoning', { correlationId, reason: decision.reason });
       this.emit({
         type: 'delegation.skipped',
@@ -3578,116 +3642,143 @@ export class Runtime {
         },
       });
       finalResponse = await this.runRootSoloReasoning(userInput, correlationId);
+      await this.completeRootExecutionStep(correlationId, step, { resultSummary: finalResponse });
     } else {
-      await this.transitionRootTurnState('S_delegate_planning', { correlationId, count: decision.agents.length });
-      this.emit({
-        type: 'delegation.plan.created',
-        agentId: 'root',
-        data: {
+      let roundDecision = decision;
+      let delegationRounds = 0;
+      let previousStepId: string | undefined;
+      let clarification: string | undefined;
+
+      while (roundDecision.action === 'spawn_subagents') {
+        delegationRounds += 1;
+        const plans = roundDecision.agents.slice(0, 3);
+        const step = await this.startRootExecutionStep(correlationId, {
+          action: 'delegate',
+          reason: roundDecision.reason,
+          agentCount: plans.length,
+        }, previousStepId ? [previousStepId] : []);
+
+        await this.transitionRootTurnState('S_delegate_planning', {
           correlationId,
-          count: decision.agents.length,
-          agents: decision.agents,
-          ...decisionMetadata,
-        },
-      });
-      await this.transitionRootTurnState('S_spawn_subagents', { correlationId, count: decision.agents.length });
-      for (const plan of decision.agents.slice(0, 3)) {
-        this.emit({
-          type: 'delegation.subagent.selected',
-          agentId: 'root',
-          data: {
-            correlationId,
-            archetype: plan.archetype,
-            name: plan.name,
-            tomLevel: plan.tomLevel,
-            budgetTokens: plan.budgetTokens,
-            cognitiveGapIds: plan.cognitiveGapIds,
-            existenceReason: plan.existenceReason,
-            tomProfile: plan.tomProfile,
-          },
+          stepId: step.id,
+          count: plans.length,
         });
-        this.emit({
-          type: 'delegation.subagent.task_assigned',
-          agentId: 'root',
-          data: {
-            correlationId,
-            archetype: plan.archetype,
-            name: plan.name,
-            task: plan.task,
-            cognitiveGapIds: plan.cognitiveGapIds,
-            existenceReason: plan.existenceReason,
-          },
-        });
-      }
-      const plans = decision.agents.slice(0, 3);
-      if (this.workspaceRuntimeConfig?.evolution.enabled
-        && this.workspaceRuntimeConfig.evolution.mode === 'auto') {
-        evolution = await this.runEvolution({
-          task: userInput,
-          parentId: 'root',
+        this.emitDelegationPlan(correlationId, plans, roundDecision.reason, decisionMetadata, step.id);
+        await this.transitionRootTurnState('S_spawn_subagents', {
           correlationId,
-          profile: this.workspaceRuntimeConfig.evolution.profile,
-          seedAgents: plans.map(plan => ({
-            archetype: plan.archetype,
-            name: plan.name,
-            role: plan.existenceReason ?? plan.archetype,
-            task: plan.task,
-            tools: plan.tools,
-            skills: plan.skills,
-            budgetTokens: plan.budgetTokens,
-            tomLevel: plan.tomLevel,
-            perspective: plan.tomProfile?.perspective,
-            groundingRequired: plan.archetype === 'researcher' || plan.archetype === 'tester',
-          })),
+          stepId: step.id,
+          count: plans.length,
         });
-      } else if (plans.length > 1 && this.workspaceRuntimeConfig?.teams.createForMultipleAgents !== false) {
-        const team = await this.spawnTeam({
-          parentAgentId: 'root',
-          name: this.deriveTeamName(plans),
-          description: userInput,
-          task: userInput,
-          members: plans.map((plan, index) => ({ ...plan, lead: index === 0 })),
-          tomAnalysis: this.tomAnalyses.get(correlationId),
-          correlationId,
-          lifecycleOrigin: 'automatic_delegation',
-        });
-        const teamResult = await this.runTeam(team.identity.id, userInput, { correlationId });
-        teamResults.push(teamResult);
-        subagents.push(...teamResult.memberExecutions);
-      } else {
-        for (const plan of plans) {
-          const result = await this.handleSpawnCommand({
-            archetype: plan.archetype,
-            task: plan.task,
-            parentId: 'root',
-            name: plan.name,
-            tools: plan.tools,
-            skills: plan.skills,
-            tomLevel: plan.tomLevel,
-            tomProfile: plan.tomProfile,
-            cognitiveGapIds: plan.cognitiveGapIds,
-            existenceReason: plan.existenceReason,
-            budgetTokens: plan.budgetTokens,
+
+        let round: RootDelegationRoundResult;
+        try {
+          round = await this.executeRootDelegationRound(userInput, plans, correlationId);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          this.executionTrees.failStep(correlationId, step.id, message);
+          this.emit({
+            type: 'root.step.failed',
+            agentId: 'root',
             correlationId,
-            source: 'root',
-            requireRootSynthesis: false,
-            showSubagentOutput: false,
-            disableRecursiveDelegation: this.getBudgetState().mode === 'limited',
+            data: { stepId: step.id, error: message },
           });
-          subagents.push(result);
+          throw error;
         }
+        subagents.push(...round.subagents);
+        teamResults.push(...round.teams);
+        if (round.evolution) {
+          evolution = round.evolution;
+          evolutions.push(round.evolution);
+        }
+
+        await this.transitionRootTurnState('S_wait_subagents', {
+          correlationId,
+          stepId: step.id,
+          completed: round.evolution?.metrics.agentsSpawned ?? round.subagents.length,
+        });
+        const completedStep = await this.completeRootExecutionStep(correlationId, step, {
+          actorIds: round.subagents.map(item => item.agent.identity.id),
+          teamIds: round.teams.map(item => item.team.identity.id),
+          nodes: this.buildRootExecutionNodes(correlationId, step.index),
+          resultSummary: this.summarizeDelegationRound(round),
+        });
+        previousStepId = completedStep.id;
+
+        const tree = this.executionTrees.get(correlationId)!;
+        const maxRounds = Math.max(1, rootStepConfig?.maxDelegationRounds ?? 3);
+        const canReassess = rootStepConfig?.enabled !== false
+          && rootStepConfig?.reassessAfterDelegation !== false
+          && !round.evolution
+          && delegationRounds < maxRounds
+          && tree.steps.length < tree.maxSteps - 1;
+
+        await this.transitionRootTurnState('S_assess_task', {
+          correlationId,
+          stepId: step.id,
+          delegationRounds,
+        });
+        if (!canReassess) {
+          this.emit({
+            type: 'root.step.limit_reached',
+            agentId: 'root',
+            correlationId,
+            data: { stepId: step.id, delegationRounds, maxRounds, maxSteps: tree.maxSteps },
+          });
+          break;
+        }
+
+        const continuation = await this.decideRootContinuation(
+          userInput,
+          correlationId,
+          tree.steps,
+          subagents,
+          teamResults
+        );
+        this.emit({
+          type: 'root.step.decision',
+          agentId: 'root',
+          correlationId,
+          data: { stepId: step.id, nextAction: continuation.action, reason: continuation.reason },
+        });
+        if (continuation.action === 'delegate_more') {
+          let next: DelegationDecision = {
+            action: 'spawn_subagents',
+            reason: continuation.reason,
+            agents: continuation.agents,
+          };
+          next = await this.selectDelegationCandidate('root', userInput, this.applyBudgetConstraints(next), correlationId, 'root', true);
+          if (next.action === 'spawn_subagents') {
+            roundDecision = next;
+            continue;
+          }
+        } else if (continuation.action === 'ask_clarification') {
+          clarification = continuation.question;
+        }
+        break;
       }
-      await this.transitionRootTurnState('S_wait_subagents', {
-        correlationId,
-        completed: evolution?.metrics.agentsSpawned ?? subagents.length,
+
+      const finalStep = await this.startRootExecutionStep(correlationId, {
+        action: clarification ? 'ask_clarification' : 'finalize',
+        reason: clarification ? 'More user input is required after delegated inspection.' : 'Roy has sufficient accumulated state to produce the final result.',
+        agentCount: 0,
+      }, previousStepId ? [previousStepId] : []);
+      if (clarification) {
+        await this.transitionRootTurnState('S_solo_reasoning', { correlationId, stepId: finalStep.id });
+        finalResponse = clarification;
+      } else {
+        await this.transitionRootTurnState('S_synthesize', {
+          correlationId,
+          stepId: finalStep.id,
+          completed: evolution?.metrics.agentsSpawned ?? subagents.length,
+        });
+        finalResponse = evolution && evolutions.length === 1 && subagents.length === 0
+          ? await this.synthesizeEvolutionResult(userInput, evolution, correlationId)
+          : await this.synthesizeDelegatedResults(userInput, subagents, correlationId, teamResults);
+      }
+      await this.completeRootExecutionStep(correlationId, finalStep, {
+        nodes: this.buildRootExecutionNodes(correlationId, finalStep.index),
+        resultSummary: finalResponse,
       });
-      await this.transitionRootTurnState('S_synthesize', {
-        correlationId,
-        completed: evolution?.metrics.agentsSpawned ?? subagents.length,
-      });
-      finalResponse = evolution
-        ? await this.synthesizeEvolutionResult(userInput, evolution, correlationId)
-        : await this.synthesizeDelegatedResults(userInput, subagents, correlationId, teamResults);
       this.emit({
         type: 'delegation.completed',
         agentId: 'root',
@@ -3730,6 +3821,13 @@ export class Runtime {
     await ctx.queue.ack(finalMessage.id);
     await this.transitionRootTurnState('S_turn_done', { correlationId });
     await this.transitionRootTurnState('S_solo', { correlationId });
+    const executionTree = this.executionTrees.finish(correlationId);
+    this.emit({
+      type: 'root.execution_tree.completed',
+      agentId: 'root',
+      correlationId,
+      data: { steps: executionTree.steps.length, nodes: executionTree.nodes.length },
+    });
     await this.proposeMemoryUpdates('turn.completed');
 
     const rootUsageAfter = ctx.agent.getUsage();
@@ -3749,6 +3847,8 @@ export class Runtime {
       subagents,
       teams: teamResults,
       evolution,
+      evolutions,
+      executionTree,
       messages: await this.getMessages({ correlationId }),
       usage: {
         root: rootUsage,
@@ -4204,7 +4304,13 @@ export class Runtime {
           },
         });
       }
-      this.emit({ type: 'team.member.added', agentId: agent.identity.id, data: { teamId: payload.teamId, parentId } });
+      this.emit({
+        type: 'team.member.added',
+        agentId: agent.identity.id,
+        sessionId: ctx.sessionId,
+        correlationId,
+        data: { teamId: payload.teamId, parentId, correlationId },
+      });
     }
     const delegationPattern = await ctx.memory.upsertDelegationPattern({
       archetype: payload.archetype,
@@ -5798,7 +5904,8 @@ export class Runtime {
     task: string,
     decision: DelegationDecision,
     correlationId: string,
-    scope: 'root' | 'agent'
+    scope: 'root' | 'agent',
+    preserveRequestedPlan = false
   ): Promise<DelegationDecision> {
     if (decision.action !== 'spawn_subagents') return decision;
     const policy = this.getAgentPolicy(parentId);
@@ -5825,11 +5932,14 @@ export class Runtime {
       this.workspaceRuntimeConfig?.tom.maxAgentsPerDecision ?? 3
     );
     const tomEnabled = this.workspaceRuntimeConfig?.tom.enabled !== false;
+    const stagedRootStep = scope === 'root'
+      && (this.executionTrees.get(correlationId)?.steps.length ?? 0) === 0
+      && this.requiresStagedDelegation(task);
     const completedPlans = tomEnabled
       ? this.tomPlanner.completePlans(
         tomAnalysis,
         decision.agents,
-        this.workspaceRuntimeConfig?.tom.autoCompleteGaps === false
+        this.workspaceRuntimeConfig?.tom.autoCompleteGaps === false || stagedRootStep || preserveRequestedPlan
           ? Math.min(decision.agents.length, remainingAgentSlots)
           : remainingAgentSlots
       )
@@ -6272,6 +6382,440 @@ export class Runtime {
     this.emit({ type: 'turn.fsm.state', agentId: 'root', data: { state, ...data } });
   }
 
+  private async startRootExecutionStep(
+    correlationId: string,
+    decision: RootExecutionStepDecision,
+    dependsOn: string[] = []
+  ): Promise<RootExecutionStep> {
+    const ctx = this.getContext();
+    const step = this.executionTrees.startStep(correlationId, { decision, dependsOn });
+    const message = await this.enqueueMessage({
+      kind: 'root.step.plan',
+      sessionId: ctx.sessionId,
+      from: 'root',
+      to: 'runtime',
+      correlationId,
+      payload: {
+        stepId: step.id,
+        index: step.index,
+        dependsOn: step.dependsOn,
+        decision: step.decision,
+      },
+      metadata: { agentId: 'root', tags: ['root-execution-step'] },
+    });
+    await this.processQueuedMessage(message.id);
+    await ctx.queue.ack(message.id);
+    this.emit({
+      type: 'root.step.started',
+      agentId: 'root',
+      correlationId,
+      data: {
+        stepId: step.id,
+        index: step.index,
+        dependsOn: step.dependsOn,
+        decision: step.decision,
+      },
+    });
+    return step;
+  }
+
+  private async completeRootExecutionStep(
+    correlationId: string,
+    step: RootExecutionStep,
+    input: CompleteRootExecutionStepInput
+  ): Promise<RootExecutionStep> {
+    const ctx = this.getContext();
+    const completed = this.executionTrees.completeStep(correlationId, step.id, input);
+    const message = await this.enqueueMessage({
+      kind: 'root.step.result',
+      sessionId: ctx.sessionId,
+      from: 'runtime',
+      to: 'root',
+      correlationId,
+      payload: {
+        stepId: completed.id,
+        index: completed.index,
+        actorIds: completed.actorIds,
+        teamIds: completed.teamIds,
+        resultSummary: completed.resultSummary,
+        treeSnapshot: completed.treeSnapshot,
+      },
+      metadata: { agentId: 'root', tags: ['root-execution-step'] },
+    });
+    await this.processQueuedMessage(message.id);
+    await ctx.queue.ack(message.id);
+    this.emit({
+      type: 'root.step.tree.updated',
+      agentId: 'root',
+      correlationId,
+      data: {
+        stepId: completed.id,
+        index: completed.index,
+        nodeCount: completed.treeSnapshot.length,
+      },
+    });
+    this.emit({
+      type: 'root.step.completed',
+      agentId: 'root',
+      correlationId,
+      data: {
+        stepId: completed.id,
+        index: completed.index,
+        actorIds: completed.actorIds,
+        teamIds: completed.teamIds,
+      },
+    });
+    return completed;
+  }
+
+  private emitDelegationPlan(
+    correlationId: string,
+    plans: DelegationAgentPlan[],
+    reason: string,
+    decisionMetadata: Record<string, unknown>,
+    stepId: string
+  ): void {
+    this.emit({
+      type: 'delegation.plan.created',
+      agentId: 'root',
+      correlationId,
+      data: { correlationId, stepId, count: plans.length, reason, agents: plans, ...decisionMetadata },
+    });
+    for (const plan of plans) {
+      this.emit({
+        type: 'delegation.subagent.selected',
+        agentId: 'root',
+        correlationId,
+        data: {
+          correlationId,
+          stepId,
+          archetype: plan.archetype,
+          name: plan.name,
+          tomLevel: plan.tomLevel,
+          budgetTokens: plan.budgetTokens,
+          cognitiveGapIds: plan.cognitiveGapIds,
+          existenceReason: plan.existenceReason,
+          tomProfile: plan.tomProfile,
+        },
+      });
+      this.emit({
+        type: 'delegation.subagent.task_assigned',
+        agentId: 'root',
+        correlationId,
+        data: {
+          correlationId,
+          stepId,
+          archetype: plan.archetype,
+          name: plan.name,
+          task: plan.task,
+          cognitiveGapIds: plan.cognitiveGapIds,
+          existenceReason: plan.existenceReason,
+        },
+      });
+    }
+  }
+
+  private async executeRootDelegationRound(
+    userTask: string,
+    plans: DelegationAgentPlan[],
+    correlationId: string
+  ): Promise<RootDelegationRoundResult> {
+    if (this.workspaceRuntimeConfig?.evolution.enabled
+      && this.workspaceRuntimeConfig.evolution.mode === 'auto') {
+      const evolution = await this.runEvolution({
+        task: userTask,
+        parentId: 'root',
+        correlationId,
+        profile: this.workspaceRuntimeConfig.evolution.profile,
+        seedAgents: plans.map(plan => ({
+          archetype: plan.archetype,
+          name: plan.name,
+          role: plan.existenceReason ?? plan.archetype,
+          task: plan.task,
+          tools: plan.tools,
+          skills: plan.skills,
+          budgetTokens: plan.budgetTokens,
+          tomLevel: plan.tomLevel,
+          perspective: plan.tomProfile?.perspective,
+          groundingRequired: plan.archetype === 'researcher' || plan.archetype === 'tester',
+        })),
+      });
+      return { subagents: [], teams: [], evolution };
+    }
+
+    if (plans.length > 1 && this.workspaceRuntimeConfig?.teams.createForMultipleAgents !== false) {
+      const team = await this.spawnTeam({
+        parentAgentId: 'root',
+        name: this.deriveTeamName(plans),
+        description: userTask,
+        task: userTask,
+        members: plans.map((plan, index) => ({ ...plan, lead: index === 0 })),
+        tomAnalysis: this.tomAnalyses.get(correlationId),
+        correlationId,
+        lifecycleOrigin: 'automatic_delegation',
+      });
+      const teamResult = await this.runTeam(team.identity.id, userTask, { correlationId });
+      return { subagents: [...teamResult.memberExecutions], teams: [teamResult] };
+    }
+
+    const subagents: RootMediatedSpawnResult[] = [];
+    for (const plan of plans) {
+      subagents.push(await this.handleSpawnCommand({
+        archetype: plan.archetype,
+        task: plan.task,
+        parentId: 'root',
+        name: plan.name,
+        tools: plan.tools,
+        skills: plan.skills,
+        tomLevel: plan.tomLevel,
+        tomProfile: plan.tomProfile,
+        cognitiveGapIds: plan.cognitiveGapIds,
+        existenceReason: plan.existenceReason,
+        budgetTokens: plan.budgetTokens,
+        correlationId,
+        source: 'root',
+        requireRootSynthesis: false,
+        showSubagentOutput: false,
+        disableRecursiveDelegation: this.getBudgetState().mode === 'limited',
+      }));
+    }
+    return { subagents, teams: [] };
+  }
+
+  private async decideRootContinuation(
+    userTask: string,
+    correlationId: string,
+    steps: RootExecutionStep[],
+    subagents: RootMediatedSpawnResult[],
+    teams: TeamRunResult[]
+  ): Promise<RootContinuationDecision> {
+    const ctx = this.getContext();
+    if (!ctx.llm) return { action: 'finalize', reason: 'No LLM is configured for root step reassessment.' };
+
+    const evidenceFollowUp = this.buildRequiredEvidenceFollowUp(userTask, subagents);
+    if (evidenceFollowUp) {
+      this.emit({
+        type: 'root.step.evidence_gap',
+        agentId: 'root',
+        correlationId,
+        data: {
+          target: evidenceFollowUp.target,
+          requiredTool: 'fs.read',
+          reason: evidenceFollowUp.reason,
+        },
+      });
+      return {
+        action: 'delegate_more',
+        reason: evidenceFollowUp.reason,
+        agents: [evidenceFollowUp.plan],
+      };
+    }
+
+    const completedTasks = subagents.map(item => ({
+      id: item.agent.identity.id,
+      archetype: item.node.identity.archetype,
+      task: item.subagentResult.agent.lastTask,
+      grounded: item.subagentResult.grounded,
+      evidence: item.subagentResult.evidence,
+      warnings: item.subagentResult.warnings,
+      result: item.subagentResult.result.slice(0, 3000),
+    }));
+    try {
+      const raw = await this.completeJSONAsAgent<RootContinuationDecision>(ctx.agent, [
+        {
+          role: 'system',
+          content: `You are Roy's dynamic root-step controller.
+Reassess the original task after completed execution steps. The execution tree may grow only when the current evidence exposes a concrete unresolved gap.
+Choose exactly one action:
+{"action":"finalize","reason":"..."}
+{"action":"ask_clarification","reason":"...","question":"..."}
+{"action":"delegate_more","reason":"...","agents":[{"archetype":"tester","name":"Tester-1","task":"...","tomLevel":0,"existenceReason":"..."}]}
+Do not repeat an existing agent task. Delegate only work that depends on prior-step results. Prefer finalize when evidence is sufficient. Use at most 1-3 agents.`,
+        },
+        {
+          role: 'user',
+          content: [
+            `<original_task>${userTask}</original_task>`,
+            `<completed_steps>${JSON.stringify(steps.map(step => ({ id: step.id, decision: step.decision, resultSummary: step.resultSummary })), null, 2)}</completed_steps>`,
+            `<agent_results>${JSON.stringify(completedTasks, null, 2)}</agent_results>`,
+            `<team_results>${JSON.stringify(teams.map(item => ({ id: item.team.identity.id, result: item.result.slice(0, 3000) })), null, 2)}</team_results>`,
+            `<budget>${JSON.stringify(this.getBudgetState(), null, 2)}</budget>`,
+          ].join('\n\n'),
+        },
+      ], { temperature: 0.1, maxTokens: 1400 }, 'root.dynamic_step_decision', correlationId);
+      return this.normalizeRootContinuation(raw, userTask, completedTasks.map(item => `${item.archetype}:${item.task ?? ''}`));
+    } catch (error) {
+      this.emit({
+        type: 'root.step.decision.fallback',
+        agentId: 'root',
+        correlationId,
+        data: { reason: 'continuation_decision_failed', error: error instanceof Error ? error.message : String(error) },
+      });
+      return { action: 'finalize', reason: 'Root step reassessment failed, so Roy will synthesize completed results.' };
+    }
+  }
+
+  private normalizeRootContinuation(
+    value: unknown,
+    userTask: string,
+    completedTasks: string[]
+  ): RootContinuationDecision {
+    const input = value as Partial<RootContinuationDecision>;
+    if (input.action === 'ask_clarification') {
+      return {
+        action: 'ask_clarification',
+        reason: typeof input.reason === 'string' ? input.reason : 'The completed step exposed missing user input.',
+        question: typeof input.question === 'string' && input.question.trim()
+          ? input.question.trim()
+          : 'What additional constraint should Roy use before continuing?',
+      };
+    }
+    if (input.action === 'delegate_more' && Array.isArray((input as { agents?: unknown[] }).agents)) {
+      const seen = new Set(completedTasks.map(item => item.toLowerCase()));
+      const agents = (input as { agents: Array<Partial<DelegationAgentPlan>> }).agents
+        .filter(item => this.isValidArchetype(String(item.archetype)))
+        .map((item): DelegationAgentPlan => ({
+          archetype: String(item.archetype) as SubAgentArchetype,
+          name: typeof item.name === 'string' ? item.name : undefined,
+          task: typeof item.task === 'string' && item.task.trim() ? item.task.trim() : userTask,
+          tools: Array.isArray(item.tools) ? item.tools.filter((tool): tool is string => typeof tool === 'string') : undefined,
+          skills: Array.isArray(item.skills) ? item.skills.filter((skill): skill is string => typeof skill === 'string') : undefined,
+          tomLevel: typeof item.tomLevel === 'number' ? item.tomLevel : undefined,
+          budgetTokens: typeof item.budgetTokens === 'number' ? item.budgetTokens : undefined,
+          cognitiveGapIds: Array.isArray(item.cognitiveGapIds)
+            ? item.cognitiveGapIds.filter((id): id is string => typeof id === 'string')
+            : undefined,
+          existenceReason: typeof item.existenceReason === 'string' ? item.existenceReason : undefined,
+        }))
+        .filter(item => !seen.has(`${item.archetype}:${item.task}`.toLowerCase()))
+        .slice(0, 3);
+      if (agents.length > 0) {
+        return {
+          action: 'delegate_more',
+          reason: typeof input.reason === 'string' ? input.reason : 'A prior step exposed a concrete unresolved gap.',
+          agents,
+        };
+      }
+    }
+    return {
+      action: 'finalize',
+      reason: input.action === 'finalize' && typeof input.reason === 'string'
+        ? input.reason
+        : 'Completed steps provide enough information for Roy to synthesize the result.',
+    };
+  }
+
+  private buildRequiredEvidenceFollowUp(
+    userTask: string,
+    subagents: RootMediatedSpawnResult[]
+  ): { target: string; reason: string; plan: DelegationAgentPlan } | undefined {
+    const targets = [...new Set(
+      [...userTask.matchAll(/(?:^|\s|[`'"])([./]?[a-zA-Z0-9_-]+\.(?:json|ya?ml|toml|md|ts|tsx|js|jsx|mjs|cjs))(?=\s|[,.!?;:`'"]|$)/g)]
+        .map(match => match[1])
+    )];
+    if (targets.length === 0) return undefined;
+
+    for (const target of targets) {
+      const normalizedTarget = target.replace(/^\.\//, '').toLowerCase();
+      const hasReadEvidence = subagents.some(item => item.subagentResult.toolCalls.some(call => {
+        if (call.toolName !== 'fs.read' || !call.success) return false;
+        const callPath = typeof call.params.path === 'string' ? call.params.path.toLowerCase() : '';
+        return callPath === normalizedTarget || callPath.endsWith(`/${normalizedTarget}`);
+      }));
+      if (hasReadEvidence) continue;
+
+      const verifierAlreadyAttempted = subagents.some(item => {
+        const archetype = item.node.identity.archetype;
+        const task = item.subagentResult.agent.lastTask?.toLowerCase() ?? '';
+        return (archetype === 'tester' || archetype === 'critic') && task.includes(normalizedTarget);
+      });
+      if (verifierAlreadyAttempted) continue;
+
+      const reason = `The task requires file-content evidence for ${target}, but completed steps contain no successful fs.read call for that target.`;
+      return {
+        target,
+        reason,
+        plan: {
+          archetype: 'tester',
+          name: 'EvidenceVerifier-1',
+          task: `Read ${target} with fs.read, verify the claims made by prior agents against its actual content, and report concrete evidence and remaining limitations.`,
+          tools: ['fs.read'],
+          skills: ['use_tool_when_needed'],
+          tomLevel: 1,
+          existenceReason: `Close the unresolved file-content evidence gap for ${target}.`,
+        },
+      };
+    }
+    return undefined;
+  }
+
+  private buildRootExecutionNodes(correlationId: string, stepIndex: number): RootExecutionNodeSnapshot[] {
+    const budget = this.getBudgetState();
+    const events = this.events.filter(event => event.correlationId === correlationId || event.data?.correlationId === correlationId);
+    const nodes = new Map<string, RootExecutionNodeSnapshot>();
+    for (const event of events) {
+      if (event.type === 'agent.spawned' && event.agentId) {
+        nodes.set(event.agentId, {
+          id: event.agentId,
+          kind: 'agent',
+          name: String(event.data?.name ?? event.agentId),
+          role: String(event.data?.archetype ?? 'subagent'),
+          parentId: typeof event.data?.parentId === 'string' ? event.data.parentId : 'root',
+          status: 'active',
+          createdAtStep: stepIndex,
+          updatedAtStep: stepIndex,
+          tokenUsage: budget.perAgent[event.agentId]?.totalTokens,
+        });
+      } else if (event.type === 'team.created' && event.agentId) {
+        nodes.set(event.agentId, {
+          id: event.agentId,
+          kind: 'team',
+          name: String(event.data?.name ?? event.agentId),
+          role: 'subteam',
+          parentId: typeof event.data?.parentAgentId === 'string' ? event.data.parentAgentId : 'root',
+          status: 'active',
+          createdAtStep: stepIndex,
+          updatedAtStep: stepIndex,
+          tokenUsage: budget.perTeam[event.agentId]?.totalTokens,
+        });
+      }
+    }
+    for (const node of nodes.values()) {
+      const teamMembership = events.find(event => event.type === 'team.member.added' && event.agentId === node.id);
+      if (node.kind === 'agent' && typeof teamMembership?.data?.teamId === 'string') {
+        node.teamId = teamMembership.data.teamId;
+        node.parentId = teamMembership.data.teamId;
+      }
+      const lifecycle = this.lifecycle.get(node.id);
+      const failed = events.some(event => event.agentId === node.id && (event.type === 'agent.run.failed' || event.type === 'team.run.failed'));
+      const completed = events.some(event => event.agentId === node.id && (event.type === 'agent.run.completed' || event.type === 'team.run.completed'));
+      node.status = failed
+        ? 'failed'
+        : lifecycle?.status === 'released' || lifecycle?.status === 'persisted'
+          ? 'released'
+          : completed ? 'done' : 'active';
+      node.updatedAtStep = stepIndex;
+      node.tokenUsage = node.kind === 'agent'
+        ? budget.perAgent[node.id]?.totalTokens ?? node.tokenUsage
+        : budget.perTeam[node.id]?.totalTokens ?? node.tokenUsage;
+    }
+    return [...nodes.values()];
+  }
+
+  private summarizeDelegationRound(round: RootDelegationRoundResult): string {
+    if (round.evolution) {
+      return `Evolution ${round.evolution.id} selected ${round.evolution.selected?.genome.id ?? 'no genome'} with score ${round.evolution.selectedEvaluation?.score ?? 0}.`;
+    }
+    const teamSummary = round.teams.map(item => `${item.team.identity.name}: ${item.result.slice(0, 1200)}`);
+    const agentSummary = round.subagents.map(item => [
+      `${item.agent.identity.name} (${item.node.identity.archetype})`,
+      `grounded=${item.subagentResult.grounded}`,
+      `warnings=${item.subagentResult.warnings.join('; ') || 'none'}`,
+      item.subagentResult.result.slice(0, 1200),
+    ].join(' | '));
+    return [...teamSummary, ...agentSummary].join('\n') || 'Delegation round completed without a visible result.';
+  }
+
   private async decideDelegation(userInput: string, correlationId: string): Promise<DelegationDecision> {
     const ctx = this.getContext();
     const fallback = this.fallbackDelegationDecision(userInput);
@@ -6296,6 +6840,7 @@ Decide whether the user request should be solved directly by Roy, clarified, or 
 Reason in terms of cognitive gaps: missing evidence, missing perspective, failure-mode uncertainty, implementation capability, verification, or belief reconciliation.
 Use delegation only when the task benefits from grounded inspection, critique, planning, coding, testing, or summarization.
 Do not spawn more than 3 subagents. Prefer 1-2 unless the task clearly needs more.
+If later work depends on an earlier result, create only the immediately executable first-step agents. Roy will reassess after that step and grow the tree if needed.
 Ask for clarification when the user request is too ambiguous to assign a concrete task safely.
 Return strict JSON matching one of:
 {"action":"solve_directly","reason":"..."}
@@ -6312,7 +6857,7 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
             '<runtime_policy>Subagents must be runtime actors with identity, state, budget, messages, and events. Each agent must fill a distinct cognitive gap, receive a concrete non-overlapping task, and expose why it exists. The runtime will validate and enrich the ToM profiles. If budget is limited, reduce the number of subagents or solve directly and explain the constraint.</runtime_policy>',
           ].join('\n\n'),
         },
-      ], { temperature: 0.1, maxTokens: 900 }, 'root.delegation_decision', correlationId);
+      ], { temperature: 0.1, maxTokens: 1800 }, 'root.delegation_decision', correlationId);
       const normalized = this.applyBudgetConstraints(this.normalizeDelegationDecision(decision, userInput));
       this.emit({
         type: 'delegation.assess.completed',
@@ -6602,7 +7147,10 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     }
 
     const asksProjectInspection = /\b(inspect|analy[sz]e|review|audit|check|read|list)\b/.test(lower)
-      && /\b(repo|repository|project|codebase|architecture|structure|src|files?)\b/.test(lower);
+      && (
+        /\b(repo|repository|project|codebase|architecture|structure|src|files?|filesystem)\b/.test(lower)
+        || /(?:^|\s)[./]?[a-z0-9_-]+\.(?:json|ya?ml|toml|md|ts|tsx|js|jsx|mjs|cjs)(?:\s|$)/.test(lower)
+      );
     const asksRisk = /\b(risk|risks|problem|bug|bugs|issue|issues|critique|review|regression|coupling)\b/.test(lower);
     const asksPlan = /\b(plan|steps|roadmap|refactor|design|phase|implement)\b/.test(lower);
     const asksCode = /\b(code|implement|fix|modify|change|patch)\b/.test(lower);
@@ -6653,6 +7201,13 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
       action: 'solve_directly',
       reason: 'The request appears simple enough for Roy to answer without spawning subagents.',
     };
+  }
+
+  private requiresStagedDelegation(task: string): boolean {
+    const normalized = task.toLowerCase().replace(/\s+/g, ' ');
+    return /\b(after|once|based on|depending on)\b.{0,100}\b(result|finding|evidence|output|inspection)\b/.test(normalized)
+      || /\b(first|initial)\b.{0,120}\b(then|next|afterward|subsequent)\b/.test(normalized)
+      || /\b(then|next)\b.{0,100}\b(decide|determine|verify|delegate|spawn)\b/.test(normalized);
   }
 
   private applyBudgetConstraints(decision: DelegationDecision): DelegationDecision {
@@ -6982,6 +7537,8 @@ output_grounded: ${result.subagentResult.evidence.outputGrounded}
 tool_calls: ${result.subagentResult.toolCalls.map(call => call.toolName).join(', ') || 'none'}
 observed_paths:
 ${result.subagentResult.evidence.observedPaths.slice(0, 40).map(item => `- ${item}`).join('\n') || '- none'}
+tool_result_summary:
+${result.subagentResult.evidence.toolResultSummary?.slice(0, 6000) || 'none'}
 warnings:
 ${warnings}
 content:

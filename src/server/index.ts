@@ -199,6 +199,19 @@ async function main(): Promise<void> {
     res.json(runtime.getState());
   });
 
+  app.get('/v1/execution-tree', (_req, res) => {
+    res.json(runtime.getRootExecutionTree() ?? null);
+  });
+
+  app.get('/v1/execution-tree/:correlationId', (req, res) => {
+    const tree = runtime.getRootExecutionTree(req.params.correlationId);
+    if (!tree) {
+      res.status(404).json({ error: `Execution tree "${req.params.correlationId}" not found` });
+      return;
+    }
+    res.json(tree);
+  });
+
   app.get('/v1/runtime/sessions', (_req, res) => {
     res.json({ sessions: runtimePool.list() });
   });

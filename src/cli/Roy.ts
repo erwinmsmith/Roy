@@ -386,6 +386,10 @@ export class Roy {
         this.printEvents(parts);
         break;
 
+      case '/tree':
+        this.printRootExecutionTree(parts[1]);
+        break;
+
       case '/queue':
         await this.printQueue();
         break;
@@ -504,6 +508,7 @@ export class Roy {
       /events --agent <id> Filter events by agent
       /events --type <type> Filter events by event type
       /events --latest <n> Show latest N events
+      /tree [correlation-id] Show the root step history and dynamic actor tree
       /queue              Show runtime message queue state
       /cache agents       Show cached agent patterns
       /cache delegations  Show cached delegation patterns
@@ -1576,7 +1581,7 @@ export class Roy {
     const commands = [
       '/help', '/h', '/clear', '/cls', '/reset', '/agents', '/spawn', '/run', '/teams', '/team', '/tom', '/communication', '/evo', '/exit', '/quit', '/q',
       '/api', '/status', '/skills', '/actions', '/tools', '/memory', '/session',
-      '/system', '/fsm', '/budget', '/events', '/queue', '/cache', '/messages', '/traces', '/config', '/prompt', '/context', '/conversation', '/verbose', '/color'
+      '/system', '/fsm', '/budget', '/events', '/tree', '/queue', '/cache', '/messages', '/traces', '/config', '/prompt', '/context', '/conversation', '/verbose', '/color'
     ];
 
     if (line.startsWith('/')) {
@@ -2074,24 +2079,29 @@ export class Roy {
 
   private async printRootTurnResult(result: Awaited<ReturnType<typeof runtime.handleUserTurn>>): Promise<void> {
     if (result.decision.action === 'spawn_subagents') {
-      console.log(`  ${this.green('roy[root] spawned')} ${result.subagents.length} subagent${result.subagents.length === 1 ? '' : 's'}: ${result.subagents.map(item => item.agent.name).join(', ')}`);
+      const delegationSteps = result.executionTree.steps.filter(step => step.decision.action === 'delegate');
+      console.log(`  ${this.green('roy[root] completed')} ${delegationSteps.length} delegation step${delegationSteps.length === 1 ? '' : 's'}`);
       if (this.verboseMode) {
         console.log(`  ${this.dim(`decision: ${result.decision.reason}`)}`);
       }
-      for (let index = 0; index < result.subagents.length; index += 1) {
-        const item = result.subagents[index];
-        const branch = index === result.subagents.length - 1 ? '└─' : '├─';
-        console.log(`  ${branch} ${this.yellow(`${item.agent.name}[subagent] completed`)}, ${item.subagentResult.usage.totalTokens} tokens`);
+      for (const step of delegationSteps) {
+        console.log(`  ${this.cyan(`step ${step.index}`)} ${this.dim(`depends=${step.dependsOn.join(', ') || 'root-input'}`)}`);
+        this.printExecutionSnapshot(step.treeSnapshot, result.executionTree.rootAgentId, '  ');
         if (this.verboseMode) {
-          console.log(`  │  ${this.dim(`node: ${item.node.nodeId} definition=${item.node.definitionFingerprint.slice(0, 12)}`)}`);
-          for (const call of item.subagentResult.toolCalls) {
-            const toolPath = typeof call.params.path === 'string'
-              ? path.relative(process.cwd(), call.params.path) || '.'
-              : '';
-            console.log(`  │  ${this.dim(`tool: ${call.toolName} ${toolPath}`.trim())}`);
-          }
-          for (const warning of item.subagentResult.warnings) {
-            console.log(`  │  ${this.yellow('[warning]')} ${warning}`);
+          for (const agentId of step.actorIds) {
+            const item = result.subagents.find(entry => entry.agent.identity.id === agentId);
+            if (item) {
+              console.log(`  │  ${this.dim(`node: ${item.node.nodeId} definition=${item.node.definitionFingerprint.slice(0, 12)}`)}`);
+              for (const call of item.subagentResult.toolCalls) {
+                const toolPath = typeof call.params.path === 'string'
+                  ? path.relative(process.cwd(), call.params.path) || '.'
+                  : '';
+                console.log(`  │  ${this.dim(`tool: ${call.toolName} ${toolPath}`.trim())}`);
+              }
+              for (const warning of item.subagentResult.warnings) {
+                console.log(`  │  ${this.yellow('[warning]')} ${warning}`);
+              }
+            }
           }
         }
       }
@@ -2101,6 +2111,49 @@ export class Roy {
     }
 
     console.log('  ' + this.green('roy[root] > ') + result.finalResponse + '\n');
+  }
+
+  private printRootExecutionTree(correlationId?: string): void {
+    const tree = runtime.getRootExecutionTree(correlationId);
+    console.log('\n  ' + this.bold('Root Execution Tree'));
+    if (!tree) {
+      console.log('    ' + this.dim(correlationId ? `No execution tree found for ${correlationId}` : 'No root turn has executed yet'));
+      console.log('');
+      return;
+    }
+    console.log(`    Correlation: ${this.cyan(tree.correlationId)}`);
+    console.log(`    Status: ${tree.status}  Steps: ${tree.steps.length}/${tree.maxSteps}`);
+    for (const step of tree.steps) {
+      console.log(`\n    ${this.cyan(`Step ${step.index}`)} [${step.decision.action}, ${step.status}]`);
+      console.log(`      depends: ${step.dependsOn.join(', ') || 'user.input'}`);
+      console.log(`      reason: ${step.decision.reason}`);
+      this.printExecutionSnapshot(step.treeSnapshot, tree.rootAgentId, '      ');
+      if (step.resultSummary) console.log(`      ${this.dim(`result: ${step.resultSummary.replace(/\s+/g, ' ').slice(0, 220)}`)}`);
+    }
+    console.log('');
+  }
+
+  private printExecutionSnapshot(
+    nodes: NonNullable<ReturnType<typeof runtime.getRootExecutionTree>>['nodes'],
+    rootId: string,
+    prefix: string
+  ): void {
+    const root = nodes.find(node => node.id === rootId);
+    const childrenByParent = new Map<string, typeof nodes>();
+    for (const node of nodes.filter(item => item.id !== rootId)) {
+      const parentId = node.parentId ?? rootId;
+      childrenByParent.set(parentId, [...(childrenByParent.get(parentId) ?? []), node]);
+    }
+    const printChildren = (parentId: string, childPrefix: string): void => {
+      const children = childrenByParent.get(parentId) ?? [];
+      children.forEach((node, index) => {
+        const last = index === children.length - 1;
+        console.log(`${childPrefix}${last ? '└── ' : '├── '}${node.name} [${node.role}, ${node.status}, ${node.tokenUsage ?? 0} tokens]`);
+        printChildren(node.id, childPrefix + (last ? '    ' : '│   '));
+      });
+    };
+    console.log(`${prefix}${root?.name ?? 'Roy'} [root, ${root?.status ?? 'active'}]`);
+    printChildren(rootId, prefix);
   }
 
   private async printAgentOutput(): Promise<string> {

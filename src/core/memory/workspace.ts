@@ -167,6 +167,12 @@ export interface WorkspaceRuntimeConfig {
     maxTotalAgentsPerTurn: number;
     allowCustomAgents: boolean;
     budgetAware: boolean;
+    rootSteps: {
+      enabled: boolean;
+      maxStepsPerTurn: number;
+      maxDelegationRounds: number;
+      reassessAfterDelegation: boolean;
+    };
     candidateScoring: {
       enabledScorers: Array<'heuristic' | 'cost' | 'tom' | 'cache_evolution' | 'llm'>;
       minimumScore: number;
@@ -459,7 +465,7 @@ Role-specific terms are recorded here.
 };
 
 const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
-  version: 6,
+  version: 7,
   traceEvents: true,
   memoryUpdates: 'suggest',
   delegation: {
@@ -470,6 +476,12 @@ const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
     maxTotalAgentsPerTurn: 10,
     allowCustomAgents: true,
     budgetAware: true,
+    rootSteps: {
+      enabled: true,
+      maxStepsPerTurn: 4,
+      maxDelegationRounds: 3,
+      reassessAfterDelegation: true,
+    },
     candidateScoring: {
       enabledScorers: ['heuristic', 'cost', 'tom', 'cache_evolution', 'llm'],
       minimumScore: 0.05,
