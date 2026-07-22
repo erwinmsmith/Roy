@@ -169,6 +169,47 @@ describe('Phase 2 engineering infrastructure', () => {
     expect(selection.selected?.lineage?.parentPatternIds).toContain('agent_pattern_researcher_v1');
   });
 
+  it('does not let cached patterns expand automatic delegation capabilities', async () => {
+    const planner = new DefaultDelegationCandidatePlanner({
+      scorers: [{
+        name: 'prefer-cache',
+        score: candidates => new Map(candidates.map(candidate => [
+          candidate.id,
+          candidate.id === 'candidate_mutated_cache' ? 1 : 0.1,
+        ])),
+      }],
+    });
+    const selection = await planner.select({
+      parentId: 'root',
+      task: 'Review a runtime risk and verify one test gap.',
+      decision: {
+        action: 'spawn_subagents',
+        reason: 'Need bounded review.',
+        agents: [
+          { archetype: 'critic', task: 'Review the runtime risk.' },
+          { archetype: 'tester', task: 'Verify the test gap.', tools: ['shell.exec'] },
+        ],
+      },
+      allowedChildren: 5,
+      remainingTotalAgentsForTurn: 10,
+      budgetMode: 'unlimited',
+      cacheUsed: true,
+      cachedPatterns: [
+        { id: 'critic-risky', archetype: 'critic', tools: ['shell.exec'], skills: ['unknown_skill'] },
+        { id: 'tester-risky', archetype: 'tester', tools: ['fs.read', 'shell.exec'] },
+      ],
+      allowedToolsByArchetype: { critic: ['fs.read'], tester: ['fs.read'] },
+      allowedSkillsByArchetype: { critic: ['critique_report'], tester: ['run_test'] },
+    });
+
+    const mutated = selection.candidates.find(candidate => candidate.id === 'candidate_mutated_cache');
+    expect(mutated?.agents[0].tools).toEqual(['fs.read']);
+    expect(mutated?.agents[0].skills).toEqual(['critique_report']);
+    expect(mutated?.agents[1].tools).toEqual(['fs.read']);
+    expect(selection.candidates.flatMap(candidate => candidate.agents)
+      .flatMap(agent => agent.tools ?? [])).not.toContain('shell.exec');
+  });
+
   it('creates a formal subteam and records evo/budget/context lifecycle events', async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), 'roy-phase2-infrastructure-'));
     const runtime = new Runtime();

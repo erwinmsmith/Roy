@@ -40,6 +40,9 @@ export interface DelegationCandidateInput {
   remainingBudgetTokens?: number;
   cacheUsed: boolean;
   cachedPatterns?: Array<Record<string, unknown>>;
+  allowedToolsByArchetype?: Record<string, string[]>;
+  allowedSkillsByArchetype?: Record<string, string[]>;
+  enforceMinimumToMCoverage?: boolean;
   parentToMProfile?: ToMProfile;
   tomAnalysis?: ToMTaskAnalysis;
 }

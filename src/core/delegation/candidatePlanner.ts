@@ -77,7 +77,8 @@ export class DefaultDelegationCandidatePlanner {
     const run = await engine.run(input);
     const candidates = run.evaluated.map(item => item.candidate).sort((a, b) => b.score - a.score);
     const selected = run.selected?.candidate;
-    const coverageRejected = input.budgetMode === 'unlimited'
+    const coverageRejected = input.enforceMinimumToMCoverage !== false
+      && input.budgetMode === 'unlimited'
       && Math.min(input.allowedChildren, input.remainingTotalAgentsForTurn) > 1
       && selected?.tomCoverage
       && selected.tomCoverage.coverageScore < this.minimumToMCoverage;
@@ -109,7 +110,11 @@ export class DefaultDelegationCandidatePlanner {
 
   private generateCandidates(input: DelegationCandidateInput, limit: number): DelegationCandidate[] {
     if (input.decision.action !== 'spawn_subagents') return [];
-    const bounded = input.decision.agents.slice(0, limit);
+    const bounded = input.decision.agents.slice(0, limit).map(agent => ({
+      ...agent,
+      tools: this.authorizeRequestedBindings(agent.tools, input.allowedToolsByArchetype?.[agent.archetype]),
+      skills: this.authorizeRequestedBindings(agent.skills, input.allowedSkillsByArchetype?.[agent.archetype]),
+    }));
     const candidates: DelegationCandidate[] = [];
     if (bounded.length > 0) {
       candidates.push(this.createCandidate('candidate_full_plan', input.parentId, bounded, this.sourceFor(bounded, input.cacheUsed), 'uses the complete bounded delegation plan'));
@@ -124,8 +129,16 @@ export class DefaultDelegationCandidatePlanner {
         const pattern = cached.find(item => item.archetype === agent.archetype || item.key === agent.archetype);
         return {
           ...agent,
-          tools: this.mergeStringLists(agent.tools, pattern?.tools),
-          skills: this.mergeStringLists(agent.skills, pattern?.skills),
+          tools: this.mergeAuthorizedStringLists(
+            agent.tools,
+            pattern?.tools,
+            input.allowedToolsByArchetype?.[agent.archetype]
+          ),
+          skills: this.mergeAuthorizedStringLists(
+            agent.skills,
+            pattern?.skills,
+            input.allowedSkillsByArchetype?.[agent.archetype]
+          ),
         };
       });
       candidates.push({
@@ -245,10 +258,22 @@ export class DefaultDelegationCandidatePlanner {
     return 'generated';
   }
 
-  private mergeStringLists(primary: string[] | undefined, cached: unknown): string[] | undefined {
+  private mergeAuthorizedStringLists(
+    primary: string[] | undefined,
+    cached: unknown,
+    allowed: string[] | undefined
+  ): string[] | undefined {
     const cachedList = Array.isArray(cached) ? cached.filter((value): value is string => typeof value === 'string') : [];
-    const merged = Array.from(new Set([...(primary ?? []), ...cachedList]));
+    const allowedSet = allowed ? new Set(allowed) : undefined;
+    const merged = Array.from(new Set([...(primary ?? []), ...cachedList]))
+      .filter(value => !allowedSet || allowedSet.has(value));
     return merged.length > 0 ? merged : undefined;
+  }
+
+  private authorizeRequestedBindings(requested: string[] | undefined, allowed: string[] | undefined): string[] | undefined {
+    if (!allowed) return requested;
+    const allowedSet = new Set(allowed);
+    return (requested ?? allowed).filter(value => allowedSet.has(value));
   }
 }
 

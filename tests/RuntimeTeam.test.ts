@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Runtime, { type DelegationDecision } from '../src/core/runtime/Runtime.js';
@@ -51,6 +51,26 @@ class PartialFailureTeamLLM extends TeamTestLLM {
       throw new Error('critic execution failed');
     }
     yield* super.stream(messages);
+  }
+}
+
+class RootPartialFailureTeamLLM extends PartialFailureTeamLLM {
+  override async completeJSON<T>(messages: LLMMessage[]): Promise<T> {
+    const prompt = messages.map(message => message.content).join('\n');
+    if (prompt.includes("Roy's root delegation controller")) {
+      return {
+        action: 'spawn_subagents',
+        reason: 'Use independent inspection and critique.',
+        agents: [
+          { archetype: 'researcher', name: 'Researcher-1', task: 'Inspect bounded project evidence.', tomLevel: 0 },
+          { archetype: 'critic', name: 'Critic-1', task: 'Critique the bounded project evidence.', tomLevel: 2 },
+        ],
+      } satisfies DelegationDecision as T;
+    }
+    if (prompt.includes("Roy's dynamic root-step controller")) {
+      return { action: 'finalize', reason: 'Synthesize the successful result and explicit failure.' } as T;
+    }
+    return super.completeJSON<T>(messages);
   }
 }
 
@@ -340,6 +360,32 @@ describe('Phase 3 subteam runtime', () => {
     const teamSession = await readFile(path.join(cwd, '.roy', 'teams', 'partialreviewteam', 'sessions.jsonl'), 'utf8');
     expect(teamSession).toContain('"partial":true');
     expect(teamSession).toContain('critic execution failed');
+    await runtime.shutdown();
+  });
+
+  it('keeps failed automatic team members in the root step actor tree', async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), 'roy-phase3-root-partial-tree-'));
+    await mkdir(path.join(cwd, '.roy'), { recursive: true });
+    await writeFile(path.join(cwd, '.roy', 'config.json'), JSON.stringify({
+      tom: { autoCompleteGaps: false, minimumCoverage: 0 },
+      delegation: { rootSteps: { reassessAfterDelegation: true } },
+    }));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'phase3-root-partial-tree',
+      workspaceCwd: cwd,
+      llmProvider: new RootPartialFailureTeamLLM(),
+    });
+
+    const result = await runtime.handleUserTurn('Inspect bounded project evidence and critique one risk.');
+    const failed = result.teams[0].memberOutcomes.find(outcome => outcome.status === 'failed');
+
+    expect(failed?.agentId).toBeDefined();
+    expect(result.executionTree.steps[0].actorIds).toContain(failed?.agentId);
+    expect(result.executionTree.nodes).toContainEqual(expect.objectContaining({
+      id: failed?.agentId,
+      status: 'failed',
+    }));
     await runtime.shutdown();
   });
 

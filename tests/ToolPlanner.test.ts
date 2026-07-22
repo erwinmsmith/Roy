@@ -58,4 +58,36 @@ describe('AgentToolPlanner', () => {
       expect.objectContaining({ toolName: 'shell.exec', params: { command: 'cat package.json' }, groundingRequired: true }),
     ]);
   });
+
+  it('prioritizes an explicitly requested directory and multiple source files', () => {
+    const planner = new AgentToolPlanner();
+    const plans = planner.plan({
+      task: 'Read src/core/runtime/index.ts and src/server/RuntimeSessionPool.ts. Also read src/core/delegation/index.ts and list tests/ directory.',
+      workspacePath: '.',
+      archetype: 'researcher',
+      bindings: [
+        { name: 'fs.list', enabled: true },
+        { name: 'fs.read', enabled: true },
+      ],
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({ toolName: 'fs.list', params: { path: 'tests', maxDepth: 3 } }),
+      expect.objectContaining({ toolName: 'fs.read', params: { path: 'src/core/runtime/index.ts' } }),
+      expect.objectContaining({ toolName: 'fs.read', params: { path: 'src/server/RuntimeSessionPool.ts' } }),
+    ]);
+  });
+
+  it('keeps the broad workspace listing fallback for tasks without explicit paths', () => {
+    const plans = new AgentToolPlanner().plan({
+      task: 'Inspect this repository structure using filesystem evidence.',
+      workspacePath: '.',
+      archetype: 'researcher',
+      bindings: [{ name: 'fs.list', enabled: true }],
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({ toolName: 'fs.list', params: { path: '.', maxDepth: 2 } }),
+    ]);
+  });
 });

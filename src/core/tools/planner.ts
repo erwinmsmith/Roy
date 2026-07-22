@@ -22,8 +22,18 @@ export class AgentToolPlanner {
     const enabled = new Set(input.bindings.filter(binding => binding.enabled).map(binding => binding.name));
     const lower = input.task.toLowerCase();
     const plans: PlannedToolCall[] = [];
+    const referencedPaths = this.extractReferencedPaths(input.task);
+    const referencedDirectories = referencedPaths.filter(item => item.endsWith('/'));
+    const referencedFiles = referencedPaths.filter(item => !item.endsWith('/'));
 
-    if (enabled.has('fs.list') && /\b(inspect|analy[sz]e|review|list|structure|project|codebase|repo|repository|files?|evidence|coverage|verify)\b/.test(lower)) {
+    if (enabled.has('fs.list') && referencedDirectories.length > 0) {
+      plans.push(...referencedDirectories.map(directory => ({
+        toolName: 'fs.list',
+        params: { path: directory.replace(/\/$/, ''), maxDepth: 3 },
+        reason: `The task explicitly requests directory evidence from ${directory}.`,
+        groundingRequired: true,
+      })));
+    } else if (enabled.has('fs.list') && /\b(inspect|analy[sz]e|review|list|structure|project|codebase|repo|repository|files?|evidence|coverage|verify)\b/.test(lower)) {
       plans.push({
         toolName: 'fs.list',
         params: { path: input.workspacePath, maxDepth: 2 },
@@ -32,23 +42,24 @@ export class AgentToolPlanner {
       });
     }
 
-    const explicitFilePath = input.task.match(/(?:^|\s)(\.?\.?\/[A-Za-z0-9._/@-]+|[A-Za-z0-9_/-]+\.(?:ts|tsx|js|json|md|yaml|yml))(?:\s|$)/)?.[1];
     const inferredFilePath = /\b(?:package exports?|export map|package manifest|package entr(?:y|ies))\b/.test(lower)
       ? 'package.json'
       : input.archetype === 'critic'
         && /\b(?:architecture|architectural|repository|codebase|dependency|coupling)\b/.test(lower)
         ? 'package.json'
       : undefined;
-    const filePath = explicitFilePath ?? inferredFilePath;
-    if (enabled.has('fs.read') && filePath && /\b(read|inspect|review|check|open|identify|analy[sz]e)\b/.test(lower)) {
-      plans.push({
+    const filePaths = referencedFiles.length > 0
+      ? referencedFiles
+      : inferredFilePath ? [inferredFilePath] : [];
+    if (enabled.has('fs.read') && filePaths.length > 0 && /\b(read|inspect|review|check|open|identify|analy[sz]e)\b/.test(lower)) {
+      plans.push(...filePaths.map(filePath => ({
         toolName: 'fs.read',
         params: { path: filePath },
-        reason: explicitFilePath
+        reason: referencedFiles.length > 0
           ? `The task explicitly references ${filePath}.`
           : `The package export request requires evidence from ${filePath}.`,
         groundingRequired: true,
-      });
+      })));
     }
 
     if (enabled.has('shell.exec')) {
@@ -73,5 +84,12 @@ export class AgentToolPlanner {
     }
 
     return plans.slice(0, 3);
+  }
+
+  private extractReferencedPaths(task: string): string[] {
+    const matches = task.matchAll(/(?:^|[\s`'"(])((?:\.{1,2}\/)?(?:[A-Za-z0-9._@-]+\/)*[A-Za-z0-9._@-]+(?:\/|\.(?:ts|tsx|js|mjs|cjs|json|md|yaml|yml)))(?=$|[.\s`'"),:;])/g);
+    return [...new Set([...matches]
+      .map(match => match[1].replace(/^\.\//, ''))
+      .filter(value => value.length > 0))];
   }
 }

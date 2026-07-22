@@ -137,7 +137,7 @@ describe('Root dynamic execution tree', () => {
     const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-dynamic-tree-'));
     await mkdir(path.join(workspaceCwd, '.roy'), { recursive: true });
     await writeFile(path.join(workspaceCwd, '.roy', 'config.json'), JSON.stringify({
-      tom: { autoCompleteGaps: false, minimumCoverage: 0 },
+      tom: { autoCompleteGaps: false, minimumCoverage: 1 },
       delegation: {
         rootSteps: {
           enabled: true,

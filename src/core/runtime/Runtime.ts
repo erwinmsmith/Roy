@@ -2751,6 +2751,18 @@ export class Runtime {
     return (configured ?? namesByArchetype[archetype]).map(name => this.createToolBinding(name));
   }
 
+  private getAutomaticallyApprovedToolBindings(archetype: SubAgentArchetype): ToolBinding[] {
+    const approval = this.workspaceRuntimeConfig?.tools.approval;
+    return this.getDefaultToolBindings(archetype).filter(binding => {
+      if (!approval) return binding.permission === 'read_only';
+      const decision = approval.overrides[binding.name]
+        ?? (binding.permission === 'read_only'
+          ? approval.readOnly
+          : binding.permission === 'write' ? approval.write : approval.execute);
+      return decision === 'auto';
+    });
+  }
+
   private getDefaultSkillBindings(archetype: SubAgentArchetype): SkillBinding[] {
     const namesByArchetype: Record<SubAgentArchetype, string[]> = {
       researcher: ['use_tool_when_needed', 'delegate_to_subagent'],
@@ -3774,7 +3786,7 @@ export class Runtime {
           completed: round.evolution?.metrics.agentsSpawned ?? round.subagents.length,
         });
         const completedStep = await this.completeRootExecutionStep(correlationId, step, {
-          actorIds: round.subagents.map(item => item.agent.identity.id),
+          actorIds: this.collectDelegationRoundActorIds(round),
           teamIds: round.teams.map(item => item.team.identity.id),
           nodes: this.buildRootExecutionNodes(correlationId, step.index),
           resultSummary: this.summarizeDelegationRound(round),
@@ -6094,6 +6106,7 @@ export class Runtime {
       ctx.memory.getCachePatterns('agents'),
       ctx.memory.getCachePatterns('delegations'),
     ]);
+    const archetypes = [...new Set(completedPlans.map(agent => agent.archetype))];
     const selection = await this.requireCandidatePlanner().select({
       parentId,
       correlationId,
@@ -6105,6 +6118,15 @@ export class Runtime {
       remainingBudgetTokens: budget.remainingTokens,
       cacheUsed: cacheHits.some(Boolean),
       cachedPatterns: [...agentPatterns, ...delegationPatterns],
+      allowedToolsByArchetype: Object.fromEntries(archetypes.map(archetype => [
+        archetype,
+        this.getAutomaticallyApprovedToolBindings(archetype).map(binding => binding.name),
+      ])),
+      allowedSkillsByArchetype: Object.fromEntries(archetypes.map(archetype => [
+        archetype,
+        this.getDefaultSkillBindings(archetype).filter(binding => binding.enabled).map(binding => binding.name),
+      ])),
+      enforceMinimumToMCoverage: !preserveRequestedPlan,
       parentToMProfile,
       tomAnalysis,
     });
@@ -6720,6 +6742,16 @@ export class Runtime {
       }));
     }
     return { subagents, teams: [] };
+  }
+
+  private collectDelegationRoundActorIds(round: RootDelegationRoundResult): string[] {
+    return [...new Set([
+      ...round.subagents.map(item => item.agent.identity.id),
+      ...round.teams.flatMap(team => team.team.memberAgentIds),
+      ...round.teams.flatMap(team => team.memberOutcomes
+        .map(outcome => outcome.agentId)
+        .filter((agentId): agentId is string => Boolean(agentId))),
+    ])];
   }
 
   private async decideRootContinuation(

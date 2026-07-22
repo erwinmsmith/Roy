@@ -123,8 +123,9 @@ export class RootExecutionActivityProjector {
   }
 
   checkpoint(input: BuildRootCheckpointInput): RootExecutionCheckpoint {
-    const evidence = input.activities
-      .filter(activity => activity.kind === 'tool' && activity.status === 'completed')
+    const successfulToolResults = input.activities.filter(activity => this.isSuccessfulToolResult(activity));
+    const messageToolResults = successfulToolResults.filter(activity => activity.data?.kind === 'tool.result');
+    const evidence = (messageToolResults.length > 0 ? messageToolResults : successfulToolResults)
       .map(activity => activity.summary ?? activity.label)
       .filter((value, index, values) => values.indexOf(value) === index)
       .slice(0, 20);
@@ -157,6 +158,11 @@ export class RootExecutionActivityProjector {
     };
   }
 
+  private isSuccessfulToolResult(activity: RootExecutionActivity): boolean {
+    if (activity.kind !== 'tool' || activity.status !== 'completed' || activity.data?.success === false) return false;
+    return activity.eventType === 'tool.result' || activity.data?.kind === 'tool.result';
+  }
+
   private kindForMessage(kind: RuntimeMessage['kind']): RootExecutionActivityKind | undefined {
     if (kind === 'user.input' || kind === 'root.final_response') return 'conversation';
     if (kind === 'tool.call' || kind === 'tool.result') return 'tool';
@@ -187,6 +193,25 @@ export class RootExecutionActivityProjector {
     if (message.kind === 'tool.call') {
       const payload = message.payload as { toolName?: unknown; params?: unknown };
       return `${String(payload.toolName ?? message.to)} ${JSON.stringify(payload.params ?? {}).slice(0, 500)}`;
+    }
+    if (message.kind === 'tool.result') {
+      const payload = message.payload as {
+        success?: unknown;
+        error?: unknown;
+        result?: { root?: unknown; entries?: unknown; path?: unknown; content?: unknown; command?: unknown; stdout?: unknown };
+      };
+      if (payload.success === false) return `Tool failed: ${String(payload.error ?? 'unknown error')}`;
+      if (Array.isArray(payload.result?.entries)) {
+        const entries = payload.result.entries.filter((item): item is string => typeof item === 'string');
+        return `Observed ${String(payload.result.root ?? '.')}: ${entries.slice(0, 30).join(', ')}`.slice(0, 1000);
+      }
+      if (typeof payload.result?.path === 'string') {
+        return `Read ${payload.result.path}: ${String(payload.result.content ?? '').replace(/\s+/g, ' ').slice(0, 700)}`;
+      }
+      if (typeof payload.result?.command === 'string') {
+        return `Executed ${payload.result.command}: ${String(payload.result.stdout ?? '').replace(/\s+/g, ' ').slice(0, 700)}`;
+      }
+      return `${message.from} returned a successful tool result to ${message.to}`;
     }
     return `${message.from} sent ${message.kind} to ${message.to}`;
   }
