@@ -50,7 +50,13 @@ describe('Workspace memory initialization', () => {
     });
     expect(rootState.updatedAt).toEqual(expect.any(String));
     const workspaceConfig = JSON.parse(await readFile(path.join(workspaceCwd, '.roy', 'config.json'), 'utf8'));
-    expect(workspaceConfig.version).toBe(9);
+    expect(workspaceConfig.version).toBe(10);
+    expect(workspaceConfig.llm).toEqual({
+      streamMaxAttempts: 3,
+      jsonMaxAttempts: 2,
+      retryInitialDelayMs: 250,
+      retryMaxDelayMs: 2000,
+    });
     expect(workspaceConfig.tools.web).toEqual(expect.objectContaining({
       enabled: true,
       searchProvider: 'auto',
@@ -83,6 +89,7 @@ describe('Workspace memory initialization', () => {
       autoCompleteGaps: true,
       maxAgentsPerDecision: 3,
       minimumCoverage: 0.6,
+      enforceMinimumCoverage: false,
     });
     expect(workspaceConfig.communication).toMatchObject({
       defaultProtocol: 'tom',
@@ -220,7 +227,8 @@ describe('Workspace memory initialization', () => {
     expect(researcher?.tools.map(tool => tool.name)).toEqual(['fs.read']);
     expect(researcher?.skills.map(skill => skill.name)).toEqual(['use_tool_when_needed']);
     const migratedConfig = JSON.parse(await readFile(path.join(workspaceCwd, '.roy', 'config.json'), 'utf8'));
-    expect(migratedConfig.version).toBe(9);
+    expect(migratedConfig.version).toBe(10);
+    expect(migratedConfig.llm.streamMaxAttempts).toBe(3);
     expect(migratedConfig.delegation.rootSteps).toEqual({
       enabled: true,
       maxStepsPerTurn: 12,
@@ -231,6 +239,7 @@ describe('Workspace memory initialization', () => {
       persistEveryStep: true,
     });
     expect(migratedConfig.tom.minimumCoverage).toBe(0.6);
+    expect(migratedConfig.tom.enforceMinimumCoverage).toBe(false);
     expect(migratedConfig.evolution.ablations.withoutEvoMutation).toBe(false);
 
     await runtime.shutdown();

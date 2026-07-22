@@ -81,6 +81,7 @@ export class TeamRegistry {
       memberStatuses: {},
       memberErrors: {},
       executionPolicy: normalizeTeamExecutionPolicy(spec.executionPolicy),
+      synthesisPolicy: spec.synthesisPolicy,
       task: spec.task,
       correlationId: spec.correlationId,
       createdAt: spec.createdAt ?? now,

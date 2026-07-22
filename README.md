@@ -34,6 +34,10 @@ Roy [root]
 
 Each parent owns its direct children and synthesizes their results before returning a result upward.
 
+Agent and team definitions are generated from live task state. A delegation decision can request independent agents or a formal team and can define task-specific names, roles, member tasks, approved capability requests, coordination policy, and synthesis policy. These are proposals, not authority: Runtime intersects tools and skills with registered parent-approved bindings, enforces FSM/depth/child/turn/budget limits, and creates fresh runtime instances. One-member team proposals are reduced to an agent. Built-in archetypes remain capability baselines and cache keys; they are not fixed team templates.
+
+The same decision path runs for non-root agents. A team member may create a child when its own delegation controller identifies a concrete gap and policy allows it. The child returns to that member, the member synthesizes to its team, and the team returns to its parent. This preserves the actor tree instead of bypassing intermediate ownership.
+
 ## Dynamic Root Execution Tree
 
 A root turn is a bounded sequence of dependent execution steps, not a one-shot delegation plan. Each step stores its decision, dependencies, actors, teams, result summary, activity graph, checkpoint, and a complete tree snapshot. Activities distinguish conversation, context loading, root thinking, tool calls, agent/team work, delegation, synthesis, and control transitions. After every delegated step, Roy reassesses the original task against accumulated evidence, warnings, budget, and prior results. Roy may add another dependent branch, ask for missing input, or finalize. Only Roy produces the user-facing result.
@@ -55,6 +59,8 @@ Roy -> final response
 The live registry and historical snapshots are deliberately separate from actor lifecycle. A completed child may be released while remaining visible in every relevant step snapshot. Trees are atomically persisted under `.roy/execution-trees/<session-id>/<correlation-id>.json` after each step and loaded again after runtime restart. Correlation IDs include the session and a random suffix, so histories from concurrent or restarted runtimes do not collide. Use `/tree`, `/tree <correlation-id>`, `/tree list`, `GET /v1/execution-tree`, `GET /v1/execution-tree/:correlationId`, or `GET /v1/execution-trees` to inspect this state. Queue messages `root.step.plan` and `root.step.result`, plus `root.step.*` events, expose the same control flow.
 
 The root task loop reserves a final synthesis step and applies four independent guards: step count, delegation rounds, wall-clock deadline, and repeated checkpoint fingerprints. Long-horizon or explicitly staged requests are promoted into an initial planning checkpoint even when a model initially classifies them as direct-answer tasks.
+
+Every delegated plan also carries an explicit continuation contract. `reassess` allows Roy to grow another dependent step from unresolved evidence; `finalize_after_round` skips root reassessment and moves directly to final synthesis. Formal teams independently declare `memberDelegationPolicy: allow|deny`, so a minimal one-round team can prohibit recursive member expansion without removing recursive delegation from other agents. A complete model-generated team plan is preserved as proposed: ToM enriches and scores its profiles but does not append fixed archetype members.
 
 Workspace limits prevent an unbounded reasoning loop:
 
@@ -121,7 +127,11 @@ Roy [root]
 
 A subteam has its own identity, FSM, task/result boundary, synthesis call, token usage, message flow, memory directory, topology snapshot, session log, and reusable cache pattern. Member tasks flow `parent -> team -> member`; member results flow `member -> team -> parent`.
 
-Team execution is policy controlled. A team can run sequentially or with bounded concurrency, stop on the first failure or continue in best-effort mode, and require a minimum number of successful members before synthesis. Cached team patterns restore member tasks, tools, skills, lead assignment, full ToM profiles, cognitive-gap assignments, and execution policy into a new runtime team instance.
+Team execution is policy controlled. A team can run sequentially or with bounded concurrency, stop on the first failure or continue in best-effort mode, and require a minimum number of successful members before synthesis. A model-generated synthesis policy is stored on the team actor and injected into team synthesis. Cached team patterns restore member tasks, tools, skills, lead assignment, full ToM profiles, cognitive-gap assignments, execution policy, and synthesis policy into a new runtime team instance.
+
+## Multi-Turn Experiments
+
+`Runtime.runMultiTurnExperiment()` executes an ordered turn list in one session and returns a structured snapshot per turn: root decision, execution tree, newly created agent/team IDs, event types, budget state, token usage, and failure status. Later turns use the normal session context path, so they can choose a different actor structure from earlier findings rather than replaying a fixed plan. The same interface is available through `POST /v1/experiments/multi-turn` with `{ "turns": ["...", "..."], "stopOnError": true }`.
 
 ## ToM-Aware Delegation
 
@@ -342,6 +352,10 @@ Built-in tools include:
 
 Agents plan tool use only when the task needs external evidence or execution. Tool availability comes from parent-approved bindings. Read-only tools can run automatically by default; write and execute tools require an approval unless workspace policy overrides them. `shell.exec` also applies its own command allowlist.
 
+Model-generated custom agents use the same capability contract. When a concrete task requires file, runtime API, web, test, or build evidence but omits an explicit binding, Runtime derives the minimum registered capability, intersects it with approval policy, and records the resulting binding on the compute node. File planning merges explicit paths with inferred runtime entry points and avoids a broad workspace listing when targeted reads are available.
+
+Provider calls are resilient at both transport and structured-output boundaries. Stream retries discard partial output before retrying and failed root turns restore the session FSM so later turns can continue. JSON control-plane calls reserve model-family reasoning capacity and retry truncated/invalid output in unlimited mode. Configure `.roy/config.json` with `llm.streamMaxAttempts`, `llm.jsonMaxAttempts`, `llm.retryInitialDelayMs`, and `llm.retryMaxDelayMs`.
+
 ## Budget Control
 
 Token metering is always enabled. The default allocation policy is `market`; the session limit may still be unlimited. Agents and teams submit requests with purpose, priority, resource estimates, requested tokens, and a minimum viable grant. A replaceable `ReasoningInvestmentModel` combines root/parent utility, historical outcomes, evidence gain, uncertainty reduction, conflict resolution, verification gain, cache confidence, execution risk, token/context cost, tool calls, and latency into a structured expected-return estimate.
@@ -504,6 +518,7 @@ Primary endpoints:
 
 ```text
 POST /v1/chat
+POST /v1/experiments/multi-turn
 GET  /v1/status
 GET  /v1/execution-tree
 GET  /v1/execution-tree/:correlationId
@@ -553,7 +568,7 @@ GET  /v1/traces
 
 ## Validation
 
-The test suite covers root-controlled and recursive delegation, strict nested FSM transitions, context boundaries, subteam lifecycle, candidate scoring, cache mutation, competitive budget allocation and rebalancing, provider-specific token normalization, tool approval, bounded continuous tool execution, real-provider web result parsing, SSRF defenses, evidence relevance, memory persistence, queue transitions, and CLI-facing runtime behavior.
+The test suite covers autonomous task-specific agent/team design, multi-turn structure changes, recursive team-member delegation, root-controlled delegation, strict nested FSM transitions, context boundaries, subteam lifecycle, candidate scoring, cache mutation, competitive budget allocation and rebalancing, provider-specific token normalization, tool approval, bounded continuous tool execution, real-provider web result parsing, SSRF defenses, evidence relevance, memory persistence, queue transitions, and CLI-facing runtime behavior.
 
 ## Contact
 

@@ -178,10 +178,10 @@ describe('Runtime root-controlled delegation', () => {
 
     expect(result.decision.action).toBe('spawn_subagents');
     expect(result.subagents).toHaveLength(3);
-    expect(result.subagents.map(item => item.agent.identity.id)).toEqual([
-      'agent_researcher_001',
-      'agent_critic_002',
-      'agent_summarizer_003',
+    expect(result.subagents.map(item => item.node.identity.archetype)).toEqual([
+      'researcher',
+      'critic',
+      'summarizer',
     ]);
     expect(result.finalResponse).toBe('Final synthesis from Researcher-1 and Critic-2.');
 
@@ -214,16 +214,17 @@ describe('Runtime root-controlled delegation', () => {
 
     const messages = await runtime.getMessages({ correlationId: result.correlationId });
     expect(messages.map(message => message.kind)).toContain('user.input');
-    expect(messages.filter(message => message.kind === 'agent.task')).toHaveLength(3);
-    expect(messages.filter(message => message.kind === 'agent.result')).toHaveLength(3);
+    const teamId = result.teams[0].team.identity.id;
+    expect(messages.filter(message => message.kind === 'agent.task' && message.from === teamId)).toHaveLength(3);
+    expect(messages.filter(message => message.kind === 'agent.result' && message.to === teamId)).toHaveLength(3);
     expect(messages.map(message => message.kind)).toContain('root.synthesis');
     expect(messages.map(message => message.kind)).toContain('root.final_response');
 
     const budget = runtime.getBudgetState();
     expect(budget.perAgent.root.totalTokens).toBeGreaterThan(0);
-    expect(budget.perAgent.agent_researcher_001.totalTokens).toBeGreaterThan(0);
-    expect(budget.perAgent.agent_critic_002.totalTokens).toBeGreaterThan(0);
-    expect(budget.perAgent.agent_summarizer_003.totalTokens).toBeGreaterThan(0);
+    for (const item of result.subagents) {
+      expect(budget.perAgent[item.agent.identity.id].totalTokens).toBeGreaterThan(0);
+    }
     expect(result.subagents.every(item => item.agent.identity.tomProfile.cognitiveGaps.length > 0)).toBe(true);
     const tomState = runtime.getToMState(result.correlationId);
     expect(tomState.analyses).toHaveLength(1);
@@ -306,6 +307,10 @@ describe('Runtime root-controlled delegation', () => {
 
   it('records cache participation in delegation decisions and still creates fresh runtime instances', async () => {
     const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-phase2-cache-'));
+    await mkdir(path.join(workspaceCwd, '.roy'), { recursive: true });
+    await writeFile(path.join(workspaceCwd, '.roy', 'config.json'), JSON.stringify({
+      tom: { enforceMinimumCoverage: true },
+    }));
     const runtime = new Runtime();
     await runtime.initialize({
       sessionId: 'phase2-cache-test',
@@ -327,7 +332,9 @@ describe('Runtime root-controlled delegation', () => {
     expect(result.subagents[0].creationUsage.definitionTokens).toBe(0);
 
     const decisionEvent = runtime.getEvents()
-      .find(event => event.type === 'delegation.decision' && event.data?.correlationId === result.correlationId);
+      .find(event => event.type === 'delegation.decision'
+        && event.agentId === 'root'
+        && event.data?.correlationId === result.correlationId);
     expect(decisionEvent?.data?.cacheUsed).toBe(true);
     const hits = runtime.getEvents()
       .filter(event => event.type === 'cache.hit' && event.data?.correlationId === result.correlationId);

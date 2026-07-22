@@ -96,6 +96,9 @@ export class DefaultDelegationCandidatePlanner {
         action: 'spawn_subagents',
         reason: `${input.decision.reason} Candidate ${selected.id} selected: ${selected.rationale}`,
         agents: selected.agents,
+        coordination: selected.agents.length > 1 ? input.decision.coordination : 'independent',
+        team: selected.agents.length > 1 ? input.decision.team : undefined,
+        continuationPolicy: input.decision.continuationPolicy,
       },
     };
   }
@@ -119,7 +122,7 @@ export class DefaultDelegationCandidatePlanner {
     if (bounded.length > 0) {
       candidates.push(this.createCandidate('candidate_full_plan', input.parentId, bounded, this.sourceFor(bounded, input.cacheUsed), 'uses the complete bounded delegation plan'));
     }
-    if (bounded.length > 1) {
+    if (bounded.length > 1 && input.decision.coordination !== 'team') {
       candidates.push(this.createCandidate(`candidate_single_${bounded[0].archetype}`, input.parentId, [bounded[0]], input.cacheUsed ? 'cache_hit' : bounded[0].archetype === 'custom' ? 'custom_generated' : 'generated', 'uses the highest-priority specialist to reduce cost'));
     }
     const cached = input.cachedPatterns ?? [];

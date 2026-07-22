@@ -8,6 +8,13 @@ export {
   type ToMRuntimeState,
   type RunEvolutionInput,
   type EvolutionBenchmarkResult,
+  type DelegationDecision,
+  type DelegationAgentPlan,
+  type DelegationTeamPlan,
+  type RootTurnResult,
+  type MultiTurnExperimentInput,
+  type MultiTurnExperimentTurn,
+  type MultiTurnExperimentResult,
 } from './Runtime.js';
 export { AgentManager } from './AgentManager.js';
 export {

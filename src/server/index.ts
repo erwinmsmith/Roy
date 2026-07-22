@@ -246,6 +246,22 @@ async function main(): Promise<void> {
     }
   });
 
+  app.post('/v1/experiments/multi-turn', async (req, res) => {
+    const turns = req.body?.turns;
+    if (!Array.isArray(turns) || turns.length === 0 || turns.some(turn => typeof turn !== 'string' || !turn.trim())) {
+      res.status(400).json({ error: 'Expected body { "turns": non-empty string[], "stopOnError"?: boolean }' });
+      return;
+    }
+    try {
+      res.json(await runtime.runMultiTurnExperiment({
+        turns,
+        stopOnError: req.body?.stopOnError,
+      }));
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
   app.get('/v1/agents', (req, res) => {
     res.json(runtime.getState().agents);
   });

@@ -23,7 +23,13 @@ export interface TeamExecutionOutcome<T> {
 export function normalizeTeamExecutionPolicy(
   input: Partial<TeamExecutionPolicy> = {}
 ): TeamExecutionPolicy {
-  const policy: TeamExecutionPolicy = { ...DEFAULT_TEAM_EXECUTION_POLICY, ...input };
+  const policy: TeamExecutionPolicy = { ...DEFAULT_TEAM_EXECUTION_POLICY };
+  if (input.mode !== undefined) policy.mode = input.mode;
+  if (input.failureMode !== undefined) policy.failureMode = input.failureMode;
+  if (input.maxConcurrency !== undefined) policy.maxConcurrency = input.maxConcurrency;
+  if (input.minimumSuccessfulMembers !== undefined) {
+    policy.minimumSuccessfulMembers = input.minimumSuccessfulMembers;
+  }
   if (policy.mode !== 'sequential' && policy.mode !== 'parallel') {
     throw new Error(`Unsupported team execution mode "${String(policy.mode)}"`);
   }

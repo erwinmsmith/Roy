@@ -355,6 +355,7 @@ export interface SpawnTeamSpec {
   tomAnalysis?: ToMTaskAnalysis;
   leadAgentId?: string;
   task?: string;
+  synthesisPolicy?: string;
   members?: TeamMemberSpec[];
   correlationId?: string;
   executionPolicy?: Partial<TeamExecutionPolicy>;
@@ -481,11 +482,17 @@ export type DelegationDecision =
       action: 'spawn_subagents';
       reason: string;
       agents: DelegationAgentPlan[];
+      coordination?: 'independent' | 'team';
+      team?: DelegationTeamPlan;
+      continuationPolicy?: 'reassess' | 'finalize_after_round';
     };
 
 export interface DelegationAgentPlan {
   archetype: SubAgentArchetype;
   name?: string;
+  role?: string;
+  style?: string;
+  description?: string;
   task: string;
   tools?: string[];
   skills?: string[];
@@ -494,6 +501,17 @@ export interface DelegationAgentPlan {
   tomProfile?: ToMProfile;
   cognitiveGapIds?: string[];
   existenceReason?: string;
+  systemPrompt?: string;
+}
+
+export interface DelegationTeamPlan {
+  name: string;
+  description: string;
+  task?: string;
+  synthesisPolicy?: string;
+  tomLevel?: number;
+  executionPolicy?: Partial<TeamExecutionPolicy>;
+  memberDelegationPolicy?: 'allow' | 'deny';
 }
 
 type RootContinuationDecision =
@@ -510,6 +528,9 @@ type RootContinuationDecision =
       action: 'delegate_more';
       reason: string;
       agents: DelegationAgentPlan[];
+      coordination?: 'independent' | 'team';
+      team?: DelegationTeamPlan;
+      continuationPolicy?: 'reassess' | 'finalize_after_round';
     };
 
 interface RootDelegationRoundResult {
@@ -544,6 +565,33 @@ export interface RootTurnResult {
     teamSynthesis: Record<string, TokenUsage>;
     total: TokenUsage;
   };
+}
+
+export interface MultiTurnExperimentInput {
+  turns: string[];
+  stopOnError?: boolean;
+}
+
+export interface MultiTurnExperimentTurn {
+  index: number;
+  input: string;
+  status: 'completed' | 'failed';
+  result?: RootTurnResult;
+  error?: string;
+  eventTypes: string[];
+  agentIds: string[];
+  teamIds: string[];
+  budget: BudgetState;
+}
+
+export interface MultiTurnExperimentResult {
+  sessionId: string;
+  startedAt: number;
+  completedAt: number;
+  turns: MultiTurnExperimentTurn[];
+  completedTurns: number;
+  failedTurns: number;
+  totalUsage: TokenUsage;
 }
 
 export interface RunEvolutionInput {
@@ -1000,8 +1048,8 @@ export class Runtime {
       timestamp: Date.now(),
     };
     this.events.push(runtimeEvent);
-    if (this.events.length > 500) {
-      this.events = this.events.slice(-500);
+    if (this.events.length > 5000) {
+      this.events = this.events.slice(-5000);
     }
     void this.memory?.writeTrace(runtimeEvent).catch(error => {
       logger.warn(`Failed to write runtime trace: ${error instanceof Error ? error.message : String(error)}`);
@@ -1399,6 +1447,8 @@ export class Runtime {
         && typeof cachedTeamPattern.executionPolicy === 'object'
         ? cachedTeamPattern.executionPolicy as Partial<TeamExecutionPolicy>
         : {};
+      const synthesisPolicy = spec.synthesisPolicy
+        ?? (typeof cachedTeamPattern?.synthesisPolicy === 'string' ? cachedTeamPattern.synthesisPolicy : undefined);
       const configuredTeamPolicy = this.workspaceRuntimeConfig?.teams;
       const executionPolicy = normalizeTeamExecutionPolicy({
         mode: configuredTeamPolicy?.executionMode,
@@ -1485,6 +1535,7 @@ export class Runtime {
         tomProfile: teamTomProfile,
         leadAgentId: spec.leadAgentId,
         task: spec.task,
+        synthesisPolicy,
         correlationId,
         executionPolicy: { ...executionPolicy },
       });
@@ -1512,6 +1563,7 @@ export class Runtime {
         tomAnalysis: spec.tomAnalysis,
         leadAgentId: spec.leadAgentId,
         task: spec.task,
+        synthesisPolicy,
         members: members.map(member => ({ ...member })),
         correlationId: spec.correlationId,
         executionPolicy: { ...executionPolicy },
@@ -1554,6 +1606,7 @@ export class Runtime {
           lead: member.lead ?? false,
         })),
         executionPolicy: { ...executionPolicy },
+        synthesisPolicy,
       });
       await ctx.memory.writeTeamTopology(teamKey, {
         type: 'subteam',
@@ -1566,6 +1619,7 @@ export class Runtime {
         tomProfile: team.identity.tomProfile,
         tomAnalysis: spec.tomAnalysis,
         executionPolicy,
+        synthesisPolicy,
         updatedAt: new Date().toISOString(),
       });
       const approved = await this.enqueueMessage({
@@ -1730,7 +1784,11 @@ export class Runtime {
     return this.teams.get(teamId)!;
   }
 
-  private async executeTeamMember(teamId: string, spec: TeamMemberSpec): Promise<RootMediatedSpawnResult> {
+  private async executeTeamMember(
+    teamId: string,
+    spec: TeamMemberSpec,
+    recursiveDelegation: boolean
+  ): Promise<RootMediatedSpawnResult> {
     const team = this.teams.get(teamId);
     if (!team) throw new Error(`Team "${teamId}" not found`);
     if (team.fsmState !== 'S_member_execute') {
@@ -1762,7 +1820,7 @@ export class Runtime {
         execution: {
           requireParentSynthesis: false,
           showSubagentOutput: false,
-          disableRecursiveDelegation: true,
+          disableRecursiveDelegation: !recursiveDelegation,
           teamId,
         },
         lifecycleOrigin: 'team_member',
@@ -1802,7 +1860,11 @@ export class Runtime {
     return result;
   }
 
-  async runTeam(teamId: string, task: string, options: { correlationId?: string } = {}): Promise<TeamRunResult> {
+  async runTeam(
+    teamId: string,
+    task: string,
+    options: { correlationId?: string; memberRecursiveDelegation?: boolean } = {}
+  ): Promise<TeamRunResult> {
     const ctx = this.getContext();
     const initial = this.teams.get(teamId);
     if (!initial) throw new Error(`Team "${teamId}" not found`);
@@ -1856,7 +1918,11 @@ export class Runtime {
                 correlationId,
                 data: { teamId, memberKey: key, archetype: plan.archetype, task: plan.task },
               });
-              const execution = await this.executeTeamMember(teamId, plan);
+              const execution = await this.executeTeamMember(
+                teamId,
+                plan,
+                options.memberRecursiveDelegation !== false
+              );
               this.teams.clearMemberTracking(teamId, key);
               return {
                 agentId: execution.agent.identity.id,
@@ -1886,7 +1952,7 @@ export class Runtime {
               });
               const result = await this.runAgent(agentId, memberTask, {
                 correlationId,
-                disableRecursiveDelegation: true,
+                disableRecursiveDelegation: options.memberRecursiveDelegation === false,
               });
               this.teams.recordMemberResult(teamId, agentId, memberTask, result.result, result.usage);
               this.emit({
@@ -2806,9 +2872,20 @@ export class Runtime {
     return bindings;
   }
 
-  private getAutomaticallyApprovedToolBindings(archetype: SubAgentArchetype, task?: string): ToolBinding[] {
+  private getAutomaticallyApprovedToolBindings(
+    archetype: SubAgentArchetype,
+    task?: string,
+    requestedTools: string[] = []
+  ): ToolBinding[] {
     const approval = this.workspaceRuntimeConfig?.tools.approval;
     const bindings = task ? this.getToolBindingsForTask(archetype, task) : this.getDefaultToolBindings(archetype);
+    const names = new Set(bindings.map(binding => binding.name));
+    for (const name of requestedTools) {
+      if (!names.has(name) && toolRegistry.has(name)) {
+        bindings.push(this.createToolBinding(name));
+        names.add(name);
+      }
+    }
     return bindings.filter(binding => {
       if (!approval) return binding.permission === 'read_only';
       const decision = approval.overrides[binding.name]
@@ -3643,8 +3720,17 @@ export class Runtime {
   }
 
   async handleUserTurn(userInput: string): Promise<RootTurnResult> {
-    const ctx = this.getContext();
     const correlationId = this.createCorrelationId();
+    try {
+      return await this.executeUserTurn(userInput, correlationId);
+    } catch (error) {
+      await this.recoverFailedRootTurn(correlationId, error);
+      throw error;
+    }
+  }
+
+  private async executeUserTurn(userInput: string, correlationId: string): Promise<RootTurnResult> {
+    const ctx = this.getContext();
     const rootUsageBefore = ctx.agent.getUsage();
     const rootStepConfig = this.workspaceRuntimeConfig?.delegation.rootSteps;
     const maxSteps = Math.max(2, rootStepConfig?.maxStepsPerTurn ?? 12);
@@ -3720,7 +3806,9 @@ export class Runtime {
       decision,
       correlationId,
       'root',
-      requiresLongHorizon
+      requiresLongHorizon || (decision.action === 'spawn_subagents'
+        && decision.coordination === 'team'
+        && Boolean(decision.team))
     );
     if (requiredLongHorizonDecision?.action === 'spawn_subagents' && decision.action !== 'spawn_subagents') {
       const rootPolicy = this.getAgentPolicy('root');
@@ -3748,6 +3836,9 @@ export class Runtime {
         action: decision.action,
         reason: decision.reason,
         agents: decision.action === 'spawn_subagents' ? decision.agents : [],
+        coordination: decision.action === 'spawn_subagents' ? decision.coordination : undefined,
+        team: decision.action === 'spawn_subagents' ? decision.team : undefined,
+        continuationPolicy: decision.action === 'spawn_subagents' ? decision.continuationPolicy : undefined,
         ...decisionMetadata,
       },
     });
@@ -3816,6 +3907,26 @@ export class Runtime {
           count: plans.length,
         });
         this.emitDelegationPlan(correlationId, plans, roundDecision.reason, decisionMetadata, step.id);
+        if (roundDecision.team && plans.length > 1) {
+          this.emit({
+            type: 'delegation.team.designed',
+            agentId: 'root',
+            correlationId,
+            data: {
+              stepId: step.id,
+              coordination: roundDecision.coordination,
+              team: roundDecision.team,
+              members: plans.map(plan => ({
+                archetype: plan.archetype,
+                name: plan.name,
+                role: plan.role,
+                task: plan.task,
+                tools: plan.tools,
+                skills: plan.skills,
+              })),
+            },
+          });
+        }
         await this.transitionRootTurnState('S_spawn_subagents', {
           correlationId,
           stepId: step.id,
@@ -3824,7 +3935,7 @@ export class Runtime {
 
         let round: RootDelegationRoundResult;
         try {
-          round = await this.executeRootDelegationRound(userInput, plans, correlationId);
+          round = await this.executeRootDelegationRound(userInput, roundDecision, correlationId);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           this.executionTrees.failStep(correlationId, step.id, message);
@@ -3877,6 +3988,7 @@ export class Runtime {
         const loopGuard = loopController.evaluate(tree);
         const canReassess = rootStepConfig?.enabled !== false
           && rootStepConfig?.reassessAfterDelegation !== false
+          && roundDecision.continuationPolicy !== 'finalize_after_round'
           && !round.evolution
           && delegationRounds < maxRounds
           && loopGuard.continue;
@@ -3925,6 +4037,9 @@ export class Runtime {
             action: 'spawn_subagents',
             reason: continuation.reason,
             agents: continuation.agents,
+            coordination: continuation.coordination,
+            team: continuation.team,
+            continuationPolicy: continuation.continuationPolicy,
           };
           next = await this.selectDelegationCandidate('root', userInput, this.applyBudgetConstraints(next), correlationId, 'root', true);
           if (next.action === 'spawn_subagents') {
@@ -4043,6 +4158,105 @@ export class Runtime {
           ...(evolution ? [this.sumUsage(evolution.executions.map(item => this.evolutionUsageToTokenUsage(item.usage)))] : []),
         ]),
       },
+    };
+  }
+
+  async runMultiTurnExperiment(input: MultiTurnExperimentInput): Promise<MultiTurnExperimentResult> {
+    const turns = input.turns.map(turn => turn.trim()).filter(Boolean);
+    if (turns.length === 0) throw new Error('Multi-turn experiment requires at least one non-empty turn');
+    const ctx = this.getContext();
+    const startedAt = Date.now();
+    const results: MultiTurnExperimentTurn[] = [];
+    this.emit({
+      type: 'experiment.multi_turn.started',
+      agentId: 'root',
+      sessionId: ctx.sessionId,
+      data: { turnCount: turns.length },
+    });
+
+    for (const [index, turn] of turns.entries()) {
+      const turnStartedAt = Date.now();
+      this.emit({
+        type: 'experiment.turn.started',
+        agentId: 'root',
+        sessionId: ctx.sessionId,
+        data: { index: index + 1, input: turn },
+      });
+      try {
+        const result = await this.handleUserTurn(turn);
+        const turnEvents = this.getEvents().filter(event =>
+          event.timestamp >= turnStartedAt
+          && (event.correlationId === result.correlationId || event.data?.correlationId === result.correlationId)
+        );
+        const agentIds = [...new Set(turnEvents
+          .filter(event => event.type === 'agent.spawned' && event.agentId)
+          .map(event => event.agentId!))];
+        const teamIds = [...new Set(turnEvents
+          .filter(event => event.type === 'team.created' && event.agentId)
+          .map(event => event.agentId!))];
+        results.push({
+          index: index + 1,
+          input: turn,
+          status: 'completed',
+          result,
+          eventTypes: turnEvents.map(event => event.type),
+          agentIds,
+          teamIds,
+          budget: this.getBudgetState(),
+        });
+        this.emit({
+          type: 'experiment.turn.completed',
+          agentId: 'root',
+          sessionId: ctx.sessionId,
+          correlationId: result.correlationId,
+          data: {
+            index: index + 1,
+            decision: result.decision.action,
+            agentsCreated: agentIds.length,
+            teamsCreated: teamIds.length,
+            totalTokens: result.usage.total.totalTokens,
+          },
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        results.push({
+          index: index + 1,
+          input: turn,
+          status: 'failed',
+          error: message,
+          eventTypes: this.getEvents().filter(event => event.timestamp >= turnStartedAt).map(event => event.type),
+          agentIds: [],
+          teamIds: [],
+          budget: this.getBudgetState(),
+        });
+        this.emit({
+          type: 'experiment.turn.failed',
+          agentId: 'root',
+          sessionId: ctx.sessionId,
+          data: { index: index + 1, error: message },
+        });
+        if (input.stopOnError !== false) break;
+      }
+    }
+
+    const completedAt = Date.now();
+    const completedTurns = results.filter(turn => turn.status === 'completed').length;
+    const failedTurns = results.length - completedTurns;
+    const totalUsage = this.sumUsage(results.flatMap(turn => turn.result ? [turn.result.usage.total] : []));
+    this.emit({
+      type: 'experiment.multi_turn.completed',
+      agentId: 'root',
+      sessionId: ctx.sessionId,
+      data: { completedTurns, failedTurns, totalTokens: totalUsage.totalTokens, wallClockMs: completedAt - startedAt },
+    });
+    return {
+      sessionId: ctx.sessionId,
+      startedAt,
+      completedAt,
+      turns: results,
+      completedTurns,
+      failedTurns,
+      totalUsage,
     };
   }
 
@@ -5398,7 +5612,7 @@ export class Runtime {
         },
       });
       if (recursiveDelegation.action === 'spawn_subagents' && recursiveDelegation.agents.length > 0) {
-        return await this.runAgentDelegatedChildren(agentId, task, recursiveDelegation.agents, usageBefore, options);
+        return await this.runAgentDelegatedChildren(agentId, task, recursiveDelegation, usageBefore, options);
       }
       if (recursiveDelegation.action !== 'spawn_subagents') {
         this.emit({
@@ -6209,14 +6423,24 @@ export class Runtime {
         archetype,
         this.getAutomaticallyApprovedToolBindings(
           archetype,
-          completedPlans.filter(plan => plan.archetype === archetype).map(plan => plan.task).join('\n')
+          completedPlans.filter(plan => plan.archetype === archetype).map(plan => plan.task).join('\n'),
+          completedPlans
+            .filter(plan => plan.archetype === archetype)
+            .flatMap(plan => plan.tools ?? [])
         ).map(binding => binding.name),
       ])),
       allowedSkillsByArchetype: Object.fromEntries(archetypes.map(archetype => [
         archetype,
-        this.getDefaultSkillBindings(archetype).filter(binding => binding.enabled).map(binding => binding.name),
+        Array.from(new Set([
+          ...this.getDefaultSkillBindings(archetype).filter(binding => binding.enabled).map(binding => binding.name),
+          ...completedPlans
+            .filter(plan => plan.archetype === archetype)
+            .flatMap(plan => plan.skills ?? [])
+            .filter(skill => skillRegistry.has(skill)),
+        ])),
       ])),
-      enforceMinimumToMCoverage: !preserveRequestedPlan,
+      enforceMinimumToMCoverage: !preserveRequestedPlan
+        && this.workspaceRuntimeConfig?.tom.enforceMinimumCoverage === true,
       parentToMProfile,
       tomAnalysis,
     });
@@ -6585,6 +6809,38 @@ export class Runtime {
     this.emit({ type: 'turn.fsm.state', agentId: 'root', data: { state, ...data } });
   }
 
+  private async recoverFailedRootTurn(correlationId: string, error: unknown): Promise<void> {
+    const ctx = this.getContext();
+    const message = error instanceof Error ? error.message : String(error);
+    const failedState = ctx.fsm.getState();
+    const tree = this.executionTrees.get(correlationId);
+    if (tree?.status === 'running') {
+      this.executionTrees.fail(correlationId, message);
+      await this.persistRootExecutionTree(correlationId).catch(persistError => {
+        this.emit({
+          type: 'root.execution_tree.persistence.failed',
+          agentId: 'root',
+          correlationId,
+          data: { error: persistError instanceof Error ? persistError.message : String(persistError) },
+        });
+      });
+    }
+    ctx.agent.setRuntimeState('idle');
+    this.emit({
+      type: 'root.turn.failed',
+      agentId: 'root',
+      correlationId,
+      data: { error: message, failedState },
+    });
+    ctx.fsm.reset();
+    this.emit({
+      type: 'root.turn.recovered',
+      agentId: 'root',
+      correlationId,
+      data: { from: failedState, to: ctx.fsm.getState(), runtimeState: 'idle' },
+    });
+  }
+
   private async startRootExecutionStep(
     correlationId: string,
     decision: RootExecutionStepDecision,
@@ -6769,9 +7025,10 @@ export class Runtime {
 
   private async executeRootDelegationRound(
     userTask: string,
-    plans: DelegationAgentPlan[],
+    decision: Extract<DelegationDecision, { action: 'spawn_subagents' }>,
     correlationId: string
   ): Promise<RootDelegationRoundResult> {
+    const plans = decision.agents;
     if (this.workspaceRuntimeConfig?.evolution.enabled
       && this.workspaceRuntimeConfig.evolution.mode === 'auto') {
       const evolution = await this.runEvolution({
@@ -6795,41 +7052,70 @@ export class Runtime {
       return { subagents: [], teams: [], evolution };
     }
 
-    if (plans.length > 1 && this.workspaceRuntimeConfig?.teams.createForMultipleAgents !== false) {
+    const shouldCreateTeam = plans.length > 1
+      && (decision.coordination === 'team'
+        || (decision.coordination === undefined && this.workspaceRuntimeConfig?.teams.createForMultipleAgents !== false));
+    if (shouldCreateTeam) {
+      const teamPlan = decision.team;
       const team = await this.spawnTeam({
         parentAgentId: 'root',
-        name: this.deriveTeamName(plans),
-        description: userTask,
-        task: userTask,
+        name: teamPlan?.name ?? this.deriveTeamName(plans),
+        description: teamPlan?.description ?? userTask,
+        task: teamPlan?.task ?? userTask,
+        synthesisPolicy: teamPlan?.synthesisPolicy,
+        tomLevel: teamPlan?.tomLevel,
+        executionPolicy: teamPlan?.executionPolicy,
         members: plans.map((plan, index) => ({ ...plan, lead: index === 0 })),
         tomAnalysis: this.tomAnalyses.get(correlationId),
         correlationId,
         lifecycleOrigin: 'automatic_delegation',
       });
-      const teamResult = await this.runTeam(team.identity.id, userTask, { correlationId });
+      const teamResult = await this.runTeam(team.identity.id, userTask, {
+        correlationId,
+        memberRecursiveDelegation: teamPlan?.memberDelegationPolicy !== 'deny',
+      });
       return { subagents: [...teamResult.memberExecutions], teams: [teamResult] };
     }
 
     const subagents: RootMediatedSpawnResult[] = [];
     for (const plan of plans) {
-      subagents.push(await this.handleSpawnCommand({
-        archetype: plan.archetype,
-        task: plan.task,
-        parentId: 'root',
-        name: plan.name,
-        tools: plan.tools,
-        skills: plan.skills,
-        tomLevel: plan.tomLevel,
-        tomProfile: plan.tomProfile,
-        cognitiveGapIds: plan.cognitiveGapIds,
-        existenceReason: plan.existenceReason,
-        budgetTokens: plan.budgetTokens,
-        correlationId,
-        source: 'root',
-        requireRootSynthesis: false,
-        showSubagentOutput: false,
-        disableRecursiveDelegation: this.getBudgetState().mode === 'limited',
-      }));
+      try {
+        subagents.push(await this.handleSpawnCommand({
+          archetype: plan.archetype,
+          task: plan.task,
+          parentId: 'root',
+          name: plan.name,
+          customRole: plan.role,
+          customStyle: plan.style,
+          tools: plan.tools,
+          skills: plan.skills,
+          tomLevel: plan.tomLevel,
+          tomProfile: plan.tomProfile,
+          cognitiveGapIds: plan.cognitiveGapIds,
+          existenceReason: plan.existenceReason,
+          systemPrompt: plan.systemPrompt,
+          budgetTokens: plan.budgetTokens,
+          correlationId,
+          source: 'root',
+          requireRootSynthesis: false,
+          showSubagentOutput: false,
+          disableRecursiveDelegation: this.getBudgetState().mode === 'limited',
+        }));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.startsWith('Spawn rejected:')) throw error;
+        this.emit({
+          type: 'delegation.child.skipped',
+          agentId: 'root',
+          correlationId,
+          data: {
+            archetype: plan.archetype,
+            name: plan.name,
+            task: plan.task,
+            reason: message.slice('Spawn rejected:'.length).trim(),
+          },
+        });
+      }
     }
     return { subagents, teams: [] };
   }
@@ -6891,8 +7177,9 @@ Reassess the original task after completed execution steps. The execution tree m
 Choose exactly one action:
 {"action":"finalize","reason":"..."}
 {"action":"ask_clarification","reason":"...","question":"..."}
-{"action":"delegate_more","reason":"...","agents":[{"archetype":"tester","name":"Tester-1","task":"...","tomLevel":0,"existenceReason":"..."}]}
-Do not repeat an existing agent task. Delegate only work that depends on prior-step results. Prefer finalize when evidence is sufficient. Use at most 1-3 agents.`,
+{"action":"delegate_more","reason":"...","coordination":"independent","continuationPolicy":"reassess","agents":[{"archetype":"custom","name":"task-specific name","role":"task-specific responsibility","task":"...","tools":[],"skills":[],"tomLevel":0,"existenceReason":"..."}]}
+{"action":"delegate_more","reason":"...","coordination":"team","continuationPolicy":"reassess","team":{"name":"task-specific team","description":"...","synthesisPolicy":"..."},"agents":[...]}
+Do not repeat an existing agent task. Generate the next actor structure from unresolved state rather than a fixed role list. Delegate only work that depends on prior-step results. Prefer finalize when evidence is sufficient. Use at most 1-3 agents.`,
         },
         {
           role: 'user',
@@ -6937,27 +7224,20 @@ Do not repeat an existing agent task. Delegate only work that depends on prior-s
       const webTask = this.taskNeedsWebAccess(userTask);
       const agents = (input as { agents: Array<Partial<DelegationAgentPlan>> }).agents
         .filter(item => this.isValidArchetype(String(item.archetype)))
-        .map((item): DelegationAgentPlan => ({
-          archetype: String(item.archetype) as SubAgentArchetype,
-          name: typeof item.name === 'string' ? item.name : undefined,
-          task: webTask
-            ? `${typeof item.task === 'string' && item.task.trim() ? item.task.trim() : userTask}\nThis is a continuation of the original public-web task. Use web.search/web.fetch rather than treating product or domain names as local file paths.`
-            : typeof item.task === 'string' && item.task.trim() ? item.task.trim() : userTask,
-          tools: webTask
-            ? Array.from(new Set([
-              ...(Array.isArray(item.tools) ? item.tools.filter((tool): tool is string => typeof tool === 'string' && !tool.startsWith('fs.')) : []),
+        .map((item): DelegationAgentPlan => {
+          const normalized = this.normalizeDelegationAgentPlan(item, userTask);
+          if (!webTask) return normalized;
+          return {
+            ...normalized,
+            task: `${normalized.task}\nThis is a continuation of the original public-web task. Use web.search/web.fetch rather than treating product or domain names as local file paths.`,
+            tools: Array.from(new Set([
+              ...(normalized.tools ?? []).filter(tool => !tool.startsWith('fs.')),
               'web.search',
               'web.fetch',
-            ]))
-            : Array.isArray(item.tools) ? item.tools.filter((tool): tool is string => typeof tool === 'string') : undefined,
-          skills: Array.isArray(item.skills) ? item.skills.filter((skill): skill is string => typeof skill === 'string') : undefined,
-          tomLevel: typeof item.tomLevel === 'number' ? item.tomLevel : undefined,
-          budgetTokens: typeof item.budgetTokens === 'number' ? item.budgetTokens : undefined,
-          cognitiveGapIds: Array.isArray(item.cognitiveGapIds)
-            ? item.cognitiveGapIds.filter((id): id is string => typeof id === 'string')
-            : undefined,
-          existenceReason: typeof item.existenceReason === 'string' ? item.existenceReason : undefined,
-        }))
+            ])),
+            skills: Array.from(new Set([...(normalized.skills ?? []), 'use_tool_when_needed'])),
+          };
+        })
         .filter(item => !seen.has(`${item.archetype}:${item.task}`.toLowerCase()))
         .slice(0, 3);
       if (agents.length > 0) {
@@ -6965,6 +7245,9 @@ Do not repeat an existing agent task. Delegate only work that depends on prior-s
           action: 'delegate_more',
           reason: typeof input.reason === 'string' ? input.reason : 'A prior step exposed a concrete unresolved gap.',
           agents,
+          coordination: this.normalizeCoordination(input, agents.length),
+          team: this.normalizeDelegationTeamPlan(input, userTask, agents.length),
+          continuationPolicy: this.normalizeContinuationPolicy(input),
         };
       }
     }
@@ -7104,20 +7387,32 @@ Do not repeat an existing agent task. Delegate only work that depends on prior-s
     try {
       this.emit({ type: 'delegation.assess.started', agentId: 'root', data: { correlationId } });
       const rootContext = await ctx.memory.loadRootContext();
+      const sessionWindow = await this.contextWindowManager?.build({
+        sessionId: ctx.sessionId,
+        agentId: 'root',
+        agentKey: 'roy',
+        role: 'root',
+        task: userInput,
+        memoryScope: this.getDefaultMemoryScope('root'),
+      });
       const decision = await this.completeJSONAsAgent<DelegationDecision>(ctx.agent, [
         {
           role: 'system',
           content: `You are Roy's root delegation controller.
-Decide whether the user request should be solved directly by Roy, clarified, or delegated to 1-3 subagents.
+Decide whether the user request should be solved directly by Roy, clarified, delegated to independent agents, or delegated to an autonomously designed subteam.
 Reason in terms of cognitive gaps: missing evidence, missing perspective, failure-mode uncertainty, implementation capability, verification, or belief reconciliation.
 Use delegation only when the task benefits from grounded inspection, critique, planning, coding, testing, or summarization.
 Do not spawn more than 3 subagents. Prefer 1-2 unless the task clearly needs more.
 If later work depends on an earlier result, create only the immediately executable first-step agents. Roy will reassess after that step and grow the tree if needed.
 Ask for clarification when the user request is too ambiguous to assign a concrete task safely.
+Design agent names, roles, tasks, tools, and skills from the current task. Do not copy a fixed team template. Use a team only when members require an explicit coordination and synthesis boundary.
 Return strict JSON matching one of:
 {"action":"solve_directly","reason":"..."}
 {"action":"ask_clarification","reason":"...","question":"..."}
-{"action":"spawn_subagents","reason":"...","agents":[{"archetype":"researcher","name":"Researcher-1","task":"...","tomLevel":0,"existenceReason":"which cognitive gap this agent fills"}]}
+{"action":"spawn_subagents","reason":"...","coordination":"independent","continuationPolicy":"reassess","agents":[{"archetype":"custom","name":"EvidenceMapper-1","role":"task-specific evidence mapper","task":"...","tools":["fs.read"],"skills":["use_tool_when_needed"],"tomLevel":0,"existenceReason":"which cognitive gap this agent fills"}]}
+{"action":"spawn_subagents","reason":"...","coordination":"team","continuationPolicy":"finalize_after_round","team":{"name":"task-specific team name","description":"why this team exists","task":"shared objective","synthesisPolicy":"how member evidence must be combined","memberDelegationPolicy":"deny","executionPolicy":{"mode":"parallel","failureMode":"best_effort","maxConcurrency":2,"minimumSuccessfulMembers":1}},"agents":[{"archetype":"custom","name":"task-specific name","role":"task-specific responsibility","task":"non-overlapping member task","tools":[],"skills":[],"tomLevel":1,"existenceReason":"which cognitive gap this member fills"}]}
+Set continuationPolicy to finalize_after_round when the user explicitly requires one delegation round, one team, or finalization immediately after team synthesis. Otherwise use reassess.
+Set team.memberDelegationPolicy to deny for a minimal or single-round team; use allow only when member-level recursive delegation is part of the requested work.
 Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, custom.`,
         },
         {
@@ -7125,13 +7420,14 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
           content: [
             `<user_task>${userInput}</user_task>`,
             `<memory_context>${this.formatPublicContext(rootContext).slice(0, 6000)}</memory_context>`,
+            `<recent_session_context>${sessionWindow?.sessionContext || 'No prior turns in this session.'}</recent_session_context>`,
             `<budget_state>${JSON.stringify(this.getBudgetState(), null, 2)}</budget_state>`,
             `<runtime_capabilities>${JSON.stringify({
               tools: toolRegistry.list().map(tool => tool.name),
               skills: skillRegistry.list().map(skill => skill.name),
               webEnabled: this.workspaceRuntimeConfig?.tools.web.enabled !== false,
             }, null, 2)}</runtime_capabilities>`,
-            '<runtime_policy>Subagents must be runtime actors with identity, state, budget, messages, and events. Each agent must fill a distinct cognitive gap, receive a concrete non-overlapping task, and expose why it exists. The runtime will validate and enrich the ToM profiles. If budget is limited, reduce the number of subagents or solve directly and explain the constraint.</runtime_policy>',
+            '<runtime_policy>Subagents and teams must be runtime actors with identity, state, budget, messages, events, and lifecycle. Propose only registered tools and skills shown above; Runtime will intersect every request with parent-approved capabilities. Each agent must fill a distinct cognitive gap, receive a concrete non-overlapping task, and expose why it exists. A one-member team will be reduced to an agent. If budget is limited, reduce the structure or solve directly.</runtime_policy>',
           ].join('\n\n'),
         },
       ], { temperature: 0.1, maxTokens: 1800 }, 'root.delegation_decision', correlationId);
@@ -7168,12 +7464,14 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     if (policy.allowedChildren <= policy.currentChildren) {
       return { action: 'solve_directly', reason: 'Agent has no remaining child slots for this parent.' };
     }
-
-    const fallback = this.fallbackAgentDelegationDecision(agent, task);
-    if (fallback.action !== 'spawn_subagents') {
-      return fallback;
+    if (policy.depth >= policy.spawnPolicy.maxDepth) {
+      return { action: 'solve_directly', reason: 'Agent is at the maximum recursive delegation depth.' };
+    }
+    if (this.getRemainingTotalAgentsForTurn(agent.identity.id, correlationId) <= 0) {
+      return { action: 'solve_directly', reason: 'No agent slots remain for this turn.' };
     }
 
+    const fallback = this.fallbackAgentDelegationDecision(agent, task);
     const ctx = this.getContext();
     if (!ctx.llm) {
       this.emit({
@@ -7195,9 +7493,10 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
           content: `You are ${agent.identity.name}'s delegation controller.
 Decide whether this non-root agent should solve directly or delegate to 1-3 direct child agents. Delegate only to close an explicit evidence, perspective, risk, planning, implementation, verification, or synthesis gap in the parent agent's current model.
 Only delegate when a child with a different specialty materially improves the result.
-Return strict JSON:
+Generate task-specific child definitions rather than selecting a fixed role template. Return strict JSON:
 {"action":"solve_directly","reason":"..."}
-{"action":"spawn_subagents","reason":"...","agents":[{"archetype":"critic","name":"Critic-1","task":"...","tomLevel":2,"existenceReason":"which cognitive gap this child fills"}]}
+{"action":"spawn_subagents","reason":"...","coordination":"independent","continuationPolicy":"reassess","agents":[{"archetype":"custom","name":"task-specific name","role":"task-specific responsibility","task":"...","tools":[],"skills":[],"tomLevel":1,"existenceReason":"which cognitive gap this child fills"}]}
+{"action":"spawn_subagents","reason":"...","coordination":"team","team":{"name":"task-specific team name","description":"...","synthesisPolicy":"..."},"agents":[...]}
 Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, custom.`,
         },
         {
@@ -7308,19 +7607,7 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
       const agents = (item as { agents: Array<Partial<DelegationAgentPlan>> }).agents
         .filter(plan => this.isValidArchetype(String(plan.archetype)))
         .slice(0, 3)
-        .map((plan): DelegationAgentPlan => ({
-          archetype: String(plan.archetype) as SubAgentArchetype,
-          name: typeof plan.name === 'string' ? plan.name : undefined,
-          task: typeof plan.task === 'string' && plan.task.trim() ? plan.task.trim() : task,
-          tools: Array.isArray(plan.tools) ? plan.tools.filter((item): item is string => typeof item === 'string') : undefined,
-          skills: Array.isArray(plan.skills) ? plan.skills.filter((item): item is string => typeof item === 'string') : undefined,
-          tomLevel: typeof plan.tomLevel === 'number' ? plan.tomLevel : undefined,
-          budgetTokens: typeof plan.budgetTokens === 'number' ? plan.budgetTokens : undefined,
-      cognitiveGapIds: Array.isArray(plan.cognitiveGapIds)
-            ? plan.cognitiveGapIds.filter((item): item is string => typeof item === 'string')
-            : undefined,
-          existenceReason: typeof plan.existenceReason === 'string' ? plan.existenceReason : undefined,
-        }));
+        .map((plan): DelegationAgentPlan => this.normalizeDelegationAgentPlan(plan, task));
       if (agents.length > 0) {
         return {
           action: 'spawn_subagents',
@@ -7328,6 +7615,9 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
             ? item.reason.trim()
             : 'The agent benefits from a direct child specialist.',
           agents,
+          coordination: this.normalizeCoordination(item, agents.length),
+          team: this.normalizeDelegationTeamPlan(item, task, agents.length),
+          continuationPolicy: this.normalizeContinuationPolicy(item),
         };
       }
     }
@@ -7347,9 +7637,12 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     if (supportedAgents.length === 0) {
       return { action: 'solve_directly', reason: 'Requested custom child agents are not allowed by this parent policy.' };
     }
+    const boundedAgents = supportedAgents.slice(0, Math.min(allowed, 3));
     return {
       ...decision,
-      agents: supportedAgents.slice(0, Math.min(allowed, 3)),
+      agents: boundedAgents,
+      coordination: boundedAgents.length > 1 ? decision.coordination : 'independent',
+      team: boundedAgents.length > 1 ? decision.team : undefined,
     };
   }
 
@@ -7390,19 +7683,7 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
       const agents = (item as { agents: Array<Partial<DelegationAgentPlan>> }).agents
         .filter(plan => this.isValidArchetype(String(plan.archetype)))
         .slice(0, 3)
-        .map((plan): DelegationAgentPlan => ({
-          archetype: String(plan.archetype) as SubAgentArchetype,
-          name: typeof plan.name === 'string' ? plan.name : undefined,
-          task: typeof plan.task === 'string' && plan.task.trim()
-            ? plan.task.trim()
-            : userInput,
-          tomLevel: typeof plan.tomLevel === 'number' ? plan.tomLevel : undefined,
-          budgetTokens: typeof plan.budgetTokens === 'number' ? plan.budgetTokens : undefined,
-          cognitiveGapIds: Array.isArray(plan.cognitiveGapIds)
-            ? plan.cognitiveGapIds.filter((item): item is string => typeof item === 'string')
-            : undefined,
-          existenceReason: typeof plan.existenceReason === 'string' ? plan.existenceReason : undefined,
-        }));
+        .map((plan): DelegationAgentPlan => this.normalizeDelegationAgentPlan(plan, userInput));
 
       if (agents.length > 0) {
         return {
@@ -7411,11 +7692,126 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
             ? item.reason.trim()
             : 'The task benefits from delegated specialist work.',
           agents,
+          coordination: this.normalizeCoordination(item, agents.length),
+          team: this.normalizeDelegationTeamPlan(item, userInput, agents.length),
+          continuationPolicy: this.normalizeContinuationPolicy(item),
         };
       }
     }
 
     return this.applyBudgetConstraints(this.fallbackDelegationDecision(userInput));
+  }
+
+  private normalizeCoordination(value: unknown, agentCount: number): 'independent' | 'team' {
+    if (agentCount <= 1) return 'independent';
+    const coordination = (value as { coordination?: unknown }).coordination;
+    if (coordination === 'independent' || coordination === 'team') return coordination;
+    return 'team';
+  }
+
+  private normalizeContinuationPolicy(value: unknown): 'reassess' | 'finalize_after_round' {
+    return (value as { continuationPolicy?: unknown }).continuationPolicy === 'finalize_after_round'
+      ? 'finalize_after_round'
+      : 'reassess';
+  }
+
+  private normalizeDelegationAgentPlan(
+    plan: Partial<DelegationAgentPlan>,
+    fallbackTask: string
+  ): DelegationAgentPlan {
+    const archetype = String(plan.archetype) as SubAgentArchetype;
+    const task = typeof plan.task === 'string' && plan.task.trim() ? plan.task.trim() : fallbackTask;
+    const requestedTools = Array.isArray(plan.tools)
+      ? plan.tools.filter((tool): tool is string => typeof tool === 'string')
+      : [];
+    const inferredTools = this.inferMinimumTaskTools(task);
+    const tools = Array.from(new Set([...requestedTools, ...inferredTools]));
+    const requestedSkills = Array.isArray(plan.skills)
+      ? plan.skills.filter((skill): skill is string => typeof skill === 'string')
+      : [];
+    const skills = tools.length > 0
+      ? Array.from(new Set([...requestedSkills, 'use_tool_when_needed']))
+      : requestedSkills;
+    return {
+      archetype,
+      name: typeof plan.name === 'string' ? plan.name : undefined,
+      role: typeof plan.role === 'string' ? plan.role : undefined,
+      style: typeof plan.style === 'string' ? plan.style : undefined,
+      description: typeof plan.description === 'string' ? plan.description : undefined,
+      task,
+      tools: tools.length > 0 ? tools : undefined,
+      skills: skills.length > 0 ? skills : undefined,
+      tomLevel: typeof plan.tomLevel === 'number' ? plan.tomLevel : undefined,
+      budgetTokens: typeof plan.budgetTokens === 'number' ? plan.budgetTokens : undefined,
+      cognitiveGapIds: Array.isArray(plan.cognitiveGapIds)
+        ? plan.cognitiveGapIds.filter((item): item is string => typeof item === 'string')
+        : undefined,
+      existenceReason: typeof plan.existenceReason === 'string' ? plan.existenceReason : undefined,
+      systemPrompt: typeof plan.systemPrompt === 'string' ? plan.systemPrompt : undefined,
+    };
+  }
+
+  private inferMinimumTaskTools(task: string): string[] {
+    const lower = task.toLowerCase();
+    const tools: string[] = [];
+    if (this.taskNeedsWebAccess(task)) tools.push('web.search', 'web.fetch');
+    if (/\b(?:read|inspect|review|check|audit|verify|compare|cross-reference)\b/.test(lower)
+      && /(?:\b(?:file|source|manifest|package\.json|exports?|apis?)\b|[./][a-z0-9_-]+\.(?:ts|tsx|js|jsx|json|md|ya?ml|toml)\b)/i.test(task)
+      && !this.taskNeedsWebAccess(task)) {
+      tools.push('fs.read');
+    }
+    if (/\b(?:list|tree|structure|directories|workspace|repository|codebase)\b/.test(lower)
+      && !this.taskNeedsWebAccess(task)) {
+      tools.push('fs.list');
+    }
+    if (/\b(?:run|execute)\s+(?:the\s+)?(?:tests?|build)\b|\bnpm (?:test|run build)\b/.test(lower)) {
+      tools.push('shell.exec');
+    }
+    return Array.from(new Set(tools)).filter(tool => toolRegistry.has(tool));
+  }
+
+  private normalizeDelegationTeamPlan(
+    value: unknown,
+    task: string,
+    agentCount: number
+  ): DelegationTeamPlan | undefined {
+    if (agentCount <= 1 || this.normalizeCoordination(value, agentCount) !== 'team') return undefined;
+    const raw = (value as { team?: unknown }).team;
+    if (!raw || typeof raw !== 'object') return undefined;
+    const team = raw as Record<string, unknown>;
+    const name = typeof team.name === 'string' && team.name.trim() ? team.name.trim() : 'DelegatedTeam';
+    const description = typeof team.description === 'string' && team.description.trim()
+      ? team.description.trim()
+      : `Coordinate task-specific agents for: ${task}`;
+    const rawPolicy = team.executionPolicy && typeof team.executionPolicy === 'object'
+      ? team.executionPolicy as Record<string, unknown>
+      : undefined;
+    const executionPolicy: Partial<TeamExecutionPolicy> | undefined = rawPolicy ? {
+      mode: rawPolicy.mode === 'parallel' || rawPolicy.mode === 'sequential' ? rawPolicy.mode : undefined,
+      failureMode: rawPolicy.failureMode === 'fail_fast' || rawPolicy.failureMode === 'best_effort'
+        ? rawPolicy.failureMode
+        : undefined,
+      maxConcurrency: typeof rawPolicy.maxConcurrency === 'number' ? Math.max(1, Math.floor(rawPolicy.maxConcurrency)) : undefined,
+      minimumSuccessfulMembers: typeof rawPolicy.minimumSuccessfulMembers === 'number'
+        ? Math.max(1, Math.floor(rawPolicy.minimumSuccessfulMembers))
+        : undefined,
+    } : undefined;
+    return {
+      name,
+      description,
+      task: typeof team.task === 'string' && team.task.trim() ? team.task.trim() : task,
+      synthesisPolicy: typeof team.synthesisPolicy === 'string' && team.synthesisPolicy.trim()
+        ? team.synthesisPolicy.trim()
+        : undefined,
+      tomLevel: typeof team.tomLevel === 'number'
+        ? Math.max(0, Math.min(3, Math.floor(team.tomLevel)))
+        : undefined,
+      executionPolicy,
+      memberDelegationPolicy: team.memberDelegationPolicy === 'deny'
+        || this.normalizeContinuationPolicy(value) === 'finalize_after_round'
+        ? 'deny'
+        : 'allow',
+    };
   }
 
   private fallbackDelegationDecision(userInput: string): DelegationDecision {
@@ -7532,6 +7928,8 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
         action: 'spawn_subagents',
         reason: `${decision.reason} Budget constrained: reduced delegation to one subagent with ${remaining} tokens remaining.`,
         agents: decision.agents.slice(0, 1),
+        coordination: 'independent',
+        continuationPolicy: decision.continuationPolicy,
       };
     }
 
@@ -7568,6 +7966,74 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
       data: { purpose: 'root.solo_reasoning', reason: 'model_returned_empty_visible_output' },
     });
     return '[runtime_root_completion_fallback]\nRoy could not produce visible output for this turn. No stale response was reused.';
+  }
+
+  private async collectRuntimeLLMStream(
+    provider: LLMProvider,
+    messages: LLMMessage[],
+    options: LLMCompletionOptions,
+    context: { actorId: string; purpose: string; correlationId: string; teamId?: string }
+  ): Promise<{ content: string; usage?: ModelTokenUsage }> {
+    const retryConfig = this.workspaceRuntimeConfig?.llm;
+    const maxAttempts = Math.max(1, Math.floor(retryConfig?.streamMaxAttempts ?? 3));
+    const initialDelayMs = Math.max(0, Math.floor(retryConfig?.retryInitialDelayMs ?? 250));
+    const maxDelayMs = Math.max(initialDelayMs, Math.floor(retryConfig?.retryMaxDelayMs ?? 2_000));
+    let discardedPartialCharacters = 0;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      const chunks: string[] = [];
+      let usage: ModelTokenUsage | undefined;
+      try {
+        for await (const chunk of provider.stream(messages, options)) {
+          if (chunk.content) chunks.push(chunk.content);
+          if (chunk.usage) usage = chunk.usage;
+        }
+        if (attempt > 1) {
+          this.emit({
+            type: 'llm.stream.recovered',
+            agentId: context.actorId,
+            correlationId: context.correlationId,
+            data: { ...context, attempt, discardedPartialCharacters },
+          });
+        }
+        return { content: chunks.join(''), usage };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const retryable = this.isRetryableLLMStreamError(error);
+        const willRetry = retryable && attempt < maxAttempts;
+        const discardedThisAttempt = chunks.join('').length;
+        discardedPartialCharacters += discardedThisAttempt;
+        this.emit({
+          type: willRetry ? 'llm.stream.retrying' : 'llm.stream.failed',
+          agentId: context.actorId,
+          correlationId: context.correlationId,
+          data: {
+            ...context,
+            attempt,
+            maxAttempts,
+            error: message,
+            retryable,
+            discardedPartialCharacters: discardedThisAttempt,
+          },
+        });
+        if (!willRetry) throw error;
+        const delayMs = Math.min(maxDelayMs, initialDelayMs * (2 ** (attempt - 1)));
+        if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs));
+      }
+    }
+    throw new Error('LLM stream exhausted without a result');
+  }
+
+  private isRetryableLLMStreamError(error: unknown): boolean {
+    const value = error as { code?: unknown; status?: unknown; message?: unknown } | undefined;
+    const code = typeof value?.code === 'string' ? value.code.toUpperCase() : '';
+    const status = typeof value?.status === 'number' ? value.status : undefined;
+    const message = String(value?.message ?? error ?? '').toLowerCase();
+    if (['ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ETIMEDOUT', 'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT'].includes(code)) {
+      return true;
+    }
+    if (status !== undefined && [408, 409, 425, 429, 500, 502, 503, 504].includes(status)) return true;
+    return /premature close|socket hang up|connection (?:was )?(?:closed|reset)|stream (?:was )?(?:closed|terminated)|fetch failed|network error|timed? ?out|temporarily unavailable|service unavailable/.test(message);
   }
 
   private async completeAsRoot(prompt: string, purpose: string, correlationId: string): Promise<string> {
@@ -7633,27 +8099,27 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     });
     if (allocation?.status === 'denied') throw new Error(`Root completion rejected by budget market: ${allocation.reason}`);
     const usageBefore = ctx.agent.getUsage();
-    const chunks: string[] = [];
-    let usageChunk: { usage?: ModelTokenUsage } | undefined;
     try {
       const maxTokens = allocation?.status === 'granted'
         ? Math.max(1, this.completionCapacity(allocation.allocatedTokens, estimatedInputTokens))
         : undefined;
-      for await (const chunk of ctx.llm.stream([...messages], { temperature: 0.2, maxTokens })) {
-        if (chunk.content) chunks.push(chunk.content);
-        if (chunk.usage) usageChunk = chunk;
-      }
+      const completion = await this.collectRuntimeLLMStream(
+        ctx.llm,
+        [...messages],
+        { temperature: 0.2, maxTokens },
+        { actorId: 'root', purpose, correlationId }
+      );
+      const content = completion.content;
+      ctx.agent.recordRuntimeCompletion(content, {
+        content,
+        usage: completion.usage ?? this.estimateModelUsage(messages, content),
+      });
+      this.settleDirectBudget('root', allocation, this.usageDifference(usageBefore, ctx.agent.getUsage()), correlationId);
+      return content;
     } catch (error) {
       if (allocation?.status === 'granted') this.budgetMarket?.release(allocation.id, 'root_completion_failed');
       throw error;
     }
-    const content = chunks.join('');
-    ctx.agent.recordRuntimeCompletion(content, {
-      content,
-      usage: usageChunk?.usage ?? this.estimateModelUsage(messages, content),
-    });
-    this.settleDirectBudget('root', allocation, this.usageDifference(usageBefore, ctx.agent.getUsage()), correlationId);
-    return content;
   }
 
   private async completeJSONAsAgent<T>(
@@ -7667,6 +8133,7 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     if (!ctx.llm) throw new Error('LLM not configured');
     const usageBefore = agent.getUsage();
     const estimatedInput = this.estimateTextTokens(messages.map(message => `${message.role}:${message.content}`).join('\n'));
+    const requestedCompletionTokens = this.reasoningAwareCompletionTokenBudget(options.maxTokens ?? 512);
     const ownsAllocation = agent.id === 'root' || !this.agentBudgetAllocations.has(agent.id);
     const allocation = ownsAllocation
       ? await this.requestAgentBudget({
@@ -7674,7 +8141,7 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
         requesterId: agent.id,
         archetype: agent.id === 'root' ? 'custom' : this.inferAgentArchetype(agent.getInfo()),
         correlationId,
-        requestedTokens: this.budgetRequestTokens(estimatedInput, options.maxTokens ?? 512),
+        requestedTokens: this.budgetRequestTokens(estimatedInput, requestedCompletionTokens),
         minimumTokens: this.budgetMinimumTokens(estimatedInput),
         priority: purpose.includes('delegation') ? 'high' : 'medium',
         expectedUtility: 0.82,
@@ -7713,27 +8180,71 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     const boundedOptions: LLMCompletionOptions = {
       ...options,
       maxTokens: availableTokens === undefined
-        ? options.maxTokens
+        ? requestedCompletionTokens
         : Math.max(1, Math.min(
-          options.maxTokens ?? availableTokens,
+          requestedCompletionTokens,
           this.completionCapacity(availableTokens, estimatedInput)
         )),
     };
 
     try {
-      let value: T;
-      if (ctx.llm.completeJSONWithUsage) {
-        const result = await ctx.llm.completeJSONWithUsage<T>(messages, boundedOptions);
-        value = result.value;
-        agent.recordRuntimeUsage(result.completion);
-      } else {
-        value = await ctx.llm.completeJSON<T>(messages, boundedOptions);
-        const output = JSON.stringify(value);
-        agent.recordRuntimeUsage({
-          content: output,
-          usage: this.estimateModelUsage(messages, output),
-        });
+      const configuredAttempts = Math.max(1, Math.floor(this.workspaceRuntimeConfig?.llm.jsonMaxAttempts ?? 2));
+      const maxAttempts = this.getBudgetState().mode === 'limited' ? 1 : configuredAttempts;
+      let value: T | undefined;
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        const attemptMessages = attempt === 1 ? messages : [
+          ...messages,
+          {
+            role: 'user' as const,
+            content: 'The previous response was incomplete or invalid. Return one complete, concise JSON object only. Do not include analysis, markdown, or prose outside the JSON object.',
+          },
+        ];
+        try {
+          if (ctx.llm.completeJSONWithUsage) {
+            const result = await ctx.llm.completeJSONWithUsage<T>(attemptMessages, boundedOptions);
+            value = result.value;
+            agent.recordRuntimeUsage(result.completion);
+          } else {
+            value = await ctx.llm.completeJSON<T>(attemptMessages, boundedOptions);
+            const output = JSON.stringify(value);
+            agent.recordRuntimeUsage({
+              content: output,
+              usage: this.estimateModelUsage(attemptMessages, output),
+            });
+          }
+          if (attempt > 1) {
+            this.emit({
+              type: 'llm.json.recovered',
+              agentId: agent.id,
+              correlationId,
+              data: { purpose, attempt },
+            });
+          }
+          break;
+        } catch (error) {
+          const retryable = this.isRetryableJSONCompletionError(error);
+          const willRetry = retryable && attempt < maxAttempts;
+          this.emit({
+            type: willRetry ? 'llm.json.retrying' : 'llm.json.failed',
+            agentId: agent.id,
+            correlationId,
+            data: {
+              purpose,
+              attempt,
+              maxAttempts,
+              retryable,
+              error: (error instanceof Error ? error.message : String(error)).slice(0, 1000),
+            },
+          });
+          if (!willRetry) throw error;
+          const retryConfig = this.workspaceRuntimeConfig?.llm;
+          const initialDelayMs = Math.max(0, retryConfig?.retryInitialDelayMs ?? 250);
+          const maxDelayMs = Math.max(initialDelayMs, retryConfig?.retryMaxDelayMs ?? 2_000);
+          const delayMs = Math.min(maxDelayMs, initialDelayMs * (2 ** (attempt - 1)));
+          if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs));
+        }
       }
+      if (value === undefined) throw new Error('JSON completion exhausted without a value');
       const usage = this.usageDifference(usageBefore, agent.getUsage());
       if (ownsAllocation) {
         this.settleDirectBudget(agent.id, allocation, usage, correlationId);
@@ -7749,6 +8260,13 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
       if (allocation?.status === 'granted') this.budgetMarket?.release(allocation.id, 'json_completion_failed');
       throw error;
     }
+  }
+
+  private isRetryableJSONCompletionError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return message.startsWith('Failed to parse JSON response:')
+      || message === 'Empty JSON response'
+      || this.isRetryableLLMStreamError(error);
   }
 
   private async synthesizeDelegatedResults(
@@ -7782,11 +8300,26 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     });
     this.emit({ type: 'agent.status.changed', agentId: 'root', data: { to: 'synthesizing', correlationId } });
     this.emit({ type: 'agent.llm.called', agentId: 'root', data: { purpose: 'root.multi_agent_synthesis', correlationId } });
-    const response = await this.completeAsRoot(
-      this.buildMultiAgentSynthesisPrompt(userTask, results, teamResults),
-      'root.multi_agent_synthesis',
-      correlationId
-    );
+    let response = '';
+    try {
+      response = await this.completeAsRoot(
+        this.buildMultiAgentSynthesisPrompt(userTask, results, teamResults),
+        'root.multi_agent_synthesis',
+        correlationId
+      );
+    } catch (error) {
+      this.emit({
+        type: 'root.synthesis.recovered',
+        agentId: 'root',
+        correlationId,
+        data: {
+          reason: error instanceof Error ? error.message : String(error),
+          recovery: 'deterministic_delegated_result',
+          teamCount: teamResults.length,
+          subagentCount: results.length,
+        },
+      });
+    }
     let finalResponse = response.trim()
       ? response
       : this.buildRootSynthesisFallback(
@@ -8815,7 +9348,7 @@ Produce the final response to the user as Roy, the root agent.`;
   private async runAgentDelegatedChildren(
     agentId: string,
     task: string,
-    plans: DelegationAgentPlan[],
+    decision: Extract<DelegationDecision, { action: 'spawn_subagents' }>,
     usageBefore: AgentUsage,
     options: {
       correlationId?: string;
@@ -8832,6 +9365,7 @@ Produce the final response to the user as Roy, the root agent.`;
       throw new Error(`Agent "${agentId}" not found`);
     }
     const correlationId = options.correlationId ?? this.createCorrelationId();
+    const plans = decision.agents;
     await this.transitionAgentFsm(agentId, 'S_planning', { correlationId, count: plans.length });
     this.emit({
       type: 'delegation.plan.created',
@@ -8876,40 +9410,69 @@ Produce the final response to the user as Roy, the root agent.`;
     }
 
     let teamResult: TeamRunResult | undefined;
-    if (plans.length > 1 && this.workspaceRuntimeConfig?.teams.createForMultipleAgents !== false) {
+    const shouldCreateTeam = plans.length > 1
+      && (decision.coordination === 'team'
+        || (decision.coordination === undefined && this.workspaceRuntimeConfig?.teams.createForMultipleAgents !== false));
+    if (shouldCreateTeam) {
+      const teamPlan = decision.team;
       const team = await this.spawnTeam({
         parentAgentId: agentId,
-        name: this.deriveTeamName(plans),
-        description: task,
-        task,
+        name: teamPlan?.name ?? this.deriveTeamName(plans),
+        description: teamPlan?.description ?? task,
+        task: teamPlan?.task ?? task,
+        synthesisPolicy: teamPlan?.synthesisPolicy,
+        tomLevel: teamPlan?.tomLevel,
+        executionPolicy: teamPlan?.executionPolicy,
         members: plans.map((plan, index) => ({ ...plan, lead: index === 0 })),
         tomAnalysis: this.tomAnalyses.get(correlationId),
         correlationId,
         lifecycleOrigin: 'automatic_delegation',
       });
-      teamResult = await this.runTeam(team.identity.id, task, { correlationId });
+      teamResult = await this.runTeam(team.identity.id, task, {
+        correlationId,
+        memberRecursiveDelegation: teamPlan?.memberDelegationPolicy !== 'deny',
+      });
       childResults.push(...teamResult.memberExecutions);
     } else {
       for (const plan of plans) {
-        const result = await this.handleSpawnCommand({
-          archetype: plan.archetype,
-          task: plan.task,
-          parentId: agentId,
-          name: plan.name,
-          tools: plan.tools,
-          skills: plan.skills,
-          tomLevel: plan.tomLevel,
-          tomProfile: plan.tomProfile,
-          cognitiveGapIds: plan.cognitiveGapIds,
-          existenceReason: plan.existenceReason,
-          budgetTokens: plan.budgetTokens,
-          correlationId,
-          source: agentId,
-          requireRootSynthesis: false,
-          showSubagentOutput: false,
-          disableRecursiveDelegation: false,
-        });
-        childResults.push(result);
+        try {
+          const result = await this.handleSpawnCommand({
+            archetype: plan.archetype,
+            task: plan.task,
+            parentId: agentId,
+            name: plan.name,
+            customRole: plan.role,
+            customStyle: plan.style,
+            tools: plan.tools,
+            skills: plan.skills,
+            tomLevel: plan.tomLevel,
+            tomProfile: plan.tomProfile,
+            cognitiveGapIds: plan.cognitiveGapIds,
+            existenceReason: plan.existenceReason,
+            systemPrompt: plan.systemPrompt,
+            budgetTokens: plan.budgetTokens,
+            correlationId,
+            source: agentId,
+            requireRootSynthesis: false,
+            showSubagentOutput: false,
+            disableRecursiveDelegation: false,
+          });
+          childResults.push(result);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (!message.startsWith('Spawn rejected:')) throw error;
+          this.emit({
+            type: 'delegation.child.skipped',
+            agentId,
+            correlationId,
+            data: {
+              archetype: plan.archetype,
+              name: plan.name,
+              task: plan.task,
+              reason: message.slice('Spawn rejected:'.length).trim(),
+            },
+          });
+        }
       }
     }
 
@@ -9190,6 +9753,7 @@ Produce the final response to the user as Roy, the root agent.`;
       `Team task: ${task}`,
       `You are ${team.identity.name}, a subteam actor in Roy.`,
       `Description: ${team.identity.description}`,
+      `Parent-defined synthesis policy: ${team.synthesisPolicy ?? 'Aggregate evidence, preserve disagreements, and return one grounded result.'}`,
       `ToM level: ${team.identity.tomLevel}`,
       `ToM profile: ${JSON.stringify(team.identity.tomProfile, null, 2)}`,
       `Lead agent: ${team.leadAgentId ?? 'not assigned'}`,
@@ -9235,7 +9799,7 @@ Produce the final response to the user as Roy, the root agent.`;
         data: { teamId: team.identity.id, totalTokens: 0, limited: true, reason: 'llm_not_configured' },
       });
       return {
-        content: `Team ${team.identity.name} could not synthesize results because no LLM is configured.`,
+        content: this.buildTeamSynthesisFallback(team, task, members, failures, 'llm_not_configured'),
         usage,
       };
     }
@@ -9248,26 +9812,51 @@ Produce the final response to the user as Roy, the root agent.`;
       completionTokens: completionTokenBudget,
     });
     if (allocation?.status === 'denied') {
-      throw new Error(`Team synthesis rejected: ${allocation.reason}`);
+      const usage = this.zeroTokenUsage();
+      this.emit({
+        type: 'team.synthesis.recovered',
+        agentId: team.identity.id,
+        sessionId: ctx.sessionId,
+        correlationId,
+        data: {
+          teamId: team.identity.id,
+          reason: allocation.reason,
+          recovery: 'deterministic_member_aggregation',
+          completedMembers: members.length,
+          failedMembers: failures.length,
+        },
+      });
+      this.emit({
+        type: 'team.synthesis.completed',
+        agentId: team.identity.id,
+        sessionId: ctx.sessionId,
+        correlationId,
+        data: { teamId: team.identity.id, totalTokens: 0, limited: true, reason: allocation.reason },
+      });
+      return {
+        content: this.buildTeamSynthesisFallback(team, task, members, failures, allocation.reason),
+        usage,
+      };
     }
     const maxCompletionTokens = allocation
       ? Math.max(1, this.completionCapacity(allocation.grantedTokens, estimatedPromptTokens))
       : completionTokenBudget;
-    const chunks: string[] = [];
-    let providerUsage: ModelTokenUsage | undefined;
+    let completion: { content: string; usage?: ModelTokenUsage };
     try {
-      for await (const chunk of ctx.llm.stream([
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: prompt },
-      ], { temperature: 0.2, maxTokens: maxCompletionTokens })) {
-        if (chunk.content) chunks.push(chunk.content);
-        if (chunk.usage) providerUsage = chunk.usage;
-      }
+      completion = await this.collectRuntimeLLMStream(
+        ctx.llm,
+        [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: prompt },
+        ],
+        { temperature: 0.2, maxTokens: maxCompletionTokens },
+        { actorId: team.identity.id, teamId: team.identity.id, purpose: 'team.synthesis', correlationId }
+      );
     } catch (error) {
       this.releaseTeamSynthesisBudget(team.identity.id, allocation, correlationId, 'team_synthesis_failed');
       throw error;
     }
-    let content = chunks.join('');
+    let content = completion.content;
     if (!content.trim()) {
       content = this.buildTeamSynthesisFallback(team, task, orderedMembers, failures);
       this.emit({
@@ -9282,7 +9871,7 @@ Produce the final response to the user as Roy, the root agent.`;
         },
       });
     }
-    const normalizedUsage = providerUsage ?? this.estimateModelUsage([
+    const normalizedUsage = completion.usage ?? this.estimateModelUsage([
       { role: 'system', content: systemPrompt },
       { role: 'user', content: prompt },
     ], content);
@@ -9320,7 +9909,8 @@ Produce the final response to the user as Roy, the root agent.`;
     team: TeamRuntimeState,
     task: string,
     members: RunAgentResult[],
-    failures: Array<TeamExecutionOutcome<unknown>>
+    failures: Array<TeamExecutionOutcome<unknown>>,
+    reason = 'model_returned_empty_visible_output'
   ): string {
     const reports = members.map(member => {
       const report = member.result.trim() || 'No visible narrative response was produced.';
@@ -9335,7 +9925,8 @@ Produce the final response to the user as Roy, the root agent.`;
       '[runtime_team_synthesis_fallback]',
       `# ${team.identity.name} Result`,
       `Task: ${task}`,
-      'The synthesis model returned no visible answer. The following member reports are preserved for diagnosis and are not accepted as a verified team conclusion.',
+      `The synthesis model was unavailable (${reason}). The following member reports are preserved for diagnosis and are not accepted as a verified team conclusion.`,
+      `Parent-defined synthesis policy: ${team.synthesisPolicy ?? 'not provided'}`,
       '## Unverified Member Reports',
       reports || 'No member report was available.',
       '## Runtime Evidence',
@@ -9446,16 +10037,16 @@ Produce the final response to the user as Roy, the root agent.`;
     const maxTokens = remainingTokens === undefined
       ? undefined
       : Math.max(1, this.completionCapacity(remainingTokens, estimatedInputTokens));
-    const chunks: string[] = [];
-    let usageChunk: { usage?: ModelTokenUsage } | undefined;
-    for await (const chunk of ctx.llm.stream(messages, { temperature: 0.2, maxTokens })) {
-      if (chunk.content) chunks.push(chunk.content);
-      if (chunk.usage) usageChunk = chunk;
-    }
-    const content = chunks.join('');
+    const completion = await this.collectRuntimeLLMStream(
+      ctx.llm,
+      messages,
+      { temperature: 0.2, maxTokens },
+      { actorId: agent.id, purpose, correlationId }
+    );
+    const content = completion.content;
     agent.recordRuntimeCompletion(content, {
       content,
-      usage: usageChunk?.usage ?? this.estimateModelUsage(messages, content),
+      usage: completion.usage ?? this.estimateModelUsage(messages, content),
     });
     return content;
   }
@@ -10616,19 +11207,30 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       .filter(Boolean)
       .join('\n\n')
       .slice(0, 16_000);
-    const repaired = await this.completeAsRoot(
-      [
-        'Rewrite the draft as a strictly evidence-grounded final answer.',
-        'Use only facts in the runtime evidence. Cite only URLs in <allowed_urls>.',
-        'Do not mention, cite, reconstruct, or replace unsupported URLs. Preserve explicit limitations.',
-        `<task>${task}</task>`,
-        `<allowed_urls>\n${observedUrls.map(url => `- ${url}`).join('\n')}\n</allowed_urls>`,
-        `<runtime_evidence>\n${evidenceSummary || 'No textual evidence summary was available.'}\n</runtime_evidence>`,
-        `<draft>\n${response}\n</draft>`,
-      ].join('\n\n'),
-      `${purpose}.grounding_repair`,
-      correlationId
-    );
+    let repaired: string;
+    try {
+      repaired = await this.completeAsRoot(
+        [
+          'Rewrite the draft as a strictly evidence-grounded final answer.',
+          'Use only facts in the runtime evidence. Cite only URLs in <allowed_urls>.',
+          'Do not mention, cite, reconstruct, or replace unsupported URLs. Preserve explicit limitations.',
+          `<task>${task}</task>`,
+          `<allowed_urls>\n${observedUrls.map(url => `- ${url}`).join('\n')}\n</allowed_urls>`,
+          `<runtime_evidence>\n${evidenceSummary || 'No textual evidence summary was available.'}\n</runtime_evidence>`,
+          `<draft>\n${response}\n</draft>`,
+        ].join('\n\n'),
+        `${purpose}.grounding_repair`,
+        correlationId
+      );
+    } catch (error) {
+      this.emit({
+        type: 'root.synthesis.grounding.repair_skipped',
+        agentId: 'root',
+        correlationId,
+        data: { purpose, reason: error instanceof Error ? error.message : String(error) },
+      });
+      repaired = this.removeUnsupportedUrls(response, unsupported);
+    }
     const candidate = repaired.trim() || response;
     const remainingUnsupported = this.findUnsupportedResponseUrls(candidate, observedUrls);
     if (remainingUnsupported.length === 0) {

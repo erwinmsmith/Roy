@@ -46,6 +46,39 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('plans concrete source reads for runtime API export inspection', () => {
+    const plans = new AgentToolPlanner().plan({
+      task: 'Inspect the exported runtime API surface and identify mismatches.',
+      workspacePath: '/workspace',
+      archetype: 'custom',
+      bindings: [{ name: 'fs.read', enabled: true }],
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({ toolName: 'fs.read', params: { path: 'src/index.ts' } }),
+      expect.objectContaining({ toolName: 'fs.read', params: { path: 'src/core/runtime/index.ts' } }),
+    ]);
+  });
+
+  it('merges an explicit manifest target with inferred runtime API source targets', () => {
+    const plans = new AgentToolPlanner().plan({
+      task: 'Read package.json and inspect exported runtime APIs for a consistency mismatch.',
+      workspacePath: '/workspace',
+      archetype: 'custom',
+      bindings: [
+        { name: 'fs.list', enabled: true },
+        { name: 'fs.read', enabled: true },
+      ],
+    });
+
+    expect(plans.map(plan => plan.params.path)).toEqual([
+      'package.json',
+      'src/index.ts',
+      'src/core/runtime/index.ts',
+    ]);
+    expect(plans.every(plan => plan.toolName === 'fs.read')).toBe(true);
+  });
+
   it('uses an allowlisted manifest command when a cached critic only exposes shell execution', () => {
     const plans = new AgentToolPlanner().plan({
       task: 'Identify architectural coupling risks using filesystem evidence.',

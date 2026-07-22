@@ -145,6 +145,24 @@ describe('Phase 2 engineering infrastructure', () => {
     expect(teams.transitionFsm(team.identity.id, 'S_team_done').status).toBe('done');
   });
 
+  it('uses team policy defaults when a generated partial policy contains undefined fields', () => {
+    const teams = new TeamRegistry();
+    const team = teams.create({
+      name: 'Partial Policy Team',
+      parentAgentId: 'root',
+      description: 'Validate generated partial execution policy normalization.',
+      generation: 1,
+      executionPolicy: { mode: 'parallel', failureMode: undefined },
+    });
+
+    expect(team.executionPolicy).toEqual({
+      mode: 'parallel',
+      failureMode: 'best_effort',
+      maxConcurrency: 3,
+      minimumSuccessfulMembers: 1,
+    });
+  });
+
   it('uses LLM scoring and cache mutation through the pluggable planner', async () => {
     const planner = new DefaultDelegationCandidatePlanner({ llm: new EngineeringLLM() });
     const selection = await planner.select({
@@ -167,6 +185,36 @@ describe('Phase 2 engineering infrastructure', () => {
     expect(selection.selected?.id).toBe('candidate_mutated_cache');
     expect(selection.selected?.scoreBreakdown.llm).toBe(1);
     expect(selection.selected?.lineage?.parentPatternIds).toContain('agent_pattern_researcher_v1');
+  });
+
+  it('preserves an explicit team coordination contract during candidate selection', async () => {
+    const planner = new DefaultDelegationCandidatePlanner({
+      scorers: [{ name: 'uniform', score: candidates => new Map(candidates.map(candidate => [candidate.id, 1])) }],
+    });
+    const selection = await planner.select({
+      parentId: 'root',
+      task: 'Reconcile two independently grounded perspectives.',
+      decision: {
+        action: 'spawn_subagents',
+        reason: 'The perspectives require an explicit synthesis boundary.',
+        coordination: 'team',
+        team: { name: 'GeneratedCell', description: 'Task-specific coordination boundary.' },
+        agents: [
+          { archetype: 'custom', name: 'Perspective-A', task: 'Establish the first bounded perspective.' },
+          { archetype: 'custom', name: 'Perspective-B', task: 'Establish the second bounded perspective.' },
+        ],
+      },
+      allowedChildren: 5,
+      remainingTotalAgentsForTurn: 10,
+      budgetMode: 'unlimited',
+      cacheUsed: false,
+    });
+
+    expect(selection.candidates.every(candidate => candidate.agents.length >= 2)).toBe(true);
+    expect(selection.decision.action).toBe('spawn_subagents');
+    if (selection.decision.action !== 'spawn_subagents') throw new Error('Expected team delegation');
+    expect(selection.decision.coordination).toBe('team');
+    expect(selection.decision.team?.name).toBe('GeneratedCell');
   });
 
   it('does not let cached patterns expand automatic delegation capabilities', async () => {

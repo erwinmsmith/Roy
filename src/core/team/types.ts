@@ -47,6 +47,7 @@ export interface TeamRuntimeState {
   memberStatuses: Record<string, TeamMemberExecutionStatus>;
   memberErrors: Record<string, string>;
   executionPolicy: TeamExecutionPolicy;
+  synthesisPolicy?: string;
   task?: string;
   result?: string;
   correlationId?: string;
@@ -65,6 +66,7 @@ export interface CreateTeamSpec {
   tomProfile?: ToMProfile;
   leadAgentId?: string;
   task?: string;
+  synthesisPolicy?: string;
   correlationId?: string;
   executionPolicy?: Partial<TeamExecutionPolicy>;
   createdAt?: number;

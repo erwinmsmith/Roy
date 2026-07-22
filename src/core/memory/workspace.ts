@@ -160,6 +160,12 @@ export interface WorkspaceRuntimeConfig {
   version: number;
   traceEvents: boolean;
   memoryUpdates: MemoryMode;
+  llm: {
+    streamMaxAttempts: number;
+    jsonMaxAttempts: number;
+    retryInitialDelayMs: number;
+    retryMaxDelayMs: number;
+  };
   delegation: {
     enabled: boolean;
     mode: 'manual' | 'auto';
@@ -187,6 +193,7 @@ export interface WorkspaceRuntimeConfig {
     autoCompleteGaps: boolean;
     maxAgentsPerDecision: number;
     minimumCoverage: number;
+    enforceMinimumCoverage: boolean;
     requireExistenceReason: boolean;
     higherOrderForMultiplePerspectives: boolean;
   };
@@ -292,6 +299,7 @@ export interface TeamPatternInput {
   leadArchetype?: string;
   members?: Array<Record<string, unknown>>;
   executionPolicy?: Record<string, unknown>;
+  synthesisPolicy?: string;
 }
 
 export interface MemorySignals {
@@ -488,9 +496,15 @@ Role-specific terms are recorded here.
 };
 
 const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
-  version: 9,
+  version: 10,
   traceEvents: true,
   memoryUpdates: 'suggest',
+  llm: {
+    streamMaxAttempts: 3,
+    jsonMaxAttempts: 2,
+    retryInitialDelayMs: 250,
+    retryMaxDelayMs: 2_000,
+  },
   delegation: {
     enabled: true,
     mode: 'auto',
@@ -518,6 +532,7 @@ const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
     autoCompleteGaps: true,
     maxAgentsPerDecision: 3,
     minimumCoverage: 0.6,
+    enforceMinimumCoverage: false,
     requireExistenceReason: true,
     higherOrderForMultiplePerspectives: true,
   },
@@ -1555,6 +1570,7 @@ Keep this agent identity separate from the model provider identity.
         leadArchetype: input.leadArchetype,
         members: input.members ?? input.memberArchetypes.map(archetype => ({ archetype })),
         executionPolicy: input.executionPolicy,
+        synthesisPolicy: input.synthesisPolicy,
         memoryPath: `.roy/teams/${key}/memory.md`,
         topologyPath: `.roy/teams/${key}/topology.json`,
         status: usageCount >= 2 ? 'active' : 'candidate',

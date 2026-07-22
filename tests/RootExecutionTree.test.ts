@@ -132,7 +132,61 @@ class DirectInitialDecisionLLM extends DynamicStepLLM {
   }
 }
 
+class FinalizeAfterRoundLLM extends DynamicStepLLM {
+  continuationCalls = 0;
+
+  override async completeJSON<T>(messages: LLMMessage[]): Promise<T> {
+    const text = messages.map(message => String(message.content)).join('\n');
+    if (text.includes("Roy's root delegation controller")) {
+      return {
+        action: 'spawn_subagents',
+        reason: 'A bounded two-view team should complete this task in one round.',
+        coordination: 'team',
+        continuationPolicy: 'finalize_after_round',
+        team: {
+          name: 'BoundedDecisionCell',
+          description: 'Produces two bounded views and stops after synthesis.',
+          synthesisPolicy: 'Reconcile both views once, then return the result.',
+        },
+        agents: [
+          { archetype: 'custom', name: 'ConstraintView', task: 'State the decision constraints.' },
+          { archetype: 'custom', name: 'ChallengeView', task: 'Challenge one decision assumption.' },
+        ],
+      } satisfies DelegationDecision as T;
+    }
+    if (text.includes("Roy's dynamic root-step controller")) {
+      this.continuationCalls += 1;
+      return { action: 'delegate_more', reason: 'This must not be called.', agents: [] } as T;
+    }
+    return super.completeJSON<T>(messages);
+  }
+}
+
 describe('Root dynamic execution tree', () => {
+  it('honors a model-selected finalize-after-round policy for a formal team', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-finalize-after-team-'));
+    await mkdir(path.join(workspaceCwd, '.roy'), { recursive: true });
+    await writeFile(path.join(workspaceCwd, '.roy', 'config.json'), JSON.stringify({
+      tom: { autoCompleteGaps: false, minimumCoverage: 0 },
+      delegation: { rootSteps: { maxDelegationRounds: 4, reassessAfterDelegation: true } },
+    }));
+    const llm = new FinalizeAfterRoundLLM();
+    const runtime = new Runtime();
+    await runtime.initialize({ sessionId: 'finalize-after-team-test', workspaceCwd, llmProvider: llm });
+
+    const result = await runtime.handleUserTurn('Use one team and finalize immediately after its synthesis.');
+
+    expect(result.decision).toMatchObject({
+      action: 'spawn_subagents',
+      coordination: 'team',
+      continuationPolicy: 'finalize_after_round',
+    });
+    expect(result.teams).toHaveLength(1);
+    expect(result.executionTree.steps.map(step => step.decision.action)).toEqual(['delegate', 'finalize']);
+    expect(llm.continuationCalls).toBe(0);
+    await runtime.shutdown();
+  });
+
   it('reassesses prior state, grows the tree in a dependent step, and lets Roy finalize', async () => {
     const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-dynamic-tree-'));
     await mkdir(path.join(workspaceCwd, '.roy'), { recursive: true });

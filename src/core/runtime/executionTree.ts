@@ -240,6 +240,36 @@ export class RootExecutionTreeRegistry {
     return structuredClone(step);
   }
 
+  fail(correlationId: string, error: string): RootExecutionTreeState {
+    const tree = this.requireTree(correlationId);
+    const now = Date.now();
+    let runningStep: RootExecutionStep | undefined;
+    for (let index = tree.steps.length - 1; index >= 0; index -= 1) {
+      if (tree.steps[index].status === 'running') {
+        runningStep = tree.steps[index];
+        break;
+      }
+    }
+    if (runningStep) {
+      runningStep.status = 'failed';
+      runningStep.error = error;
+      runningStep.treeSnapshot = structuredClone(tree.nodes);
+      runningStep.completedAt = now;
+    }
+    tree.status = 'failed';
+    tree.error = error;
+    tree.completedAt = now;
+    tree.updatedAt = now;
+    tree.loop.elapsedMs = now - tree.createdAt;
+    tree.loop.stopReason = 'failed';
+    const root = tree.nodes.find(node => node.id === tree.rootAgentId);
+    if (root) {
+      root.status = 'failed';
+      root.updatedAtStep = tree.currentStep;
+    }
+    return cloneTree(tree);
+  }
+
   finish(
     correlationId: string,
     stopReason: RootExecutionLoopState['stopReason'] = 'completed'

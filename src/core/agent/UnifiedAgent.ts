@@ -668,11 +668,19 @@ Tool-use policy:
     if (!user) return messages;
     const wrapperReserve = 16;
     const contentBudget = Math.max(16, inputBudget - wrapperReserve);
-    const systemBudget = system ? Math.max(8, Math.floor(contentBudget * 0.42)) : 0;
-    const userBudget = Math.max(8, contentBudget - systemBudget);
-    const compact: LLMMessage[] = [];
-    if (system) compact.push({ role: 'system', content: this.truncateForTokenBudget(system.content, systemBudget) });
-    compact.push({ role: user.role, content: this.truncateForTokenBudget(user.content, userBudget) });
+    let systemBudget = system ? Math.max(8, Math.floor(contentBudget * 0.42)) : 0;
+    let userBudget = Math.max(8, contentBudget - systemBudget);
+    let compact: LLMMessage[] = [];
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      compact = [];
+      if (system) compact.push({ role: 'system', content: this.truncateForTokenBudget(system.content, systemBudget) });
+      compact.push({ role: user.role, content: this.truncateForTokenBudget(user.content, userBudget) });
+      const compactEstimate = this.estimateMessageTokens(compact);
+      if (compactEstimate <= inputBudget) return compact;
+      const scale = Math.max(0.1, Math.min(0.9, (inputBudget - wrapperReserve) / compactEstimate));
+      systemBudget = system ? Math.max(8, Math.floor(systemBudget * scale)) : 0;
+      userBudget = Math.max(8, Math.floor(userBudget * scale));
+    }
     return compact;
   }
 

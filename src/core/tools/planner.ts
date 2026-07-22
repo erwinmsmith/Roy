@@ -33,6 +33,7 @@ export class AgentToolPlanner {
     const referencedDirectories = referencedPaths.filter(item => item.endsWith('/'));
     const referencedFiles = referencedPaths.filter(item => !item.endsWith('/'));
     const referencedUrls = this.extractReferencedUrls(input.task);
+    const runtimeApiInspection = /\bruntime\s+apis?\b[\s\S]{0,80}\b(?:exports?|surface|inspection|declarations?|signatures?|source|symbols?)\b|\bexported runtime apis?\b/.test(lower);
 
     if (enabled.has('web.fetch') && referencedUrls.length > 0) {
       plans.push(...referencedUrls.map(url => ({
@@ -59,6 +60,8 @@ export class AgentToolPlanner {
       })));
     } else if (enabled.has('fs.list')
       && /\b(inspect|analy[sz]e|review|list|structure|project|codebase|repo|repository|files?|evidence|coverage|verify)\b/.test(lower)
+      && referencedPaths.length === 0
+      && !runtimeApiInspection
       && !this.isWebOnlyTask(lower)) {
       plans.push({
         toolName: 'fs.list',
@@ -68,15 +71,16 @@ export class AgentToolPlanner {
       });
     }
 
-    const inferredFilePath = /\b(?:package exports?|export map|package manifest|package entr(?:y|ies))\b/.test(lower)
-      ? 'package.json'
-      : input.archetype === 'critic'
-        && /\b(?:architecture|architectural|repository|codebase|dependency|coupling)\b/.test(lower)
-        ? 'package.json'
-      : undefined;
-    const filePaths = referencedFiles.length > 0
-      ? referencedFiles
-      : inferredFilePath ? [inferredFilePath] : [];
+    const inferredFilePaths: string[] = [];
+    if (/\b(?:package exports?|export map|package manifest|package entr(?:y|ies))\b/.test(lower)
+      || input.archetype === 'critic'
+        && /\b(?:architecture|architectural|repository|codebase|dependency|coupling)\b/.test(lower)) {
+      inferredFilePaths.push('package.json');
+    }
+    if (runtimeApiInspection) {
+      inferredFilePaths.push('src/index.ts', 'src/core/runtime/index.ts');
+    }
+    const filePaths = Array.from(new Set([...referencedFiles, ...inferredFilePaths]));
     if (enabled.has('fs.read')
       && filePaths.length > 0
       && /\b(read|inspect|review|check|open|identify|analy[sz]e)\b/.test(lower)
