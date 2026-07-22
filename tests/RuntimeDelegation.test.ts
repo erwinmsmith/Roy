@@ -118,7 +118,41 @@ class RootDelegationLLM implements LLMProvider {
   }
 }
 
+class EmptyVisibleRootSynthesisLLM extends RootDelegationLLM {
+  override async *stream(messages: LLMMessage[], options?: LLMCompletionOptions): AsyncGenerator<LLMStreamChunk, void, unknown> {
+    const text = messages.map(message => String(message.content)).join('\n');
+    if (text.includes('Synthesize their results into one final user-facing response')) {
+      yield {
+        content: '',
+        done: true,
+        usage: { promptTokens: 100, completionTokens: 512, totalTokens: 612, thinkingTokens: 512 },
+      };
+      return;
+    }
+    yield* super.stream(messages, options);
+  }
+}
+
 describe('Runtime root-controlled delegation', () => {
+  it('returns a delegated-result fallback when root synthesis has no visible output', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-phase2-root-fallback-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'phase2-root-fallback-test',
+      workspaceCwd,
+      fsmEnabled: true,
+      llmProvider: new EmptyVisibleRootSynthesisLLM(),
+    });
+
+    const result = await runtime.handleUserTurn('Analyze this repo and find architectural risks');
+
+    expect(result.finalResponse).toContain('[runtime_root_synthesis_fallback]');
+    expect(result.finalResponse).toContain('Delegated result:');
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({ type: 'root.synthesis.fallback' }));
+
+    await runtime.shutdown();
+  });
+
   it('assesses a complex task, spawns subagents, waits for results, and synthesizes', async () => {
     const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-phase2-delegation-'));
     const runtime = new Runtime();

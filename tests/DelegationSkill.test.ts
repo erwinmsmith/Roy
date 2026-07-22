@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Runtime from '../src/core/runtime/Runtime.js';
@@ -263,6 +263,35 @@ describe('delegate_to_subagent skill', () => {
     expect(fresh.node.reuse.creationMode).toBe('generated');
     expect(fresh.node.reuse.cacheHits).toEqual([]);
 
+    await runtime.shutdown();
+  });
+
+  it('repairs stale cached capabilities with safe archetype read tools', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-delegation-cache-capability-repair-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'delegation-cache-capability-repair-test',
+      workspaceCwd,
+      fsmEnabled: false,
+      llmProvider: new DelegationLLM(),
+    });
+    const execute = () => skillRegistry.execute(
+      'delegate_to_subagent',
+      { action: 'delegate_to_subagent', params: { archetype: 'critic', task: 'Review repository architecture risks.' } },
+      { agentId: 'root', sessionId: 'delegation-cache-capability-repair-test', variables: {} }
+    );
+    await execute();
+    const cachePath = path.join(workspaceCwd, '.roy', 'cache', 'agent-patterns.json');
+    const cache = JSON.parse(await readFile(cachePath, 'utf8'));
+    const critic = cache.patterns.find((item: any) => item.id === 'agent_pattern_critic_v1');
+    critic.tools = ['shell.exec'];
+    await writeFile(cachePath, `${JSON.stringify(cache, null, 2)}\n`, 'utf8');
+
+    const repaired = (await execute()).result as Record<string, any>;
+
+    expect(repaired.node.capabilities.tools).toEqual(['fs.read', 'shell.exec']);
+    expect(repaired.node.reuse.creationMode).toBe('mutated_from_cache');
+    expect(repaired.agentResult.toolCalls.map((call: any) => call.toolName)).toContain('fs.read');
     await runtime.shutdown();
   });
 

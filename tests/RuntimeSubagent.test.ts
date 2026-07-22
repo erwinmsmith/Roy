@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Runtime from '../src/core/runtime/Runtime.js';
@@ -47,7 +47,120 @@ class EchoLLM implements LLMProvider {
   }
 }
 
+class ContradictoryArchitectureLLM extends EchoLLM {
+  override async *stream(_messages: LLMMessage[], _options?: LLMCompletionOptions): AsyncGenerator<LLMStreamChunk, void, unknown> {
+    yield { content: 'This is a Rust project built around Cargo.toml, Cargo.lock, and src/main.rs.', done: false };
+    yield {
+      content: '',
+      done: true,
+      usage: { promptTokens: 20, completionTokens: 12, totalTokens: 32 },
+    };
+  }
+}
+
+class FabricatedPathsLLM extends EchoLLM {
+  override async *stream(_messages: LLMMessage[], _options?: LLMCompletionOptions): AsyncGenerator<LLMStreamChunk, void, unknown> {
+    yield { content: 'The repository contains `package.json`, `src/fabricated/worker.ts`, and `config/missing.yaml`.', done: false };
+    yield { content: '', done: true, usage: { promptTokens: 20, completionTokens: 12, totalTokens: 32 } };
+  }
+}
+
 describe('Runtime controlled subagent spawning', () => {
+  it('rejects a model report that contradicts runtime filesystem evidence', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-grounding-contradiction-'));
+    await writeFile(path.join(workspaceCwd, 'package.json'), '{"name":"typescript-project"}\n', 'utf8');
+    await writeFile(path.join(workspaceCwd, 'index.ts'), 'export const value = 1;\n', 'utf8');
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'grounding-contradiction-test',
+      llmProvider: new ContradictoryArchitectureLLM(),
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+
+    const agent = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'researcher',
+      tomLevel: 0,
+      description: 'Inspect repository architecture from filesystem evidence.',
+      task: 'Inspect repository architecture from filesystem evidence.',
+      outputContract: { format: 'markdown', groundingRequired: true },
+    });
+    const result = await runtime.runAgent(
+      agent.identity.id,
+      'Inspect repository architecture from filesystem evidence.',
+      { archetype: 'researcher' }
+    );
+
+    expect(result.evidence.toolGrounded).toBe(true);
+    expect(result.evidence.outputGrounded).toBe(false);
+    expect(result.grounded).toBe(false);
+    expect(result.warnings).toContainEqual(expect.stringContaining('claims a Rust/Cargo project'));
+    expect(runtime.getEvents().map(event => event.type)).toContain('agent.grounding.contradiction');
+
+    await runtime.shutdown();
+  });
+
+  it('rejects multiple concrete project paths that are absent from runtime evidence', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-grounding-path-contradiction-'));
+    await writeFile(path.join(workspaceCwd, 'package.json'), '{"name":"typescript-project"}\n', 'utf8');
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'grounding-path-contradiction-test',
+      llmProvider: new FabricatedPathsLLM(),
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+    const agent = await runtime.spawnAgent({
+      parentId: 'root', archetype: 'researcher', tomLevel: 0,
+      description: 'Inspect repository architecture from filesystem evidence.',
+      task: 'Inspect repository architecture from filesystem evidence.',
+      outputContract: { format: 'markdown', groundingRequired: true },
+    });
+
+    const result = await runtime.runAgent(agent.identity.id, agent.identity.description ?? 'Inspect repository.', {
+      archetype: 'researcher', disableRecursiveDelegation: true,
+    });
+
+    expect(result.grounded).toBe(false);
+    expect(result.evidence.outputGrounded).toBe(false);
+    expect(result.warnings).toContainEqual(expect.stringContaining('src/fabricated/worker.ts'));
+    await runtime.shutdown();
+  });
+
+  it('does not mark a grounding-required agent as grounded when no tool can be planned', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-grounding-required-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'grounding-required-test',
+      llmProvider: new EchoLLM(),
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+
+    const agent = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'tester',
+      tomLevel: 0,
+      description: 'Verify behavior without an authorized tool.',
+      task: 'Verify behavior against tests and failure cases.',
+      tools: [],
+      outputContract: { format: 'markdown', groundingRequired: true },
+    });
+    const result = await runtime.runAgent(
+      agent.identity.id,
+      'Verify behavior against tests and failure cases.',
+      { archetype: 'tester', disableRecursiveDelegation: true }
+    );
+
+    expect(result.toolCalls).toHaveLength(0);
+    expect(result.evidence).toMatchObject({ toolGrounded: false, outputGrounded: false });
+    expect(result.grounded).toBe(false);
+    expect(result.warnings).toContainEqual(expect.stringContaining('no authorized tool call'));
+
+    await runtime.shutdown();
+  });
+
   it('spawns, registers, runs, and tracks a subagent', async () => {
     const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-subagent-'));
     const runtime = new Runtime();
@@ -487,6 +600,11 @@ describe('Runtime controlled subagent spawning', () => {
     expect(eventTypes).toContain('delegation.plan.created');
     expect(eventTypes).toContain('delegation.completed');
     expect(eventTypes).toContain('agent.synthesis.completed');
+    expect(runtime.getEvents().some(event =>
+      event.type === 'budget.rebalanced'
+      && event.agentId === researcher.identity.id
+      && event.data?.purpose === 'agent.multi_child_synthesis'
+    )).toBe(true);
     expect(runtime.getEvents().some(event =>
       event.type === 'budget.context.truncated'
       && event.agentId === researcher.identity.id

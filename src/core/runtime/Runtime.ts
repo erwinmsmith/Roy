@@ -3926,10 +3926,18 @@ export class Runtime {
 
     const cachedTools = this.stringArray(cachedAgentPattern?.tools);
     const cachedSkills = this.stringArray(cachedAgentPattern?.skills);
-    const baseTools = cachedTools.length > 0 ? cachedTools : this.getDefaultToolBindings(request.archetype).map(item => item.name);
+    const defaultToolBindings = this.getDefaultToolBindings(request.archetype);
+    const defaultTools = defaultToolBindings.map(item => item.name);
+    const defaultReadOnlyTools = defaultToolBindings
+      .filter(item => item.permission === 'read_only')
+      .map(item => item.name);
+    const baseTools = cachedTools.length > 0
+      ? Array.from(new Set([...defaultReadOnlyTools, ...cachedTools]))
+      : defaultTools;
     const baseSkills = cachedSkills.length > 0 ? cachedSkills : this.getDefaultSkillBindings(request.archetype).map(item => item.name);
     const tools = request.tools ?? baseTools;
     const skills = request.skills ?? baseSkills;
+    const cacheCapabilityRepair = cachedTools.length > 0 && !this.sameStringSet(cachedTools, baseTools);
     const toolsOverrideDefinition = request.tools !== undefined && !this.sameStringSet(request.tools, baseTools);
     const skillsOverrideDefinition = request.skills !== undefined && !this.sameStringSet(request.skills, baseSkills);
     this.validateDelegatedCapabilities(parentId, tools, skills);
@@ -3961,6 +3969,7 @@ export class Runtime {
       || request.style !== undefined
       || request.description !== undefined
       || request.systemPrompt !== undefined
+      || cacheCapabilityRepair
       || toolsOverrideDefinition
       || skillsOverrideDefinition
       || request.memoryScope !== undefined
@@ -3977,7 +3986,7 @@ export class Runtime {
           : 'generated';
     const outputContract = request.outputContract ?? {
       format: 'markdown',
-      groundingRequired: request.archetype === 'researcher',
+      groundingRequired: this.taskRequiresGrounding(request.archetype, request.task),
     };
     const description = request.description ?? `Reusable ${request.archetype} agent compute node.`;
     const definitionSeed = {
@@ -5171,6 +5180,20 @@ export class Runtime {
           data: { task },
         });
       }
+      const evidenceContradictions = grounding.evidence.toolGrounded
+        ? this.detectEvidenceContradictions(result, grounding.evidence)
+        : [];
+      for (const contradiction of evidenceContradictions) {
+        grounding.warnings.push(contradiction);
+        this.emit({
+          type: 'agent.grounding.contradiction',
+          agentId,
+          sessionId: ctx.sessionId,
+          correlationId: options.correlationId,
+          data: { warning: contradiction, observedPaths: grounding.evidence.observedPaths.slice(0, 30) },
+        });
+      }
+
       agent.setRuntimeState('done');
       await this.transitionAgentFsm(agentId, 'S_responding', { correlationId: options.correlationId });
 
@@ -5183,11 +5206,12 @@ export class Runtime {
       let evidence: RunEvidence = {
         ...grounding.evidence,
         outputGrounded: grounding.evidence.toolGrounded
-          ? this.resultIncludesEvidence(result || agent.getInfo().lastResult || '', grounding.evidence)
+          ? evidenceContradictions.length === 0
+            && this.resultIncludesEvidence(result || agent.getInfo().lastResult || '', grounding.evidence)
           : grounding.evidence.outputGrounded,
       };
       const warnings = [...grounding.warnings];
-      if (grounding.evidence.toolGrounded && !evidence.outputGrounded) {
+      if (grounding.evidence.toolGrounded && !evidence.outputGrounded && evidenceContradictions.length === 0) {
         result = this.attachRuntimeEvidence(result, grounding.evidence);
         evidence = { ...evidence, outputGrounded: true };
         warnings.push('Runtime appended structured tool evidence because the model response omitted concrete observed paths.');
@@ -5210,7 +5234,7 @@ export class Runtime {
           task,
           correlationId: options.correlationId,
           totalTokens: usageDelta.totalTokens,
-          grounded: grounding.grounded,
+          grounded: grounding.grounded && evidence.outputGrounded,
           evidence,
           warnings,
         },
@@ -5234,7 +5258,7 @@ export class Runtime {
         usage: usageDelta,
         toolCalls: grounding.toolCalls,
         evidence,
-        grounded: grounding.grounded,
+        grounded: grounding.grounded && evidence.outputGrounded,
         warnings,
       };
       await this.finalizeActorLifecycle(agentId, 'success', options.correlationId);
@@ -6670,7 +6694,14 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     ctx.agent.setRuntimeState('idle');
     this.emit({ type: 'agent.status.changed', agentId: 'root', data: { to: 'idle', correlationId } });
     this.emit({ type: 'root.solo.completed', agentId: 'root', data: { correlationId, totalTokens: usageDelta.totalTokens } });
-    return response || ctx.agent.getInfo().lastResult || '';
+    if (response.trim()) return response;
+    this.emit({
+      type: 'root.completion.fallback',
+      agentId: 'root',
+      correlationId,
+      data: { purpose: 'root.solo_reasoning', reason: 'model_returned_empty_visible_output' },
+    });
+    return '[runtime_root_completion_fallback]\nRoy could not produce visible output for this turn. No stale response was reused.';
   }
 
   private async completeAsRoot(prompt: string, purpose: string, correlationId: string): Promise<string> {
@@ -6719,13 +6750,17 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
       { role: 'user', content: effectivePrompt },
     ];
     const estimatedInputTokens = this.estimateTextTokens(messages.map(message => message.content).join('\n'));
+    const visibleCompletionTokens = 512;
+    const completionTokens = purpose.includes('synthesis')
+      ? this.synthesisCompletionTokenBudget(visibleCompletionTokens)
+      : visibleCompletionTokens;
     const allocation = await this.requestAgentBudget({
       parentId: 'root',
       requesterId: 'root',
       archetype: 'custom',
       correlationId,
       requestedTokens: Math.max(
-        this.budgetRequestTokens(estimatedInputTokens, 512),
+        this.budgetRequestTokens(estimatedInputTokens, completionTokens),
         this.workspaceRuntimeConfig?.budgetMarket.defaultRequestsByArchetype.root ?? 2400
       ),
       minimumTokens: this.budgetMinimumTokens(estimatedInputTokens),
@@ -6889,6 +6924,25 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
       'root.multi_agent_synthesis',
       correlationId
     );
+    const finalResponse = response.trim()
+      ? response
+      : this.buildRootSynthesisFallback(
+        userTask,
+        teamResults.map(result => result.result).filter(Boolean),
+        results.map(result => result.subagentResult.result).filter(Boolean)
+      );
+    if (!response.trim()) {
+      this.emit({
+        type: 'root.synthesis.fallback',
+        agentId: 'root',
+        correlationId,
+        data: {
+          reason: 'model_returned_empty_visible_output',
+          teamCount: teamResults.length,
+          subagentCount: results.length,
+        },
+      });
+    }
     const usageAfter = ctx.agent.getUsage();
     const usageDelta = this.usageDifference(usageBefore, usageAfter);
     this.recordTurnUsage(usageDelta);
@@ -6901,7 +6955,7 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
       data: { correlationId, totalTokens: usageDelta.totalTokens, subagentCount: results.length },
     });
     await ctx.queue.ack(synthesisMessage.id);
-    return response || ctx.agent.getInfo().lastResult || '';
+    return finalResponse;
   }
 
   private buildMultiAgentSynthesisPrompt(
@@ -6962,6 +7016,17 @@ ${reports}
 Produce the final response to the user as Roy, the root agent.`;
   }
 
+  private buildRootSynthesisFallback(userTask: string, primaryResults: string[], secondaryResults: string[]): string {
+    const selected = primaryResults.find(result => result.trim())
+      ?? secondaryResults.find(result => result.trim());
+    return [
+      '[runtime_root_synthesis_fallback]',
+      'Roy\'s synthesis backend returned no visible text. The runtime is returning the best completed delegated result without adding new claims.',
+      `User task: ${userTask}`,
+      selected ? `Delegated result:\n${selected.slice(0, 16000)}` : 'No non-empty delegated result was available.',
+    ].join('\n\n');
+  }
+
   private async synthesizeEvolutionResult(
     task: string,
     run: EvolutionRunResult,
@@ -6973,7 +7038,7 @@ Produce the final response to the user as Roy, the root agent.`;
     if (!execution) {
       return `Roy could not complete the evolutionary delegation run. Run ${run.id} produced no executable result.`;
     }
-    return this.completeAsRoot(
+    const response = await this.completeAsRoot(
       [
         'Synthesize the selected evolutionary agent/team result into the final answer to the user.',
         'Do not expose hidden chain-of-thought. Explain observable evidence, limitations, and relevant disagreements.',
@@ -6992,6 +7057,14 @@ Produce the final response to the user as Roy, the root agent.`;
       'root.evolution_synthesis',
       correlationId
     );
+    if (response.trim()) return response;
+    this.emit({
+      type: 'root.synthesis.fallback',
+      agentId: 'root',
+      correlationId,
+      data: { reason: 'model_returned_empty_visible_output', source: 'evolution', runId: run.id },
+    });
+    return this.buildRootSynthesisFallback(task, [execution.result], []);
   }
 
   private resolveEvolutionRunOptions(
@@ -7427,7 +7500,7 @@ Produce the final response to the user as Roy, the root agent.`;
           [
             {
               role: 'system',
-              content: 'Evaluate an executed agent/team candidate. Return strict JSON with optional 0..1 fields taskSuccess, answerQuality, completeness, costEfficiency, novelty, toolUse, consistency, tomCoverage, plus rationale. Judge only observable output and metrics.',
+              content: 'Evaluate an executed agent/team candidate. Return strict JSON with optional 0..1 fields taskSuccess, answerQuality, completeness, costEfficiency, novelty, toolUse, consistency, tomCoverage, plus rationale. Check whether technical conclusions follow from the supplied evidence, distinguish facts from inference, and penalize unsupported or factually incorrect claims. A long, grounded-looking answer is not necessarily correct.',
             },
             {
               role: 'user',
@@ -7734,9 +7807,11 @@ Produce the final response to the user as Roy, the root agent.`;
     this.emit({ type: 'agent.status.changed', agentId: parentId, data: { from, to: 'synthesizing', correlationId } });
     this.emit({ type: 'agent.llm.called', agentId: parentId, data: { purpose: 'agent.child_synthesis', correlationId } });
 
+    const synthesisPrompt = this.buildParentChildSynthesisPrompt(parent.getInfo(), userTask, childAgent, childResult);
+    this.ensureAgentSynthesisBudget(parent, synthesisPrompt, 'agent.child_synthesis', correlationId);
     const response = await this.completeAsAgent(
       parent,
-      this.buildParentChildSynthesisPrompt(parent.getInfo(), userTask, childAgent, childResult),
+      synthesisPrompt,
       'agent.child_synthesis',
       correlationId
     );
@@ -7828,9 +7903,11 @@ Produce the final response to the user as Roy, the root agent.`;
     this.emit({ type: 'agent.status.changed', agentId: parentId, data: { from, to: 'synthesizing', correlationId } });
     this.emit({ type: 'agent.llm.called', agentId: parentId, data: { purpose: 'agent.multi_child_synthesis', correlationId } });
 
+    const synthesisPrompt = this.buildParentMultiChildSynthesisPrompt(parent.getInfo(), userTask, childResults, teamResult);
+    this.ensureAgentSynthesisBudget(parent, synthesisPrompt, 'agent.multi_child_synthesis', correlationId);
     const response = await this.completeAsAgent(
       parent,
-      this.buildParentMultiChildSynthesisPrompt(parent.getInfo(), userTask, childResults, teamResult),
+      synthesisPrompt,
       'agent.multi_child_synthesis',
       correlationId
     );
@@ -8502,6 +8579,71 @@ Produce the final response to the user as Roy, the root agent.`;
     return content;
   }
 
+  private ensureAgentSynthesisBudget(
+    agent: BaseAgent,
+    prompt: string,
+    purpose: string,
+    correlationId: string
+  ): void {
+    const allocationId = this.agentBudgetAllocations.get(agent.id);
+    if (!allocationId || !this.budgetMarket) return;
+    const allocation = this.budgetMarket.getAllocation(allocationId);
+    if (!allocation || allocation.status !== 'granted') return;
+
+    const communicationContext = agent.getCommunicationContext()?.rendered ?? '';
+    const estimatedInputTokens = this.estimateTextTokens([
+      `system:You are ${agent.name}, a runtime agent in the Roy autonomous agent system.`,
+      communicationContext,
+      `user:${prompt}`,
+    ].filter(Boolean).join('\n'));
+    const requestedCompletionTokens = this.synthesisCompletionTokenBudget(512);
+    const requiredTokens = this.budgetRequestTokens(estimatedInputTokens, requestedCompletionTokens);
+    const marketRemaining = Math.max(0, allocation.allocatedTokens - allocation.consumedTokens);
+    const agentRemaining = agent.getCompletionTokenLimit();
+    const currentRemaining = agentRemaining === undefined
+      ? marketRemaining
+      : Math.min(marketRemaining, agentRemaining);
+    if (currentRemaining >= requiredTokens) return;
+
+    const updated = this.budgetMarket.augment(
+      allocationId,
+      requiredTokens - currentRemaining,
+      Math.min(64, Math.max(1, requiredTokens - currentRemaining))
+    );
+    const addedTokens = Math.max(0, (updated?.allocatedTokens ?? allocation.allocatedTokens) - allocation.allocatedTokens);
+    if (addedTokens === 0) {
+      this.emit({
+        type: 'budget.rebalance.skipped',
+        agentId: agent.id,
+        correlationId,
+        data: {
+          allocationId,
+          purpose,
+          requiredTokens,
+          currentRemaining,
+          reason: 'insufficient_remaining_budget',
+        },
+      });
+      return;
+    }
+
+    agent.setCompletionTokenLimit(currentRemaining + addedTokens, this.budgetAccountingDimension());
+    this.emit({
+      type: 'budget.rebalanced',
+      agentId: agent.id,
+      correlationId,
+      data: {
+        allocationId,
+        purpose,
+        previousRemainingTokens: currentRemaining,
+        addedTokens,
+        remainingTokens: currentRemaining + addedTokens,
+        requestedInputTokens: estimatedInputTokens,
+        requestedCompletionTokens,
+      },
+    });
+  }
+
   private buildParentChildSynthesisPrompt(parent: AgentInfo, userTask: string, childAgent: AgentInfo, childResult: RunAgentResult): string {
     const warnings = childResult.warnings.length > 0
       ? childResult.warnings.map(item => `- ${item}`).join('\n')
@@ -8653,6 +8795,17 @@ ${reports}`;
       'root.synthesis',
       correlationId
     );
+    const finalResponse = response.trim()
+      ? response
+      : this.buildRootSynthesisFallback(userTask, [], [subagentResult.result]);
+    if (!response.trim()) {
+      this.emit({
+        type: 'root.synthesis.fallback',
+        agentId: 'root',
+        correlationId,
+        data: { reason: 'model_returned_empty_visible_output', subagentId: agent.identity.id },
+      });
+    }
 
     const usageAfter = ctx.agent.getUsage();
     const usageDelta = this.usageDifference(usageBefore, usageAfter);
@@ -8663,7 +8816,7 @@ ${reports}`;
     this.emit({ type: 'agent.status.changed', agentId: 'root', data: { to: 'idle' } });
     this.emit({ type: 'root.synthesis.completed', agentId: 'root', data: { correlationId, totalTokens: usageDelta.totalTokens } });
     await ctx.queue.ack(synthesisMessage.id);
-    return response || ctx.agent.getInfo().lastResult || '';
+    return finalResponse;
   }
 
   private buildRootSynthesisPrompt(userTask: string, agent: AgentInfo, subagentResult: RunAgentResult): string {
@@ -9182,14 +9335,33 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
   ): Promise<{ toolCalls: ToolCallRecord[]; grounded: boolean; warnings: string[]; context: string; evidence: RunEvidence }> {
     const bindings = this.agentBindings.get(agentId)?.tools ?? [];
     const inspectionRoot = this.resolveInspectionRoot(task);
-    const plans = this.toolPlanner.plan({ task, workspacePath: inspectionRoot, bindings });
+    const groundingRequired = this.agentRestoreSpecs.get(agentId)?.outputContract?.groundingRequired
+      ?? this.taskRequiresGrounding(options.archetype ?? 'custom', task);
+    const plans = this.toolPlanner.plan({
+      task,
+      workspacePath: inspectionRoot,
+      bindings,
+      archetype: options.archetype,
+    });
     if (plans.length === 0) {
+      const warning = groundingRequired
+        ? 'Grounding was required, but no authorized tool call could be planned for this task.'
+        : undefined;
+      if (warning) {
+        this.emit({
+          type: 'agent.grounding.warning',
+          agentId,
+          sessionId: this.getContext().sessionId,
+          correlationId: options.correlationId,
+          data: { warning, reason: 'no_grounding_tool_plan' },
+        });
+      }
       return {
         toolCalls: [],
-        grounded: true,
-        warnings: [],
+        grounded: !groundingRequired,
+        warnings: warning ? [warning] : [],
         context: '',
-        evidence: { toolGrounded: false, outputGrounded: true, observedPaths: [] },
+        evidence: { toolGrounded: false, outputGrounded: !groundingRequired, observedPaths: [] },
       };
     }
 
@@ -9255,6 +9427,7 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
     return [
       '[runtime_grounding_provided]',
       task,
+      '\nGrounding rules:\n- Treat the runtime-provided tool output as authoritative.\n- Mention only files, technologies, commands, and test results supported by that output.\n- If prior assumptions conflict with the tool output, discard the assumptions.\n- Label anything not established by the tool output as unverified; do not invent a replacement structure.',
       grounding.context ? `\nGrounding context:\n${grounding.context}` : '',
       grounding.warnings.length > 0 ? `\nGrounding warnings:\n${grounding.warnings.join('\n')}` : '',
     ].filter(Boolean).join('\n');
@@ -9270,6 +9443,46 @@ Produce the final response to the user as Roy, the root agent. Do not claim you 
       .filter(term => term.length >= 4)
       .slice(0, 30);
     return evidenceTerms.some(term => normalized.includes(term));
+  }
+
+  private taskRequiresGrounding(archetype: SubAgentArchetype, task: string): boolean {
+    if (archetype === 'researcher' || archetype === 'tester') return true;
+    return /\b(?:filesystem|repository|codebase|source|tool)[ -]?(?:grounded|evidence)\b|\busing (?:filesystem|source|tool) evidence\b/i.test(task);
+  }
+
+  private detectEvidenceContradictions(result: string, evidence: RunEvidence): string[] {
+    if (!result.trim() || evidence.observedPaths.length === 0) return [];
+    const observed = evidence.observedPaths.map(item => item.toLowerCase());
+    const normalized = result.toLowerCase();
+    const hasNodeEvidence = observed.some(item => item === 'package.json' || /\.(?:ts|tsx|js)$/.test(item));
+    const hasRustEvidence = observed.some(item => item === 'cargo.toml' || item.endsWith('.rs'));
+    const claimsRust = /\bcargo\.(?:toml|lock)\b|\brust-toolchain(?:\.toml)?\b|(?:^|[\s`'"(])[^\s`'"()]+\.rs\b|\brust (?:project|codebase|crate|toolchain)\b/im.test(normalized);
+    const contradictions: string[] = [];
+    if (hasNodeEvidence && !hasRustEvidence && claimsRust) {
+      contradictions.push('The model report claims a Rust/Cargo project, but runtime filesystem evidence contains Node/TypeScript markers and no Rust project markers.');
+    }
+    const evidenceText = `${evidence.observedPaths.join('\n')}\n${evidence.toolResultSummary ?? ''}`.toLowerCase();
+    const unsupportedPaths = Array.from(result.matchAll(/`([^`\n]{1,180})`/g))
+      .map(match => match[1].trim().replace(/^["']|["']$/g, '').replace(/^\.\//, '').replace(/[,:;.)]+$/, ''))
+      .filter(candidate => this.looksLikeConcreteProjectPath(candidate))
+      .filter(candidate => {
+        const normalizedCandidate = candidate.toLowerCase();
+        return !evidenceText.includes(normalizedCandidate)
+          && !observed.some(item => item === normalizedCandidate || item.endsWith(`/${normalizedCandidate}`));
+      });
+    const uniqueUnsupportedPaths = Array.from(new Set(unsupportedPaths));
+    if (uniqueUnsupportedPaths.length >= 2) {
+      contradictions.push(
+        `The model report references concrete project paths not present in runtime evidence: ${uniqueUnsupportedPaths.slice(0, 6).join(', ')}.`
+      );
+    }
+    return contradictions;
+  }
+
+  private looksLikeConcreteProjectPath(value: string): boolean {
+    if (!value || /\s|[*{}<>]|^(?:https?:|npm |pnpm |yarn )/i.test(value)) return false;
+    if (/^(?:src|test|tests|docs|config|scripts|lib|app|packages)\//i.test(value)) return true;
+    return /(?:^|\/)[A-Za-z0-9_.-]+\.(?:ts|tsx|js|jsx|json|ya?ml|toml|md|txt|lock|env)$/i.test(value);
   }
 
   private attachRuntimeEvidence(result: string, evidence: RunEvidence): string {

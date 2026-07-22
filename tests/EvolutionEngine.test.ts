@@ -283,6 +283,37 @@ describe('Phase 6 evolution core', () => {
     expect(evaluation.rationale).toContain('could not be verified');
   });
 
+  it('labels heuristic quality as observable rather than independently judged correctness', async () => {
+    const candidate = new TeamFirstGenomePlanner().propose(proposalInput())[0];
+    const evaluation = await new CompositeEvolutionEvaluator().evaluate(
+      proposalInput().task,
+      candidate,
+      {
+        candidateId: candidate.id,
+        actorKind: 'team',
+        actorId: 'observable_team',
+        success: true,
+        result: 'A long grounded report with concrete evidence. '.repeat(200),
+        usage: { inputTokens: 100, outputTokens: 100, thinkingTokens: 20, totalTokens: 220 },
+        wallClockMs: 5,
+        agentIds: ['researcher', 'critic'],
+        teamIds: ['observable_team'],
+        toolCalls: 2,
+        successfulToolCalls: 2,
+        unresolvedToolIntents: 0,
+        groundedResults: 2,
+        totalResults: 2,
+        failedActors: 0,
+        recoveredFailures: 0,
+        warnings: [],
+      }
+    );
+
+    expect(evaluation.dimensions.answerQuality).toBeLessThanOrEqual(0.72);
+    expect(evaluation.evaluator).toBe('composite_observable');
+    expect(evaluation.rationale).toContain('Semantic correctness was not independently judged');
+  });
+
   it('allows a completed answer to preserve local uncertainty in its limitations', async () => {
     const candidate = new TeamFirstGenomePlanner().propose(proposalInput())[0];
     const evaluation = await new CompositeEvolutionEvaluator().evaluate(

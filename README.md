@@ -181,6 +181,8 @@ Cached genomes are validated before population admission. Structurally stale pat
 
 Selected genomes are stored in `.roy/cache/evolution-patterns.json` and linked back to their concrete agent/team patterns. Full runs and metrics are appended to `.roy/cache/evolution-history.jsonl`. Evolution defaults to `manual` mode so normal chat does not unexpectedly execute a candidate population. Set `/evo mode auto` to route complex delegated turns through evolution.
 
+Without an LLM judge, evolution uses an observable execution evaluator. It scores completion, grounding coverage, tool success, cost, consistency, and ToM coverage, caps heuristic answer quality, and reports itself as `composite_observable`. That score is useful for runtime selection but is not an independent proof that domain conclusions are factually correct. Enable `useLlmJudge` or provide a custom `EvolutionJudge` when semantic correctness must participate in selection.
+
 The workspace defaults can be changed in `.roy/config.json` or through `/evo` and the evolution config API:
 
 ```json
@@ -208,6 +210,8 @@ The workspace defaults can be changed in `.roy/config.json` or through `/evo` an
 ```
 
 The LLM scorer is also a metered control-plane call. Before scoring, the runtime either reserves a dedicated root allocation or reuses the active parent-agent allocation. The provider response is attributed to that parent actor, including reported thinking/cache tokens, and the allocation is settled or released on failure. Custom planners and scorer hooks are available through the `roy/delegation` package export.
+
+Recursive parents keep one market allocation across planning and synthesis. If direct-child or team reports make the parent synthesis context larger than the remaining allocation, the runtime requests a bounded continuation augmentation on that allocation, records `budget.rebalanced`, and still respects the session limit. This avoids both untracked synthesis and duplicate allocation settlement.
 
 ## Context And Memory
 

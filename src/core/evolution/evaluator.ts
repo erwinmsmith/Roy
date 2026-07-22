@@ -37,7 +37,7 @@ export class CompositeEvolutionEvaluator implements EvolutionCandidateEvaluator 
     const base: EvolutionEvaluationDimensions = {
       taskSuccess: taskCompleted ? Math.max(0.5, successRate) : validExecution ? 0.25 : 0,
       answerQuality: validExecution && execution.result.trim().length > 0
-        ? Math.min(1, 0.45 + Math.log10(execution.result.length + 1) / 5)
+        ? Math.min(this.judge ? 1 : 0.72, 0.45 + Math.log10(execution.result.length + 1) / 5)
         : 0,
       completeness: taskCompleted
         ? clamp((successRate + groundedRate + 1) / 3)
@@ -83,8 +83,8 @@ export class CompositeEvolutionEvaluator implements EvolutionCandidateEvaluator 
         ? `LLM judge failed (${judgeFailure}); composite observable metrics were used.`
         : typeof judged.rationale === 'string'
         ? judged.rationale
-        : `Composite execution score from success, output, evidence, cost, consistency, and ToM coverage.`,
-      evaluator: this.judge ? `${this.name}+${this.judge.name}` : this.name,
+        : 'Observable execution score from completion, evidence, cost, consistency, and ToM coverage. Semantic correctness was not independently judged.',
+      evaluator: this.judge ? `${this.name}+${this.judge.name}` : `${this.name}_observable`,
     };
   }
 

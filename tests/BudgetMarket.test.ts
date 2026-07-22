@@ -179,6 +179,27 @@ describe('Phase 5 budget market', () => {
     expect(market.getState().ledger.some(entry => entry.type === 'rebalanced')).toBe(true);
   });
 
+  it('augments an active allocation for a continuation without exceeding the session limit', () => {
+    let usedTokens = 0;
+    const market = new BudgetMarket(() => usedTokens, { mode: 'fixed', minimumGrantTokens: 100 });
+    market.configure(1000);
+    const allocation = market.request({
+      requesterId: 'planner', parentId: 'root', requestedTokens: 400, minimumTokens: 100,
+      purpose: 'recursive delegation',
+    });
+    market.consume(allocation.id, 350);
+    usedTokens = 350;
+
+    const augmented = market.augment(allocation.id, 800, 100);
+
+    expect(augmented).toMatchObject({ allocatedTokens: 1000, grantedTokens: 1000, consumedTokens: 350 });
+    expect(market.getState()).toMatchObject({ reservedTokens: 650, availableTokens: 0 });
+    expect(market.getState().ledger).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'requested', allocationId: allocation.id, tokens: 800 }),
+      expect.objectContaining({ type: 'rebalanced', allocationId: allocation.id, tokens: 600 }),
+    ]));
+  });
+
   it('rebalances duplicate requester purposes by allocation order instead of conflating bids', () => {
     const market = new BudgetMarket(() => 0, { mode: 'market', minimumGrantTokens: 100 });
     market.configure(2000);

@@ -117,6 +117,48 @@ export class BudgetMarket {
     return this.clone(allocation);
   }
 
+  augment(
+    allocationId: string,
+    requestedAdditionalTokens: number,
+    minimumAdditionalTokens = 1
+  ): BudgetAllocation | undefined {
+    const allocation = this.allocations.get(allocationId);
+    if (!allocation || allocation.status !== 'granted') return undefined;
+
+    const requested = Math.max(0, Math.floor(requestedAdditionalTokens));
+    const minimum = Math.max(1, Math.floor(minimumAdditionalTokens));
+    if (requested === 0) return this.clone(allocation);
+
+    this.appendLedger('requested', allocation.id, allocation.request.requesterId, requested, {
+      purpose: `${allocation.request.purpose}:continuation`,
+      continuation: true,
+    });
+    const available = this.limitTokens === null
+      ? requested
+      : Math.min(requested, this.availableTokens() ?? 0);
+    if (available < minimum) {
+      this.appendLedger('rebalanced', allocation.id, allocation.request.requesterId, 0, {
+        previousTokens: allocation.allocatedTokens,
+        requestedAdditionalTokens: requested,
+        reason: 'insufficient_remaining_budget_for_continuation',
+      });
+      return this.clone(allocation);
+    }
+
+    const previousTokens = allocation.allocatedTokens;
+    allocation.allocatedTokens += available;
+    allocation.grantedTokens += available;
+    allocation.rationale = 'continuation_budget_augmented';
+    allocation.reason = allocation.rationale;
+    allocation.updatedAt = Date.now();
+    this.appendLedger('rebalanced', allocation.id, allocation.request.requesterId, available, {
+      previousTokens,
+      requestedAdditionalTokens: requested,
+      continuation: true,
+    });
+    return this.clone(allocation);
+  }
+
   consume(allocationId: string, usage: number | ModelTokenUsage): BudgetAllocation | undefined {
     const allocation = this.allocations.get(allocationId);
     if (!allocation || !['granted', 'exceeded'].includes(allocation.status)) return undefined;
