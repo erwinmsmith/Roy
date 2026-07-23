@@ -3936,7 +3936,7 @@ export class Runtime {
         const mutationApplied = this.hasSuccessfulWorkspaceMutation(rootExecution.toolCalls);
         const verificationRan = this.hasSuccessfulWorkspaceVerification(rootExecution.toolCalls);
         this.emit({
-          type: mutationApplied
+          type: mutationApplied && verificationRan
             ? 'root.execution.required.completed'
             : 'root.execution.required.unmet',
           agentId: 'root',
@@ -4186,7 +4186,7 @@ export class Runtime {
         });
         previousStepId = completedExecutionStep.id;
         this.emit({
-          type: mutationApplied
+          type: mutationApplied && verificationRan
             ? 'root.execution.required.completed'
             : 'root.execution.required.unmet',
           agentId: 'root',

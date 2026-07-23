@@ -14,6 +14,19 @@ describe('workspace execution intent', () => {
     })).toBe(false);
   });
 
+  it('does not treat temporary output as a workspace mutation', () => {
+    expect(isSuccessfulWorkspaceMutationCall({
+      toolName: 'shell.exec',
+      params: { command: "echo 'started' > /tmp/migration_started.txt" },
+      success: true,
+    })).toBe(false);
+    expect(isSuccessfulWorkspaceMutationCall({
+      toolName: 'shell.exec',
+      params: { command: "echo 'started' > /var/tmp/migration_started.txt" },
+      success: true,
+    })).toBe(false);
+  });
+
   it('recognizes actual file writes and verification commands', () => {
     expect(isSuccessfulWorkspaceMutationCall({
       toolName: 'shell.exec',

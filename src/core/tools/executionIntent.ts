@@ -14,6 +14,12 @@ const NULL_OUTPUT_TARGETS = new Set([
   '&2',
 ]);
 
+const NON_WORKSPACE_OUTPUT_PREFIXES = [
+  '/tmp/',
+  '/var/tmp/',
+  '/private/tmp/',
+];
+
 export function taskRequestsWorkspaceMutation(task: string): boolean {
   const normalized = task.toLowerCase().replace(/\s+/g, ' ');
   if (/\b(?:do not|don't|without)\s+(?:modify|edit|write|change|patch|mutate)\b/.test(normalized)
@@ -43,7 +49,7 @@ export function isSuccessfulWorkspaceMutationCall(call: ExecutionIntentCall): bo
   if (/\btee(?:\s+-a)?\s+(?!\/dev\/(?:null|stdout|stderr)\b)\S+/i.test(command)) {
     return true;
   }
-  return extractRedirectionTargets(command).some(target => !NULL_OUTPUT_TARGETS.has(target));
+  return extractRedirectionTargets(command).some(target => !isNonWorkspaceOutputTarget(target));
 }
 
 export function isSuccessfulWorkspaceVerificationCall(call: ExecutionIntentCall): boolean {
@@ -55,6 +61,11 @@ export function isSuccessfulWorkspaceVerificationCall(call: ExecutionIntentCall)
 
 function masksShellFailure(command: string): boolean {
   return /\|\|\s*(?:true|:)(?:\s*(?:[;&|]|$))|;\s*(?:true|:)\s*;?\s*$|\bset\s+\+e\b/i.test(command);
+}
+
+function isNonWorkspaceOutputTarget(target: string): boolean {
+  return NULL_OUTPUT_TARGETS.has(target)
+    || NON_WORKSPACE_OUTPUT_PREFIXES.some(prefix => target.startsWith(prefix));
 }
 
 function extractRedirectionTargets(command: string): string[] {
