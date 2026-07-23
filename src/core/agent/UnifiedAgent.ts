@@ -19,6 +19,11 @@ import {
 import { logger } from '../utils/logger.js';
 import type { PlannedToolCall } from '../tools/planner.js';
 import type { ToolLoopCallRecord } from '../tools/executionLoop.js';
+import {
+  isSuccessfulWorkspaceMutationCall as isSuccessfulWorkspaceMutation,
+  isSuccessfulWorkspaceVerificationCall as isSuccessfulWorkspaceVerification,
+  taskRequestsWorkspaceMutation as requestsWorkspaceMutation,
+} from '../tools/executionIntent.js';
 
 export type AgentMode = 'conversational' | 'action' | 'hybrid';
 
@@ -833,31 +838,6 @@ Tool-use policy:
     const doc = contextManager.get(this.name, this.sessionId);
     return doc?.content ?? '';
   }
-}
-
-function requestsWorkspaceMutation(task: string): boolean {
-  const normalized = task.toLowerCase().replace(/\s+/g, ' ');
-  if (/\b(?:do not|don't|without)\s+(?:modify|edit|write|change|patch|mutate)\b/.test(normalized)
-    || /\b(?:read[- ]only|analysis only|review only|plan only)\b/.test(normalized)) {
-    return false;
-  }
-  return /\b(?:implement|modify|edit|create|write|patch|repair|fix|refactor|migrate|upgrade|downgrade|install|remove|replace|apply|build)\b[\s\S]{0,240}\b(?:file|code|project|repository|repo|workspace|artifact|solution|dependency|dependencies|implementation|migration|application|package|tests?)\b/i.test(task)
-    || /\b(?:fix|repair|migrate|upgrade|refactor|implement)\b[\s\S]{0,160}\b(?:bug|issue|failure|task|feature|api|cli|runtime|system)\b/i.test(task)
-    || /(?:实现|修改|编辑|创建|写入|修复|重构|迁移|升级|安装|替换|落盘|改动)[\s\S]{0,120}(?:文件|代码|项目|仓库|工作区|依赖|实现|测试|系统)/.test(task);
-}
-
-function isSuccessfulWorkspaceMutation(call: ToolLoopCallRecord): boolean {
-  if (!call.success) return false;
-  if (call.toolName === 'fs.write') return true;
-  if (call.toolName !== 'shell.exec') return false;
-  const command = String(call.params.command ?? '');
-  return /(?:^|[;&|]\s*|\s)(?:apply_patch|touch|mkdir|cp|mv|rm|install|npm\s+(?:install|uninstall)|pnpm\s+(?:add|remove|install)|yarn\s+(?:add|remove|install)|pip\s+install|uv\s+(?:add|remove|pip\s+install)|sed\s+-i|perl\s+-pi)\b|(?:^|\s)(?:python|python3|node)\b[\s\S]*(?:writeFile|write_text|write_bytes|open\s*\([^)]*['"][wa]['"]|>\s*[^&])|(?:^|[^>])>>?\s*[A-Za-z0-9_./-]+/i.test(command);
-}
-
-function isSuccessfulWorkspaceVerification(call: ToolLoopCallRecord): boolean {
-  if (!call.success || call.toolName !== 'shell.exec') return false;
-  const command = String(call.params.command ?? '');
-  return /\b(?:test|pytest|vitest|jest|mocha|cargo\s+test|go\s+test|npm\s+(?:test|run\s+(?:test|check|build|lint|typecheck))|pnpm\s+(?:test|run)|yarn\s+(?:test|run)|ruff|eslint|tsc|mypy|pyright|compileall)\b/i.test(command);
 }
 
 function compactToolObservation(result: unknown, toolName: string): unknown {

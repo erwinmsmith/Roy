@@ -36,7 +36,10 @@ import {
   FsListTool,
   FsReadTool,
   FsWriteTool,
+  isSuccessfulWorkspaceMutationCall,
+  isSuccessfulWorkspaceVerificationCall,
   ShellExecTool,
+  taskRequestsWorkspaceMutation,
   WebFetchTool,
   WebSearchTool,
   registerCoreTools,
@@ -11306,15 +11309,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
   }
 
   private taskRequiresWorkspaceMutation(task: string): boolean {
-    const normalized = task.toLowerCase().replace(/\s+/g, ' ');
-    if (/\b(?:do not|don't|without)\s+(?:modify|edit|write|change|patch|mutate)\b/.test(normalized)
-      || /\b(?:read[- ]only|analysis only|review only|plan only)\b/.test(normalized)
-      || /(?:不要|无需|仅|只)\s*(?:修改|写入|改动|执行)/.test(task)) {
-      return false;
-    }
-    return /\b(?:implement|modify|edit|create|write|patch|repair|fix|refactor|migrate|upgrade|downgrade|install|remove|replace|apply|build)\b[\s\S]{0,240}\b(?:file|code|project|repository|repo|workspace|artifact|solution|dependency|dependencies|implementation|migration|application|package|tests?)\b/i.test(task)
-      || /\b(?:fix|repair|migrate|upgrade|refactor|implement)\b[\s\S]{0,160}\b(?:bug|issue|failure|task|feature|api|cli|runtime|system)\b/i.test(task)
-      || /(?:实现|修改|编辑|创建|写入|修复|重构|迁移|升级|安装|替换|落盘|改动)[\s\S]{0,120}(?:文件|代码|项目|仓库|工作区|依赖|实现|测试|系统)/.test(task);
+    return taskRequestsWorkspaceMutation(task);
   }
 
   private buildRootExecutionClosureTask(
@@ -11348,21 +11343,11 @@ For web-grounded work, use only facts present in the subagent report or runtime 
   }
 
   private hasSuccessfulWorkspaceMutation(calls: ToolCallRecord[]): boolean {
-    return calls.some(call => {
-      if (!call.success) return false;
-      if (call.toolName === 'fs.write') return true;
-      if (call.toolName !== 'shell.exec') return false;
-      const command = String(call.params.command ?? '');
-      return /(?:^|[;&|]\s*|\s)(?:apply_patch|touch|mkdir|cp|mv|rm|install|npm\s+(?:install|uninstall)|pnpm\s+(?:add|remove|install)|yarn\s+(?:add|remove|install)|pip\s+install|uv\s+(?:add|remove|pip\s+install)|sed\s+-i|perl\s+-pi)\b|(?:^|\s)(?:python|python3|node)\b[\s\S]*(?:writeFile|write_text|write_bytes|open\s*\([^)]*['"][wa]['"]|>\s*[^&])|(?:^|[^>])>>?\s*[A-Za-z0-9_./-]+/i.test(command);
-    });
+    return calls.some(call => isSuccessfulWorkspaceMutationCall(call));
   }
 
   private hasSuccessfulWorkspaceVerification(calls: ToolCallRecord[]): boolean {
-    return calls.some(call => {
-      if (!call.success || call.toolName !== 'shell.exec') return false;
-      const command = String(call.params.command ?? '');
-      return /\b(?:test|pytest|vitest|jest|mocha|cargo\s+test|go\s+test|npm\s+(?:test|run\s+(?:test|check|build|lint|typecheck))|pnpm\s+(?:test|run)|yarn\s+(?:test|run)|ruff|eslint|tsc|mypy|pyright|compileall)\b/i.test(command);
-    });
+    return calls.some(call => isSuccessfulWorkspaceVerificationCall(call));
   }
 
   private summarizeRootExecutionClosure(execution: GroundingRunResult): string {
