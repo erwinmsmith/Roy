@@ -119,6 +119,42 @@ class ContinuingStepLLM extends DynamicStepLLM {
   }
 }
 
+class RecoverableStepFailureLLM extends DynamicStepLLM {
+  private continuationCalls = 0;
+
+  override async *stream(messages: LLMMessage[]): AsyncGenerator<LLMStreamChunk, void, unknown> {
+    const text = messages.map(message => String(message.content)).join('\n');
+    const content = text.includes('Synthesize their results into one final user-facing response')
+      ? 'Roy recovered the prior completed checkpoint and produced a final response.'
+      : text.includes('Emit an unresolved tool request')
+        ? '<tool_call><tool_name>fs.read</tool_name><path>missing.txt</path></tool_call>'
+        : 'First checkpoint completed with usable evidence.';
+    yield {
+      content,
+      done: true,
+      usage: { promptTokens: 20, completionTokens: 8, totalTokens: 28 },
+    };
+  }
+
+  override async completeJSON<T>(messages: LLMMessage[]): Promise<T> {
+    const text = messages.map(message => String(message.content)).join('\n');
+    if (text.includes("Roy's dynamic root-step controller")) {
+      this.continuationCalls += 1;
+      return {
+        action: 'delegate_more',
+        reason: 'Try one additional bounded checkpoint.',
+        agents: [{
+          archetype: 'custom',
+          name: 'FailingCheckpoint',
+          task: 'Emit an unresolved tool request without executing it.',
+          tomLevel: 0,
+        }],
+      } as T;
+    }
+    return super.completeJSON<T>(messages);
+  }
+}
+
 class DirectInitialDecisionLLM extends DynamicStepLLM {
   override async completeJSON<T>(messages: LLMMessage[]): Promise<T> {
     const text = messages.map(message => String(message.content)).join('\n');
@@ -337,6 +373,83 @@ describe('Root dynamic execution tree', () => {
     expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
       type: 'root.step.limit_reached',
       data: expect.objectContaining({ reason: 'max_iterations' }),
+    }));
+    await runtime.shutdown();
+  });
+
+  it('reserves both execution and finalization steps for workspace mutations', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-bounded-mutation-loop-'));
+    await mkdir(path.join(workspaceCwd, '.roy'), { recursive: true });
+    await writeFile(path.join(workspaceCwd, '.roy', 'config.json'), JSON.stringify({
+      tom: { autoCompleteGaps: false, minimumCoverage: 0 },
+      delegation: {
+        rootSteps: {
+          enabled: true,
+          maxStepsPerTurn: 4,
+          maxDelegationRounds: 10,
+          reassessAfterDelegation: true,
+          maxWallClockMs: 60000,
+          maxStalledIterations: 5,
+        },
+      },
+    }));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'bounded-mutation-loop-test',
+      workspaceCwd,
+      fsmEnabled: true,
+      llmProvider: new ContinuingStepLLM(),
+    });
+
+    const result = await runtime.handleUserTurn('Modify the project code and run tests.');
+
+    expect(result.executionTree.steps).toHaveLength(4);
+    expect(result.executionTree.steps.map(step => step.decision.action)).toEqual([
+      'delegate',
+      'delegate',
+      'solve_directly',
+      'finalize',
+    ]);
+    expect(result.executionTree.loop.stopReason).toBe('max_iterations');
+    await runtime.shutdown();
+  });
+
+  it('keeps the execution tree running when a later delegated step is recoverable', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-recoverable-step-'));
+    await mkdir(path.join(workspaceCwd, '.roy'), { recursive: true });
+    await writeFile(path.join(workspaceCwd, '.roy', 'config.json'), JSON.stringify({
+      tom: { autoCompleteGaps: false, minimumCoverage: 0 },
+      delegation: {
+        rootSteps: {
+          enabled: true,
+          maxStepsPerTurn: 5,
+          maxDelegationRounds: 4,
+          reassessAfterDelegation: true,
+        },
+      },
+    }));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'recoverable-step-test',
+      workspaceCwd,
+      fsmEnabled: true,
+      llmProvider: new RecoverableStepFailureLLM(),
+    });
+
+    const result = await runtime.handleUserTurn(
+      'Analyze this staged question, then recover from a failed optional checkpoint.'
+    );
+
+    expect(result.finalResponse).toContain('recovered the prior completed checkpoint');
+    expect(result.executionTree.status).toBe('completed');
+    expect(result.executionTree.steps.map(step => step.status)).toEqual([
+      'completed',
+      'failed',
+      'completed',
+    ]);
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'root.step.recovered',
+      data: expect.objectContaining({ recovery: 'synthesize_completed_prior_steps' }),
     }));
     await runtime.shutdown();
   });

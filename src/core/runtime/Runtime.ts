@@ -3765,12 +3765,17 @@ export class Runtime {
     const ctx = this.getContext();
     const rootUsageBefore = ctx.agent.getUsage();
     const rootStepConfig = this.workspaceRuntimeConfig?.delegation.rootSteps;
-    const maxSteps = Math.max(2, rootStepConfig?.maxStepsPerTurn ?? 12);
+    const requiresWorkspaceMutation = this.taskRequiresWorkspaceMutation(userInput);
+    const reservedFinalSteps = requiresWorkspaceMutation ? 2 : 1;
+    const maxSteps = Math.max(
+      reservedFinalSteps + 1,
+      rootStepConfig?.maxStepsPerTurn ?? 12
+    );
     const loopController = new RootTaskLoopController({
       maxIterations: maxSteps,
       maxWallClockMs: Math.max(1, rootStepConfig?.maxWallClockMs ?? 15 * 60_000),
       maxStalledIterations: Math.max(1, rootStepConfig?.maxStalledIterations ?? 2),
-      reserveFinalSteps: 1,
+      reserveFinalSteps: reservedFinalSteps,
     });
     this.executionTrees.begin({
       correlationId,
@@ -3971,7 +3976,10 @@ export class Runtime {
           round = await this.executeRootDelegationRound(userInput, roundDecision, correlationId);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
-          this.executionTrees.failStep(correlationId, step.id, message);
+          const canRecoverFromPriorWork = subagents.length > 0 || teamResults.length > 0;
+          this.executionTrees.failStep(correlationId, step.id, message, {
+            failTree: !canRecoverFromPriorWork,
+          });
           await this.persistRootExecutionTree(correlationId);
           this.emit({
             type: 'root.step.failed',
@@ -3979,7 +3987,7 @@ export class Runtime {
             correlationId,
             data: { stepId: step.id, error: message },
           });
-          if (subagents.length > 0 || teamResults.length > 0) {
+          if (canRecoverFromPriorWork) {
             this.emit({
               type: 'root.step.recovered',
               agentId: 'root',
@@ -3991,6 +3999,11 @@ export class Runtime {
                 completedSubagents: subagents.length,
                 completedTeams: teamResults.length,
               },
+            });
+            await this.transitionRootTurnState('S_wait_subagents', {
+              correlationId,
+              stepId: step.id,
+              recovered: true,
             });
             break;
           }
@@ -4085,7 +4098,7 @@ export class Runtime {
         break;
       }
 
-      if (!clarification && this.taskRequiresWorkspaceMutation(userInput)) {
+      if (!clarification && requiresWorkspaceMutation) {
         const executionStep = await this.startRootExecutionStep(correlationId, {
           action: 'solve_directly',
           reason: 'Delegated analysis is complete; the root must apply and verify the requested workspace changes.',

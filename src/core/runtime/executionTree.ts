@@ -225,18 +225,25 @@ export class RootExecutionTreeRegistry {
     return structuredClone(step);
   }
 
-  failStep(correlationId: string, stepId: string, error: string): RootExecutionStep {
+  failStep(
+    correlationId: string,
+    stepId: string,
+    error: string,
+    options: { failTree?: boolean } = {}
+  ): RootExecutionStep {
     const tree = this.requireTree(correlationId);
     const step = this.requireStep(tree, stepId);
     step.status = 'failed';
     step.error = error;
     step.treeSnapshot = structuredClone(tree.nodes);
     step.completedAt = Date.now();
-    tree.status = 'failed';
-    tree.error = error;
     tree.updatedAt = step.completedAt;
     tree.loop.elapsedMs = step.completedAt - tree.createdAt;
-    tree.loop.stopReason = 'failed';
+    if (options.failTree ?? true) {
+      tree.status = 'failed';
+      tree.error = error;
+      tree.loop.stopReason = 'failed';
+    }
     return structuredClone(step);
   }
 
