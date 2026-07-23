@@ -139,39 +139,62 @@ export class UnifiedAgent extends BaseAgent {
         reason?: string;
         calls?: Array<{ toolName?: unknown; params?: unknown }>;
       };
-      let response = await this.completeJSONWithAccounting<PlanningResponse>(
-        messages,
-        { temperature: 0, maxTokens: executionRequired ? 4096 : 640 }
-      );
-      if (executionRequired
-        && response.action !== 'call_tools'
-        && (!mutationApplied || !verificationRan)) {
-        response = await this.completeJSONWithAccounting<PlanningResponse>([
-          ...messages,
+      let planningMessages = messages;
+      let response: PlanningResponse = {};
+      let plannedCalls: PlannedToolCall[] = [];
+      for (let attempt = 0; attempt < (executionRequired ? 3 : 1); attempt += 1) {
+        response = await this.completeJSONWithAccounting<PlanningResponse>(
+          planningMessages,
+          { temperature: 0, maxTokens: executionRequired ? 4096 : 640 }
+        );
+        plannedCalls = normalizePlannedToolCalls(
+          response,
+          authorized,
+          input.remainingCalls,
+          input.round
+        );
+        const advancesExecution = !executionRequired
+          || (mutationApplied
+            ? verificationRan || plannedCalls.some(call => isSuccessfulWorkspaceVerification({
+              ...call,
+              success: true,
+            }))
+            : plannedCalls.some(call => isSuccessfulWorkspaceMutation({
+              ...call,
+              success: true,
+            })));
+        if (advancesExecution) break;
+        planningMessages = [
+          ...planningMessages,
           { role: 'assistant', content: JSON.stringify(response) },
           {
             role: 'user',
             content: [
-              'Runtime rejected finish because the execution contract is incomplete.',
-              !mutationApplied ? 'Request a concrete workspace mutation now.' : '',
-              mutationApplied && !verificationRan ? 'Request a concrete verification command now.' : '',
+              'Runtime rejected this plan because the execution contract is incomplete.',
+              !mutationApplied
+                ? 'Read-only, diagnostic, repeated, or finish plans are insufficient. Request a concrete fs.write or mutating shell.exec call now.'
+                : '',
+              mutationApplied && !verificationRan
+                ? 'Non-verifying, repeated, or finish plans are insufficient. Request a concrete verification command now.'
+                : '',
               'Return the required call_tools JSON. Do not ask for permission.',
             ].filter(Boolean).join('\n'),
           },
-        ], { temperature: 0, maxTokens: 4096 });
+        ];
       }
-      if (response.action !== 'call_tools' || !Array.isArray(response.calls)) return [];
-      return response.calls
-        .filter(call => typeof call.toolName === 'string' && authorized.has(call.toolName))
-        .slice(0, input.remainingCalls)
-        .map(call => ({
-          toolName: String(call.toolName),
-          params: call.params && typeof call.params === 'object' && !Array.isArray(call.params)
-            ? call.params as Record<string, unknown>
-            : {},
-          reason: response.reason?.trim() || `Agent requested another tool round after observing round ${input.round}.`,
-          groundingRequired: true,
-        }));
+      if (executionRequired) {
+        const advancesExecution = mutationApplied
+          ? verificationRan || plannedCalls.some(call => isSuccessfulWorkspaceVerification({
+            ...call,
+            success: true,
+          }))
+          : plannedCalls.some(call => isSuccessfulWorkspaceMutation({
+            ...call,
+            success: true,
+          }));
+        if (!advancesExecution) return [];
+      }
+      return plannedCalls;
     } catch (error) {
       logger.warn(`Agent ${this.name} could not plan another tool round:`, error);
       if (authorized.has('web.fetch')) {
@@ -838,6 +861,30 @@ Tool-use policy:
     const doc = contextManager.get(this.name, this.sessionId);
     return doc?.content ?? '';
   }
+}
+
+function normalizePlannedToolCalls(
+  response: {
+    action?: string;
+    reason?: string;
+    calls?: Array<{ toolName?: unknown; params?: unknown }>;
+  },
+  authorized: Set<string>,
+  remainingCalls: number,
+  round: number
+): PlannedToolCall[] {
+  if (response.action !== 'call_tools' || !Array.isArray(response.calls)) return [];
+  return response.calls
+    .filter(call => typeof call.toolName === 'string' && authorized.has(call.toolName))
+    .slice(0, remainingCalls)
+    .map(call => ({
+      toolName: String(call.toolName),
+      params: call.params && typeof call.params === 'object' && !Array.isArray(call.params)
+        ? call.params as Record<string, unknown>
+        : {},
+      reason: response.reason?.trim() || `Agent requested another tool round after observing round ${round}.`,
+      groundingRequired: true,
+    }));
 }
 
 function compactToolObservation(result: unknown, toolName: string): unknown {

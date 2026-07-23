@@ -52,6 +52,31 @@ class NonJSONWebPlanningLLM extends PlanningLLM {
   }
 }
 
+class ReadOnlyThenMutationPlanningLLM extends PlanningLLM {
+  constructor() {
+    super('none');
+  }
+
+  override async completeJSON<T>(): Promise<T> {
+    this.jsonCalls += 1;
+    if (this.jsonCalls === 1) {
+      return {
+        action: 'call_tools',
+        reason: 'Repeat inspection instead of implementing.',
+        calls: [{ toolName: 'fs.read', params: { path: 'artifact.txt' } }],
+      } as T;
+    }
+    return {
+      action: 'call_tools',
+      reason: 'Apply the required workspace change.',
+      calls: [{
+        toolName: 'fs.write',
+        params: { path: 'artifact.txt', content: 'implemented' },
+      }],
+    } as T;
+  }
+}
+
 class EchoTool implements Tool {
   readonly name = 'echo-tool';
   readonly description = 'Echoes a value';
@@ -281,6 +306,40 @@ describe('UnifiedAgent capability execution', () => {
       expect.objectContaining({
         toolName: 'web.fetch',
         params: { url: 'https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal/timeout_static' },
+      }),
+    ]);
+  });
+
+  it('rejects a read-only continuation when a workspace mutation is still required', async () => {
+    const llm = new ReadOnlyThenMutationPlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'implementation-agent',
+      goal: 'implement workspace changes',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.read', 'fs.write', 'shell.exec'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: 'Implement the project change by creating artifact.txt and run tests.',
+      round: 1,
+      remainingCalls: 4,
+      tools: [{ name: 'fs.read' }, { name: 'fs.write' }, { name: 'shell.exec' }],
+      calls: [{
+        toolName: 'fs.read',
+        params: { path: 'artifact.txt' },
+        reason: 'initial inspection',
+        groundingRequired: true,
+        success: false,
+        error: 'missing',
+      }],
+    });
+
+    expect(llm.jsonCalls).toBe(2);
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.write',
+        params: { path: 'artifact.txt', content: 'implemented' },
       }),
     ]);
   });

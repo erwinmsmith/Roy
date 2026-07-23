@@ -100,6 +100,53 @@ class DelegatedTerminalTaskLLM extends TerminalTaskLLM {
   }
 }
 
+class FailedDelegationRecoveryLLM extends TerminalTaskLLM {
+  override async *stream(messages: LLMMessage[]): AsyncGenerator<LLMStreamChunk, void, unknown> {
+    const text = messages.map(message => message.content).join('\n');
+    const content = text.includes('<root_execution_report>')
+      ? 'Recovered the failed delegation, created failed-delegation.txt, and verified it.'
+      : '<tool_call><tool_name>fs.read</tool_name><path>missing.txt</path></tool_call>';
+    yield { content, done: true };
+  }
+
+  override async completeJSON<T>(messages: LLMMessage[]): Promise<T> {
+    const system = messages.find(message => message.role === 'system')?.content ?? '';
+    const user = messages.findLast(message => message.role === 'user')?.content ?? '';
+    if (system.includes("root delegation controller")) {
+      return {
+        action: 'spawn_subagents',
+        reason: 'Try one delegated inspection before implementation.',
+        continuationPolicy: 'finalize_after_round',
+        agents: [{
+          archetype: 'custom',
+          name: 'FailingInspector',
+          task: 'Return invalid unresolved tool markup without executing any tool.',
+          tomLevel: 0,
+        }],
+      } as T;
+    }
+    if (system.includes("delegation controller")) {
+      return { action: 'solve_directly', reason: 'The child should answer directly.' } as T;
+    }
+    if (system.includes('plan authorized tool calls')) {
+      if (user.includes('[runtime_execution_phase]') && user.includes('Completed tool round: 0')) {
+        return {
+          action: 'call_tools',
+          reason: 'Recover by applying and verifying the requested workspace change.',
+          calls: [{
+            toolName: 'shell.exec',
+            params: {
+              command: "printf 'recovered' > failed-delegation.txt && test \"$(cat failed-delegation.txt)\" = recovered",
+            },
+          }],
+        } as T;
+      }
+      return { action: 'finish', reason: 'No child tool call is required.', calls: [] } as T;
+    }
+    return {} as T;
+  }
+}
+
 describe('benchmark terminal capability', () => {
   it('runs an explicitly authorized shell loop and persists its execution tree', async () => {
     const workspace = await mkdtemp(path.join(tmpdir(), 'roy-terminal-task-'));
@@ -224,6 +271,74 @@ describe('benchmark terminal capability', () => {
       type: 'tool.call',
       agentId: 'root',
       data: expect.objectContaining({ toolName: 'shell.exec' }),
+    }));
+
+    await runtime.shutdown();
+  });
+
+  it('recovers an initial failed delegation through root execution', async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), 'roy-failed-delegation-recovery-'));
+    await mkdir(path.join(workspace, '.roy'), { recursive: true });
+    await writeFile(path.join(workspace, '.roy', 'config.json'), JSON.stringify({
+      delegation: {
+        rootSteps: {
+          enabled: true,
+          maxStepsPerTurn: 4,
+          maxDelegationRounds: 2,
+          reassessAfterDelegation: true,
+        },
+      },
+      tools: {
+        approval: {
+          readOnly: 'auto',
+          write: 'auto',
+          execute: 'auto',
+          overrides: {},
+        },
+        shell: {
+          mode: 'unrestricted',
+          shell: '/bin/sh',
+          defaultTimeoutMs: 10_000,
+          maxTimeoutMs: 60_000,
+          defaultMaxOutputBytes: 40_000,
+          maxCallsPerAgent: 10,
+        },
+        executionLoop: {
+          enabled: true,
+          maxRounds: 4,
+          maxCallsPerRun: 8,
+          maxConsecutiveFailures: 2,
+          maxWallClockMs: 30_000,
+          maxFetchesAfterSearch: 2,
+          llmReplanning: true,
+        },
+      },
+    }, null, 2));
+
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'failed-delegation-recovery-test',
+      workspaceCwd: workspace,
+      llmProvider: new FailedDelegationRecoveryLLM(),
+    });
+    const result = await runtime.handleUserTurn(
+      'Implement a workspace change by creating failed-delegation.txt, then verify the file.'
+    );
+
+    expect(await readFile(path.join(workspace, 'failed-delegation.txt'), 'utf8')).toBe('recovered');
+    expect(result.executionTree.status).toBe('completed');
+    expect(result.executionTree.steps.map(step => step.status)).toEqual([
+      'failed',
+      'completed',
+      'completed',
+    ]);
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'root.step.recovered',
+      data: expect.objectContaining({ recovery: 'root_execution_after_failed_delegation' }),
+    }));
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'root.execution.required.completed',
+      data: expect.objectContaining({ mutationApplied: true, verificationRan: true }),
     }));
 
     await runtime.shutdown();

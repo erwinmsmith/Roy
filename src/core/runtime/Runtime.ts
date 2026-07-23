@@ -3976,9 +3976,11 @@ export class Runtime {
           round = await this.executeRootDelegationRound(userInput, roundDecision, correlationId);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
-          const canRecoverFromPriorWork = subagents.length > 0 || teamResults.length > 0;
+          const hasCompletedPriorWork = subagents.length > 0 || teamResults.length > 0;
+          const canRecoverWithRootExecution = requiresWorkspaceMutation;
+          const canRecover = hasCompletedPriorWork || canRecoverWithRootExecution;
           this.executionTrees.failStep(correlationId, step.id, message, {
-            failTree: !canRecoverFromPriorWork,
+            failTree: !canRecover,
           });
           await this.persistRootExecutionTree(correlationId);
           this.emit({
@@ -3987,7 +3989,7 @@ export class Runtime {
             correlationId,
             data: { stepId: step.id, error: message },
           });
-          if (canRecoverFromPriorWork) {
+          if (canRecover) {
             this.emit({
               type: 'root.step.recovered',
               agentId: 'root',
@@ -3995,7 +3997,9 @@ export class Runtime {
               data: {
                 stepId: step.id,
                 error: message,
-                recovery: 'synthesize_completed_prior_steps',
+                recovery: hasCompletedPriorWork
+                  ? 'synthesize_completed_prior_steps'
+                  : 'root_execution_after_failed_delegation',
                 completedSubagents: subagents.length,
                 completedTeams: teamResults.length,
               },
