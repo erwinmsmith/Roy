@@ -50,7 +50,7 @@ describe('Workspace memory initialization', () => {
     });
     expect(rootState.updatedAt).toEqual(expect.any(String));
     const workspaceConfig = JSON.parse(await readFile(path.join(workspaceCwd, '.roy', 'config.json'), 'utf8'));
-    expect(workspaceConfig.version).toBe(11);
+    expect(workspaceConfig.version).toBe(12);
     expect(workspaceConfig.llm).toEqual({
       streamMaxAttempts: 3,
       jsonMaxAttempts: 2,
@@ -79,6 +79,10 @@ describe('Workspace memory initialization', () => {
       maxWallClockMs: 900000,
       maxStalledIterations: 2,
       persistEveryStep: true,
+      cacheExecutionKnowledge: true,
+      teamFirstLongHorizon: true,
+      maxCachedSteps: 200,
+      maxFeedbackItemsInPrompt: 24,
     });
     expect(workspaceConfig.lifecycle).toMatchObject({
       manual: 'retain_session',
@@ -126,6 +130,7 @@ describe('Workspace memory initialization', () => {
       generations: 1,
     });
     expect(await readFile(path.join(workspaceCwd, '.roy', 'cache', 'evolution-patterns.json'), 'utf8')).toContain('"patterns"');
+    expect(await readFile(path.join(workspaceCwd, '.roy', 'cache', 'execution-knowledge.json'), 'utf8')).toContain('"paths"');
 
     runtime.emit({ type: 'turn.started', agentId: 'root', data: { turnId: 'turn_test' } });
     await new Promise(resolve => setTimeout(resolve, 10));
@@ -231,7 +236,7 @@ describe('Workspace memory initialization', () => {
     expect(researcher?.tools.map(tool => tool.name)).toEqual(['fs.read']);
     expect(researcher?.skills.map(skill => skill.name)).toEqual(['use_tool_when_needed']);
     const migratedConfig = JSON.parse(await readFile(path.join(workspaceCwd, '.roy', 'config.json'), 'utf8'));
-    expect(migratedConfig.version).toBe(11);
+    expect(migratedConfig.version).toBe(12);
     expect(migratedConfig.llm.streamMaxAttempts).toBe(3);
     expect(migratedConfig.delegation.rootSteps).toEqual({
       enabled: true,
@@ -241,6 +246,10 @@ describe('Workspace memory initialization', () => {
       maxWallClockMs: 900000,
       maxStalledIterations: 2,
       persistEveryStep: true,
+      cacheExecutionKnowledge: true,
+      teamFirstLongHorizon: true,
+      maxCachedSteps: 200,
+      maxFeedbackItemsInPrompt: 24,
     });
     expect(migratedConfig.tom.minimumCoverage).toBe(0.6);
     expect(migratedConfig.tom.enforceMinimumCoverage).toBe(false);

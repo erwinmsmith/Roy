@@ -19,12 +19,21 @@ import { AgentManager } from './AgentManager.js';
 import {
   RootExecutionTreeRegistry,
   type CompleteRootExecutionStepInput,
+  type RootExecutionActivity,
+  type RootExecutionCheckpoint,
   type RootExecutionNodeSnapshot,
   type RootExecutionStep,
   type RootExecutionStepDecision,
   type RootExecutionTreeState,
 } from './executionTree.js';
 import { RootExecutionActivityProjector } from './executionActivity.js';
+import {
+  compactExecutionKnowledgeForPrompt,
+  type ExecutionCachedActor,
+  type ExecutionCacheSnapshot,
+  type ExecutionFeedbackRecord,
+  type ExecutionKnowledgeCacheState,
+} from './executionCache.js';
 import { RootTaskLoopController } from './taskLoop.js';
 import { FSM } from '../executor/FSM.js';
 import { signalBus } from '../executor/SignalBus.js';
@@ -692,6 +701,14 @@ export class Runtime {
   private agentBudgetLimits = new Map<string, number>();
   private toolApprovalManager: ToolApprovalManager | null = null;
   private toolCallCounts = new Map<string, number>();
+  private readonly failedPathObservations = new Map<string, Map<string, {
+    toolName: string;
+    path: string;
+    error: string;
+    actorId: string;
+    observedAt: number;
+  }>>();
+  private readonly changedPathsByCorrelation = new Map<string, Set<string>>();
   private runtimeToolOverrides = new Map<string, Tool>();
   private readonly teams = new TeamRegistry();
   private teamMemberPlans = new Map<string, TeamMemberSpec[]>();
@@ -1824,13 +1841,28 @@ export class Runtime {
     if (team.fsmState !== 'S_member_execute') {
       throw new Error(`Team "${teamId}" cannot execute a member in FSM state "${team.fsmState}"`);
     }
+    const effectiveTask = this.buildTeamMemberTaskWithStepCache(team, spec.task);
+    if (effectiveTask !== spec.task) {
+      this.emit({
+        type: 'team.member.step_cache.injected',
+        agentId: teamId,
+        sessionId: this.getContext().sessionId,
+        correlationId: team.correlationId,
+        data: {
+          teamId,
+          memberName: spec.name,
+          completedMembers: Object.keys(team.memberResults).length,
+          failedMembers: Object.keys(team.memberErrors).length,
+        },
+      });
+    }
     const membersBefore = new Set(team.memberAgentIds);
     let execution: Awaited<ReturnType<Runtime['createAgentComputeNode']>>;
     try {
       execution = await this.createAgentComputeNode({
         parentId: team.identity.parentAgentId,
         archetype: spec.archetype,
-        task: spec.task,
+        task: effectiveTask,
         name: spec.name,
         role: spec.role,
         style: spec.style,
@@ -1888,6 +1920,37 @@ export class Runtime {
       },
     });
     return result;
+  }
+
+  private buildTeamMemberTaskWithStepCache(team: TeamRuntimeState, task: string): string {
+    const completed = Object.entries(team.memberResults);
+    const failed = Object.entries(team.memberErrors);
+    if (completed.length === 0 && failed.length === 0) return task;
+    return [
+      task,
+      '<team_step_cache>',
+      JSON.stringify({
+        teamId: team.identity.id,
+        teamTaskSummary: (team.task ?? task).replace(/\s+/g, ' ').slice(0, 1600),
+        completedMembers: completed.slice(-8).map(([agentId, result]) => ({
+          agentId,
+          taskSummary: team.memberTasks[agentId]?.replace(/\s+/g, ' ').slice(0, 1000),
+          result: result.slice(0, 4000),
+        })),
+        failedMembers: failed.slice(-8).map(([memberKey, error]) => ({
+          memberKey,
+          error: error.slice(0, 2000),
+        })),
+      }, null, 2),
+      '</team_step_cache>',
+      [
+        'Team-step attention:',
+        '- Treat grounded prior member evidence as shared state, but independently verify it when your role requires verification.',
+        '- Consume failure output and do not repeat an equivalent failed path without a changed hypothesis.',
+        '- Add new authoritative paths, mutations, verification evidence, and unresolved feedback for team synthesis.',
+        '- You may recursively form a child team only for a newly exposed gap that cannot be closed with your own bound tools.',
+      ].join('\n'),
+    ].join('\n\n');
   }
 
   async runTeam(
@@ -1948,17 +2011,26 @@ export class Runtime {
                 correlationId,
                 data: { teamId, memberKey: key, archetype: plan.archetype, task: plan.task },
               });
-              const execution = await this.executeTeamMember(
-                teamId,
-                plan,
-                options.memberRecursiveDelegation !== false
-              );
-              this.teams.clearMemberTracking(teamId, key);
-              return {
-                agentId: execution.agent.identity.id,
-                result: execution.subagentResult,
-                execution,
-              };
+              try {
+                const execution = await this.executeTeamMember(
+                  teamId,
+                  plan,
+                  options.memberRecursiveDelegation !== false
+                );
+                this.teams.clearMemberTracking(teamId, key);
+                return {
+                  agentId: execution.agent.identity.id,
+                  result: execution.subagentResult,
+                  execution,
+                };
+              } catch (error) {
+                this.teams.recordMemberFailure(
+                  teamId,
+                  key,
+                  error instanceof Error ? error.message : String(error)
+                );
+                throw error;
+              }
             },
           };
         }), initial.executionPolicy);
@@ -1968,10 +2040,12 @@ export class Runtime {
         if (team.memberAgentIds.length === 0) throw new Error(`Team "${teamId}" has no members or member plans`);
         await this.transitionTeamFsm(teamId, 'S_member_execute', { count: team.memberAgentIds.length });
         executionOutcomes = await executeTeamItems(team.memberAgentIds.map(agentId => {
-          const memberTask = team.memberTasks[agentId] ?? task;
+          const assignedTask = team.memberTasks[agentId] ?? task;
           return {
             key: agentId,
             execute: async (): Promise<TeamWorkValue> => {
+              const currentTeam = this.teams.get(teamId)!;
+              const memberTask = this.buildTeamMemberTaskWithStepCache(currentTeam, assignedTask);
               this.teams.markMemberRunning(teamId, agentId);
               this.emit({
                 type: 'team.member.started',
@@ -1980,19 +2054,28 @@ export class Runtime {
                 correlationId,
                 data: { teamId, memberKey: agentId, task: memberTask },
               });
-              const result = await this.runAgent(agentId, memberTask, {
-                correlationId,
-                disableRecursiveDelegation: options.memberRecursiveDelegation === false,
-              });
-              this.teams.recordMemberResult(teamId, agentId, memberTask, result.result, result.usage);
-              this.emit({
-                type: 'team.member.completed',
-                agentId,
-                sessionId: ctx.sessionId,
-                correlationId,
-                data: { teamId, task: memberTask, totalTokens: result.usage.totalTokens },
-              });
-              return { agentId, result };
+              try {
+                const result = await this.runAgent(agentId, memberTask, {
+                  correlationId,
+                  disableRecursiveDelegation: options.memberRecursiveDelegation === false,
+                });
+                this.teams.recordMemberResult(teamId, agentId, memberTask, result.result, result.usage);
+                this.emit({
+                  type: 'team.member.completed',
+                  agentId,
+                  sessionId: ctx.sessionId,
+                  correlationId,
+                  data: { teamId, task: memberTask, totalTokens: result.usage.totalTokens },
+                });
+                return { agentId, result };
+              } catch (error) {
+                this.teams.recordMemberFailure(
+                  teamId,
+                  agentId,
+                  error instanceof Error ? error.message : String(error)
+                );
+                throw error;
+              }
             },
           };
         }), initial.executionPolicy);
@@ -2174,6 +2257,13 @@ export class Runtime {
     if (!binding) return { success: false, error: `Tool "${toolName}" is not authorized for agent "${agentId}"` };
     const runtimeTool = this.runtimeToolOverrides.get(toolName);
     if (!runtimeTool && !toolRegistry.has(toolName)) return { success: false, error: `Tool "${toolName}" not found` };
+    const cachedPathRejection = await this.getCachedInvalidPathRejection(
+      agentId,
+      toolName,
+      params,
+      options
+    );
+    if (cachedPathRejection) return cachedPathRejection;
 
     const callKey = `${agentId}:${toolName}`;
     const calls = this.toolCallCounts.get(callKey) ?? 0;
@@ -2266,6 +2356,7 @@ export class Runtime {
     const result = runtimeTool
       ? await this.executeRuntimeTool(runtimeTool, params)
       : await toolRegistry.execute(toolName, params);
+    this.recordToolPathOutcome(agentId, toolName, params, result, options.correlationId);
     this.toolCallCounts.set(callKey, calls + 1);
     const resultMessage = await this.enqueueMessage({
       kind: 'tool.result',
@@ -2290,6 +2381,150 @@ export class Runtime {
       data: { toolName, correlationId: options.correlationId, success: result.success, error: result.error },
     });
     return result;
+  }
+
+  private async getCachedInvalidPathRejection(
+    agentId: string,
+    toolName: string,
+    params: Record<string, unknown>,
+    options: { reason?: string; correlationId?: string; nodeId?: string }
+  ): Promise<ToolResult | undefined> {
+    if ((toolName !== 'fs.read' && toolName !== 'fs.list') || typeof params.path !== 'string') {
+      return undefined;
+    }
+    const requestedPath = this.normalizeCachedPath(params.path);
+    const correlationKey = options.correlationId ?? this.getContext().sessionId;
+    const retryReason = options.reason ?? '';
+    if (/\b(?:changed hypothesis|path created|created by|after mutation|retry after|state changed)\b/i.test(retryReason)
+      || /(?:假设已改变|路径已创建|写入后重试|状态已改变)/.test(retryReason)) {
+      return undefined;
+    }
+    const changedPaths = this.changedPathsByCorrelation.get(correlationKey) ?? new Set<string>();
+    if ([...changedPaths].some(item =>
+      item === requestedPath || requestedPath.startsWith(`${item}/`) || item.startsWith(`${requestedPath}/`)
+    )) {
+      return undefined;
+    }
+    const liveFailure = this.failedPathObservations.get(correlationKey)?.get(requestedPath);
+    const knowledge = await this.getContext().memory.readExecutionKnowledge(undefined, 24);
+    const lastInvalidAt = knowledge.paths
+      .filter(item => item.invalidPaths.includes(requestedPath))
+      .reduce((latest, item) => Math.max(latest, item.updatedAt), 0);
+    const lastObservedAt = knowledge.paths
+      .filter(item => item.observedPaths.includes(requestedPath))
+      .reduce((latest, item) => Math.max(latest, item.updatedAt), 0);
+    if (!liveFailure && (lastInvalidAt === 0 || lastObservedAt > lastInvalidAt)) return undefined;
+
+    const basename = path.posix.basename(requestedPath);
+    const alternatives = Array.from(new Set(
+      knowledge.paths.flatMap(item => item.observedPaths)
+        .filter(item =>
+          item !== requestedPath
+          && (path.posix.basename(item) === basename || item.includes(`/${basename}/`))
+        )
+    )).slice(0, 8);
+    const source = liveFailure ? 'current execution path' : 'persisted execution knowledge';
+    const error = [
+      `Cached invalid path rejected: ${requestedPath} already failed in ${source}.`,
+      alternatives.length > 0
+        ? `Use an authoritative observed alternative: ${alternatives.join(', ')}.`
+        : 'Inspect an observed parent directory before selecting a replacement path.',
+      'Retry this exact path only after a mutation or with a reason that states the changed hypothesis.',
+    ].join(' ');
+    this.emit({
+      type: 'tool.path.cache_rejected',
+      agentId,
+      sessionId: this.getContext().sessionId,
+      correlationId: options.correlationId,
+      nodeId: options.nodeId,
+      data: {
+        toolName,
+        path: requestedPath,
+        source,
+        alternatives,
+        previousError: liveFailure?.error,
+      },
+    });
+    return {
+      success: false,
+      error,
+      metadata: {
+        cacheRejected: true,
+        path: requestedPath,
+        alternatives,
+      },
+    };
+  }
+
+  private recordToolPathOutcome(
+    agentId: string,
+    toolName: string,
+    params: Record<string, unknown>,
+    result: ToolResult,
+    correlationId?: string
+  ): void {
+    const correlationKey = correlationId ?? this.getContext().sessionId;
+    if (toolName === 'shell.exec'
+      && result.success
+      && typeof params.command === 'string'
+      && isSuccessfulWorkspaceMutationCall({
+        toolName,
+        params,
+        success: true,
+      })) {
+      const changed = this.changedPathsByCorrelation.get(correlationKey) ?? new Set<string>();
+      for (const changedPath of this.extractShellMutationPaths(params.command)) {
+        changed.add(changedPath);
+        this.failedPathObservations.get(correlationKey)?.delete(changedPath);
+      }
+      this.changedPathsByCorrelation.set(correlationKey, changed);
+      return;
+    }
+    if (typeof params.path !== 'string') return;
+    const observedPath = this.normalizeCachedPath(params.path);
+    if (result.success) {
+      this.failedPathObservations.get(correlationKey)?.delete(observedPath);
+      if (toolName === 'fs.write') {
+        const changed = this.changedPathsByCorrelation.get(correlationKey) ?? new Set<string>();
+        changed.add(observedPath);
+        this.changedPathsByCorrelation.set(correlationKey, changed);
+      }
+      return;
+    }
+    if (toolName !== 'fs.read' && toolName !== 'fs.list') return;
+    const failures = this.failedPathObservations.get(correlationKey) ?? new Map();
+    failures.set(observedPath, {
+      toolName,
+      path: observedPath,
+      error: result.error ?? 'unknown path failure',
+      actorId: agentId,
+      observedAt: Date.now(),
+    });
+    this.failedPathObservations.set(correlationKey, failures);
+  }
+
+  private extractShellMutationPaths(command: string): string[] {
+    const tokens = command.match(/"[^"]*"|'[^']*'|[^\s]+/g) ?? [];
+    const changed = new Set<string>();
+    const mutationCommands = new Set(['mkdir', 'touch', 'rm', 'rmdir', 'mv', 'cp', 'install', 'truncate']);
+    const controls = new Set(['&&', '||', '|', ';']);
+    for (let index = 0; index < tokens.length; index += 1) {
+      const commandToken = tokens[index].replace(/^.*\//, '');
+      if (!mutationCommands.has(commandToken)) continue;
+      for (let cursor = index + 1; cursor < tokens.length; cursor += 1) {
+        const raw = tokens[cursor];
+        const unquoted = raw.replace(/^['"]|['"]$/g, '').replace(/[;,]+$/, '');
+        if (controls.has(raw) || /^(?:&&|\|\||[|;])$/.test(unquoted)) break;
+        if (!unquoted || unquoted.startsWith('-')) continue;
+        if (mutationCommands.has(unquoted.replace(/^.*\//, ''))) break;
+        changed.add(this.normalizeCachedPath(unquoted));
+      }
+    }
+    for (const match of command.matchAll(/>{1,2}\s*(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/g)) {
+      const target = match[1] ?? match[2] ?? match[3];
+      if (target) changed.add(this.normalizeCachedPath(target));
+    }
+    return [...changed];
   }
 
   async resolveToolApproval(id: string, decision: 'approved' | 'denied'): Promise<ToolApprovalRequest | undefined> {
@@ -3423,6 +3658,10 @@ export class Runtime {
     return ctx.memory.getCachePatterns(kind);
   }
 
+  async getExecutionKnowledge(task?: string, limit = 24): Promise<ExecutionKnowledgeCacheState> {
+    return this.getContext().memory.readExecutionKnowledge(task, limit);
+  }
+
   async getEvolutionHistory(limit = 50): Promise<Array<Record<string, unknown>>> {
     return this.getContext().memory.readEvolutionHistory(limit);
   }
@@ -3758,6 +3997,9 @@ export class Runtime {
     } catch (error) {
       await this.recoverFailedRootTurn(correlationId, error);
       throw error;
+    } finally {
+      this.failedPathObservations.delete(correlationId);
+      this.changedPathsByCorrelation.delete(correlationId);
     }
   }
 
@@ -3816,17 +4058,7 @@ export class Runtime {
     let requiredLongHorizonDecision: DelegationDecision | undefined;
     if (decision.action === 'solve_directly'
       && requiresLongHorizon) {
-      decision = {
-        action: 'spawn_subagents',
-        reason: 'The request describes a staged or long-running task, so Roy will establish an initial checkpoint before reassessing the next step.',
-        agents: [{
-          archetype: 'planner',
-          name: 'TaskPlanner-1',
-          task: `Establish the first executable checkpoint for this long-horizon task. Identify completed state, missing evidence, required tools, and the next bounded action: ${userInput}`,
-          tomLevel: 1,
-          existenceReason: 'Create explicit state that the root task loop can reassess after the first step.',
-        }],
-      };
+      decision = this.buildLongHorizonTeamDecision(userInput, requiresWorkspaceMutation);
       requiredLongHorizonDecision = decision;
       this.emit({
         type: 'root.task_loop.promoted',
@@ -3835,6 +4067,7 @@ export class Runtime {
         data: { reason: 'long_horizon_task_detected' },
       });
     } else if (decision.action === 'spawn_subagents' && requiresLongHorizon) {
+      decision = this.ensureLongHorizonTeamDecision(decision, userInput, requiresWorkspaceMutation, correlationId);
       requiredLongHorizonDecision = decision;
     }
     decision = await this.selectDelegationCandidate(
@@ -3847,6 +4080,9 @@ export class Runtime {
         && decision.coordination === 'team'
         && Boolean(decision.team))
     );
+    if (requiresLongHorizon && decision.action === 'spawn_subagents') {
+      decision = this.ensureLongHorizonTeamDecision(decision, userInput, requiresWorkspaceMutation, correlationId);
+    }
     if (requiredLongHorizonDecision?.action === 'spawn_subagents' && decision.action !== 'spawn_subagents') {
       const rootPolicy = this.getAgentPolicy('root');
       const hasCapacity = Boolean(rootPolicy && rootPolicy.allowedChildren > rootPolicy.currentChildren)
@@ -4020,9 +4256,7 @@ export class Runtime {
           const hasCompletedPriorWork = subagents.length > 0 || teamResults.length > 0;
           const canRecoverWithRootExecution = requiresWorkspaceMutation;
           const canRecover = hasCompletedPriorWork || canRecoverWithRootExecution;
-          this.executionTrees.failStep(correlationId, step.id, message, {
-            failTree: !canRecover,
-          });
+          await this.failRootExecutionStep(correlationId, step, message, !canRecover);
           await this.persistRootExecutionTree(correlationId);
           this.emit({
             type: 'root.step.failed',
@@ -4067,8 +4301,8 @@ export class Runtime {
           completed: round.evolution?.metrics.agentsSpawned ?? round.subagents.length,
         });
         const completedStep = await this.completeRootExecutionStep(correlationId, step, {
-          actorIds: this.collectDelegationRoundActorIds(round),
-          teamIds: round.teams.map(item => item.team.identity.id),
+          actorIds: this.collectDelegationRoundActorIds(round, step.startedAt),
+          teamIds: this.collectDelegationRoundTeamIds(round, step.startedAt),
           nodes: this.buildRootExecutionNodes(correlationId, step.index),
           resultSummary: this.summarizeDelegationRound(round),
         });
@@ -4080,7 +4314,9 @@ export class Runtime {
         const roundMutationApplied = this.delegationRoundHasWorkspaceMutation(round);
         const exploratoryDelegationLimit = 4;
         const executionHandoffRequired = requiresWorkspaceMutation
-          && (roundMutationApplied || delegationRounds >= exploratoryDelegationLimit);
+          && (requiresLongHorizon
+            ? delegationRounds >= maxRounds
+            : roundMutationApplied || delegationRounds >= exploratoryDelegationLimit);
         const canReassess = rootStepConfig?.enabled !== false
           && rootStepConfig?.reassessAfterDelegation !== false
           && roundDecision.continuationPolicy !== 'finalize_after_round'
@@ -4130,12 +4366,22 @@ export class Runtime {
           break;
         }
 
-        const continuation = await this.decideRootContinuation(
+        let continuation = await this.decideRootContinuation(
           userInput,
           correlationId,
           tree.steps,
           subagents,
           teamResults
+        );
+        continuation = this.ensureLongHorizonRecoveryContinuation(
+          continuation,
+          userInput,
+          completedStep,
+          delegationRounds,
+          maxRounds,
+          requiresLongHorizon,
+          requiresWorkspaceMutation,
+          correlationId
         );
         this.emit({
           type: 'root.step.decision',
@@ -4154,6 +4400,15 @@ export class Runtime {
           };
           next = await this.selectDelegationCandidate('root', userInput, this.applyBudgetConstraints(next), correlationId, 'root', true);
           if (next.action === 'spawn_subagents') {
+            if (requiresLongHorizon
+              && (requiresWorkspaceMutation || next.coordination === 'team' || Boolean(next.team))) {
+              next = this.ensureLongHorizonTeamDecision(
+                next,
+                userInput,
+                requiresWorkspaceMutation,
+                correlationId
+              );
+            }
             roundDecision = next;
             continue;
           }
@@ -7038,6 +7293,108 @@ export class Runtime {
     return step;
   }
 
+  private async failRootExecutionStep(
+    correlationId: string,
+    step: RootExecutionStep,
+    error: string,
+    failTree: boolean
+  ): Promise<RootExecutionStep> {
+    const ctx = this.getContext();
+    const tree = this.executionTrees.get(correlationId);
+    if (!tree) throw new Error(`Execution tree not found: ${correlationId}`);
+    const messages = await this.getMessages({ correlationId });
+    const projected = this.executionActivityProjector.project({
+      tree,
+      step,
+      messages,
+      events: this.events,
+    });
+    const failedAt = Date.now();
+    const activities: RootExecutionActivity[] = [...projected, {
+      id: `${step.id}.failure`,
+      kind: 'control',
+      status: 'failed',
+      label: 'Root step failed',
+      actorId: 'root',
+      summary: error.slice(0, 1200),
+      startedAt: failedAt,
+      completedAt: failedAt,
+      data: { error },
+    }];
+    const events = this.events.filter(event =>
+      (event.correlationId === correlationId || event.data?.correlationId === correlationId)
+      && event.timestamp >= step.startedAt
+      && event.timestamp <= failedAt
+    );
+    const actorIds = [...new Set(events
+      .filter(event => event.type === 'agent.spawned')
+      .map(event => event.agentId)
+      .filter((id): id is string => Boolean(id)))];
+    const teamIds = [...new Set(events
+      .filter(event => event.type === 'team.created')
+      .map(event => event.agentId)
+      .filter((id): id is string => Boolean(id)))];
+    const checkpoint = this.executionActivityProjector.checkpoint({
+      tree,
+      step,
+      resultSummary: `Step failed: ${error}`,
+      activities,
+      actorIds,
+      teamIds,
+    });
+    checkpoint.pending = [`Repair the failed step using this feedback: ${error.slice(0, 1000)}`];
+    checkpoint.decisionBasis = `${step.decision.reason} Failure feedback: ${error.slice(0, 800)}`;
+    const nodes = this.buildRootExecutionNodes(correlationId, step.index);
+    const cache = this.buildExecutionCacheSnapshot({
+      tree,
+      step,
+      nodes,
+      actorIds,
+      teamIds,
+      resultSummary: `Step failed: ${error}`,
+      checkpoint,
+      activities,
+      messages,
+      stepStatus: 'failed',
+    });
+    const failed = this.executionTrees.failStep(correlationId, step.id, error, {
+      failTree,
+      activities,
+      checkpoint,
+      cache,
+    });
+    if (this.workspaceRuntimeConfig?.delegation.rootSteps.cacheExecutionKnowledge !== false) {
+      await ctx.memory.writeExecutionCacheSnapshot(
+        cache,
+        this.workspaceRuntimeConfig?.delegation.rootSteps.maxCachedSteps ?? 200
+      );
+      this.emit({
+        type: 'execution.cache.snapshot.recorded',
+        agentId: 'root',
+        correlationId,
+        data: {
+          stepId: failed.id,
+          pathId: cache.path.id,
+          status: 'failed',
+          actorObjects: cache.actors.length,
+          feedbackObjects: cache.feedback.length,
+        },
+      });
+      this.emit({
+        type: 'execution.feedback.captured',
+        agentId: 'root',
+        correlationId,
+        data: {
+          stepId: failed.id,
+          pathId: cache.path.id,
+          count: cache.feedback.length,
+          kinds: [...new Set(cache.feedback.map(item => item.kind))],
+        },
+      });
+    }
+    return failed;
+  }
+
   private async completeRootExecutionStep(
     correlationId: string,
     step: RootExecutionStep,
@@ -7046,10 +7403,11 @@ export class Runtime {
     const ctx = this.getContext();
     const tree = this.executionTrees.get(correlationId);
     if (!tree) throw new Error(`Execution tree not found: ${correlationId}`);
+    const messages = await this.getMessages({ correlationId });
     const collectedActivities = input.activities ?? this.executionActivityProjector.project({
       tree,
       step,
-      messages: await this.getMessages({ correlationId }),
+      messages,
       events: this.events,
     });
     const checkpoint = input.checkpoint ?? this.executionActivityProjector.checkpoint({
@@ -7076,10 +7434,22 @@ export class Runtime {
         stateFingerprint: checkpoint.stateFingerprint,
       },
     }];
+    const cache = input.cache ?? this.buildExecutionCacheSnapshot({
+      tree,
+      step,
+      nodes: input.nodes ?? tree.nodes,
+      actorIds: input.actorIds ?? [],
+      teamIds: input.teamIds ?? [],
+      resultSummary: input.resultSummary,
+      checkpoint,
+      activities,
+      messages,
+    });
     const completed = this.executionTrees.completeStep(correlationId, step.id, {
       ...input,
       activities,
       checkpoint,
+      cache,
     });
     const message = await this.enqueueMessage({
       kind: 'root.step.result',
@@ -7124,8 +7494,339 @@ export class Runtime {
         teamIds: completed.teamIds,
       },
     });
+    if (this.workspaceRuntimeConfig?.delegation.rootSteps.cacheExecutionKnowledge !== false) {
+      const cachePath = await ctx.memory.writeExecutionCacheSnapshot(
+        cache,
+        this.workspaceRuntimeConfig?.delegation.rootSteps.maxCachedSteps ?? 200
+      );
+      this.emit({
+        type: 'execution.cache.snapshot.recorded',
+        agentId: 'root',
+        correlationId,
+        data: {
+          stepId: completed.id,
+          pathId: cache.path.id,
+          actorObjects: cache.actors.length,
+          feedbackObjects: cache.feedback.length,
+          cachePath,
+        },
+      });
+      this.emit({
+        type: 'execution.path.updated',
+        agentId: 'root',
+        correlationId,
+        data: {
+          stepId: completed.id,
+          pathId: cache.path.id,
+          status: cache.path.status,
+          parentPathIds: cache.path.parentPathIds,
+          observedPaths: cache.path.observedPaths,
+          invalidPaths: cache.path.invalidPaths,
+        },
+      });
+      if (cache.feedback.length > 0) {
+        this.emit({
+          type: 'execution.feedback.captured',
+          agentId: 'root',
+          correlationId,
+          data: {
+            stepId: completed.id,
+            pathId: cache.path.id,
+            count: cache.feedback.length,
+            kinds: [...new Set(cache.feedback.map(item => item.kind))],
+          },
+        });
+      }
+    }
     await this.persistRootExecutionTree(correlationId);
     return completed;
+  }
+
+  private buildExecutionCacheSnapshot(input: {
+    tree: RootExecutionTreeState;
+    step: RootExecutionStep;
+    nodes: RootExecutionNodeSnapshot[];
+    actorIds: string[];
+    teamIds: string[];
+    resultSummary?: string;
+    checkpoint: RootExecutionCheckpoint;
+    activities: RootExecutionActivity[];
+    messages: RuntimeMessage[];
+    stepStatus?: 'completed' | 'failed';
+  }): ExecutionCacheSnapshot {
+    const { tree, step } = input;
+    const now = Date.now();
+    const pathId = `${step.id}.path`;
+    const taskFingerprint = this.executionTaskFingerprint(tree.task);
+    const stepStart = step.index === 1 ? tree.createdAt : step.startedAt;
+    const stepMessages = input.messages.filter(message =>
+      message.createdAt >= stepStart && message.createdAt <= now
+    );
+    const toolCalls = new Map(
+      stepMessages
+        .filter(message => message.kind === 'tool.call')
+        .map(message => [message.id, message])
+    );
+    const observedPaths = new Set<string>();
+    const invalidPaths = new Set<string>();
+    const successfulTools = new Set<string>();
+    const failedTools = new Set<string>();
+    const feedback: ExecutionFeedbackRecord[] = [];
+    let mutationObserved = false;
+    let verificationObserved = false;
+    const addFeedback = (
+      kind: ExecutionFeedbackRecord['kind'],
+      summary: string,
+      options: Pick<ExecutionFeedbackRecord, 'actorId' | 'toolName' | 'path'> = {}
+    ): void => {
+      const normalizedSummary = summary.replace(/\s+/g, ' ').trim().slice(0, 1200);
+      if (!normalizedSummary) return;
+      const duplicate = feedback.some(item =>
+        item.kind === kind
+        && item.toolName === options.toolName
+        && item.path === options.path
+        && item.summary === normalizedSummary
+      );
+      if (duplicate) return;
+      feedback.push({
+        id: `${pathId}.feedback_${String(feedback.length + 1).padStart(3, '0')}`,
+        kind,
+        correlationId: tree.correlationId,
+        stepId: step.id,
+        pathId,
+        actorId: options.actorId,
+        toolName: options.toolName,
+        path: options.path,
+        summary: normalizedSummary,
+        actionable: kind === 'tool_failure'
+          || kind === 'actor_failure'
+          || kind === 'external_feedback'
+          || kind === 'unresolved_gap',
+        createdAt: now,
+      });
+    };
+
+    for (const message of stepMessages.filter(item => item.kind === 'tool.result')) {
+      const resultPayload = message.payload as {
+        success?: unknown;
+        error?: unknown;
+        result?: Record<string, unknown>;
+      };
+      const callMessage = message.parentMessageId ? toolCalls.get(message.parentMessageId) : undefined;
+      const callPayload = (callMessage?.payload ?? {}) as {
+        toolName?: unknown;
+        params?: Record<string, unknown>;
+        reason?: unknown;
+      };
+      const toolName = String(callPayload.toolName ?? callMessage?.to?.replace(/^tool\./, '') ?? 'unknown');
+      const params = callPayload.params ?? {};
+      const success = resultPayload.success === true;
+      const result = resultPayload.result ?? {};
+      const candidatePath = [
+        typeof result.path === 'string' ? result.path : undefined,
+        typeof params.path === 'string' ? params.path : undefined,
+        typeof result.root === 'string' ? result.root : undefined,
+      ].find((value): value is string => Boolean(value));
+      const callRecord: ToolCallRecord = {
+        toolName,
+        params,
+        result,
+        success,
+        error: typeof resultPayload.error === 'string' ? resultPayload.error : undefined,
+        reason: typeof callPayload.reason === 'string' ? callPayload.reason : undefined,
+      };
+      if (success) {
+        successfulTools.add(toolName);
+        if (candidatePath) observedPaths.add(this.normalizeCachedPath(candidatePath));
+        if (Array.isArray(result.entries)) {
+          const root = typeof result.root === 'string' ? result.root : '';
+          for (const entry of result.entries.filter((item): item is string => typeof item === 'string').slice(0, 80)) {
+            observedPaths.add(this.normalizeCachedPath(root && root !== '.' ? path.join(root, entry) : entry));
+          }
+        }
+        if (isSuccessfulWorkspaceMutationCall(callRecord)) mutationObserved = true;
+        if (isSuccessfulWorkspaceVerificationCall(callRecord)) verificationObserved = true;
+      } else {
+        failedTools.add(toolName);
+        if (candidatePath) invalidPaths.add(this.normalizeCachedPath(candidatePath));
+        addFeedback(
+          'tool_failure',
+          `${toolName} failed${candidatePath ? ` for ${candidatePath}` : ''}: ${String(resultPayload.error ?? 'unknown error')}`,
+          { actorId: message.metadata?.agentId, toolName, path: candidatePath }
+        );
+      }
+    }
+
+    if (observedPaths.size > 0) {
+      addFeedback(
+        'path_observation',
+        `Authoritative paths observed by successful runtime tools: ${[...observedPaths].slice(0, 40).join(', ')}`
+      );
+    }
+    if (mutationObserved) {
+      addFeedback('workspace_mutation', 'At least one workspace mutation completed successfully in this path.');
+    }
+    if (verificationObserved) {
+      addFeedback('workspace_verification', 'At least one workspace verification command completed successfully in this path.');
+    }
+    if (step.index === 1 && this.containsExternalExecutionFeedback(tree.task)) {
+      addFeedback(
+        'external_feedback',
+        `External or user-supplied execution feedback that must be reconciled in this run: ${tree.task.slice(0, 2400)}`
+      );
+    }
+    for (const activity of input.activities.filter(item =>
+      (item.kind === 'agent' || item.kind === 'team') && item.status === 'failed'
+    )) {
+      addFeedback(
+        'actor_failure',
+        `${activity.label}: ${activity.summary ?? String(activity.data?.error ?? 'actor execution failed')}`,
+        { actorId: activity.actorId }
+      );
+    }
+    for (const pending of input.checkpoint.pending.filter(item =>
+      !item.startsWith('Root must reassess accumulated state')
+      && !item.startsWith('Await user clarification')
+    )) {
+      addFeedback('unresolved_gap', pending);
+    }
+
+    const events = this.events.filter(event =>
+      (event.correlationId === tree.correlationId || event.data?.correlationId === tree.correlationId)
+      && event.timestamp >= stepStart
+      && event.timestamp <= now
+    );
+    const generatedIds = new Set([
+      ...input.actorIds,
+      ...input.teamIds,
+      ...events
+        .filter(event => event.type === 'agent.spawned' || event.type === 'team.created')
+        .map(event => event.agentId)
+        .filter((id): id is string => Boolean(id)),
+    ]);
+    const actors: ExecutionCachedActor[] = input.nodes
+      .filter(node => node.id !== tree.rootAgentId && generatedIds.has(node.id))
+      .map(node => {
+        const runEvent = [...events].reverse().find(event =>
+          event.agentId === node.id && (event.type === 'agent.run.started' || event.type === 'team.member.started')
+        );
+        const spawnEvent = events.find(event =>
+          event.agentId === node.id && (event.type === 'agent.spawned' || event.type === 'team.created')
+        );
+        const task = typeof runEvent?.data?.task === 'string' ? runEvent.data.task : undefined;
+        const activeInfo = node.kind === 'agent'
+          ? this.getContext().manager.getAgentById(node.id)?.getInfo() ?? this.archivedAgentInfo.get(node.id)
+          : undefined;
+        const generation = activeInfo?.identity.generation
+          ?? this.actorGenerationFromNodes(node, input.nodes);
+        return {
+          id: `${pathId}.actor.${node.id}`,
+          runtimeActorId: node.id,
+          kind: node.kind,
+          correlationId: tree.correlationId,
+          stepId: step.id,
+          pathId,
+          name: node.name,
+          role: node.role,
+          parentId: node.parentId,
+          teamId: node.teamId,
+          generation,
+          task,
+          taskFingerprint: task ? this.executionTaskFingerprint(task) : undefined,
+          definitionFingerprint: typeof spawnEvent?.data?.definitionFingerprint === 'string'
+            ? spawnEvent.data.definitionFingerprint
+            : node.definitionFingerprint,
+          status: node.status === 'waiting' ? 'active' : node.status,
+          createdAt: spawnEvent?.timestamp ?? step.startedAt,
+          updatedAt: now,
+        };
+      });
+    const parentPathIds = step.dependsOn.map(dependency => {
+      const dependencyStep = tree.steps.find(item => item.id === dependency);
+      return dependencyStep?.cache?.path.id ?? `${dependency}.path`;
+    });
+    const hasFailures = failedTools.size > 0 || feedback.some(item => item.kind === 'actor_failure');
+    const hasSuccess = successfulTools.size > 0 || input.actorIds.length > 0 || input.teamIds.length > 0;
+    const pathStatus = input.stepStatus === 'failed'
+      ? (hasSuccess ? 'partial' : 'failed')
+      : hasFailures ? (hasSuccess ? 'partial' : 'failed') : 'completed';
+    const stepRecord = {
+      id: `${step.id}.cache`,
+      correlationId: tree.correlationId,
+      stepId: step.id,
+      index: step.index,
+      task: tree.task,
+      taskFingerprint,
+      pathId,
+      dependsOn: [...step.dependsOn],
+      action: step.decision.action,
+      status: input.stepStatus ?? 'completed',
+      actorIds: [...input.actorIds],
+      teamIds: [...input.teamIds],
+      feedbackIds: feedback.map(item => item.id),
+      resultSummary: input.resultSummary?.slice(0, 5000),
+      stateFingerprint: input.checkpoint.stateFingerprint,
+      createdAt: step.startedAt,
+      updatedAt: now,
+    };
+    return {
+      step: stepRecord,
+      path: {
+        id: pathId,
+        correlationId: tree.correlationId,
+        stepId: step.id,
+        parentPathIds,
+        taskFingerprint,
+        status: pathStatus,
+        actorIds: actors.filter(item => item.kind === 'agent').map(item => item.runtimeActorId),
+        teamIds: actors.filter(item => item.kind === 'team').map(item => item.runtimeActorId),
+        observedPaths: [...observedPaths].slice(0, 120),
+        invalidPaths: [...invalidPaths].slice(0, 80),
+        successfulTools: [...successfulTools],
+        failedTools: [...failedTools],
+        mutationObserved,
+        verificationObserved,
+        feedbackIds: feedback.map(item => item.id),
+        summary: input.resultSummary?.slice(0, 5000),
+        createdAt: step.startedAt,
+        updatedAt: now,
+      },
+      actors,
+      feedback,
+    };
+  }
+
+  private actorGenerationFromNodes(
+    node: RootExecutionNodeSnapshot,
+    nodes: RootExecutionNodeSnapshot[]
+  ): number {
+    let generation = 1;
+    let parentId = node.parentId;
+    const visited = new Set<string>([node.id]);
+    while (parentId && parentId !== 'root' && !visited.has(parentId)) {
+      visited.add(parentId);
+      generation += 1;
+      parentId = nodes.find(item => item.id === parentId)?.parentId;
+    }
+    return generation;
+  }
+
+  private executionTaskFingerprint(task: string): string {
+    return createHash('sha256')
+      .update(task.toLowerCase().replace(/\s+/g, ' ').trim())
+      .digest('hex');
+  }
+
+  private normalizeCachedPath(value: string): string {
+    let normalized = value.trim().replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/+$/, '');
+    const workspaceRoot = this.workspaceRoot.replaceAll('\\', '/').replace(/\/+$/, '');
+    if (normalized === workspaceRoot) normalized = '.';
+    else if (normalized.startsWith(`${workspaceRoot}/`)) normalized = normalized.slice(workspaceRoot.length + 1);
+    return normalized || '.';
+  }
+
+  private containsExternalExecutionFeedback(value: string): boolean {
+    return /(?:<feedback>|(?:verifier|grader|reviewer|test)\s+(?:feedback|failure|reported)|previous\s+(?:attempt|round)[\s\S]{0,120}(?:failed|failure|error)|(?:验证器|评分器|评审|测试)[\s\S]{0,40}(?:反馈|失败|报错)|上一轮[\s\S]{0,100}(?:失败|报错|反馈))/i.test(value);
   }
 
   private async persistRootExecutionTree(correlationId: string): Promise<void> {
@@ -7279,13 +7980,45 @@ export class Runtime {
     return { subagents, teams: [] };
   }
 
-  private collectDelegationRoundActorIds(round: RootDelegationRoundResult): string[] {
+  private collectDelegationRoundActorIds(round: RootDelegationRoundResult, startedAt: number): string[] {
+    const correlationIds = new Set([
+      ...round.subagents.map(item => item.correlationId),
+      ...round.teams.map(item => item.correlationId),
+    ]);
     return [...new Set([
       ...round.subagents.map(item => item.agent.identity.id),
       ...round.teams.flatMap(team => team.team.memberAgentIds),
       ...round.teams.flatMap(team => team.memberOutcomes
         .map(outcome => outcome.agentId)
         .filter((agentId): agentId is string => Boolean(agentId))),
+      ...this.events
+        .filter(event =>
+          event.type === 'agent.spawned'
+          && event.timestamp >= startedAt
+          && event.correlationId
+          && correlationIds.has(event.correlationId)
+        )
+        .map(event => event.agentId)
+        .filter((agentId): agentId is string => Boolean(agentId)),
+    ])];
+  }
+
+  private collectDelegationRoundTeamIds(round: RootDelegationRoundResult, startedAt: number): string[] {
+    const correlationIds = new Set([
+      ...round.subagents.map(item => item.correlationId),
+      ...round.teams.map(item => item.correlationId),
+    ]);
+    return [...new Set([
+      ...round.teams.map(item => item.team.identity.id),
+      ...this.events
+        .filter(event =>
+          event.type === 'team.created'
+          && event.timestamp >= startedAt
+          && event.correlationId
+          && correlationIds.has(event.correlationId)
+        )
+        .map(event => event.agentId)
+        .filter((teamId): teamId is string => Boolean(teamId)),
     ])];
   }
 
@@ -7335,6 +8068,24 @@ export class Runtime {
       warnings: item.subagentResult.warnings,
       result: item.subagentResult.result.slice(0, 3000),
     }));
+    const executionKnowledge = await ctx.memory.readExecutionKnowledge(
+      userTask,
+      this.workspaceRuntimeConfig?.delegation.rootSteps.maxFeedbackItemsInPrompt ?? 24
+    );
+    if (executionKnowledge.steps.length > 0) {
+      this.emit({
+        type: 'execution.cache.hit',
+        agentId: 'root',
+        correlationId,
+        data: {
+          scope: 'root.continuation',
+          steps: executionKnowledge.steps.length,
+          paths: executionKnowledge.paths.length,
+          actors: executionKnowledge.actors.length,
+          feedback: executionKnowledge.feedback.length,
+        },
+      });
+    }
     try {
       const raw = await this.completeJSONAsAgent<RootContinuationDecision>(ctx.agent, [
         {
@@ -7346,13 +8097,15 @@ Choose exactly one action:
 {"action":"ask_clarification","reason":"...","question":"..."}
 {"action":"delegate_more","reason":"...","coordination":"independent","continuationPolicy":"reassess","agents":[{"archetype":"custom","name":"task-specific name","role":"task-specific responsibility","task":"...","tools":[],"skills":[],"tomLevel":0,"existenceReason":"..."}]}
 {"action":"delegate_more","reason":"...","coordination":"team","continuationPolicy":"reassess","team":{"name":"task-specific team","description":"...","synthesisPolicy":"..."},"agents":[...]}
-Do not repeat an existing agent task. Generate the next actor structure from unresolved state rather than a fixed role list. Delegate only work that depends on prior-step results. Prefer finalize when evidence is sufficient. Use at most 1-3 agents.`,
+Do not repeat an existing agent task, cached failed path, or equivalent failed tool call unless the new task states the changed hypothesis. Generate the next actor structure from unresolved state rather than a fixed role list. Route each actionable feedback item to an actor that has the tools and responsibility to close it. Reuse a successful cached actor/team definition only as a template for a fresh runtime actor. Delegate only work that depends on prior-step results. Prefer finalize when evidence is sufficient. Use at most 1-3 agents.`,
         },
         {
           role: 'user',
           content: [
             `<original_task>${userTask}</original_task>`,
+            `<acceptance_checklist>${this.buildTaskAcceptanceChecklist(userTask)}</acceptance_checklist>`,
             `<completed_steps>${JSON.stringify(steps.map(step => ({ id: step.id, decision: step.decision, resultSummary: step.resultSummary })), null, 2)}</completed_steps>`,
+            `<execution_knowledge>${this.formatExecutionKnowledge(executionKnowledge)}</execution_knowledge>`,
             `<agent_results>${JSON.stringify(completedTasks, null, 2)}</agent_results>`,
             `<team_results>${JSON.stringify(teams.map(item => ({ id: item.team.identity.id, result: item.result.slice(0, 3000) })), null, 2)}</team_results>`,
             `<budget>${JSON.stringify(this.getBudgetState(), null, 2)}</budget>`,
@@ -7488,12 +8241,23 @@ Do not repeat an existing agent task. Generate the next actor structure from unr
     const nodes = new Map<string, RootExecutionNodeSnapshot>();
     for (const event of events) {
       if (event.type === 'agent.spawned' && event.agentId) {
+        const info = this.getContext().manager.getAgentById(event.agentId)?.getInfo()
+          ?? this.archivedAgentInfo.get(event.agentId);
+        const taskEvent = [...events].reverse().find(item =>
+          item.agentId === event.agentId && item.type === 'agent.run.started'
+        );
+        const task = typeof taskEvent?.data?.task === 'string' ? taskEvent.data.task : undefined;
         nodes.set(event.agentId, {
           id: event.agentId,
           kind: 'agent',
           name: String(event.data?.name ?? event.agentId),
           role: String(event.data?.archetype ?? 'subagent'),
           parentId: typeof event.data?.parentId === 'string' ? event.data.parentId : 'root',
+          generation: info?.identity.generation,
+          definitionFingerprint: typeof event.data?.definitionFingerprint === 'string'
+            ? event.data.definitionFingerprint
+            : undefined,
+          taskFingerprint: task ? this.executionTaskFingerprint(task) : undefined,
           status: 'active',
           createdAtStep: stepIndex,
           updatedAtStep: stepIndex,
@@ -7520,8 +8284,8 @@ Do not repeat an existing agent task. Generate the next actor structure from unr
         node.parentId = teamMembership.data.teamId;
       }
       const lifecycle = this.lifecycle.get(node.id);
-      const failed = events.some(event => event.agentId === node.id && (event.type === 'agent.run.failed' || event.type === 'team.run.failed'));
-      const completed = events.some(event => event.agentId === node.id && (event.type === 'agent.run.completed' || event.type === 'team.run.completed'));
+      const failed = events.some(event => event.agentId === node.id && (event.type === 'agent.run.failed' || event.type === 'team.failed'));
+      const completed = events.some(event => event.agentId === node.id && (event.type === 'agent.run.completed' || event.type === 'team.completed'));
       node.status = failed
         ? 'failed'
         : lifecycle?.status === 'released' || lifecycle?.status === 'persisted'
@@ -7565,6 +8329,24 @@ Do not repeat an existing agent task. Generate the next actor structure from unr
     try {
       this.emit({ type: 'delegation.assess.started', agentId: 'root', data: { correlationId } });
       const rootContext = await ctx.memory.loadRootContext();
+      const executionKnowledge = await ctx.memory.readExecutionKnowledge(
+        userInput,
+        this.workspaceRuntimeConfig?.delegation.rootSteps.maxFeedbackItemsInPrompt ?? 24
+      );
+      if (executionKnowledge.steps.length > 0) {
+        this.emit({
+          type: 'execution.cache.hit',
+          agentId: 'root',
+          correlationId,
+          data: {
+            scope: 'root.delegation',
+            steps: executionKnowledge.steps.length,
+            paths: executionKnowledge.paths.length,
+            actors: executionKnowledge.actors.length,
+            feedback: executionKnowledge.feedback.length,
+          },
+        });
+      }
       const sessionWindow = await this.contextWindowManager?.build({
         sessionId: ctx.sessionId,
         agentId: 'root',
@@ -7582,6 +8364,7 @@ Reason in terms of cognitive gaps: missing evidence, missing perspective, failur
 Use delegation only when the task benefits from grounded inspection, critique, planning, coding, testing, or summarization.
 Do not spawn more than 3 subagents. Prefer 1-2 unless the task clearly needs more.
 If later work depends on an earlier result, create only the immediately executable first-step agents. Roy will reassess after that step and grow the tree if needed.
+For a long-horizon, multi-step, iterative, or recursive task, prefer a task-specific team of 2-3 complementary members, set continuationPolicy to reassess, and allow member delegation. A single root step may contain many descendant derivations; every member and descendant still needs a distinct gap, bounded task, and synthesis path.
 When the task requests workspace changes, include an executor whose concrete task is to apply changes with fs.write or shell.exec and verify them. Do not assign every agent to analysis or proposal writing.
 Ask for clarification when the user request is too ambiguous to assign a concrete task safely.
 Design agent names, roles, tasks, tools, and skills from the current task. Do not copy a fixed team template. Use a team only when members require an explicit coordination and synthesis boundary.
@@ -7591,13 +8374,15 @@ Return strict JSON matching one of:
 {"action":"spawn_subagents","reason":"...","coordination":"independent","continuationPolicy":"reassess","agents":[{"archetype":"custom","name":"EvidenceMapper-1","role":"task-specific evidence mapper","task":"...","tools":["fs.read"],"skills":["use_tool_when_needed"],"tomLevel":0,"existenceReason":"which cognitive gap this agent fills"}]}
 {"action":"spawn_subagents","reason":"...","coordination":"team","continuationPolicy":"finalize_after_round","team":{"name":"task-specific team name","description":"why this team exists","task":"shared objective","synthesisPolicy":"how member evidence must be combined","memberDelegationPolicy":"deny","executionPolicy":{"mode":"parallel","failureMode":"best_effort","maxConcurrency":2,"minimumSuccessfulMembers":1}},"agents":[{"archetype":"custom","name":"task-specific name","role":"task-specific responsibility","task":"non-overlapping member task","tools":[],"skills":[],"tomLevel":1,"existenceReason":"which cognitive gap this member fills"}]}
 Set continuationPolicy to finalize_after_round when the user explicitly requires one delegation round, one team, or finalization immediately after team synthesis. Otherwise use reassess.
-Set team.memberDelegationPolicy to deny for a minimal or single-round team; use allow only when member-level recursive delegation is part of the requested work.
+Set team.memberDelegationPolicy to deny only for a minimal or explicitly single-round team. For long-horizon work, use allow so members can form their own subteam when newly observed evidence warrants it.
 Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, custom.`,
         },
         {
           role: 'user',
           content: [
             `<user_task>${userInput}</user_task>`,
+            `<acceptance_checklist>${this.buildTaskAcceptanceChecklist(userInput)}</acceptance_checklist>`,
+            `<execution_knowledge>${this.formatExecutionKnowledge(executionKnowledge)}</execution_knowledge>`,
             `<memory_context>${this.formatPublicContext(rootContext).slice(0, 6000)}</memory_context>`,
             `<recent_session_context>${sessionWindow?.sessionContext || 'No prior turns in this session.'}</recent_session_context>`,
             `<budget_state>${JSON.stringify(this.getBudgetState(), null, 2)}</budget_state>`,
@@ -7606,7 +8391,7 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
               skills: skillRegistry.list().map(skill => skill.name),
               webEnabled: this.workspaceRuntimeConfig?.tools.web.enabled !== false,
             }, null, 2)}</runtime_capabilities>`,
-            '<runtime_policy>Subagents and teams must be runtime actors with identity, state, budget, messages, events, and lifecycle. Propose only registered tools and skills shown above; Runtime will intersect every request with parent-approved capabilities. Each agent must fill a distinct cognitive gap, receive a concrete non-overlapping task, and expose why it exists. A one-member team will be reduced to an agent. If budget is limited, reduce the structure or solve directly.</runtime_policy>',
+            '<runtime_policy>Subagents and teams must be runtime actors with identity, state, budget, messages, events, and lifecycle. Propose only registered tools and skills shown above; Runtime will intersect every request with parent-approved capabilities. Each agent must fill a distinct cognitive gap, receive a concrete non-overlapping task, and expose why it exists. Treat successful cached paths as authoritative, explicitly route actionable failure feedback to the actor that can repair it, and do not repeat an equivalent failed path. Reuse cached definitions only as structure for fresh runtime actors. If budget is limited, reduce the structure or solve directly.</runtime_policy>',
           ].join('\n\n'),
         },
       ], { temperature: 0.1, maxTokens: 1800 }, 'root.delegation_decision', correlationId);
@@ -7663,6 +8448,24 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     }
 
     try {
+      const executionKnowledge = await ctx.memory.readExecutionKnowledge(
+        task,
+        this.workspaceRuntimeConfig?.delegation.rootSteps.maxFeedbackItemsInPrompt ?? 24
+      );
+      if (executionKnowledge.steps.length > 0) {
+        this.emit({
+          type: 'execution.cache.hit',
+          agentId: agent.identity.id,
+          correlationId,
+          data: {
+            scope: 'agent.delegation',
+            steps: executionKnowledge.steps.length,
+            paths: executionKnowledge.paths.length,
+            actors: executionKnowledge.actors.length,
+            feedback: executionKnowledge.feedback.length,
+          },
+        });
+      }
       this.emit({ type: 'delegation.assess.started', agentId: agent.identity.id, data: { correlationId, scope: 'agent' } });
       const decision = await this.completeJSONAsAgent<DelegationDecision>(
         ctx.manager.getAgentById(agent.identity.id)!,
@@ -7672,7 +8475,9 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
           content: `You are ${agent.identity.name}'s delegation controller.
 Decide whether this non-root agent should solve directly or delegate to 1-3 direct child agents. Delegate only to close an explicit evidence, perspective, risk, planning, implementation, verification, or synthesis gap in the parent agent's current model.
 Only delegate when a child with a different specialty materially improves the result.
+For two or more coupled gaps, prefer a team with a clear synthesis boundary. Team members may recursively create their own team when a newly discovered gap cannot be closed locally and depth/budget policy permits.
 When the task requests workspace changes and this agent has fs.write or shell.exec, it must execute the change itself or delegate a concrete implementation task. Do not return a proposed patch without applying it.
+Treat successful cached paths as authoritative. Do not repeat a cached invalid path or equivalent failed call without a changed hypothesis. Route actionable cached feedback to a child with the capabilities to close it. Cached actors and teams are reusable definitions, not live instances.
 Generate task-specific child definitions rather than selecting a fixed role template. Return strict JSON:
 {"action":"solve_directly","reason":"..."}
 {"action":"spawn_subagents","reason":"...","coordination":"independent","continuationPolicy":"reassess","agents":[{"archetype":"custom","name":"task-specific name","role":"task-specific responsibility","task":"...","tools":[],"skills":[],"tomLevel":1,"existenceReason":"which cognitive gap this child fills"}]}
@@ -7684,12 +8489,14 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
           content: [
             `<agent>${JSON.stringify(agent.identity, null, 2)}</agent>`,
             `<task>${task}</task>`,
+            `<acceptance_checklist>${this.buildTaskAcceptanceChecklist(task)}</acceptance_checklist>`,
             `<policy>${JSON.stringify(policy, null, 2)}</policy>`,
-            '<runtime_policy>Delegate only to a direct child. The parent must synthesize child results before passing anything upward.</runtime_policy>',
+            `<execution_knowledge>${this.formatExecutionKnowledge(executionKnowledge)}</execution_knowledge>`,
+            '<runtime_policy>Delegate only to a direct child or a direct child team. The parent must synthesize child results before passing anything upward. A child team may contain multiple fresh actors and those actors may continue recursive team-first delegation within policy.</runtime_policy>',
           ].join('\n\n'),
         },
         ],
-        { temperature: 0.1, maxTokens: 500 },
+        { temperature: 0.1, maxTokens: 1000 },
         'agent.delegation_decision',
         correlationId
       );
@@ -7720,6 +8527,12 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
   }
 
   private fallbackAgentDelegationDecision(agent: AgentInfo, task: string): DelegationDecision {
+    if (agent.identity.teamId && task.includes('<team_step_cache>')) {
+      return {
+        action: 'solve_directly',
+        reason: 'The model did not select a recursive child, and this team member already received prior member state for its bounded role.',
+      };
+    }
     const archetype = this.inferAgentArchetype(agent);
     const lower = task.toLowerCase();
     const wantsReview = /\b(review|critique|risk|risks|failure|validate|audit)\b/.test(lower);
@@ -8096,6 +8909,276 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     return this.requiresStagedDelegation(task)
       || /\b(long[- ]?(?:running|horizon|term)|multi[- ]?(?:step|stage|phase)|iterate|iteration|checkpoint|until complete|continue until|progressively|recursive)\b/.test(normalized)
       || /(长程|长期任务|多步骤|多阶段|逐步执行|持续执行|循环执行|直到完成|递归派生|检查点)/.test(normalized);
+  }
+
+  private buildTaskAcceptanceChecklist(task: string): string {
+    const lines = task
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(Boolean);
+    const explicitItems = lines
+      .filter(line =>
+        /^(?:[-*+]\s+|\d+[.)]\s+)/.test(line)
+        || /\b(?:must|must not|required|preserve|keep|honou?r|support|pass only if)\b/i.test(line)
+        || /(?:必须|不得|需要|保持|保留|支持|完成后|通过条件)/.test(line)
+      )
+      .map(line => line.replace(/^(?:[-*+]\s+|\d+[.)]\s+)/, '').replace(/\s+/g, ' ').slice(0, 500));
+    const items = [...new Set(explicitItems)].slice(0, 50);
+    if (items.length === 0) {
+      items.push(task.replace(/\s+/g, ' ').trim().slice(0, 1200));
+    }
+    return JSON.stringify({
+      items: items.map((item, index) => ({
+        id: `acceptance_${String(index + 1).padStart(2, '0')}`,
+        requirement: item,
+        status: 'unverified',
+      })),
+      closurePolicy: [
+        'Before finalizing, classify every item as verified, failed, or explicitly blocked using runtime evidence.',
+        'Search for stale parallel declarations, call sites, generated metadata, configuration, and compatibility paths relevant to each item.',
+        'A passing narrow check does not close sibling requirements; preserve failures and unverified items as actionable feedback.',
+      ],
+    }, null, 2);
+  }
+
+  private ensureLongHorizonRecoveryContinuation(
+    continuation: RootContinuationDecision,
+    task: string,
+    completedStep: RootExecutionStep,
+    delegationRound: number,
+    maxDelegationRounds: number,
+    requiresLongHorizon: boolean,
+    requiresWorkspaceMutation: boolean,
+    correlationId: string
+  ): RootContinuationDecision {
+    if (!requiresLongHorizon
+      || !requiresWorkspaceMutation
+      || continuation.action !== 'finalize'
+      || delegationRound >= maxDelegationRounds) {
+      return continuation;
+    }
+    const pathState = completedStep.cache?.path;
+    if (!pathState?.mutationObserved
+      || (pathState.verificationObserved && pathState.status === 'completed')) {
+      return continuation;
+    }
+    const actionableFeedback = completedStep.cache?.feedback
+      .filter(item => item.actionable)
+      .slice(0, 12)
+      .map(item => item.summary) ?? [];
+    const nextRound = delegationRound + 1;
+    this.emit({
+      type: 'root.step.long_horizon_recovery.required',
+      agentId: 'root',
+      correlationId,
+      data: {
+        stepId: completedStep.id,
+        pathId: pathState.id,
+        nextRound,
+        pathStatus: pathState.status,
+        mutationObserved: pathState.mutationObserved,
+        verificationObserved: pathState.verificationObserved,
+        actionableFeedback: actionableFeedback.length,
+        rejectedFinalizeReason: continuation.reason,
+      },
+    });
+    return {
+      action: 'delegate_more',
+      reason: [
+        `Step ${completedStep.index} changed the workspace but did not close its execution path.`,
+        pathState.verificationObserved
+          ? 'Verification ran, but failed tools or unresolved feedback keep the path partial.'
+          : 'No successful verification was observed after the mutation.',
+        'Continue from cached state instead of repeating broad discovery.',
+      ].join(' '),
+      agents: [
+        {
+          archetype: 'coder',
+          name: `RecoveryExecutor-${nextRound}`,
+          role: 'cached-state recovery executor',
+          task: [
+            'Continue the long-horizon workspace task from the persisted execution cache.',
+            'Do not restart broad project discovery and do not retry cached invalid paths without a changed hypothesis.',
+            'Implement the next unresolved bounded slice, consume failed tool output as repair feedback, and run a focused check before reporting.',
+            `Original task: ${task}`,
+          ].join('\n'),
+          tools: ['fs.list', 'fs.read', 'fs.write', 'shell.exec'],
+          skills: ['use_tool_when_needed', 'delegate_to_subagent'],
+          tomLevel: 1,
+          existenceReason: 'A cached mutated path remains partial or unverified and requires another bounded implementation slice.',
+        },
+        {
+          archetype: 'tester',
+          name: `RecoveryVerifier-${nextRound}`,
+          role: 'independent cached-path verifier',
+          task: [
+            'Consume the preceding team member result and persisted execution cache.',
+            'Verify the actual workspace after the recovery edit with the most relevant executable checks.',
+            'Report exact failures, authoritative paths, and the smallest next repair; do not claim completion without successful tool evidence.',
+            `Original task: ${task}`,
+          ].join('\n'),
+          tools: ['fs.list', 'fs.read', 'shell.exec'],
+          skills: ['use_tool_when_needed', 'delegate_to_subagent'],
+          tomLevel: 1,
+          existenceReason: 'The preceding mutation lacks a closed, independently verified execution path.',
+        },
+      ],
+      coordination: 'team',
+      continuationPolicy: 'reassess',
+      team: {
+        name: `LongHorizonRecoveryTeam-${nextRound}`,
+        description: 'Continues a partial cached execution path through a bounded implementation and independent verification pass.',
+        task,
+        synthesisPolicy: 'Return completed mutations, verification evidence, remaining failed paths, and actionable feedback as the next cached checkpoint.',
+        memberDelegationPolicy: 'allow',
+        executionPolicy: {
+          mode: 'sequential',
+          failureMode: 'best_effort',
+          maxConcurrency: 1,
+          minimumSuccessfulMembers: 1,
+        },
+      },
+    };
+  }
+
+  private buildLongHorizonTeamDecision(
+    task: string,
+    requiresWorkspaceMutation: boolean
+  ): Extract<DelegationDecision, { action: 'spawn_subagents' }> {
+    const agents: DelegationAgentPlan[] = requiresWorkspaceMutation
+      ? [
+        {
+          archetype: 'researcher',
+          name: 'PathSteward-1',
+          role: 'execution state and path steward',
+          task: `Establish the first grounded checkpoint for this long-horizon task. Inspect authoritative workspace paths, identify cached invalid paths and actionable feedback, and pass a bounded execution map to the team: ${task}`,
+          tools: ['fs.list', 'fs.read'],
+          skills: ['use_tool_when_needed', 'delegate_to_subagent'],
+          tomLevel: 1,
+          existenceReason: 'Maintain authoritative path, cache, and unresolved-feedback state for the team.',
+        },
+        {
+          archetype: 'coder',
+          name: 'Executor-2',
+          role: 'workspace executor',
+          task: `Inspect the actual workspace, implement the next complete bounded slice of the requested change, use failed tool output to repair it, and do not stop at a proposal: ${task}`,
+          tools: ['fs.list', 'fs.read', 'fs.write', 'shell.exec'],
+          skills: ['use_tool_when_needed', 'delegate_to_subagent'],
+          tomLevel: 1,
+          existenceReason: 'Apply the requested workspace mutation with runtime tools.',
+        },
+        {
+          archetype: 'tester',
+          name: 'Verifier-3',
+          role: 'independent closure verifier',
+          task: `Verify the actual resulting workspace state for this task. Run relevant checks, distinguish authoritative and invalid paths, and return concrete repair feedback for any failure: ${task}`,
+          tools: ['fs.list', 'fs.read', 'shell.exec'],
+          skills: ['use_tool_when_needed', 'delegate_to_subagent'],
+          tomLevel: 1,
+          existenceReason: 'Close the mutation-and-verification loop and produce actionable feedback.',
+        },
+      ]
+      : [
+        {
+          archetype: 'researcher',
+          name: 'EvidenceSteward-1',
+          role: 'grounded evidence and path steward',
+          task: `Establish the first grounded checkpoint, authoritative evidence paths, cached failures to avoid, and unresolved gaps for: ${task}`,
+          tools: ['fs.list', 'fs.read'],
+          skills: ['use_tool_when_needed', 'delegate_to_subagent'],
+          tomLevel: 1,
+          existenceReason: 'Create durable evidence and path state for a long-horizon task.',
+        },
+        {
+          archetype: 'tester',
+          name: 'CheckpointVerifier-2',
+          role: 'checkpoint and feedback verifier',
+          task: `Independently verify the first bounded checkpoint, challenge unsupported claims, and return actionable feedback that later steps and descendants can consume for: ${task}`,
+          tools: ['fs.list', 'fs.read', 'shell.exec'],
+          skills: ['use_tool_when_needed', 'delegate_to_subagent'],
+          tomLevel: 1,
+          existenceReason: 'Validate the checkpoint and expose concrete next-step feedback.',
+        },
+      ];
+    return {
+      action: 'spawn_subagents',
+      reason: 'The request describes a staged or long-running task, so Roy will start with a checkpointed team whose members and descendants can extend one execution step.',
+      agents,
+      coordination: 'team',
+      continuationPolicy: 'reassess',
+      team: {
+        name: 'LongHorizonCheckpointTeam',
+        description: 'Maintains grounded state, executes bounded work, verifies closure, and propagates feedback across recursive derivations.',
+        task,
+        synthesisPolicy: 'Synthesize authoritative paths, completed work, failed paths, verification evidence, and unresolved feedback into the next root checkpoint.',
+        memberDelegationPolicy: 'allow',
+        executionPolicy: {
+          mode: 'sequential',
+          failureMode: 'best_effort',
+          maxConcurrency: 1,
+          minimumSuccessfulMembers: 1,
+        },
+      },
+    };
+  }
+
+  private ensureLongHorizonTeamDecision(
+    decision: Extract<DelegationDecision, { action: 'spawn_subagents' }>,
+    task: string,
+    requiresWorkspaceMutation: boolean,
+    correlationId?: string
+  ): Extract<DelegationDecision, { action: 'spawn_subagents' }> {
+    if (this.workspaceRuntimeConfig?.delegation.rootSteps.teamFirstLongHorizon === false
+      || this.workspaceRuntimeConfig?.teams.enabled === false) {
+      return decision;
+    }
+    const available = Math.min(
+      3,
+      this.getRemainingTotalAgentsForTurn('root', correlationId)
+    );
+    if (available < 2) return decision;
+    const agents = [...decision.agents.slice(0, available)];
+    const archetypes = new Set(agents.map(agent => agent.archetype));
+    const bootstrapAgents = this.buildLongHorizonTeamDecision(task, requiresWorkspaceMutation).agents;
+    const additions = requiresWorkspaceMutation
+      ? [
+        ...bootstrapAgents.filter(agent => agent.archetype === 'coder'),
+        ...bootstrapAgents.filter(agent => agent.archetype === 'tester'),
+        ...bootstrapAgents.filter(agent => agent.archetype !== 'coder' && agent.archetype !== 'tester'),
+      ]
+      : [
+        ...bootstrapAgents.filter(agent => agent.archetype === 'tester'),
+        ...bootstrapAgents.filter(agent => agent.archetype !== 'tester'),
+      ];
+    for (const addition of additions) {
+      if (agents.length >= available) break;
+      if (archetypes.has(addition.archetype)) continue;
+      agents.push(addition);
+      archetypes.add(addition.archetype);
+    }
+    if (agents.length < 2) return decision;
+    return {
+      ...decision,
+      agents,
+      coordination: 'team',
+      continuationPolicy: 'reassess',
+      team: {
+        name: decision.team?.name ?? 'LongHorizonCheckpointTeam',
+        description: decision.team?.description
+          ?? 'Coordinates grounded state, execution, verification, and recursive descendant feedback for a long-horizon task.',
+        task: decision.team?.task ?? task,
+        synthesisPolicy: decision.team?.synthesisPolicy
+          ?? 'Synthesize authoritative paths, completed work, failed paths, verification evidence, and unresolved feedback into the next root checkpoint.',
+        tomLevel: decision.team?.tomLevel,
+        executionPolicy: decision.team?.executionPolicy ?? {
+          mode: 'sequential',
+          failureMode: 'best_effort',
+          maxConcurrency: 1,
+          minimumSuccessfulMembers: 1,
+        },
+        memberDelegationPolicy: 'allow',
+      },
+    };
   }
 
   private applyBudgetConstraints(decision: DelegationDecision): DelegationDecision {
@@ -9920,7 +11003,12 @@ Produce the final response to the user as Roy, the root agent.`;
       ctx.memory.readTeamDoc(teamKey, 'memory'),
       ctx.memory.loadRootContext(),
     ]);
-    const publicContext = [rootContext.projectMemory, rootContext.constraints, rootContext.decisions]
+    const publicContext = [
+      `<execution_knowledge>${this.formatExecutionKnowledge(rootContext.executionKnowledge)}</execution_knowledge>`,
+      rootContext.projectMemory,
+      rootContext.constraints,
+      rootContext.decisions,
+    ]
       .filter(Boolean)
       .join('\n\n')
       .slice(0, 6000);
@@ -9951,6 +11039,12 @@ Produce the final response to the user as Roy, the root agent.`;
       `observed_paths: ${JSON.stringify(member.evidence.observedPaths)}`,
       `observed_urls: ${JSON.stringify(member.evidence.observedUrls ?? [])}`,
       `discovered_urls: ${JSON.stringify(member.evidence.discoveredUrls ?? [])}`,
+      `failed_tool_calls: ${JSON.stringify(member.toolCalls.filter(call => !call.success).map(call => ({
+        toolName: call.toolName,
+        params: call.params,
+        error: call.error,
+      })))}`,
+      `warnings: ${JSON.stringify(member.warnings)}`,
       `tool_result_summary:\n${(member.evidence.toolResultSummary ?? 'none').slice(0, 5000)}`,
       `tom_profile: ${JSON.stringify(member.agent.identity.tomProfile)}`,
       'member_report:',
@@ -9964,6 +11058,7 @@ Produce the final response to the user as Roy, the root agent.`;
     ].join('\n')).join('\n\n');
     const prompt = [
       `Team task: ${task}`,
+      `<acceptance_checklist>\n${this.buildTaskAcceptanceChecklist(task)}\n</acceptance_checklist>`,
       `You are ${team.identity.name}, a subteam actor in Roy.`,
       `Description: ${team.identity.description}`,
       `Parent-defined synthesis policy: ${team.synthesisPolicy ?? 'Aggregate evidence, preserve disagreements, and return one grounded result.'}`,
@@ -9977,6 +11072,10 @@ Produce the final response to the user as Roy, the root agent.`;
       'Reconcile member beliefs explicitly, preserve unresolved uncertainty, and explain how the final result covers the team cognitive gaps.',
       'Give the lead report coordination priority, but verify it against all available member evidence.',
       'If member failures are present, state their impact and do not imply full team completion.',
+      'Reconcile every acceptance-checklist item against structured tool evidence. Keep failed and unverified items explicit for the next cached step.',
+      'Before declaring an item verified, inspect stale parallel declarations, call sites, generated metadata, configuration, and compatibility paths that can contradict the primary edit.',
+      'Produce explicit completed-state, authoritative-path, invalid-path, verification, and actionable-feedback sections so the runtime can carry them into later steps.',
+      'Do not repeat a cached failed path or equivalent failed call unless a member used a changed hypothesis and recorded the new outcome.',
       'The structured observed_paths, observed_urls, and tool_result_summary fields are the authoritative evidence boundary.',
       'Do not infer file contents merely because a path was observed. Do not invent example values and present them as observations.',
       'A member report claim is usable only when supported by that member structured evidence or clearly labeled as analysis.',
@@ -10709,6 +11808,19 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       '<constraints>',
       context.constraints.trim(),
       '</constraints>',
+      '<execution_knowledge>',
+      JSON.stringify(
+        compactExecutionKnowledgeForPrompt(
+          context.executionKnowledge,
+          this.workspaceRuntimeConfig?.delegation.rootSteps.maxFeedbackItemsInPrompt ?? 24
+        ),
+        null,
+        2
+      ),
+      '</execution_knowledge>',
+      '<execution_attention_contract>',
+      'Successful observed paths and tool results are authoritative. Do not repeat cached failed paths or equivalent failed calls without a changed hypothesis. Reuse a cached actor/team definition only when it fills the current cognitive gap, and instantiate a fresh runtime actor. Propagate unresolved feedback to descendants and verify mutations before completion.',
+      '</execution_attention_contract>',
       '<decisions>',
       context.decisions.trim(),
       '</decisions>',
@@ -10719,6 +11831,23 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       `<team_patterns>${JSON.stringify(context.teamPatterns, null, 2)}</team_patterns>`,
       `<delegation_patterns>${JSON.stringify(context.delegationPatterns, null, 2)}</delegation_patterns>`,
     ].join('\n');
+  }
+
+  private formatExecutionKnowledge(context: ExecutionKnowledgeCacheState): string {
+    if (context.steps.length === 0) {
+      return JSON.stringify({
+        steps: [],
+        attention: 'No cached execution path is available. Establish grounded paths and record failures explicitly.',
+      });
+    }
+    return JSON.stringify(
+      compactExecutionKnowledgeForPrompt(
+        context,
+        this.workspaceRuntimeConfig?.delegation.rootSteps.maxFeedbackItemsInPrompt ?? 24
+      ),
+      null,
+      2
+    );
   }
 
   private formatCachedPublicContext(cacheHits: string[]): string {
@@ -11415,6 +12544,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     return [
       '[runtime_execution_phase]',
       `Original task:\n${userTask}`,
+      `<acceptance_checklist>\n${this.buildTaskAcceptanceChecklist(userTask)}\n</acceptance_checklist>`,
       delegatedFindings
         ? `Delegated findings and proposals:\n${delegatedFindings}`
         : 'No delegated report was available. Inspect the workspace directly.',
@@ -11441,9 +12571,23 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       const priorExecution = attempts.length > 0
         ? this.combineGroundingRuns(attempts)
         : undefined;
-      const task = priorExecution
+      const baseTask = priorExecution
         ? this.buildRootExecutionRepairTask(userTask, priorExecution, attempt)
         : this.buildRootExecutionClosureTask(userTask, subagents, teamResults);
+      const executionKnowledge = await this.getContext().memory.readExecutionKnowledge(
+        userTask,
+        this.workspaceRuntimeConfig?.delegation.rootSteps.maxFeedbackItemsInPrompt ?? 24
+      );
+      const task = [
+        baseTask,
+        `<execution_knowledge>\n${this.formatExecutionKnowledge(executionKnowledge)}\n</execution_knowledge>`,
+        [
+          'Execution attention:',
+          '- Use successful cached paths as the authoritative starting point.',
+          '- Do not retry a cached invalid path or equivalent failed call unless this attempt changes the hypothesis.',
+          '- Consume actionable feedback, preserve useful state from prior paths, and append new verification evidence.',
+        ].join('\n'),
+      ].join('\n\n');
       const current = await this.runGroundingCheck(
         'root',
         task,

@@ -1,6 +1,7 @@
 import type { AgentRole } from '../agent/BaseAgent.js';
 import type { MultiPartyTrace } from '../communication/index.js';
 import type { ConversationEntry, RootMemoryContext, WorkspaceMemoryManager } from '../memory/index.js';
+import { compactExecutionKnowledgeForPrompt } from '../runtime/executionCache.js';
 import type {
   ContextWindow,
   ContextWindowPolicy,
@@ -77,7 +78,7 @@ export class ContextWindowManager {
       },
       sources: {
         public: rootContext
-          ? ['.roy/public/project.md', '.roy/public/context.md', '.roy/public/constraints.md', '.roy/public/decisions.md', '.roy/public/glossary.md', '.roy/public/user.md']
+          ? ['.roy/public/project.md', '.roy/public/context.md', '.roy/public/constraints.md', '.roy/public/decisions.md', '.roy/public/glossary.md', '.roy/public/user.md', '.roy/cache/execution-knowledge.json']
           : [],
         private: privateBundle
           ? [`.roy/agents/${privateBundle.key}/memory.md`, `.roy/agents/${privateBundle.key}/context.md`]
@@ -172,8 +173,14 @@ export class ContextWindowManager {
 
   private formatPublicContext(context: RootMemoryContext): string {
     return [
-      '<project_memory>', context.projectMemory.trim(), '</project_memory>',
+      '<execution_knowledge>',
+      JSON.stringify(compactExecutionKnowledgeForPrompt(context.executionKnowledge)),
+      '</execution_knowledge>',
+      '<execution_attention_contract>',
+      'Treat successful observed paths and tool results as authoritative. Do not repeat cached failed paths or equivalent failed calls without a changed hypothesis. Reuse cached actor/team definitions only when their recorded role fills the current gap, and create a fresh runtime instance. Propagate unresolved feedback to descendants and verify mutations before completion.',
+      '</execution_attention_contract>',
       '<constraints>', context.constraints.trim(), '</constraints>',
+      '<project_memory>', context.projectMemory.trim(), '</project_memory>',
       '<decisions>', context.decisions.trim(), '</decisions>',
       '<glossary>', context.glossary.trim(), '</glossary>',
       `<agent_patterns>${JSON.stringify(context.agentPatterns)}</agent_patterns>`,

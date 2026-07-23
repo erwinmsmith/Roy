@@ -35,6 +35,16 @@ export {
   type ProjectRootStepActivitiesInput,
 } from './executionActivity.js';
 export {
+  compactExecutionKnowledgeForPrompt,
+  type ExecutionCachedActor,
+  type ExecutionCachedPath,
+  type ExecutionCachedStep,
+  type ExecutionCacheSnapshot,
+  type ExecutionFeedbackKind,
+  type ExecutionFeedbackRecord,
+  type ExecutionKnowledgeCacheState,
+} from './executionCache.js';
+export {
   RootTaskLoopController,
   type RootTaskLoopConfig,
   type RootTaskLoopGuard,

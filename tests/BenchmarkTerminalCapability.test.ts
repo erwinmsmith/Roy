@@ -14,6 +14,7 @@ import type {
 class TerminalTaskLLM implements LLMProvider {
   readonly name = 'terminal-task-test';
   readonly defaultModel = 'test-model';
+  rootDecisionPrompts: string[] = [];
 
   async complete(): Promise<LLMCompletionResult> {
     return { content: 'Created artifact.txt and verified its contents.' };
@@ -27,6 +28,7 @@ class TerminalTaskLLM implements LLMProvider {
     const system = messages.find(message => message.role === 'system')?.content ?? '';
     const user = messages.findLast(message => message.role === 'user')?.content ?? '';
     if (system.includes("root delegation controller")) {
+      this.rootDecisionPrompts.push(user);
       return { action: 'solve_directly', reason: 'The root has the required terminal capability.' } as T;
     }
     if (system.includes('plan authorized tool calls')) {
@@ -188,6 +190,167 @@ class RetryingDirectExecutionLLM extends TerminalTaskLLM {
 }
 
 describe('benchmark terminal capability', () => {
+  it('reuses persisted invalid-path knowledge in a later correlation', async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), 'roy-persisted-path-cache-'));
+    const cacheDirectory = path.join(workspace, '.roy', 'cache');
+    await mkdir(cacheDirectory, { recursive: true });
+    const now = Date.now();
+    await writeFile(path.join(cacheDirectory, 'execution-knowledge.json'), JSON.stringify({
+      version: 1,
+      updatedAt: now,
+      steps: [{
+        id: 'prior.step.cache',
+        correlationId: 'prior-correlation',
+        stepId: 'prior.step',
+        index: 1,
+        task: 'Inspect the workspace.',
+        taskFingerprint: 'prior-task',
+        pathId: 'prior.step.path',
+        dependsOn: [],
+        action: 'delegate',
+        status: 'completed',
+        actorIds: [],
+        teamIds: [],
+        feedbackIds: [],
+        createdAt: now,
+        updatedAt: now,
+      }],
+      paths: [{
+        id: 'prior.step.path',
+        correlationId: 'prior-correlation',
+        stepId: 'prior.step',
+        parentPathIds: [],
+        taskFingerprint: 'prior-task',
+        status: 'partial',
+        actorIds: [],
+        teamIds: [],
+        observedPaths: ['src/actual.txt'],
+        invalidPaths: ['missing.txt'],
+        successfulTools: ['fs.list'],
+        failedTools: ['fs.read'],
+        mutationObserved: false,
+        verificationObserved: false,
+        feedbackIds: [],
+        createdAt: now,
+        updatedAt: now,
+      }],
+      actors: [],
+      feedback: [],
+    }, null, 2));
+
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'persisted-path-cache-test',
+      workspaceCwd: workspace,
+    });
+    const rejected = await runtime.executeToolForAgent(
+      'root',
+      'fs.read',
+      { path: 'missing.txt' },
+      { correlationId: 'later-correlation' }
+    );
+
+    expect(rejected).toMatchObject({
+      success: false,
+      metadata: { cacheRejected: true, path: 'missing.txt' },
+    });
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'tool.path.cache_rejected',
+      correlationId: 'later-correlation',
+      data: expect.objectContaining({ source: 'persisted execution knowledge' }),
+    }));
+    expect(runtime.getEvents().filter(event =>
+      event.type === 'tool.call' && event.correlationId === 'later-correlation'
+    )).toHaveLength(0);
+    await runtime.shutdown();
+  });
+
+  it('rejects repeated reads of a cached invalid path until the hypothesis changes', async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), 'roy-invalid-path-cache-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'invalid-path-cache-test',
+      workspaceCwd: workspace,
+    });
+
+    const first = await runtime.executeToolForAgent(
+      'root',
+      'fs.read',
+      { path: path.join(workspace, 'missing.txt') },
+      { correlationId: 'invalid-path-turn' }
+    );
+    const repeated = await runtime.executeToolForAgent(
+      'root',
+      'fs.read',
+      { path: 'missing.txt' },
+      { correlationId: 'invalid-path-turn' }
+    );
+
+    expect(first.success).toBe(false);
+    expect(repeated).toMatchObject({
+      success: false,
+      metadata: {
+        cacheRejected: true,
+        path: 'missing.txt',
+      },
+    });
+    expect(runtime.getEvents().filter(event =>
+      event.type === 'tool.call'
+      && event.correlationId === 'invalid-path-turn'
+      && event.data.toolName === 'fs.read'
+    )).toHaveLength(1);
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'tool.path.cache_rejected',
+      correlationId: 'invalid-path-turn',
+      data: expect.objectContaining({ path: 'missing.txt' }),
+    }));
+
+    await writeFile(path.join(workspace, 'missing.txt'), 'created after the failed observation');
+    const retriedAfterChange = await runtime.executeToolForAgent(
+      'root',
+      'fs.read',
+      { path: 'missing.txt' },
+      {
+        correlationId: 'invalid-path-turn',
+        reason: 'Retry after mutation: path created by the current execution.',
+      }
+    );
+    expect(retriedAfterChange).toMatchObject({ success: true });
+
+    const missingDirectory = await runtime.executeToolForAgent(
+      'root',
+      'fs.list',
+      { path: 'outputs' },
+      { correlationId: 'invalid-path-turn' }
+    );
+    expect(missingDirectory.success).toBe(false);
+    await mkdir(path.join(workspace, 'outputs'));
+    (runtime as unknown as {
+      recordToolPathOutcome: (
+        agentId: string,
+        toolName: string,
+        params: Record<string, unknown>,
+        result: { success: boolean; result?: Record<string, unknown> },
+        correlationId: string
+      ) => void;
+    }).recordToolPathOutcome(
+      'root',
+      'shell.exec',
+      { command: `mkdir -p ${path.join(workspace, 'outputs')}` },
+      { success: true, result: {} },
+      'invalid-path-turn'
+    );
+    const retriedAfterShellMutation = await runtime.executeToolForAgent(
+      'root',
+      'fs.list',
+      { path: 'outputs' },
+      { correlationId: 'invalid-path-turn' }
+    );
+    expect(retriedAfterShellMutation).toMatchObject({ success: true });
+
+    await runtime.shutdown();
+  });
+
   it('runs an explicitly authorized shell loop and persists its execution tree', async () => {
     const workspace = await mkdtemp(path.join(tmpdir(), 'roy-terminal-task-'));
     await mkdir(path.join(workspace, '.roy'), { recursive: true });
@@ -226,15 +389,18 @@ describe('benchmark terminal capability', () => {
     }, null, 2));
 
     const runtime = new Runtime();
+    const llm = new TerminalTaskLLM();
     await runtime.initialize({
       sessionId: 'terminal-capability-test',
       workspaceCwd: workspace,
-      llmProvider: new TerminalTaskLLM(),
+      llmProvider: llm,
     });
     const result = await runtime.handleUserTurn(
       'Use the terminal in this workspace to create artifact.txt, verify it, and report completion.'
     );
 
+    expect(llm.rootDecisionPrompts[0]).toContain('<acceptance_checklist>');
+    expect(llm.rootDecisionPrompts[0]).toContain('"status": "unverified"');
     expect(await readFile(path.join(workspace, 'artifact.txt'), 'utf8')).toBe('roy-terminal-ready');
     expect(result.finalResponse).toContain('Created artifact.txt');
     expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
@@ -254,6 +420,28 @@ describe('benchmark terminal capability', () => {
       path.join(workspace, '.roy', 'execution-trees', 'terminal-capability-test', `${result.correlationId}.json`),
       'utf8'
     ))).toMatchObject({ correlationId: result.correlationId, status: 'completed' });
+    const executionKnowledge = JSON.parse(
+      await readFile(path.join(workspace, '.roy', 'cache', 'execution-knowledge.json'), 'utf8')
+    );
+    expect(executionKnowledge.paths).toContainEqual(expect.objectContaining({
+      mutationObserved: true,
+      verificationObserved: true,
+      successfulTools: expect.arrayContaining(['shell.exec']),
+    }));
+    expect(executionKnowledge.feedback).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'workspace_mutation' }),
+      expect.objectContaining({ kind: 'workspace_verification' }),
+    ]));
+
+    await runtime.handleUserTurn(
+      'Summarize the cached execution state for the previously created artifact.txt.'
+    );
+    expect(llm.rootDecisionPrompts.at(-1)).toContain('<execution_knowledge>');
+    expect(llm.rootDecisionPrompts.at(-1)).toContain('"mutationObserved": true');
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'execution.cache.hit',
+      data: expect.objectContaining({ scope: 'root.delegation' }),
+    }));
 
     await runtime.shutdown();
   });

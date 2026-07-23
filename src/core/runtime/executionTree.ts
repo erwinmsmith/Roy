@@ -1,3 +1,5 @@
+import type { ExecutionCacheSnapshot } from './executionCache.js';
+
 export type RootExecutionTreeStatus = 'running' | 'completed' | 'failed';
 export type RootExecutionStepStatus = 'running' | 'completed' | 'failed';
 export type RootExecutionNodeStatus = 'active' | 'waiting' | 'done' | 'failed' | 'released';
@@ -57,6 +59,9 @@ export interface RootExecutionNodeSnapshot {
   role: string;
   parentId?: string;
   teamId?: string;
+  generation?: number;
+  definitionFingerprint?: string;
+  taskFingerprint?: string;
   status: RootExecutionNodeStatus;
   createdAtStep: number;
   updatedAtStep: number;
@@ -81,6 +86,7 @@ export interface RootExecutionStep {
   treeSnapshot: RootExecutionNodeSnapshot[];
   activities: RootExecutionActivity[];
   checkpoint?: RootExecutionCheckpoint;
+  cache?: ExecutionCacheSnapshot;
   startedAt: number;
   completedAt?: number;
   error?: string;
@@ -115,6 +121,7 @@ export interface CompleteRootExecutionStepInput {
   resultSummary?: string;
   activities?: RootExecutionActivity[];
   checkpoint?: RootExecutionCheckpoint;
+  cache?: ExecutionCacheSnapshot;
 }
 
 function cloneTree(tree: RootExecutionTreeState): RootExecutionTreeState {
@@ -204,6 +211,7 @@ export class RootExecutionTreeRegistry {
     step.resultSummary = input.resultSummary;
     step.activities = structuredClone(input.activities ?? step.activities);
     step.checkpoint = input.checkpoint ? structuredClone(input.checkpoint) : step.checkpoint;
+    step.cache = input.cache ? structuredClone(input.cache) : step.cache;
     step.treeSnapshot = structuredClone(tree.nodes);
     step.completedAt = Date.now();
     tree.updatedAt = step.completedAt;
@@ -229,12 +237,20 @@ export class RootExecutionTreeRegistry {
     correlationId: string,
     stepId: string,
     error: string,
-    options: { failTree?: boolean } = {}
+    options: {
+      failTree?: boolean;
+      activities?: RootExecutionActivity[];
+      checkpoint?: RootExecutionCheckpoint;
+      cache?: ExecutionCacheSnapshot;
+    } = {}
   ): RootExecutionStep {
     const tree = this.requireTree(correlationId);
     const step = this.requireStep(tree, stepId);
     step.status = 'failed';
     step.error = error;
+    step.activities = structuredClone(options.activities ?? step.activities);
+    step.checkpoint = options.checkpoint ? structuredClone(options.checkpoint) : step.checkpoint;
+    step.cache = options.cache ? structuredClone(options.cache) : step.cache;
     step.treeSnapshot = structuredClone(tree.nodes);
     step.completedAt = Date.now();
     tree.updatedAt = step.completedAt;

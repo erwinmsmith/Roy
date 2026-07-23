@@ -16,6 +16,7 @@ class DynamicStepLLM implements LLMProvider {
   readonly name = 'dynamic-step-test';
   readonly defaultModel = 'test-model';
   private continuationCalls = 0;
+  continuationPrompt = '';
 
   async complete(_messages: LLMMessage[], _options?: LLMCompletionOptions): Promise<LLMCompletionResult> {
     return { content: 'complete', usage: { promptTokens: 4, completionTokens: 2, totalTokens: 6 } };
@@ -50,6 +51,7 @@ class DynamicStepLLM implements LLMProvider {
       } satisfies DelegationDecision as T;
     }
     if (text.includes("Roy's dynamic root-step controller")) {
+      this.continuationPrompt = text;
       this.continuationCalls += 1;
       if (this.continuationCalls === 1) {
         return {
@@ -238,11 +240,12 @@ describe('Root dynamic execution tree', () => {
       },
     }));
     const runtime = new Runtime();
+    const llm = new DynamicStepLLM();
     await runtime.initialize({
       sessionId: 'dynamic-tree-test',
       workspaceCwd,
       fsmEnabled: true,
-      llmProvider: new DynamicStepLLM(),
+      llmProvider: llm,
     });
 
     const result = await runtime.handleUserTurn('Inspect this project, then verify any gap before answering.');
@@ -265,7 +268,13 @@ describe('Root dynamic execution tree', () => {
       'tester',
     ]));
     expect(result.executionTree.nodes.find(node => node.role === 'researcher')?.createdAtStep).toBe(1);
-    expect(result.executionTree.nodes.find(node => node.role === 'tester')?.createdAtStep).toBe(2);
+    expect(result.executionTree.nodes.find(node => node.name === 'CheckpointVerifier-2')?.createdAtStep).toBe(1);
+    expect(result.executionTree.nodes
+      .filter(node => node.name === 'Tester-1')
+      .some(node => node.createdAtStep === 2)).toBe(true);
+    expect(result.executionTree.steps[1].actorIds.filter(
+      actorId => result.executionTree.steps[0].actorIds.includes(actorId)
+    )).toEqual([]);
     expect(result.executionTree.loop).toMatchObject({
       iteration: 3,
       stopReason: 'completed',
@@ -287,6 +296,27 @@ describe('Root dynamic execution tree', () => {
     expect(events.filter(event => event.type === 'root.step.started')).toHaveLength(3);
     expect(events.filter(event => event.type === 'root.step.tree.updated')).toHaveLength(3);
     expect(events).toContainEqual(expect.objectContaining({ type: 'root.execution_tree.completed' }));
+    expect(events).toContainEqual(expect.objectContaining({ type: 'execution.cache.snapshot.recorded' }));
+    expect(events).toContainEqual(expect.objectContaining({ type: 'execution.path.updated' }));
+    expect(llm.continuationPrompt).toContain('<execution_knowledge>');
+    expect(llm.continuationPrompt).toContain('<acceptance_checklist>');
+    expect(llm.continuationPrompt).toContain('LongHorizonCheckpointTeam');
+
+    const executionKnowledge = JSON.parse(
+      await readFile(path.join(workspaceCwd, '.roy', 'cache', 'execution-knowledge.json'), 'utf8')
+    );
+    expect(executionKnowledge.steps).toHaveLength(3);
+    expect(executionKnowledge.paths).toHaveLength(3);
+    expect(executionKnowledge.actors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'team', generation: 1 }),
+      expect.objectContaining({ kind: 'agent', role: 'researcher' }),
+      expect.objectContaining({ kind: 'agent', role: 'tester' }),
+    ]));
+    expect(result.executionTree.steps[0].cache).toMatchObject({
+      path: expect.objectContaining({
+        id: `${result.executionTree.steps[0].id}.path`,
+      }),
+    });
 
     const persisted = await runtime.listPersistedRootExecutionTrees('dynamic-tree-test');
     expect(persisted).toHaveLength(1);
@@ -324,8 +354,9 @@ describe('Root dynamic execution tree', () => {
     );
 
     expect(result.decision.action).toBe('spawn_subagents');
-    expect(result.executionTree.steps[0].decision).toMatchObject({ action: 'delegate', agentCount: 1 });
-    expect(result.executionTree.steps[0].actorIds).toHaveLength(1);
+    expect(result.executionTree.steps[0].decision).toMatchObject({ action: 'delegate', agentCount: 2 });
+    expect(result.executionTree.steps[0].actorIds).toHaveLength(2);
+    expect(result.executionTree.steps[0].teamIds).toHaveLength(1);
     expect(result.subagents[0].node.identity.archetype).toBe('researcher');
     expect(result.executionTree.steps[0].activities).toContainEqual(expect.objectContaining({
       kind: 'tool',
@@ -495,6 +526,13 @@ describe('Root dynamic execution tree', () => {
       type: 'root.step.recovered',
       data: expect.objectContaining({ recovery: 'synthesize_completed_prior_steps' }),
     }));
+    expect(result.executionTree.steps[1].cache).toMatchObject({
+      step: expect.objectContaining({ status: 'failed' }),
+      path: expect.objectContaining({ status: expect.stringMatching(/failed|partial/) }),
+    });
+    expect(result.executionTree.steps[1].cache?.feedback).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'actor_failure', actionable: true }),
+    ]));
     await runtime.shutdown();
   });
 
@@ -511,9 +549,79 @@ describe('Root dynamic execution tree', () => {
     const result = await runtime.handleUserTurn('Execute this multi-step task progressively with checkpoints until complete.');
 
     expect(result.decision.action).toBe('spawn_subagents');
-    expect(result.subagents[0].node.identity.archetype).toBe('planner');
+    expect(result.teams).toHaveLength(1);
+    expect(result.subagents.map(item => item.node.identity.archetype)).toEqual([
+      'researcher',
+      'tester',
+    ]);
     expect(result.executionTree.steps.map(step => step.decision.action)).toEqual(['delegate', 'finalize']);
     expect(runtime.getEvents()).toContainEqual(expect.objectContaining({ type: 'root.task_loop.promoted' }));
     await runtime.shutdown();
+  });
+
+  it('rejects premature finalize when a long-horizon mutation path is still unverified', () => {
+    const runtime = new Runtime();
+    const ensureRecovery = (runtime as unknown as {
+      ensureLongHorizonRecoveryContinuation: (
+        continuation: { action: 'finalize'; reason: string },
+        task: string,
+        step: unknown,
+        delegationRound: number,
+        maxDelegationRounds: number,
+        requiresLongHorizon: boolean,
+        requiresWorkspaceMutation: boolean,
+        correlationId: string
+      ) => {
+        action: string;
+        agents?: Array<{ archetype: string; name: string }>;
+        coordination?: string;
+        team?: { memberDelegationPolicy?: string };
+      };
+    }).ensureLongHorizonRecoveryContinuation;
+    const continuation = ensureRecovery.call(
+      runtime,
+      { action: 'finalize', reason: 'The first edit appears sufficient.' },
+      'Continue until the workspace migration is implemented and verified.',
+      {
+        id: 'step_01',
+        index: 1,
+        cache: {
+          path: {
+            id: 'step_01.path',
+            status: 'partial',
+            mutationObserved: true,
+            verificationObserved: false,
+          },
+          feedback: [{
+            actionable: true,
+            summary: 'The verification command has not run.',
+          }],
+        },
+      },
+      1,
+      4,
+      true,
+      true,
+      'long-horizon-recovery-test'
+    );
+
+    expect(continuation).toMatchObject({
+      action: 'delegate_more',
+      coordination: 'team',
+      agents: [
+        { archetype: 'coder', name: 'RecoveryExecutor-2' },
+        { archetype: 'tester', name: 'RecoveryVerifier-2' },
+      ],
+      team: { memberDelegationPolicy: 'allow' },
+    });
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'root.step.long_horizon_recovery.required',
+      correlationId: 'long-horizon-recovery-test',
+      data: expect.objectContaining({
+        pathStatus: 'partial',
+        mutationObserved: true,
+        verificationObserved: false,
+      }),
+    }));
   });
 });

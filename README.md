@@ -40,7 +40,7 @@ The same decision path runs for non-root agents. A team member may create a chil
 
 ## Dynamic Root Execution Tree
 
-A root turn is a bounded sequence of dependent execution steps, not a one-shot delegation plan. Each step stores its decision, dependencies, actors, teams, result summary, activity graph, checkpoint, and a complete tree snapshot. Activities distinguish conversation, context loading, root thinking, tool calls, agent/team work, delegation, synthesis, and control transitions. After every delegated step, Roy reassesses the original task against accumulated evidence, warnings, budget, and prior results. Roy may add another dependent branch, ask for missing input, or finalize. Only Roy produces the user-facing result.
+A root turn is a bounded sequence of dependent execution steps, not a one-shot delegation plan. Each step stores its decision, dependencies, actors, teams, result summary, activity graph, checkpoint, complete tree snapshot, and an execution-cache snapshot. The cache makes the step, its path, every generated agent/team definition, and actionable feedback independently addressable. Activities distinguish conversation, context loading, root thinking, tool calls, agent/team work, delegation, synthesis, and control transitions. After every delegated step, Roy reassesses the original task against accumulated evidence, warnings, budget, and prior results. Roy may add another dependent branch, ask for missing input, or finalize. Only Roy produces the user-facing result.
 
 ```text
 Step 1: inspect
@@ -56,7 +56,9 @@ Step 3: finalize (depends on step 2)
 Roy -> final response
 ```
 
-The live registry and historical snapshots are deliberately separate from actor lifecycle. A completed child may be released while remaining visible in every relevant step snapshot. Trees are atomically persisted under `.roy/execution-trees/<session-id>/<correlation-id>.json` after each step and loaded again after runtime restart. Correlation IDs include the session and a random suffix, so histories from concurrent or restarted runtimes do not collide. Use `/tree`, `/tree <correlation-id>`, `/tree list`, `GET /v1/execution-tree`, `GET /v1/execution-tree/:correlationId`, or `GET /v1/execution-trees` to inspect this state. Queue messages `root.step.plan` and `root.step.result`, plus `root.step.*` events, expose the same control flow.
+The live registry and historical snapshots are deliberately separate from actor lifecycle. A completed child may be released while remaining visible in every relevant step snapshot. Trees are atomically persisted under `.roy/execution-trees/<session-id>/<correlation-id>.json` after each step and loaded again after runtime restart. The cross-turn execution cache is stored in `.roy/cache/execution-knowledge.json`; it separates authoritative observed paths from invalid paths, records successful and failed tools, mutation/verification closure, parent paths, actor generations, and actionable tool/actor/external feedback. Root and descendant delegation controllers receive a bounded task-relevant view of this cache plus an acceptance checklist extracted from the task. Before closure they must classify each item with runtime evidence and inspect stale parallel declarations, call sites, generated metadata, configuration, and compatibility paths. Repeated `fs.read`/`fs.list` calls against a cached invalid path are also rejected at the tool boundary until a mutation or an explicitly changed hypothesis makes the retry meaningful. Long-horizon mutation paths cannot finalize while their latest mutation remains partial or unverified; Roy derives a sequential recovery executor/verifier team and caches the next checkpoint instead.
+
+Correlation IDs include the session and a random suffix, so histories from concurrent or restarted runtimes do not collide. Use `/tree`, `/tree <correlation-id>`, `/tree list`, `/cache execution`, `GET /v1/execution-tree`, `GET /v1/execution-tree/:correlationId`, `GET /v1/execution-trees`, or `GET /v1/cache/execution` to inspect this state. Queue messages `root.step.plan` and `root.step.result`, plus `root.step.*`, `execution.cache.*`, `execution.path.*`, `execution.feedback.*`, `tool.path.cache_rejected`, and `root.step.long_horizon_recovery.required` events, expose the same control flow.
 
 The root task loop reserves a final synthesis step and applies four independent guards: step count, delegation rounds, wall-clock deadline, and repeated checkpoint fingerprints. Long-horizon or explicitly staged requests are promoted into an initial planning checkpoint even when a model initially classifies them as direct-answer tasks.
 
@@ -74,7 +76,11 @@ Workspace limits prevent an unbounded reasoning loop:
       "reassessAfterDelegation": true,
       "maxWallClockMs": 900000,
       "maxStalledIterations": 2,
-      "persistEveryStep": true
+      "persistEveryStep": true,
+      "cacheExecutionKnowledge": true,
+      "teamFirstLongHorizon": true,
+      "maxCachedSteps": 200,
+      "maxFeedbackItemsInPrompt": 24
     }
   }
 }
@@ -127,7 +133,7 @@ Roy [root]
 
 A subteam has its own identity, FSM, task/result boundary, synthesis call, token usage, message flow, memory directory, topology snapshot, session log, and reusable cache pattern. Member tasks flow `parent -> team -> member`; member results flow `member -> team -> parent`.
 
-Team execution is policy controlled. A team can run sequentially or with bounded concurrency, stop on the first failure or continue in best-effort mode, and require a minimum number of successful members before synthesis. A model-generated synthesis policy is stored on the team actor and injected into team synthesis. Cached team patterns restore member tasks, tools, skills, lead assignment, full ToM profiles, cognitive-gap assignments, execution policy, and synthesis policy into a new runtime team instance.
+Team execution is policy controlled. A team can run sequentially or with bounded concurrency, stop on the first failure or continue in best-effort mode, and require a minimum number of successful members before synthesis. During sequential execution, each later member receives an in-step cache of prior member results and failures. It can consume that feedback, avoid repeated failed paths, add evidence, or recursively create a child team when a newly exposed gap requires it. This allows one root step to contain multiple actor generations while preserving a single parent path and synthesis boundary. A model-generated synthesis policy is stored on the team actor and injected into team synthesis. Cached team patterns restore member tasks, tools, skills, lead assignment, full ToM profiles, cognitive-gap assignments, execution policy, and synthesis policy into a new runtime team instance.
 
 ## Multi-Turn Experiments
 
@@ -178,7 +184,7 @@ Workspace policy is stored in `.roy/config.json`:
 }
 ```
 
-Existing workspace configs are migrated to schema version 9 without discarding user overrides.
+Existing workspace configs are migrated to schema version 12 without discarding user overrides.
 
 ## Web Tools And Continuous Execution
 
@@ -314,7 +320,7 @@ Roy initializes a project-local `.roy/` workspace:
   public/       Shared project, context, decision, and constraint memory
   agents/       Private identity, prompt, context, memory, state, and sessions
   teams/        Team memory and topology
-  cache/        Agent, delegation, team, proposal, and evolution records
+  cache/        Agent, delegation, team, execution-path, feedback, proposal, and evolution records
   queue/        Queue state location
   sessions/     Complete conversation JSONL files
   traces/       Runtime event traces
@@ -552,6 +558,7 @@ The package also exposes `roy/runtime`, `roy/team`, `roy/tom`, `roy/communicatio
 /cache agents
 /cache delegations
 /cache teams
+/cache execution
 /cache evolution
 /evo
 /evo run --profile evo_team "Analyze this repository architecture and identify risks"
@@ -608,7 +615,7 @@ POST /v1/budget/allocations/:id/consume
 POST /v1/budget/allocations/:id/settle
 POST /v1/budget/allocations/:id/release
 POST /v1/budget/rebalance
-GET  /v1/cache/:kind
+GET  /v1/cache/:kind      # agents, delegations, teams, execution, or evolution
 GET  /v1/events
 GET  /v1/messages
 GET  /v1/communication

@@ -137,3 +137,12 @@ export type {
   WorkspaceRuntimeConfig,
   WorkspaceMemoryState,
 } from './workspace.js';
+export type {
+  ExecutionCachedActor,
+  ExecutionCachedPath,
+  ExecutionCachedStep,
+  ExecutionCacheSnapshot,
+  ExecutionFeedbackKind,
+  ExecutionFeedbackRecord,
+  ExecutionKnowledgeCacheState,
+} from '../runtime/executionCache.js';

@@ -175,6 +175,8 @@ export class RootExecutionActivityProjector {
 
   private kindForEvent(type: string): RootExecutionActivityKind | undefined {
     if (type === 'context.loaded' || type === 'team.context.loaded' || type.startsWith('memory.load')) return 'context';
+    if (type.startsWith('execution.cache')) return 'context';
+    if (type.startsWith('execution.feedback') || type.startsWith('execution.path')) return 'control';
     if (type === 'agent.llm.called' || type === 'delegation.decision' || type.startsWith('tom.')) return 'thinking';
     if (type.startsWith('tool.') || type.includes('.tool_loop')) return 'tool';
     if (type.startsWith('delegation.') || type.startsWith('spawn.') || type.startsWith('agent.create')) return 'delegation';

@@ -514,6 +514,7 @@ export class Roy {
       /cache agents       Show cached agent patterns
       /cache delegations  Show cached delegation patterns
       /cache teams        Show cached team patterns
+      /cache execution    Show cached steps, paths, generated actors, and feedback
       /cache evolution    Show delegation evolution history
       /evo                Show Phase 6 evolution config and latest run
       /evo run [--profile <profile>] "task" Run team-first evolution
@@ -1881,6 +1882,27 @@ export class Roy {
 
   private async printCache(parts: string[]): Promise<void> {
     const scope = parts[1] ?? 'agents';
+    if (scope === 'execution') {
+      const knowledge = await runtime.getExecutionKnowledge(undefined, 24);
+      console.log('\n  ' + this.bold('Cache: execution'));
+      console.log(`    steps: ${knowledge.steps.length}  paths: ${knowledge.paths.length}  actors: ${knowledge.actors.length}  feedback: ${knowledge.feedback.length}`);
+      for (const step of knowledge.steps.slice(-12)) {
+        const pathState = knowledge.paths.find(item => item.id === step.pathId);
+        console.log(`    - ${this.cyan(step.stepId)} action=${step.action} status=${step.status} path=${pathState?.status ?? '-'}`);
+        if (pathState?.observedPaths.length) {
+          console.log(`      observed: ${pathState.observedPaths.slice(0, 8).join(', ')}`);
+        }
+        if (pathState?.invalidPaths.length) {
+          console.log(`      invalid:  ${pathState.invalidPaths.slice(0, 8).join(', ')}`);
+        }
+        const feedback = knowledge.feedback.filter(item => item.stepId === step.stepId && item.actionable);
+        for (const item of feedback.slice(0, 4)) {
+          console.log(`      feedback: [${item.kind}] ${item.summary}`);
+        }
+      }
+      console.log('');
+      return;
+    }
     if (scope === 'evolution') {
       const records = await runtime.getEvolutionHistory(20);
       console.log('\n  ' + this.bold('Cache: evolution'));

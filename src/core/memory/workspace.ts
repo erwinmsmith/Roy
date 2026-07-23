@@ -3,6 +3,11 @@ import path from 'node:path';
 import type { ToMProfile, ToMTaskAnalysis } from '../tom/index.js';
 import type { RuntimeEvent } from '../runtime/Runtime.js';
 import type { RootExecutionTreeState } from '../runtime/executionTree.js';
+import {
+  EMPTY_EXECUTION_KNOWLEDGE_CACHE,
+  type ExecutionCacheSnapshot,
+  type ExecutionKnowledgeCacheState,
+} from '../runtime/executionCache.js';
 import type { EvolutionPattern, EvolutionRunOptions } from '../evolution/index.js';
 import type {
   ActorKind,
@@ -50,6 +55,7 @@ export interface RootMemoryContext {
   teamPatterns: unknown[];
   delegationPatterns: unknown[];
   evolutionPatterns: unknown[];
+  executionKnowledge: ExecutionKnowledgeCacheState;
 }
 
 export interface ConversationEntry {
@@ -182,6 +188,10 @@ export interface WorkspaceRuntimeConfig {
       maxWallClockMs: number;
       maxStalledIterations: number;
       persistEveryStep: boolean;
+      cacheExecutionKnowledge: boolean;
+      teamFirstLongHorizon: boolean;
+      maxCachedSteps: number;
+      maxFeedbackItemsInPrompt: number;
     };
     candidateScoring: {
       enabledScorers: Array<'heuristic' | 'cost' | 'tom' | 'cache_evolution' | 'llm'>;
@@ -321,6 +331,8 @@ export interface MemorySignals {
     agentResults: number;
     rootFinalResponses: number;
     groundedAgentResults: number;
+    cachedExecutionSteps: number;
+    actionableExecutionFeedback: number;
   };
   toolCalls: string[];
   agents: Array<{
@@ -335,6 +347,14 @@ export interface MemorySignals {
       observedPaths: string[];
       toolResultSummary?: string;
     };
+  }>;
+  executionFeedback: Array<{
+    kind: string;
+    actorId?: string;
+    toolName?: string;
+    path?: string;
+    summary: string;
+    pathId: string;
   }>;
   candidateSignals: string[];
 }
@@ -504,7 +524,7 @@ Role-specific terms are recorded here.
 };
 
 const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
-  version: 11,
+  version: 12,
   traceEvents: true,
   memoryUpdates: 'suggest',
   llm: {
@@ -529,6 +549,10 @@ const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
       maxWallClockMs: 15 * 60_000,
       maxStalledIterations: 2,
       persistEveryStep: true,
+      cacheExecutionKnowledge: true,
+      teamFirstLongHorizon: true,
+      maxCachedSteps: 200,
+      maxFeedbackItemsInPrompt: 24,
     },
     candidateScoring: {
       enabledScorers: ['heuristic', 'cost', 'tom', 'cache_evolution', 'llm'],
@@ -725,6 +749,10 @@ export class WorkspaceMemoryManager {
     await this.writeIfMissing(path.join(cachePath, 'delegation-patterns.json'), JSON.stringify({ patterns: [] }, null, 2) + '\n');
     await this.writeIfMissing(path.join(cachePath, 'evolution-patterns.json'), JSON.stringify({ patterns: [] }, null, 2) + '\n');
     await this.writeIfMissing(path.join(cachePath, 'tool-results.json'), JSON.stringify({ results: [] }, null, 2) + '\n');
+    await this.writeIfMissing(
+      path.join(cachePath, 'execution-knowledge.json'),
+      JSON.stringify(EMPTY_EXECUTION_KNOWLEDGE_CACHE, null, 2) + '\n'
+    );
     await this.writeIfMissing(path.join(cachePath, 'memory-proposals.json'), JSON.stringify({ proposals: [] }, null, 2) + '\n');
     await this.writeIfMissing(path.join(cachePath, 'memory-updates.json'), JSON.stringify({ updates: [] }, null, 2) + '\n');
     await this.writeIfMissing(path.join(cachePath, 'evolution-history.jsonl'), '');
@@ -799,6 +827,7 @@ export class WorkspaceMemoryManager {
       teamPatterns: await this.readPatterns('team-patterns.json'),
       delegationPatterns: await this.readPatterns('delegation-patterns.json'),
       evolutionPatterns: await this.readPatterns('evolution-patterns.json'),
+      executionKnowledge: await this.readExecutionKnowledge(undefined, 24),
     };
   }
 
@@ -900,6 +929,73 @@ export class WorkspaceMemoryManager {
       }
     }
     return records.sort((left, right) => right.updatedAt - left.updatedAt);
+  }
+
+  async writeExecutionCacheSnapshot(snapshot: ExecutionCacheSnapshot, maxSteps = 200): Promise<string> {
+    if (!this.initialized) throw new Error('Workspace memory is not initialized');
+    const filePath = path.join(this.rootPath, 'cache', 'execution-knowledge.json');
+    await this.withFileLock(filePath, async () => {
+      const current = await this.readJson<ExecutionKnowledgeCacheState>(
+        filePath,
+        structuredClone(EMPTY_EXECUTION_KNOWLEDGE_CACHE)
+      );
+      const upsert = <T extends { id: string }>(items: T[], incoming: T[]): T[] => {
+        const byId = new Map(items.map(item => [item.id, item]));
+        for (const item of incoming) byId.set(item.id, item);
+        return [...byId.values()];
+      };
+      const boundedSteps = upsert(current.steps ?? [], [snapshot.step])
+        .sort((left, right) => left.updatedAt - right.updatedAt)
+        .slice(-Math.max(1, maxSteps));
+      const stepIds = new Set(boundedSteps.map(step => step.stepId));
+      const state: ExecutionKnowledgeCacheState = {
+        version: 1,
+        updatedAt: Date.now(),
+        steps: boundedSteps,
+        paths: upsert(current.paths ?? [], [snapshot.path])
+          .filter(item => stepIds.has(item.stepId)),
+        actors: upsert(current.actors ?? [], snapshot.actors)
+          .filter(item => stepIds.has(item.stepId)),
+        feedback: upsert(current.feedback ?? [], snapshot.feedback)
+          .filter(item => stepIds.has(item.stepId)),
+      };
+      await this.writeAtomic(filePath, JSON.stringify(state, null, 2) + '\n');
+    });
+    return filePath;
+  }
+
+  async readExecutionKnowledge(task?: string, limit = 24): Promise<ExecutionKnowledgeCacheState> {
+    const filePath = path.join(this.rootPath, 'cache', 'execution-knowledge.json');
+    const current = await this.readJson<ExecutionKnowledgeCacheState>(
+      filePath,
+      structuredClone(EMPTY_EXECUTION_KNOWLEDGE_CACHE)
+    );
+    const boundedLimit = Math.max(1, limit);
+    const taskTerms = this.executionKnowledgeTerms(task ?? '');
+    const ranked = [...(current.steps ?? [])]
+      .map(step => {
+        const candidateTerms = this.executionKnowledgeTerms(`${step.task}\n${step.resultSummary ?? ''}`);
+        const overlap = taskTerms.size === 0
+          ? 0
+          : [...taskTerms].filter(term => candidateTerms.has(term)).length / taskTerms.size;
+        return {
+          step,
+          score: task && step.task === task ? 100 : overlap * 10,
+        };
+      })
+      .sort((left, right) => right.score - left.score || right.step.updatedAt - left.step.updatedAt)
+      .slice(0, boundedLimit)
+      .map(item => item.step)
+      .sort((left, right) => left.updatedAt - right.updatedAt);
+    const stepIds = new Set(ranked.map(step => step.stepId));
+    return {
+      version: 1,
+      updatedAt: current.updatedAt ?? 0,
+      steps: ranked,
+      paths: (current.paths ?? []).filter(item => stepIds.has(item.stepId)),
+      actors: (current.actors ?? []).filter(item => stepIds.has(item.stepId)),
+      feedback: (current.feedback ?? []).filter(item => stepIds.has(item.stepId)),
+    };
   }
 
   async ensureAgentMemory(agentKey: string, options: { name?: string; role?: string; description?: string } = {}): Promise<void> {
@@ -1213,6 +1309,7 @@ Keep this agent identity separate from the model provider identity.
     const agentResults = conversations.filter(entry => entry.role === 'agent' && entry.metadata?.kind === 'agent.result');
     const rootFinalResponses = conversations.filter(entry => entry.role === 'assistant' && entry.metadata?.kind === 'root.final_response');
     const commandEntries = conversations.filter(entry => entry.metadata?.command === 'spawn' || entry.role === 'user');
+    const executionKnowledge = await this.readExecutionKnowledge(undefined, 50);
     const agents = agentResults.map(entry => {
       const metadata = entry.metadata ?? {};
       const evidence = this.normalizeEvidence(metadata.evidence);
@@ -1253,6 +1350,15 @@ Keep this agent identity separate from the model provider identity.
         candidateSignals.add('roy.delegation_lesson');
       }
     }
+    if (executionKnowledge.feedback.some(item => item.actionable)) {
+      candidateSignals.add('roy.execution_feedback');
+    }
+    if (executionKnowledge.paths.some(item => item.invalidPaths.length > 0)) {
+      candidateSignals.add('roy.invalid_path');
+    }
+    if (executionKnowledge.paths.some(item => item.mutationObserved && item.verificationObserved)) {
+      candidateSignals.add('roy.execution_closure');
+    }
 
     return {
       source: {
@@ -1265,9 +1371,21 @@ Keep this agent identity separate from the model provider identity.
         agentResults: agentResults.length,
         rootFinalResponses: rootFinalResponses.length,
         groundedAgentResults: agents.filter(agent => agent.grounded).length,
+        cachedExecutionSteps: executionKnowledge.steps.length,
+        actionableExecutionFeedback: executionKnowledge.feedback.filter(item => item.actionable).length,
       },
       toolCalls: [...new Set(agents.flatMap(agent => agent.toolCalls))],
       agents,
+      executionFeedback: executionKnowledge.feedback
+        .filter(item => item.actionable)
+        .map(item => ({
+          kind: item.kind,
+          actorId: item.actorId,
+          toolName: item.toolName,
+          path: item.path,
+          summary: item.summary,
+          pathId: item.pathId,
+        })),
       candidateSignals: [...candidateSignals],
     };
   }
@@ -2362,6 +2480,17 @@ Keep this agent identity separate from the model provider identity.
 
   private safeKey(value: string): string {
     return value.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'agent';
+  }
+
+  private executionKnowledgeTerms(value: string): Set<string> {
+    return new Set(
+      value
+        .toLowerCase()
+        .split(/[^a-z0-9_\-./\u4e00-\u9fff]+/)
+        .map(item => item.trim())
+        .filter(item => item.length >= 3)
+        .slice(0, 160)
+    );
   }
 
   private capitalize(value: string): string {

@@ -511,13 +511,19 @@ async function main(): Promise<void> {
 
   app.get('/v1/cache/:kind', async (req, res) => {
     const kind = req.params.kind;
+    if (kind === 'execution') {
+      const limit = req.query.limit ? Number(req.query.limit) : 24;
+      const task = typeof req.query.task === 'string' ? req.query.task : undefined;
+      res.json(await runtime.getExecutionKnowledge(task, Number.isFinite(limit) && limit > 0 ? limit : 24));
+      return;
+    }
     if (kind === 'evolution') {
       const limit = req.query.limit ? Number(req.query.limit) : 50;
       res.json(await runtime.getEvolutionHistory(Number.isFinite(limit) && limit > 0 ? limit : 50));
       return;
     }
     if (kind !== 'agents' && kind !== 'delegations' && kind !== 'teams') {
-      res.status(400).json({ error: 'Cache kind must be agents, delegations, teams, or evolution' });
+      res.status(400).json({ error: 'Cache kind must be agents, delegations, teams, execution, or evolution' });
       return;
     }
     res.json(await runtime.getCachePatterns(kind));

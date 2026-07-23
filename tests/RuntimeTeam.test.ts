@@ -167,6 +167,13 @@ describe('Phase 3 subteam runtime', () => {
     ]);
     expect(runtime.getEvents().map(event => event.type)).toContain('team.synthesis.completed');
     expect(runtime.getEvents().find(event => event.type === 'team.context.loaded')?.agentId).toBe(team.identity.id);
+    expect(runtime.getEvents().filter(event => event.type === 'team.member.step_cache.injected')).toHaveLength(2);
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'agent.run.started',
+      data: expect.objectContaining({
+        task: expect.stringContaining('<team_step_cache>'),
+      }),
+    }));
 
     const budget = runtime.getBudgetState();
     expect(budget.perTeam[team.identity.id].totalTokens).toBe(result.usage.totalTokens);
