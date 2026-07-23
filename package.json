@@ -57,6 +57,7 @@
   },
   "bin": {
     "roy": "dist/cli/Roy.js",
+    "roy-run": "dist/cli/Run.js",
     "roy-server": "dist/server/index.js"
   },
   "files": [

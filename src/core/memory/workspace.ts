@@ -242,6 +242,14 @@ export interface WorkspaceRuntimeConfig {
       allowHttp: boolean;
       userAgent: string;
     };
+    shell: {
+      mode: 'allowlist' | 'unrestricted';
+      shell: string;
+      defaultTimeoutMs: number;
+      maxTimeoutMs: number;
+      defaultMaxOutputBytes: number;
+      maxCallsPerAgent: number;
+    };
     executionLoop: {
       enabled: boolean;
       maxRounds: number;
@@ -496,7 +504,7 @@ Role-specific terms are recorded here.
 };
 
 const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
-  version: 10,
+  version: 11,
   traceEvents: true,
   memoryUpdates: 'suggest',
   llm: {
@@ -547,7 +555,7 @@ const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
       researcher: ['fs.list', 'fs.read'],
       critic: ['fs.read'],
       planner: [],
-      coder: ['fs.read', 'shell.exec'],
+      coder: ['fs.read', 'fs.write', 'shell.exec'],
       summarizer: [],
       tester: ['fs.read', 'shell.exec'],
       custom: [],
@@ -612,6 +620,14 @@ const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
       maxContentChars: 20_000,
       allowHttp: false,
       userAgent: 'RoyRuntime/0.1 (+https://github.com/erwinmsmith/Roy)',
+    },
+    shell: {
+      mode: 'allowlist',
+      shell: process.env.SHELL || '/bin/sh',
+      defaultTimeoutMs: 10_000,
+      maxTimeoutMs: 60_000,
+      defaultMaxOutputBytes: 40_000,
+      maxCallsPerAgent: 5,
     },
     executionLoop: {
       enabled: true,

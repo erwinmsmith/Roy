@@ -1,9 +1,10 @@
-import { execFile } from 'node:child_process';
+import { exec, execFile } from 'node:child_process';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import type { Tool, ToolResult } from './types.js';
 
 const execFileAsync = promisify(execFile);
+const execAsync = promisify(exec);
 
 interface CommandPolicy {
   executable: string;
@@ -21,6 +22,18 @@ export interface ShellExecResult {
   stderr: string;
   exitCode: number;
   timedOut: boolean;
+  mode: ShellExecMode;
+}
+
+export type ShellExecMode = 'allowlist' | 'unrestricted';
+
+export interface ShellExecConfig {
+  mode: ShellExecMode;
+  workspaceRoot: string;
+  shell: string;
+  defaultTimeoutMs: number;
+  maxTimeoutMs: number;
+  defaultMaxOutputBytes: number;
 }
 
 const COMMAND_POLICIES: CommandPolicy[] = [
@@ -37,26 +50,34 @@ const COMMAND_POLICIES: CommandPolicy[] = [
 const DEFAULT_TIMEOUT_MS = 10_000;
 const MAX_TIMEOUT_MS = 60_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 40_000;
+const DEFAULT_CONFIG: ShellExecConfig = {
+  mode: 'allowlist',
+  workspaceRoot: process.cwd(),
+  shell: process.env.SHELL || '/bin/sh',
+  defaultTimeoutMs: DEFAULT_TIMEOUT_MS,
+  maxTimeoutMs: MAX_TIMEOUT_MS,
+  defaultMaxOutputBytes: DEFAULT_MAX_OUTPUT_BYTES,
+};
 
 export class ShellExecTool implements Tool {
   readonly name = 'shell.exec';
-  readonly description = 'Execute a safe allowlisted command in the current project workspace.';
+  readonly description = 'Execute a command in the configured workspace. Defaults to a safe allowlist; unrestricted shell mode requires explicit workspace policy and runtime approval.';
   readonly version = '0.1.0';
   readonly parameters = {
     command: {
       type: 'string' as const,
       required: true,
-      description: 'Command line to execute. It must match the shell.exec allowlist.',
+      description: 'Command line to execute. It must match the allowlist unless unrestricted mode is explicitly configured.',
     },
     cwd: {
       type: 'string' as const,
       required: false,
-      description: 'Working directory. Defaults to the process cwd and must stay inside the workspace.',
+      description: 'Working directory relative to the configured workspace.',
     },
     timeoutMs: {
       type: 'number' as const,
       required: false,
-      description: 'Timeout in milliseconds. Max 60000.',
+      description: 'Timeout in milliseconds, capped by workspace policy.',
     },
     maxOutputBytes: {
       type: 'number' as const,
@@ -64,6 +85,16 @@ export class ShellExecTool implements Tool {
       description: 'Maximum stdout/stderr bytes returned.',
     },
   };
+
+  private readonly config: ShellExecConfig;
+
+  constructor(config: Partial<ShellExecConfig> = {}) {
+    this.config = {
+      ...DEFAULT_CONFIG,
+      ...config,
+      workspaceRoot: path.resolve(config.workspaceRoot ?? DEFAULT_CONFIG.workspaceRoot),
+    };
+  }
 
   validate(params: Record<string, unknown>): { valid: boolean; errors?: string[] } {
     const errors: string[] = [];
@@ -79,50 +110,61 @@ export class ShellExecTool implements Tool {
     if (params.maxOutputBytes !== undefined && (typeof params.maxOutputBytes !== 'number' || !Number.isFinite(params.maxOutputBytes) || params.maxOutputBytes <= 0)) {
       errors.push('maxOutputBytes must be a positive number when provided');
     }
+    if (typeof params.command === 'string' && params.command.includes('\0')) {
+      errors.push('command must not contain NUL bytes');
+    }
     return { valid: errors.length === 0, errors: errors.length > 0 ? errors : undefined };
   }
 
   async execute(params: Record<string, unknown>): Promise<ToolResult> {
     const command = String(params.command).trim();
-    let parsed: string[];
-    try {
-      parsed = this.parseCommand(command);
-    } catch (error) {
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : String(error),
-      };
-    }
-    if (parsed.length === 0) {
-      return { success: false, error: 'Command is empty' };
-    }
-
-    const [executable, ...args] = parsed;
-    const policy = this.findPolicy(executable, args);
-    if (!policy) {
-      return {
-        success: false,
-        error: `Command is not allowlisted: ${this.redactCommand(command)}`,
-        metadata: {
-          allowed: this.formatAllowlist(),
-        },
-      };
-    }
-
-    const workspaceRoot = path.resolve(process.cwd());
+    const workspaceRoot = this.config.workspaceRoot;
     const cwd = this.resolveCwd(typeof params.cwd === 'string' ? params.cwd : undefined, workspaceRoot);
     if (!cwd) {
       return { success: false, error: 'cwd must stay inside the current workspace' };
     }
 
-    if (policy.readOnlyPaths && !this.argsStayInsideWorkspace(args, workspaceRoot, cwd)) {
-      return { success: false, error: 'path arguments must be relative paths inside the current workspace' };
-    }
-
-    const timeoutMs = Math.min(Number(params.timeoutMs ?? DEFAULT_TIMEOUT_MS), MAX_TIMEOUT_MS);
-    const maxOutputBytes = Number(params.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES);
+    const timeoutMs = Math.min(Number(params.timeoutMs ?? this.config.defaultTimeoutMs), this.config.maxTimeoutMs);
+    const maxOutputBytes = Number(params.maxOutputBytes ?? this.config.defaultMaxOutputBytes);
 
     try {
+      if (this.config.mode === 'unrestricted') {
+        const output = await execAsync(command, {
+          cwd,
+          timeout: timeoutMs,
+          maxBuffer: Math.max(maxOutputBytes * 2, 1024),
+          windowsHide: true,
+          shell: this.config.shell,
+        });
+        return {
+          success: true,
+          result: this.buildResult(command, this.config.shell, ['-lc', command], cwd, output.stdout, output.stderr, 0, false, maxOutputBytes),
+          metadata: {
+            mode: this.config.mode,
+            timeoutMs,
+          },
+        };
+      }
+
+      const parsed = this.parseCommand(command);
+      if (parsed.length === 0) {
+        return { success: false, error: 'Command is empty' };
+      }
+      const [executable, ...args] = parsed;
+      const policy = this.findPolicy(executable, args);
+      if (!policy) {
+        return {
+          success: false,
+          error: `Command is not allowlisted: ${this.redactCommand(command)}`,
+          metadata: {
+            mode: this.config.mode,
+            allowed: this.formatAllowlist(),
+          },
+        };
+      }
+      if (policy.readOnlyPaths && !this.argsStayInsideWorkspace(args, workspaceRoot, cwd)) {
+        return { success: false, error: 'path arguments must be relative paths inside the current workspace' };
+      }
       const output = await execFileAsync(executable, args, {
         cwd,
         timeout: timeoutMs,
@@ -133,6 +175,7 @@ export class ShellExecTool implements Tool {
         success: true,
         result: this.buildResult(command, executable, args, cwd, output.stdout, output.stderr, 0, false, maxOutputBytes),
         metadata: {
+          mode: this.config.mode,
           allowlistPolicy: this.policyLabel(policy),
           timeoutMs,
         },
@@ -149,8 +192,8 @@ export class ShellExecTool implements Tool {
       const timedOut = err.killed === true && err.signal === 'SIGTERM';
       const result = this.buildResult(
         command,
-        executable,
-        args,
+        this.config.mode === 'unrestricted' ? this.config.shell : parsedCommandExecutable(command),
+        this.config.mode === 'unrestricted' ? ['-lc', command] : parsedCommandArgs(command),
         cwd,
         this.outputToString(err.stdout),
         this.outputToString(err.stderr),
@@ -163,7 +206,7 @@ export class ShellExecTool implements Tool {
         result,
         error: timedOut ? `Command timed out after ${timeoutMs}ms` : err.message,
         metadata: {
-          allowlistPolicy: this.policyLabel(policy),
+          mode: this.config.mode,
           timeoutMs,
         },
       };
@@ -190,6 +233,7 @@ export class ShellExecTool implements Tool {
       stderr: this.truncate(this.outputToString(stderr), maxOutputBytes),
       exitCode,
       timedOut,
+      mode: this.config.mode,
     };
   }
 
@@ -289,4 +333,13 @@ export class ShellExecTool implements Tool {
   private formatAllowlist(): string[] {
     return COMMAND_POLICIES.map(policy => this.policyLabel(policy));
   }
+}
+
+function parsedCommandExecutable(command: string): string {
+  return command.trim().split(/\s+/, 1)[0] || '';
+}
+
+function parsedCommandArgs(command: string): string[] {
+  const [first, ...rest] = command.trim().split(/\s+/);
+  return first ? rest : [];
 }

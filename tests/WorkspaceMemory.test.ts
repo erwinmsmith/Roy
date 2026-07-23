@@ -50,7 +50,7 @@ describe('Workspace memory initialization', () => {
     });
     expect(rootState.updatedAt).toEqual(expect.any(String));
     const workspaceConfig = JSON.parse(await readFile(path.join(workspaceCwd, '.roy', 'config.json'), 'utf8'));
-    expect(workspaceConfig.version).toBe(10);
+    expect(workspaceConfig.version).toBe(11);
     expect(workspaceConfig.llm).toEqual({
       streamMaxAttempts: 3,
       jsonMaxAttempts: 2,
@@ -61,6 +61,10 @@ describe('Workspace memory initialization', () => {
       enabled: true,
       searchProvider: 'auto',
       braveApiKeyEnv: 'BRAVE_SEARCH_API_KEY',
+    }));
+    expect(workspaceConfig.tools.shell).toEqual(expect.objectContaining({
+      mode: 'allowlist',
+      maxCallsPerAgent: 5,
     }));
     expect(workspaceConfig.tools.executionLoop).toEqual(expect.objectContaining({
       enabled: true,
@@ -227,7 +231,7 @@ describe('Workspace memory initialization', () => {
     expect(researcher?.tools.map(tool => tool.name)).toEqual(['fs.read']);
     expect(researcher?.skills.map(skill => skill.name)).toEqual(['use_tool_when_needed']);
     const migratedConfig = JSON.parse(await readFile(path.join(workspaceCwd, '.roy', 'config.json'), 'utf8'));
-    expect(migratedConfig.version).toBe(10);
+    expect(migratedConfig.version).toBe(11);
     expect(migratedConfig.llm.streamMaxAttempts).toBe(3);
     expect(migratedConfig.delegation.rootSteps).toEqual({
       enabled: true,

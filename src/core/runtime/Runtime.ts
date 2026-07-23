@@ -33,6 +33,10 @@ import type { AgentInfo, AgentUsage, BaseAgent, ToMProfile } from '../agent/Base
 import { actionRegistry } from '../actions/index.js';
 import {
   AgentToolExecutionLoop,
+  FsListTool,
+  FsReadTool,
+  FsWriteTool,
+  ShellExecTool,
   WebFetchTool,
   WebSearchTool,
   registerCoreTools,
@@ -666,6 +670,7 @@ export class Runtime {
   private queue: MessageQueue | null = null;
   private scheduler: MessageScheduler | null = null;
   private memory: WorkspaceMemoryManager | null = null;
+  private workspaceRoot = process.cwd();
   private agentBindings = new Map<string, AgentBindingState>();
   private workspaceRuntimeConfig: WorkspaceRuntimeConfig | null = null;
   private contextWindowManager: ContextWindowManager | null = null;
@@ -756,8 +761,21 @@ export class Runtime {
     const memory = new WorkspaceMemoryManager();
     await memory.initWorkspace(options.workspaceCwd ?? process.cwd(), options.sessionId ?? 'main');
     this.workspaceRuntimeConfig = await memory.getWorkspaceConfig();
-    registerCoreTools({ web: this.workspaceRuntimeConfig.tools.web });
+    const workspaceRoot = options.workspaceCwd ?? process.cwd();
+    this.workspaceRoot = path.resolve(workspaceRoot);
+    registerCoreTools({
+      web: this.workspaceRuntimeConfig.tools.web,
+      shell: this.workspaceRuntimeConfig.tools.shell,
+      workspaceRoot,
+    });
     this.runtimeToolOverrides.clear();
+    this.runtimeToolOverrides.set('fs.list', new FsListTool(workspaceRoot));
+    this.runtimeToolOverrides.set('fs.read', new FsReadTool(workspaceRoot));
+    this.runtimeToolOverrides.set('fs.write', new FsWriteTool(workspaceRoot));
+    this.runtimeToolOverrides.set('shell.exec', new ShellExecTool({
+      ...this.workspaceRuntimeConfig.tools.shell,
+      workspaceRoot,
+    }));
     if (this.workspaceRuntimeConfig.tools.web.enabled) {
       const webConfig = this.workspaceRuntimeConfig.tools.web;
       this.runtimeToolOverrides.set('web.search', new WebSearchTool(webConfig));
@@ -2853,7 +2871,7 @@ export class Runtime {
       researcher: ['fs.list', 'fs.read'],
       critic: ['fs.read'],
       planner: [],
-      coder: ['fs.read', 'shell.exec'],
+      coder: ['fs.read', 'fs.write', 'shell.exec'],
       summarizer: [],
       tester: ['fs.read', 'shell.exec'],
       custom: [],
@@ -2930,10 +2948,12 @@ export class Runtime {
       permission,
       constraints: name === 'shell.exec'
         ? {
-            allowlistedCommands: ['npm', 'node', 'git', 'pwd', 'ls', 'cat', 'rg', 'sed'],
-            maxCalls: 5,
+            allowlistedCommands: this.workspaceRuntimeConfig?.tools.shell.mode === 'unrestricted'
+              ? ['*']
+              : ['npm', 'node', 'git', 'pwd', 'ls', 'cat', 'rg'],
+            maxCalls: this.workspaceRuntimeConfig?.tools.shell.maxCallsPerAgent ?? 5,
           }
-        : { allowedPaths: [process.cwd()], maxCalls: 20 },
+        : { allowedPaths: [this.workspaceRoot], maxCalls: 20 },
     };
   }
 
@@ -7767,6 +7787,10 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     if (/\b(?:run|execute)\s+(?:the\s+)?(?:tests?|build)\b|\bnpm (?:test|run build)\b/.test(lower)) {
       tools.push('shell.exec');
     }
+    if (/\b(?:terminal|shell|command line|cli|container)\b/.test(lower)
+      || /\b(?:implement|modify|edit|create|write|patch|repair|fix|refactor)\b[\s\S]*\b(?:file|code|project|repository|workspace|artifact|solution)\b/.test(lower)) {
+      tools.push('fs.read', 'fs.write', 'shell.exec');
+    }
     return Array.from(new Set(tools)).filter(tool => toolRegistry.has(tool));
   }
 
@@ -10845,6 +10869,45 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       bindings,
       archetype: options.archetype,
     });
+    const actor = this.getContext().manager.getAgentById(agentId);
+    const loopConfig = this.workspaceRuntimeConfig?.tools.executionLoop ?? {
+      enabled: true,
+      maxRounds: 6,
+      maxCallsPerRun: 10,
+      maxConsecutiveFailures: 2,
+      maxWallClockMs: 120_000,
+      maxFetchesAfterSearch: 2,
+      llmReplanning: true,
+    };
+    const needsModelPlannedAction = bindings.some(binding =>
+      binding.enabled && (binding.name === 'shell.exec' || binding.name === 'fs.write')
+    ) && (
+      /\b(?:terminal|shell|command line|cli|container)\b/i.test(task)
+      || /\b(?:implement|modify|edit|create|write|patch|repair|fix|refactor)\b[\s\S]*\b(?:file|code|project|repository|workspace|artifact|solution)\b/i.test(task)
+    );
+    if (needsModelPlannedAction
+      && loopConfig.enabled
+      && loopConfig.llmReplanning
+      && actor instanceof UnifiedAgent) {
+      const modelPlans = await actor.planNextToolRound({
+        task,
+        round: 0,
+        remainingCalls: loopConfig.maxCallsPerRun,
+        tools: bindings
+          .filter(binding => binding.enabled)
+          .map(binding => {
+            const metadata = toolRegistry.getMetadata(binding.name);
+            return {
+              name: binding.name,
+              description: metadata?.description,
+              parameters: metadata?.parameters as Record<string, unknown> | undefined,
+            };
+          }),
+        calls: [],
+      });
+      const plannedFingerprints = new Set(plans.map(plan => this.toolPlanFingerprint(plan)));
+      plans.push(...modelPlans.filter(plan => !plannedFingerprints.has(this.toolPlanFingerprint(plan))));
+    }
     if (plans.length === 0) {
       const warning = groundingRequired
         ? 'Grounding was required, but no authorized tool call could be planned for this task.'
@@ -10877,22 +10940,12 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     }
 
     await options.onBeforeExecution?.(plans);
-    const loopConfig = this.workspaceRuntimeConfig?.tools.executionLoop ?? {
-      enabled: true,
-      maxRounds: 6,
-      maxCallsPerRun: 10,
-      maxConsecutiveFailures: 2,
-      maxWallClockMs: 120_000,
-      maxFetchesAfterSearch: 2,
-      llmReplanning: true,
-    };
     const loop = new AgentToolExecutionLoop({
       maxRounds: loopConfig.enabled ? loopConfig.maxRounds : 1,
       maxCalls: loopConfig.enabled ? loopConfig.maxCallsPerRun : Math.max(1, plans.length),
       maxConsecutiveFailures: loopConfig.maxConsecutiveFailures,
       maxWallClockMs: loopConfig.maxWallClockMs,
     });
-    const actor = this.getContext().manager.getAgentById(agentId);
     const toolLoop = await loop.run({
       task,
       initialPlans: plans,
@@ -11024,6 +11077,12 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         const content = typeof read?.content === 'string' ? read.content.slice(0, 8000) : '';
         summaries.push(`${String(read?.path ?? 'file')}: ${content.slice(0, 1000)}`);
         contexts.push(`File read result for ${String(read?.path ?? 'file')}:\n${content}`);
+      } else if (call.toolName === 'fs.write') {
+        const written = call.result as { path?: unknown; bytes?: unknown; mode?: unknown } | undefined;
+        if (typeof written?.path === 'string') observedPaths.push(written.path);
+        const summary = `Wrote ${String(written?.bytes ?? 'unknown')} bytes to ${String(written?.path ?? 'file')} (${String(written?.mode ?? 'unknown')}).`;
+        summaries.push(summary);
+        contexts.push(summary);
       } else if (call.toolName === 'shell.exec') {
         const shell = call.result as { command?: unknown; stdout?: unknown; stderr?: unknown } | undefined;
         const output = [shell?.stdout, shell?.stderr].filter(value => typeof value === 'string' && value).join('\n');
@@ -11105,7 +11164,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     task: string,
     calls: Array<{ toolName: string }>
   ): boolean {
-    return calls.some(call => call.toolName.startsWith('web.'))
+    return calls.some(call => call.toolName.startsWith('web.') || call.toolName === 'shell.exec' || call.toolName === 'fs.write')
       || /\b(?:multi-step|continue|iterate|until|cross-check|multiple sources|independent sources)\b/i.test(task);
   }
 
@@ -11337,19 +11396,19 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     return /<tool_call>[\s\S]*?<\/tool_call>/i.test(result)
       || /<tool_name>[\s\S]*?<\/tool_name>/i.test(result)
       || /<function_calls>[\s\S]*?<\/function_calls>/i.test(result)
-      || /<invocation\s+name=["'](?:web\.(?:search|fetch)|fs\.(?:list|read)|shell\.exec)["'][\s\S]*?<\/invocation>/i.test(result)
-      || /```(?:tool|json)?\s*\n\s*(?:web\.(?:search|fetch)|fs\.(?:list|read)|shell\.exec)\b[\s\S]*?```/i.test(result)
+      || /<invocation\s+name=["'](?:web\.(?:search|fetch)|fs\.(?:list|read|write)|shell\.exec)["'][\s\S]*?<\/invocation>/i.test(result)
+      || /```(?:tool|json)?\s*\n\s*(?:web\.(?:search|fetch)|fs\.(?:list|read|write)|shell\.exec)\b[\s\S]*?```/i.test(result)
       || /\{\s*"(?:tool_name|tool|function)"\s*:\s*"[^"\n]+"[\s\S]*?\}/i.test(result);
   }
 
   private resolveInspectionRoot(task: string): string {
     const match = task.match(/(?:\.{1,2}\/|\/)[A-Za-z0-9._/@-]+/);
-    if (!match) return process.cwd();
-    const candidate = path.resolve(process.cwd(), match[0]);
-    const workspaceRoot = path.resolve(process.cwd());
+    if (!match) return this.workspaceRoot;
+    const workspaceRoot = this.workspaceRoot;
+    const candidate = path.resolve(workspaceRoot, match[0]);
     const relative = path.relative(workspaceRoot, candidate);
     if (relative.startsWith('..') || path.isAbsolute(relative)) {
-      return process.cwd();
+      return workspaceRoot;
     }
     return candidate;
   }

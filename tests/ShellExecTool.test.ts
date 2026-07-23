@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Runtime from '../src/core/runtime/Runtime.js';
@@ -48,6 +48,24 @@ describe('shell.exec tool', () => {
     const badPath = await tool.execute({ command: 'cat ../package.json' });
     expect(badPath.success).toBe(false);
     expect(badPath.error).toContain('path arguments');
+  });
+
+  it('supports explicitly configured unrestricted execution inside an isolated workspace', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-unrestricted-shell-'));
+    const tool = new ShellExecTool({
+      mode: 'unrestricted',
+      workspaceRoot: workspaceCwd,
+      shell: '/bin/sh',
+    });
+    const result = await tool.execute({
+      command: "printf 'benchmark-ready' > artifact.txt && printf 'done'",
+    });
+
+    expect(result.success).toBe(true);
+    const output = result.result as ShellExecResult;
+    expect(output.mode).toBe('unrestricted');
+    expect(output.stdout).toBe('done');
+    expect(await readFile(path.join(workspaceCwd, 'artifact.txt'), 'utf8')).toBe('benchmark-ready');
   });
 
   it('registers as a core tool available to Runtime agents', async () => {

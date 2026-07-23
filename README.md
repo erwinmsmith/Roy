@@ -348,9 +348,48 @@ Built-in tools include:
 
 - `fs.list`
 - `fs.read`
+- `fs.write`
 - `shell.exec`
 
 Agents plan tool use only when the task needs external evidence or execution. Tool availability comes from parent-approved bindings. Read-only tools can run automatically by default; write and execute tools require an approval unless workspace policy overrides them. `shell.exec` also applies its own command allowlist.
+
+`shell.exec` defaults to `allowlist` mode. Isolated terminal benchmarks may opt in
+to an unrestricted shell, longer tool loops, and automatic execute approval through
+the workspace `.roy/config.json`:
+
+```json
+{
+  "tools": {
+    "approval": {
+      "readOnly": "auto",
+      "write": "auto",
+      "execute": "auto",
+      "overrides": {}
+    },
+    "shell": {
+      "mode": "unrestricted",
+      "shell": "/bin/sh",
+      "defaultTimeoutMs": 120000,
+      "maxTimeoutMs": 900000,
+      "defaultMaxOutputBytes": 120000,
+      "maxCallsPerAgent": 200
+    },
+    "executionLoop": {
+      "enabled": true,
+      "maxRounds": 200,
+      "maxCallsPerRun": 200,
+      "maxConsecutiveFailures": 5,
+      "maxWallClockMs": 5400000,
+      "maxFetchesAfterSearch": 2,
+      "llmReplanning": true
+    }
+  }
+}
+```
+
+Unrestricted mode intentionally permits arbitrary shell syntax. Enable it only
+inside an external sandbox/container whose filesystem and process permissions
+define the real security boundary.
 
 Model-generated custom agents use the same capability contract. When a concrete task requires file, runtime API, web, test, or build evidence but omits an explicit binding, Runtime derives the minimum registered capability, intersects it with approval policy, and records the resulting binding on the compute node. File planning merges explicit paths with inferred runtime entry points and avoids a broad workspace listing when targeted reads are available.
 
@@ -433,6 +472,19 @@ Start the CLI:
 ```bash
 npm run dev:cli
 ```
+
+Run one task non-interactively (for harnesses and automation):
+
+```bash
+npm run build
+printf '%s\n' 'Inspect the workspace and run the tests.' | \
+  node dist/cli/Run.js --workspace . --json --output roy-run.json
+```
+
+The installed binary is `roy-run`. Its JSON artifact includes the final response,
+execution tree, correlated runtime events, messages, and token usage. Runtime state
+and complete persisted traces remain under the target workspace's `.roy/`
+directory.
 
 Start the HTTP and Socket.IO server:
 

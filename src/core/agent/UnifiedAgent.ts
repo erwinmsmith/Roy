@@ -833,6 +833,22 @@ function compactToolObservation(result: unknown, toolName: string): unknown {
       })),
     };
   }
+  if (result && typeof result === 'object' && toolName === 'shell.exec') {
+    const shell = result as {
+      command?: unknown;
+      stdout?: unknown;
+      stderr?: unknown;
+      exitCode?: unknown;
+      timedOut?: unknown;
+    };
+    return {
+      command: String(shell.command ?? '').slice(0, 1000),
+      stdout: String(shell.stdout ?? '').slice(-6000),
+      stderr: String(shell.stderr ?? '').slice(-3000),
+      exitCode: shell.exitCode,
+      timedOut: shell.timedOut,
+    };
+  }
   return compactObservationValue(result, 0);
 }
 
