@@ -4036,12 +4036,17 @@ export class Runtime {
         const tree = this.executionTrees.get(correlationId)!;
         const maxRounds = Math.max(1, rootStepConfig?.maxDelegationRounds ?? 8);
         const loopGuard = loopController.evaluate(tree);
+        const roundMutationApplied = this.delegationRoundHasWorkspaceMutation(round);
+        const exploratoryDelegationLimit = 4;
+        const executionHandoffRequired = requiresWorkspaceMutation
+          && (roundMutationApplied || delegationRounds >= exploratoryDelegationLimit);
         const canReassess = rootStepConfig?.enabled !== false
           && rootStepConfig?.reassessAfterDelegation !== false
           && roundDecision.continuationPolicy !== 'finalize_after_round'
           && !round.evolution
           && delegationRounds < maxRounds
-          && loopGuard.continue;
+          && loopGuard.continue
+          && !executionHandoffRequired;
 
         await this.transitionRootTurnState('S_assess_task', {
           correlationId,
@@ -4049,23 +4054,38 @@ export class Runtime {
           delegationRounds,
         });
         if (!canReassess) {
-          if (!loopGuard.continue && loopGuard.reason !== 'continue') loopStopReason = loopGuard.reason;
-          else if (delegationRounds >= maxRounds) loopStopReason = 'max_iterations';
-          this.emit({
-            type: 'root.step.limit_reached',
-            agentId: 'root',
-            correlationId,
-            data: {
-              stepId: step.id,
-              delegationRounds,
-              maxRounds,
-              maxSteps: tree.maxSteps,
-              reason: loopGuard.continue ? 'max_delegation_rounds' : loopGuard.reason,
-              remainingSteps: loopGuard.remainingSteps,
-              elapsedMs: loopGuard.elapsedMs,
-              stalledIterations: tree.loop.stalledIterations,
-            },
-          });
+          if (executionHandoffRequired) {
+            this.emit({
+              type: 'root.execution.handoff.required',
+              agentId: 'root',
+              correlationId,
+              data: {
+                stepId: step.id,
+                delegationRounds,
+                reason: roundMutationApplied
+                  ? 'delegated_workspace_mutation_observed'
+                  : 'delegation_round_cap_without_mutation',
+              },
+            });
+          } else {
+            if (!loopGuard.continue && loopGuard.reason !== 'continue') loopStopReason = loopGuard.reason;
+            else if (delegationRounds >= maxRounds) loopStopReason = 'max_iterations';
+            this.emit({
+              type: 'root.step.limit_reached',
+              agentId: 'root',
+              correlationId,
+              data: {
+                stepId: step.id,
+                delegationRounds,
+                maxRounds,
+                maxSteps: tree.maxSteps,
+                reason: loopGuard.continue ? 'max_delegation_rounds' : loopGuard.reason,
+                remainingSteps: loopGuard.remainingSteps,
+                elapsedMs: loopGuard.elapsedMs,
+                stalledIterations: tree.loop.stalledIterations,
+              },
+            });
+          }
           break;
         }
 
@@ -7225,6 +7245,14 @@ export class Runtime {
         .map(outcome => outcome.agentId)
         .filter((agentId): agentId is string => Boolean(agentId))),
     ])];
+  }
+
+  private delegationRoundHasWorkspaceMutation(round: RootDelegationRoundResult): boolean {
+    const calls = [
+      ...round.subagents.flatMap(item => item.subagentResult.toolCalls),
+      ...round.teams.flatMap(team => team.members.flatMap(member => member.toolCalls)),
+    ];
+    return this.hasSuccessfulWorkspaceMutation(calls);
   }
 
   private async decideRootContinuation(

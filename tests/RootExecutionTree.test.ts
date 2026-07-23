@@ -414,6 +414,50 @@ describe('Root dynamic execution tree', () => {
     await runtime.shutdown();
   });
 
+  it('hands a mutation task to root execution after bounded exploratory delegation', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-mutation-handoff-'));
+    await mkdir(path.join(workspaceCwd, '.roy'), { recursive: true });
+    await writeFile(path.join(workspaceCwd, '.roy', 'config.json'), JSON.stringify({
+      tom: { autoCompleteGaps: false, minimumCoverage: 0 },
+      delegation: {
+        rootSteps: {
+          enabled: true,
+          maxStepsPerTurn: 10,
+          maxDelegationRounds: 10,
+          reassessAfterDelegation: true,
+          maxWallClockMs: 60000,
+          maxStalledIterations: 8,
+        },
+      },
+    }));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'mutation-handoff-test',
+      workspaceCwd,
+      fsmEnabled: true,
+      llmProvider: new ContinuingStepLLM(),
+    });
+
+    const result = await runtime.handleUserTurn('Modify the project code and run tests.');
+
+    expect(result.executionTree.steps.map(step => step.decision.action)).toEqual([
+      'delegate',
+      'delegate',
+      'delegate',
+      'delegate',
+      'solve_directly',
+      'finalize',
+    ]);
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'root.execution.handoff.required',
+      data: expect.objectContaining({
+        delegationRounds: 4,
+        reason: 'delegation_round_cap_without_mutation',
+      }),
+    }));
+    await runtime.shutdown();
+  });
+
   it('keeps the execution tree running when a later delegated step is recoverable', async () => {
     const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-recoverable-step-'));
     await mkdir(path.join(workspaceCwd, '.roy'), { recursive: true });
