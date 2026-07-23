@@ -442,6 +442,15 @@ export interface ToolCallRecord {
   round?: number;
 }
 
+interface GroundingRunResult {
+  toolCalls: ToolCallRecord[];
+  grounded: boolean;
+  warnings: string[];
+  context: string;
+  evidence: RunEvidence;
+  toolLoop: ToolLoopSummary;
+}
+
 export interface SpawnCommandPayload {
   archetype: SubAgentArchetype;
   task: string;
@@ -3911,6 +3920,7 @@ export class Runtime {
       let delegationRounds = 0;
       let previousStepId: string | undefined;
       let clarification: string | undefined;
+      let rootExecution: GroundingRunResult | undefined;
 
       while (roundDecision.action === 'spawn_subagents') {
         delegationRounds += 1;
@@ -4072,6 +4082,47 @@ export class Runtime {
         break;
       }
 
+      if (!clarification && this.taskRequiresWorkspaceMutation(userInput)) {
+        const executionStep = await this.startRootExecutionStep(correlationId, {
+          action: 'solve_directly',
+          reason: 'Delegated analysis is complete; the root must apply and verify the requested workspace changes.',
+          agentCount: 0,
+        }, previousStepId ? [previousStepId] : []);
+        this.emit({
+          type: 'root.execution.required.started',
+          agentId: 'root',
+          correlationId,
+          data: { stepId: executionStep.id },
+        });
+        rootExecution = await this.runGroundingCheck(
+          'root',
+          this.buildRootExecutionClosureTask(userInput, subagents, teamResults),
+          { correlationId, archetype: 'coder' }
+        );
+        const mutationApplied = this.hasSuccessfulWorkspaceMutation(rootExecution.toolCalls);
+        const verificationRan = this.hasSuccessfulWorkspaceVerification(rootExecution.toolCalls);
+        const completedExecutionStep = await this.completeRootExecutionStep(correlationId, executionStep, {
+          resultSummary: this.summarizeRootExecutionClosure(rootExecution),
+        });
+        previousStepId = completedExecutionStep.id;
+        this.emit({
+          type: mutationApplied
+            ? 'root.execution.required.completed'
+            : 'root.execution.required.unmet',
+          agentId: 'root',
+          correlationId,
+          data: {
+            stepId: executionStep.id,
+            mutationApplied,
+            verificationRan,
+            toolCalls: rootExecution.toolCalls.map(call => ({
+              toolName: call.toolName,
+              success: call.success,
+            })),
+          },
+        });
+      }
+
       const finalStep = await this.startRootExecutionStep(correlationId, {
         action: clarification ? 'ask_clarification' : 'finalize',
         reason: clarification ? 'More user input is required after delegated inspection.' : 'Roy has sufficient accumulated state to produce the final result.',
@@ -4088,8 +4139,14 @@ export class Runtime {
           completed: evolution?.metrics.agentsSpawned ?? subagents.length,
         });
         finalResponse = evolution && evolutions.length === 1 && subagents.length === 0
-          ? await this.synthesizeEvolutionResult(userInput, evolution, correlationId)
-          : await this.synthesizeDelegatedResults(userInput, subagents, correlationId, teamResults);
+          ? await this.synthesizeEvolutionResult(userInput, evolution, correlationId, rootExecution)
+          : await this.synthesizeDelegatedResults(
+            userInput,
+            subagents,
+            correlationId,
+            teamResults,
+            rootExecution
+          );
       }
       await this.completeRootExecutionStep(correlationId, finalStep, {
         nodes: this.buildRootExecutionNodes(correlationId, finalStep.index),
@@ -7231,12 +7288,23 @@ Do not repeat an existing agent task. Generate the next actor structure from unr
   ): RootContinuationDecision {
     const input = value as Partial<RootContinuationDecision>;
     if (input.action === 'ask_clarification') {
+      const reason = typeof input.reason === 'string'
+        ? input.reason
+        : 'The completed step exposed missing user input.';
+      const question = typeof input.question === 'string' && input.question.trim()
+        ? input.question.trim()
+        : 'What additional constraint should Roy use before continuing?';
+      if (this.taskRequiresWorkspaceMutation(userTask)
+        && this.isToolPermissionClarification(reason, question)) {
+        return {
+          action: 'finalize',
+          reason: 'Runtime tool policy, not conversational permission, governs workspace actions; proceed to the root execution phase.',
+        };
+      }
       return {
         action: 'ask_clarification',
-        reason: typeof input.reason === 'string' ? input.reason : 'The completed step exposed missing user input.',
-        question: typeof input.question === 'string' && input.question.trim()
-          ? input.question.trim()
-          : 'What additional constraint should Roy use before continuing?',
+        reason,
+        question,
       };
     }
     if (input.action === 'delegate_more' && Array.isArray((input as { agents?: unknown[] }).agents)) {
@@ -7424,6 +7492,7 @@ Reason in terms of cognitive gaps: missing evidence, missing perspective, failur
 Use delegation only when the task benefits from grounded inspection, critique, planning, coding, testing, or summarization.
 Do not spawn more than 3 subagents. Prefer 1-2 unless the task clearly needs more.
 If later work depends on an earlier result, create only the immediately executable first-step agents. Roy will reassess after that step and grow the tree if needed.
+When the task requests workspace changes, include an executor whose concrete task is to apply changes with fs.write or shell.exec and verify them. Do not assign every agent to analysis or proposal writing.
 Ask for clarification when the user request is too ambiguous to assign a concrete task safely.
 Design agent names, roles, tasks, tools, and skills from the current task. Do not copy a fixed team template. Use a team only when members require an explicit coordination and synthesis boundary.
 Return strict JSON matching one of:
@@ -7513,6 +7582,7 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
           content: `You are ${agent.identity.name}'s delegation controller.
 Decide whether this non-root agent should solve directly or delegate to 1-3 direct child agents. Delegate only to close an explicit evidence, perspective, risk, planning, implementation, verification, or synthesis gap in the parent agent's current model.
 Only delegate when a child with a different specialty materially improves the result.
+When the task requests workspace changes and this agent has fs.write or shell.exec, it must execute the change itself or delegate a concrete implementation task. Do not return a proposed patch without applying it.
 Generate task-specific child definitions rather than selecting a fixed role template. Return strict JSON:
 {"action":"solve_directly","reason":"..."}
 {"action":"spawn_subagents","reason":"...","coordination":"independent","continuationPolicy":"reassess","agents":[{"archetype":"custom","name":"task-specific name","role":"task-specific responsibility","task":"...","tools":[],"skills":[],"tomLevel":1,"existenceReason":"which cognitive gap this child fills"}]}
@@ -7682,6 +7752,10 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
         && toolRegistry.get('web.search')
         && toolRegistry.get('web.fetch')) {
         return this.fallbackDelegationDecision(userInput);
+      }
+      if (this.taskRequiresWorkspaceMutation(userInput)
+        && this.isToolPermissionClarification(reason, question)) {
+        return this.applyBudgetConstraints(this.fallbackDelegationDecision(userInput));
       }
       return {
         action: 'ask_clarification',
@@ -8297,7 +8371,8 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     userTask: string,
     results: RootMediatedSpawnResult[],
     correlationId: string,
-    teamResults: TeamRunResult[] = []
+    teamResults: TeamRunResult[] = [],
+    rootExecution?: GroundingRunResult
   ): Promise<string> {
     const ctx = this.getContext();
     const synthesisMessage = await this.enqueueMessage({
@@ -8327,7 +8402,7 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     let response = '';
     try {
       response = await this.completeAsRoot(
-        this.buildMultiAgentSynthesisPrompt(userTask, results, teamResults),
+        this.buildMultiAgentSynthesisPrompt(userTask, results, teamResults, rootExecution),
         'root.multi_agent_synthesis',
         correlationId
       );
@@ -8366,7 +8441,10 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     finalResponse = await this.enforceRootEvidenceBoundary(
       finalResponse,
       userTask,
-      results.map(result => result.subagentResult.evidence),
+      [
+        ...results.map(result => result.subagentResult.evidence),
+        ...(rootExecution ? [rootExecution.evidence] : []),
+      ],
       correlationId,
       'root.multi_agent_synthesis'
     );
@@ -8388,7 +8466,8 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
   private buildMultiAgentSynthesisPrompt(
     userTask: string,
     results: RootMediatedSpawnResult[],
-    teamResults: TeamRunResult[] = []
+    teamResults: TeamRunResult[] = [],
+    rootExecution?: GroundingRunResult
   ): string {
     const reports = results.map(result => {
       const warnings = result.subagentResult.warnings.length > 0
@@ -8435,6 +8514,19 @@ content:
 ${result.result}
 </team_report>`).join('\n\n');
 
+    const executionReport = rootExecution
+      ? `<root_execution_report>
+mutation_applied: ${this.hasSuccessfulWorkspaceMutation(rootExecution.toolCalls)}
+verification_ran: ${this.hasSuccessfulWorkspaceVerification(rootExecution.toolCalls)}
+tool_calls:
+${rootExecution.toolCalls.map(call => `- ${call.toolName}: ${call.success ? 'success' : `failed (${call.error ?? 'unknown error'})`}`).join('\n') || '- none'}
+runtime_evidence:
+${rootExecution.evidence.toolResultSummary?.slice(0, 12_000) || 'none'}
+warnings:
+${rootExecution.warnings.map(item => `- ${item}`).join('\n') || '- none'}
+</root_execution_report>`
+      : '';
+
     return `The user requested:
 <user_task>
 ${userTask}
@@ -8444,10 +8536,13 @@ Roy delegated this task to ${results.length} subagent(s). Synthesize their resul
 Use concrete evidence from grounded reports. If a report is ungrounded or missing concrete tool output, say so and avoid overstating it.
 Compare each agent's belief scope and perspective against the cognitive gaps it was created to fill. Preserve unresolved uncertainty instead of forcing agreement.
 For web-grounded work, cite only observed_urls from the reports. Never introduce a URL or factual detail from model memory. Search-result discovered_urls are not opened evidence.
+When a root_execution_report is present, treat its successful tool results as the authoritative final workspace state. Do not repeat an earlier claim that changes were only proposed when the root execution report proves they were applied. Never claim completion when mutation_applied is false.
 
 ${teamReports ? `The following subteam reports have already aggregated their direct members. Treat them as the primary delegation result.\n\n${teamReports}` : ''}
 
 ${reports}
+
+${executionReport}
 
 Produce the final response to the user as Roy, the root agent.`;
   }
@@ -8466,7 +8561,8 @@ Produce the final response to the user as Roy, the root agent.`;
   private async synthesizeEvolutionResult(
     task: string,
     run: EvolutionRunResult,
-    correlationId: string
+    correlationId: string,
+    rootExecution?: GroundingRunResult
   ): Promise<string> {
     const selected = run.selected;
     const execution = run.selectedExecution;
@@ -8489,6 +8585,9 @@ Produce the final response to the user as Roy, the root agent.`;
         }, null, 2)}</evolution_run>`,
         `<selected_result>${execution.result}</selected_result>`,
         `<warnings>${execution.warnings.join('\n') || 'none'}</warnings>`,
+        rootExecution
+          ? `<root_execution_report>\n${this.summarizeRootExecutionClosure(rootExecution)}\n</root_execution_report>`
+          : '',
       ].join('\n\n'),
       'root.evolution_synthesis',
       correlationId
@@ -10851,14 +10950,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       patternId?: string;
       onBeforeExecution?: (plans: PlannedToolCall[]) => Promise<void>;
     }
-  ): Promise<{
-    toolCalls: ToolCallRecord[];
-    grounded: boolean;
-    warnings: string[];
-    context: string;
-    evidence: RunEvidence;
-    toolLoop: ToolLoopSummary;
-  }> {
+  ): Promise<GroundingRunResult> {
     const bindings = this.agentBindings.get(agentId)?.tools ?? [];
     const inspectionRoot = this.resolveInspectionRoot(task);
     const groundingRequired = this.agentRestoreSpecs.get(agentId)?.outputContract?.groundingRequired
@@ -10882,6 +10974,8 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     const needsModelPlannedAction = bindings.some(binding =>
       binding.enabled && (binding.name === 'shell.exec' || binding.name === 'fs.write')
     ) && (
+      this.taskRequiresWorkspaceMutation(task)
+      ||
       /\b(?:terminal|shell|command line|cli|container)\b/i.test(task)
       || /\b(?:implement|modify|edit|create|write|patch|repair|fix|refactor)\b[\s\S]*\b(?:file|code|project|repository|workspace|artifact|solution)\b/i.test(task)
     );
@@ -11164,7 +11258,8 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     task: string,
     calls: Array<{ toolName: string }>
   ): boolean {
-    return calls.some(call => call.toolName.startsWith('web.') || call.toolName === 'shell.exec' || call.toolName === 'fs.write')
+    return this.taskRequiresWorkspaceMutation(task)
+      || calls.some(call => call.toolName.startsWith('web.') || call.toolName === 'shell.exec' || call.toolName === 'fs.write')
       || /\b(?:multi-step|continue|iterate|until|cross-check|multiple sources|independent sources)\b/i.test(task);
   }
 
@@ -11208,6 +11303,83 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       .filter(term => term.length >= 4)
       .slice(0, 30);
     return evidenceTerms.some(term => normalized.includes(term));
+  }
+
+  private taskRequiresWorkspaceMutation(task: string): boolean {
+    const normalized = task.toLowerCase().replace(/\s+/g, ' ');
+    if (/\b(?:do not|don't|without)\s+(?:modify|edit|write|change|patch|mutate)\b/.test(normalized)
+      || /\b(?:read[- ]only|analysis only|review only|plan only)\b/.test(normalized)
+      || /(?:不要|无需|仅|只)\s*(?:修改|写入|改动|执行)/.test(task)) {
+      return false;
+    }
+    return /\b(?:implement|modify|edit|create|write|patch|repair|fix|refactor|migrate|upgrade|downgrade|install|remove|replace|apply|build)\b[\s\S]{0,240}\b(?:file|code|project|repository|repo|workspace|artifact|solution|dependency|dependencies|implementation|migration|application|package|tests?)\b/i.test(task)
+      || /\b(?:fix|repair|migrate|upgrade|refactor|implement)\b[\s\S]{0,160}\b(?:bug|issue|failure|task|feature|api|cli|runtime|system)\b/i.test(task)
+      || /(?:实现|修改|编辑|创建|写入|修复|重构|迁移|升级|安装|替换|落盘|改动)[\s\S]{0,120}(?:文件|代码|项目|仓库|工作区|依赖|实现|测试|系统)/.test(task);
+  }
+
+  private buildRootExecutionClosureTask(
+    userTask: string,
+    subagents: RootMediatedSpawnResult[],
+    teamResults: TeamRunResult[]
+  ): string {
+    const delegatedFindings = [
+      ...teamResults.slice(-4).map(result =>
+        `Team ${result.team.identity.name}:\n${result.result.slice(-5000)}`
+      ),
+      ...subagents.slice(-8).map(result =>
+        `${result.agent.identity.name} (${result.node.identity.archetype}):\n${result.subagentResult.result.slice(-4000)}`
+      ),
+    ].join('\n\n');
+    return [
+      '[runtime_execution_phase]',
+      `Original task:\n${userTask}`,
+      delegatedFindings
+        ? `Delegated findings and proposals:\n${delegatedFindings}`
+        : 'No delegated report was available. Inspect the workspace directly.',
+      [
+        'Execution contract:',
+        '- Work on the configured workspace now; do not stop at analysis or a proposed patch.',
+        '- The listed tools are already bound to this actor. Request the tool calls directly; Runtime enforces approval policy. Do not ask the user for tool permission.',
+        '- Inspect current files as needed, apply the required changes with fs.write or shell.exec, and run relevant verification commands.',
+        '- Continue through failed verification when another bounded repair is possible.',
+        '- Finish only after the requested workspace mutation has been attempted and the resulting state has been verified or a concrete blocking error has been observed.',
+      ].join('\n'),
+    ].join('\n\n');
+  }
+
+  private hasSuccessfulWorkspaceMutation(calls: ToolCallRecord[]): boolean {
+    return calls.some(call => {
+      if (!call.success) return false;
+      if (call.toolName === 'fs.write') return true;
+      if (call.toolName !== 'shell.exec') return false;
+      const command = String(call.params.command ?? '');
+      return /(?:^|[;&|]\s*|\s)(?:apply_patch|touch|mkdir|cp|mv|rm|install|npm\s+(?:install|uninstall)|pnpm\s+(?:add|remove|install)|yarn\s+(?:add|remove|install)|pip\s+install|uv\s+(?:add|remove|pip\s+install)|sed\s+-i|perl\s+-pi)\b|(?:^|\s)(?:python|python3|node)\b[\s\S]*(?:writeFile|write_text|write_bytes|open\s*\([^)]*['"][wa]['"]|>\s*[^&])|(?:^|[^>])>>?\s*[A-Za-z0-9_./-]+/i.test(command);
+    });
+  }
+
+  private hasSuccessfulWorkspaceVerification(calls: ToolCallRecord[]): boolean {
+    return calls.some(call => {
+      if (!call.success || call.toolName !== 'shell.exec') return false;
+      const command = String(call.params.command ?? '');
+      return /\b(?:test|pytest|vitest|jest|mocha|cargo\s+test|go\s+test|npm\s+(?:test|run\s+(?:test|check|build|lint|typecheck))|pnpm\s+(?:test|run)|yarn\s+(?:test|run)|ruff|eslint|tsc|mypy|pyright|compileall)\b/i.test(command);
+    });
+  }
+
+  private summarizeRootExecutionClosure(execution: GroundingRunResult): string {
+    const mutationApplied = this.hasSuccessfulWorkspaceMutation(execution.toolCalls);
+    const verificationRan = this.hasSuccessfulWorkspaceVerification(execution.toolCalls);
+    const successfulCalls = execution.toolCalls.filter(call => call.success).length;
+    return [
+      `Root execution closure: mutationApplied=${mutationApplied}, verificationRan=${verificationRan}.`,
+      `Tool calls: ${successfulCalls}/${execution.toolCalls.length} succeeded.`,
+      execution.evidence.toolResultSummary?.slice(0, 4000) || 'No runtime tool evidence was produced.',
+      execution.warnings.length > 0 ? `Warnings: ${execution.warnings.join('; ')}` : '',
+    ].filter(Boolean).join('\n');
+  }
+
+  private isToolPermissionClarification(reason: string, question: string): boolean {
+    return /\b(?:permission|approval|allowed|authorized|may i|can i|do i have permission)\b[\s\S]{0,120}\b(?:read|inspect|write|edit|modify|execute|run|shell|terminal|tool|files?)\b/i.test(`${reason}\n${question}`)
+      || /(?:是否|能否|可以|允许|授权)[\s\S]{0,80}(?:读取|检查|写入|修改|执行|运行|终端|工具|文件)/.test(`${reason}\n${question}`);
   }
 
   private taskRequiresGrounding(archetype: SubAgentArchetype, task: string): boolean {

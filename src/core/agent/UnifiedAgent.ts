@@ -83,6 +83,10 @@ export class UnifiedAgent extends BaseAgent {
       .filter(tool => !this.allowedTools || this.allowedTools.has(tool.name))
       .map(tool => tool.name));
     if (authorized.size === 0) return [];
+    const executionRequired = requestsWorkspaceMutation(input.task)
+      && (authorized.has('fs.write') || authorized.has('shell.exec'));
+    const mutationApplied = input.calls.some(call => isSuccessfulWorkspaceMutation(call));
+    const verificationRan = input.calls.some(call => isSuccessfulWorkspaceVerification(call));
     const observations = input.calls.slice(-4).map(call => ({
       toolName: call.toolName,
       params: call.params,
@@ -96,6 +100,16 @@ export class UnifiedAgent extends BaseAgent {
         content: [
           `You plan authorized tool calls for ${this.name}.`,
           'Continue only when another tool call is necessary to answer the task with concrete evidence.',
+          'The listed tools are bound to this actor. Request the call directly and let Runtime enforce approval policy; never ask the user conversationally for tool permission.',
+          executionRequired
+            ? 'This is an execution task. Do not finish after analysis or a proposed patch. Apply the workspace change, then run relevant verification.'
+            : '',
+          executionRequired && !mutationApplied
+            ? 'No successful workspace mutation has been observed yet. Read only what is needed, then request fs.write or a mutating shell.exec call.'
+            : '',
+          executionRequired && mutationApplied && !verificationRan
+            ? 'A workspace mutation succeeded, but no verification call has succeeded yet. Request a relevant test, build, lint, typecheck, or targeted assertion.'
+            : '',
           'Never repeat an equivalent call. Search snippets are discovery evidence; fetch relevant result pages before making source-backed claims.',
           'Reject search results that do not match the core entities and topic in the task. Never fetch an irrelevant result merely because it is available.',
           'After two web.search calls, do not keep reformulating the same search. Fetch a likely official public URL if one can be identified, or finish with an explicit evidence limitation.',
@@ -108,17 +122,39 @@ export class UnifiedAgent extends BaseAgent {
           `Task:\n${input.task}`,
           `Completed tool round: ${input.round}`,
           `Remaining call capacity: ${input.remainingCalls}`,
+          `Execution state: ${JSON.stringify({ executionRequired, mutationApplied, verificationRan })}`,
           `Authorized tools:\n${JSON.stringify(input.tools, null, 2)}`,
           `Tool observations:\n${JSON.stringify(observations, null, 2)}`,
         ].join('\n\n'),
       },
     ];
     try {
-      const response = await this.completeJSONWithAccounting<{
+      type PlanningResponse = {
         action?: string;
         reason?: string;
         calls?: Array<{ toolName?: unknown; params?: unknown }>;
-      }>(messages, { temperature: 0, maxTokens: 640 });
+      };
+      let response = await this.completeJSONWithAccounting<PlanningResponse>(
+        messages,
+        { temperature: 0, maxTokens: executionRequired ? 4096 : 640 }
+      );
+      if (executionRequired
+        && response.action !== 'call_tools'
+        && (!mutationApplied || !verificationRan)) {
+        response = await this.completeJSONWithAccounting<PlanningResponse>([
+          ...messages,
+          { role: 'assistant', content: JSON.stringify(response) },
+          {
+            role: 'user',
+            content: [
+              'Runtime rejected finish because the execution contract is incomplete.',
+              !mutationApplied ? 'Request a concrete workspace mutation now.' : '',
+              mutationApplied && !verificationRan ? 'Request a concrete verification command now.' : '',
+              'Return the required call_tools JSON. Do not ask for permission.',
+            ].filter(Boolean).join('\n'),
+          },
+        ], { temperature: 0, maxTokens: 4096 });
+      }
       if (response.action !== 'call_tools' || !Array.isArray(response.calls)) return [];
       return response.calls
         .filter(call => typeof call.toolName === 'string' && authorized.has(call.toolName))
@@ -797,6 +833,31 @@ Tool-use policy:
     const doc = contextManager.get(this.name, this.sessionId);
     return doc?.content ?? '';
   }
+}
+
+function requestsWorkspaceMutation(task: string): boolean {
+  const normalized = task.toLowerCase().replace(/\s+/g, ' ');
+  if (/\b(?:do not|don't|without)\s+(?:modify|edit|write|change|patch|mutate)\b/.test(normalized)
+    || /\b(?:read[- ]only|analysis only|review only|plan only)\b/.test(normalized)) {
+    return false;
+  }
+  return /\b(?:implement|modify|edit|create|write|patch|repair|fix|refactor|migrate|upgrade|downgrade|install|remove|replace|apply|build)\b[\s\S]{0,240}\b(?:file|code|project|repository|repo|workspace|artifact|solution|dependency|dependencies|implementation|migration|application|package|tests?)\b/i.test(task)
+    || /\b(?:fix|repair|migrate|upgrade|refactor|implement)\b[\s\S]{0,160}\b(?:bug|issue|failure|task|feature|api|cli|runtime|system)\b/i.test(task)
+    || /(?:实现|修改|编辑|创建|写入|修复|重构|迁移|升级|安装|替换|落盘|改动)[\s\S]{0,120}(?:文件|代码|项目|仓库|工作区|依赖|实现|测试|系统)/.test(task);
+}
+
+function isSuccessfulWorkspaceMutation(call: ToolLoopCallRecord): boolean {
+  if (!call.success) return false;
+  if (call.toolName === 'fs.write') return true;
+  if (call.toolName !== 'shell.exec') return false;
+  const command = String(call.params.command ?? '');
+  return /(?:^|[;&|]\s*|\s)(?:apply_patch|touch|mkdir|cp|mv|rm|install|npm\s+(?:install|uninstall)|pnpm\s+(?:add|remove|install)|yarn\s+(?:add|remove|install)|pip\s+install|uv\s+(?:add|remove|pip\s+install)|sed\s+-i|perl\s+-pi)\b|(?:^|\s)(?:python|python3|node)\b[\s\S]*(?:writeFile|write_text|write_bytes|open\s*\([^)]*['"][wa]['"]|>\s*[^&])|(?:^|[^>])>>?\s*[A-Za-z0-9_./-]+/i.test(command);
+}
+
+function isSuccessfulWorkspaceVerification(call: ToolLoopCallRecord): boolean {
+  if (!call.success || call.toolName !== 'shell.exec') return false;
+  const command = String(call.params.command ?? '');
+  return /\b(?:test|pytest|vitest|jest|mocha|cargo\s+test|go\s+test|npm\s+(?:test|run\s+(?:test|check|build|lint|typecheck))|pnpm\s+(?:test|run)|yarn\s+(?:test|run)|ruff|eslint|tsc|mypy|pyright|compileall)\b/i.test(command);
 }
 
 function compactToolObservation(result: unknown, toolName: string): unknown {

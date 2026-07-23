@@ -486,6 +486,12 @@ execution tree, correlated runtime events, messages, and token usage. Runtime st
 and complete persisted traces remain under the target workspace's `.roy/`
 directory.
 
+For implementation, migration, repair, and other workspace-mutation tasks, Roy
+enforces an execution closure after delegated analysis. The root actor must request
+the bound write/execute tools through Runtime, apply the workspace change, and run
+relevant verification before final synthesis. Runtime approval policy remains
+authoritative; agents do not ask conversationally for tool permission.
+
 Start the HTTP and Socket.IO server:
 
 ```bash
