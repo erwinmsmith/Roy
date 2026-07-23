@@ -147,6 +147,46 @@ class FailedDelegationRecoveryLLM extends TerminalTaskLLM {
   }
 }
 
+class RetryingDirectExecutionLLM extends TerminalTaskLLM {
+  override async *stream(): AsyncGenerator<LLMStreamChunk, void, unknown> {
+    yield { content: 'Recovered the incomplete execution and verified artifact.txt.', done: true };
+  }
+
+  override async completeJSON<T>(messages: LLMMessage[]): Promise<T> {
+    const system = messages.find(message => message.role === 'system')?.content ?? '';
+    const user = messages.findLast(message => message.role === 'user')?.content ?? '';
+    if (system.includes("root delegation controller")) {
+      return { action: 'solve_directly', reason: 'Execute the bounded workspace task directly.' } as T;
+    }
+    if (system.includes('plan authorized tool calls')) {
+      if (user.includes('[runtime_execution_phase]') && user.includes('Completed tool round: 0')) {
+        return {
+          action: 'call_tools',
+          reason: 'Apply an initial incomplete edit.',
+          calls: [{
+            toolName: 'fs.write',
+            params: { path: 'artifact.txt', content: 'incomplete' },
+          }],
+        } as T;
+      }
+      if (user.includes('[runtime_execution_repair_phase]') && user.includes('Completed tool round: 0')) {
+        return {
+          action: 'call_tools',
+          reason: 'Repair and verify the incomplete edit.',
+          calls: [{
+            toolName: 'shell.exec',
+            params: {
+              command: "printf 'repaired' > artifact.txt && test \"$(cat artifact.txt)\" = repaired",
+            },
+          }],
+        } as T;
+      }
+      return { action: 'finish', reason: 'No additional call selected in this attempt.', calls: [] } as T;
+    }
+    return {} as T;
+  }
+}
+
 describe('benchmark terminal capability', () => {
   it('runs an explicitly authorized shell loop and persists its execution tree', async () => {
     const workspace = await mkdtemp(path.join(tmpdir(), 'roy-terminal-task-'));
@@ -279,6 +319,76 @@ describe('benchmark terminal capability', () => {
       type: 'tool.call',
       agentId: 'root',
       data: expect.objectContaining({ toolName: 'shell.exec' }),
+    }));
+
+    await runtime.shutdown();
+  });
+
+  it('re-enters root execution when the first direct attempt is not verified', async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), 'roy-direct-execution-retry-'));
+    await mkdir(path.join(workspace, '.roy'), { recursive: true });
+    await writeFile(path.join(workspace, '.roy', 'config.json'), JSON.stringify({
+      tools: {
+        approval: {
+          readOnly: 'auto',
+          write: 'auto',
+          execute: 'auto',
+          overrides: {},
+        },
+        shell: {
+          mode: 'unrestricted',
+          shell: '/bin/sh',
+          defaultTimeoutMs: 10_000,
+          maxTimeoutMs: 60_000,
+          defaultMaxOutputBytes: 40_000,
+          maxCallsPerAgent: 10,
+        },
+        executionLoop: {
+          enabled: true,
+          maxRounds: 4,
+          maxCallsPerRun: 8,
+          maxConsecutiveFailures: 2,
+          maxWallClockMs: 30_000,
+          maxFetchesAfterSearch: 2,
+          llmReplanning: true,
+        },
+      },
+    }, null, 2));
+
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'direct-execution-retry-test',
+      workspaceCwd: workspace,
+      llmProvider: new RetryingDirectExecutionLLM(),
+    });
+    await runtime.handleUserTurn(
+      'Implement the workspace change in artifact.txt and run a verification.'
+    );
+
+    expect(await readFile(path.join(workspace, 'artifact.txt'), 'utf8')).toBe('repaired');
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'root.execution.attempt.completed',
+      data: expect.objectContaining({
+        attempt: 1,
+        mutationApplied: true,
+        verificationRan: false,
+      }),
+    }));
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'root.execution.attempt.completed',
+      data: expect.objectContaining({
+        attempt: 2,
+        mutationApplied: true,
+        verificationRan: true,
+      }),
+    }));
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'root.execution.required.completed',
+      data: expect.objectContaining({
+        source: 'solve_directly',
+        mutationApplied: true,
+        verificationRan: true,
+      }),
     }));
 
     await runtime.shutdown();

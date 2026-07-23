@@ -3928,10 +3928,11 @@ export class Runtime {
           correlationId,
           data: { stepId: step.id, source: 'solve_directly' },
         });
-        const rootExecution = await this.runGroundingCheck(
-          'root',
-          this.buildRootExecutionClosureTask(userInput, [], []),
-          { correlationId, archetype: 'coder' }
+        const rootExecution = await this.runRequiredRootExecution(
+          userInput,
+          [],
+          [],
+          correlationId
         );
         const mutationApplied = this.hasSuccessfulWorkspaceMutation(rootExecution.toolCalls);
         const verificationRan = this.hasSuccessfulWorkspaceVerification(rootExecution.toolCalls);
@@ -4174,10 +4175,11 @@ export class Runtime {
           correlationId,
           data: { stepId: executionStep.id },
         });
-        rootExecution = await this.runGroundingCheck(
-          'root',
-          this.buildRootExecutionClosureTask(userInput, subagents, teamResults),
-          { correlationId, archetype: 'coder' }
+        rootExecution = await this.runRequiredRootExecution(
+          userInput,
+          subagents,
+          teamResults,
+          correlationId
         );
         const mutationApplied = this.hasSuccessfulWorkspaceMutation(rootExecution.toolCalls);
         const verificationRan = this.hasSuccessfulWorkspaceVerification(rootExecution.toolCalls);
@@ -11425,6 +11427,116 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         '- Finish only after the requested workspace mutation has been attempted and the resulting state has been verified or a concrete blocking error has been observed.',
       ].join('\n'),
     ].join('\n\n');
+  }
+
+  private async runRequiredRootExecution(
+    userTask: string,
+    subagents: RootMediatedSpawnResult[],
+    teamResults: TeamRunResult[],
+    correlationId: string
+  ): Promise<GroundingRunResult> {
+    const attempts: GroundingRunResult[] = [];
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      const priorExecution = attempts.length > 0
+        ? this.combineGroundingRuns(attempts)
+        : undefined;
+      const task = priorExecution
+        ? this.buildRootExecutionRepairTask(userTask, priorExecution, attempt)
+        : this.buildRootExecutionClosureTask(userTask, subagents, teamResults);
+      const current = await this.runGroundingCheck(
+        'root',
+        task,
+        { correlationId, archetype: 'coder' }
+      );
+      attempts.push(current);
+      const combined = this.combineGroundingRuns(attempts);
+      const mutationApplied = this.hasSuccessfulWorkspaceMutation(combined.toolCalls);
+      const verificationRan = this.hasSuccessfulWorkspaceVerification(combined.toolCalls);
+      this.emit({
+        type: 'root.execution.attempt.completed',
+        agentId: 'root',
+        correlationId,
+        data: {
+          attempt,
+          maxAttempts,
+          mutationApplied,
+          verificationRan,
+          toolCalls: current.toolCalls.length,
+          stopReason: current.toolLoop.stopReason,
+        },
+      });
+      if (mutationApplied && verificationRan) return combined;
+    }
+    return this.combineGroundingRuns(attempts);
+  }
+
+  private buildRootExecutionRepairTask(
+    userTask: string,
+    priorExecution: GroundingRunResult,
+    attempt: number
+  ): string {
+    return [
+      '[runtime_execution_repair_phase]',
+      `Original task:\n${userTask}`,
+      `Execution attempt ${attempt - 1} did not satisfy the required mutation-and-verification closure.`,
+      [
+        `Mutation observed: ${this.hasSuccessfulWorkspaceMutation(priorExecution.toolCalls)}`,
+        `Successful verification observed: ${this.hasSuccessfulWorkspaceVerification(priorExecution.toolCalls)}`,
+        `Prior tool evidence:\n${priorExecution.evidence.toolResultSummary?.slice(-10_000) || 'No textual tool evidence was available.'}`,
+        priorExecution.warnings.length > 0
+          ? `Prior warnings:\n${priorExecution.warnings.slice(-8).join('\n')}`
+          : '',
+      ].filter(Boolean).join('\n\n'),
+      [
+        'Recovery contract:',
+        '- Inspect the actual configured workspace state and continue the original implementation; do not create marker or progress files.',
+        '- Use failed command output to repair remaining defects. Do not repeat an equivalent failed call.',
+        '- Do not hide failure with shell status masking.',
+        '- Apply any remaining workspace changes and run a relevant verification command whose exit status is preserved.',
+        '- Finish only when the original task is implemented and verification succeeds, or after a concrete blocking error is observed.',
+      ].join('\n'),
+    ].join('\n\n');
+  }
+
+  private combineGroundingRuns(runs: GroundingRunResult[]): GroundingRunResult {
+    const first = runs[0];
+    const last = runs[runs.length - 1];
+    if (!first || !last) {
+      throw new Error('Cannot combine an empty set of grounding runs');
+    }
+    const toolCalls = runs.flatMap(run => run.toolCalls);
+    return {
+      toolCalls,
+      grounded: runs.every(run => run.grounded),
+      warnings: runs.flatMap(run => run.warnings),
+      context: runs.map(run => run.context).filter(Boolean).join('\n\n'),
+      evidence: {
+        toolGrounded: runs.some(run => run.evidence.toolGrounded),
+        outputGrounded: runs.every(run => run.evidence.outputGrounded),
+        observedPaths: Array.from(new Set(runs.flatMap(run => run.evidence.observedPaths))),
+        observedUrls: Array.from(new Set(runs.flatMap(run => run.evidence.observedUrls ?? []))),
+        relevantObservedUrls: Array.from(new Set(
+          runs.flatMap(run => run.evidence.relevantObservedUrls ?? [])
+        )),
+        discoveredUrls: Array.from(new Set(
+          runs.flatMap(run => run.evidence.discoveredUrls ?? [])
+        )),
+        toolResultSummary: runs
+          .map(run => run.evidence.toolResultSummary)
+          .filter((summary): summary is string => Boolean(summary))
+          .join('\n\n'),
+      },
+      toolLoop: {
+        rounds: runs.flatMap(run => run.toolLoop.rounds),
+        totalCalls: runs.reduce((sum, run) => sum + run.toolLoop.totalCalls, 0),
+        successfulCalls: runs.reduce((sum, run) => sum + run.toolLoop.successfulCalls, 0),
+        failedCalls: runs.reduce((sum, run) => sum + run.toolLoop.failedCalls, 0),
+        stopReason: last.toolLoop.stopReason,
+        startedAt: first.toolLoop.startedAt,
+        completedAt: last.toolLoop.completedAt,
+      },
+    };
   }
 
   private hasSuccessfulWorkspaceMutation(calls: ToolCallRecord[]): boolean {
