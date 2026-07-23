@@ -201,6 +201,14 @@ describe('benchmark terminal capability', () => {
       type: 'tool.call',
       data: expect.objectContaining({ toolName: 'shell.exec' }),
     }));
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'root.execution.required.completed',
+      data: expect.objectContaining({
+        source: 'solve_directly',
+        mutationApplied: true,
+        verificationRan: true,
+      }),
+    }));
     expect(result.executionTree.status).toBe('completed');
     expect(JSON.parse(await readFile(
       path.join(workspace, '.roy', 'execution-trees', 'terminal-capability-test', `${result.correlationId}.json`),

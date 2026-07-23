@@ -3921,7 +3921,47 @@ export class Runtime {
           reason: decision.reason,
         },
       });
-      finalResponse = await this.runRootSoloReasoning(userInput, correlationId);
+      if (requiresWorkspaceMutation) {
+        this.emit({
+          type: 'root.execution.required.started',
+          agentId: 'root',
+          correlationId,
+          data: { stepId: step.id, source: 'solve_directly' },
+        });
+        const rootExecution = await this.runGroundingCheck(
+          'root',
+          this.buildRootExecutionClosureTask(userInput, [], []),
+          { correlationId, archetype: 'coder' }
+        );
+        const mutationApplied = this.hasSuccessfulWorkspaceMutation(rootExecution.toolCalls);
+        const verificationRan = this.hasSuccessfulWorkspaceVerification(rootExecution.toolCalls);
+        this.emit({
+          type: mutationApplied
+            ? 'root.execution.required.completed'
+            : 'root.execution.required.unmet',
+          agentId: 'root',
+          correlationId,
+          data: {
+            stepId: step.id,
+            source: 'solve_directly',
+            mutationApplied,
+            verificationRan,
+            toolCalls: rootExecution.toolCalls.map(call => ({
+              toolName: call.toolName,
+              success: call.success,
+            })),
+          },
+        });
+        finalResponse = await this.synthesizeDelegatedResults(
+          userInput,
+          [],
+          correlationId,
+          [],
+          rootExecution
+        );
+      } else {
+        finalResponse = await this.runRootSoloReasoning(userInput, correlationId);
+      }
       await this.completeRootExecutionStep(correlationId, step, { resultSummary: finalResponse });
     } else {
       let roundDecision = decision;
