@@ -32,6 +32,24 @@ describe('workspace execution intent', () => {
     })).toBe(true);
   });
 
+  it('does not accept verification commands that mask a failing exit status', () => {
+    expect(isSuccessfulWorkspaceVerificationCall({
+      toolName: 'shell.exec',
+      params: { command: 'pytest -q 2>&1 || true' },
+      success: true,
+    })).toBe(false);
+    expect(isSuccessfulWorkspaceVerificationCall({
+      toolName: 'shell.exec',
+      params: { command: 'npm test; true' },
+      success: true,
+    })).toBe(false);
+    expect(isSuccessfulWorkspaceVerificationCall({
+      toolName: 'shell.exec',
+      params: { command: 'set +e; npm run check' },
+      success: true,
+    })).toBe(false);
+  });
+
   it('distinguishes mutation tasks from explicitly read-only work', () => {
     expect(taskRequestsWorkspaceMutation('Migrate the project code and run tests.')).toBe(true);
     expect(taskRequestsWorkspaceMutation('Review the project in read-only mode.')).toBe(false);

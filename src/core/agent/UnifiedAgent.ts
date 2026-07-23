@@ -113,8 +113,9 @@ export class UnifiedAgent extends BaseAgent {
             ? 'No successful workspace mutation has been observed yet. Read only what is needed, then request fs.write or a mutating shell.exec call.'
             : '',
           executionRequired && mutationApplied && !verificationRan
-            ? 'A workspace mutation succeeded, but no verification call has succeeded yet. Request a relevant test, build, lint, typecheck, or targeted assertion.'
+            ? 'At least one workspace mutation succeeded, but that does not prove the full implementation is complete. Continue any remaining edits or repairs, then request a relevant test, build, lint, typecheck, or targeted assertion.'
             : '',
+          'When verification fails, use its output to repair the workspace before retrying. Never hide a failing exit status with `|| true`, `; true`, `|| :`, or equivalent shell constructs.',
           'Never repeat an equivalent call. Search snippets are discovery evidence; fetch relevant result pages before making source-backed claims.',
           'Reject search results that do not match the core entities and topic in the task. Never fetch an irrelevant result merely because it is available.',
           'After two web.search calls, do not keep reformulating the same search. Fetch a likely official public URL if one can be identified, or finish with an explicit evidence limitation.',
@@ -142,6 +143,9 @@ export class UnifiedAgent extends BaseAgent {
       let planningMessages = messages;
       let response: PlanningResponse = {};
       let plannedCalls: PlannedToolCall[] = [];
+      const completedCallFingerprints = new Set(input.calls.map(call =>
+        plannedToolCallFingerprint(call)
+      ));
       for (let attempt = 0; attempt < (executionRequired ? 3 : 1); attempt += 1) {
         response = await this.completeJSONWithAccounting<PlanningResponse>(
           planningMessages,
@@ -152,13 +156,13 @@ export class UnifiedAgent extends BaseAgent {
           authorized,
           input.remainingCalls,
           input.round
-        );
+        ).filter(call => !completedCallFingerprints.has(plannedToolCallFingerprint(call)));
         const advancesExecution = !executionRequired
           || (mutationApplied
-            ? verificationRan || plannedCalls.some(call => isSuccessfulWorkspaceVerification({
-              ...call,
-              success: true,
-            }))
+            ? verificationRan || plannedCalls.some(call =>
+              isSuccessfulWorkspaceMutation({ ...call, success: true })
+              || isSuccessfulWorkspaceVerification({ ...call, success: true })
+            )
             : plannedCalls.some(call => isSuccessfulWorkspaceMutation({
               ...call,
               success: true,
@@ -175,7 +179,7 @@ export class UnifiedAgent extends BaseAgent {
                 ? 'Read-only, diagnostic, repeated, or finish plans are insufficient. Request a concrete fs.write or mutating shell.exec call now.'
                 : '',
               mutationApplied && !verificationRan
-                ? 'Non-verifying, repeated, or finish plans are insufficient. Request a concrete verification command now.'
+                ? 'Finish, read-only, masked-failure, and repeated plans are insufficient. Request a concrete remaining edit or repair, or a distinct verification command whose exit status is preserved.'
                 : '',
               'Return the required call_tools JSON. Do not ask for permission.',
             ].filter(Boolean).join('\n'),
@@ -184,10 +188,10 @@ export class UnifiedAgent extends BaseAgent {
       }
       if (executionRequired) {
         const advancesExecution = mutationApplied
-          ? verificationRan || plannedCalls.some(call => isSuccessfulWorkspaceVerification({
-            ...call,
-            success: true,
-          }))
+          ? verificationRan || plannedCalls.some(call =>
+            isSuccessfulWorkspaceMutation({ ...call, success: true })
+            || isSuccessfulWorkspaceVerification({ ...call, success: true })
+          )
           : plannedCalls.some(call => isSuccessfulWorkspaceMutation({
             ...call,
             success: true,
@@ -885,6 +889,15 @@ function normalizePlannedToolCalls(
       reason: response.reason?.trim() || `Agent requested another tool round after observing round ${round}.`,
       groundingRequired: true,
     }));
+}
+
+function plannedToolCallFingerprint(
+  call: Pick<PlannedToolCall, 'toolName' | 'params'>
+): string {
+  const sortedParams = Object.fromEntries(
+    Object.entries(call.params).sort(([left], [right]) => left.localeCompare(right))
+  );
+  return `${call.toolName}:${JSON.stringify(sortedParams)}`;
 }
 
 function compactToolObservation(result: unknown, toolName: string): unknown {

@@ -77,6 +77,31 @@ class ReadOnlyThenMutationPlanningLLM extends PlanningLLM {
   }
 }
 
+class MutationRepairPlanningLLM extends PlanningLLM {
+  constructor(private readonly repeatVerificationFirst = false) {
+    super('none');
+  }
+
+  override async completeJSON<T>(): Promise<T> {
+    this.jsonCalls += 1;
+    if (this.repeatVerificationFirst && this.jsonCalls === 1) {
+      return {
+        action: 'call_tools',
+        reason: 'Repeat the already failed verification.',
+        calls: [{ toolName: 'shell.exec', params: { command: 'pytest -q' } }],
+      } as T;
+    }
+    return {
+      action: 'call_tools',
+      reason: 'Repair the implementation using the failed verification output.',
+      calls: [{
+        toolName: 'fs.write',
+        params: { path: 'artifact.txt', content: 'repaired' },
+      }],
+    } as T;
+  }
+}
+
 class EchoTool implements Tool {
   readonly name = 'echo-tool';
   readonly description = 'Echoes a value';
@@ -340,6 +365,92 @@ describe('UnifiedAgent capability execution', () => {
       expect.objectContaining({
         toolName: 'fs.write',
         params: { path: 'artifact.txt', content: 'implemented' },
+      }),
+    ]);
+  });
+
+  it('allows another workspace repair after a mutation when verification failed', async () => {
+    const llm = new MutationRepairPlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'repair-agent',
+      goal: 'repair failed implementation',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.write', 'shell.exec'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: 'Implement the project change and run tests.',
+      round: 2,
+      remainingCalls: 4,
+      tools: [{ name: 'fs.write' }, { name: 'shell.exec' }],
+      calls: [
+        {
+          toolName: 'fs.write',
+          params: { path: 'artifact.txt', content: 'initial' },
+          reason: 'initial implementation',
+          groundingRequired: true,
+          success: true,
+        },
+        {
+          toolName: 'shell.exec',
+          params: { command: 'pytest -q' },
+          reason: 'verify implementation',
+          groundingRequired: true,
+          success: false,
+          error: 'tests failed',
+        },
+      ],
+    });
+
+    expect(llm.jsonCalls).toBe(1);
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.write',
+        params: { path: 'artifact.txt', content: 'repaired' },
+      }),
+    ]);
+  });
+
+  it('rejects an equivalent failed verification call before planning a repair', async () => {
+    const llm = new MutationRepairPlanningLLM(true);
+    const agent = new UnifiedAgent({
+      name: 'deduplicating-repair-agent',
+      goal: 'repair failed implementation',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.write', 'shell.exec'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: 'Implement the project change and run tests.',
+      round: 2,
+      remainingCalls: 4,
+      tools: [{ name: 'fs.write' }, { name: 'shell.exec' }],
+      calls: [
+        {
+          toolName: 'fs.write',
+          params: { path: 'artifact.txt', content: 'initial' },
+          reason: 'initial implementation',
+          groundingRequired: true,
+          success: true,
+        },
+        {
+          toolName: 'shell.exec',
+          params: { command: 'pytest -q' },
+          reason: 'verify implementation',
+          groundingRequired: true,
+          success: false,
+          error: 'tests failed',
+        },
+      ],
+    });
+
+    expect(llm.jsonCalls).toBe(2);
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.write',
+        params: { path: 'artifact.txt', content: 'repaired' },
       }),
     ]);
   });
