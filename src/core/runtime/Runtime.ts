@@ -8611,10 +8611,9 @@ export class Runtime {
   }): boolean {
     if (!input.requiresWorkspaceMutation) return false;
     if (input.roundMutationApplied) return true;
-    return input.delegationRounds >= (
-      input.requiresLongHorizon
-        ? input.maxRounds
-        : input.exploratoryDelegationLimit
+    return input.delegationRounds >= Math.min(
+      input.maxRounds,
+      input.exploratoryDelegationLimit
     );
   }
 
@@ -8804,7 +8803,10 @@ Do not repeat an existing agent task, cached failed path, or equivalent failed t
     userTask: string,
     subagents: RootMediatedSpawnResult[]
   ): { target: string; reason: string; plan: DelegationAgentPlan } | undefined {
-    if (this.taskNeedsWebAccess(userTask)) return undefined;
+    if (this.taskNeedsWebAccess(userTask)
+      || this.taskRequiresWorkspaceMutation(userTask)) {
+      return undefined;
+    }
     const targets = [...new Set(
       [...userTask.matchAll(/(?:^|\s|[`'"])([./]?[a-zA-Z0-9_-]+\.(?:json|ya?ml|toml|md|ts|tsx|js|jsx|mjs|cjs))(?=\s|[,.!?;:`'"]|$)/g)]
         .map(match => match[1])

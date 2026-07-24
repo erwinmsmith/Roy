@@ -658,9 +658,25 @@ describe('Root dynamic execution tree', () => {
       requiresWorkspaceMutation: true,
       requiresLongHorizon: true,
       roundMutationApplied: false,
-      delegationRounds: 12,
+      delegationRounds: 4,
       maxRounds: 12,
       exploratoryDelegationLimit: 4,
     })).toBe(true);
+  });
+
+  it('does not treat mutation-task output paths as missing input evidence', () => {
+    const runtime = new Runtime();
+    const buildFollowUp = (runtime as unknown as {
+      buildRequiredEvidenceFollowUp: (
+        task: string,
+        subagents: unknown[]
+      ) => unknown;
+    }).buildRequiredEvidenceFollowUp;
+
+    expect(buildFollowUp.call(
+      runtime,
+      'Implement the pipeline and create outputs/validation_report.json, then verify it.',
+      []
+    )).toBeUndefined();
   });
 });
