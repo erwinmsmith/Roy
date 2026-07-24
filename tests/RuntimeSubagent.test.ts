@@ -189,6 +189,38 @@ describe('Runtime controlled subagent spawning', () => {
     expect(needsWeb(
       'Read https://nodejs.org/api/globals.html and summarize the fetch section.'
     )).toBe(true);
+    expect(needsWeb([
+      'Repair the local document reconstruction pipeline and run its CLI.',
+      'Official/public references:',
+      '- OpenCV: https://opencv.org/',
+      '- TableBank: https://github.com/doc-analysis/TableBank',
+    ].join('\n'))).toBe(false);
+  });
+
+  it('keeps acceptance items focused on obligations instead of headings, inputs, and passive references', () => {
+    const runtime = new Runtime();
+    const extract = (task: string) => (runtime as unknown as {
+      extractTaskAcceptanceItems: (value: string) => string[];
+    }).extractTaskAcceptanceItems(task);
+
+    const items = extract([
+      'The input contains:',
+      '- customers',
+      '- orders',
+      'Required outputs:',
+      '- outputs/reconstructed_tables.csv',
+      '- outputs/layout_qc.json',
+      'The implementation must assign OCR tokens to cells by geometry.',
+      'Official/public references:',
+      '- OpenCV: https://opencv.org/',
+      '- TableBank: https://github.com/doc-analysis/TableBank',
+    ].join('\n'));
+
+    expect(items).toEqual([
+      'outputs/reconstructed_tables.csv',
+      'outputs/layout_qc.json',
+      'The implementation must assign OCR tokens to cells by geometry.',
+    ]);
   });
 
   it('continues workspace evidence collection after a directory listing when the task requests file reads', () => {
@@ -413,6 +445,19 @@ describe('Runtime controlled subagent spawning', () => {
       normalizeToolWorkspacePath: (value: string) => string;
     }).normalizeToolWorkspacePath;
     expect(normalizePath.call(runtime, path.join(workspaceCwd, 'app.js'))).toBe('app.js');
+    const compactAssignment = (runtime as unknown as {
+      compactFileSynthesisAssignment: (value: string) => string;
+    }).compactFileSynthesisAssignment;
+    const compacted = compactAssignment.call(runtime, [
+      'Implement the immutable task.',
+      '<team_step_cache>',
+      'large repeated derived member context',
+      '</team_step_cache>',
+      'Preserve the acceptance criteria.',
+    ].join('\n'));
+    expect(compacted).toContain('Implement the immutable task.');
+    expect(compacted).toContain('Preserve the acceptance criteria.');
+    expect(compacted).not.toContain('derived member context');
     await runtime.shutdown();
   });
 
@@ -728,6 +773,80 @@ describe('Runtime controlled subagent spawning', () => {
     expect(result.grounded).toBe(false);
     expect(result.warnings).toContainEqual(expect.stringContaining('no authorized tool call'));
 
+    await runtime.shutdown();
+  });
+
+  it('requires a tester to rerun cached verification instead of accepting another actor result', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-fresh-tester-verification-'));
+    await writeFile(path.join(workspaceCwd, 'app.js'), 'export const value = 1;\n', 'utf8');
+    await writeFile(
+      path.join(workspaceCwd, 'package.json'),
+      JSON.stringify({
+        name: 'fresh-tester-verification-test',
+        type: 'module',
+        scripts: { test: 'node --check app.js' },
+      }),
+      'utf8'
+    );
+    await mkdir(path.join(workspaceCwd, '.roy'), { recursive: true });
+    await writeFile(
+      path.join(workspaceCwd, '.roy', 'config.json'),
+      JSON.stringify({
+        tools: {
+          approval: {
+            execute: 'auto',
+          },
+        },
+      }),
+      'utf8'
+    );
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'fresh-tester-verification-test',
+      llmProvider: new EchoLLM(),
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+    const task = [
+      'Verify the actual workspace independently.',
+      '## Required Verification Command',
+      '```bash',
+      'npm test',
+      '```',
+    ].join('\n');
+    const tester = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'tester',
+      tomLevel: 0,
+      description: task,
+      task,
+      tools: ['shell.exec'],
+      outputContract: { format: 'markdown', groundingRequired: true },
+    });
+
+    const result = await runtime.runAgent(tester.identity.id, task, {
+      archetype: 'tester',
+      disableRecursiveDelegation: true,
+      priorToolCalls: [{
+        toolName: 'shell.exec',
+        params: { command: 'npm test' },
+        success: true,
+        result: { command: 'npm test', exitCode: 0 },
+      }],
+    });
+
+    expect(result.toolCalls).toEqual([
+      expect.objectContaining({
+        toolName: 'shell.exec',
+        params: expect.objectContaining({ command: 'npm test' }),
+        success: true,
+      }),
+    ]);
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'agent.verification.evidence.completed',
+      agentId: tester.identity.id,
+      data: expect.objectContaining({ attempts: 1, successful: 1 }),
+    }));
     await runtime.shutdown();
   });
 

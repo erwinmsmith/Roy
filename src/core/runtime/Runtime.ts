@@ -3507,14 +3507,13 @@ export class Runtime {
       };
     }
 
-    const assignedTask = this.compactDelegatedTask(
-      this.agentRestoreSpecs.get(agent.id)?.task?.trim() || task.trim(),
-      16_000
+    const assignedTask = this.compactFileSynthesisAssignment(
+      this.agentRestoreSpecs.get(agent.id)?.task?.trim() || task.trim()
     );
     const evidence = this.compactFileSynthesisEvidence(
       groundingCalls,
       normalizedPath,
-      52_000
+      30_000
     );
     const prompt = [
       '[runtime_workspace_file_synthesis]',
@@ -3689,6 +3688,15 @@ export class Runtime {
     return sections.reverse().join('\n\n');
   }
 
+  private compactFileSynthesisAssignment(task: string): string {
+    const withoutDerivedCaches = task
+      .replace(/<team_step_cache>[\s\S]*?<\/team_step_cache>/gi, '')
+      .replace(/<system_communication_context\b[\s\S]*?<\/system_communication_context>/gi, '')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+    return this.compactDelegatedTask(withoutDerivedCaches, 8_000);
+  }
+
   private stripSingleMarkdownCodeFence(content: string): string {
     const trimmed = content.trim();
     const fenced = /^```[A-Za-z0-9_+.-]*\s*\n([\s\S]*?)\n```\s*$/.exec(trimmed);
@@ -3771,17 +3779,24 @@ export class Runtime {
     const runtimeOriginalTask = task.match(
       /(?:^|\n)Original task:\s*\n([\s\S]*?)(?=\n(?:<acceptance_checklist>|Execution attempt \d+|Delegated findings and proposals:|Prior tool evidence:|Execution contract:|Recovery contract:|Audit contract:|<delegated_execution_state>|<execution_resume_ledger>))/
     )?.[1];
-    const authoredTask = (runtimeOriginalTask ?? task)
+    const authoredTask = this.stripPassiveReferenceSections((runtimeOriginalTask ?? task)
       .split(/\n(?:---\s*\n)?##\s+VERIFICATION FAILED\b/i, 1)[0]
       .split(/\n<official_verifier_feedback>/i, 1)[0]
-      .split(/\n(?:latest command output|terminal output|command output)\s*:/i, 1)[0];
+      .split(/\n(?:latest command output|terminal output|command output)\s*:/i, 1)[0]);
     const lower = authoredTask.toLowerCase();
-    return /https?:\/\//.test(authoredTask)
+    return /\b(?:open|read|fetch|visit|consult|browse|summari[sz]e|analy[sz]e|review|research|compare|verify)\b[\s\S]{0,240}https?:\/\//i.test(authoredTask)
       || /\b(?:web|internet|online|website|browse|news|up-to-date|citations?|official documentation|public documentation)\b/.test(lower)
       || /\bsearch\b[\s\S]{0,100}\b(?:external|official|public)?\s*(?:sources?|documentation|websites?|internet|web)\b/.test(lower)
       || /\b(?:external|official|public)?\s*(?:sources?|documentation|websites?|internet|web)\b[\s\S]{0,100}\bsearch\b/.test(lower)
       || /\blatest\b[\s\S]*\b(?:documentation|release|version|news|announcement|api)\b/.test(lower)
       || /\b(?:research|compare|verify)\b[\s\S]*\b(?:external|official|independent)\s+sources?\b/.test(lower);
+  }
+
+  private stripPassiveReferenceSections(task: string): string {
+    return task.replace(
+      /(?:^|\n)(?:#{1,6}\s*)?(?:(?:official\s*\/\s*public|official|public)\s+)?references?\s*:?\s*\n[\s\S]*$/i,
+      ''
+    ).trimEnd();
   }
 
   private getDefaultSkillBindings(archetype: SubAgentArchetype): SkillBinding[] {
@@ -6832,14 +6847,14 @@ export class Runtime {
     if (!agent) {
       throw new Error(`Agent "${agentId}" not found`);
     }
+    const actorArchetype = options.archetype ?? this.inferAgentArchetype(agent.getInfo());
 
     this.activateActorLifecycle(agentId, options.correlationId);
 
     if (!this.agentBudgetAllocations.has(agentId)) {
-      const archetype = options.archetype ?? this.inferAgentArchetype(agent.getInfo());
       const allocation = await this.requestAgentBudget({
         parentId: agent.getIdentity().parentId ?? 'root',
-        archetype,
+        archetype: actorArchetype,
         correlationId: options.correlationId,
         nodeId: options.nodeId,
         requestedTokens: this.agentBudgetLimits.get(agentId),
@@ -6871,6 +6886,10 @@ export class Runtime {
           || binding.name === 'fs.replace'
           || binding.name === 'fs.synthesize'
         )
+      );
+    const actorVerificationEvidenceRequired = actorArchetype === 'tester'
+      && (this.agentBindings.get(agentId)?.tools ?? []).some(binding =>
+        binding.enabled && binding.name === 'shell.exec'
       );
 
     const session = ctx.manager.getSession(ctx.sessionId);
@@ -6958,6 +6977,51 @@ export class Runtime {
         },
       });
       activeGrounding = grounding;
+      if (actorVerificationEvidenceRequired
+        && !grounding.toolCalls.some(call => isWorkspaceVerificationCall(call))) {
+        const priorVerification = [...(options.priorToolCalls ?? [])].reverse()
+          .find(call => isWorkspaceVerificationCall(call));
+        if (priorVerification) {
+          const verification = await this.runGroundingCheck(agentId, task, {
+            ...options,
+            priorToolCalls: grounding.toolCalls,
+            initialPlans: [{
+              toolName: 'shell.exec',
+              params: { ...priorVerification.params },
+              reason: 'Run a fresh independent verification for the tester role instead of reusing another actor\'s cached result.',
+              groundingRequired: true,
+            }],
+            skipInitialModelPlanning: true,
+          });
+          grounding = this.combineGroundingRuns([grounding, verification]);
+          activeGrounding = grounding;
+        }
+      }
+      if (actorVerificationEvidenceRequired) {
+        const verificationCalls = grounding.toolCalls.filter(call =>
+          isWorkspaceVerificationCall(call)
+        );
+        this.emit({
+          type: verificationCalls.length > 0
+            ? 'agent.verification.evidence.completed'
+            : 'agent.verification.evidence.missing',
+          agentId,
+          sessionId: ctx.sessionId,
+          correlationId: options.correlationId,
+          nodeId: options.nodeId,
+          data: {
+            attempts: verificationCalls.length,
+            successful: verificationCalls.filter(call =>
+              isSuccessfulWorkspaceVerificationCall(call)
+            ).length,
+          },
+        });
+        if (verificationCalls.length === 0) {
+          throw new Error(
+            'Tester execution produced no fresh verification command evidence'
+          );
+        }
+      }
       if (actorWorkspaceExecutionRequired) {
         let closure = this.analyzeWorkspaceExecutionClosure(grounding.toolCalls);
         let continuation = 0;
@@ -10399,11 +10463,37 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
       .map(line => line.trim())
       .filter(Boolean);
     const explicitItems: string[] = [];
+    let requirementSection = false;
+    let passiveReferenceSection = false;
     for (let index = 0; index < lines.length; index += 1) {
       const line = lines[index]!;
-      const explicit = /^(?:[-*+]\s+|\d+[.)]\s+)/.test(line)
-        || /\b(?:must|must not|required|preserve|keep|honou?r|support|pass only if)\b/i.test(line)
+      const normativeLine = /\b(?:must|must not|required|preserve|keep|honou?r|support|pass only if)\b/i.test(line)
         || /(?:必须|不得|需要|保持|保留|支持|完成后|通过条件)/.test(line);
+      const markdownSection = /^#{1,6}\s+/.test(line)
+        ? line.replace(/^#{1,6}\s+/, '').replace(/:$/, '').trim()
+        : undefined;
+      const plainSectionLabel = line.match(/^([^`].*?):\s*$/)?.[1]?.trim();
+      const knownSectionLabel = Boolean(plainSectionLabel
+        && /^(?:requirements?|required outputs?|deliverables?|acceptance(?: criteria)?|output contract|artifacts?|(?:(?:official\s*\/\s*public|official|public)\s+)?references?)$/i.test(
+          plainSectionLabel
+        ));
+      const plainSection = !normativeLine || knownSectionLabel
+        ? plainSectionLabel
+        : undefined;
+      const section = markdownSection ?? plainSection;
+      if (section) {
+        passiveReferenceSection = /^(?:(?:official\s*\/\s*public|official|public)\s+)?references?$/i.test(section);
+        requirementSection = !passiveReferenceSection
+          && /\b(?:requirements?|required outputs?|deliverables?|acceptance|output contract|artifacts?)\b/i.test(section);
+        continue;
+      }
+      if (passiveReferenceSection) continue;
+      const listed = /^(?:[-*+]\s+|\d+[.)]\s+)/.test(line);
+      const explicit = normativeLine || listed && (
+        requirementSection
+        || /\boutputs?\//i.test(line)
+        || /\.(?:json|csv|md|ya?ml|toml|txt|py|ts|js)\b/i.test(line)
+      );
       if (!explicit) continue;
       let requirement = line
         .replace(/^(?:[-*+]\s+|\d+[.)]\s+)/, '')
@@ -10804,15 +10894,16 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     const combinedIntent = `${intent} ${leadingTaskIntent}`;
     const evidenceDeliverableOnly =
       /\b(?:explor|research|evidence|path steward|mapper|analyst)\w*\b/.test(intent)
-      && /\b(?:write|create|produce|return)\b[\s\S]{0,100}\b(?:report|summary|findings|analysis|plan|inventory|map|documentation|notes?)\b/.test(
+      && /\b(?:write|create|produce|return|summari[sz]e|document)\b[\s\S]{0,120}\b(?:report|summary|findings|analysis|plan|inventory|map|documentation|notes?|project structure|implementation)\b/.test(
         leadingTaskIntent
       )
-      && !/\b(?:implement|implementation|build|modify|edit|patch|repair|fix|migrate|executor|coder|engineer)\b/.test(
-        combinedIntent
+      && !/\b(?:implement|build|modify|edit|patch|repair|fix|migrate)\b/.test(
+        leadingTaskIntent
       );
     const implementationIntent =
-      /\b(?:implement|implementation|build|modify|edit|patch|repair|fix|migrate|executor|coder|engineer)\b/.test(
-        combinedIntent
+      /\b(?:executor|coder|engineer|implementation (?:owner|agent|specialist|lead))\b/.test(intent)
+      || /\b(?:implement|build|modify|edit|patch|repair|fix|migrate)\b/.test(
+        leadingTaskIntent
       )
       || /\b(?:create|write)\b[\s\S]{0,100}\b(?:source|code|pipeline|application|module|package|cli|service|required artifacts?|production files?)\b/.test(
         combinedIntent
@@ -14202,6 +14293,10 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     }));
     for (let index = plans.length - 1; index >= 0; index -= 1) {
       const plan = plans[index]!;
+      if (options.archetype === 'tester'
+        && isWorkspaceVerificationCall({ ...plan, success: true })) {
+        continue;
+      }
       const cached = this.cachedToolPlanDecision(plan, options.priorToolCalls ?? []);
       if (!cached.skip) {
         continue;
@@ -15247,6 +15342,41 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     let stalledIterations = 0;
     let acceptanceAuditInvalidated = false;
     const auditRequired = this.taskRequiresAcceptanceAudit(userTask);
+    if (delegatedExecution) {
+      const delegatedClosure = this.analyzeWorkspaceExecutionClosure(
+        delegatedExecution.toolCalls
+      );
+      if (delegatedClosure.closed) {
+        this.emit({
+          type: 'root.execution.delegated.closure.reused',
+          agentId: 'root',
+          correlationId,
+          data: {
+            ...delegatedClosure,
+            auditRequired,
+            toolCalls: delegatedExecution.toolCalls.length,
+          },
+        });
+        if (!auditRequired) return delegatedExecution;
+        const auditRemainingMs = this.remainingRootExecutionTimeMs(correlationId);
+        if (auditRemainingMs > 5_000) {
+          const audit = await this.runRootAcceptanceAudit(
+            userTask,
+            delegatedExecution,
+            correlationId,
+            Math.max(1_000, auditRemainingMs)
+          );
+          attempts.push(audit);
+          const auditedExecution = combineWithDelegatedExecution();
+          const auditedClosure = this.analyzeWorkspaceExecutionClosure(
+            auditedExecution.toolCalls,
+            auditedExecution.acceptanceAudit,
+            true
+          );
+          if (auditedClosure.closed) return auditedExecution;
+        }
+      }
+    }
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       const remainingMs = this.remainingRootExecutionTimeMs(correlationId);
       if (attempt > 1 && remainingMs <= 5_000) {

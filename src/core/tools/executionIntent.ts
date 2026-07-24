@@ -120,6 +120,18 @@ export function isSuccessfulWorkspaceVerificationCall(call: ExecutionIntentCall)
   const shell = call.result as { exitCode?: unknown; stdout?: unknown; stderr?: unknown } | undefined;
   if (typeof shell?.exitCode === 'number' && shell.exitCode !== 0) return false;
   const output = `${String(shell?.stdout ?? '')}\n${String(shell?.stderr ?? '')}`;
+  const command = String(call.params.command ?? '');
+  if (/\.roy\/official-verifier\//i.test(command)) {
+    const trimmed = output.trim();
+    const numericScore = /^(?:0(?:\.\d+)?|1(?:\.0+)?)$/.test(trimmed)
+      ? Number(trimmed)
+      : undefined;
+    const labeledScore = [...output.matchAll(
+      /(?:^|\n)\s*(?:reward|score)\s*[:=]\s*(0(?:\.\d+)?|1(?:\.0+)?)\s*(?:\n|$)/gi
+    )].map(match => Number(match[1])).at(-1);
+    const verifierScore = labeledScore ?? numericScore;
+    if (verifierScore !== undefined && verifierScore < 1) return false;
+  }
   const reportedStatuses = [...output.matchAll(/(?:^|\n)\s*(?:exit(?:_code)?|status)\s*[:=]\s*(-?\d+)\s*(?:\n|$)/gi)]
     .map(match => Number(match[1]));
   return reportedStatuses.length === 0 || reportedStatuses.every(status => status === 0);

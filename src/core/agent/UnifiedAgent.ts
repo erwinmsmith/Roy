@@ -125,6 +125,9 @@ export class UnifiedAgent extends BaseAgent {
       && isSuccessfulWorkspaceVerification(input.calls[lastVerificationIndex]!);
     const latestVerificationFailed = lastVerificationIndex > lastMutationIndex
       && !isSuccessfulWorkspaceVerification(input.calls[lastVerificationIndex]!);
+    if (executionRequired && mutationRequirementSatisfied && verificationPassed) {
+      return [];
+    }
     const inspectedAfterLatestFailure = latestVerificationFailed
       && input.calls.slice(lastVerificationIndex + 1).some(call =>
         call.success && (
@@ -186,7 +189,7 @@ export class UnifiedAgent extends BaseAgent {
             : '',
           executionRequired && latestVerificationFailed
             ? inspectedAfterLatestFailure
-              ? 'The newest verification failed after the latest mutation. Apply a focused repair now unless a distinct task-relevant input, rule, test, or source file has not yet been read; batch only those novel reads and never repeat broad discovery.'
+              ? 'The newest verification failed after the latest mutation. Apply a focused fs.replace repair now unless a distinct task-relevant input, rule, test, or source file has not yet been read; batch only those novel reads and never repeat broad discovery. Do not regenerate a complete existing implementation with fs.synthesize for a localized traceback unless concrete evidence requires a structural rewrite.'
               : 'The newest verification failed after the latest mutation. Preserve its detailed causal frontier and inspect only the reported source location before applying a focused repair.'
             : '',
           executionRequired && mutationApplied && !verificationPassed && !latestVerificationFailed
@@ -1248,17 +1251,61 @@ function recoverGroundedSynthesisPlan(input: {
   }
   const candidate = rankGroundedSynthesisTargets(input.calls, input.task)[0];
   if (!candidate) return undefined;
+  const aggregateVerifierRepair = input.latestVerificationFailed
+    && !hasLocalizedVerificationFailureSinceLastMutation(input.calls)
+    && input.calls.some(call =>
+      call.toolName === 'fs.read'
+      && call.success
+      && normalizePlannedWorkspacePath(String(
+        (call.result as { path?: unknown } | undefined)?.path
+          ?? call.params.path
+          ?? ''
+      )).startsWith('.roy/official-verifier/')
+    );
+  // The deterministic fallback is deliberately limited to true scaffolds.
+  // Replacing a non-stub implementation after a malformed planner response
+  // discards working behavior and turns a local repair into another expensive
+  // whole-file generation. A broad official-verifier score is the exception:
+  // after its source has been read, one structural repair may be necessary.
+  if (!candidate.stubSignal && !aggregateVerifierRepair) {
+    return undefined;
+  }
   return {
     toolName: 'fs.synthesize',
     params: {
       path: candidate.filePath,
       instructions: input.latestVerificationFailed
-        ? 'Repair the implementation to satisfy the latest grounded verifier failure and the immutable assignment while preserving working behavior.'
+        ? aggregateVerifierRepair
+          ? 'Structurally repair the implementation to satisfy the grounded aggregate official-verifier failures and immutable assignment, preserving behavior already proven by passing verifier groups.'
+          : 'Repair the implementation to satisfy the latest grounded verifier failure and the immutable assignment while preserving working behavior.'
         : 'Implement the complete assigned workspace behavior in this authoritative source file using the grounded inputs, rules, and project structure.',
     },
     reason: `Runtime recovered a grounded file-synthesis action after structured planning did not advance execution in round ${input.round}.`,
     groundingRequired: true,
   };
+}
+
+function verificationFailureIsLocalized(latestFailure: ToolLoopCallRecord): boolean {
+  const output = [
+    String(latestFailure.error ?? ''),
+    JSON.stringify(latestFailure.result ?? ''),
+  ].join('\n');
+  return /\bTraceback \(most recent call last\)|\bFile ["'][^"']+["'], line \d+|(?:^|\s)[A-Za-z0-9_./-]+\.(?:py|ts|tsx|js|jsx|mjs|cjs):\d+(?::\d+)?\b/im.test(
+    output
+  );
+}
+
+function hasLocalizedVerificationFailureSinceLastMutation(
+  calls: ToolLoopCallRecord[]
+): boolean {
+  const lastMutationIndex = findLastToolCallIndex(calls, call =>
+    isSuccessfulWorkspaceMutation(call)
+  );
+  return calls.slice(lastMutationIndex + 1).some(call =>
+    isWorkspaceVerificationCall(call)
+    && !isSuccessfulWorkspaceVerification(call)
+    && verificationFailureIsLocalized(call)
+  );
 }
 
 function recoverPostMutationVerificationPlan(input: {
@@ -1426,6 +1473,29 @@ function isDestructiveRepairOverwrite(
   planned: PlannedToolCall,
   completed: ToolLoopCallRecord[]
 ): boolean {
+  if (planned.toolName === 'fs.synthesize') {
+    const instructions = String(planned.params.instructions ?? '');
+    if (!hasLocalizedVerificationFailureSinceLastMutation(completed)
+      && /\b(?:structural|cross-cutting|rewrite (?:the )?entire|replace (?:the )?architecture|multiple independent failures)\b/i.test(instructions)) {
+      return false;
+    }
+    const target = normalizePlannedWorkspacePath(String(planned.params.path ?? ''));
+    if (!target || !completed.some(call => isSuccessfulWorkspaceMutation(call))) return false;
+    const observed = [...completed].reverse().find(call =>
+      call.toolName === 'fs.read'
+      && call.success
+      && normalizePlannedWorkspacePath(String(
+        (call.result as { path?: unknown } | undefined)?.path
+          ?? call.params.path
+          ?? ''
+      )) === target
+    );
+    const content = String(
+      (observed?.result as { content?: unknown } | undefined)?.content ?? ''
+    );
+    return Boolean(content)
+      && !/\b(?:todo|notimplemented(?:error)?|not implemented|placeholder|stub)\b|^\s*pass\s*(?:#.*)?$/im.test(content);
+  }
   if (planned.toolName !== 'fs.write'
     || String(planned.params.mode ?? 'overwrite') !== 'overwrite') {
     return false;

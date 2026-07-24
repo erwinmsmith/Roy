@@ -176,6 +176,42 @@ class DestructiveRepairThenReplacePlanningLLM extends PlanningLLM {
   }
 }
 
+class WholeFileRepairThenReplacePlanningLLM extends PlanningLLM {
+  constructor() {
+    super('none');
+  }
+
+  override async completeJSON<T>(): Promise<T> {
+    this.jsonCalls += 1;
+    if (this.jsonCalls === 1) {
+      return {
+        action: 'call_tools',
+        reason: 'Regenerate the complete implementation for a local traceback.',
+        calls: [{
+          toolName: 'fs.synthesize',
+          params: {
+            path: 'src/app.py',
+            instructions: 'Repair the latest localized failure.',
+          },
+        }],
+      } as T;
+    }
+    return {
+      action: 'call_tools',
+      reason: 'Repair only the reported local variable collision.',
+      calls: [{
+        toolName: 'fs.replace',
+        params: {
+          path: 'src/app.py',
+          startLine: 40,
+          endLine: 40,
+          newText: '    cleaned_orders = clean_orders(raw_orders)',
+        },
+      }],
+    } as T;
+  }
+}
+
 class NoisyFailureInspectionPlanningLLM extends PlanningLLM {
   constructor() {
     super('none');
@@ -924,6 +960,78 @@ describe('UnifiedAgent capability execution', () => {
     ]);
   });
 
+  it('uses a focused replacement instead of regenerating a complete implementation for a local traceback', async () => {
+    const llm = new WholeFileRepairThenReplacePlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'localized-synthesis-repair-agent',
+      goal: 'repair the causal line without another full-file generation',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.read', 'fs.replace', 'fs.synthesize', 'shell.exec'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: 'Implement src/app.py and continue until the official verifier passes.',
+      executionRequired: true,
+      round: 5,
+      remainingCalls: 3,
+      tools: [
+        { name: 'fs.read' },
+        { name: 'fs.replace' },
+        { name: 'fs.synthesize' },
+        { name: 'shell.exec' },
+      ],
+      calls: [
+        {
+          toolName: 'fs.synthesize',
+          params: {
+            path: 'src/app.py',
+            instructions: 'Implement the complete assigned behavior.',
+          },
+          reason: 'Create the initial implementation.',
+          groundingRequired: true,
+          success: true,
+          result: { path: 'src/app.py', bytes: 32_000 },
+        },
+        {
+          toolName: 'shell.exec',
+          params: { command: 'pytest -q .roy/official-verifier/test_outputs.py' },
+          reason: 'Run the official verifier.',
+          groundingRequired: true,
+          success: false,
+          error: 'src/app.py:40: UnboundLocalError: local variable clean_orders',
+          result: {
+            exitCode: 1,
+            stderr: 'src/app.py:40: UnboundLocalError: local variable clean_orders',
+          },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/app.py', startLine: 36, endLine: 44 },
+          reason: 'Inspect the localized causal frontier.',
+          groundingRequired: true,
+          success: true,
+          result: {
+            path: 'src/app.py',
+            content: 'def run():\n    clean_orders = clean_orders(raw_orders)\n',
+            startLine: 36,
+            endLine: 44,
+          },
+        },
+      ],
+    });
+
+    expect(llm.jsonCalls).toBe(2);
+    expect(plans).toEqual([expect.objectContaining({
+      toolName: 'fs.replace',
+      params: expect.objectContaining({
+        path: 'src/app.py',
+        startLine: 40,
+        endLine: 40,
+      }),
+    })]);
+  });
+
   it('converts a full observed-file overwrite into an exact snapshot replacement', async () => {
     const llm = new DestructiveRepairThenReplacePlanningLLM();
     const agent = new UnifiedAgent({
@@ -1564,6 +1672,193 @@ describe('UnifiedAgent capability execution', () => {
     expect(JSON.stringify(plans)).not.toContain('def run');
   });
 
+  it('does not recover a destructive whole-file synthesis for an existing non-stub implementation', async () => {
+    const llm = new CapturingToolPlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'non-stub-synthesis-recovery-agent',
+      goal: 'preserve working behavior when structured repair planning does not advance',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.read', 'fs.replace', 'fs.synthesize', 'shell.exec'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: 'Repair src/dq_audit/audit.py and verify the resulting behavior.',
+      executionRequired: true,
+      round: 8,
+      remainingCalls: 3,
+      tools: [
+        { name: 'fs.read' },
+        { name: 'fs.replace' },
+        { name: 'fs.synthesize' },
+        { name: 'shell.exec' },
+      ],
+      calls: [{
+        toolName: 'fs.read',
+        params: { path: 'src/dq_audit/audit.py' },
+        reason: 'Inspect the existing implementation.',
+        groundingRequired: true,
+        success: true,
+        result: {
+          path: 'src/dq_audit/audit.py',
+          content: 'def run_audit(config):\n    return reconcile(config)\n',
+          truncated: false,
+        },
+      }],
+    });
+
+    expect(llm.jsonCalls).toBe(3);
+    expect(plans).toEqual([]);
+  });
+
+  it('allows one grounded structural synthesis for an aggregate official-verifier failure', async () => {
+    const llm = new CapturingToolPlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'aggregate-verifier-repair-agent',
+      goal: 'repair broad hidden capability gaps after reading the official verifier',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.read', 'fs.replace', 'fs.synthesize', 'shell.exec'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: 'Repair src/table_recon/audit.py until the official verifier reward is 1.',
+      executionRequired: true,
+      round: 5,
+      remainingCalls: 3,
+      tools: [
+        { name: 'fs.read' },
+        { name: 'fs.replace' },
+        { name: 'fs.synthesize' },
+        { name: 'shell.exec' },
+      ],
+      calls: [
+        {
+          toolName: 'shell.exec',
+          params: { command: 'python .roy/official-verifier/grade.py' },
+          reason: 'Run the official verifier.',
+          groundingRequired: true,
+          success: true,
+          result: { exitCode: 0, stdout: '0.037500000000\n' },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: '.roy/official-verifier/grade.py' },
+          reason: 'Inspect the aggregate hidden capability assertions.',
+          groundingRequired: true,
+          success: true,
+          result: {
+            path: '.roy/official-verifier/grade.py',
+            content: 'GROUPS = ["hidden_wrapper", "layout_qc", "end_to_end_stress"]',
+          },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/table_recon/audit.py' },
+          reason: 'Inspect the current implementation.',
+          groundingRequired: true,
+          success: true,
+          result: {
+            path: 'src/table_recon/audit.py',
+            content: 'def run_audit(manifest, outputs):\n    return reconstruct_public(manifest, outputs)\n',
+          },
+        },
+      ],
+    });
+
+    expect(llm.jsonCalls).toBe(1);
+    expect(plans).toEqual([expect.objectContaining({
+      toolName: 'fs.synthesize',
+      params: {
+        path: 'src/table_recon/audit.py',
+        instructions: expect.stringContaining('aggregate official-verifier failures'),
+      },
+    })]);
+  });
+
+  it('prefers a focused repair when a local traceback exists alongside an aggregate score', async () => {
+    const llm = new CapturingToolPlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'mixed-verifier-repair-agent',
+      goal: 'use the actionable local failure before another structural rewrite',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.read', 'fs.replace', 'fs.synthesize', 'shell.exec'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: 'Repair src/table_recon/audit.py until the official verifier reward is 1.',
+      executionRequired: true,
+      round: 8,
+      remainingCalls: 3,
+      tools: [
+        { name: 'fs.read' },
+        { name: 'fs.replace' },
+        { name: 'fs.synthesize' },
+        { name: 'shell.exec' },
+      ],
+      calls: [
+        {
+          toolName: 'fs.synthesize',
+          params: {
+            path: 'src/table_recon/audit.py',
+            instructions: 'Apply the first structural hidden-capability repair.',
+          },
+          reason: 'Repair broad verifier groups.',
+          groundingRequired: true,
+          success: true,
+        },
+        {
+          toolName: 'shell.exec',
+          params: {
+            command: 'python -m table_recon.cli run --manifest data/public/manifest.json --out-dir outputs',
+          },
+          reason: 'Run the task CLI.',
+          groundingRequired: true,
+          success: false,
+          error: 'src/table_recon/audit.py:473: UnboundLocalError: xs',
+          result: {
+            exitCode: 1,
+            stderr: 'src/table_recon/audit.py:473: UnboundLocalError: xs',
+          },
+        },
+        {
+          toolName: 'shell.exec',
+          params: { command: 'python .roy/official-verifier/grade.py' },
+          reason: 'Run the aggregate official verifier.',
+          groundingRequired: true,
+          success: true,
+          result: { exitCode: 0, stdout: '0.017500000000\n' },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: '.roy/official-verifier/grade.py' },
+          reason: 'Inspect the aggregate verifier.',
+          groundingRequired: true,
+          success: true,
+          result: {
+            path: '.roy/official-verifier/grade.py',
+            content: 'GROUPS = ["hidden_layout_qc"]',
+          },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/table_recon/audit.py', startLine: 468, endLine: 478 },
+          reason: 'Inspect the local traceback location.',
+          groundingRequired: true,
+          success: true,
+          result: {
+            path: 'src/table_recon/audit.py',
+            content: 'grid_detection_used = len(xs) > 0',
+          },
+        },
+      ],
+    });
+
+    expect(llm.jsonCalls).toBe(3);
+    expect(plans).toEqual([]);
+  });
+
   it('binds a synthesized repair to the failed observed stub instead of a working wrapper', async () => {
     const llm = new WrongRepairTargetPlanningLLM();
     const agent = new UnifiedAgent({
@@ -1693,6 +1988,54 @@ describe('UnifiedAgent capability execution', () => {
       params: verifierParams,
       reason: expect.stringContaining('most recent authoritative verification'),
     })]);
+  });
+
+  it('stops replanning once the latest mutation has passed fresh verification', async () => {
+    const llm = new CapturingToolPlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'verified-execution-stop-agent',
+      goal: 'stop after the assigned mutation is genuinely verified',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.read', 'fs.replace', 'shell.exec'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: 'Repair src/app.py and verify it with pytest.',
+      executionRequired: true,
+      round: 4,
+      remainingCalls: 4,
+      tools: [
+        { name: 'fs.read' },
+        { name: 'fs.replace' },
+        { name: 'shell.exec' },
+      ],
+      calls: [
+        {
+          toolName: 'fs.replace',
+          params: {
+            path: 'src/app.py',
+            startLine: 10,
+            endLine: 10,
+            newText: '    return 42',
+          },
+          reason: 'Repair the reported implementation line.',
+          groundingRequired: true,
+          success: true,
+        },
+        {
+          toolName: 'shell.exec',
+          params: { command: 'pytest -q' },
+          reason: 'Verify the repaired implementation.',
+          groundingRequired: true,
+          success: true,
+          result: { command: 'pytest -q', exitCode: 0, stdout: '8 passed' },
+        },
+      ],
+    });
+
+    expect(plans).toEqual([]);
+    expect(llm.jsonCalls).toBe(0);
   });
 
   it('keeps synthesis on the explicit implementation module instead of a nearby CLI wrapper', async () => {

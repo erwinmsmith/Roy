@@ -113,6 +113,18 @@ describe('workspace execution intent', () => {
       success: true,
       result: { exitCode: 0, stdout: '12 passed' },
     })).toBe(true);
+    expect(isSuccessfulWorkspaceVerificationCall({
+      toolName: 'shell.exec',
+      params: { command: 'python .roy/official-verifier/grade.py' },
+      success: true,
+      result: { exitCode: 0, stdout: '0.037500000000\n' },
+    })).toBe(false);
+    expect(isSuccessfulWorkspaceVerificationCall({
+      toolName: 'shell.exec',
+      params: { command: 'python .roy/official-verifier/grade.py' },
+      success: true,
+      result: { exitCode: 0, stdout: 'reward: 1.0\n' },
+    })).toBe(true);
   });
 
   it('canonicalizes execution controls without conflating output contracts', () => {

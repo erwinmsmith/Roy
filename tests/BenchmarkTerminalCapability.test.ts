@@ -910,6 +910,93 @@ describe('benchmark terminal capability', () => {
     await runtime.shutdown();
   });
 
+  it('reuses a delegated mutation and fresh verification without making root repeat the work', async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), 'roy-delegated-closed-reuse-'));
+    await writeFile(path.join(workspace, 'delegated-global.txt'), 'delegated', 'utf8');
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'delegated-closed-reuse-test',
+      workspaceCwd: workspace,
+      llmProvider: new TerminalTaskLLM(),
+    });
+    const now = Date.now();
+    const delegatedResults = [{
+      node: { identity: { archetype: 'coder' } },
+      agent: { identity: { name: 'DelegatedWriter' } },
+      subagentResult: {
+        toolCalls: [
+          {
+            toolName: 'shell.exec',
+            params: { command: "printf 'delegated' > delegated-global.txt" },
+            result: { exitCode: 0, stdout: '', stderr: '' },
+            success: true,
+            startedAt: now - 40,
+            completedAt: now - 30,
+          },
+          {
+            toolName: 'shell.exec',
+            params: { command: 'test "$(cat delegated-global.txt)" = delegated' },
+            result: { exitCode: 0, stdout: '', stderr: '' },
+            success: true,
+            startedAt: now - 20,
+            completedAt: now - 10,
+          },
+        ],
+        grounded: true,
+        warnings: [],
+        context: '',
+        evidence: {
+          toolGrounded: true,
+          outputGrounded: true,
+          observedPaths: ['delegated-global.txt'],
+          toolResultSummary: 'DelegatedWriter created and freshly verified delegated-global.txt.',
+        },
+        toolLoop: {
+          rounds: [],
+          totalCalls: 2,
+          successfulCalls: 2,
+          failedCalls: 0,
+          stopReason: 'completed',
+          startedAt: now - 40,
+          completedAt: now - 10,
+        },
+        result: 'Created and verified delegated-global.txt.',
+        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        agent: { identity: { name: 'DelegatedWriter' } },
+      },
+    }];
+    const execute = (runtime as unknown as {
+      runRequiredRootExecution: (
+        task: string,
+        subagents: unknown[],
+        teams: unknown[],
+        correlationId: string
+      ) => Promise<{ toolCalls: Array<{ toolName: string; success: boolean }> }>;
+    }).runRequiredRootExecution.bind(runtime);
+
+    const execution = await execute(
+      'Implement and verify delegated-global.txt in the workspace.',
+      delegatedResults,
+      [],
+      'delegated-closed-reuse-correlation'
+    );
+
+    expect(execution.toolCalls).toHaveLength(2);
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'root.execution.delegated.closure.reused',
+      data: expect.objectContaining({
+        mutationApplied: true,
+        verificationPassed: true,
+        auditRequired: false,
+      }),
+    }));
+    expect(runtime.getEvents()).not.toContainEqual(expect.objectContaining({
+      type: 'tool.call',
+      agentId: 'root',
+    }));
+    await runtime.shutdown();
+  });
+
   it('re-enters root execution when the first direct attempt is not verified', async () => {
     const workspace = await mkdtemp(path.join(tmpdir(), 'roy-direct-execution-retry-'));
     await mkdir(path.join(workspace, '.roy'), { recursive: true });

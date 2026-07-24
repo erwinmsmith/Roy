@@ -650,6 +650,13 @@ describe('Root dynamic execution tree', () => {
       task: 'After the implementation completes, run validation and inspect every output.',
       tools: ['fs.read', 'shell.exec'],
     })).toBe(2);
+    expect(classify.call(runtime, {
+      archetype: 'custom',
+      name: 'WorkspaceExplorer',
+      role: 'workspace explorer and information gatherer',
+      task: 'Explore the workspace, read all Python files, and summarize the project structure and existing audit.py implementation.',
+      tools: ['fs.list', 'fs.read', 'fs.search'],
+    })).toBe(0);
   });
 
   it('does not treat write-capable exploration as implementation and restores a real executor', async () => {
