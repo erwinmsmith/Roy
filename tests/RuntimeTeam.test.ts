@@ -240,7 +240,7 @@ describe('Phase 3 subteam runtime', () => {
     };
     expect(patterns.patterns[0].id).toBe('team_pattern_analysisteam_v1');
     expect(patterns.patterns[0].memberArchetypes).toEqual(['researcher', 'critic', 'summarizer']);
-    expect(patterns.patterns[0].members[0].tools).toEqual(['fs.list', 'fs.read']);
+    expect(patterns.patterns[0].members[0].tools).toEqual(['fs.list', 'fs.read', 'fs.search']);
     expect(patterns.patterns[0].members[0].skills).toContain('delegate_to_subagent');
     expect(patterns.patterns[0].usage.completedCount).toBe(1);
     expect(patterns.patterns[0].usage.averageTokens).toBe(result.usage.totalTokens);

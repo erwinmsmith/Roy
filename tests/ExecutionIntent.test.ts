@@ -38,6 +38,11 @@ describe('workspace execution intent', () => {
       params: { path: 'artifact.txt', content: 'ready' },
       success: true,
     })).toBe(true);
+    expect(isSuccessfulWorkspaceMutationCall({
+      toolName: 'fs.replace',
+      params: { path: 'artifact.txt', oldText: 'ready', newText: 'done' },
+      success: true,
+    })).toBe(true);
     expect(isSuccessfulWorkspaceVerificationCall({
       toolName: 'shell.exec',
       params: { command: 'pytest -q' },
@@ -61,6 +66,24 @@ describe('workspace execution intent', () => {
       params: { command: 'set +e; npm run check' },
       success: true,
     })).toBe(false);
+    expect(isSuccessfulWorkspaceVerificationCall({
+      toolName: 'shell.exec',
+      params: { command: "python -m support_rag.cli answer --question test 2>&1; echo 'EXIT:'$?" },
+      success: true,
+      result: { exitCode: 0, stdout: 'EXIT:1' },
+    })).toBe(false);
+    expect(isSuccessfulWorkspaceVerificationCall({
+      toolName: 'shell.exec',
+      params: { command: 'pytest -q' },
+      success: true,
+      result: { exitCode: 1, stdout: '1 failed' },
+    })).toBe(false);
+    expect(isSuccessfulWorkspaceVerificationCall({
+      toolName: 'shell.exec',
+      params: { command: 'pytest -q' },
+      success: true,
+      result: { exitCode: 0, stdout: '12 passed' },
+    })).toBe(true);
   });
 
   it('distinguishes mutation tasks from explicitly read-only work', () => {

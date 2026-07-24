@@ -34,6 +34,9 @@ export class AgentToolPlanner {
     const referencedFiles = referencedPaths.filter(item => !item.endsWith('/'));
     const referencedUrls = this.extractReferencedUrls(input.task);
     const runtimeApiInspection = /\bruntime\s+apis?\b[\s\S]{0,80}\b(?:exports?|surface|inspection|declarations?|signatures?|source|symbols?)\b|\bexported runtime apis?\b/.test(lower);
+    const mutationTask = /\b(?:implement|modify|edit|create|write|patch|repair|fix|refactor|migrate|upgrade|install|replace|apply)\b/.test(lower);
+    const broadWorkspaceInspection = /\b(?:actual|current|entire|full|all)\b[\s\S]{0,100}\b(?:workspace|project|repository|repo|codebase|files?|metadata|manifests?)\b/.test(lower)
+      || /\b(?:workspace|project|repository|repo|codebase)\b[\s\S]{0,100}\b(?:structure|layout|inventory|metadata|manifests?|all files?)\b/.test(lower);
 
     if (enabled.has('web.fetch') && referencedUrls.length > 0) {
       plans.push(...referencedUrls.map(url => ({
@@ -51,7 +54,14 @@ export class AgentToolPlanner {
       });
     }
 
-    if (enabled.has('fs.list') && referencedDirectories.length > 0) {
+    if (enabled.has('fs.list') && !this.isWebOnlyTask(lower) && (mutationTask || broadWorkspaceInspection)) {
+      plans.push({
+        toolName: 'fs.list',
+        params: { path: '.', maxDepth: 4 },
+        reason: 'Establish the authoritative workspace layout before choosing paths or applying changes.',
+        groundingRequired: true,
+      });
+    } else if (enabled.has('fs.list') && referencedDirectories.length > 0) {
       plans.push(...referencedDirectories.map(directory => ({
         toolName: 'fs.list',
         params: { path: directory.replace(/\/$/, ''), maxDepth: 3 },
@@ -96,11 +106,8 @@ export class AgentToolPlanner {
     }
 
     if (enabled.has('shell.exec')) {
-      const explicitTestRun = /\b(?:run|execute)\s+(?:the\s+)?tests?\b|\bnpm test\b/.test(lower);
-      const testerVerification = input.archetype === 'tester'
-        && (/\b(?:verify|validate|check)\b[\s\S]*\b(?:tests?|claims?|behavio(?:u)?r|failure cases?)\b/.test(lower)
-          || /\b(?:test coverage|coverage gaps?|regression risk)\b/.test(lower));
-      if (explicitTestRun || testerVerification) {
+      const explicitNpmTest = /\bnpm test\b/.test(lower);
+      if (explicitNpmTest) {
         plans.push({ toolName: 'shell.exec', params: { command: 'npm test' }, reason: 'The task explicitly requests the test suite.', groundingRequired: true });
       } else if (input.archetype === 'critic'
         && !enabled.has('fs.read')

@@ -194,6 +194,10 @@ export interface WorkspaceRuntimeConfig {
       maxFeedbackItemsInPrompt: number;
       maxExecutionClosureAttempts: number;
       directDecisionAuditMinObligations: number;
+      maxExploratoryDelegationRounds: number;
+      executionReserveMs: number;
+      finalizationReserveMs: number;
+      requireAcceptanceAudit: boolean;
     };
     candidateScoring: {
       enabledScorers: Array<'heuristic' | 'cost' | 'tom' | 'cache_evolution' | 'llm'>;
@@ -526,7 +530,7 @@ Role-specific terms are recorded here.
 };
 
 const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
-  version: 12,
+  version: 13,
   traceEvents: true,
   memoryUpdates: 'suggest',
   llm: {
@@ -557,6 +561,10 @@ const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
       maxFeedbackItemsInPrompt: 24,
       maxExecutionClosureAttempts: 3,
       directDecisionAuditMinObligations: 4,
+      maxExploratoryDelegationRounds: 2,
+      executionReserveMs: 2 * 60_000,
+      finalizationReserveMs: 30_000,
+      requireAcceptanceAudit: true,
     },
     candidateScoring: {
       enabledScorers: ['heuristic', 'cost', 'tom', 'cache_evolution', 'llm'],
@@ -580,12 +588,12 @@ const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
   },
   agents: {
     defaultToolsByArchetype: {
-      researcher: ['fs.list', 'fs.read'],
-      critic: ['fs.read'],
+      researcher: ['fs.list', 'fs.read', 'fs.search'],
+      critic: ['fs.read', 'fs.search'],
       planner: [],
-      coder: ['fs.read', 'fs.write', 'shell.exec'],
+      coder: ['fs.list', 'fs.read', 'fs.search', 'fs.replace', 'fs.write', 'shell.exec'],
       summarizer: [],
-      tester: ['fs.read', 'shell.exec'],
+      tester: ['fs.list', 'fs.read', 'fs.search', 'shell.exec'],
       custom: [],
     },
     defaultSkillsByArchetype: {

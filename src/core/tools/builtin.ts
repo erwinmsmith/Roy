@@ -1,5 +1,5 @@
 import { toolRegistry } from './registry.js';
-import { FsListTool, FsReadTool, FsWriteTool } from './fsTools.js';
+import { FsListTool, FsReadTool, FsReplaceTool, FsSearchTool, FsWriteTool } from './fsTools.js';
 import { ShellExecTool, type ShellExecConfig } from './shellExec.js';
 import { WebFetchTool, WebSearchTool, type WebToolConfig } from './webTools.js';
 
@@ -13,6 +13,12 @@ export function registerCoreTools(options: {
   }
   if (!toolRegistry.has('fs.read')) {
     toolRegistry.register(new FsReadTool(options.workspaceRoot), 'filesystem');
+  }
+  if (!toolRegistry.has('fs.search')) {
+    toolRegistry.register(new FsSearchTool(options.workspaceRoot), 'filesystem');
+  }
+  if (!toolRegistry.has('fs.replace')) {
+    toolRegistry.register(new FsReplaceTool(options.workspaceRoot), 'filesystem');
   }
   if (!toolRegistry.has('fs.write')) {
     toolRegistry.register(new FsWriteTool(options.workspaceRoot), 'filesystem');

@@ -27,12 +27,37 @@ class TerminalTaskLLM implements LLMProvider {
   async completeJSON<T>(messages: LLMMessage[], _options?: LLMCompletionOptions): Promise<T> {
     const system = messages.find(message => message.role === 'system')?.content ?? '';
     const user = messages.findLast(message => message.role === 'user')?.content ?? '';
+    if (system.includes('final acceptance auditor')) {
+      return {
+        items: Array.from({ length: 10 }, (_, index) => ({
+          id: `acceptance_${String(index + 1).padStart(2, '0')}`,
+          status: 'verified',
+          evidence: 'The final read-only audit observed the artifact and a passing executable check.',
+        })),
+        reason: 'All supplied acceptance items have direct audit evidence.',
+      } as T;
+    }
     if (system.includes("root delegation controller")) {
       this.rootDecisionPrompts.push(user);
       return { action: 'solve_directly', reason: 'The root has the required terminal capability.' } as T;
     }
     if (system.includes('plan authorized tool calls')) {
-      if (user.includes('Completed tool round: 0')) {
+      if (user.includes('[runtime_acceptance_audit_phase]') && user.includes('Completed tool round:')) {
+        const file = user.includes('failed-delegation.txt')
+          ? 'failed-delegation.txt'
+          : user.includes('delegated.txt')
+            ? 'delegated.txt'
+            : 'artifact.txt';
+        return {
+          action: 'call_tools',
+          reason: 'Verify the final artifact without changing it.',
+          calls: [{
+            toolName: 'shell.exec',
+            params: { command: `test -f ${file} && test -s ${file}` },
+          }],
+        } as T;
+      }
+      if (user.includes('Completed tool round:')) {
         return {
           action: 'call_tools',
           reason: 'Create and verify the requested artifact.',
@@ -66,6 +91,9 @@ class DelegatedTerminalTaskLLM extends TerminalTaskLLM {
   override async completeJSON<T>(messages: LLMMessage[]): Promise<T> {
     const system = messages.find(message => message.role === 'system')?.content ?? '';
     const user = messages.findLast(message => message.role === 'user')?.content ?? '';
+    if (system.includes('final acceptance auditor') || user.includes('[runtime_acceptance_audit_phase]')) {
+      return super.completeJSON<T>(messages);
+    }
     if (system.includes("root delegation controller")) {
       return {
         action: 'spawn_subagents',
@@ -84,7 +112,7 @@ class DelegatedTerminalTaskLLM extends TerminalTaskLLM {
       return { action: 'solve_directly', reason: 'The child should inspect directly.' } as T;
     }
     if (system.includes('plan authorized tool calls')) {
-      if (user.includes('[runtime_execution_phase]') && user.includes('Completed tool round: 0')) {
+      if (user.includes('[runtime_execution_phase]') && user.includes('Completed tool round:')) {
         return {
           action: 'call_tools',
           reason: 'Apply and verify the delegated workspace change.',
@@ -114,6 +142,9 @@ class FailedDelegationRecoveryLLM extends TerminalTaskLLM {
   override async completeJSON<T>(messages: LLMMessage[]): Promise<T> {
     const system = messages.find(message => message.role === 'system')?.content ?? '';
     const user = messages.findLast(message => message.role === 'user')?.content ?? '';
+    if (system.includes('final acceptance auditor') || user.includes('[runtime_acceptance_audit_phase]')) {
+      return super.completeJSON<T>(messages);
+    }
     if (system.includes("root delegation controller")) {
       return {
         action: 'spawn_subagents',
@@ -131,7 +162,7 @@ class FailedDelegationRecoveryLLM extends TerminalTaskLLM {
       return { action: 'solve_directly', reason: 'The child should answer directly.' } as T;
     }
     if (system.includes('plan authorized tool calls')) {
-      if (user.includes('[runtime_execution_phase]') && user.includes('Completed tool round: 0')) {
+      if (user.includes('[runtime_execution_phase]') && user.includes('Completed tool round:')) {
         return {
           action: 'call_tools',
           reason: 'Recover by applying and verifying the requested workspace change.',
@@ -157,11 +188,14 @@ class RetryingDirectExecutionLLM extends TerminalTaskLLM {
   override async completeJSON<T>(messages: LLMMessage[]): Promise<T> {
     const system = messages.find(message => message.role === 'system')?.content ?? '';
     const user = messages.findLast(message => message.role === 'user')?.content ?? '';
+    if (system.includes('final acceptance auditor') || user.includes('[runtime_acceptance_audit_phase]')) {
+      return super.completeJSON<T>(messages);
+    }
     if (system.includes("root delegation controller")) {
       return { action: 'solve_directly', reason: 'Execute the bounded workspace task directly.' } as T;
     }
     if (system.includes('plan authorized tool calls')) {
-      if (user.includes('[runtime_execution_phase]') && user.includes('Completed tool round: 0')) {
+      if (user.includes('[runtime_execution_phase]') && user.includes('Completed tool round:')) {
         return {
           action: 'call_tools',
           reason: 'Apply an initial incomplete edit.',
@@ -171,7 +205,7 @@ class RetryingDirectExecutionLLM extends TerminalTaskLLM {
           }],
         } as T;
       }
-      if (user.includes('[runtime_execution_repair_phase]') && user.includes('Completed tool round: 0')) {
+      if (user.includes('[runtime_execution_repair_phase]') && user.includes('Completed tool round:')) {
         return {
           action: 'call_tools',
           reason: 'Repair and verify the incomplete edit.',

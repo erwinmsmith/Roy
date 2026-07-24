@@ -89,10 +89,17 @@ export class UnifiedAgent extends BaseAgent {
       .map(tool => tool.name));
     if (authorized.size === 0) return [];
     const executionRequired = requestsWorkspaceMutation(input.task)
-      && (authorized.has('fs.write') || authorized.has('shell.exec'));
+      && (authorized.has('fs.write') || authorized.has('fs.replace') || authorized.has('shell.exec'));
     const mutationApplied = input.calls.some(call => isSuccessfulWorkspaceMutation(call));
     const verificationRan = input.calls.some(call => isSuccessfulWorkspaceVerification(call));
-    const observations = input.calls.slice(-4).map(call => ({
+    const successfulInspection = input.calls.some(call =>
+      call.success && (
+        call.toolName === 'fs.list'
+        || call.toolName === 'fs.read'
+        || call.toolName === 'fs.search'
+      )
+    );
+    const observations = input.calls.slice(-12).map(call => ({
       toolName: call.toolName,
       params: call.params,
       success: call.success,
@@ -110,7 +117,9 @@ export class UnifiedAgent extends BaseAgent {
             ? 'This is an execution task. Do not finish after analysis or a proposed patch. Apply the workspace change, then run relevant verification.'
             : '',
           executionRequired && !mutationApplied
-            ? 'No successful workspace mutation has been observed yet. Read only what is needed, then request fs.write or a mutating shell.exec call.'
+            ? successfulInspection
+              ? 'The workspace layout has been grounded. Request fs.replace, fs.write, or a mutating shell.exec call that advances the actual task.'
+              : 'No authoritative workspace inspection has succeeded yet. Recover failed paths with fs.list, fs.read, or fs.search before requesting a mutation.'
             : '',
           executionRequired && mutationApplied && !verificationRan
             ? 'At least one workspace mutation succeeded, but that does not prove the full implementation is complete. Continue any remaining edits or repairs, then request a relevant test, build, lint, typecheck, or targeted assertion.'
@@ -128,7 +137,12 @@ export class UnifiedAgent extends BaseAgent {
           `Task:\n${input.task}`,
           `Completed tool round: ${input.round}`,
           `Remaining call capacity: ${input.remainingCalls}`,
-          `Execution state: ${JSON.stringify({ executionRequired, mutationApplied, verificationRan })}`,
+          `Execution state: ${JSON.stringify({
+            executionRequired,
+            successfulInspection,
+            mutationApplied,
+            verificationRan,
+          })}`,
           `Authorized tools:\n${JSON.stringify(input.tools, null, 2)}`,
           `Tool observations:\n${JSON.stringify(observations, null, 2)}`,
         ].join('\n\n'),
@@ -157,16 +171,22 @@ export class UnifiedAgent extends BaseAgent {
           input.remainingCalls,
           input.round
         ).filter(call => !completedCallFingerprints.has(plannedToolCallFingerprint(call)));
+        const plannedInspection = plannedCalls.some(call =>
+          call.toolName === 'fs.list'
+          || call.toolName === 'fs.read'
+          || call.toolName === 'fs.search'
+        );
         const advancesExecution = !executionRequired
           || (mutationApplied
             ? verificationRan || plannedCalls.some(call =>
               isSuccessfulWorkspaceMutation({ ...call, success: true })
               || isSuccessfulWorkspaceVerification({ ...call, success: true })
             )
-            : plannedCalls.some(call => isSuccessfulWorkspaceMutation({
-              ...call,
-              success: true,
-            })));
+            : ((!successfulInspection && plannedInspection)
+              || plannedCalls.some(call => isSuccessfulWorkspaceMutation({
+                ...call,
+                success: true,
+              }))));
         if (advancesExecution) break;
         planningMessages = [
           ...planningMessages,
@@ -176,7 +196,9 @@ export class UnifiedAgent extends BaseAgent {
             content: [
               'Runtime rejected this plan because the execution contract is incomplete.',
               !mutationApplied
-                ? 'Read-only, diagnostic, repeated, or finish plans are insufficient. Request a concrete fs.write or mutating shell.exec call now.'
+                ? successfulInspection
+                  ? 'The workspace is already grounded. Request a concrete fs.replace, fs.write, or mutating shell.exec call now.'
+                  : 'The previous inspection failed or was absent. Request a corrected fs.list, fs.read, or fs.search call before mutating.'
                 : '',
               mutationApplied && !verificationRan
                 ? 'Finish, read-only, masked-failure, and repeated plans are insufficient. Request a concrete remaining edit or repair, or a distinct verification command whose exit status is preserved.'
@@ -187,15 +209,21 @@ export class UnifiedAgent extends BaseAgent {
         ];
       }
       if (executionRequired) {
+        const plannedInspection = plannedCalls.some(call =>
+          call.toolName === 'fs.list'
+          || call.toolName === 'fs.read'
+          || call.toolName === 'fs.search'
+        );
         const advancesExecution = mutationApplied
           ? verificationRan || plannedCalls.some(call =>
             isSuccessfulWorkspaceMutation({ ...call, success: true })
             || isSuccessfulWorkspaceVerification({ ...call, success: true })
           )
-          : plannedCalls.some(call => isSuccessfulWorkspaceMutation({
-            ...call,
-            success: true,
-          }));
+          : ((!successfulInspection && plannedInspection)
+            || plannedCalls.some(call => isSuccessfulWorkspaceMutation({
+              ...call,
+              success: true,
+            })));
         if (!advancesExecution) return [];
       }
       return plannedCalls;
@@ -948,6 +976,25 @@ function compactToolObservation(result: unknown, toolName: string): unknown {
       stderr: String(shell.stderr ?? '').slice(-3000),
       exitCode: shell.exitCode,
       timedOut: shell.timedOut,
+    };
+  }
+  if (result && typeof result === 'object' && toolName === 'fs.search') {
+    const search = result as {
+      query?: unknown;
+      filesSearched?: unknown;
+      matches?: Array<{ path?: unknown; line?: unknown; column?: unknown; preview?: unknown }>;
+      truncated?: unknown;
+    };
+    return {
+      query: search.query,
+      filesSearched: search.filesSearched,
+      matches: (search.matches ?? []).slice(0, 30).map(match => ({
+        path: match.path,
+        line: match.line,
+        column: match.column,
+        preview: String(match.preview ?? '').slice(0, 500),
+      })),
+      truncated: search.truncated,
     };
   }
   return compactObservationValue(result, 0);

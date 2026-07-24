@@ -50,7 +50,7 @@ describe('Workspace memory initialization', () => {
     });
     expect(rootState.updatedAt).toEqual(expect.any(String));
     const workspaceConfig = JSON.parse(await readFile(path.join(workspaceCwd, '.roy', 'config.json'), 'utf8'));
-    expect(workspaceConfig.version).toBe(12);
+    expect(workspaceConfig.version).toBe(13);
     expect(workspaceConfig.llm).toEqual({
       streamMaxAttempts: 3,
       jsonMaxAttempts: 2,
@@ -85,6 +85,10 @@ describe('Workspace memory initialization', () => {
       maxFeedbackItemsInPrompt: 24,
       maxExecutionClosureAttempts: 3,
       directDecisionAuditMinObligations: 4,
+      maxExploratoryDelegationRounds: 2,
+      executionReserveMs: 120000,
+      finalizationReserveMs: 30000,
+      requireAcceptanceAudit: true,
     });
     expect(workspaceConfig.lifecycle).toMatchObject({
       manual: 'retain_session',
@@ -115,7 +119,7 @@ describe('Workspace memory initialization', () => {
       allowCustomAgents: true,
       budgetAware: true,
     });
-    expect(workspaceConfig.agents.defaultToolsByArchetype.researcher).toEqual(['fs.list', 'fs.read']);
+    expect(workspaceConfig.agents.defaultToolsByArchetype.researcher).toEqual(['fs.list', 'fs.read', 'fs.search']);
     expect(workspaceConfig.agents.defaultSkillsByArchetype.researcher).toEqual(['use_tool_when_needed', 'delegate_to_subagent']);
     expect(workspaceConfig.teams).toMatchObject({
       enabled: true,
@@ -238,7 +242,7 @@ describe('Workspace memory initialization', () => {
     expect(researcher?.tools.map(tool => tool.name)).toEqual(['fs.read']);
     expect(researcher?.skills.map(skill => skill.name)).toEqual(['use_tool_when_needed']);
     const migratedConfig = JSON.parse(await readFile(path.join(workspaceCwd, '.roy', 'config.json'), 'utf8'));
-    expect(migratedConfig.version).toBe(12);
+    expect(migratedConfig.version).toBe(13);
     expect(migratedConfig.llm.streamMaxAttempts).toBe(3);
     expect(migratedConfig.delegation.rootSteps).toEqual({
       enabled: true,
@@ -254,6 +258,10 @@ describe('Workspace memory initialization', () => {
       maxFeedbackItemsInPrompt: 24,
       maxExecutionClosureAttempts: 3,
       directDecisionAuditMinObligations: 4,
+      maxExploratoryDelegationRounds: 2,
+      executionReserveMs: 120000,
+      finalizationReserveMs: 30000,
+      requireAcceptanceAudit: true,
     });
     expect(migratedConfig.tom.minimumCoverage).toBe(0.6);
     expect(migratedConfig.tom.enforceMinimumCoverage).toBe(false);

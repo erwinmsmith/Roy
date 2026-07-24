@@ -44,6 +44,8 @@ import {
   AgentToolExecutionLoop,
   FsListTool,
   FsReadTool,
+  FsReplaceTool,
+  FsSearchTool,
   FsWriteTool,
   isSuccessfulWorkspaceMutationCall,
   isSuccessfulWorkspaceVerificationCall,
@@ -462,12 +464,35 @@ interface GroundingRunResult {
   context: string;
   evidence: RunEvidence;
   toolLoop: ToolLoopSummary;
+  acceptanceAudit?: WorkspaceAcceptanceAudit;
+}
+
+interface WorkspaceAcceptanceAuditItem {
+  id: string;
+  status: 'verified' | 'failed' | 'blocked' | 'unverified';
+  evidence: string;
+}
+
+interface WorkspaceAcceptanceAudit {
+  required: boolean;
+  performed: boolean;
+  passed: boolean;
+  items: WorkspaceAcceptanceAuditItem[];
+  missingItemIds: string[];
+  toolEvidenceSufficient: boolean;
+  reason: string;
 }
 
 interface WorkspaceExecutionClosureStatus {
   mutationApplied: boolean;
   verificationAttemptedAfterMutation: boolean;
   verificationPassed: boolean;
+  acceptanceAuditRequired: boolean;
+  acceptanceAuditPerformed: boolean;
+  acceptanceAuditPassed: boolean;
+  acceptanceItems: number;
+  acceptanceItemsVerified: number;
+  acceptanceItemsFailed: number;
   closed: boolean;
   lastMutationCallIndex: number;
   lastVerificationCallIndex: number;
@@ -820,6 +845,8 @@ export class Runtime {
     this.runtimeToolOverrides.clear();
     this.runtimeToolOverrides.set('fs.list', new FsListTool(workspaceRoot));
     this.runtimeToolOverrides.set('fs.read', new FsReadTool(workspaceRoot));
+    this.runtimeToolOverrides.set('fs.search', new FsSearchTool(workspaceRoot));
+    this.runtimeToolOverrides.set('fs.replace', new FsReplaceTool(workspaceRoot));
     this.runtimeToolOverrides.set('fs.write', new FsWriteTool(workspaceRoot));
     this.runtimeToolOverrides.set('shell.exec', new ShellExecTool({
       ...this.workspaceRuntimeConfig.tools.shell,
@@ -2466,7 +2493,8 @@ export class Runtime {
     params: Record<string, unknown>,
     options: { reason?: string; correlationId?: string; nodeId?: string }
   ): Promise<ToolResult | undefined> {
-    if ((toolName !== 'fs.read' && toolName !== 'fs.list') || typeof params.path !== 'string') {
+    if ((toolName !== 'fs.read' && toolName !== 'fs.list' && toolName !== 'fs.search')
+      || typeof params.path !== 'string') {
       return undefined;
     }
     const requestedPath = this.normalizeCachedPath(params.path);
@@ -2561,14 +2589,14 @@ export class Runtime {
     const observedPath = this.normalizeCachedPath(params.path);
     if (result.success) {
       this.failedPathObservations.get(correlationKey)?.delete(observedPath);
-      if (toolName === 'fs.write') {
+      if (toolName === 'fs.write' || toolName === 'fs.replace') {
         const changed = this.changedPathsByCorrelation.get(correlationKey) ?? new Set<string>();
         changed.add(observedPath);
         this.changedPathsByCorrelation.set(correlationKey, changed);
       }
       return;
     }
-    if (toolName !== 'fs.read' && toolName !== 'fs.list') return;
+    if (toolName !== 'fs.read' && toolName !== 'fs.list' && toolName !== 'fs.search') return;
     const failures = this.failedPathObservations.get(correlationKey) ?? new Map();
     failures.set(observedPath, {
       toolName,
@@ -3192,12 +3220,12 @@ export class Runtime {
 
   private getDefaultToolBindings(archetype: SubAgentArchetype): ToolBinding[] {
     const namesByArchetype: Record<SubAgentArchetype, string[]> = {
-      researcher: ['fs.list', 'fs.read'],
-      critic: ['fs.read'],
+      researcher: ['fs.list', 'fs.read', 'fs.search'],
+      critic: ['fs.read', 'fs.search'],
       planner: [],
-      coder: ['fs.read', 'fs.write', 'shell.exec'],
+      coder: ['fs.list', 'fs.read', 'fs.search', 'fs.replace', 'fs.write', 'shell.exec'],
       summarizer: [],
-      tester: ['fs.read', 'shell.exec'],
+      tester: ['fs.list', 'fs.read', 'fs.search', 'shell.exec'],
       custom: [],
     };
     const configured = this.workspaceRuntimeConfig?.agents.defaultToolsByArchetype[archetype];
@@ -3265,7 +3293,7 @@ export class Runtime {
   private createToolBinding(name: string): ToolBinding {
     const permission: ToolBinding['permission'] = name === 'shell.exec'
       ? 'execute'
-      : name === 'fs.write'
+      : name === 'fs.write' || name === 'fs.replace'
         ? 'write'
         : 'read_only';
     return {
@@ -4308,7 +4336,11 @@ export class Runtime {
           [],
           correlationId
         );
-        requiredExecutionClosure = this.analyzeWorkspaceExecutionClosure(rootExecution.toolCalls);
+        requiredExecutionClosure = this.analyzeWorkspaceExecutionClosure(
+          rootExecution.toolCalls,
+          rootExecution.acceptanceAudit,
+          this.taskRequiresAcceptanceAudit(userInput)
+        );
         this.emit({
           type: requiredExecutionClosure.closed
             ? 'root.execution.required.completed'
@@ -4449,15 +4481,32 @@ export class Runtime {
         const maxRounds = Math.max(1, rootStepConfig?.maxDelegationRounds ?? 8);
         const loopGuard = loopController.evaluate(tree);
         const roundMutationApplied = this.delegationRoundHasWorkspaceMutation(round);
-        const exploratoryDelegationLimit = 4;
-        const executionHandoffRequired = this.shouldHandoffToRootExecution({
+        const exploratoryDelegationLimit = Math.max(
+          1,
+          rootStepConfig?.maxExploratoryDelegationRounds ?? 2
+        );
+        const configuredExecutionReserveMs = Math.max(
+          0,
+          rootStepConfig?.executionReserveMs ?? 2 * 60_000
+        );
+        const executionReserveMs = Math.min(
+          configuredExecutionReserveMs,
+          Math.floor(tree.loop.maxWallClockMs * 0.4)
+        );
+        const timeReserveHandoffRequired = requiresWorkspaceMutation
+          && loopGuard.elapsedMs >= Math.max(
+            0,
+            tree.loop.maxWallClockMs - executionReserveMs
+          );
+        const executionHandoffRequired = timeReserveHandoffRequired
+          || this.shouldHandoffToRootExecution({
           requiresWorkspaceMutation,
           requiresLongHorizon,
           roundMutationApplied,
           delegationRounds,
           maxRounds,
           exploratoryDelegationLimit,
-        });
+          });
         const canReassess = rootStepConfig?.enabled !== false
           && rootStepConfig?.reassessAfterDelegation !== false
           && roundDecision.continuationPolicy !== 'finalize_after_round'
@@ -4480,9 +4529,14 @@ export class Runtime {
               data: {
                 stepId: step.id,
                 delegationRounds,
-                reason: roundMutationApplied
-                  ? 'delegated_workspace_mutation_observed'
-                  : 'delegation_round_cap_without_mutation',
+                reason: timeReserveHandoffRequired
+                  ? 'execution_time_reserve_reached'
+                  : roundMutationApplied
+                    ? 'delegated_workspace_mutation_observed'
+                    : 'delegation_round_cap_without_mutation',
+                elapsedMs: loopGuard.elapsedMs,
+                executionReserveMs,
+                rootWallClockMs: tree.loop.maxWallClockMs,
               },
             });
           } else {
@@ -4577,7 +4631,11 @@ export class Runtime {
           teamResults,
           correlationId
         );
-        requiredExecutionClosure = this.analyzeWorkspaceExecutionClosure(rootExecution.toolCalls);
+        requiredExecutionClosure = this.analyzeWorkspaceExecutionClosure(
+          rootExecution.toolCalls,
+          rootExecution.acceptanceAudit,
+          this.taskRequiresAcceptanceAudit(userInput)
+        );
         const completedExecutionStep = await this.completeRootExecutionStep(correlationId, executionStep, {
           resultSummary: this.summarizeRootExecutionClosure(rootExecution),
         });
@@ -6217,7 +6275,7 @@ export class Runtime {
           },
         });
       }
-      const grounding = await this.runGroundingCheck(agentId, task, {
+      let grounding = await this.runGroundingCheck(agentId, task, {
         ...options,
         onBeforeExecution: async initialPlans => {
           await this.transitionAgentFsm(agentId, 'S_tool_calling', {
@@ -6249,7 +6307,42 @@ export class Runtime {
       let result = session ? await this.drainAgentOutput(session.messageQueue, agent.name) : agent.getInfo().lastResult ?? '';
       if (this.containsUnresolvedToolIntent(result)) {
         if (!grounding.evidence.toolGrounded) {
-          throw new Error('Agent returned an unexecuted tool request without runtime grounding evidence');
+          const recoveryPlans = this.extractUnresolvedToolPlans(agentId, result);
+          if (recoveryPlans.length > 0) {
+            this.emit({
+              type: 'agent.output.tool_intent.recovery.started',
+              agentId,
+              sessionId: ctx.sessionId,
+              correlationId: options.correlationId,
+              data: {
+                task,
+                tools: recoveryPlans.map(plan => plan.toolName),
+              },
+            });
+            const recovered = await this.runGroundingCheck(agentId, task, {
+              ...options,
+              initialPlans: recoveryPlans,
+              skipInitialModelPlanning: true,
+            });
+            grounding = this.combineGroundingRuns([grounding, recovered]);
+            this.emit({
+              type: grounding.evidence.toolGrounded
+                ? 'agent.output.tool_intent.recovery.completed'
+                : 'agent.output.tool_intent.recovery.failed',
+              agentId,
+              sessionId: ctx.sessionId,
+              correlationId: options.correlationId,
+              data: {
+                task,
+                successfulCalls: recovered.toolLoop.successfulCalls,
+                failedCalls: recovered.toolLoop.failedCalls,
+                stopReason: recovered.toolLoop.stopReason,
+              },
+            });
+          }
+          if (!grounding.evidence.toolGrounded) {
+            throw new Error('Agent returned an unexecuted tool request without runtime grounding evidence');
+          }
         }
         this.emit({
           type: 'agent.output.repair.started',
@@ -9088,7 +9181,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     if (/\b(?:read|inspect|review|check|audit|verify|compare|cross-reference)\b/.test(lower)
       && /(?:\b(?:file|source|manifest|package\.json|exports?|apis?)\b|[./][a-z0-9_-]+\.(?:ts|tsx|js|jsx|json|md|ya?ml|toml)\b)/i.test(task)
       && !this.taskNeedsWebAccess(task)) {
-      tools.push('fs.read');
+      tools.push('fs.read', 'fs.search');
     }
     if (/\b(?:list|tree|structure|directories|workspace|repository|codebase)\b/.test(lower)
       && !this.taskNeedsWebAccess(task)) {
@@ -9099,7 +9192,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     }
     if (/\b(?:terminal|shell|command line|cli|container)\b/.test(lower)
       || /\b(?:implement|modify|edit|create|write|patch|repair|fix|refactor)\b[\s\S]*\b(?:file|code|project|repository|workspace|artifact|solution)\b/.test(lower)) {
-      tools.push('fs.read', 'fs.write', 'shell.exec');
+      tools.push('fs.list', 'fs.read', 'fs.search', 'fs.replace', 'fs.write', 'shell.exec');
     }
     return Array.from(new Set(tools)).filter(tool => toolRegistry.has(tool));
   }
@@ -9245,6 +9338,22 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
   }
 
   private buildTaskAcceptanceChecklist(task: string): string {
+    const items = this.extractTaskAcceptanceItems(task);
+    return JSON.stringify({
+      items: items.map((item, index) => ({
+        id: `acceptance_${String(index + 1).padStart(2, '0')}`,
+        requirement: item,
+        status: 'unverified',
+      })),
+      closurePolicy: [
+        'Before finalizing, classify every item as verified, failed, or explicitly blocked using runtime evidence.',
+        'Search for stale parallel declarations, call sites, generated metadata, configuration, and compatibility paths relevant to each item.',
+        'A passing narrow check does not close sibling requirements; preserve failures and unverified items as actionable feedback.',
+      ],
+    }, null, 2);
+  }
+
+  private extractTaskAcceptanceItems(task: string): string[] {
     const lines = task
       .split(/\r?\n/)
       .map(line => line.trim())
@@ -9260,18 +9369,19 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     if (items.length === 0) {
       items.push(task.replace(/\s+/g, ' ').trim().slice(0, 1200));
     }
-    return JSON.stringify({
-      items: items.map((item, index) => ({
-        id: `acceptance_${String(index + 1).padStart(2, '0')}`,
-        requirement: item,
-        status: 'unverified',
-      })),
-      closurePolicy: [
-        'Before finalizing, classify every item as verified, failed, or explicitly blocked using runtime evidence.',
-        'Search for stale parallel declarations, call sites, generated metadata, configuration, and compatibility paths relevant to each item.',
-        'A passing narrow check does not close sibling requirements; preserve failures and unverified items as actionable feedback.',
-      ],
-    }, null, 2);
+    return items;
+  }
+
+  private taskRequiresAcceptanceAudit(task: string): boolean {
+    if (this.workspaceRuntimeConfig?.delegation.rootSteps.requireAcceptanceAudit === false) {
+      return false;
+    }
+    const threshold = Math.max(
+      1,
+      this.workspaceRuntimeConfig?.delegation.rootSteps.directDecisionAuditMinObligations ?? 4
+    );
+    return this.requiresLongHorizonLoop(task)
+      || this.extractTaskAcceptanceItems(task).length >= threshold;
   }
 
   private ensureLongHorizonRecoveryContinuation(
@@ -9335,7 +9445,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
             'Implement the next unresolved bounded slice, consume failed tool output as repair feedback, and run a focused check before reporting.',
             `Original task: ${task}`,
           ].join('\n'),
-          tools: ['fs.list', 'fs.read', 'fs.write', 'shell.exec'],
+          tools: ['fs.list', 'fs.read', 'fs.search', 'fs.replace', 'fs.write', 'shell.exec'],
           skills: ['use_tool_when_needed', 'delegate_to_subagent'],
           tomLevel: 1,
           existenceReason: 'A cached mutated path remains partial or unverified and requires another bounded implementation slice.',
@@ -9350,8 +9460,8 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
             'Report exact failures, authoritative paths, and the smallest next repair; do not claim completion without successful tool evidence.',
             `Original task: ${task}`,
           ].join('\n'),
-          tools: ['fs.list', 'fs.read', 'shell.exec'],
-          skills: ['use_tool_when_needed', 'delegate_to_subagent'],
+          tools: ['fs.list', 'fs.read', 'fs.search', 'shell.exec'],
+          skills: ['use_tool_when_needed'],
           tomLevel: 1,
           existenceReason: 'The preceding mutation lacks a closed, independently verified execution path.',
         },
@@ -9385,8 +9495,8 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
           name: 'PathSteward-1',
           role: 'execution state and path steward',
           task: `Establish the first grounded checkpoint for this long-horizon task. Inspect authoritative workspace paths, identify cached invalid paths and actionable feedback, and pass a bounded execution map to the team: ${task}`,
-          tools: ['fs.list', 'fs.read'],
-          skills: ['use_tool_when_needed', 'delegate_to_subagent'],
+          tools: ['fs.list', 'fs.read', 'fs.search'],
+          skills: ['use_tool_when_needed'],
           tomLevel: 1,
           existenceReason: 'Maintain authoritative path, cache, and unresolved-feedback state for the team.',
         },
@@ -9395,7 +9505,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
           name: 'Executor-2',
           role: 'workspace executor',
           task: `Inspect the actual workspace, implement the next complete bounded slice of the requested change, use failed tool output to repair it, and do not stop at a proposal: ${task}`,
-          tools: ['fs.list', 'fs.read', 'fs.write', 'shell.exec'],
+          tools: ['fs.list', 'fs.read', 'fs.search', 'fs.replace', 'fs.write', 'shell.exec'],
           skills: ['use_tool_when_needed', 'delegate_to_subagent'],
           tomLevel: 1,
           existenceReason: 'Apply the requested workspace mutation with runtime tools.',
@@ -9405,8 +9515,8 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
           name: 'Verifier-3',
           role: 'independent closure verifier',
           task: `Verify the actual resulting workspace state for this task. Run relevant checks, distinguish authoritative and invalid paths, and return concrete repair feedback for any failure: ${task}`,
-          tools: ['fs.list', 'fs.read', 'shell.exec'],
-          skills: ['use_tool_when_needed', 'delegate_to_subagent'],
+          tools: ['fs.list', 'fs.read', 'fs.search', 'shell.exec'],
+          skills: ['use_tool_when_needed'],
           tomLevel: 1,
           existenceReason: 'Close the mutation-and-verification loop and produce actionable feedback.',
         },
@@ -9417,8 +9527,8 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
           name: 'EvidenceSteward-1',
           role: 'grounded evidence and path steward',
           task: `Establish the first grounded checkpoint, authoritative evidence paths, cached failures to avoid, and unresolved gaps for: ${task}`,
-          tools: ['fs.list', 'fs.read'],
-          skills: ['use_tool_when_needed', 'delegate_to_subagent'],
+          tools: ['fs.list', 'fs.read', 'fs.search'],
+          skills: ['use_tool_when_needed'],
           tomLevel: 1,
           existenceReason: 'Create durable evidence and path state for a long-horizon task.',
         },
@@ -9427,8 +9537,8 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
           name: 'CheckpointVerifier-2',
           role: 'checkpoint and feedback verifier',
           task: `Independently verify the first bounded checkpoint, challenge unsupported claims, and return actionable feedback that later steps and descendants can consume for: ${task}`,
-          tools: ['fs.list', 'fs.read', 'shell.exec'],
-          skills: ['use_tool_when_needed', 'delegate_to_subagent'],
+          tools: ['fs.list', 'fs.read', 'fs.search', 'shell.exec'],
+          skills: ['use_tool_when_needed'],
           tomLevel: 1,
           existenceReason: 'Validate the checkpoint and expose concrete next-step feedback.',
         },
@@ -10281,6 +10391,10 @@ ${result.result}
       ? `<root_execution_report>
 mutation_applied: ${this.hasSuccessfulWorkspaceMutation(rootExecution.toolCalls)}
 verification_ran: ${this.hasSuccessfulWorkspaceVerification(rootExecution.toolCalls)}
+acceptance_audit_required: ${rootExecution.acceptanceAudit?.required === true}
+acceptance_audit_passed: ${rootExecution.acceptanceAudit?.passed === true}
+acceptance_items:
+${rootExecution.acceptanceAudit?.items.map(item => `- ${item.id}: ${item.status} — ${item.evidence}`).join('\n') || '- none'}
 tool_calls:
 ${rootExecution.toolCalls.map(call => `- ${call.toolName}: ${call.success ? 'success' : `failed (${call.error ?? 'unknown error'})`}`).join('\n') || '- none'}
 runtime_evidence:
@@ -10299,7 +10413,7 @@ Roy delegated this task to ${results.length} subagent(s). Synthesize their resul
 Use concrete evidence from grounded reports. If a report is ungrounded or missing concrete tool output, say so and avoid overstating it.
 Compare each agent's belief scope and perspective against the cognitive gaps it was created to fill. Preserve unresolved uncertainty instead of forcing agreement.
 For web-grounded work, cite only observed_urls from the reports. Never introduce a URL or factual detail from model memory. Search-result discovered_urls are not opened evidence.
-When a root_execution_report is present, treat its successful tool results as the authoritative final workspace state. Do not repeat an earlier claim that changes were only proposed when the root execution report proves they were applied. Never claim completion when mutation_applied is false.
+When a root_execution_report is present, treat its successful tool results as the authoritative final workspace state. Do not repeat an earlier claim that changes were only proposed when the root execution report proves they were applied. Never claim completion when mutation_applied is false or when acceptance_audit_required is true and acceptance_audit_passed is false.
 
 ${teamReports ? `The following subteam reports have already aggregated their direct members. Treat them as the primary delegation result.\n\n${teamReports}` : ''}
 
@@ -12758,20 +12872,30 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       nodeId?: string;
       patternId?: string;
       intentTask?: string;
+      maxWallClockMs?: number;
+      initialPlans?: PlannedToolCall[];
+      skipInitialModelPlanning?: boolean;
+      toolAllowlist?: string[];
       onBeforeExecution?: (plans: PlannedToolCall[]) => Promise<void>;
     }
   ): Promise<GroundingRunResult> {
-    const bindings = this.agentBindings.get(agentId)?.tools ?? [];
+    const allowedTools = options.toolAllowlist
+      ? new Set(options.toolAllowlist)
+      : undefined;
+    const bindings = (this.agentBindings.get(agentId)?.tools ?? [])
+      .filter(binding => !allowedTools || allowedTools.has(binding.name));
     const intentTask = options.intentTask ?? task;
     const inspectionRoot = this.resolveInspectionRoot(intentTask);
     const groundingRequired = this.agentRestoreSpecs.get(agentId)?.outputContract?.groundingRequired
       ?? this.taskRequiresGrounding(options.archetype ?? 'custom', intentTask);
-    const plans = this.toolPlanner.plan({
-      task: intentTask,
-      workspacePath: inspectionRoot,
-      bindings,
-      archetype: options.archetype,
-    });
+    const plans = options.initialPlans
+      ? [...options.initialPlans]
+      : this.toolPlanner.plan({
+        task: intentTask,
+        workspacePath: inspectionRoot,
+        bindings,
+        archetype: options.archetype,
+      });
     const actor = this.getContext().manager.getAgentById(agentId);
     const loopConfig = this.workspaceRuntimeConfig?.tools.executionLoop ?? {
       enabled: true,
@@ -12783,16 +12907,27 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       llmReplanning: true,
     };
     const needsModelPlannedAction = bindings.some(binding =>
-      binding.enabled && (binding.name === 'shell.exec' || binding.name === 'fs.write')
+      binding.enabled && (
+        binding.name === 'shell.exec'
+        || binding.name === 'fs.write'
+        || binding.name === 'fs.replace'
+      )
     ) && (
       this.taskRequiresWorkspaceMutation(intentTask)
       ||
       /\b(?:terminal|shell|command line|cli|container)\b/i.test(intentTask)
       || /\b(?:implement|modify|edit|create|write|patch|repair|fix|refactor)\b[\s\S]*\b(?:file|code|project|repository|workspace|artifact|solution)\b/i.test(intentTask)
     );
+    const hasInitialInspection = plans.some(plan =>
+      plan.toolName === 'fs.list'
+      || plan.toolName === 'fs.read'
+      || plan.toolName === 'fs.search'
+    );
     if (needsModelPlannedAction
       && loopConfig.enabled
       && loopConfig.llmReplanning
+      && !options.skipInitialModelPlanning
+      && !hasInitialInspection
       && actor instanceof UnifiedAgent) {
       const modelPlans = await actor.planNextToolRound({
         task,
@@ -12849,7 +12984,10 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       maxRounds: loopConfig.enabled ? loopConfig.maxRounds : 1,
       maxCalls: loopConfig.enabled ? loopConfig.maxCallsPerRun : Math.max(1, plans.length),
       maxConsecutiveFailures: loopConfig.maxConsecutiveFailures,
-      maxWallClockMs: loopConfig.maxWallClockMs,
+      maxWallClockMs: Math.max(
+        1,
+        Math.min(loopConfig.maxWallClockMs, options.maxWallClockMs ?? loopConfig.maxWallClockMs)
+      ),
     });
     const toolLoop = await loop.run({
       task,
@@ -12988,6 +13126,27 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         const summary = `Wrote ${String(written?.bytes ?? 'unknown')} bytes to ${String(written?.path ?? 'file')} (${String(written?.mode ?? 'unknown')}).`;
         summaries.push(summary);
         contexts.push(summary);
+      } else if (call.toolName === 'fs.replace') {
+        const replaced = call.result as { path?: unknown; replacements?: unknown; bytes?: unknown } | undefined;
+        if (typeof replaced?.path === 'string') observedPaths.push(replaced.path);
+        const summary = `Replaced ${String(replaced?.replacements ?? 'unknown')} occurrence(s) in ${String(replaced?.path ?? 'file')} (${String(replaced?.bytes ?? 'unknown')} bytes after edit).`;
+        summaries.push(summary);
+        contexts.push(summary);
+      } else if (call.toolName === 'fs.search') {
+        const searched = call.result as {
+          query?: unknown;
+          filesSearched?: unknown;
+          matches?: Array<{ path?: unknown; line?: unknown; preview?: unknown }>;
+          truncated?: unknown;
+        } | undefined;
+        const matches = Array.isArray(searched?.matches) ? searched.matches : [];
+        const lines = matches.slice(0, 100).map(match => {
+          if (typeof match.path === 'string') observedPaths.push(match.path);
+          return `${String(match.path ?? 'file')}:${String(match.line ?? '?')}: ${String(match.preview ?? '').slice(0, 500)}`;
+        });
+        const summary = `Workspace search for ${JSON.stringify(String(searched?.query ?? call.params.query ?? ''))} across ${String(searched?.filesSearched ?? 'unknown')} file(s):\n${lines.join('\n') || 'No matches.'}${searched?.truncated ? '\n[truncated]' : ''}`;
+        summaries.push(summary);
+        contexts.push(summary);
       } else if (call.toolName === 'shell.exec') {
         const shell = call.result as { command?: unknown; stdout?: unknown; stderr?: unknown } | undefined;
         const output = [shell?.stdout, shell?.stderr].filter(value => typeof value === 'string' && value).join('\n');
@@ -13070,7 +13229,12 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     calls: Array<{ toolName: string }>
   ): boolean {
     return this.taskRequiresWorkspaceMutation(task)
-      || calls.some(call => call.toolName.startsWith('web.') || call.toolName === 'shell.exec' || call.toolName === 'fs.write')
+      || calls.some(call =>
+        call.toolName.startsWith('web.')
+        || call.toolName === 'shell.exec'
+        || call.toolName === 'fs.write'
+        || call.toolName === 'fs.replace'
+      )
       || /\b(?:multi-step|continue|iterate|until|cross-check|multiple sources|independent sources)\b/i.test(task);
   }
 
@@ -13151,6 +13315,170 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     ].join('\n\n');
   }
 
+  private buildRootAcceptanceAuditTask(
+    userTask: string,
+    priorExecution: GroundingRunResult
+  ): string {
+    return [
+      '[runtime_acceptance_audit_phase]',
+      'This is a read-only final audit. Do not modify, edit, write, patch, install, or create files during this audit.',
+      `Original task:\n${userTask}`,
+      `<acceptance_checklist>\n${this.buildTaskAcceptanceChecklist(userTask)}\n</acceptance_checklist>`,
+      [
+        'Audit contract:',
+        '- Establish the authoritative workspace root and actual project layout before selecting paths.',
+        '- Cross-check every parallel manifest, requirements file, generated declaration, configuration source, compatibility path, and relevant call site that could contradict the primary edit.',
+        '- Use fs.search for stale declarations or forbidden patterns when text search is applicable; do not assume rg, grep, npm, or another ecosystem command exists.',
+        '- Choose verification commands from observed project metadata instead of assuming a language or package manager.',
+        '- Run the broadest relevant executable checks that fit the remaining time, preserving their real exit status.',
+        '- Return concrete evidence for every acceptance item. A narrow passing check does not verify unrelated items.',
+      ].join('\n'),
+      `Prior execution evidence:\n${priorExecution.evidence.toolResultSummary?.slice(-12_000) || 'No prior textual evidence.'}`,
+    ].join('\n\n');
+  }
+
+  private async runRootAcceptanceAudit(
+    userTask: string,
+    priorExecution: GroundingRunResult,
+    correlationId: string,
+    maxWallClockMs: number
+  ): Promise<GroundingRunResult> {
+    const task = this.buildRootAcceptanceAuditTask(userTask, priorExecution);
+    const grounding = await this.runGroundingCheck('root', task, {
+      correlationId,
+      archetype: 'tester',
+      intentTask: task,
+      maxWallClockMs,
+      toolAllowlist: ['fs.list', 'fs.read', 'fs.search', 'shell.exec'],
+    });
+    const items = this.extractTaskAcceptanceItems(userTask);
+    const expectedIds = items.map((_, index) =>
+      `acceptance_${String(index + 1).padStart(2, '0')}`
+    );
+    const inventoryObserved = grounding.toolCalls.some(call =>
+      call.toolName === 'fs.list' && call.success
+    );
+    const stateInspected = grounding.toolCalls.some(call =>
+      call.success && (
+        call.toolName === 'fs.read'
+        || call.toolName === 'fs.search'
+        || call.toolName === 'shell.exec'
+      )
+    );
+    const verificationPassed = grounding.toolCalls.some(call =>
+      isSuccessfulWorkspaceVerificationCall(call)
+    );
+    const toolEvidenceSufficient = inventoryObserved && stateInspected && verificationPassed;
+    let normalizedItems: WorkspaceAcceptanceAuditItem[] = expectedIds.map(id => ({
+      id,
+      status: 'unverified',
+      evidence: 'No acceptance classification was returned.',
+    }));
+    let classificationReason: string;
+    try {
+      const response = await this.completeJSONAsAgent<{
+        items?: Array<{ id?: unknown; status?: unknown; evidence?: unknown }>;
+        reason?: unknown;
+      }>(
+        this.getContext().agent,
+        [
+          {
+            role: 'system',
+            content: [
+              'You are Roy\'s conservative final acceptance auditor.',
+              'Classify every checklist item from authoritative runtime tool evidence only.',
+              'Use verified only when the evidence directly proves the complete requirement and no observed sibling declaration contradicts it.',
+              'Use failed when evidence contradicts the requirement, blocked for a concrete external blocker, and unverified when evidence is incomplete.',
+              'Return JSON only: {"items":[{"id":"acceptance_01","status":"verified|failed|blocked|unverified","evidence":"..."}],"reason":"..."}.',
+            ].join('\n'),
+          },
+          {
+            role: 'user',
+            content: [
+              `<acceptance_checklist>${this.buildTaskAcceptanceChecklist(userTask)}</acceptance_checklist>`,
+              `<audit_tool_evidence>${grounding.evidence.toolResultSummary?.slice(0, 20_000) || 'none'}</audit_tool_evidence>`,
+              `<audit_warnings>${grounding.warnings.join('\n') || 'none'}</audit_warnings>`,
+              `<audit_structure>${JSON.stringify({
+                inventoryObserved,
+                stateInspected,
+                verificationPassed,
+                observedPaths: grounding.evidence.observedPaths.slice(0, 120),
+              })}</audit_structure>`,
+            ].join('\n\n'),
+          },
+        ],
+        { temperature: 0, maxTokens: Math.min(4096, 300 + items.length * 140) },
+        'root.acceptance_audit',
+        correlationId
+      );
+      const responseById = new Map(
+        (response.items ?? [])
+          .filter(item => typeof item.id === 'string')
+          .map(item => [String(item.id), item])
+      );
+      normalizedItems = expectedIds.map(id => {
+        const item = responseById.get(id);
+        const status = item?.status === 'verified'
+          || item?.status === 'failed'
+          || item?.status === 'blocked'
+          || item?.status === 'unverified'
+          ? item.status
+          : 'unverified';
+        return {
+          id,
+          status,
+          evidence: typeof item?.evidence === 'string'
+            ? item.evidence.slice(0, 1000)
+            : 'No direct evidence was supplied.',
+        };
+      });
+      classificationReason = typeof response.reason === 'string'
+        ? response.reason.slice(0, 2000)
+        : 'Acceptance items classified from runtime evidence.';
+    } catch (error) {
+      classificationReason = `Acceptance classification failed: ${error instanceof Error ? error.message : String(error)}`;
+    }
+    const missingItemIds = normalizedItems
+      .filter(item => item.status !== 'verified')
+      .map(item => item.id);
+    const audit: WorkspaceAcceptanceAudit = {
+      required: true,
+      performed: true,
+      passed: toolEvidenceSufficient && missingItemIds.length === 0,
+      items: normalizedItems,
+      missingItemIds,
+      toolEvidenceSufficient,
+      reason: classificationReason,
+    };
+    this.emit({
+      type: audit.passed
+        ? 'root.acceptance.audit.completed'
+        : 'root.acceptance.audit.unmet',
+      agentId: 'root',
+      correlationId,
+      data: {
+        ...audit,
+        inventoryObserved,
+        stateInspected,
+        verificationPassed,
+        toolCalls: grounding.toolCalls.map(call => ({
+          toolName: call.toolName,
+          success: call.success,
+        })),
+      },
+    });
+    return {
+      ...grounding,
+      acceptanceAudit: audit,
+      warnings: audit.passed
+        ? grounding.warnings
+        : [
+          ...grounding.warnings,
+          `Final acceptance audit remains open: ${missingItemIds.join(', ') || 'insufficient global tool evidence'}. ${classificationReason}`,
+        ],
+    };
+  }
+
   private async runRequiredRootExecution(
     userTask: string,
     subagents: RootMediatedSpawnResult[],
@@ -13162,7 +13490,35 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       1,
       this.workspaceRuntimeConfig?.delegation.rootSteps.maxExecutionClosureAttempts ?? 3
     );
+    const auditRequired = this.taskRequiresAcceptanceAudit(userTask);
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      const remainingMs = this.remainingRootExecutionTimeMs(correlationId);
+      if (attempt > 1 && remainingMs <= 5_000) {
+        this.emit({
+          type: 'root.execution.time_budget.exhausted',
+          agentId: 'root',
+          correlationId,
+          data: { attempt, maxAttempts, remainingMs },
+        });
+        break;
+      }
+      const remainingAttempts = Math.max(1, maxAttempts - attempt + 1);
+      const attemptWallClockMs = Math.max(
+        1_000,
+        Math.floor(remainingMs / (remainingAttempts + (auditRequired ? 1 : 0)))
+      );
+      this.emit({
+        type: 'root.execution.time_budget.allocated',
+        agentId: 'root',
+        correlationId,
+        data: {
+          attempt,
+          maxAttempts,
+          remainingMs,
+          attemptWallClockMs,
+          auditRequired,
+        },
+      });
       const priorExecution = attempts.length > 0
         ? this.combineGroundingRuns(attempts)
         : undefined;
@@ -13186,11 +13542,44 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       const current = await this.runGroundingCheck(
         'root',
         task,
-        { correlationId, archetype: 'coder', intentTask: userTask }
+        {
+          correlationId,
+          archetype: 'coder',
+          intentTask: userTask,
+          maxWallClockMs: attemptWallClockMs,
+        }
       );
       attempts.push(current);
-      const combined = this.combineGroundingRuns(attempts);
-      const closure = this.analyzeWorkspaceExecutionClosure(combined.toolCalls);
+      let combined = this.combineGroundingRuns(attempts);
+      if (this.hasSuccessfulWorkspaceMutation(current.toolCalls)) {
+        combined.acceptanceAudit = undefined;
+      }
+      let closure = this.analyzeWorkspaceExecutionClosure(
+        combined.toolCalls,
+        combined.acceptanceAudit,
+        auditRequired
+      );
+      if (closure.mutationApplied
+        && closure.verificationPassed
+        && auditRequired
+        && !closure.acceptanceAuditPassed) {
+        const auditRemainingMs = this.remainingRootExecutionTimeMs(correlationId);
+        if (auditRemainingMs > 5_000) {
+          const audit = await this.runRootAcceptanceAudit(
+            userTask,
+            combined,
+            correlationId,
+            Math.max(1_000, auditRemainingMs)
+          );
+          attempts.push(audit);
+          combined = this.combineGroundingRuns(attempts);
+          closure = this.analyzeWorkspaceExecutionClosure(
+            combined.toolCalls,
+            combined.acceptanceAudit,
+            auditRequired
+          );
+        }
+      }
       this.emit({
         type: 'root.execution.attempt.completed',
         agentId: 'root',
@@ -13201,7 +13590,10 @@ For web-grounded work, use only facts present in the subagent report or runtime 
           ...closure,
           verificationRan: closure.verificationPassed,
           toolCalls: current.toolCalls.length,
-          stopReason: current.toolLoop.stopReason,
+          acceptanceAuditToolCalls: combined.acceptanceAudit
+            ? attempts.at(-1)?.toolCalls.length ?? 0
+            : 0,
+          stopReason: attempts.at(-1)?.toolLoop.stopReason ?? current.toolLoop.stopReason,
         },
       });
       if (closure.closed) return combined;
@@ -13219,7 +13611,11 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       `Original task:\n${userTask}`,
       `Execution attempt ${attempt - 1} did not satisfy the required mutation-and-verification closure.`,
       [
-        `Closure status: ${JSON.stringify(this.analyzeWorkspaceExecutionClosure(priorExecution.toolCalls))}`,
+        `Closure status: ${JSON.stringify(this.analyzeWorkspaceExecutionClosure(
+          priorExecution.toolCalls,
+          priorExecution.acceptanceAudit,
+          this.taskRequiresAcceptanceAudit(userTask)
+        ))}`,
         `Prior tool evidence:\n${priorExecution.evidence.toolResultSummary?.slice(-10_000) || 'No textual tool evidence was available.'}`,
         priorExecution.warnings.length > 0
           ? `Prior warnings:\n${priorExecution.warnings.slice(-8).join('\n')}`
@@ -13245,7 +13641,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     const toolCalls = runs.flatMap(run => run.toolCalls);
     return {
       toolCalls,
-      grounded: runs.every(run => run.grounded),
+      grounded: runs.some(run => run.grounded),
       warnings: runs.flatMap(run => run.warnings),
       context: runs.map(run => run.context).filter(Boolean).join('\n\n'),
       evidence: {
@@ -13273,7 +13669,24 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         startedAt: first.toolLoop.startedAt,
         completedAt: last.toolLoop.completedAt,
       },
+      acceptanceAudit: [...runs].reverse()
+        .find(run => run.acceptanceAudit)?.acceptanceAudit,
     };
+  }
+
+  private remainingRootExecutionTimeMs(correlationId: string): number {
+    const tree = this.executionTrees.get(correlationId);
+    if (!tree) return this.workspaceRuntimeConfig?.tools.executionLoop.maxWallClockMs ?? 120_000;
+    const configuredFinalizationReserveMs = Math.max(
+      0,
+      this.workspaceRuntimeConfig?.delegation.rootSteps.finalizationReserveMs ?? 30_000
+    );
+    const finalizationReserveMs = Math.min(
+      configuredFinalizationReserveMs,
+      Math.floor(tree.loop.maxWallClockMs * 0.2)
+    );
+    const elapsedMs = Math.max(0, Date.now() - tree.createdAt);
+    return Math.max(1_000, tree.loop.maxWallClockMs - elapsedMs - finalizationReserveMs);
   }
 
   private hasSuccessfulWorkspaceMutation(calls: ToolCallRecord[]): boolean {
@@ -13284,7 +13697,11 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     return calls.some(call => isSuccessfulWorkspaceVerificationCall(call));
   }
 
-  private analyzeWorkspaceExecutionClosure(calls: ToolCallRecord[]): WorkspaceExecutionClosureStatus {
+  private analyzeWorkspaceExecutionClosure(
+    calls: ToolCallRecord[],
+    acceptanceAudit?: WorkspaceAcceptanceAudit,
+    acceptanceAuditRequired = false
+  ): WorkspaceExecutionClosureStatus {
     let lastMutationCallIndex = -1;
     for (let index = 0; index < calls.length; index += 1) {
       if (isSuccessfulWorkspaceMutationCall(calls[index]!)) lastMutationCallIndex = index;
@@ -13295,20 +13712,39 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     const lastVerification = verificationCalls.at(-1);
     const mutationApplied = lastMutationCallIndex >= 0;
     const verificationAttemptedAfterMutation = mutationApplied && verificationCalls.length > 0;
-    const verificationPassed = verificationAttemptedAfterMutation && lastVerification?.call.success === true;
+    const verificationPassed = verificationAttemptedAfterMutation
+      && Boolean(lastVerification && isSuccessfulWorkspaceVerificationCall(lastVerification.call));
+    const acceptanceItems = acceptanceAudit?.items.length ?? 0;
+    const acceptanceItemsVerified = acceptanceAudit?.items
+      .filter(item => item.status === 'verified').length ?? 0;
+    const acceptanceItemsFailed = acceptanceAudit?.items
+      .filter(item => item.status === 'failed' || item.status === 'blocked').length ?? 0;
+    const acceptanceAuditPerformed = acceptanceAudit?.performed === true;
+    const acceptanceAuditPassed = !acceptanceAuditRequired || acceptanceAudit?.passed === true;
     return {
       mutationApplied,
       verificationAttemptedAfterMutation,
       verificationPassed,
-      closed: mutationApplied && verificationPassed,
+      acceptanceAuditRequired,
+      acceptanceAuditPerformed,
+      acceptanceAuditPassed,
+      acceptanceItems,
+      acceptanceItemsVerified,
+      acceptanceItemsFailed,
+      closed: mutationApplied && verificationPassed && acceptanceAuditPassed,
       lastMutationCallIndex,
       lastVerificationCallIndex: lastVerification?.index ?? -1,
-      failedVerificationCallsAfterMutation: verificationCalls.filter(item => !item.call.success).length,
+      failedVerificationCallsAfterMutation: verificationCalls
+        .filter(item => !isSuccessfulWorkspaceVerificationCall(item.call)).length,
     };
   }
 
   private summarizeRootExecutionClosure(execution: GroundingRunResult): string {
-    const closure = this.analyzeWorkspaceExecutionClosure(execution.toolCalls);
+    const closure = this.analyzeWorkspaceExecutionClosure(
+      execution.toolCalls,
+      execution.acceptanceAudit,
+      execution.acceptanceAudit?.required === true
+    );
     const successfulCalls = execution.toolCalls.filter(call => call.success).length;
     return [
       `Root execution closure: mutationApplied=${closure.mutationApplied}, `
@@ -13515,9 +13951,112 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     return /<tool_call>[\s\S]*?<\/tool_call>/i.test(result)
       || /<tool_name>[\s\S]*?<\/tool_name>/i.test(result)
       || /<function_calls>[\s\S]*?<\/function_calls>/i.test(result)
-      || /<invocation\s+name=["'](?:web\.(?:search|fetch)|fs\.(?:list|read|write)|shell\.exec)["'][\s\S]*?<\/invocation>/i.test(result)
-      || /```(?:tool|json)?\s*\n\s*(?:web\.(?:search|fetch)|fs\.(?:list|read|write)|shell\.exec)\b[\s\S]*?```/i.test(result)
+      || /<invocation\s+name=["'](?:web\.(?:search|fetch)|fs\.(?:list|read|search|replace|write)|shell\.exec)["'][\s\S]*?<\/invocation>/i.test(result)
+      || /```(?:tool|json)?\s*\n\s*(?:web\.(?:search|fetch)|fs\.(?:list|read|search|replace|write)|shell\.exec)\b[\s\S]*?```/i.test(result)
       || /\{\s*"(?:tool_name|tool|function)"\s*:\s*"[^"\n]+"[\s\S]*?\}/i.test(result);
+  }
+
+  private extractUnresolvedToolPlans(agentId: string, result: string): PlannedToolCall[] {
+    const authorized = new Set(
+      (this.agentBindings.get(agentId)?.tools ?? [])
+        .filter(binding => binding.enabled)
+        .map(binding => binding.name)
+    );
+    const candidates: Array<{ toolName: string; params: Record<string, unknown> }> = [];
+    const parseParams = (body: string): Record<string, unknown> => {
+      const argumentText = body.match(/<arguments?>\s*([\s\S]*?)\s*<\/arguments?>/i)?.[1]
+        ?? body.match(/<params?>\s*([\s\S]*?)\s*<\/params?>/i)?.[1];
+      if (argumentText) {
+        try {
+          const parsed = JSON.parse(argumentText);
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            return parsed as Record<string, unknown>;
+          }
+        } catch {
+          // Fall through to simple XML field extraction.
+        }
+      }
+      const params: Record<string, unknown> = {};
+      for (const field of [
+        'path',
+        'query',
+        'command',
+        'content',
+        'oldText',
+        'newText',
+        'cwd',
+        'url',
+      ]) {
+        const match = body.match(new RegExp(`<${field}>\\s*([\\s\\S]*?)\\s*</${field}>`, 'i'));
+        if (match?.[1] !== undefined) params[field] = match[1];
+      }
+      return params;
+    };
+    for (const match of result.matchAll(/<tool_call>([\s\S]*?)<\/tool_call>/gi)) {
+      const body = match[1] ?? '';
+      const toolName = body.match(/<tool_name>\s*([^<]+?)\s*<\/tool_name>/i)?.[1]?.trim();
+      if (toolName) candidates.push({ toolName, params: parseParams(body) });
+    }
+    for (const match of result.matchAll(/<invocation\s+name=["']([^"']+)["'][^>]*>([\s\S]*?)<\/invocation>/gi)) {
+      candidates.push({
+        toolName: String(match[1] ?? '').trim(),
+        params: parseParams(match[2] ?? ''),
+      });
+    }
+    for (const match of result.matchAll(/```(?:tool|json)?\s*\n\s*((?:web\.(?:search|fetch)|fs\.(?:list|read|search|replace|write)|shell\.exec))\s*\n([\s\S]*?)```/gi)) {
+      try {
+        const parsed = JSON.parse((match[2] ?? '').trim());
+        candidates.push({
+          toolName: String(match[1] ?? '').trim(),
+          params: parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+            ? parsed as Record<string, unknown>
+            : {},
+        });
+      } catch {
+        // Invalid model-authored JSON remains unexecuted and will fail grounding.
+      }
+    }
+    const trimmed = result.trim().replace(/^```json\s*/i, '').replace(/\s*```$/i, '');
+    if (trimmed.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(trimmed) as {
+          tool_name?: unknown;
+          tool?: unknown;
+          function?: unknown;
+          arguments?: unknown;
+          params?: unknown;
+        };
+        const toolName = String(parsed.tool_name ?? parsed.tool ?? parsed.function ?? '').trim();
+        const rawParams = parsed.arguments ?? parsed.params;
+        const params = typeof rawParams === 'string'
+          ? JSON.parse(rawParams)
+          : rawParams;
+        candidates.push({
+          toolName,
+          params: params && typeof params === 'object' && !Array.isArray(params)
+            ? params as Record<string, unknown>
+            : {},
+        });
+      } catch {
+        // Other structured forms may already have been recovered above.
+      }
+    }
+    const seen = new Set<string>();
+    return candidates
+      .filter(candidate => candidate.toolName && authorized.has(candidate.toolName))
+      .map(candidate => ({
+        toolName: candidate.toolName,
+        params: candidate.params,
+        reason: 'Execute the model-authored tool intent through Runtime authorization and feed the result back before finalizing.',
+        groundingRequired: true,
+      }))
+      .filter(plan => {
+        const fingerprint = this.toolPlanFingerprint(plan);
+        if (seen.has(fingerprint)) return false;
+        seen.add(fingerprint);
+        return true;
+      })
+      .slice(0, 3);
   }
 
   private resolveInspectionRoot(task: string): string {

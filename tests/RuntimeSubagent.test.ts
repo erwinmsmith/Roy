@@ -75,6 +75,16 @@ class MarkdownToolIntentLLM extends EchoLLM {
   }
 }
 
+class XmlToolIntentRecoveryLLM extends EchoLLM {
+  override async *stream(messages: LLMMessage[], _options?: LLMCompletionOptions): AsyncGenerator<LLMStreamChunk, void, unknown> {
+    const prompt = messages.map(message => String(message.content)).join('\n');
+    const content = prompt.includes('Produce the final task result from the evidence above.')
+      ? 'The recovered runtime call read evidence.txt and confirmed the value.'
+      : '<tool_call><tool_name>fs.read</tool_name><path>evidence.txt</path></tool_call>';
+    yield { content, done: true, usage: { promptTokens: 20, completionTokens: 10, totalTokens: 30 } };
+  }
+}
+
 describe('Runtime controlled subagent spawning', () => {
   it('allows a semantic researcher to reason without pretending it has an external tool path', async () => {
     const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-semantic-researcher-'));
@@ -165,6 +175,49 @@ describe('Runtime controlled subagent spawning', () => {
     expect(result.result).not.toContain('```tool');
     expect(result.result).toContain('package.json');
     expect(runtime.getEvents().map(event => event.type)).toContain('agent.output.repair.completed');
+    await runtime.shutdown();
+  });
+
+  it('executes an authorized unresolved tool intent before repairing the answer', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-tool-intent-recovery-'));
+    await writeFile(path.join(workspaceCwd, 'evidence.txt'), 'runtime-grounded\n', 'utf8');
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'tool-intent-recovery-test',
+      llmProvider: new XmlToolIntentRecoveryLLM(),
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+    const agent = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'custom',
+      name: 'IntentRecovery-1',
+      tomLevel: 0,
+      description: 'Resolve the attached fact.',
+      task: 'Resolve the attached fact.',
+      tools: ['fs.read'],
+      skills: ['use_tool_when_needed'],
+      outputContract: { format: 'markdown', groundingRequired: true },
+    });
+
+    const result = await runtime.runAgent(agent.identity.id, 'Resolve the attached fact.', {
+      archetype: 'custom',
+      disableRecursiveDelegation: true,
+    });
+
+    expect(result.toolCalls).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.read',
+        success: true,
+        params: { path: 'evidence.txt' },
+      }),
+    ]);
+    expect(result.result).toContain('evidence.txt');
+    expect(runtime.getEvents().map(event => event.type)).toEqual(expect.arrayContaining([
+      'agent.output.tool_intent.recovery.started',
+      'agent.output.tool_intent.recovery.completed',
+      'agent.output.repair.completed',
+    ]));
     await runtime.shutdown();
   });
 
@@ -460,9 +513,9 @@ describe('Runtime controlled subagent spawning', () => {
     const researcher = profiles.find(profile => profile.archetype === 'researcher');
     const critic = profiles.find(profile => profile.archetype === 'critic');
 
-    expect(researcher?.tools.map(tool => tool.name)).toEqual(['fs.list', 'fs.read']);
+    expect(researcher?.tools.map(tool => tool.name)).toEqual(['fs.list', 'fs.read', 'fs.search']);
     expect(researcher?.skills.map(skill => skill.name)).toContain('delegate_to_subagent');
-    expect(critic?.tools.map(tool => tool.name)).toEqual(['fs.read']);
+    expect(critic?.tools.map(tool => tool.name)).toEqual(['fs.read', 'fs.search']);
     expect(critic?.skills.map(skill => skill.name)).toContain('delegate_to_subagent');
     expect(researcher?.spawnPolicy.maxChildren).toBe(5);
     expect(researcher?.spawnPolicy.maxDepth).toBe(3);
@@ -490,9 +543,9 @@ describe('Runtime controlled subagent spawning', () => {
       task: 'Search the web for the latest official Node.js documentation.',
     });
 
-    expect(runtime.getAgentPolicy(localAgent.identity.id)?.tools.map(tool => tool.name)).toEqual(['fs.list', 'fs.read']);
+    expect(runtime.getAgentPolicy(localAgent.identity.id)?.tools.map(tool => tool.name)).toEqual(['fs.list', 'fs.read', 'fs.search']);
     expect(runtime.getAgentPolicy(webAgent.identity.id)?.tools.map(tool => tool.name)).toEqual([
-      'fs.list', 'fs.read', 'web.search', 'web.fetch',
+      'fs.list', 'fs.read', 'fs.search', 'web.search', 'web.fetch',
     ]);
     await runtime.shutdown();
   });
@@ -512,12 +565,12 @@ describe('Runtime controlled subagent spawning', () => {
       task: 'Inspect the project structure',
     });
     const policy = runtime.getAgentPolicy(result.agent.identity.id);
-    expect(policy?.tools.map(tool => tool.name)).toEqual(['fs.list', 'fs.read']);
+    expect(policy?.tools.map(tool => tool.name)).toEqual(['fs.list', 'fs.read', 'fs.search']);
     expect(policy?.skills.map(skill => skill.name)).toEqual(['use_tool_when_needed', 'delegate_to_subagent']);
 
     const agentPatterns = await runtime.getCachePatterns('agents');
     const researcherPattern = agentPatterns.find(pattern => pattern.id === 'agent_pattern_researcher_v1');
-    expect(researcherPattern?.tools).toEqual(['fs.list', 'fs.read']);
+    expect(researcherPattern?.tools).toEqual(['fs.list', 'fs.read', 'fs.search']);
     expect(researcherPattern?.skills).toEqual(['use_tool_when_needed', 'delegate_to_subagent']);
     expect(researcherPattern?.spawnPolicy).toMatchObject({
       maxChildren: 5,

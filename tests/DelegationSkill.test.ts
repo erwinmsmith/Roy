@@ -106,7 +106,7 @@ describe('delegate_to_subagent skill', () => {
     expect(result.node.sessionId).toBe('delegation-skill-test');
     expect(result.node.definitionFingerprint).toMatch(/^[a-f0-9]{64}$/);
     expect(result.node.invocationFingerprint).toMatch(/^[a-f0-9]{64}$/);
-    expect(result.node.capabilities.tools).toEqual(['fs.list', 'fs.read']);
+    expect(result.node.capabilities.tools).toEqual(['fs.list', 'fs.read', 'fs.search']);
     expect(result.node.capabilities.skills).toEqual(['use_tool_when_needed', 'delegate_to_subagent']);
     expect(result.node.assignment.outputContract.groundingRequired).toBe(true);
     expect(result.node.governance.lifecycle).toEqual({ mode: 'retain_session' });
@@ -252,7 +252,7 @@ describe('delegate_to_subagent skill', () => {
     const cacheAfterMutation = JSON.parse(await readFile(path.join(workspaceCwd, '.roy', 'cache', 'agent-patterns.json'), 'utf8'));
     const canonicalAfterMutation = cacheAfterMutation.patterns.find((item: any) => item.id === 'agent_pattern_researcher_v1');
     const mutationPattern = cacheAfterMutation.patterns.find((item: any) => item.id === mutated.node.reuse.targetPatternId);
-    expect(canonicalAfterMutation.tools).toEqual(['fs.list', 'fs.read']);
+    expect(canonicalAfterMutation.tools).toEqual(['fs.list', 'fs.read', 'fs.search']);
     expect(canonicalAfterMutation.definitionFingerprint).toBe(second.node.definitionFingerprint);
     expect(mutationPattern.basePatternId).toBe('agent_pattern_researcher_v1');
     expect(mutationPattern.tools).toEqual(['fs.read']);
@@ -289,7 +289,7 @@ describe('delegate_to_subagent skill', () => {
 
     const repaired = (await execute()).result as Record<string, any>;
 
-    expect(repaired.node.capabilities.tools).toEqual(['fs.read', 'shell.exec']);
+    expect(repaired.node.capabilities.tools).toEqual(['fs.read', 'fs.search', 'shell.exec']);
     expect(repaired.node.reuse.creationMode).toBe('mutated_from_cache');
     expect(repaired.agentResult.toolCalls.map((call: any) => call.toolName)).toContain('fs.read');
     await runtime.shutdown();

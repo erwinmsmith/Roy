@@ -17,7 +17,7 @@ describe('AgentToolPlanner', () => {
     expect(plans.every(plan => plan.groundingRequired)).toBe(true);
   });
 
-  it('runs the test suite when a tester is assigned behavioral verification', () => {
+  it('does not guess an npm verification command without observed project metadata', () => {
     const plans = new AgentToolPlanner().plan({
       task: 'Verify the claims against tests and failure cases.',
       workspacePath: '/workspace',
@@ -26,6 +26,17 @@ describe('AgentToolPlanner', () => {
         { name: 'fs.read', enabled: true },
         { name: 'shell.exec', enabled: true },
       ],
+    });
+
+    expect(plans).toEqual([]);
+  });
+
+  it('honors an explicitly requested npm verification command', () => {
+    const plans = new AgentToolPlanner().plan({
+      task: 'Run npm test and report the real exit status.',
+      workspacePath: '/workspace',
+      archetype: 'tester',
+      bindings: [{ name: 'shell.exec', enabled: true }],
     });
 
     expect(plans).toEqual([
@@ -120,7 +131,7 @@ describe('AgentToolPlanner', () => {
     });
 
     expect(plans).toEqual([
-      expect.objectContaining({ toolName: 'fs.list', params: { path: '.', maxDepth: 2 } }),
+      expect.objectContaining({ toolName: 'fs.list', params: { path: '.', maxDepth: 4 } }),
     ]);
   });
 

@@ -476,15 +476,13 @@ describe('Root dynamic execution tree', () => {
     expect(result.executionTree.steps.map(step => step.decision.action)).toEqual([
       'delegate',
       'delegate',
-      'delegate',
-      'delegate',
       'solve_directly',
       'finalize',
     ]);
     expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
       type: 'root.execution.handoff.required',
       data: expect.objectContaining({
-        delegationRounds: 4,
+        delegationRounds: 2,
         reason: 'delegation_round_cap_without_mutation',
       }),
     }));

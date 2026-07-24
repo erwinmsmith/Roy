@@ -1,6 +1,7 @@
 export interface ExecutionIntentCall {
   toolName: string;
   params: Record<string, unknown>;
+  result?: unknown;
   success: boolean;
 }
 
@@ -34,7 +35,7 @@ export function taskRequestsWorkspaceMutation(task: string): boolean {
 
 export function isSuccessfulWorkspaceMutationCall(call: ExecutionIntentCall): boolean {
   if (!call.success) return false;
-  if (call.toolName === 'fs.write') return true;
+  if (call.toolName === 'fs.write' || call.toolName === 'fs.replace') return true;
   if (call.toolName !== 'shell.exec') return false;
   const command = String(call.params.command ?? '');
   if (/(?:^|[;&|]\s*|\s)(?:apply_patch|touch|mkdir|cp|mv|rm|install|chmod|truncate|git\s+apply|npm\s+(?:install|uninstall)|pnpm\s+(?:add|remove|install)|yarn\s+(?:add|remove|install)|pip\s+install|uv\s+(?:add|remove|pip\s+install)|sed\s+-i|perl\s+-pi)\b/i.test(command)) {
@@ -53,7 +54,13 @@ export function isSuccessfulWorkspaceMutationCall(call: ExecutionIntentCall): bo
 }
 
 export function isSuccessfulWorkspaceVerificationCall(call: ExecutionIntentCall): boolean {
-  return call.success && isWorkspaceVerificationCall(call);
+  if (!call.success || !isWorkspaceVerificationCall(call)) return false;
+  const shell = call.result as { exitCode?: unknown; stdout?: unknown; stderr?: unknown } | undefined;
+  if (typeof shell?.exitCode === 'number' && shell.exitCode !== 0) return false;
+  const output = `${String(shell?.stdout ?? '')}\n${String(shell?.stderr ?? '')}`;
+  const reportedStatuses = [...output.matchAll(/(?:^|\n)\s*(?:exit(?:_code)?|status)\s*[:=]\s*(-?\d+)\s*(?:\n|$)/gi)]
+    .map(match => Number(match[1]));
+  return reportedStatuses.length === 0 || reportedStatuses.every(status => status === 0);
 }
 
 export function isWorkspaceVerificationCall(call: ExecutionIntentCall): boolean {
@@ -64,7 +71,8 @@ export function isWorkspaceVerificationCall(call: ExecutionIntentCall): boolean 
 }
 
 function masksShellFailure(command: string): boolean {
-  return /\|\|\s*(?:true|:)(?:\s*(?:[;&|]|$))|;\s*(?:true|:)\s*;?\s*$|\bset\s+\+e\b/i.test(command);
+  return /\|\|\s*(?:true|:)(?:\s*(?:[;&|]|$))|;\s*(?:true|:)\s*;?\s*$|\bset\s+\+e\b/i.test(command)
+    || /;\s*(?:printf|echo)\b[^;\n]*(?:\$\?|exit(?:_code)?|status)/i.test(command);
 }
 
 function isNonWorkspaceOutputTarget(target: string): boolean {
