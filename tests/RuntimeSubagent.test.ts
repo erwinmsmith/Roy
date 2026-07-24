@@ -300,6 +300,46 @@ describe('Runtime controlled subagent spawning', () => {
     await runtime.shutdown();
   });
 
+  it('does not demand a workspace mutation from a read-only evidence member whose task references the parent implementation', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-read-only-parent-task-'));
+    await writeFile(path.join(workspaceCwd, 'app.ts'), 'export const value = "stub";\n');
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'read-only-parent-task-test',
+      llmProvider: new EchoLLM(),
+      workspaceCwd,
+    });
+    const researcher = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'researcher',
+      name: 'PathSteward-1',
+      description: 'Inspect the authoritative path for the parent implementation task.',
+      task: [
+        'Inspect app.ts and report its current state.',
+        'Original task: Implement the workspace code in app.ts and verify the result.',
+      ].join('\n'),
+      tools: ['fs.read'],
+    });
+
+    await expect(runtime.runAgent(
+      researcher.identity.id,
+      [
+        'Inspect app.ts and report its current state.',
+        'Original task: Implement the workspace code in app.ts and verify the result.',
+      ].join('\n'),
+      { disableRecursiveDelegation: true, archetype: 'researcher' }
+    )).resolves.toMatchObject({
+      toolCalls: expect.arrayContaining([
+        expect.objectContaining({ toolName: 'fs.read', success: true }),
+      ]),
+    });
+    expect(runtime.getEvents()).not.toContainEqual(expect.objectContaining({
+      type: 'agent.execution.no_progress',
+      agentId: researcher.identity.id,
+    }));
+    await runtime.shutdown();
+  });
+
   it('synthesizes an observed source file through a separate payload channel and verifies it', async () => {
     const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-file-synthesis-'));
     await writeFile(path.join(workspaceCwd, 'app.js'), 'throw new Error("stub");\n');

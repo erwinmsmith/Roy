@@ -6760,6 +6760,14 @@ export class Runtime {
     const activeAllocationId = this.agentBudgetAllocations.get(agentId);
     const activeAllocation = activeAllocationId ? this.budgetMarket?.getAllocation(activeAllocationId) : undefined;
     agent.setCompletionTokenLimit(activeAllocation?.allocatedTokens, this.budgetAccountingDimension());
+    const actorWorkspaceExecutionRequired = this.taskRequiresWorkspaceMutation(task)
+      && (this.agentBindings.get(agentId)?.tools ?? []).some(binding =>
+        binding.enabled && (
+          binding.name === 'fs.write'
+          || binding.name === 'fs.replace'
+          || binding.name === 'fs.synthesize'
+        )
+      );
 
     const session = ctx.manager.getSession(ctx.sessionId);
     if (session) {
@@ -6846,7 +6854,7 @@ export class Runtime {
         },
       });
       activeGrounding = grounding;
-      if (this.taskRequiresWorkspaceMutation(task)) {
+      if (actorWorkspaceExecutionRequired) {
         let closure = this.analyzeWorkspaceExecutionClosure(grounding.toolCalls);
         let continuation = 0;
         while (!closure.closed) {
@@ -6930,7 +6938,7 @@ export class Runtime {
       let forcedExecutionContinuationAttempted = false;
       while (true) {
         const unresolvedToolIntent = this.containsUnresolvedToolIntent(result);
-        const workspaceExecutionOpen = this.taskRequiresWorkspaceMutation(task)
+        const workspaceExecutionOpen = actorWorkspaceExecutionRequired
           && !this.analyzeWorkspaceExecutionClosure(
             grounding.toolCalls,
             undefined,
@@ -10502,7 +10510,6 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     );
     if (available < 2) return decision;
     const agents = [...decision.agents.slice(0, available)];
-    const coveredPhases = new Set(agents.map(agent => this.longHorizonMemberPhase(agent)));
     const bootstrapAgents = this.buildLongHorizonTeamDecision(task, requiresWorkspaceMutation).agents;
     const additions = requiresWorkspaceMutation
       ? [
@@ -10514,6 +10521,38 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
         ...bootstrapAgents.filter(agent => agent.archetype === 'tester'),
         ...bootstrapAgents.filter(agent => agent.archetype !== 'tester'),
       ];
+    const requiredPhases = requiresWorkspaceMutation ? [1, 2, 0] : [2, 0];
+    for (const requiredPhase of requiredPhases) {
+      if (agents.some(agent => this.longHorizonMemberPhase(agent) === requiredPhase)) {
+        continue;
+      }
+      const addition = additions.find(agent =>
+        this.longHorizonMemberPhase(agent) === requiredPhase
+      );
+      if (!addition) continue;
+      if (agents.length < available) {
+        agents.push(addition);
+        continue;
+      }
+      const phaseCounts = new Map<number, number>();
+      for (const agent of agents) {
+        const phase = this.longHorizonMemberPhase(agent);
+        phaseCounts.set(phase, (phaseCounts.get(phase) ?? 0) + 1);
+      }
+      const replaceable = agents
+        .map((agent, index) => ({
+          agent,
+          index,
+          phase: this.longHorizonMemberPhase(agent),
+        }))
+        .filter(item => (phaseCounts.get(item.phase) ?? 0) > 1)
+        .sort((left, right) =>
+          Number(right.agent.archetype === 'custom') - Number(left.agent.archetype === 'custom')
+          || right.index - left.index
+        )[0];
+      if (replaceable) agents[replaceable.index] = addition;
+    }
+    const coveredPhases = new Set(agents.map(agent => this.longHorizonMemberPhase(agent)));
     for (const addition of additions) {
       if (agents.length >= available) break;
       const phase = this.longHorizonMemberPhase(addition);
@@ -10603,13 +10642,9 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     )
       && !/\b(?:implement|implementation|build|create|write|modify|edit|patch|repair|fix|migrate|executor|coder|engineer)\b/.test(intent);
     if (verifiesOnly) return 2;
-    const canMutate = (plan.tools ?? []).some(tool =>
-      tool === 'fs.write' || tool === 'fs.replace' || tool === 'fs.synthesize'
-    );
-    if (canMutate
-      || /\b(?:implement|implementation|build|create|write|modify|edit|patch|repair|fix|migrate|executor|coder|engineer)\b/.test(
-        `${intent} ${leadingTaskIntent}`
-      )) {
+    if (/\b(?:implement|implementation|build|create|write|modify|edit|patch|repair|fix|migrate|executor|coder|engineer)\b/.test(
+      `${intent} ${leadingTaskIntent}`
+    )) {
       return 1;
     }
     return 0;
@@ -14031,7 +14066,14 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       1_000,
       Math.min(60_000, Math.floor(remainingGroundingMs() * 0.4))
     );
-    const workspaceExecutionRequired = this.taskRequiresWorkspaceMutation(intentTask);
+    const workspaceExecutionRequired = this.taskRequiresWorkspaceMutation(intentTask)
+      && bindings.some(binding =>
+        binding.enabled && (
+          binding.name === 'fs.write'
+          || binding.name === 'fs.replace'
+          || binding.name === 'fs.synthesize'
+        )
+      );
     const needsModelPlannedAction = bindings.some(binding =>
       binding.enabled && (
         binding.name === 'shell.exec'

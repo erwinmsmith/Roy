@@ -652,6 +652,69 @@ describe('Root dynamic execution tree', () => {
     })).toBe(2);
   });
 
+  it('does not treat write-capable exploration as implementation and restores a real executor', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-long-horizon-intent-alignment-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'long-horizon-intent-alignment-test',
+      workspaceCwd,
+      fsmEnabled: true,
+      llmProvider: new DirectInitialDecisionLLM(),
+    });
+    const normalize = (runtime as unknown as {
+      ensureLongHorizonTeamDecision: (
+        decision: Extract<DelegationDecision, { action: 'spawn_subagents' }>,
+        task: string,
+        requiresWorkspaceMutation: boolean,
+        correlationId: string
+      ) => Extract<DelegationDecision, { action: 'spawn_subagents' }>;
+    }).ensureLongHorizonTeamDecision;
+    const decision = normalize.call(runtime, {
+      action: 'spawn_subagents',
+      reason: 'Explore, implement, and verify the workspace task.',
+      coordination: 'team',
+      agents: [
+        {
+          archetype: 'researcher',
+          name: 'PathSteward',
+          role: 'evidence mapper',
+          task: 'Inspect authoritative paths and inputs.',
+          tools: ['fs.list', 'fs.read', 'fs.search'],
+        },
+        {
+          archetype: 'custom',
+          name: 'WorkspaceExplorer',
+          role: 'explorer',
+          task: 'Explore the workspace thoroughly and report existing code and data.',
+          tools: ['fs.list', 'fs.read', 'fs.search', 'fs.write', 'fs.synthesize', 'shell.exec'],
+        },
+        {
+          archetype: 'tester',
+          name: 'Verifier',
+          role: 'acceptance verifier',
+          task: 'After implementation, run the required verification.',
+          tools: ['fs.read', 'shell.exec'],
+        },
+      ],
+      team: {
+        name: 'CandidateTeam',
+        description: 'Candidate plan with capability-intent mismatch.',
+      },
+    }, 'Implement the complete workspace pipeline and verify it.', true, 'intent-alignment-test');
+
+    expect(decision.agents.map(agent => agent.name)).toEqual([
+      'PathSteward',
+      'Executor-2',
+      'Verifier',
+    ]);
+    expect(decision.agents.map(agent => agent.archetype)).toEqual([
+      'researcher',
+      'coder',
+      'tester',
+    ]);
+    await runtime.shutdown();
+  });
+
   it('rejects premature finalize when a long-horizon mutation path is still unverified', () => {
     const runtime = new Runtime();
     const ensureRecovery = (runtime as unknown as {
