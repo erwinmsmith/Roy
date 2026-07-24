@@ -13334,6 +13334,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       skipInitialModelPlanning?: boolean;
       toolAllowlist?: string[];
       priorToolCalls?: ToolCallRecord[];
+      requireFreshMutation?: boolean;
       onBeforeExecution?: (plans: PlannedToolCall[]) => Promise<void>;
     }
   ): Promise<GroundingRunResult> {
@@ -13447,6 +13448,9 @@ For web-grounded work, use only facts present in the subagent report or runtime 
             };
           }),
         calls: priorPlannerCalls,
+        requiredMutationAfterCallIndex: options.requireFreshMutation
+          ? priorPlannerCalls.length - 1
+          : undefined,
       });
       this.emitToolPlanningFailure(actor, agentId, options, 0);
       const plannedFingerprints = new Set(plans.map(plan => this.toolPlanFingerprint(plan)));
@@ -13587,6 +13591,9 @@ For web-grounded work, use only facts present in the subagent report or runtime 
               };
           }),
           calls: [...priorPlannerCalls, ...context.calls],
+          requiredMutationAfterCallIndex: options.requireFreshMutation
+            ? priorPlannerCalls.length - 1
+            : undefined,
         });
         this.emitToolPlanningFailure(actor, agentId, options, context.round);
         return llmPlans.filter(plan => {
@@ -14321,6 +14328,13 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       const priorExecution = attempts.length > 0
         ? combineWithDelegatedExecution()
         : undefined;
+      const priorClosure = priorExecution
+        ? this.analyzeWorkspaceExecutionClosure(
+            priorExecution.toolCalls,
+            priorExecution.acceptanceAudit,
+            auditRequired
+          )
+        : undefined;
       let baseTask = priorExecution
         ? this.buildRootExecutionRepairTask(userTask, priorExecution, attempt)
         : this.buildRootExecutionClosureTask(userTask, subagents, teamResults);
@@ -14371,6 +14385,10 @@ For web-grounded work, use only facts present in the subagent report or runtime 
           intentTask: userTask,
           maxWallClockMs: attemptWallClockMs,
           priorToolCalls: priorExecution?.toolCalls ?? delegatedExecution?.toolCalls,
+          requireFreshMutation: Boolean(
+            priorClosure?.acceptanceAuditPerformed
+            && !priorClosure.acceptanceAuditPassed
+          ),
         }
       );
       attempts.push(current);

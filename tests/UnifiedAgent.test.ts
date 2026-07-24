@@ -1005,6 +1005,59 @@ describe('UnifiedAgent capability execution', () => {
     expect(userPrompt).toContain('"inspectedAfterLatestFailure":true');
   });
 
+  it('requires a new mutation after an unmet acceptance audit even when prior verification passed', async () => {
+    const llm = new ReadOnlyThenMutationPlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'acceptance-repair-planner',
+      goal: 'repair unmet acceptance items',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.read', 'fs.write', 'shell.exec'],
+    });
+    const calls = [
+      {
+        toolName: 'fs.write',
+        params: { path: 'artifact.txt', content: 'placeholder' },
+        reason: 'Write the initial implementation.',
+        groundingRequired: true,
+        success: true,
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'test -f artifact.txt' },
+        reason: 'Run the declared command.',
+        groundingRequired: true,
+        success: true,
+      },
+      {
+        toolName: 'fs.read',
+        params: { path: 'artifact.txt' },
+        reason: 'Acceptance audit observed placeholder content.',
+        groundingRequired: true,
+        success: true,
+        result: { content: 'placeholder' },
+      },
+    ];
+
+    const plans = await agent.planNextToolRound({
+      task: '[runtime_execution_repair_phase]\nAcceptance audit failed: placeholder content remains.',
+      executionRequired: true,
+      requiredMutationAfterCallIndex: calls.length - 1,
+      round: 3,
+      remainingCalls: 2,
+      tools: [{ name: 'fs.read' }, { name: 'fs.write' }, { name: 'shell.exec' }],
+      calls,
+    });
+
+    expect(llm.jsonCalls).toBe(2);
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.write',
+        params: { path: 'artifact.txt', content: 'implemented' },
+      }),
+    ]);
+  });
+
   it('classifies a tool-planning request timeout for runtime telemetry', async () => {
     const llm = new CapturingToolPlanningLLM(new Error('Request timed out after 250ms'));
     const agent = new UnifiedAgent({

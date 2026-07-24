@@ -41,6 +41,7 @@ export interface UnifiedAgentConfig extends AgentConfig {
 export interface AgentToolRoundPlanningInput {
   task: string;
   executionRequired?: boolean;
+  requiredMutationAfterCallIndex?: number;
   round: number;
   remainingCalls: number;
   requestTimeoutMs?: number;
@@ -101,6 +102,11 @@ export class UnifiedAgent extends BaseAgent {
     const executionRequired = (input.executionRequired ?? requestsWorkspaceMutation(input.task))
       && (authorized.has('fs.write') || authorized.has('fs.replace') || authorized.has('shell.exec'));
     const mutationApplied = input.calls.some(call => isSuccessfulWorkspaceMutation(call));
+    const freshMutationRequired = input.requiredMutationAfterCallIndex !== undefined;
+    const freshMutationApplied = !freshMutationRequired || input.calls
+      .slice(Math.max(0, Number(input.requiredMutationAfterCallIndex) + 1))
+      .some(call => isSuccessfulWorkspaceMutation(call));
+    const mutationRequirementSatisfied = mutationApplied && freshMutationApplied;
     const lastMutationIndex = findLastToolCallIndex(input.calls, call =>
       isSuccessfulWorkspaceMutation(call)
     );
@@ -108,7 +114,8 @@ export class UnifiedAgent extends BaseAgent {
       isWorkspaceVerificationCall(call)
     );
     const verificationAttempted = lastVerificationIndex >= 0;
-    const verificationPassed = lastVerificationIndex > lastMutationIndex
+    const verificationPassed = freshMutationApplied
+      && lastVerificationIndex > lastMutationIndex
       && isSuccessfulWorkspaceVerification(input.calls[lastVerificationIndex]!);
     const latestVerificationFailed = lastVerificationIndex > lastMutationIndex
       && !isSuccessfulWorkspaceVerification(input.calls[lastVerificationIndex]!);
@@ -164,9 +171,11 @@ export class UnifiedAgent extends BaseAgent {
           executionRequired
             ? 'This is an execution task. Do not finish after analysis or a proposed patch. Apply the workspace change, then run relevant verification.'
             : '',
-          executionRequired && !mutationApplied
+          executionRequired && !mutationRequirementSatisfied
             ? successfulInspection
-              ? 'The workspace layout has been grounded. Request fs.replace, fs.write, or a mutating shell.exec call that advances the actual task.'
+              ? freshMutationRequired
+                ? 'A prior acceptance audit found unmet requirements. Existing mutations and passing commands do not close this repair phase. Request a new focused fs.replace, fs.write, or mutating shell.exec call that fixes the reported unmet item.'
+                : 'The workspace layout has been grounded. Request fs.replace, fs.write, or a mutating shell.exec call that advances the actual task.'
               : 'No authoritative workspace inspection has succeeded yet. Recover failed paths with fs.list, fs.read, or fs.search before requesting a mutation.'
             : '',
           executionRequired && latestVerificationFailed
@@ -197,6 +206,8 @@ export class UnifiedAgent extends BaseAgent {
             executionRequired,
             successfulInspection,
             mutationApplied,
+            freshMutationRequired,
+            freshMutationApplied,
             verificationAttempted,
             verificationPassed,
             latestVerificationFailed,
@@ -310,7 +321,7 @@ export class UnifiedAgent extends BaseAgent {
               : plannedInspection || plannedCalls.some(call =>
                 isSuccessfulWorkspaceMutation({ ...call, success: true })
               )
-            : mutationApplied
+          : mutationRequirementSatisfied
               ? verificationPassed || plannedCalls.some(call =>
                 isSuccessfulWorkspaceMutation({ ...call, success: true })
                 || isSuccessfulWorkspaceVerification({ ...call, success: true })
@@ -328,9 +339,11 @@ export class UnifiedAgent extends BaseAgent {
             role: 'user',
             content: [
               'Runtime rejected this plan because the execution contract is incomplete.',
-              !mutationApplied
+              !mutationRequirementSatisfied
                 ? successfulInspection
-                  ? 'The workspace is already grounded. Request a concrete fs.replace, fs.write, or mutating shell.exec call now.'
+                  ? freshMutationRequired
+                    ? 'The previous acceptance audit is still open. Request a new focused mutation that addresses one of its failed or unverified items now.'
+                    : 'The workspace is already grounded. Request a concrete fs.replace, fs.write, or mutating shell.exec call now.'
                   : 'The previous inspection failed or was absent. Request a corrected fs.list, fs.read, or fs.search call before mutating.'
                 : '',
               latestVerificationFailed && inspectedAfterLatestFailure
@@ -338,7 +351,7 @@ export class UnifiedAgent extends BaseAgent {
                   ? 'The latest verifier failure concerns an existing file. Preserve working code: use fs.replace for a focused repair instead of overwriting that file, then verify.'
                   : 'The latest verifier failure and its relevant source evidence are already grounded. Request a concrete fs.replace, fs.write for a new file, or mutating shell.exec repair before any further verification.'
                 : '',
-              mutationApplied && !verificationPassed && !latestVerificationFailed
+              mutationRequirementSatisfied && !verificationPassed && !latestVerificationFailed
                 ? 'Finish, read-only, masked-failure, and repeated plans are insufficient. Request a concrete remaining edit or repair, or a distinct verification command whose exit status is preserved.'
                 : '',
               'Return the required call_tools JSON. Do not ask for permission.',
@@ -360,7 +373,7 @@ export class UnifiedAgent extends BaseAgent {
             : plannedInspection || plannedCalls.some(call =>
               isSuccessfulWorkspaceMutation({ ...call, success: true })
             )
-          : mutationApplied
+          : mutationRequirementSatisfied
             ? verificationPassed || plannedCalls.some(call =>
               isSuccessfulWorkspaceMutation({ ...call, success: true })
               || isSuccessfulWorkspaceVerification({ ...call, success: true })
