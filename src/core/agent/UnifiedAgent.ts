@@ -188,7 +188,7 @@ export class UnifiedAgent extends BaseAgent {
             : '',
           'When verification fails, use its output to repair the workspace before retrying. Never hide a failing exit status with `|| true`, `; true`, `|| :`, or equivalent shell constructs.',
           'Before creating or replacing a module, use observed package metadata and directory layout to identify the authoritative source root. Never create a parallel top-level package when the project installs from src/, lib/, packages/, or another configured source directory.',
-          'Keep mutation payloads bounded: prefer fs.replace for focused edits. Limit one fs.write/fs.replace payload to 6000 characters. For a larger full-file rewrite, write one bounded chunk with fs.write mode=overwrite, then append later chunks with mode=append in subsequent tool rounds before verification.',
+          'Keep mutations transactional: prefer fs.replace for focused edits and request at most one file mutation per plan. A complete fs.write/fs.replace payload may contain up to 24000 characters. Do not combine companion-file writes with a large implementation write; Runtime will request the next file in a later round.',
           'When malformed quoting or embedded newlines make exact oldText fragile, inspect the reported lines and call fs.replace with path, startLine, endLine, and newText instead of guessing escaped oldText repeatedly.',
           'Use fs.write or fs.replace for file content. Do not embed multiline source, Markdown backticks, or shell-sensitive content inside python -c, echo, sed, or similar shell.exec writers; shell substitution can execute unintended commands and corrupt the edit.',
           'Never repeat an equivalent call. Search snippets are discovery evidence; fetch relevant result pages before making source-backed claims.',
@@ -244,7 +244,7 @@ export class UnifiedAgent extends BaseAgent {
             {
               temperature: 0,
               maxTokens: executionRequired
-                ? attempt === 0 ? 4096 : 8192
+                ? 8192
                 : 640,
               timeoutMs: remainingPlanningMs,
             }
@@ -255,14 +255,12 @@ export class UnifiedAgent extends BaseAgent {
             authorized,
             input.calls
           );
-          if (recoveredMutation) {
-            response = recoveredMutation;
-          } else {
-            const canRetry = executionRequired
-              && attempt + 1 < maxPlanningAttempts
-              && isRetryableToolPlanningResponseError(error)
-              && (planningDeadline === undefined || Date.now() < planningDeadline);
-            if (!canRetry) throw error;
+          const canRetry = executionRequired
+            && attempt + 1 < maxPlanningAttempts
+            && isRetryableToolPlanningResponseError(error)
+            && (planningDeadline === undefined || Date.now() < planningDeadline);
+          if (canRetry) {
+            const recoveredPrefix = recoveredMutation?.calls[0]?.params;
             planningMessages = [
               ...planningMessages,
               {
@@ -270,13 +268,20 @@ export class UnifiedAgent extends BaseAgent {
                 content: [
                   'The previous tool plan was incomplete or was not valid JSON.',
                   'Return one complete compact JSON object only, with no analysis or markdown.',
-                  'Request at most one mutation call in this response.',
-                  'Keep fs.write content or fs.replace replacement text within 6000 characters.',
-                  'For a larger rewrite, emit only the next bounded chunk and continue with fs.write mode=append in a later tool round.',
+                  'Request exactly one highest-value mutation call in this response; omit empty companion files.',
+                  'Return complete file content or one complete focused replacement, up to 24000 characters.',
+                  recoveredPrefix
+                    ? `The incomplete response began a write to ${String(recoveredPrefix.path)}. Reconstruct that file as one complete mutation instead of returning only a continuation. Its last recoverable prefix was:\n${String(recoveredPrefix.content ?? '').slice(-1200)}`
+                    : '',
                 ].join('\n'),
               },
             ];
             continue;
+          }
+          if (recoveredMutation) {
+            response = recoveredMutation;
+          } else {
+            throw error;
           }
         }
         plannedCalls = normalizePlannedToolCalls(
@@ -285,6 +290,7 @@ export class UnifiedAgent extends BaseAgent {
           input.remainingCalls,
           input.round
         ).filter(call => !shouldSuppressRepeatedPlannedCall(call, input.calls));
+        plannedCalls = selectSingleWorkspaceMutation(plannedCalls);
         plannedCalls = plannedCalls.map(call =>
           convertObservedOverwriteToExactReplace(call, input.calls, authorized) ?? call
         );
@@ -1123,6 +1129,27 @@ function findLastToolCallIndex(
     if (predicate(calls[index]!)) return index;
   }
   return -1;
+}
+
+function selectSingleWorkspaceMutation(plans: PlannedToolCall[]): PlannedToolCall[] {
+  const mutations = plans
+    .map((call, index) => ({ call, index }))
+    .filter(item => isSuccessfulWorkspaceMutation({ ...item.call, success: true }));
+  if (mutations.length <= 1) return plans;
+  const selected = [...mutations].sort((left, right) =>
+    mutationPayloadLength(right.call) - mutationPayloadLength(left.call)
+    || left.index - right.index
+  )[0];
+  return plans.filter((call, index) =>
+    !isSuccessfulWorkspaceMutation({ ...call, success: true })
+    || index === selected?.index
+  );
+}
+
+function mutationPayloadLength(call: PlannedToolCall): number {
+  return ['content', 'newText', 'oldText']
+    .map(key => typeof call.params[key] === 'string' ? String(call.params[key]).length : 0)
+    .reduce((sum, length) => sum + length, 0);
 }
 
 function isDestructiveRepairOverwrite(

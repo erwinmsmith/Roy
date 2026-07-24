@@ -342,6 +342,34 @@ class RecoverableLaterTruncatedWritePlanningLLM extends PlanningLLM {
   }
 }
 
+class MultipleMutationPlanningLLM extends PlanningLLM {
+  constructor() {
+    super('none');
+  }
+
+  override async completeJSON<T>(): Promise<T> {
+    this.jsonCalls += 1;
+    return {
+      action: 'call_tools',
+      reason: 'Write an empty companion and the actual implementation.',
+      calls: [
+        {
+          toolName: 'fs.write',
+          params: { path: 'src/__init__.py', content: '', mode: 'overwrite' },
+        },
+        {
+          toolName: 'fs.write',
+          params: {
+            path: 'src/app.py',
+            content: 'def run_pipeline():\n    return 42\n',
+            mode: 'overwrite',
+          },
+        },
+      ],
+    } as T;
+  }
+}
+
 describe('UnifiedAgent capability execution', () => {
   beforeEach(() => {
     actionRegistry.clear();
@@ -1197,13 +1225,14 @@ describe('UnifiedAgent capability execution', () => {
     ]);
     const firstSystemPrompt = llm.messagesByAttempt[0]
       ?.find(message => message.role === 'system')?.content ?? '';
-    expect(firstSystemPrompt).toContain('Limit one fs.write/fs.replace payload to 6000 characters');
+    expect(firstSystemPrompt).toContain('up to 24000 characters');
+    expect(firstSystemPrompt).toContain('at most one file mutation per plan');
     expect(firstSystemPrompt).toContain('Do not embed multiline source');
     const retryPrompt = llm.messagesByAttempt[1]
       ?.findLast(message => message.role === 'user')?.content ?? '';
     expect(retryPrompt).toContain('one complete compact JSON object');
-    expect(retryPrompt).toContain('mode=append');
-    expect(llm.optionsByAttempt[0]?.maxTokens).toBe(4096);
+    expect(retryPrompt).toContain('one complete focused replacement');
+    expect(llm.optionsByAttempt[0]?.maxTokens).toBe(8192);
     expect(llm.optionsByAttempt[1]?.maxTokens).toBe(8192);
     expect(agent.getLastToolPlanningFailure()).toBeUndefined();
   });
@@ -1227,7 +1256,7 @@ describe('UnifiedAgent capability execution', () => {
       calls: [],
     });
 
-    expect(llm.jsonCalls).toBe(1);
+    expect(llm.jsonCalls).toBe(3);
     expect(plans).toEqual([
       expect.objectContaining({
         toolName: 'fs.write',
@@ -1262,7 +1291,7 @@ describe('UnifiedAgent capability execution', () => {
       calls: [],
     });
 
-    expect(llm.jsonCalls).toBe(1);
+    expect(llm.jsonCalls).toBe(3);
     expect(plans).toEqual([
       expect.objectContaining({
         toolName: 'fs.write',
@@ -1313,6 +1342,36 @@ describe('UnifiedAgent capability execution', () => {
           path: 'src/app.py',
           content: 'continuation helper line\n',
           mode: 'append',
+        }),
+      }),
+    ]);
+  });
+
+  it('keeps only the highest-value file mutation from a multi-file plan', async () => {
+    const llm = new MultipleMutationPlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'single-mutation-agent',
+      goal: 'apply implementation files transactionally',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.write'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: 'Implement src/app.py.',
+      executionRequired: true,
+      round: 1,
+      remainingCalls: 3,
+      tools: [{ name: 'fs.write' }],
+      calls: [],
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.write',
+        params: expect.objectContaining({
+          path: 'src/app.py',
+          content: 'def run_pipeline():\n    return 42\n',
         }),
       }),
     ]);

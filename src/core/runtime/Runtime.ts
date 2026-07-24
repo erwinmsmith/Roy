@@ -3347,8 +3347,18 @@ export class Runtime {
   }
 
   private taskNeedsWebAccess(task: string): boolean {
-    const lower = task.toLowerCase();
-    return /https?:\/\//.test(task)
+    // Long-horizon workspace continuations append verifier output, install logs,
+    // warnings, and cached execution evidence to the original task. URLs inside
+    // that evidence (for example a pytest warning link) are observations, not a
+    // request to abandon the local repair path and browse the web. Route tools
+    // from the authored task section only; downstream agents still receive the
+    // complete feedback as execution context.
+    const authoredTask = task
+      .split(/\n(?:---\s*\n)?##\s+VERIFICATION FAILED\b/i, 1)[0]
+      .split(/\n<official_verifier_feedback>/i, 1)[0]
+      .split(/\n(?:latest command output|terminal output|command output)\s*:/i, 1)[0];
+    const lower = authoredTask.toLowerCase();
+    return /https?:\/\//.test(authoredTask)
       || /\b(?:web|internet|online|website|browse|news|up-to-date|citations?|official documentation|public documentation)\b/.test(lower)
       || /\bsearch\b[\s\S]{0,100}\b(?:external|official|public)?\s*(?:sources?|documentation|websites?|internet|web)\b/.test(lower)
       || /\b(?:external|official|public)?\s*(?:sources?|documentation|websites?|internet|web)\b[\s\S]{0,100}\bsearch\b/.test(lower)

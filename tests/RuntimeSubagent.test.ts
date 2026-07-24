@@ -86,6 +86,33 @@ class XmlToolIntentRecoveryLLM extends EchoLLM {
 }
 
 describe('Runtime controlled subagent spawning', () => {
+  it('does not route a local repair through web tools because verifier logs contain URLs', () => {
+    const runtime = new Runtime();
+    const needsWeb = (task: string) => (runtime as unknown as {
+      taskNeedsWebAccess: (value: string) => boolean;
+    }).taskNeedsWebAccess(task);
+
+    expect(needsWeb([
+      'Work directly in /app. Repair src/dq_audit/audit.py and run the local verifier.',
+      '---',
+      '## VERIFICATION FAILED — CONTINUE WORKING',
+      '<official_verifier_feedback>',
+      'WARNING: see https://docs.pytest.org/en/stable/how-to/capture-warnings.html',
+      '</official_verifier_feedback>',
+    ].join('\n'))).toBe(false);
+    expect(needsWeb([
+      'Repair the current workspace package and rerun its tests.',
+      'Latest command output:',
+      'WARNING: use a virtual environment: https://pip.pypa.io/warnings/venv',
+    ].join('\n'))).toBe(false);
+    expect(needsWeb(
+      'Use public web sources to compare the official Node.js and MDN documentation.'
+    )).toBe(true);
+    expect(needsWeb(
+      'Read https://nodejs.org/api/globals.html and summarize the fetch section.'
+    )).toBe(true);
+  });
+
   it('removes the tool-use skill from a delegation plan that has no tools', () => {
     const runtime = new Runtime();
     const normalized = (runtime as unknown as {
