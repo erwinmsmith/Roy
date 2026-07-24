@@ -13851,7 +13851,19 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     task: string,
     calls: Array<{ toolName: string }>
   ): boolean {
+    const requestsFollowUpWorkspaceEvidence =
+      /\b(?:read|inspect|review|audit|verify|compare|cross-reference|open|search)\b/i.test(task)
+      && (
+        /\b(?:files?|csvs?|datasets?|inputs?|rules?|tests?|source|workspace|repository|codebase)\b/i.test(task)
+        || /(?:^|[\s`'"])[./]?[a-z0-9_-]+(?:\/[a-z0-9_.-]+)*\.(?:csv|json|ya?ml|toml|md|py|ts|tsx|js|jsx|mjs|cjs)(?=$|[\s,.;:`'"])/i.test(task)
+      )
+      && calls.some(call =>
+        call.toolName === 'fs.list'
+        || call.toolName === 'fs.read'
+        || call.toolName === 'fs.search'
+      );
     return this.taskRequiresWorkspaceMutation(task)
+      || requestsFollowUpWorkspaceEvidence
       || calls.some(call =>
         call.toolName.startsWith('web.')
         || call.toolName === 'shell.exec'

@@ -370,6 +370,24 @@ class MultipleMutationPlanningLLM extends PlanningLLM {
   }
 }
 
+class NovelEvidencePlanningLLM extends PlanningLLM {
+  constructor() {
+    super('none');
+  }
+
+  override async completeJSON<T>(): Promise<T> {
+    this.jsonCalls += 1;
+    return {
+      action: 'call_tools',
+      reason: 'Read the still-unobserved input and rule files before implementing.',
+      calls: [
+        { toolName: 'fs.read', params: { path: 'data/input.csv' } },
+        { toolName: 'fs.read', params: { path: 'rules/expectations.yml' } },
+      ],
+    } as T;
+  }
+}
+
 describe('UnifiedAgent capability execution', () => {
   beforeEach(() => {
     actionRegistry.clear();
@@ -1374,6 +1392,49 @@ describe('UnifiedAgent capability execution', () => {
           content: 'def run_pipeline():\n    return 42\n',
         }),
       }),
+    ]);
+  });
+
+  it('allows novel task evidence after a failed run instead of forcing a blind mutation', async () => {
+    const llm = new NovelEvidencePlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'evidence-before-repair-agent',
+      goal: 'implement the pipeline from its actual inputs and rules',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.read', 'fs.write', 'shell.exec'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: 'Read data/input.csv and rules/expectations.yml, implement src/app.py, and run tests.',
+      executionRequired: true,
+      round: 3,
+      remainingCalls: 6,
+      tools: [{ name: 'fs.read' }, { name: 'fs.write' }, { name: 'shell.exec' }],
+      calls: [
+        {
+          toolName: 'shell.exec',
+          params: { command: 'python -m app' },
+          reason: 'Run the requested command.',
+          groundingRequired: true,
+          success: false,
+          error: 'src/app.py:7: NotImplementedError',
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/app.py' },
+          reason: 'Inspect the reported source location.',
+          groundingRequired: true,
+          success: true,
+          result: { content: 'raise NotImplementedError' },
+        },
+      ],
+    });
+
+    expect(llm.jsonCalls).toBe(1);
+    expect(plans).toEqual([
+      expect.objectContaining({ toolName: 'fs.read', params: { path: 'data/input.csv' } }),
+      expect.objectContaining({ toolName: 'fs.read', params: { path: 'rules/expectations.yml' } }),
     ]);
   });
 });

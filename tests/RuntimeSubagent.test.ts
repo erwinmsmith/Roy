@@ -113,6 +113,26 @@ describe('Runtime controlled subagent spawning', () => {
     )).toBe(true);
   });
 
+  it('continues workspace evidence collection after a directory listing when the task requests file reads', () => {
+    const runtime = new Runtime();
+    const shouldReplan = (task: string, calls: Array<{ toolName: string }>) =>
+      (runtime as unknown as {
+        shouldReplanToolLoop: (
+          value: string,
+          completed: Array<{ toolName: string }>
+        ) => boolean;
+      }).shouldReplanToolLoop(task, calls);
+
+    expect(shouldReplan(
+      'List /app, then read the CSV inputs and rules/expectations.yml before reporting.',
+      [{ toolName: 'fs.list' }]
+    )).toBe(true);
+    expect(shouldReplan(
+      'List the workspace top-level entries.',
+      [{ toolName: 'fs.list' }]
+    )).toBe(false);
+  });
+
   it('removes the tool-use skill from a delegation plan that has no tools', () => {
     const runtime = new Runtime();
     const normalized = (runtime as unknown as {

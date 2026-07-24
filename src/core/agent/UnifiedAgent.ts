@@ -175,12 +175,12 @@ export class UnifiedAgent extends BaseAgent {
             ? successfulInspection
               ? freshMutationRequired
                 ? 'A prior acceptance audit found unmet requirements. Existing mutations and passing commands do not close this repair phase. Request a new focused fs.replace, fs.write, or mutating shell.exec call that fixes the reported unmet item.'
-                : 'The workspace layout has been grounded. Request fs.replace, fs.write, or a mutating shell.exec call that advances the actual task.'
+                : 'The workspace layout has been grounded. If a distinct task-relevant input, rule, test, or source file is still necessary, request the novel reads together now; otherwise request fs.replace, fs.write, or a mutating shell.exec call that advances the actual task.'
               : 'No authoritative workspace inspection has succeeded yet. Recover failed paths with fs.list, fs.read, or fs.search before requesting a mutation.'
             : '',
           executionRequired && latestVerificationFailed
             ? inspectedAfterLatestFailure
-              ? 'The newest verification failed after the latest mutation, and relevant source evidence has already been inspected. Apply a focused repair now; do not rerun verification or broaden inspection before changing the workspace.'
+              ? 'The newest verification failed after the latest mutation. Apply a focused repair now unless a distinct task-relevant input, rule, test, or source file has not yet been read; batch only those novel reads and never repeat broad discovery.'
               : 'The newest verification failed after the latest mutation. Preserve its detailed causal frontier and inspect only the reported source location before applying a focused repair.'
             : '',
           executionRequired && mutationApplied && !verificationPassed && !latestVerificationFailed
@@ -299,10 +299,15 @@ export class UnifiedAgent extends BaseAgent {
             rejectedDestructiveRepairOverwrite = plannedCalls.some(call =>
               isDestructiveRepairOverwrite(call, input.calls)
             );
-            plannedCalls = plannedCalls.filter(call =>
+            const focusedRepairs = plannedCalls.filter(call =>
               isSuccessfulWorkspaceMutation({ ...call, success: true })
               && !isDestructiveRepairOverwrite(call, input.calls)
             );
+            plannedCalls = focusedRepairs.length > 0
+              ? [focusedRepairs[0]!]
+              : plannedCalls.filter(call =>
+                call.toolName === 'fs.read' || call.toolName === 'fs.search'
+              );
           } else {
             const directRepair = plannedCalls.find(call =>
               isSuccessfulWorkspaceMutation({ ...call, success: true })
@@ -325,18 +330,18 @@ export class UnifiedAgent extends BaseAgent {
         const advancesExecution = !executionRequired
           || (latestVerificationFailed
             ? inspectedAfterLatestFailure
-              ? plannedCalls.some(call =>
+              ? plannedInspection || plannedCalls.some(call =>
                 isSuccessfulWorkspaceMutation({ ...call, success: true })
               )
               : plannedInspection || plannedCalls.some(call =>
                 isSuccessfulWorkspaceMutation({ ...call, success: true })
               )
-          : mutationRequirementSatisfied
+              : mutationRequirementSatisfied
               ? verificationPassed || plannedCalls.some(call =>
                 isSuccessfulWorkspaceMutation({ ...call, success: true })
                 || isSuccessfulWorkspaceVerification({ ...call, success: true })
               )
-              : ((!successfulInspection && plannedInspection)
+              : (plannedInspection
                 || plannedCalls.some(call => isSuccessfulWorkspaceMutation({
                   ...call,
                   success: true,
@@ -353,13 +358,13 @@ export class UnifiedAgent extends BaseAgent {
                 ? successfulInspection
                   ? freshMutationRequired
                     ? 'The previous acceptance audit is still open. Request a new focused mutation that addresses one of its failed or unverified items now.'
-                    : 'The workspace is already grounded. Request a concrete fs.replace, fs.write, or mutating shell.exec call now.'
+                    : 'Do not repeat grounded paths. Batch any distinct task-relevant files that are still necessary, or request a concrete fs.replace, fs.write, or mutating shell.exec call now.'
                   : 'The previous inspection failed or was absent. Request a corrected fs.list, fs.read, or fs.search call before mutating.'
                 : '',
               latestVerificationFailed && inspectedAfterLatestFailure
                 ? rejectedDestructiveRepairOverwrite
                   ? 'The latest verifier failure concerns an existing file. Preserve working code: use fs.replace for a focused repair instead of overwriting that file, then verify.'
-                  : 'The latest verifier failure and its relevant source evidence are already grounded. Request a concrete fs.replace, fs.write for a new file, or mutating shell.exec repair before any further verification.'
+                  : 'The latest verifier failure is grounded. Request a focused repair, or batch only distinct task-relevant files that are still genuinely necessary before repairing.'
                 : '',
               mutationRequirementSatisfied && !verificationPassed && !latestVerificationFailed
                 ? 'Finish, read-only, masked-failure, and repeated plans are insufficient. Request a concrete remaining edit or repair, or a distinct verification command whose exit status is preserved.'
@@ -377,7 +382,7 @@ export class UnifiedAgent extends BaseAgent {
         );
         const advancesExecution = latestVerificationFailed
           ? inspectedAfterLatestFailure
-            ? plannedCalls.some(call =>
+            ? plannedInspection || plannedCalls.some(call =>
               isSuccessfulWorkspaceMutation({ ...call, success: true })
             )
             : plannedInspection || plannedCalls.some(call =>
@@ -388,7 +393,7 @@ export class UnifiedAgent extends BaseAgent {
               isSuccessfulWorkspaceMutation({ ...call, success: true })
               || isSuccessfulWorkspaceVerification({ ...call, success: true })
             )
-            : ((!successfulInspection && plannedInspection)
+            : (plannedInspection
               || plannedCalls.some(call => isSuccessfulWorkspaceMutation({
                 ...call,
                 success: true,
