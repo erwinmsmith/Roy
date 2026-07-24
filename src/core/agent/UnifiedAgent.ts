@@ -1256,13 +1256,22 @@ function recoverTruncatedFsWriteResponse(
   const prefix = 'Failed to parse JSON response:';
   if (!message.startsWith(prefix)) return undefined;
   const raw = message.slice(prefix.length);
-  const writeIndex = raw.search(/"toolName"\s*:\s*"fs\.write"/);
-  if (writeIndex < 0) return undefined;
-  const writePayload = raw.slice(writeIndex);
-  const pathField = extractPartialJsonStringField(writePayload, 'path');
-  const contentField = extractPartialJsonStringField(writePayload, 'content');
-  const filePath = pathField?.value.trim() ?? '';
-  if (!filePath || !contentField || contentField.value.length < 32) return undefined;
+  const writeIndices = [...raw.matchAll(/"toolName"\s*:\s*"fs\.write"/g)]
+    .map(match => match.index)
+    .filter((index): index is number => index !== undefined);
+  let filePath = '';
+  let contentField: { value: string; complete: boolean } | undefined;
+  for (const writeIndex of writeIndices) {
+    const writePayload = raw.slice(writeIndex);
+    const pathField = extractPartialJsonStringField(writePayload, 'path');
+    const candidateContent = extractPartialJsonStringField(writePayload, 'content');
+    const candidatePath = pathField?.value.trim() ?? '';
+    if (!candidatePath || !candidateContent || candidateContent.value.length < 32) continue;
+    filePath = candidatePath;
+    contentField = candidateContent;
+    break;
+  }
+  if (!filePath || !contentField) return undefined;
 
   let content = contentField.value.slice(0, 6_000);
   if (!contentField.complete) {

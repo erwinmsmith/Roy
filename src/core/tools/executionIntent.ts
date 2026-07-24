@@ -61,7 +61,7 @@ export function isSuccessfulWorkspaceMutationCall(call: ExecutionIntentCall): bo
   if (call.toolName === 'fs.write' || call.toolName === 'fs.replace') return true;
   if (call.toolName !== 'shell.exec') return false;
   const command = String(call.params.command ?? '');
-  if (/(?:^|[;&|]\s*|\s)(?:apply_patch|touch|mkdir|cp|mv|rm|install|chmod|truncate|git\s+apply|npm\s+(?:install|uninstall)|pnpm\s+(?:add|remove|install)|yarn\s+(?:add|remove|install)|pip\s+install|uv\s+(?:add|remove|pip\s+install)|sed\s+-i|perl\s+-pi)\b/i.test(command)) {
+  if (/(?:^|[;&|]\s*)(?:apply_patch|touch|mkdir|cp|mv|rm|install|chmod|truncate|git\s+apply|npm\s+(?:install|uninstall)|pnpm\s+(?:add|remove|install)|yarn\s+(?:add|remove|install)|uv\s+(?:add|remove)|sed\s+-i|perl\s+-pi)\b/i.test(command)) {
     return true;
   }
   if (/(?:^|\s)(?:python|python3|node)\b[\s\S]*(?:writeFile|write_text|write_bytes|open\s*\([^)]*['"][wa]['"])/i.test(command)) {

@@ -325,6 +325,23 @@ class RecoverableTruncatedWritePlanningLLM extends PlanningLLM {
   }
 }
 
+class RecoverableLaterTruncatedWritePlanningLLM extends PlanningLLM {
+  constructor() {
+    super('none');
+  }
+
+  override async completeJSON<T>(): Promise<T> {
+    this.jsonCalls += 1;
+    throw new Error(
+      'Failed to parse JSON response: '
+      + '{"action":"call_tools","calls":['
+      + '{"toolName":"fs.write","params":{"path":"src/__init__.py","content":""}},'
+      + '{"toolName":"fs.write","params":{"path":"src/app.py","content":'
+      + '"def run_pipeline():\\n    return 42\\n\\n# unfinished'
+    );
+  }
+}
+
 describe('UnifiedAgent capability execution', () => {
   beforeEach(() => {
     actionRegistry.clear();
@@ -1224,6 +1241,38 @@ describe('UnifiedAgent capability execution', () => {
       }),
     ]);
     expect(agent.getLastToolPlanningFailure()).toBeUndefined();
+  });
+
+  it('recovers a later non-empty write when an earlier planned file is empty', async () => {
+    const llm = new RecoverableLaterTruncatedWritePlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'later-write-recovery-agent',
+      goal: 'preserve useful implementation work from a multi-file response',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.write'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: 'Implement src/app.py.',
+      executionRequired: true,
+      round: 1,
+      remainingCalls: 2,
+      tools: [{ name: 'fs.write' }],
+      calls: [],
+    });
+
+    expect(llm.jsonCalls).toBe(1);
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.write',
+        params: expect.objectContaining({
+          path: 'src/app.py',
+          content: 'def run_pipeline():\n    return 42\n\n',
+          mode: 'overwrite',
+        }),
+      }),
+    ]);
   });
 
   it('appends the next recovered source chunk after an earlier recovered write', async () => {

@@ -29,6 +29,24 @@ describe('workspace execution intent', () => {
     })).toBe(false);
   });
 
+  it('does not treat environment-only dependency installation as a workspace mutation', () => {
+    expect(isSuccessfulWorkspaceMutationCall({
+      toolName: 'shell.exec',
+      params: { command: 'pip install great-expectations==0.18.21 pyyaml' },
+      success: true,
+    })).toBe(false);
+    expect(isSuccessfulWorkspaceMutationCall({
+      toolName: 'shell.exec',
+      params: { command: 'python -m pip install -e .' },
+      success: true,
+    })).toBe(false);
+    expect(isSuccessfulWorkspaceMutationCall({
+      toolName: 'shell.exec',
+      params: { command: 'uv pip install pytest' },
+      success: true,
+    })).toBe(false);
+  });
+
   it('recognizes actual file writes and verification commands', () => {
     expect(isSuccessfulWorkspaceMutationCall({
       toolName: 'shell.exec',
