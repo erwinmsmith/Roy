@@ -101,6 +101,19 @@ class NativeXmlToolIntentRecoveryLLM extends EchoLLM {
   }
 }
 
+class CapturingStreamLLM extends EchoLLM {
+  readonly streamedMessages: LLMMessage[][] = [];
+
+  override async *stream(messages: LLMMessage[], _options?: LLMCompletionOptions): AsyncGenerator<LLMStreamChunk, void, unknown> {
+    this.streamedMessages.push(messages.map(message => ({ ...message })));
+    yield {
+      content: 'Completed the assigned bounded task.',
+      done: true,
+      usage: { promptTokens: 20, completionTokens: 6, totalTokens: 26 },
+    };
+  }
+}
+
 describe('Runtime controlled subagent spawning', () => {
   it('does not route a local repair through web tools because verifier logs contain URLs', () => {
     const runtime = new Runtime();
@@ -120,6 +133,16 @@ describe('Runtime controlled subagent spawning', () => {
       'Repair the current workspace package and rerun its tests.',
       'Latest command output:',
       'WARNING: use a virtual environment: https://pip.pypa.io/warnings/venv',
+    ].join('\n'))).toBe(false);
+    expect(needsWeb([
+      '[runtime_acceptance_audit_phase]',
+      'Original task:',
+      'Work directly in /app, implement the local data pipeline, and run its tests.',
+      '<acceptance_checklist>',
+      '- Verify the required local artifacts.',
+      '</acceptance_checklist>',
+      'Audit contract:',
+      '- Cross-check independent configuration sources and verify local files.',
     ].join('\n'))).toBe(false);
     expect(needsWeb(
       'Use public web sources to compare the official Node.js and MDN documentation.'
@@ -263,6 +286,44 @@ describe('Runtime controlled subagent spawning', () => {
 
     expect(outcomes.every(outcome => outcome.success)).toBe(true);
     expect(outcomes.some(outcome => outcome.error?.includes('Tool call limit reached'))).toBe(false);
+    await runtime.shutdown();
+  });
+
+  it('renders an immutable assigned task once and sends only an observation reference', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-assignment-reference-'));
+    const llm = new CapturingStreamLLM();
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'assignment-reference-test',
+      llmProvider: llm,
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+    const task = [
+      'Analyze the distinctive zephyr ledger scenario.',
+      'Return the relevant conclusion from the supplied assignment.',
+    ].join(' ');
+    const agent = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'custom',
+      tomLevel: 0,
+      description: task,
+      task,
+      tools: [],
+      skills: [],
+      outputContract: { format: 'markdown', groundingRequired: false },
+    });
+
+    await runtime.runAgent(agent.identity.id, task, {
+      disableRecursiveDelegation: true,
+      archetype: 'custom',
+    });
+
+    const messages = llm.streamedMessages.at(-1) ?? [];
+    const rendered = messages.map(message => message.content).join('\n');
+    expect(rendered.match(/distinctive zephyr ledger scenario/g)).toHaveLength(1);
+    expect(messages.at(-1)?.content).toContain('[runtime_current_assignment]');
+    expect(messages.at(-1)?.content).not.toContain('distinctive zephyr ledger scenario');
     await runtime.shutdown();
   });
 

@@ -246,6 +246,10 @@ describe('Phase 3 subteam runtime', () => {
         task: expect.stringContaining('<team_step_cache>'),
       }),
     }));
+    expect(runtime.getEvents().find(event =>
+      event.type === 'agent.run.started'
+      && String(event.data?.task ?? '').includes('<team_step_cache>')
+    )?.data?.task).not.toContain('"teamTaskSummary"');
 
     const budget = runtime.getBudgetState();
     expect(budget.perTeam[team.identity.id].totalTokens).toBe(result.usage.totalTokens);

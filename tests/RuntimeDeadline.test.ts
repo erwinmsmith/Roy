@@ -163,4 +163,101 @@ describe('Runtime external wall-clock deadline', () => {
       reason: 'cached_file_read_still_current',
     });
   });
+
+  it('does not repeat an unchanged failed acceptance audit before a new repair', () => {
+    const runtime = new Runtime() as unknown as {
+      shouldRunRootAcceptanceAudit(
+        closure: {
+          mutationApplied: boolean;
+          verificationPassed: boolean;
+        },
+        audit: { performed: boolean; passed: boolean } | undefined,
+        required: boolean,
+        invalidated: boolean
+      ): boolean;
+      shouldRequireFreshAcceptanceMutation(
+        closure: {
+          acceptanceAuditPerformed: boolean;
+          acceptanceAuditPassed: boolean;
+        },
+        invalidated: boolean
+      ): boolean;
+    };
+    const closure = { mutationApplied: true, verificationPassed: true };
+    const failedAudit = { performed: true, passed: false };
+
+    expect(runtime.shouldRunRootAcceptanceAudit(
+      closure,
+      failedAudit,
+      true,
+      false
+    )).toBe(false);
+    expect(runtime.shouldRunRootAcceptanceAudit(
+      closure,
+      failedAudit,
+      true,
+      true
+    )).toBe(true);
+    expect(runtime.shouldRunRootAcceptanceAudit(
+      closure,
+      undefined,
+      true,
+      false
+    )).toBe(true);
+    expect(runtime.shouldRequireFreshAcceptanceMutation({
+      acceptanceAuditPerformed: true,
+      acceptanceAuditPassed: false,
+    }, false)).toBe(true);
+    expect(runtime.shouldRequireFreshAcceptanceMutation({
+      acceptanceAuditPerformed: true,
+      acceptanceAuditPassed: false,
+    }, true)).toBe(false);
+  });
+
+  it('keeps fenced output contracts attached to acceptance requirements', () => {
+    const runtime = new Runtime() as unknown as {
+      extractTaskAcceptanceItems(task: string): string[];
+    };
+    const items = runtime.extractTaskAcceptanceItems([
+      'The report must contain exactly these section headings:',
+      '```markdown',
+      '# Data Quality Audit Summary',
+      '## Overall',
+      '## Dataset Counts',
+      '```',
+    ].join('\n'));
+
+    expect(items).toContain(
+      'The report must contain exactly these section headings: # Data Quality Audit Summary | ## Overall | ## Dataset Counts'
+    );
+  });
+
+  it('carries failed acceptance evidence into the next repair task', () => {
+    const runtime = new Runtime() as unknown as {
+      buildRootExecutionRepairTask(
+        task: string,
+        prior: Record<string, unknown>,
+        attempt: number
+      ): string;
+    };
+    const repairTask = runtime.buildRootExecutionRepairTask('Repair the project.', {
+      toolCalls: [],
+      acceptanceAudit: {
+        required: true,
+        performed: true,
+        passed: false,
+        items: [{
+          id: 'acceptance_04',
+          status: 'failed',
+          evidence: 'The generated manifest still references the removed package.',
+        }],
+      },
+      evidence: { toolResultSummary: 'pytest reported one failing assertion.' },
+      warnings: [],
+    }, 2);
+
+    expect(repairTask).toContain(
+      'acceptance_04 [failed]: The generated manifest still references the removed package.'
+    );
+  });
 });
