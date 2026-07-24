@@ -141,6 +141,7 @@ export type {
   ExecutionCachedActor,
   ExecutionCachedPath,
   ExecutionCachedStep,
+  ExecutionCachedToolCall,
   ExecutionCacheSnapshot,
   ExecutionFeedbackKind,
   ExecutionFeedbackRecord,

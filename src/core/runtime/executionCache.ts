@@ -41,6 +41,17 @@ export interface ExecutionFeedbackRecord {
   createdAt: number;
 }
 
+export interface ExecutionCachedToolCall {
+  toolName: string;
+  params: Record<string, unknown>;
+  result?: unknown;
+  success: boolean;
+  error?: string;
+  reason?: string;
+  startedAt?: number;
+  completedAt?: number;
+}
+
 export interface ExecutionCachedPath {
   id: string;
   correlationId: string;
@@ -56,6 +67,11 @@ export interface ExecutionCachedPath {
   failedTools: string[];
   mutationObserved: boolean;
   verificationObserved: boolean;
+  /**
+   * Bounded causal tool evidence used to resume a later runtime process
+   * without replaying unchanged reads, listings, or verifier calls.
+   */
+  toolFrontier?: ExecutionCachedToolCall[];
   feedbackIds: string[];
   summary?: string;
   createdAt: number;
@@ -139,6 +155,12 @@ export function compactExecutionKnowledgeForPrompt(
       failedTools: item.failedTools,
       mutationObserved: item.mutationObserved,
       verificationObserved: item.verificationObserved,
+      toolFrontier: item.toolFrontier?.slice(-16).map(call => ({
+        toolName: call.toolName,
+        params: call.params,
+        success: call.success,
+        error: call.error?.slice(0, 500),
+      })),
       feedbackIds: item.feedbackIds.filter(id => feedbackIds.has(id)),
     })),
     actors: state.actors.slice(-30).map(item => ({

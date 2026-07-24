@@ -220,6 +220,31 @@ describe('workspace execution intent', () => {
     })).toBe(false);
   });
 
+  it('reuses a persisted compacted full-file read but still permits targeted rereads', () => {
+    const completed = {
+      toolName: 'fs.read',
+      params: { path: 'src/large_module.py' },
+      success: true,
+      result: {
+        path: 'src/large_module.py',
+        truncated: false,
+        startLine: 1,
+        endLine: 2_000,
+        totalLines: 2_000,
+        persistedContentCompacted: true,
+      },
+    };
+
+    expect(completedWorkspaceReadCoversPlan(completed, {
+      toolName: 'fs.read',
+      params: { path: './src/large_module.py' },
+    })).toBe(true);
+    expect(completedWorkspaceReadCoversPlan(completed, {
+      toolName: 'fs.read',
+      params: { path: 'src/large_module.py', startLine: 700, endLine: 760 },
+    })).toBe(false);
+  });
+
   it('distinguishes mutation tasks from explicitly read-only work', () => {
     expect(taskRequestsWorkspaceMutation('Migrate the project code and run tests.')).toBe(true);
     expect(taskRequestsWorkspaceMutation('Review the project in read-only mode.')).toBe(false);

@@ -32,6 +32,7 @@ import { RootExecutionActivityProjector } from './executionActivity.js';
 import {
   compactExecutionKnowledgeForPrompt,
   type ExecutionCachedActor,
+  type ExecutionCachedToolCall,
   type ExecutionCacheSnapshot,
   type ExecutionFeedbackRecord,
   type ExecutionKnowledgeCacheState,
@@ -9199,6 +9200,7 @@ export class Runtime {
     const successfulTools = new Set<string>();
     const failedTools = new Set<string>();
     const feedback: ExecutionFeedbackRecord[] = [];
+    const cachedToolFrontier: ExecutionCachedToolCall[] = [];
     let mutationObserved = false;
     let verificationObserved = false;
     const addFeedback = (
@@ -9261,7 +9263,10 @@ export class Runtime {
         success,
         error: typeof resultPayload.error === 'string' ? resultPayload.error : undefined,
         reason: typeof callPayload.reason === 'string' ? callPayload.reason : undefined,
+        startedAt: callMessage?.createdAt,
+        completedAt: message.createdAt,
       };
+      cachedToolFrontier.push(this.compactExecutionCachedToolCall(callRecord));
       const semanticVerificationFailure = success
         && isWorkspaceVerificationCall(callRecord)
         && !isSuccessfulWorkspaceVerificationCall(callRecord);
@@ -9455,6 +9460,7 @@ export class Runtime {
         failedTools: [...failedTools],
         mutationObserved,
         verificationObserved,
+        toolFrontier: this.boundExecutionToolFrontier(cachedToolFrontier),
         feedbackIds: feedback.map(item => item.id),
         summary: input.resultSummary?.slice(0, 5000),
         createdAt: step.startedAt,
@@ -9463,6 +9469,80 @@ export class Runtime {
       actors,
       feedback,
     };
+  }
+
+  private compactExecutionCachedToolCall(
+    call: ToolCallRecord
+  ): ExecutionCachedToolCall {
+    const compactText = (value: unknown, maxChars: number): unknown => {
+      if (typeof value !== 'string' || value.length <= maxChars) return value;
+      const head = Math.floor(maxChars * 0.6);
+      const tail = maxChars - head;
+      return `${value.slice(0, head)}\n[runtime_persisted_tool_evidence_compacted]\n${value.slice(-tail)}`;
+    };
+    const params = Object.fromEntries(
+      Object.entries(call.params).map(([key, value]) => [
+        key,
+        compactText(value, ['content', 'oldText', 'newText'].includes(key) ? 4_000 : 2_000),
+      ])
+    );
+    let result = call.result;
+    if (result && typeof result === 'object' && !Array.isArray(result)) {
+      const record = result as Record<string, unknown>;
+      if (call.toolName === 'fs.read') {
+        const contentCompacted = typeof record.content === 'string'
+          && record.content.length > 40_000;
+        result = {
+          ...record,
+          content: compactText(record.content, 40_000),
+          persistedContentCompacted: contentCompacted || undefined,
+        };
+      } else if (call.toolName === 'fs.list') {
+        result = {
+          ...record,
+          entries: Array.isArray(record.entries) ? record.entries.slice(0, 160) : record.entries,
+        };
+      } else if (call.toolName === 'fs.search') {
+        result = {
+          ...record,
+          matches: Array.isArray(record.matches) ? record.matches.slice(0, 80) : record.matches,
+        };
+      } else if (call.toolName === 'shell.exec') {
+        result = {
+          ...record,
+          stdout: compactText(record.stdout, 6_000),
+          stderr: compactText(record.stderr, 8_000),
+        };
+      }
+    }
+    return {
+      toolName: call.toolName,
+      params,
+      result,
+      success: call.success,
+      error: typeof call.error === 'string'
+        ? String(compactText(call.error, 4_000))
+        : undefined,
+      reason: call.reason?.slice(0, 1_000),
+      startedAt: call.startedAt,
+      completedAt: call.completedAt,
+    };
+  }
+
+  private boundExecutionToolFrontier(
+    calls: ExecutionCachedToolCall[],
+    maxCalls = 32,
+    maxSerializedChars = 240_000
+  ): ExecutionCachedToolCall[] {
+    const selected: ExecutionCachedToolCall[] = [];
+    let serializedChars = 0;
+    for (const call of calls.slice(-Math.max(1, maxCalls)).reverse()) {
+      const callChars = JSON.stringify(call).length;
+      if (selected.length > 0 && serializedChars + callChars > maxSerializedChars) continue;
+      selected.push(call);
+      serializedChars += callChars;
+    }
+    return selected.reverse();
   }
 
   private actorGenerationFromNodes(
@@ -9568,36 +9648,60 @@ export class Runtime {
       )[0];
     if (!selected) return undefined;
 
-    const stepIds = new Set(selected.items.map(item => item.step.stepId));
+    const selectedStepIds = new Set(selected.items.map(item => item.step.stepId));
+    const selectedPaths = knowledge.paths.filter(path =>
+      path.correlationId === selected.correlationId && selectedStepIds.has(path.stepId)
+    );
+    const openSelectedPaths = selectedPaths.filter(path =>
+      path.status !== 'completed'
+      || (path.mutationObserved && !path.verificationObserved)
+    );
+    const selectedFeedback = knowledge.feedback.filter(item =>
+      item.correlationId === selected.correlationId && selectedStepIds.has(item.stepId)
+    );
+    if (openSelectedPaths.length === 0
+      && selectedFeedback.every(item => !item.actionable)
+      && !externalContinuation) {
+      return undefined;
+    }
+    const anchor = [...openSelectedPaths, ...selectedPaths]
+      .sort((left, right) => right.updatedAt - left.updatedAt)[0];
+    if (!anchor) return undefined;
+
+    // Follow the persisted parent path chain across prior Runtime processes.
+    // A Harbor continuation gets a new correlation id, but its authoritative
+    // reads, verifier results, mutations, and rejected candidates remain part
+    // of one causal path and must be available for cache invalidation.
+    const pathsById = new Map(knowledge.paths.map(item => [item.id, item]));
+    const relatedPathIds = new Set<string>();
+    const pendingPathIds = [anchor.id];
+    while (pendingPathIds.length > 0 && relatedPathIds.size < 16) {
+      const pathId = pendingPathIds.shift()!;
+      if (relatedPathIds.has(pathId)) continue;
+      const cachedPath = pathsById.get(pathId);
+      if (!cachedPath) continue;
+      relatedPathIds.add(pathId);
+      pendingPathIds.push(...cachedPath.parentPathIds);
+    }
+    const relatedPaths = knowledge.paths
+      .filter(path => relatedPathIds.has(path.id))
+      .sort((left, right) => left.updatedAt - right.updatedAt);
+    const relatedStepIds = new Set(relatedPaths.map(path => path.stepId));
     const selectedKnowledge: ExecutionKnowledgeCacheState = {
       version: 1,
       updatedAt: knowledge.updatedAt,
-      steps: selected.items
-        .map(item => item.step)
+      steps: knowledge.steps
+        .filter(step => relatedStepIds.has(step.stepId))
         .sort((left, right) => left.updatedAt - right.updatedAt),
-      paths: knowledge.paths.filter(path =>
-        path.correlationId === selected.correlationId && stepIds.has(path.stepId)
-      ),
-      actors: knowledge.actors.filter(actor =>
-        actor.correlationId === selected.correlationId && stepIds.has(actor.stepId)
-      ),
-      feedback: knowledge.feedback.filter(item =>
-        item.correlationId === selected.correlationId && stepIds.has(item.stepId)
-      ),
+      paths: relatedPaths,
+      actors: knowledge.actors.filter(actor => relatedStepIds.has(actor.stepId)),
+      feedback: knowledge.feedback.filter(item => relatedStepIds.has(item.stepId)),
     };
     const openPaths = selectedKnowledge.paths.filter(path =>
       path.status !== 'completed'
       || (path.mutationObserved && !path.verificationObserved)
     );
     const actionableFeedback = selectedKnowledge.feedback.filter(item => item.actionable);
-    if (openPaths.length === 0
-      && actionableFeedback.length === 0
-      && !externalContinuation) {
-      return undefined;
-    }
-    const anchor = [...openPaths, ...selectedKnowledge.paths]
-      .sort((left, right) => right.updatedAt - left.updatedAt)[0];
-    if (!anchor) return undefined;
     return {
       sourceCorrelationId: selected.correlationId,
       anchorPathId: anchor.id,
@@ -15911,6 +16015,89 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     };
   }
 
+  private collectResumedToolGrounding(
+    correlationId: string
+  ): GroundingRunResult | undefined {
+    const resumeState = this.resumedExecutionByCorrelation.get(correlationId);
+    if (!resumeState) return undefined;
+    const toolCalls = resumeState.knowledge.paths
+      .flatMap(path => path.toolFrontier ?? [])
+      .map(call => ({
+        toolName: call.toolName,
+        params: call.params,
+        result: call.result,
+        success: call.success,
+        error: call.error,
+        reason: call.reason ?? 'Restored from the persisted causal tool frontier.',
+        startedAt: call.startedAt,
+        completedAt: call.completedAt,
+      }))
+      .sort((left, right) =>
+        (left.completedAt ?? left.startedAt ?? 0)
+        - (right.completedAt ?? right.startedAt ?? 0)
+      )
+      .slice(-96);
+    if (toolCalls.length === 0) return undefined;
+    const observedPaths = Array.from(new Set(
+      resumeState.knowledge.paths.flatMap(path => path.observedPaths)
+    )).slice(0, 160);
+    const warnings = resumeState.knowledge.feedback
+      .filter(item => item.actionable)
+      .sort((left, right) => left.createdAt - right.createdAt)
+      .slice(-16)
+      .map(item => item.summary);
+    const summary = [
+      'Persisted causal tool frontier:',
+      ...toolCalls.slice(-32).map(call =>
+        `- ${call.success ? 'ok' : 'failed'} ${call.toolName} ${JSON.stringify(call.params).slice(0, 500)}`
+      ),
+      warnings.length > 0
+        ? `Persisted actionable feedback:\n${warnings.join('\n')}`
+        : '',
+    ].filter(Boolean).join('\n');
+    const startedAt = toolCalls
+      .map(call => call.startedAt)
+      .filter((value): value is number => Number.isFinite(value))
+      .at(0) ?? Date.now();
+    const completedAt = [...toolCalls]
+      .reverse()
+      .map(call => call.completedAt)
+      .find((value): value is number => Number.isFinite(value))
+      ?? startedAt;
+    this.emit({
+      type: 'execution.tool_frontier.resumed',
+      agentId: 'root',
+      correlationId,
+      data: {
+        sourceCorrelationId: resumeState.sourceCorrelationId,
+        paths: resumeState.knowledge.paths.length,
+        toolCalls: toolCalls.length,
+        observedPaths: observedPaths.length,
+      },
+    });
+    return {
+      toolCalls,
+      grounded: toolCalls.some(call => call.success),
+      warnings,
+      context: summary,
+      evidence: {
+        toolGrounded: toolCalls.some(call => call.success),
+        outputGrounded: false,
+        observedPaths,
+        toolResultSummary: summary,
+      },
+      toolLoop: {
+        rounds: [],
+        totalCalls: toolCalls.length,
+        successfulCalls: toolCalls.filter(call => call.success).length,
+        failedCalls: toolCalls.filter(call => !call.success).length,
+        stopReason: 'completed',
+        startedAt,
+        completedAt,
+      },
+    };
+  }
+
   private async runRequiredRootExecution(
     userTask: string,
     subagents: RootMediatedSpawnResult[],
@@ -15918,11 +16105,15 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     correlationId: string
   ): Promise<GroundingRunResult> {
     const attempts: GroundingRunResult[] = [];
-    const delegatedExecution = this.collectDelegatedExecutionGrounding(
+    const liveDelegatedExecution = this.collectDelegatedExecutionGrounding(
       subagents,
       teamResults,
       correlationId
     );
+    const resumedExecution = this.collectResumedToolGrounding(correlationId);
+    const delegatedExecution = resumedExecution && liveDelegatedExecution
+      ? this.combineGroundingRuns([resumedExecution, liveDelegatedExecution])
+      : resumedExecution ?? liveDelegatedExecution;
     const combineWithDelegatedExecution = (): GroundingRunResult => this.combineGroundingRuns(
       delegatedExecution ? [delegatedExecution, ...attempts] : attempts
     );

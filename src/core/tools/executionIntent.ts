@@ -54,6 +54,7 @@ export function completedWorkspaceReadCoversPlan(
     startLine?: unknown;
     endLine?: unknown;
     totalLines?: unknown;
+    persistedContentCompacted?: unknown;
   } | undefined;
   if (result?.truncated === true) return false;
   const completedStart = positiveInteger(result?.startLine)
@@ -65,7 +66,11 @@ export function completedWorkspaceReadCoversPlan(
     && completedEnd !== undefined
     && totalLines !== undefined
     && completedEnd >= totalLines;
-  if (completedFullFile) return true;
+  if (completedFullFile) {
+    return result?.persistedContentCompacted === true
+      ? planned.params.startLine === undefined && planned.params.endLine === undefined
+      : true;
+  }
 
   const plannedStart = positiveInteger(planned.params.startLine) ?? 1;
   const plannedEnd = positiveInteger(planned.params.endLine);

@@ -39,6 +39,7 @@ export {
   type ExecutionCachedActor,
   type ExecutionCachedPath,
   type ExecutionCachedStep,
+  type ExecutionCachedToolCall,
   type ExecutionCacheSnapshot,
   type ExecutionFeedbackKind,
   type ExecutionFeedbackRecord,

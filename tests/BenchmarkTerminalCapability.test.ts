@@ -898,6 +898,12 @@ describe('benchmark terminal capability', () => {
       mutationObserved: true,
       verificationObserved: true,
       successfulTools: expect.arrayContaining(['shell.exec']),
+      toolFrontier: expect.arrayContaining([
+        expect.objectContaining({
+          toolName: 'shell.exec',
+          success: true,
+        }),
+      ]),
     }));
     expect(executionKnowledge.feedback).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: 'workspace_mutation' }),
@@ -982,12 +988,29 @@ describe('benchmark terminal capability', () => {
           resultSummary: 'The prior team did not create artifact.txt.',
           createdAt: now - 1000,
           updatedAt: now,
+        }, {
+          id: 'ancestor-step.cache',
+          correlationId: 'ancestor-correlation',
+          stepId: 'ancestor-step',
+          index: 1,
+          task,
+          taskFingerprint: 'ancestor-task',
+          pathId: 'ancestor-path',
+          dependsOn: [],
+          action: 'delegate',
+          status: 'failed',
+          actorIds: [],
+          teamIds: [],
+          feedbackIds: [],
+          resultSummary: 'The workspace root was already listed.',
+          createdAt: now - 3000,
+          updatedAt: now - 2000,
         }],
         paths: [{
           id: 'prior-path',
           correlationId: 'prior-correlation',
           stepId: 'prior-step',
-          parentPathIds: [],
+          parentPathIds: ['ancestor-path'],
           taskFingerprint: 'prior-task',
           status: 'partial',
           actorIds: ['prior-agent'],
@@ -1002,6 +1025,33 @@ describe('benchmark terminal capability', () => {
           summary: 'artifact.txt is missing',
           createdAt: now - 1000,
           updatedAt: now,
+        }, {
+          id: 'ancestor-path',
+          correlationId: 'ancestor-correlation',
+          stepId: 'ancestor-step',
+          parentPathIds: [],
+          taskFingerprint: 'ancestor-task',
+          status: 'partial',
+          actorIds: [],
+          teamIds: [],
+          observedPaths: ['.roy/config.json'],
+          invalidPaths: [],
+          successfulTools: ['fs.list'],
+          failedTools: [],
+          mutationObserved: false,
+          verificationObserved: false,
+          toolFrontier: [{
+            toolName: 'fs.list',
+            params: { path: '.', maxDepth: 2 },
+            result: { root: '.', entries: ['.roy/config.json'] },
+            success: true,
+            startedAt: now - 2900,
+            completedAt: now - 2800,
+          }],
+          feedbackIds: [],
+          summary: 'Workspace root listing is authoritative.',
+          createdAt: now - 3000,
+          updatedAt: now - 2000,
         }],
         actors: [],
         feedback: [{
@@ -1027,6 +1077,15 @@ describe('benchmark terminal capability', () => {
       data: expect.objectContaining({
         sourceCorrelationId: 'prior-correlation',
         anchorPathId: 'prior-path',
+        paths: 2,
+      }),
+    }));
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'execution.tool_frontier.resumed',
+      data: expect.objectContaining({
+        sourceCorrelationId: 'prior-correlation',
+        paths: 2,
+        toolCalls: 1,
       }),
     }));
     expect(result.executionTree.steps[0].cache?.path.parentPathIds).toContain('prior-path');
