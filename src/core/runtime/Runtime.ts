@@ -733,6 +733,18 @@ export interface AgentArchetypeProfile {
   spawnPolicy: AgentSpawnPolicy;
 }
 
+interface VerifierScorecard {
+  reward: number;
+  groups: Record<string, number>;
+}
+
+interface WorkspaceMutationCheckpoint {
+  path: string;
+  previousContent: string;
+  baseline?: VerifierScorecard;
+  createdAt: number;
+}
+
 export class Runtime {
   private static instance: Runtime | null = null;
 
@@ -763,6 +775,8 @@ export class Runtime {
     observedAt: number;
   }>>();
   private readonly changedPathsByCorrelation = new Map<string, Set<string>>();
+  private readonly mutationCheckpointsByCorrelation =
+    new Map<string, WorkspaceMutationCheckpoint>();
   private readonly resumedExecutionByCorrelation = new Map<string, ExecutionResumeState>();
   private runtimeToolOverrides = new Map<string, Tool>();
   private readonly teams = new TeamRegistry();
@@ -2608,6 +2622,11 @@ export class Runtime {
       nodeId: options.nodeId,
       data: { toolName, params, correlationId: options.correlationId },
     });
+    const mutationCheckpoint = await this.captureWorkspaceMutationCheckpoint(
+      toolName,
+      params,
+      options.groundingCalls ?? []
+    );
     let result = toolName === 'fs.synthesize'
       ? await this.executeSynthesizedFileForAgent(
         agent,
@@ -2619,13 +2638,29 @@ export class Runtime {
       : runtimeTool
         ? await this.executeRuntimeTool(runtimeTool, params)
         : await toolRegistry.execute(toolName, params);
+    if (result.success && mutationCheckpoint) {
+      this.mutationCheckpointsByCorrelation.set(
+        options.correlationId ?? ctx.sessionId,
+        mutationCheckpoint
+      );
+    }
     if (toolName === 'shell.exec'
       && isWorkspaceVerificationCall({
         toolName,
         params,
         success: result.success,
-      })) {
-      result = await this.attachVerifierDiagnostics(result, options.correlationId);
+      })
+      && this.shouldAttachVerifierDiagnostics(String(params.command ?? ''))) {
+      result = await this.attachVerifierDiagnostics(
+        result,
+        agentId,
+        options.correlationId
+      );
+      result = await this.rollbackVerifierRegression(
+        result,
+        agentId,
+        options.correlationId ?? ctx.sessionId
+      );
     }
     this.recordToolPathOutcome(agentId, toolName, params, result, options.correlationId);
     this.toolCallCounts.set(callKey, calls + 1);
@@ -2685,6 +2720,7 @@ export class Runtime {
       exitCode?: unknown;
       timedOut?: unknown;
       verifierDiagnostics?: unknown;
+      regressionRollback?: unknown;
     };
     const compactTail = (value: unknown, maxChars = 8_000): string | undefined => {
       if (typeof value !== 'string' || value.length === 0) return undefined;
@@ -2700,11 +2736,13 @@ export class Runtime {
       stdout: compactTail(shell.stdout),
       stderr: compactTail(shell.stderr),
       verifierDiagnostics: shell.verifierDiagnostics,
+      regressionRollback: shell.regressionRollback,
     };
   }
 
   private async attachVerifierDiagnostics(
     toolResult: ToolResult,
+    agentId: string,
     correlationId?: string
   ): Promise<ToolResult> {
     if (!toolResult.result || typeof toolResult.result !== 'object') return toolResult;
@@ -2735,7 +2773,7 @@ export class Runtime {
     if (diagnostics.length === 0) return toolResult;
     this.emit({
       type: 'tool.verifier_diagnostics.attached',
-      agentId: 'root',
+      agentId,
       correlationId,
       data: {
         files: diagnostics.map(item => item.path),
@@ -2747,6 +2785,150 @@ export class Runtime {
       result: {
         ...(toolResult.result as Record<string, unknown>),
         verifierDiagnostics: diagnostics,
+      },
+    };
+  }
+
+  private shouldAttachVerifierDiagnostics(command: string): boolean {
+    return /(?:^|\/)\.roy\/official-verifier\/|\bgrade\.py\b|\b(?:pytest|vitest|jest|mocha)\b/i.test(
+      command
+    );
+  }
+
+  private async captureWorkspaceMutationCheckpoint(
+    toolName: string,
+    params: Record<string, unknown>,
+    groundingCalls: ToolCallRecord[]
+  ): Promise<WorkspaceMutationCheckpoint | undefined> {
+    if (toolName !== 'fs.write'
+      && toolName !== 'fs.replace'
+      && toolName !== 'fs.synthesize') {
+      return undefined;
+    }
+    if (typeof params.path !== 'string' || !params.path.trim()) return undefined;
+    const normalizedPath = this.normalizeCachedPath(params.path);
+    const absolutePath = path.resolve(this.workspaceRoot, normalizedPath);
+    const relativePath = path.relative(this.workspaceRoot, absolutePath);
+    if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) return undefined;
+    try {
+      const previousContent = await readFile(absolutePath, 'utf8');
+      return {
+        path: normalizedPath,
+        previousContent,
+        baseline: this.latestVerifierScorecardFromCalls(groundingCalls),
+        createdAt: Date.now(),
+      };
+    } catch {
+      // New-file mutations are not rolled back automatically because removal is
+      // a materially different operation. Existing source files are protected.
+      return undefined;
+    }
+  }
+
+  private latestVerifierScorecardFromCalls(
+    calls: ToolCallRecord[]
+  ): VerifierScorecard | undefined {
+    for (const call of [...calls].reverse()) {
+      const scorecard = this.verifierScorecardFromToolResult(call.result);
+      if (scorecard) return scorecard;
+    }
+    return undefined;
+  }
+
+  private verifierScorecardFromToolResult(result: unknown): VerifierScorecard | undefined {
+    if (!result || typeof result !== 'object') return undefined;
+    const diagnostics = (result as {
+      verifierDiagnostics?: unknown;
+    }).verifierDiagnostics;
+    if (!Array.isArray(diagnostics)) return undefined;
+    for (const item of diagnostics) {
+      if (!item || typeof item !== 'object') continue;
+      const diagnostic = item as { path?: unknown; content?: unknown };
+      if (typeof diagnostic.content !== 'string') continue;
+      try {
+        const parsed = JSON.parse(diagnostic.content) as {
+          reward?: unknown;
+          groups?: unknown;
+        };
+        if (typeof parsed.reward !== 'number'
+          || !parsed.groups
+          || typeof parsed.groups !== 'object'
+          || Array.isArray(parsed.groups)) {
+          continue;
+        }
+        const groups = Object.fromEntries(
+          Object.entries(parsed.groups)
+            .filter((entry): entry is [string, number] =>
+              typeof entry[1] === 'number' && Number.isFinite(entry[1])
+            )
+        );
+        return { reward: parsed.reward, groups };
+      } catch {
+        // grade.log and other diagnostic files may not be scorecards.
+      }
+    }
+    return undefined;
+  }
+
+  private async rollbackVerifierRegression(
+    toolResult: ToolResult,
+    agentId: string,
+    correlationId: string
+  ): Promise<ToolResult> {
+    const checkpoint = this.mutationCheckpointsByCorrelation.get(correlationId);
+    const current = this.verifierScorecardFromToolResult(toolResult.result);
+    if (!checkpoint || !checkpoint.baseline || !current) return toolResult;
+    this.mutationCheckpointsByCorrelation.delete(correlationId);
+    const baseline = checkpoint.baseline;
+    if (current.reward + 1e-12 >= baseline.reward) return toolResult;
+    const regressedGroups = Object.keys(baseline.groups)
+      .filter(group => (current.groups[group] ?? 0) + 1e-12 < baseline.groups[group]!)
+      .map(group => ({
+        group,
+        before: baseline.groups[group],
+        after: current.groups[group] ?? 0,
+      }));
+    const restored = await new FsWriteTool(this.workspaceRoot).execute({
+      path: checkpoint.path,
+      content: checkpoint.previousContent,
+      mode: 'overwrite',
+      createDirectories: false,
+    });
+    if (!restored.success) {
+      return {
+        ...toolResult,
+        error: [
+          toolResult.error,
+          `Verifier reward regressed from ${baseline.reward} to ${current.reward}, and rollback of ${checkpoint.path} failed: ${restored.error}`,
+        ].filter(Boolean).join('\n'),
+      };
+    }
+    const changed = this.changedPathsByCorrelation.get(correlationId) ?? new Set<string>();
+    changed.add(checkpoint.path);
+    this.changedPathsByCorrelation.set(correlationId, changed);
+    this.emit({
+      type: 'workspace.mutation.regression_rolled_back',
+      agentId,
+      correlationId,
+      data: {
+        path: checkpoint.path,
+        baselineReward: baseline.reward,
+        regressedReward: current.reward,
+        regressedGroups,
+        checkpointAgeMs: Date.now() - checkpoint.createdAt,
+      },
+    });
+    return {
+      ...toolResult,
+      result: {
+        ...(toolResult.result as Record<string, unknown>),
+        regressionRollback: {
+          restored: true,
+          path: checkpoint.path,
+          baselineReward: baseline.reward,
+          regressedReward: current.reward,
+          regressedGroups,
+        },
       },
     };
   }
@@ -3902,12 +4084,16 @@ export class Runtime {
           stderr?: unknown;
           exitCode?: unknown;
           verifierDiagnostics?: unknown;
+          regressionRollback?: unknown;
         } | undefined;
         const output = [
           String(shell?.stdout ?? ''),
           String(shell?.stderr ?? ''),
           shell?.verifierDiagnostics
             ? `Verifier diagnostics:\n${JSON.stringify(shell.verifierDiagnostics)}`
+            : '',
+          shell?.regressionRollback
+            ? `Regression rollback:\n${JSON.stringify(shell.regressionRollback)}`
             : '',
           String(call.error ?? ''),
         ].filter(Boolean).join('\n');

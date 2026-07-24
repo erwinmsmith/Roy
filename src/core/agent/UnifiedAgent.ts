@@ -1986,6 +1986,7 @@ function compactToolObservation(
       exitCode?: unknown;
       timedOut?: unknown;
       verifierDiagnostics?: unknown;
+      regressionRollback?: unknown;
     };
     return {
       command: String(shell.command ?? '').slice(0, latest ? 800 : 250),
@@ -1998,6 +1999,7 @@ function compactToolObservation(
       exitCode: shell.exitCode,
       timedOut: shell.timedOut,
       verifierDiagnostics: compactObservationValue(shell.verifierDiagnostics, 0),
+      regressionRollback: compactObservationValue(shell.regressionRollback, 0),
     };
   }
   if (result && typeof result === 'object' && toolName === 'fs.read') {

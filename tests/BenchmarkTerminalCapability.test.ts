@@ -605,6 +605,117 @@ describe('benchmark terminal capability', () => {
     await runtime.shutdown();
   });
 
+  it('rolls back an existing source mutation when the verifier reward regresses', async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), 'roy-verifier-regression-'));
+    await mkdir(path.join(workspace, '.roy', 'official-verifier'), { recursive: true });
+    await mkdir(path.join(workspace, 'logs', 'verifier'), { recursive: true });
+    await writeFile(path.join(workspace, 'implementation.py'), 'VALUE = 41\n');
+    await writeFile(
+      path.join(workspace, '.roy', 'config.json'),
+      JSON.stringify({
+        tools: {
+          approval: { readOnly: 'auto', write: 'auto', execute: 'auto' },
+          shell: { mode: 'unrestricted', shell: '/bin/sh' },
+        },
+      })
+    );
+    const gradePath = path.join(workspace, '.roy', 'official-verifier', 'grade.py');
+    const scorecardPath = path.join(workspace, 'logs', 'verifier', 'scorecard.json');
+    await writeFile(gradePath, 'print("0.500000000000")\n');
+    await writeFile(
+      scorecardPath,
+      JSON.stringify({ groups: { public: 1, hidden: 0 }, reward: 0.5 })
+    );
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'verifier-regression-test',
+      workspaceCwd: workspace,
+    });
+
+    const baseline = await runtime.executeToolForAgent(
+      'root',
+      'shell.exec',
+      { command: 'python3 .roy/official-verifier/grade.py' },
+      { correlationId: 'verifier-regression-turn' }
+    );
+    const baselineCall = {
+      toolName: 'shell.exec',
+      params: { command: 'python3 .roy/official-verifier/grade.py' },
+      reason: 'Establish the verifier baseline.',
+      groundingRequired: true,
+      success: baseline.success,
+      result: baseline.result,
+      error: baseline.error,
+    };
+    const mutation = await runtime.executeToolForAgent(
+      'root',
+      'fs.replace',
+      {
+        path: 'implementation.py',
+        oldText: 'VALUE = 41',
+        newText: 'VALUE = 0',
+        expectedReplacements: 1,
+      },
+      {
+        correlationId: 'verifier-regression-turn',
+        groundingCalls: [baselineCall],
+      }
+    );
+    expect(await readFile(path.join(workspace, 'implementation.py'), 'utf8')).toBe(
+      'VALUE = 0\n'
+    );
+    await writeFile(gradePath, 'print("0.100000000000")\n');
+    await writeFile(
+      scorecardPath,
+      JSON.stringify({ groups: { public: 0, hidden: 0.1 }, reward: 0.1 })
+    );
+
+    const regressed = await runtime.executeToolForAgent(
+      'root',
+      'shell.exec',
+      { command: 'python3 .roy/official-verifier/grade.py' },
+      {
+        correlationId: 'verifier-regression-turn',
+        groundingCalls: [
+          baselineCall,
+          {
+            toolName: 'fs.replace',
+            params: { path: 'implementation.py' },
+            reason: 'Apply a candidate repair.',
+            groundingRequired: true,
+            success: mutation.success,
+            result: mutation.result,
+            error: mutation.error,
+          },
+        ],
+      }
+    );
+
+    expect(regressed).toMatchObject({
+      success: true,
+      result: expect.objectContaining({
+        regressionRollback: expect.objectContaining({
+          restored: true,
+          path: 'implementation.py',
+          baselineReward: 0.5,
+          regressedReward: 0.1,
+        }),
+      }),
+    });
+    expect(await readFile(path.join(workspace, 'implementation.py'), 'utf8')).toBe(
+      'VALUE = 41\n'
+    );
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'workspace.mutation.regression_rolled_back',
+      data: expect.objectContaining({
+        path: 'implementation.py',
+        baselineReward: 0.5,
+        regressedReward: 0.1,
+      }),
+    }));
+    await runtime.shutdown();
+  });
+
   it('runs an explicitly authorized shell loop and persists its execution tree', async () => {
     const workspace = await mkdtemp(path.join(tmpdir(), 'roy-terminal-task-'));
     await mkdir(path.join(workspace, '.roy'), { recursive: true });
