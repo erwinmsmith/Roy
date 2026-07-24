@@ -175,6 +175,8 @@ export interface RuntimeConfig {
   sessionId?: string;
   fsmEnabled?: boolean;
   budget?: number;
+  /** Optional external wall-clock deadline for this invocation. */
+  wallClockLimitMs?: number;
   mode?: 'conversational' | 'action' | 'hybrid';
   llmProvider?: LLMProvider;
   workspaceCwd?: string;
@@ -835,6 +837,7 @@ export class Runtime {
     const memory = new WorkspaceMemoryManager();
     await memory.initWorkspace(options.workspaceCwd ?? process.cwd(), options.sessionId ?? 'main');
     this.workspaceRuntimeConfig = await memory.getWorkspaceConfig();
+    this.applyExternalWallClockLimit(options.wallClockLimitMs);
     const workspaceRoot = options.workspaceCwd ?? process.cwd();
     this.workspaceRoot = path.resolve(workspaceRoot);
     registerCoreTools({
@@ -974,6 +977,42 @@ export class Runtime {
     this.initialized = true;
     this.emit({ type: 'runtime.initialized', agentId: 'root', data: { sessionId, provider: llm?.name ?? null } });
     return this.ctx;
+  }
+
+  private applyExternalWallClockLimit(limitMs: number | undefined): void {
+    if (limitMs === undefined) return;
+    if (!Number.isSafeInteger(limitMs) || limitMs < 1_000) {
+      throw new Error('Runtime wall-clock limit must be an integer of at least 1000ms');
+    }
+    if (!this.workspaceRuntimeConfig) return;
+    const rootSteps = this.workspaceRuntimeConfig.delegation.rootSteps;
+    const configuredWallClockMs = rootSteps.maxWallClockMs;
+    const appliedWallClockMs = Math.min(configuredWallClockMs, limitMs);
+    rootSteps.maxWallClockMs = appliedWallClockMs;
+    rootSteps.finalizationReserveMs = Math.min(
+      rootSteps.finalizationReserveMs,
+      Math.max(1_000, Math.floor(appliedWallClockMs * 0.15))
+    );
+    rootSteps.executionReserveMs = Math.min(
+      rootSteps.executionReserveMs,
+      Math.max(1_000, Math.floor(appliedWallClockMs * 0.4))
+    );
+    this.workspaceRuntimeConfig.tools.executionLoop.maxWallClockMs = Math.min(
+      this.workspaceRuntimeConfig.tools.executionLoop.maxWallClockMs,
+      Math.max(1_000, appliedWallClockMs - rootSteps.finalizationReserveMs)
+    );
+    this.emit({
+      type: 'runtime.wall_clock_limit.applied',
+      agentId: 'root',
+      data: {
+        requestedWallClockMs: limitMs,
+        configuredWallClockMs,
+        appliedWallClockMs,
+        executionReserveMs: rootSteps.executionReserveMs,
+        finalizationReserveMs: rootSteps.finalizationReserveMs,
+        toolLoopWallClockMs: this.workspaceRuntimeConfig.tools.executionLoop.maxWallClockMs,
+      },
+    });
   }
 
   getContext(): RuntimeContext {

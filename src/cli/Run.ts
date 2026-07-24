@@ -11,6 +11,7 @@ interface RunOptions {
   output?: string;
   json: boolean;
   budget?: number;
+  wallClockMs?: number;
 }
 
 function usage(): string {
@@ -24,6 +25,7 @@ Options:
   --workspace <path>     Workspace exposed to Roy (default: current directory).
   --session-id <id>      Stable session ID (default: generated).
   --budget <tokens>      Optional total token budget.
+  --wall-clock-ms <ms>   Bound this invocation to an external wall-clock budget.
   --output <path>        Atomically write the complete JSON run artifact.
   --json                 Print the complete JSON run artifact to stdout.
   -h, --help             Show this help.
@@ -69,6 +71,13 @@ function parseArgs(args: string[]): RunOptions | null {
       const value = Number(optionValue(args, index, arg));
       if (!Number.isFinite(value) || value <= 0) throw new Error('--budget must be a positive number');
       options.budget = value;
+      index += 1;
+    } else if (arg === '--wall-clock-ms') {
+      const value = Number(optionValue(args, index, arg));
+      if (!Number.isSafeInteger(value) || value < 1_000) {
+        throw new Error('--wall-clock-ms must be an integer of at least 1000');
+      }
+      options.wallClockMs = value;
       index += 1;
     } else if (arg === '--json') {
       options.json = true;
@@ -134,6 +143,7 @@ async function main(): Promise<void> {
       workspaceCwd: workspace,
       fsmEnabled: true,
       budget: options.budget,
+      wallClockLimitMs: options.wallClockMs,
     });
     const result = await runtime.handleUserTurn(task);
     const artifact = {
