@@ -224,6 +224,43 @@ describe('Runtime controlled subagent spawning', () => {
     await runtime.shutdown();
   });
 
+  it('rejects an implementation result when no grounded mutation-and-verification progress exists', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-open-execution-'));
+    await writeFile(path.join(workspaceCwd, 'app.ts'), 'export const value = "stub";\n');
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'open-execution-test',
+      llmProvider: new EchoLLM(),
+      workspaceCwd,
+    });
+    const coder = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'coder',
+      name: 'ClosureCoder-1',
+      description: 'Implements and verifies one workspace source change.',
+      task: 'Implement the workspace code in app.ts and verify the result.',
+      tools: ['fs.list', 'fs.read', 'fs.search', 'fs.replace', 'fs.write', 'shell.exec'],
+    });
+
+    await expect(runtime.runAgent(
+      coder.identity.id,
+      'Implement the workspace code in app.ts and verify the result.',
+      { disableRecursiveDelegation: true, archetype: 'coder' }
+    )).rejects.toThrow('no grounded mutation-and-verification progress');
+    expect(await readFile(path.join(workspaceCwd, 'app.ts'), 'utf8')).toBe(
+      'export const value = "stub";\n'
+    );
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'agent.execution.no_progress',
+      agentId: coder.identity.id,
+    }));
+    expect(runtime.getEvents()).not.toContainEqual(expect.objectContaining({
+      type: 'agent.run.completed',
+      agentId: coder.identity.id,
+    }));
+    await runtime.shutdown();
+  });
+
   it('keeps web tool enablement scoped to each runtime workspace', async () => {
     const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-web-scope-'));
     const bootstrap = new Runtime();

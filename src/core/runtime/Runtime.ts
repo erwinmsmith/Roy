@@ -2087,7 +2087,10 @@ export class Runtime {
         taskReference: 'Use the immutable assigned task above; this cache contains deltas only.',
         completedMembers: completed.slice(-8).map(([agentId, result]) => ({
           agentId,
-          taskSummary: team.memberTasks[agentId]?.replace(/\s+/g, ' ').slice(0, 1000),
+          taskSummary: this.compactTeamMemberTaskSummary(
+            team.memberTasks[agentId] ?? '',
+            team.task
+          ),
           result: result.slice(0, 4000),
         })),
         failedMembers: failed.slice(-8).map(([memberKey, error]) => ({
@@ -2104,6 +2107,18 @@ export class Runtime {
         '- Escalate a newly exposed gap in your result; runtime coordination handles follow-up structure only when explicitly assigned.',
       ].join('\n'),
     ].join('\n\n');
+  }
+
+  private compactTeamMemberTaskSummary(memberTask: string, teamTask?: string): string {
+    let summary = memberTask.trim();
+    if (teamTask?.trim()) {
+      summary = summary.replace(teamTask.trim(), '[immutable team task]');
+    }
+    const originalTaskIndex = summary.search(/\bOriginal task\s*:/i);
+    if (originalTaskIndex >= 0) {
+      summary = `${summary.slice(0, originalTaskIndex)}Original task: [immutable team task]`;
+    }
+    return summary.replace(/\s+/g, ' ').slice(0, 500);
   }
 
   private compactDelegatedTask(task: string, maxChars = 12_000): string {
@@ -2187,11 +2202,28 @@ export class Runtime {
       if (plans.length > 0) {
         await this.transitionTeamFsm(teamId, 'S_member_spawn', { count: plans.length });
         await this.transitionTeamFsm(teamId, 'S_member_execute', { count: plans.length });
+        let implementationPhaseFailed = false;
         executionOutcomes = await executeTeamItems(plans.map((plan, index) => {
           const key = `planned:${index + 1}:${plan.archetype}`;
+          const phase = this.longHorizonMemberPhase(plan);
           return {
             key,
             execute: async (): Promise<TeamWorkValue> => {
+              if (phase === 2 && implementationPhaseFailed) {
+                this.emit({
+                  type: 'team.member.dependency_blocked',
+                  agentId: teamId,
+                  sessionId: ctx.sessionId,
+                  correlationId,
+                  data: {
+                    teamId,
+                    memberKey: key,
+                    archetype: plan.archetype,
+                    reason: 'The implementation phase failed before producing mutation-and-verification closure.',
+                  },
+                });
+                throw new Error('dependent_verification_blocked_by_failed_implementation');
+              }
               this.teams.markMemberRunning(teamId, key);
               this.emit({
                 type: 'team.member.started',
@@ -2213,6 +2245,7 @@ export class Runtime {
                   execution,
                 };
               } catch (error) {
+                if (phase === 1) implementationPhaseFailed = true;
                 this.teams.recordMemberFailure(
                   teamId,
                   key,
@@ -6513,6 +6546,62 @@ export class Runtime {
           });
         },
       });
+      if (this.taskRequiresWorkspaceMutation(task)) {
+        let closure = this.analyzeWorkspaceExecutionClosure(grounding.toolCalls);
+        let continuation = 0;
+        while (!closure.closed) {
+          continuation += 1;
+          const next = await this.runGroundingCheck(
+            agentId,
+            this.buildAgentExecutionClosureTask(task, grounding, closure, continuation),
+            {
+              ...options,
+              intentTask: task,
+              priorToolCalls: grounding.toolCalls,
+            }
+          );
+          this.emit({
+            type: 'agent.execution.closure.attempted',
+            agentId,
+            sessionId: ctx.sessionId,
+            correlationId: options.correlationId,
+            nodeId: options.nodeId,
+            data: {
+              continuation,
+              toolCalls: next.toolCalls.length,
+              successfulToolCalls: next.toolCalls.filter(call => call.success).length,
+              previousClosure: closure,
+            },
+          });
+          if (!this.agentExecutionContinuationAdvanced(next)) {
+            this.emit({
+              type: 'agent.execution.no_progress',
+              agentId,
+              sessionId: ctx.sessionId,
+              correlationId: options.correlationId,
+              nodeId: options.nodeId,
+              data: {
+                continuation,
+                closure,
+                reason: 'The execution planner produced no new successful evidence, mutation, or verifier feedback.',
+              },
+            });
+            throw new Error(
+              'Workspace execution remained open: no grounded mutation-and-verification progress was produced'
+            );
+          }
+          grounding = this.combineGroundingRuns([grounding, next]);
+          closure = this.analyzeWorkspaceExecutionClosure(grounding.toolCalls);
+        }
+        this.emit({
+          type: 'agent.execution.closure.completed',
+          agentId,
+          sessionId: ctx.sessionId,
+          correlationId: options.correlationId,
+          nodeId: options.nodeId,
+          data: { continuations: continuation, ...closure },
+        });
+      }
       await this.transitionAgentFsm(agentId, 'S_reasoning', { task, correlationId: options.correlationId });
       this.emit({ type: 'agent.llm.called', agentId, data: { task } });
       const communicationContext = agent.getCommunicationContext();
@@ -10196,17 +10285,22 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     const intent = [
       plan.name,
       plan.role,
-      plan.task,
       plan.existenceReason,
     ].filter(Boolean).join(' ').toLowerCase();
-    const verifiesOnly = /\b(?:verify|verification|validate|validation|test|tester|review|reviewer|audit|acceptance|check)\b/.test(intent)
+    const leadingTaskIntent = plan.task.trim().slice(0, 500).toLowerCase();
+    const verifiesOnly = (
+      /\b(?:verifier|verification|validator|tester|reviewer|critic|acceptance)\b/.test(intent)
+      || /^(?:after\b[\s\S]{0,120}\bcompletes?\b[\s,;:-]*)?(?:run|perform|execute)?\s*(?:the\s+)?(?:verification|validation|tests?|review|acceptance|audit)\b/.test(leadingTaskIntent)
+    )
       && !/\b(?:implement|implementation|build|create|write|modify|edit|patch|repair|fix|migrate|executor|coder|engineer)\b/.test(intent);
     if (verifiesOnly) return 2;
     const canMutate = (plan.tools ?? []).some(tool =>
       tool === 'fs.write' || tool === 'fs.replace'
     );
     if (canMutate
-      || /\b(?:implement|implementation|build|create|write|modify|edit|patch|repair|fix|migrate|executor|coder|engineer)\b/.test(intent)) {
+      || /\b(?:implement|implementation|build|create|write|modify|edit|patch|repair|fix|migrate|executor|coder|engineer)\b/.test(
+        `${intent} ${leadingTaskIntent}`
+      )) {
       return 1;
     }
     return 0;
@@ -14750,6 +14844,46 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         '- Finish only when the original task is implemented and verification succeeds, or after a concrete blocking error is observed.',
       ].join('\n'),
     ].join('\n\n');
+  }
+
+  private buildAgentExecutionClosureTask(
+    originalTask: string,
+    priorExecution: GroundingRunResult,
+    closure: WorkspaceExecutionClosureStatus,
+    continuation: number
+  ): string {
+    const nextAction = !closure.mutationApplied
+      ? 'Use the authoritative evidence already collected and apply the implementation mutation now.'
+      : !closure.verificationAttemptedAfterMutation
+        ? 'Run the most relevant executable verification against the mutated workspace now.'
+        : 'Use the latest failed verification as causal feedback, inspect only its reported source location, repair it, and verify again.';
+    return [
+      '[runtime_agent_execution_closure_phase]',
+      `Original task:\n${this.compactDelegatedTask(originalTask)}`,
+      `Continuation ${continuation}; closure state: ${JSON.stringify(closure)}`,
+      nextAction,
+      [
+        'Execution contract:',
+        '- Reuse prior tool evidence as cached state; do not restart workspace discovery or repeat equivalent reads.',
+        '- A natural-language claim cannot satisfy this phase. The required state change must be observed through an authorized mutation tool.',
+        '- Preserve the real verification exit status and use any failure as repair feedback.',
+        '- Continue with one concrete highest-value tool action; do not finish while the closure state is open.',
+      ].join('\n'),
+      priorExecution.warnings.length > 0
+        ? `Latest warnings:\n${priorExecution.warnings.slice(-4).join('\n')}`
+        : '',
+    ].filter(Boolean).join('\n\n');
+  }
+
+  private agentExecutionContinuationAdvanced(run: GroundingRunResult): boolean {
+    return run.toolCalls.some(call =>
+      call.success
+      || (
+        call.toolName === 'shell.exec'
+        && isWorkspaceVerificationCall(call)
+        && Boolean(call.error)
+      )
+    );
   }
 
   private combineGroundingRuns(runs: GroundingRunResult[]): GroundingRunResult {

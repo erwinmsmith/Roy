@@ -624,6 +624,34 @@ describe('Root dynamic execution tree', () => {
     await runtime.shutdown();
   });
 
+  it('keeps a read-only custom evidence mapper before implementation instead of treating a generic check as verification', () => {
+    const runtime = new Runtime();
+    const classify = (runtime as unknown as {
+      longHorizonMemberPhase: (plan: {
+        archetype: 'custom';
+        name: string;
+        role: string;
+        task: string;
+        tools: string[];
+      }) => number;
+    }).longHorizonMemberPhase;
+
+    expect(classify.call(runtime, {
+      archetype: 'custom',
+      name: 'EvidenceMapper',
+      role: 'workspace evidence mapper',
+      task: 'Explore the workspace, read inputs and config files, and check for existing outputs.',
+      tools: ['fs.list', 'fs.read', 'fs.search'],
+    })).toBe(0);
+    expect(classify.call(runtime, {
+      archetype: 'custom',
+      name: 'AcceptanceVerifier',
+      role: 'independent acceptance verifier',
+      task: 'After the implementation completes, run validation and inspect every output.',
+      tools: ['fs.read', 'shell.exec'],
+    })).toBe(2);
+  });
+
   it('rejects premature finalize when a long-horizon mutation path is still unverified', () => {
     const runtime = new Runtime();
     const ensureRecovery = (runtime as unknown as {
