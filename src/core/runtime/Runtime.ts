@@ -14292,10 +14292,11 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     const combineWithDelegatedExecution = (): GroundingRunResult => this.combineGroundingRuns(
       delegatedExecution ? [delegatedExecution, ...attempts] : attempts
     );
-    const maxAttempts = Math.max(
+    const progressWindow = Math.max(
       1,
       this.workspaceRuntimeConfig?.delegation.rootSteps.maxExecutionClosureAttempts ?? 3
     );
+    let maxAttempts = progressWindow;
     const auditRequired = this.taskRequiresAcceptanceAudit(userTask);
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       const remainingMs = this.remainingRootExecutionTimeMs(correlationId);
@@ -14395,6 +14396,23 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       let combined = combineWithDelegatedExecution();
       if (this.hasSuccessfulWorkspaceMutation(current.toolCalls)) {
         combined.acceptanceAudit = undefined;
+        const extendedMaxAttempts = attempt + progressWindow;
+        if (extendedMaxAttempts > maxAttempts) {
+          const previousMaxAttempts = maxAttempts;
+          maxAttempts = extendedMaxAttempts;
+          this.emit({
+            type: 'root.execution.progress_horizon.extended',
+            agentId: 'root',
+            correlationId,
+            data: {
+              attempt,
+              previousMaxAttempts,
+              maxAttempts,
+              progressWindow,
+              reason: 'A new successful workspace mutation opened another bounded convergence window.',
+            },
+          });
+        }
       }
       let closure = this.analyzeWorkspaceExecutionClosure(
         combined.toolCalls,

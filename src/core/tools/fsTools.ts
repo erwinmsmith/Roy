@@ -43,6 +43,8 @@ export interface FsReplaceResult {
   path: string;
   replacements: number;
   bytes: number;
+  startLine?: number;
+  endLine?: number;
 }
 
 const DEFAULT_MAX_DEPTH = 2;
@@ -372,11 +374,13 @@ export class FsSearchTool implements Tool {
 
 export class FsReplaceTool implements Tool {
   readonly name = 'fs.replace';
-  readonly description = 'Replace exact text in one workspace file with occurrence checks, avoiding fragile shell quoting or full-file rewrites.';
+  readonly description = 'Replace exact text or an inclusive line range in one workspace file, avoiding fragile shell quoting or full-file rewrites.';
   readonly version = '0.1.0';
   readonly parameters = {
     path: { type: 'string' as const, required: true, description: 'Relative file path inside the workspace.' },
-    oldText: { type: 'string' as const, required: true, description: 'Exact existing text to replace.' },
+    oldText: { type: 'string' as const, required: false, description: 'Exact existing text to replace. Omit when using startLine/endLine.' },
+    startLine: { type: 'number' as const, required: false, description: 'One-based first line to replace when exact oldText is fragile.' },
+    endLine: { type: 'number' as const, required: false, description: 'One-based inclusive final line to replace.' },
     newText: { type: 'string' as const, required: true, description: 'Replacement text.' },
     replaceAll: { type: 'boolean' as const, required: false, description: 'Replace every occurrence. Defaults to false.' },
     expectedReplacements: { type: 'number' as const, required: false, description: 'Optional exact occurrence count required before writing.' },
@@ -389,11 +393,37 @@ export class FsReplaceTool implements Tool {
     if (typeof params.path !== 'string' || params.path.trim().length === 0) {
       errors.push('path must be a non-empty string');
     }
-    if (typeof params.oldText !== 'string' || params.oldText.length === 0) {
-      errors.push('oldText must be a non-empty string');
-    }
     if (typeof params.newText !== 'string') {
       errors.push('newText must be a string');
+    }
+    const hasOldText = typeof params.oldText === 'string' && params.oldText.length > 0;
+    const hasStartLine = params.startLine !== undefined;
+    const hasEndLine = params.endLine !== undefined;
+    if (!hasOldText && !hasStartLine && !hasEndLine) {
+      errors.push('provide either non-empty oldText or startLine/endLine');
+    }
+    if (hasOldText && (hasStartLine || hasEndLine)) {
+      errors.push('oldText and startLine/endLine are mutually exclusive');
+    }
+    if (hasStartLine !== hasEndLine) {
+      errors.push('startLine and endLine must be provided together');
+    }
+    if (hasStartLine && (
+      typeof params.startLine !== 'number'
+      || !Number.isInteger(params.startLine)
+      || params.startLine <= 0
+    )) {
+      errors.push('startLine must be a positive integer');
+    }
+    if (hasEndLine && (
+      typeof params.endLine !== 'number'
+      || !Number.isInteger(params.endLine)
+      || params.endLine <= 0
+    )) {
+      errors.push('endLine must be a positive integer');
+    }
+    if (hasStartLine && hasEndLine && Number(params.endLine) < Number(params.startLine)) {
+      errors.push('endLine must be greater than or equal to startLine');
     }
     if (params.replaceAll !== undefined && typeof params.replaceAll !== 'boolean') {
       errors.push('replaceAll must be a boolean when provided');
@@ -421,6 +451,43 @@ export class FsReplaceTool implements Tool {
       const fileStat = await stat(target);
       if (!fileStat.isFile()) return { success: false, error: 'path must point to a file' };
       const content = await readFile(target, 'utf8');
+      if (params.startLine !== undefined && params.endLine !== undefined) {
+        const startLine = Number(params.startLine);
+        const endLine = Number(params.endLine);
+        const lineStarts = [0];
+        for (let index = 0; index < content.length; index += 1) {
+          if (content[index] === '\n') lineStarts.push(index + 1);
+        }
+        const totalLines = content.length === 0 ? 0 : lineStarts.length;
+        if (startLine > totalLines || endLine > totalLines) {
+          return {
+            success: false,
+            error: `line range ${startLine}-${endLine} exceeds the file's ${totalLines} lines`,
+          };
+        }
+        const startOffset = lineStarts[startLine - 1]!;
+        const endOffset = endLine < lineStarts.length
+          ? lineStarts[endLine]!
+          : content.length;
+        const newline = content.includes('\r\n') ? '\r\n' : '\n';
+        let replacement = String(params.newText).replace(/\r?\n/g, newline);
+        const suffix = content.slice(endOffset);
+        if (suffix && replacement && !replacement.endsWith(newline)) {
+          replacement += newline;
+        }
+        const updated = content.slice(0, startOffset) + replacement + suffix;
+        await writeFile(target, updated, 'utf8');
+        return {
+          success: true,
+          result: {
+            path: path.relative(workspaceRoot, target),
+            replacements: 1,
+            bytes: Buffer.byteLength(updated, 'utf8'),
+            startLine,
+            endLine,
+          } satisfies FsReplaceResult,
+        };
+      }
       const oldText = String(params.oldText);
       const occurrences = countOccurrences(content, oldText);
       const expected = typeof params.expectedReplacements === 'number'

@@ -118,4 +118,35 @@ describe('workspace search and replace tools', () => {
     expect(replaced.result?.replacements).toBe(2);
     expect(await readFile(target, 'utf8')).toBe('new\nnew\n');
   });
+
+  it('replaces an inclusive line range when malformed text is unsafe to quote', async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), 'roy-fs-replace-lines-'));
+    const target = path.join(workspace, 'app.py');
+    await writeFile(
+      target,
+      "def normalize(value):\n    return value.replace('\n, '')\nprint('ready')\n",
+      'utf8'
+    );
+    const tool = new FsReplaceTool(workspace);
+
+    const replaced = await tool.execute({
+      path: 'app.py',
+      startLine: 2,
+      endLine: 3,
+      newText: "    return value.replace('\\\\n', '')\n",
+    });
+
+    expect(replaced).toMatchObject({
+      success: true,
+      result: {
+        path: 'app.py',
+        replacements: 1,
+        startLine: 2,
+        endLine: 3,
+      },
+    });
+    expect(await readFile(target, 'utf8')).toBe(
+      "def normalize(value):\n    return value.replace('\\\\n', '')\nprint('ready')\n"
+    );
+  });
 });

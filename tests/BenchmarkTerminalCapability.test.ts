@@ -961,6 +961,13 @@ describe('benchmark terminal capability', () => {
       }),
     }));
     expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'root.execution.progress_horizon.extended',
+      data: expect.objectContaining({
+        attempt: 1,
+        reason: expect.stringContaining('successful workspace mutation'),
+      }),
+    }));
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
       type: 'root.execution.attempt.completed',
       data: expect.objectContaining({
         attempt: 2,
