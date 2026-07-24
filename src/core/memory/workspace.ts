@@ -995,6 +995,7 @@ export class WorkspaceMemoryManager {
           score: task && step.task === task ? 100 : overlap * 10,
         };
       })
+      .filter(item => !task || item.score > 0)
       .sort((left, right) => right.score - left.score || right.step.updatedAt - left.step.updatedAt)
       .slice(0, boundedLimit)
       .map(item => item.step)

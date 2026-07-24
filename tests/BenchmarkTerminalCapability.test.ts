@@ -572,6 +572,124 @@ describe('benchmark terminal capability', () => {
     await runtime.shutdown();
   });
 
+  it('resumes an open persisted execution path without rebuilding the initial team', async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), 'roy-terminal-resume-'));
+    await mkdir(path.join(workspace, '.roy'), { recursive: true });
+    await writeFile(path.join(workspace, '.roy', 'config.json'), JSON.stringify({
+      tools: {
+        approval: {
+          readOnly: 'auto',
+          write: 'auto',
+          execute: 'auto',
+          overrides: {},
+        },
+        shell: {
+          mode: 'unrestricted',
+          shell: '/bin/sh',
+          defaultTimeoutMs: 10_000,
+          maxTimeoutMs: 60_000,
+          defaultMaxOutputBytes: 40_000,
+          maxCallsPerAgent: 10,
+        },
+        executionLoop: {
+          enabled: true,
+          maxRounds: 4,
+          maxCallsPerRun: 6,
+          maxConsecutiveFailures: 2,
+          maxWallClockMs: 30_000,
+          maxFetchesAfterSearch: 2,
+          llmReplanning: true,
+        },
+      },
+    }, null, 2));
+    const runtime = new Runtime();
+    const llm = new TerminalTaskLLM();
+    const task = [
+      'This is a long-horizon terminal benchmark task.',
+      'Use the terminal to create artifact.txt, verify it, and continue until the task is complete.',
+      '<official_verifier_feedback>Previous verifier failure: artifact.txt is missing.</official_verifier_feedback>',
+    ].join('\n');
+    await runtime.initialize({
+      sessionId: 'terminal-resume-test',
+      workspaceCwd: workspace,
+      llmProvider: llm,
+    });
+    const now = Date.now();
+    await writeFile(
+      path.join(workspace, '.roy', 'cache', 'execution-knowledge.json'),
+      JSON.stringify({
+        version: 1,
+        updatedAt: now,
+        steps: [{
+          id: 'prior-step.cache',
+          correlationId: 'prior-correlation',
+          stepId: 'prior-step',
+          index: 1,
+          task,
+          taskFingerprint: 'prior-task',
+          pathId: 'prior-path',
+          dependsOn: [],
+          action: 'delegate',
+          status: 'failed',
+          actorIds: ['prior-agent'],
+          teamIds: ['prior-team'],
+          feedbackIds: ['prior-feedback'],
+          resultSummary: 'The prior team did not create artifact.txt.',
+          createdAt: now - 1000,
+          updatedAt: now,
+        }],
+        paths: [{
+          id: 'prior-path',
+          correlationId: 'prior-correlation',
+          stepId: 'prior-step',
+          parentPathIds: [],
+          taskFingerprint: 'prior-task',
+          status: 'partial',
+          actorIds: ['prior-agent'],
+          teamIds: ['prior-team'],
+          observedPaths: [],
+          invalidPaths: ['artifact.txt'],
+          successfulTools: ['fs.list'],
+          failedTools: ['fs.read'],
+          mutationObserved: false,
+          verificationObserved: false,
+          feedbackIds: ['prior-feedback'],
+          summary: 'artifact.txt is missing',
+          createdAt: now - 1000,
+          updatedAt: now,
+        }],
+        actors: [],
+        feedback: [{
+          id: 'prior-feedback',
+          kind: 'external_feedback',
+          correlationId: 'prior-correlation',
+          stepId: 'prior-step',
+          pathId: 'prior-path',
+          path: 'artifact.txt',
+          summary: 'Official verifier reports artifact.txt is missing.',
+          actionable: true,
+          createdAt: now,
+        }],
+      }, null, 2)
+    );
+
+    const result = await runtime.handleUserTurn(task);
+
+    expect(llm.rootDecisionPrompts).toHaveLength(0);
+    expect(await readFile(path.join(workspace, 'artifact.txt'), 'utf8')).toBe('roy-terminal-ready');
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'root.task_loop.resumed',
+      data: expect.objectContaining({
+        sourceCorrelationId: 'prior-correlation',
+        anchorPathId: 'prior-path',
+      }),
+    }));
+    expect(result.executionTree.steps[0].cache?.path.parentPathIds).toContain('prior-path');
+    expect(result.decision).toMatchObject({ action: 'solve_directly' });
+
+    await runtime.shutdown();
+  });
+
   it('turns delegated analysis into a root workspace mutation and verification', async () => {
     const workspace = await mkdtemp(path.join(tmpdir(), 'roy-delegated-terminal-task-'));
     await mkdir(path.join(workspace, '.roy'), { recursive: true });

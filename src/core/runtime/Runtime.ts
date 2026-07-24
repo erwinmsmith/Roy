@@ -504,6 +504,14 @@ interface WorkspaceExecutionClosureStatus {
   failedVerificationCallsAfterMutation: number;
 }
 
+interface ExecutionResumeState {
+  sourceCorrelationId: string;
+  anchorPathId: string;
+  knowledge: ExecutionKnowledgeCacheState;
+  actionableFeedback: number;
+  openPaths: number;
+}
+
 export interface SpawnCommandPayload {
   archetype: SubAgentArchetype;
   task: string;
@@ -750,6 +758,7 @@ export class Runtime {
     observedAt: number;
   }>>();
   private readonly changedPathsByCorrelation = new Map<string, Set<string>>();
+  private readonly resumedExecutionByCorrelation = new Map<string, ExecutionResumeState>();
   private runtimeToolOverrides = new Map<string, Tool>();
   private readonly teams = new TeamRegistry();
   private teamMemberPlans = new Map<string, TeamMemberSpec[]>();
@@ -4221,6 +4230,7 @@ export class Runtime {
     } finally {
       this.failedPathObservations.delete(correlationId);
       this.changedPathsByCorrelation.delete(correlationId);
+      this.resumedExecutionByCorrelation.delete(correlationId);
     }
   }
 
@@ -4274,11 +4284,42 @@ export class Runtime {
 
     await this.transitionRootTurnState('S_input_received', { correlationId });
     await this.transitionRootTurnState('S_assess_task', { correlationId });
-    let decision = await this.decideDelegation(userInput, correlationId);
     const requiresLongHorizon = rootStepConfig?.enabled !== false && this.requiresLongHorizonLoop(userInput);
+    const cachedExecution = requiresLongHorizon && requiresWorkspaceMutation
+      ? await ctx.memory.readExecutionKnowledge(
+        userInput,
+        rootStepConfig?.maxFeedbackItemsInPrompt ?? 24
+      )
+      : undefined;
+    const resumeState = cachedExecution
+      ? this.findExecutionResumeState(userInput, cachedExecution)
+      : undefined;
+    if (resumeState) {
+      this.resumedExecutionByCorrelation.set(correlationId, resumeState);
+      this.emit({
+        type: 'root.task_loop.resumed',
+        agentId: 'root',
+        correlationId,
+        data: {
+          sourceCorrelationId: resumeState.sourceCorrelationId,
+          anchorPathId: resumeState.anchorPathId,
+          steps: resumeState.knowledge.steps.length,
+          paths: resumeState.knowledge.paths.length,
+          openPaths: resumeState.openPaths,
+          actionableFeedback: resumeState.actionableFeedback,
+        },
+      });
+    }
+    let decision: DelegationDecision = resumeState
+      ? {
+        action: 'solve_directly',
+        reason: 'Resume the persisted execution ledger and close its unresolved workspace paths without rebuilding the initial team.',
+      }
+      : await this.decideDelegation(userInput, correlationId);
     let requiredLongHorizonDecision: DelegationDecision | undefined;
     if (decision.action === 'solve_directly'
-      && requiresLongHorizon) {
+      && requiresLongHorizon
+      && !resumeState) {
       decision = this.buildLongHorizonTeamDecision(userInput, requiresWorkspaceMutation);
       requiredLongHorizonDecision = decision;
       this.emit({
@@ -4291,16 +4332,18 @@ export class Runtime {
       decision = this.ensureLongHorizonTeamDecision(decision, userInput, requiresWorkspaceMutation, correlationId);
       requiredLongHorizonDecision = decision;
     }
-    decision = await this.selectDelegationCandidate(
-      'root',
-      userInput,
-      decision,
-      correlationId,
-      'root',
-      requiresLongHorizon || (decision.action === 'spawn_subagents'
-        && decision.coordination === 'team'
-        && Boolean(decision.team))
-    );
+    if (!resumeState) {
+      decision = await this.selectDelegationCandidate(
+        'root',
+        userInput,
+        decision,
+        correlationId,
+        'root',
+        requiresLongHorizon || (decision.action === 'spawn_subagents'
+          && decision.coordination === 'team'
+          && Boolean(decision.team))
+      );
+    }
     if (requiresLongHorizon && decision.action === 'spawn_subagents') {
       decision = this.ensureLongHorizonTeamDecision(decision, userInput, requiresWorkspaceMutation, correlationId);
     }
@@ -6311,9 +6354,30 @@ export class Runtime {
 
     try {
       await this.transitionAgentFsm(agentId, 'S_context_loading', { task, correlationId: options.correlationId });
+      const delegationAssessment = this.shouldAssessAgentDelegation(agent.getInfo(), task);
       const recursiveDelegation = options.disableRecursiveDelegation
         ? { action: 'solve_directly', reason: 'Recursive delegation disabled for this run.' } satisfies DelegationDecision
-        : await this.decideAgentDelegation(agent.getInfo(), task, options.correlationId ?? this.createCorrelationId());
+        : !delegationAssessment.assess
+          ? {
+            action: 'solve_directly',
+            reason: delegationAssessment.reason,
+          } satisfies DelegationDecision
+          : await this.decideAgentDelegation(
+            agent.getInfo(),
+            task,
+            options.correlationId ?? this.createCorrelationId()
+          );
+      if (!options.disableRecursiveDelegation && !delegationAssessment.assess) {
+        this.emit({
+          type: 'agent.delegation.assessment.skipped',
+          agentId,
+          correlationId: options.correlationId,
+          data: {
+            reason: delegationAssessment.reason,
+            teamId: agent.getIdentity().teamId,
+          },
+        });
+      }
       this.emit({
         type: 'delegation.decision',
         agentId,
@@ -8098,6 +8162,12 @@ export class Runtime {
       const dependencyStep = tree.steps.find(item => item.id === dependency);
       return dependencyStep?.cache?.path.id ?? `${dependency}.path`;
     });
+    const resumeState = this.resumedExecutionByCorrelation.get(tree.correlationId);
+    if (step.index === 1
+      && resumeState
+      && !parentPathIds.includes(resumeState.anchorPathId)) {
+      parentPathIds.push(resumeState.anchorPathId);
+    }
     const hasFailures = failedTools.size > 0 || feedback.some(item => item.kind === 'actor_failure');
     const hasSuccess = successfulTools.size > 0 || input.actorIds.length > 0 || input.teamIds.length > 0;
     const pathStatus = input.stepStatus === 'failed'
@@ -8170,6 +8240,154 @@ export class Runtime {
       .digest('hex');
   }
 
+  private executionTaskTerms(task: string): Set<string> {
+    const stopTerms = new Set([
+      'about', 'after', 'again', 'agent', 'benchmark', 'complete', 'continue',
+      'directly', 'filesystem', 'horizon', 'implement', 'latest', 'possible',
+      'round', 'runtime', 'should', 'state', 'still', 'system', 'terminal',
+      'these', 'until', 'using', 'verifier', 'where', 'workspace',
+    ]);
+    return new Set(
+      (task.toLowerCase().match(/[\p{L}\p{N}_./-]{4,}/gu) ?? [])
+        .map(term => term.replace(/^[-./]+|[-./]+$/g, ''))
+        .filter(term => term.length >= 4 && !stopTerms.has(term))
+    );
+  }
+
+  private executionTaskSimilarity(left: string, right: string): number {
+    if (this.executionTaskFingerprint(left) === this.executionTaskFingerprint(right)) return 1;
+    const leftTerms = this.executionTaskTerms(left);
+    const rightTerms = this.executionTaskTerms(right);
+    const denominator = Math.min(leftTerms.size, rightTerms.size);
+    if (denominator === 0) return 0;
+    let overlap = 0;
+    for (const term of leftTerms) {
+      if (rightTerms.has(term)) overlap += 1;
+    }
+    return overlap / denominator;
+  }
+
+  private findExecutionResumeState(
+    task: string,
+    knowledge: ExecutionKnowledgeCacheState
+  ): ExecutionResumeState | undefined {
+    const relevantSteps = knowledge.steps
+      .map(step => ({
+        step,
+        similarity: this.executionTaskSimilarity(task, step.task),
+      }))
+      .filter(item => item.similarity >= 0.3);
+    if (relevantSteps.length === 0) return undefined;
+
+    const grouped = new Map<string, typeof relevantSteps>();
+    for (const item of relevantSteps) {
+      const values = grouped.get(item.step.correlationId) ?? [];
+      values.push(item);
+      grouped.set(item.step.correlationId, values);
+    }
+    const selected = [...grouped.entries()]
+      .map(([correlationId, items]) => ({
+        correlationId,
+        items,
+        similarity: Math.max(...items.map(item => item.similarity)),
+        updatedAt: Math.max(...items.map(item => item.step.updatedAt)),
+      }))
+      .sort((left, right) =>
+        right.similarity - left.similarity || right.updatedAt - left.updatedAt
+      )[0];
+    if (!selected) return undefined;
+
+    const stepIds = new Set(selected.items.map(item => item.step.stepId));
+    const selectedKnowledge: ExecutionKnowledgeCacheState = {
+      version: 1,
+      updatedAt: knowledge.updatedAt,
+      steps: selected.items
+        .map(item => item.step)
+        .sort((left, right) => left.updatedAt - right.updatedAt),
+      paths: knowledge.paths.filter(path => stepIds.has(path.stepId)),
+      actors: knowledge.actors.filter(actor => stepIds.has(actor.stepId)),
+      feedback: knowledge.feedback.filter(item => stepIds.has(item.stepId)),
+    };
+    const openPaths = selectedKnowledge.paths.filter(path =>
+      path.status !== 'completed'
+      || (path.mutationObserved && !path.verificationObserved)
+    );
+    const actionableFeedback = selectedKnowledge.feedback.filter(item => item.actionable);
+    const externalContinuation = this.containsExternalExecutionFeedback(task);
+    if (openPaths.length === 0
+      && actionableFeedback.length === 0
+      && !externalContinuation) {
+      return undefined;
+    }
+    const anchor = [...openPaths, ...selectedKnowledge.paths]
+      .sort((left, right) => right.updatedAt - left.updatedAt)[0];
+    if (!anchor) return undefined;
+    return {
+      sourceCorrelationId: selected.correlationId,
+      anchorPathId: anchor.id,
+      knowledge: selectedKnowledge,
+      actionableFeedback: actionableFeedback.length,
+      openPaths: openPaths.length,
+    };
+  }
+
+  private compactExecutionResumeBrief(
+    knowledge: ExecutionKnowledgeCacheState
+  ): Record<string, unknown> {
+    const feedback = [...knowledge.feedback]
+      .filter(item => item.actionable
+        || item.kind === 'workspace_mutation'
+        || item.kind === 'workspace_verification')
+      .sort((left, right) =>
+        Number(right.actionable) - Number(left.actionable)
+        || right.createdAt - left.createdAt
+      )
+      .slice(0, 12);
+    const feedbackIds = new Set(feedback.map(item => item.id));
+    return {
+      updatedAt: knowledge.updatedAt,
+      steps: knowledge.steps.slice(-6).map(step => ({
+        id: step.stepId,
+        index: step.index,
+        action: step.action,
+        status: step.status,
+        pathId: step.pathId,
+        resultSummary: step.resultSummary?.slice(0, 1200),
+        stateFingerprint: step.stateFingerprint,
+      })),
+      paths: knowledge.paths.slice(-8).map(path => ({
+        id: path.id,
+        parentPathIds: path.parentPathIds,
+        status: path.status,
+        observedPaths: path.observedPaths.slice(0, 40),
+        invalidPaths: path.invalidPaths.slice(0, 20),
+        successfulTools: path.successfulTools,
+        failedTools: path.failedTools,
+        mutationObserved: path.mutationObserved,
+        verificationObserved: path.verificationObserved,
+        feedbackIds: path.feedbackIds.filter(id => feedbackIds.has(id)),
+      })),
+      feedback: feedback.map(item => ({
+        kind: item.kind,
+        toolName: item.toolName,
+        path: item.path,
+        actionable: item.actionable,
+        summary: item.summary.slice(0, 1200),
+        pathId: item.pathId,
+      })),
+    };
+  }
+
+  private formatExecutionResumeBrief(knowledge: ExecutionKnowledgeCacheState): string {
+    if (knowledge.steps.length === 0) {
+      return JSON.stringify({
+        steps: [],
+        attention: 'No prior execution ledger is available.',
+      });
+    }
+    return JSON.stringify(this.compactExecutionResumeBrief(knowledge), null, 2);
+  }
+
   private normalizeCachedPath(value: string): string {
     let normalized = value.trim().replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/+$/, '');
     const workspaceRoot = this.workspaceRoot.replaceAll('\\', '/').replace(/\/+$/, '');
@@ -8179,7 +8397,7 @@ export class Runtime {
   }
 
   private containsExternalExecutionFeedback(value: string): boolean {
-    return /(?:<feedback>|(?:verifier|grader|reviewer|test)\s+(?:feedback|failure|reported)|previous\s+(?:attempt|round)[\s\S]{0,120}(?:failed|failure|error)|(?:验证器|评分器|评审|测试)[\s\S]{0,40}(?:反馈|失败|报错)|上一轮[\s\S]{0,100}(?:失败|报错|反馈))/i.test(value);
+    return /(?:<feedback>|<official_verifier_feedback>|(?:verifier|grader|reviewer|test)\s+(?:feedback|failure|reported)|previous\s+(?:attempt|round)[\s\S]{0,120}(?:failed|failure|error)|(?:验证器|评分器|评审|测试)[\s\S]{0,40}(?:反馈|失败|报错)|上一轮[\s\S]{0,100}(?:失败|报错|反馈))/i.test(value);
   }
 
   private async persistRootExecutionTree(correlationId: string): Promise<void> {
@@ -8434,9 +8652,6 @@ export class Runtime {
       archetype: item.node.identity.archetype,
       task: item.subagentResult.agent.lastTask,
       grounded: item.subagentResult.grounded,
-      evidence: item.subagentResult.evidence,
-      warnings: item.subagentResult.warnings,
-      result: item.subagentResult.result.slice(0, 3000),
     }));
     const executionKnowledge = await ctx.memory.readExecutionKnowledge(
       userTask,
@@ -8456,6 +8671,22 @@ export class Runtime {
         },
       });
     }
+    const latestResults = teams.length > 0
+      ? teams.slice(-2).map(item => ({
+        kind: 'team',
+        id: item.team.identity.id,
+        name: item.team.identity.name,
+        result: item.result.slice(-2400),
+      }))
+      : subagents.slice(-3).map(item => ({
+        kind: 'agent',
+        id: item.agent.identity.id,
+        name: item.agent.identity.name,
+        grounded: item.subagentResult.grounded,
+        warnings: item.subagentResult.warnings.slice(-4),
+        result: item.subagentResult.result.slice(-1800),
+      }));
+    const budget = this.getBudgetState();
     try {
       const raw = await this.completeJSONAsAgent<RootContinuationDecision>(ctx.agent, [
         {
@@ -8475,11 +8706,19 @@ Do not repeat an existing agent task, cached failed path, or equivalent failed t
           content: [
             `<original_task>${userTask}</original_task>`,
             `<acceptance_checklist>${this.buildTaskAcceptanceChecklist(userTask)}</acceptance_checklist>`,
-            `<completed_steps>${JSON.stringify(steps.map(step => ({ id: step.id, decision: step.decision, resultSummary: step.resultSummary })), null, 2)}</completed_steps>`,
-            `<execution_knowledge>${this.formatExecutionKnowledge(executionKnowledge)}</execution_knowledge>`,
-            `<agent_results>${JSON.stringify(completedTasks, null, 2)}</agent_results>`,
-            `<team_results>${JSON.stringify(teams.map(item => ({ id: item.team.identity.id, result: item.result.slice(0, 3000) })), null, 2)}</team_results>`,
-            `<budget>${JSON.stringify(this.getBudgetState(), null, 2)}</budget>`,
+            `<completed_steps>${JSON.stringify(steps.slice(-4).map(step => ({
+              id: step.id,
+              decision: step.decision,
+              resultSummary: step.resultSummary?.slice(-1200),
+            })), null, 2)}</completed_steps>`,
+            `<execution_knowledge>${this.formatExecutionResumeBrief(executionKnowledge)}</execution_knowledge>`,
+            `<latest_results>${JSON.stringify(latestResults, null, 2)}</latest_results>`,
+            `<budget>${JSON.stringify({
+              mode: budget.mode,
+              limitTokens: budget.limitTokens,
+              usedTokens: budget.usedTokens,
+              remainingTokens: budget.remainingTokens,
+            }, null, 2)}</budget>`,
           ].join('\n\n'),
         },
       ], { temperature: 0.1, maxTokens: 1400 }, 'root.dynamic_step_decision', correlationId);
@@ -9399,6 +9638,47 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     return this.requiresStagedDelegation(task)
       || /\b(long[- ]?(?:running|horizon|term)|multi[- ]?(?:step|stage|phase)|iterate|iteration|checkpoint|until complete|continue until|progressively|recursive)\b/.test(normalized)
       || /(长程|长期任务|多步骤|多阶段|逐步执行|持续执行|循环执行|直到完成|递归派生|检查点)/.test(normalized);
+  }
+
+  private shouldAssessAgentDelegation(
+    agent: AgentInfo,
+    task: string
+  ): { assess: boolean; reason: string } {
+    const explicitRecursiveResponsibility =
+      /\b(?:delegate|delegation|spawn|subagent|sub-agent|subteam|sub-team|direct child|form a team|create a team)\b/i.test(task)
+      || /(?:派生|委派|子代理|子团队|组建团队)/.test(task);
+    const teamId = agent.identity.teamId;
+    if (teamId) {
+      const team = this.teams.get(teamId);
+      if (team?.leadAgentId !== agent.identity.id) {
+        return {
+          assess: false,
+          reason: 'This bounded team-member task should execute directly; recursive structure is coordinated by the team lead.',
+        };
+      }
+      if (explicitRecursiveResponsibility
+        || this.requiresLongHorizonLoop(task)
+        || this.requiresStagedDelegation(task)) {
+        return {
+          assess: true,
+          reason: 'The team lead owns an explicit or staged recursive coordination responsibility.',
+        };
+      }
+      return {
+        assess: false,
+        reason: 'The team lead has a bounded executable task and no concrete recursive coordination gap.',
+      };
+    }
+    if (explicitRecursiveResponsibility || this.requiresStagedDelegation(task)) {
+      return {
+        assess: true,
+        reason: 'The standalone agent task explicitly requires delegation or depends on a later staged result.',
+      };
+    }
+    return {
+      assess: false,
+      reason: 'The assigned agent task is a bounded leaf responsibility with no explicit descendant gap.',
+    };
   }
 
   private buildTaskAcceptanceChecklist(task: string): string {
@@ -12485,10 +12765,17 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     multiPartyTraces?: MultiPartyTrace[];
     multiPartyTraceContext?: string;
   }): string {
+    const templateUses = (slot: string): boolean =>
+      input.bundle.prompt.includes(`{{${slot}}}`);
     const slots: Record<string, string> = {
       public_context: input.publicContext ?? '',
       agent_private_memory: input.bundle.memory.trim(),
-      agent_identity: input.bundle.identity.trim() || `You are ${input.name}, a ${input.role} agent in the Roy runtime.`,
+      agent_identity: [
+        `You are ${input.name}, a ${input.role} agent in the Roy runtime.`,
+        input.bundle.identity.trim()
+          ? `Reusable archetype identity:\n${input.bundle.identity.trim()}`
+          : '',
+      ].filter(Boolean).join('\n\n'),
       tom_profile: input.tomProfile ? JSON.stringify(input.tomProfile, null, 2) : '',
       communication_context: input.communicationContext
         ?? `Protocol: ${input.communicationProtocol ?? this.communicationManager?.getDefaultProtocolId() ?? 'tom'}. Runtime messages are rendered through the selected communication protocol.`,
@@ -12501,17 +12788,22 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       task: input.task || 'No task assigned yet.',
     };
     const renderedPromptFile = this.renderPromptSlots(input.bundle.prompt, slots);
+    const identityFallback = `You are ${input.name}, a ${input.role} agent in the Roy runtime.`;
     return [
       input.systemPrompt,
       input.description,
-      `You are ${input.name}, a ${input.role} agent in the Roy runtime.`,
-      `Your parent agent is ${input.parentName}.`,
       'The model provider is only the inference backend; never identify yourself as the provider.',
-      input.task ? `Current task: ${input.task}` : undefined,
+      templateUses('agent_identity') ? undefined : identityFallback,
+      templateUses('parent_context') ? undefined : `Your parent agent is ${input.parentName}.`,
+      input.task && !templateUses('task') ? `Current task: ${input.task}` : undefined,
       `<agent_prompt_file path=".roy/agents/${input.bundle.key}/prompt.md">\n${renderedPromptFile.trim()}\n</agent_prompt_file>`,
-      `<public_context>\n${slots.public_context}\n</public_context>`,
       `<agent_context_file path=".roy/agents/${input.bundle.key}/context.md">\n${input.bundle.context.trim()}\n</agent_context_file>`,
-      `<agent_memory_file path=".roy/agents/${input.bundle.key}/memory.md">\n${input.bundle.memory.trim()}\n</agent_memory_file>`,
+      !templateUses('public_context')
+        ? `<public_context>\n${slots.public_context}\n</public_context>`
+        : undefined,
+      !templateUses('agent_private_memory')
+        ? `<agent_memory_file path=".roy/agents/${input.bundle.key}/memory.md">\n${input.bundle.memory.trim()}\n</agent_memory_file>`
+        : undefined,
     ].filter(Boolean).join('\n\n');
   }
 
@@ -13506,14 +13798,13 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     subagents: RootMediatedSpawnResult[],
     teamResults: TeamRunResult[]
   ): string {
-    const delegatedFindings = [
-      ...teamResults.slice(-4).map(result =>
-        `Team ${result.team.identity.name}:\n${result.result.slice(-5000)}`
-      ),
-      ...subagents.slice(-8).map(result =>
-        `${result.agent.identity.name} (${result.node.identity.archetype}):\n${result.subagentResult.result.slice(-4000)}`
-      ),
-    ].join('\n\n');
+    const delegatedFindings = teamResults.length > 0
+      ? teamResults.slice(-3).map(result =>
+        `Team ${result.team.identity.name}:\n${result.result.slice(-3500)}`
+      ).join('\n\n')
+      : subagents.slice(-4).map(result =>
+        `${result.agent.identity.name} (${result.node.identity.archetype}):\n${result.subagentResult.result.slice(-2500)}`
+      ).join('\n\n');
     return [
       '[runtime_execution_phase]',
       `Original task:\n${userTask}`,
@@ -13879,13 +14170,14 @@ For web-grounded work, use only facts present in the subagent report or runtime 
           ].join('\n'),
         ].join('\n\n');
       }
-      const executionKnowledge = await this.getContext().memory.readExecutionKnowledge(
-        userTask,
-        this.workspaceRuntimeConfig?.delegation.rootSteps.maxFeedbackItemsInPrompt ?? 24
-      );
+      const executionKnowledge = this.resumedExecutionByCorrelation.get(correlationId)?.knowledge
+        ?? await this.getContext().memory.readExecutionKnowledge(
+          userTask,
+          this.workspaceRuntimeConfig?.delegation.rootSteps.maxFeedbackItemsInPrompt ?? 24
+        );
       const task = [
         baseTask,
-        `<execution_knowledge>\n${this.formatExecutionKnowledge(executionKnowledge)}\n</execution_knowledge>`,
+        `<execution_resume_ledger>\n${this.formatExecutionResumeBrief(executionKnowledge)}\n</execution_resume_ledger>`,
         [
           'Execution attention:',
           '- Use successful cached paths as the authoritative starting point.',

@@ -513,6 +513,9 @@ describe('Runtime controlled subagent spawning', () => {
     expect(rendered.prompt).toContain('Singer-1');
     expect(rendered.prompt).toContain('performer');
     expect(rendered.prompt).toContain('Introduce yourself briefly.');
+    expect(rendered.prompt.match(/Introduce yourself briefly\./g)).toHaveLength(1);
+    expect(rendered.prompt.match(/<execution_knowledge>/g)).toHaveLength(1);
+    expect(rendered.prompt.match(/<agent_memory_file/g)).toBeNull();
 
     await runtime.shutdown();
   });
@@ -865,7 +868,7 @@ describe('Runtime controlled subagent spawning', () => {
     });
     const result = await runtime.runAgent(
       researcher.identity.id,
-      'Review project risks and verify test coverage gaps.',
+      'Delegate project risk review and test-coverage verification to direct children, then aggregate them.',
       { correlationId: 'del_multi_child_test', archetype: 'researcher' }
     );
 
