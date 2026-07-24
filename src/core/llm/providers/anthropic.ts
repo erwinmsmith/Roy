@@ -107,6 +107,7 @@ export class AnthropicProvider implements LLMProvider {
       content: '',
       done: true,
       usage: tokenUsageRegistry.normalize({ provider: this.name, model, usage: finalMessage.usage, messages }),
+      finishReason: finalMessage.stop_reason ?? undefined,
     };
   }
 

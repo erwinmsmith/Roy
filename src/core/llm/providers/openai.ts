@@ -94,11 +94,14 @@ export class OpenAIProvider implements LLMProvider {
     });
 
     let rawUsage: unknown;
+    let finishReason: string | undefined;
 
     for await (const chunk of stream) {
       const content = chunk.choices[0]?.delta?.content || '';
+      const chunkFinishReason = chunk.choices[0]?.finish_reason;
 
       if (chunk.usage) rawUsage = chunk.usage;
+      if (chunkFinishReason) finishReason = chunkFinishReason;
 
       if (content) {
         yield {
@@ -112,6 +115,7 @@ export class OpenAIProvider implements LLMProvider {
       content: '',
       done: true,
       usage: tokenUsageRegistry.normalize({ provider: this.name, model, usage: rawUsage, messages }),
+      finishReason,
     };
   }
 

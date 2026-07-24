@@ -64,6 +64,17 @@ The root task loop reserves a final synthesis step and applies four independent 
 
 Every delegated plan also carries an explicit continuation contract. `reassess` allows Roy to grow another dependent step from unresolved evidence; `finalize_after_round` skips root reassessment and moves directly to final synthesis. Formal teams independently declare `memberDelegationPolicy: allow|deny`, so a minimal one-round team can prohibit recursive member expansion without removing recursive delegation from other agents. A complete model-generated team plan is preserved as proposed: ToM enriches and scores its profiles but does not append fixed archetype members.
 
+Explicit user-facing output contracts are checked before the root response is
+released. When a task requires a machine-readable marker such as
+`FINAL_RESULT:`, Roy verifies that the marker begins a line and has a
+non-placeholder value. A missing marker triggers one bounded structured repair
+that preserves the candidate answer instead of re-solving the task. The repair
+is represented as its own dependent execution step, cache snapshot, and trace
+events (`root.output_contract.repair.*`). Streaming providers also propagate
+their finish reason; `length` and `max_tokens` stops emit
+`llm.stream.truncated`, so incomplete output is observable even when no explicit
+marker contract was requested.
+
 Workspace limits prevent an unbounded reasoning loop:
 
 ```json

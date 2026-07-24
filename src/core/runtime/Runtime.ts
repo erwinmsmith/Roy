@@ -4502,6 +4502,11 @@ export class Runtime {
       });
     }
 
+    finalResponse = await this.enforceExplicitRootOutputContract(
+      finalResponse,
+      userInput,
+      correlationId
+    );
     await this.transitionRootTurnState('S_respond', { correlationId });
     const finalMessage = await this.enqueueMessage({
       kind: 'root.final_response',
@@ -9239,12 +9244,154 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     return '[runtime_root_completion_fallback]\nRoy could not produce visible output for this turn. No stale response was reused.';
   }
 
+  private inferExplicitRootOutputContract(task: string): {
+    markers: string[];
+    instruction: string;
+  } | undefined {
+    const outputCue = /\b(?:end|finish|return|respond|output|provide|emit|containing)\b/i;
+    const instructions: string[] = [];
+    const markers = new Set<string>();
+    for (const line of task.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!outputCue.test(trimmed)) continue;
+      const lineMarkers = [...trimmed.matchAll(/\b([A-Z][A-Z0-9_]{2,})\s*:/g)]
+        .map(match => match[1]);
+      if (lineMarkers.length === 0) continue;
+      lineMarkers.forEach(marker => markers.add(marker));
+      instructions.push(trimmed.slice(0, 1000));
+    }
+    if (markers.size === 0) return undefined;
+    return {
+      markers: [...markers],
+      instruction: instructions.join('\n'),
+    };
+  }
+
+  private responseSatisfiesExplicitOutputContract(
+    response: string,
+    contract: { markers: string[] }
+  ): boolean {
+    return contract.markers.every(marker => {
+      const escaped = marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const match = new RegExp(`(?:^|\\n)\\s*${escaped}\\s*:\\s*`, 'gi');
+      const matches = [...response.matchAll(match)];
+      const last = matches.at(-1);
+      if (!last || last.index === undefined) return false;
+      const value = response.slice(last.index + last[0].length).trim();
+      return Boolean(value) && !/^<[^>]+>$/.test(value.split(/\r?\n/, 1)[0].trim());
+    });
+  }
+
+  private async enforceExplicitRootOutputContract(
+    response: string,
+    userTask: string,
+    correlationId: string
+  ): Promise<string> {
+    const contract = this.inferExplicitRootOutputContract(userTask);
+    if (!contract || this.responseSatisfiesExplicitOutputContract(response, contract)) {
+      return response;
+    }
+    const tree = this.executionTrees.get(correlationId);
+    const previousStepId = tree?.steps.at(-1)?.id;
+    let repairStep: RootExecutionStep | undefined;
+    try {
+      repairStep = await this.startRootExecutionStep(correlationId, {
+        action: 'finalize',
+        reason: 'The candidate response did not satisfy the user-declared output contract; repair formatting without adding claims.',
+        agentCount: 0,
+      }, previousStepId ? [previousStepId] : []);
+    } catch (error) {
+      this.emit({
+        type: 'root.output_contract.repair.untracked',
+        agentId: 'root',
+        correlationId,
+        data: { reason: error instanceof Error ? error.message : String(error) },
+      });
+    }
+    this.emit({
+      type: 'root.output_contract.repair.started',
+      agentId: 'root',
+      correlationId,
+      data: {
+        stepId: repairStep?.id,
+        markers: contract.markers,
+        candidateCharacters: response.length,
+      },
+    });
+    try {
+      const repaired = await this.completeJSONAsAgent<{ finalResponse?: unknown }>(
+        this.getContext().agent,
+        [
+          {
+            role: 'system',
+            content: [
+              'You repair a root agent response so it obeys the user-declared output contract.',
+              'Preserve the candidate answer and its claims. Do not solve a different task or add unsupported facts.',
+              'Return JSON only with one string field named finalResponse.',
+            ].join('\n'),
+          },
+          {
+            role: 'user',
+            content: JSON.stringify({
+              originalTask: userTask,
+              requiredMarkers: contract.markers,
+              outputInstruction: contract.instruction,
+              candidateResponse: response,
+              requirement: 'The repaired response must contain every required marker at the beginning of a line with a non-placeholder value after the colon.',
+            }),
+          },
+        ],
+        { temperature: 0, maxTokens: 512 },
+        'root.output_contract_repair',
+        correlationId
+      );
+      const candidate = typeof repaired.finalResponse === 'string'
+        ? repaired.finalResponse.trim()
+        : '';
+      if (!candidate || !this.responseSatisfiesExplicitOutputContract(candidate, contract)) {
+        throw new Error('Structured repair did not satisfy the explicit output contract');
+      }
+      this.emit({
+        type: 'root.output_contract.repair.completed',
+        agentId: 'root',
+        correlationId,
+        data: {
+          stepId: repairStep?.id,
+          markers: contract.markers,
+          repairedCharacters: candidate.length,
+        },
+      });
+      if (repairStep) {
+        await this.completeRootExecutionStep(correlationId, repairStep, {
+          resultSummary: candidate,
+        });
+      }
+      return candidate;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.emit({
+        type: 'root.output_contract.repair.failed',
+        agentId: 'root',
+        correlationId,
+        data: {
+          stepId: repairStep?.id,
+          markers: contract.markers,
+          error: message,
+        },
+      });
+      if (repairStep) {
+        await this.failRootExecutionStep(correlationId, repairStep, message, false);
+      }
+      return response;
+    }
+  }
+
   private async collectRuntimeLLMStream(
     provider: LLMProvider,
     messages: LLMMessage[],
     options: LLMCompletionOptions,
     context: { actorId: string; purpose: string; correlationId: string; teamId?: string }
-  ): Promise<{ content: string; usage?: ModelTokenUsage }> {
+  ): Promise<{ content: string; usage?: ModelTokenUsage; finishReason?: string }> {
     const retryConfig = this.workspaceRuntimeConfig?.llm;
     const maxAttempts = Math.max(1, Math.floor(retryConfig?.streamMaxAttempts ?? 3));
     const initialDelayMs = Math.max(0, Math.floor(retryConfig?.retryInitialDelayMs ?? 250));
@@ -9254,10 +9401,12 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       const chunks: string[] = [];
       let usage: ModelTokenUsage | undefined;
+      let finishReason: string | undefined;
       try {
         for await (const chunk of provider.stream(messages, options)) {
           if (chunk.content) chunks.push(chunk.content);
           if (chunk.usage) usage = chunk.usage;
+          if (chunk.finishReason) finishReason = chunk.finishReason;
         }
         if (attempt > 1) {
           this.emit({
@@ -9267,7 +9416,7 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
             data: { ...context, attempt, discardedPartialCharacters },
           });
         }
-        return { content: chunks.join(''), usage };
+        return { content: chunks.join(''), usage, finishReason };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         const retryable = this.isRetryableLLMStreamError(error);
@@ -9381,6 +9530,20 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
         { actorId: 'root', purpose, correlationId }
       );
       const content = completion.content;
+      if (completion.finishReason
+        && ['length', 'max_tokens'].includes(completion.finishReason.toLowerCase())) {
+        this.emit({
+          type: 'llm.stream.truncated',
+          agentId: 'root',
+          correlationId,
+          data: {
+            purpose,
+            finishReason: completion.finishReason,
+            characters: content.length,
+            maxTokens,
+          },
+        });
+      }
       ctx.agent.recordRuntimeCompletion(content, {
         content,
         usage: completion.usage ?? this.estimateModelUsage(messages, content),

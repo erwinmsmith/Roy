@@ -67,6 +67,7 @@ export interface LLMStreamChunk {
   content: string;
   done: boolean;
   usage?: ModelTokenUsage;
+  finishReason?: string;
 }
 
 export interface LLMJSONCompletionResult<T> {
