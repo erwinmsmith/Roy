@@ -626,4 +626,43 @@ describe('Root dynamic execution tree', () => {
       }),
     }));
   });
+
+  it('hands a long-horizon task back to root as soon as a delegated mutation occurs', () => {
+    const runtime = new Runtime();
+    const shouldHandoff = (runtime as unknown as {
+      shouldHandoffToRootExecution: (input: {
+        requiresWorkspaceMutation: boolean;
+        requiresLongHorizon: boolean;
+        roundMutationApplied: boolean;
+        delegationRounds: number;
+        maxRounds: number;
+        exploratoryDelegationLimit: number;
+      }) => boolean;
+    }).shouldHandoffToRootExecution;
+
+    expect(shouldHandoff.call(runtime, {
+      requiresWorkspaceMutation: true,
+      requiresLongHorizon: true,
+      roundMutationApplied: true,
+      delegationRounds: 1,
+      maxRounds: 12,
+      exploratoryDelegationLimit: 4,
+    })).toBe(true);
+    expect(shouldHandoff.call(runtime, {
+      requiresWorkspaceMutation: true,
+      requiresLongHorizon: true,
+      roundMutationApplied: false,
+      delegationRounds: 1,
+      maxRounds: 12,
+      exploratoryDelegationLimit: 4,
+    })).toBe(false);
+    expect(shouldHandoff.call(runtime, {
+      requiresWorkspaceMutation: true,
+      requiresLongHorizon: true,
+      roundMutationApplied: false,
+      delegationRounds: 12,
+      maxRounds: 12,
+      exploratoryDelegationLimit: 4,
+    })).toBe(true);
+  });
 });

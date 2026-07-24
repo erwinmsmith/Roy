@@ -4450,10 +4450,14 @@ export class Runtime {
         const loopGuard = loopController.evaluate(tree);
         const roundMutationApplied = this.delegationRoundHasWorkspaceMutation(round);
         const exploratoryDelegationLimit = 4;
-        const executionHandoffRequired = requiresWorkspaceMutation
-          && (requiresLongHorizon
-            ? delegationRounds >= maxRounds
-            : roundMutationApplied || delegationRounds >= exploratoryDelegationLimit);
+        const executionHandoffRequired = this.shouldHandoffToRootExecution({
+          requiresWorkspaceMutation,
+          requiresLongHorizon,
+          roundMutationApplied,
+          delegationRounds,
+          maxRounds,
+          exploratoryDelegationLimit,
+        });
         const canReassess = rootStepConfig?.enabled !== false
           && rootStepConfig?.reassessAfterDelegation !== false
           && roundDecision.continuationPolicy !== 'finalize_after_round'
@@ -8220,6 +8224,23 @@ export class Runtime {
       ...round.teams.flatMap(team => team.members.flatMap(member => member.toolCalls)),
     ];
     return this.hasSuccessfulWorkspaceMutation(calls);
+  }
+
+  private shouldHandoffToRootExecution(input: {
+    requiresWorkspaceMutation: boolean;
+    requiresLongHorizon: boolean;
+    roundMutationApplied: boolean;
+    delegationRounds: number;
+    maxRounds: number;
+    exploratoryDelegationLimit: number;
+  }): boolean {
+    if (!input.requiresWorkspaceMutation) return false;
+    if (input.roundMutationApplied) return true;
+    return input.delegationRounds >= (
+      input.requiresLongHorizon
+        ? input.maxRounds
+        : input.exploratoryDelegationLimit
+    );
   }
 
   private async decideRootContinuation(
