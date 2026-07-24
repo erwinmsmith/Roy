@@ -85,6 +85,22 @@ class XmlToolIntentRecoveryLLM extends EchoLLM {
   }
 }
 
+class NativeXmlToolIntentRecoveryLLM extends EchoLLM {
+  override async *stream(messages: LLMMessage[], _options?: LLMCompletionOptions): AsyncGenerator<LLMStreamChunk, void, unknown> {
+    const prompt = messages.map(message => String(message.content)).join('\n');
+    const content = prompt.includes('Produce the final task result from the evidence above.')
+      ? 'The native runtime request read evidence.txt and confirmed runtime-grounded.'
+      : [
+        '<tool_calls>',
+        '<invoke name="fs.read">',
+        '<parameter name="path" string="true">evidence.txt</parameter>',
+        '</invoke>',
+        '</tool_calls>',
+      ].join('\n');
+    yield { content, done: true, usage: { promptTokens: 20, completionTokens: 10, totalTokens: 30 } };
+  }
+}
+
 describe('Runtime controlled subagent spawning', () => {
   it('does not route a local repair through web tools because verifier logs contain URLs', () => {
     const runtime = new Runtime();
@@ -281,7 +297,56 @@ describe('Runtime controlled subagent spawning', () => {
     expect(runtime.getEvents().map(event => event.type)).toEqual(expect.arrayContaining([
       'agent.output.tool_intent.recovery.started',
       'agent.output.tool_intent.recovery.completed',
-      'agent.output.repair.completed',
+    ]));
+    expect(runtime.getEvents().map(event => event.type)).not.toContain('agent.output.repair.completed');
+    await runtime.shutdown();
+  });
+
+  it('executes native invoke/parameter XML even after earlier grounding calls', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-native-tool-intent-'));
+    await writeFile(path.join(workspaceCwd, 'package.json'), '{"name":"seed-grounded"}\n', 'utf8');
+    await writeFile(path.join(workspaceCwd, 'evidence.txt'), 'runtime-grounded\n', 'utf8');
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'native-tool-intent-recovery-test',
+      llmProvider: new NativeXmlToolIntentRecoveryLLM(),
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+    const agent = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'custom',
+      name: 'NativeIntentRecovery-1',
+      tomLevel: 0,
+      description: 'Inspect package.json, then resolve the attached fact.',
+      task: 'Inspect package.json, then resolve the attached fact.',
+      tools: ['fs.read'],
+      skills: ['use_tool_when_needed'],
+      outputContract: { format: 'markdown', groundingRequired: true },
+    });
+
+    const result = await runtime.runAgent(
+      agent.identity.id,
+      'Inspect package.json, then resolve the attached fact.',
+      { archetype: 'custom', disableRecursiveDelegation: true }
+    );
+
+    expect(result.toolCalls).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        toolName: 'fs.read',
+        success: true,
+        params: expect.objectContaining({ path: 'package.json' }),
+      }),
+      expect.objectContaining({
+        toolName: 'fs.read',
+        success: true,
+        params: { path: 'evidence.txt' },
+      }),
+    ]));
+    expect(result.result).toContain('runtime-grounded');
+    expect(runtime.getEvents().map(event => event.type)).toEqual(expect.arrayContaining([
+      'agent.output.tool_intent.recovery.started',
+      'agent.output.tool_intent.recovery.completed',
     ]));
     await runtime.shutdown();
   });

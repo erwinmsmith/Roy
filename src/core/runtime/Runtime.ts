@@ -6501,44 +6501,90 @@ export class Runtime {
         throw new Error(stepError.replace(/^Error:\s*/, ''));
       }
       let result = session ? await this.drainAgentOutput(session.messageQueue, agent.name) : agent.getInfo().lastResult ?? '';
+      let forcedExecutionContinuationAttempted = false;
+      while (true) {
+        const unresolvedToolIntent = this.containsUnresolvedToolIntent(result);
+        const workspaceExecutionOpen = this.taskRequiresWorkspaceMutation(task)
+          && !this.analyzeWorkspaceExecutionClosure(
+            grounding.toolCalls,
+            undefined,
+            false
+          ).closed;
+        if (!unresolvedToolIntent && !workspaceExecutionOpen) break;
+
+        if (!unresolvedToolIntent) {
+          if (forcedExecutionContinuationAttempted) break;
+          forcedExecutionContinuationAttempted = true;
+          result = await this.completeAsAgent(
+            agent,
+            [
+              `Task:\n${task}`,
+              `Runtime-provided evidence:\n${(grounding.evidence.toolResultSummary ?? grounding.context).slice(-12_000)}`,
+              'The workspace execution path is still open: a mutation and successful post-mutation verification have not both been observed.',
+              'Produce the final task result from the evidence above. Do so only if the task is genuinely complete.',
+              'Otherwise emit the next concrete authorized tool request. Runtime will execute it; do not merely describe the command or ask for permission.',
+            ].join('\n\n'),
+            'agent.output_execution_continue',
+            options.correlationId ?? this.createCorrelationId()
+          );
+          continue;
+        }
+
+        const recoveryPlans = this.extractUnresolvedToolPlans(agentId, result);
+        if (recoveryPlans.length > 0) {
+          this.emit({
+            type: 'agent.output.tool_intent.recovery.started',
+            agentId,
+            sessionId: ctx.sessionId,
+            correlationId: options.correlationId,
+            data: {
+              task,
+              tools: recoveryPlans.map(plan => plan.toolName),
+            },
+          });
+          const recovered = await this.runGroundingCheck(agentId, task, {
+            ...options,
+            initialPlans: recoveryPlans,
+            priorToolCalls: grounding.toolCalls,
+            skipInitialModelPlanning: true,
+          });
+          grounding = this.combineGroundingRuns([grounding, recovered]);
+          this.emit({
+            type: recovered.toolLoop.successfulCalls > 0
+              ? 'agent.output.tool_intent.recovery.completed'
+              : 'agent.output.tool_intent.recovery.failed',
+            agentId,
+            sessionId: ctx.sessionId,
+            correlationId: options.correlationId,
+            data: {
+              task,
+              successfulCalls: recovered.toolLoop.successfulCalls,
+              failedCalls: recovered.toolLoop.failedCalls,
+              stopReason: recovered.toolLoop.stopReason,
+            },
+          });
+          if (recovered.toolCalls.length > 0) {
+            forcedExecutionContinuationAttempted = false;
+            result = await this.completeAsAgent(
+              agent,
+              [
+                `Task:\n${task}`,
+                `Runtime-provided evidence:\n${(grounding.evidence.toolResultSummary ?? grounding.context).slice(-12_000)}`,
+                'Runtime executed the model-authored tool request through the authorized tool layer.',
+                'Produce the final task result from the evidence above. Do so only if the task is genuinely complete.',
+                'If another tool call is necessary, emit the next concrete authorized tool request instead of describing future work. Runtime will continue this execution path.',
+              ].join('\n\n'),
+              'agent.output_tool_continue',
+              options.correlationId ?? this.createCorrelationId()
+            );
+            continue;
+          }
+        }
+        break;
+      }
       if (this.containsUnresolvedToolIntent(result)) {
         if (!grounding.evidence.toolGrounded) {
-          const recoveryPlans = this.extractUnresolvedToolPlans(agentId, result);
-          if (recoveryPlans.length > 0) {
-            this.emit({
-              type: 'agent.output.tool_intent.recovery.started',
-              agentId,
-              sessionId: ctx.sessionId,
-              correlationId: options.correlationId,
-              data: {
-                task,
-                tools: recoveryPlans.map(plan => plan.toolName),
-              },
-            });
-            const recovered = await this.runGroundingCheck(agentId, task, {
-              ...options,
-              initialPlans: recoveryPlans,
-              skipInitialModelPlanning: true,
-            });
-            grounding = this.combineGroundingRuns([grounding, recovered]);
-            this.emit({
-              type: grounding.evidence.toolGrounded
-                ? 'agent.output.tool_intent.recovery.completed'
-                : 'agent.output.tool_intent.recovery.failed',
-              agentId,
-              sessionId: ctx.sessionId,
-              correlationId: options.correlationId,
-              data: {
-                task,
-                successfulCalls: recovered.toolLoop.successfulCalls,
-                failedCalls: recovered.toolLoop.failedCalls,
-                stopReason: recovered.toolLoop.stopReason,
-              },
-            });
-          }
-          if (!grounding.evidence.toolGrounded) {
-            throw new Error('Agent returned an unexecuted tool request without runtime grounding evidence');
-          }
+          throw new Error('Agent returned an unexecuted tool request without runtime grounding evidence');
         }
         this.emit({
           type: 'agent.output.repair.started',
@@ -14881,9 +14927,11 @@ For web-grounded work, use only facts present in the subagent report or runtime 
   private containsUnresolvedToolIntent(result: string): boolean {
     if (!result.trim()) return false;
     return /<tool_call>[\s\S]*?<\/tool_call>/i.test(result)
+      || /<tool_calls>[\s\S]*?<\/tool_calls>/i.test(result)
       || /<tool_name>[\s\S]*?<\/tool_name>/i.test(result)
       || /<function_calls>[\s\S]*?<\/function_calls>/i.test(result)
       || /<invocation\s+name=["'](?:web\.(?:search|fetch)|fs\.(?:list|read|search|replace|write)|shell\.exec)["'][\s\S]*?<\/invocation>/i.test(result)
+      || /<invoke\s+name=["'](?:web\.(?:search|fetch)|fs\.(?:list|read|search|replace|write)|shell\.exec)["'][\s\S]*?<\/invoke>/i.test(result)
       || /```(?:tool|json)?\s*\n\s*(?:web\.(?:search|fetch)|fs\.(?:list|read|search|replace|write)|shell\.exec)\b[\s\S]*?```/i.test(result)
       || /\{\s*"(?:tool_name|tool|function)"\s*:\s*"[^"\n]+"[\s\S]*?\}/i.test(result);
   }
@@ -14922,6 +14970,23 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         const match = body.match(new RegExp(`<${field}>\\s*([\\s\\S]*?)\\s*</${field}>`, 'i'));
         if (match?.[1] !== undefined) params[field] = match[1];
       }
+      for (const match of body.matchAll(
+        /<parameter\s+name=["']([^"']+)["']([^>]*)>([\s\S]*?)<\/parameter>/gi
+      )) {
+        const name = String(match[1] ?? '').trim();
+        if (!name) continue;
+        const attributes = String(match[2] ?? '');
+        const rawValue = decodeBasicXmlEntities(String(match[3] ?? '').trim());
+        if (/\bstring=["']true["']/i.test(attributes)) {
+          params[name] = rawValue;
+          continue;
+        }
+        try {
+          params[name] = JSON.parse(rawValue);
+        } catch {
+          params[name] = rawValue;
+        }
+      }
       return params;
     };
     for (const match of result.matchAll(/<tool_call>([\s\S]*?)<\/tool_call>/gi)) {
@@ -14929,7 +14994,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       const toolName = body.match(/<tool_name>\s*([^<]+?)\s*<\/tool_name>/i)?.[1]?.trim();
       if (toolName) candidates.push({ toolName, params: parseParams(body) });
     }
-    for (const match of result.matchAll(/<invocation\s+name=["']([^"']+)["'][^>]*>([\s\S]*?)<\/invocation>/gi)) {
+    for (const match of result.matchAll(/<(?:invocation|invoke)\s+name=["']([^"']+)["'][^>]*>([\s\S]*?)<\/(?:invocation|invoke)>/gi)) {
       candidates.push({
         toolName: String(match[1] ?? '').trim(),
         params: parseParams(match[2] ?? ''),
@@ -14987,8 +15052,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         if (seen.has(fingerprint)) return false;
         seen.add(fingerprint);
         return true;
-      })
-      .slice(0, 3);
+      });
   }
 
   private resolveInspectionRoot(task: string): string {
@@ -15205,6 +15269,15 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     }
     return chunks.join('');
   }
+}
+
+function decodeBasicXmlEntities(value: string): string {
+  return value
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&amp;/gi, '&');
 }
 
 function finiteNumber(value: unknown): number | undefined {
