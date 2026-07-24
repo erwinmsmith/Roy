@@ -9557,7 +9557,7 @@ export class Runtime {
     const selected: ExecutionCachedToolCall[] = [];
     const seen = new Set<string>();
     let serializedChars = 0;
-    for (const call of calls.slice(-Math.max(1, maxCalls)).reverse()) {
+    for (const call of [...calls].reverse()) {
       const fingerprint = [
         call.toolName,
         JSON.stringify(call.params),
@@ -9571,6 +9571,7 @@ export class Runtime {
       if (selected.length > 0 && serializedChars + callChars > maxSerializedChars) continue;
       selected.push(call);
       serializedChars += callChars;
+      if (selected.length >= Math.max(1, maxCalls)) break;
     }
     return selected.reverse();
   }
@@ -16102,9 +16103,17 @@ For web-grounded work, use only facts present in the subagent report or runtime 
   ): GroundingRunResult | undefined {
     const resumeState = this.resumedExecutionByCorrelation.get(correlationId);
     if (!resumeState) return undefined;
-    const toolCalls = resumeState.knowledge.paths
+    const persistedFrontier = resumeState.knowledge.paths
       .flatMap(path => path.toolFrontier ?? [])
-      .map(call => ({
+      .sort((left, right) =>
+        (left.completedAt ?? left.startedAt ?? 0)
+        - (right.completedAt ?? right.startedAt ?? 0)
+      );
+    const toolCalls = this.boundExecutionToolFrontier(
+      persistedFrontier,
+      96,
+      720_000
+    ).map(call => ({
         toolName: call.toolName,
         params: call.params,
         result: call.result,
@@ -16113,12 +16122,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         reason: call.reason ?? 'Restored from the persisted causal tool frontier.',
         startedAt: call.startedAt,
         completedAt: call.completedAt,
-      }))
-      .sort((left, right) =>
-        (left.completedAt ?? left.startedAt ?? 0)
-        - (right.completedAt ?? right.startedAt ?? 0)
-      )
-      .slice(-96);
+      }));
     if (toolCalls.length === 0) return undefined;
     const observedPaths = Array.from(new Set(
       resumeState.knowledge.paths.flatMap(path => path.observedPaths)
