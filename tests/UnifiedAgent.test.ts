@@ -711,6 +711,45 @@ describe('UnifiedAgent capability execution', () => {
     expect(llm.options?.timeoutMs).toBeLessThanOrEqual(1_234);
   });
 
+  it('keeps one detailed tool frontier without replaying every historical log', async () => {
+    const llm = new CapturingToolPlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'delta-observation-planner',
+      goal: 'repair from bounded verifier evidence',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['shell.exec'],
+    });
+    const calls = Array.from({ length: 10 }, (_, index) => ({
+      toolName: 'shell.exec',
+      params: { command: `pytest -q tests/test_${index}.py ${'x'.repeat(2_000)}` },
+      reason: 'Run a verifier.',
+      groundingRequired: true,
+      success: false,
+      error: `command failure ${'e'.repeat(10_000)}`,
+      result: {
+        command: `pytest -q tests/test_${index}.py`,
+        stdout: `stdout ${'o'.repeat(10_000)}`,
+        stderr: `stderr ${'s'.repeat(10_000)}`,
+        exitCode: 1,
+      },
+    }));
+
+    await agent.planNextToolRound({
+      task: `TASK_HEAD\n${'requirements\n'.repeat(2_000)}LATEST_FAILURE`,
+      round: 10,
+      remainingCalls: 1,
+      tools: [{ name: 'shell.exec' }],
+      calls,
+    });
+
+    const userPrompt = llm.messages.findLast(message => message.role === 'user')?.content ?? '';
+    expect(userPrompt).toContain('TASK_HEAD');
+    expect(userPrompt).toContain('LATEST_FAILURE');
+    expect(userPrompt).toContain('earlier chars compacted');
+    expect(userPrompt.length).toBeLessThan(38_000);
+  });
+
   it('classifies a tool-planning request timeout for runtime telemetry', async () => {
     const llm = new CapturingToolPlanningLLM(new Error('Request timed out after 250ms'));
     const agent = new UnifiedAgent({

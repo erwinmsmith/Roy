@@ -107,13 +107,19 @@ export class UnifiedAgent extends BaseAgent {
         || call.toolName === 'fs.search'
       )
     );
-    const observations = input.calls.slice(-12).map(call => ({
-      toolName: call.toolName,
-      params: call.params,
-      success: call.success,
-      error: call.error,
-      result: compactToolObservation(call.result, call.toolName),
-    }));
+    const recentCalls = input.calls.slice(-8);
+    const observations = recentCalls.map((call, index) => {
+      const latest = index === recentCalls.length - 1;
+      return {
+        toolName: call.toolName,
+        params: compactToolPlanningParams(call.params, latest),
+        success: call.success,
+        error: call.error
+          ? compactTail(String(call.error), latest ? 800 : 400)
+          : undefined,
+        result: compactToolObservation(call.result, call.toolName, latest),
+      };
+    });
     const messages: LLMMessage[] = [
       {
         role: 'system',
@@ -1050,9 +1056,9 @@ function isRetryableToolPlanningResponseError(error: unknown): boolean {
 }
 
 function compactToolPlanningTask(task: string): string {
-  const maxChars = 18_000;
+  const maxChars = 12_000;
   if (task.length <= maxChars) return task;
-  const headChars = 10_000;
+  const headChars = 7_000;
   const tailChars = maxChars - headChars;
   return [
     task.slice(0, headChars),
@@ -1061,7 +1067,11 @@ function compactToolPlanningTask(task: string): string {
   ].join('\n');
 }
 
-function compactToolObservation(result: unknown, toolName: string): unknown {
+function compactToolObservation(
+  result: unknown,
+  toolName: string,
+  latest = true
+): unknown {
   if (result && typeof result === 'object' && toolName === 'web.search') {
     const search = result as {
       query?: unknown;
@@ -1104,11 +1114,31 @@ function compactToolObservation(result: unknown, toolName: string): unknown {
       timedOut?: unknown;
     };
     return {
-      command: String(shell.command ?? '').slice(0, 1000),
-      stdout: String(shell.stdout ?? '').slice(-6000),
-      stderr: String(shell.stderr ?? '').slice(-3000),
+      command: String(shell.command ?? '').slice(0, latest ? 800 : 250),
+      stdout: compactTail(String(shell.stdout ?? ''), latest ? 1_500 : 250),
+      stderr: compactTail(String(shell.stderr ?? ''), latest ? 3_000 : 500),
       exitCode: shell.exitCode,
       timedOut: shell.timedOut,
+    };
+  }
+  if (result && typeof result === 'object' && toolName === 'fs.read') {
+    const read = result as {
+      path?: unknown;
+      content?: unknown;
+      bytes?: unknown;
+      truncated?: unknown;
+      startLine?: unknown;
+      endLine?: unknown;
+      totalLines?: unknown;
+    };
+    return {
+      path: read.path,
+      content: String(read.content ?? '').slice(0, latest ? 6_000 : 800),
+      bytes: read.bytes,
+      truncated: read.truncated,
+      startLine: read.startLine,
+      endLine: read.endLine,
+      totalLines: read.totalLines,
     };
   }
   if (result && typeof result === 'object' && toolName === 'fs.search') {
@@ -1121,16 +1151,37 @@ function compactToolObservation(result: unknown, toolName: string): unknown {
     return {
       query: search.query,
       filesSearched: search.filesSearched,
-      matches: (search.matches ?? []).slice(0, 30).map(match => ({
+      matches: (search.matches ?? []).slice(0, latest ? 20 : 5).map(match => ({
         path: match.path,
         line: match.line,
         column: match.column,
-        preview: String(match.preview ?? '').slice(0, 500),
+        preview: String(match.preview ?? '').slice(0, latest ? 350 : 180),
       })),
       truncated: search.truncated,
     };
   }
   return compactObservationValue(result, 0);
+}
+
+function compactToolPlanningParams(
+  params: Record<string, unknown>,
+  latest: boolean
+): Record<string, unknown> {
+  const maxStringChars = latest ? 1_000 : 250;
+  return Object.fromEntries(Object.entries(params).map(([key, value]) => {
+    if (typeof value !== 'string') return [key, compactObservationValue(value, 0)];
+    if (value.length <= maxStringChars) return [key, value];
+    const headChars = Math.floor(maxStringChars * 0.6);
+    return [
+      key,
+      `${value.slice(0, headChars)}...[${value.length - maxStringChars} chars compacted]...${value.slice(-(maxStringChars - headChars))}`,
+    ];
+  }));
+}
+
+function compactTail(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  return `[${value.length - maxChars} earlier chars compacted]\n${value.slice(-maxChars)}`;
 }
 
 function extractPlannerFallbackUrls(message: string): string[] {
