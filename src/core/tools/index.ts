@@ -26,11 +26,15 @@ export { AgentToolPlanner } from './planner.js';
 export { AgentToolExecutionLoop } from './executionLoop.js';
 export {
   completedWorkspaceReadCoversPlan,
+  effectiveWorkspaceMutationCallIndices,
   findParallelSourceMutation,
+  hasEffectiveWorkspaceMutationCall,
   isSuccessfulWorkspaceMutationCall,
   isSuccessfulWorkspaceVerificationCall,
   isWorkspaceVerificationCall,
+  lastEffectiveWorkspaceMutationCallIndex,
   taskRequestsWorkspaceMutation,
+  workspaceCandidateRollbackFromCall,
   workspaceToolIntentFingerprint,
 } from './executionIntent.js';
 export { ToolApprovalManager } from './approval.js';
@@ -38,5 +42,9 @@ export type { Tool, ToolConfig, ToolResult, ToolMetadata } from './types.js';
 export type { ObservedToolCall, PlannedToolCall, ToolPlanBinding, ToolPlanningInput } from './planner.js';
 export type { WebToolConfig, WebSearchProviderName, WebSearchResult, WebSearchResultItem, WebFetchResult } from './webTools.js';
 export type { ToolLoopCallRecord, ToolLoopContinuationContext, ToolLoopRound, ToolLoopStopReason, ToolLoopSummary, ToolExecutionLoopOptions } from './executionLoop.js';
-export type { ExecutionIntentCall, ParallelSourceMutation } from './executionIntent.js';
+export type {
+  ExecutionIntentCall,
+  ParallelSourceMutation,
+  WorkspaceCandidateRollback,
+} from './executionIntent.js';
 export type { ToolApprovalDecision, ToolApprovalPolicy, ToolApprovalRequest, ToolApprovalResult } from './approval.js';

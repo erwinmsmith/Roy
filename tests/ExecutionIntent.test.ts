@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
   completedWorkspaceReadCoversPlan,
+  effectiveWorkspaceMutationCallIndices,
   findParallelSourceMutation,
+  hasEffectiveWorkspaceMutationCall,
   isSuccessfulWorkspaceMutationCall,
   isSuccessfulWorkspaceVerificationCall,
   taskRequestsWorkspaceMutation,
@@ -77,6 +79,46 @@ describe('workspace execution intent', () => {
       success: true,
       result: { exitCode: 0 },
     })).toBe(true);
+  });
+
+  it('keeps rolled-back candidates as trace evidence but not effective mutations', () => {
+    const calls: Array<{
+      toolName: string;
+      params: Record<string, unknown>;
+      success: boolean;
+      result?: unknown;
+    }> = [
+      {
+        toolName: 'fs.replace',
+        params: { path: 'src/app.py', oldText: '41', newText: '0' },
+        success: true,
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python .roy/official-verifier/grade.py' },
+        success: true,
+        result: {
+          exitCode: 0,
+          stdout: '0.5\n',
+          candidateRollback: {
+            restored: true,
+            path: 'src/app.py',
+            reason: 'no_objective_gain',
+          },
+        },
+      },
+    ];
+    expect(effectiveWorkspaceMutationCallIndices(calls)).toEqual([]);
+    expect(hasEffectiveWorkspaceMutationCall(calls)).toBe(false);
+    expect(isSuccessfulWorkspaceMutationCall(calls[0]!)).toBe(true);
+
+    calls.push({
+      toolName: 'fs.replace',
+      params: { path: 'src/app.py', oldText: '41', newText: '42' },
+      success: true,
+    });
+    expect(effectiveWorkspaceMutationCallIndices(calls)).toEqual([2]);
+    expect(hasEffectiveWorkspaceMutationCall(calls)).toBe(true);
   });
 
   it('does not accept verification commands that mask a failing exit status', () => {

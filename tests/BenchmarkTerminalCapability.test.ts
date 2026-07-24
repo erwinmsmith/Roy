@@ -305,6 +305,7 @@ describe('benchmark terminal capability', () => {
         toolName: string;
         params: Record<string, unknown>;
         success: boolean;
+        result?: unknown;
       }>) => {
         closed: boolean;
         verificationAttemptedAfterMutation: boolean;
@@ -338,6 +339,31 @@ describe('benchmark terminal capability', () => {
       closed: true,
       verificationAttemptedAfterMutation: true,
       verificationPassed: true,
+    });
+    expect(analyze([
+      {
+        toolName: 'fs.write',
+        params: { path: 'artifact.txt', content: 'candidate' },
+        success: true,
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python .roy/official-verifier/grade.py' },
+        success: true,
+        result: {
+          exitCode: 0,
+          stdout: '0.5\n',
+          candidateRollback: {
+            restored: true,
+            path: 'artifact.txt',
+            reason: 'no_objective_gain',
+          },
+        },
+      },
+    ])).toMatchObject({
+      closed: false,
+      verificationAttemptedAfterMutation: false,
+      verificationPassed: false,
     });
   });
 
@@ -711,6 +737,86 @@ describe('benchmark terminal capability', () => {
         path: 'implementation.py',
         baselineReward: 0.5,
         regressedReward: 0.1,
+      }),
+    }));
+
+    await writeFile(gradePath, 'print("0.500000000000")\n');
+    await writeFile(
+      scorecardPath,
+      JSON.stringify({ groups: { public: 1, hidden: 0 }, reward: 0.5 })
+    );
+    const equalBaseline = await runtime.executeToolForAgent(
+      'root',
+      'shell.exec',
+      { command: 'python3 .roy/official-verifier/grade.py' },
+      { correlationId: 'verifier-no-gain-turn' }
+    );
+    const equalBaselineCall = {
+      toolName: 'shell.exec',
+      params: { command: 'python3 .roy/official-verifier/grade.py' },
+      reason: 'Establish the equal-score verifier baseline.',
+      groundingRequired: true,
+      success: equalBaseline.success,
+      result: equalBaseline.result,
+      error: equalBaseline.error,
+    };
+    const equalMutation = await runtime.executeToolForAgent(
+      'root',
+      'fs.replace',
+      {
+        path: 'implementation.py',
+        oldText: 'VALUE = 41',
+        newText: 'VALUE = 42',
+        expectedReplacements: 1,
+      },
+      {
+        correlationId: 'verifier-no-gain-turn',
+        groundingCalls: [equalBaselineCall],
+      }
+    );
+    const noGain = await runtime.executeToolForAgent(
+      'root',
+      'shell.exec',
+      { command: 'python3 .roy/official-verifier/grade.py' },
+      {
+        correlationId: 'verifier-no-gain-turn',
+        groundingCalls: [
+          equalBaselineCall,
+          {
+            toolName: 'fs.replace',
+            params: { path: 'implementation.py' },
+            reason: 'Apply an equal-score candidate.',
+            groundingRequired: true,
+            success: equalMutation.success,
+            result: equalMutation.result,
+            error: equalMutation.error,
+          },
+        ],
+      }
+    );
+    expect(noGain).toMatchObject({
+      success: true,
+      result: expect.objectContaining({
+        candidateRollback: expect.objectContaining({
+          restored: true,
+          path: 'implementation.py',
+          reason: 'no_objective_gain',
+          baselineReward: 0.5,
+          candidateReward: 0.5,
+        }),
+      }),
+    });
+    expect((noGain.result as { regressionRollback?: unknown }).regressionRollback)
+      .toBeUndefined();
+    expect(await readFile(path.join(workspace, 'implementation.py'), 'utf8')).toBe(
+      'VALUE = 41\n'
+    );
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'workspace.mutation.candidate_rolled_back',
+      data: expect.objectContaining({
+        reason: 'no_objective_gain',
+        baselineReward: 0.5,
+        candidateReward: 0.5,
       }),
     }));
     await runtime.shutdown();

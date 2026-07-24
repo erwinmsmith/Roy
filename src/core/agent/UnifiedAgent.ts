@@ -21,10 +21,13 @@ import type { PlannedToolCall } from '../tools/planner.js';
 import type { ToolLoopCallRecord } from '../tools/executionLoop.js';
 import {
   completedWorkspaceReadCoversPlan,
+  hasEffectiveWorkspaceMutationCall,
   isSuccessfulWorkspaceMutationCall as isSuccessfulWorkspaceMutation,
   isSuccessfulWorkspaceVerificationCall as isSuccessfulWorkspaceVerification,
   isWorkspaceVerificationCall,
+  lastEffectiveWorkspaceMutationCallIndex,
   taskRequestsWorkspaceMutation as requestsWorkspaceMutation,
+  workspaceCandidateRollbackFromCall,
   workspaceToolIntentFingerprint,
 } from '../tools/executionIntent.js';
 
@@ -107,15 +110,14 @@ export class UnifiedAgent extends BaseAgent {
         || authorized.has('fs.synthesize')
         || authorized.has('shell.exec')
       );
-    const mutationApplied = input.calls.some(call => isSuccessfulWorkspaceMutation(call));
+    const mutationApplied = hasEffectiveWorkspaceMutationCall(input.calls);
     const freshMutationRequired = input.requiredMutationAfterCallIndex !== undefined;
-    const freshMutationApplied = !freshMutationRequired || input.calls
-      .slice(Math.max(0, Number(input.requiredMutationAfterCallIndex) + 1))
-      .some(call => isSuccessfulWorkspaceMutation(call));
+    const freshMutationApplied = !freshMutationRequired
+      || hasEffectiveWorkspaceMutationCall(
+        input.calls.slice(Math.max(0, Number(input.requiredMutationAfterCallIndex) + 1))
+      );
     const mutationRequirementSatisfied = mutationApplied && freshMutationApplied;
-    const lastMutationIndex = findLastToolCallIndex(input.calls, call =>
-      isSuccessfulWorkspaceMutation(call)
-    );
+    const lastMutationIndex = lastEffectiveWorkspaceMutationCallIndex(input.calls);
     const lastVerificationIndex = findLastToolCallIndex(input.calls, call =>
       isWorkspaceVerificationCall(call)
     );
@@ -192,6 +194,9 @@ export class UnifiedAgent extends BaseAgent {
               ? 'The newest verification failed after the latest mutation. Apply a focused fs.replace repair now unless a distinct task-relevant input, rule, test, or source file has not yet been read; batch only those novel reads and never repeat broad discovery. Do not regenerate a complete existing implementation with fs.synthesize for a localized traceback unless concrete evidence requires a structural rewrite.'
               : 'The newest verification failed after the latest mutation. Preserve its detailed causal frontier and inspect only the reported source location before applying a focused repair.'
             : '',
+          latestCandidateRollback(input.calls)
+            ? 'The latest verifier transaction rejected and restored a source candidate because it did not improve the objective. Treat that candidate as a failed path. Do not repeat the same broad synthesis; use the changed group evidence to make a narrower, causally distinct repair.'
+            : '',
           executionRequired && mutationApplied && !verificationPassed && !latestVerificationFailed
             ? 'At least one workspace mutation succeeded, but no verification has passed. Continue any remaining edits or repairs, then request a relevant test, build, lint, typecheck, or targeted assertion.'
             : '',
@@ -230,7 +235,11 @@ export class UnifiedAgent extends BaseAgent {
             latestVerificationFailed,
             inspectedAfterLatestFailure,
           })}`,
-          `Authorized tools:\n${JSON.stringify(input.tools, null, 2)}`,
+          `Authorized tools:\n${JSON.stringify(
+            input.tools.map(compactToolDefinitionForPlanning),
+            null,
+            2
+          )}`,
           `Tool observations:\n${JSON.stringify(observations, null, 2)}`,
         ].join('\n\n'),
       },
@@ -260,7 +269,7 @@ export class UnifiedAgent extends BaseAgent {
             {
               temperature: 0,
               maxTokens: executionRequired
-                ? 8192
+                ? 2048
                 : 640,
               timeoutMs: remainingPlanningMs,
             }
@@ -272,10 +281,17 @@ export class UnifiedAgent extends BaseAgent {
             authorized,
             input.calls
           );
+          const recoveredProsePlan = recoverProseToolPlanningResponse(
+            error,
+            authorized,
+            input.calls
+          );
           if (recoveredMutation) {
             response = recoveredMutation;
           } else if (recoveredPlan) {
             response = recoveredPlan;
+          } else if (recoveredProsePlan) {
+            response = recoveredProsePlan;
           } else {
             const canRetry = executionRequired
               && attempt + 1 < maxPlanningAttempts
@@ -1249,6 +1265,16 @@ function findLastToolCallIndex(
   return -1;
 }
 
+function latestCandidateRollback(
+  calls: ToolLoopCallRecord[]
+): ReturnType<typeof workspaceCandidateRollbackFromCall> {
+  for (let index = calls.length - 1; index >= 0; index -= 1) {
+    const rollback = workspaceCandidateRollbackFromCall(calls[index]!);
+    if (rollback) return rollback;
+  }
+  return undefined;
+}
+
 function selectSingleWorkspaceMutation(plans: PlannedToolCall[]): PlannedToolCall[] {
   const mutations = plans
     .map((call, index) => ({ call, index }))
@@ -1284,6 +1310,15 @@ function recoverGroundedSynthesisPlan(input: {
   }
   const candidate = rankGroundedSynthesisTargets(input.calls, input.task)[0];
   if (!candidate) return undefined;
+  const rejectedCandidate = latestCandidateRollback(input.calls);
+  if (rejectedCandidate
+    && normalizePlannedWorkspacePath(String(rejectedCandidate.path ?? ''))
+      === candidate.filePath) {
+    // A scorecard-backed transaction already proved that this generic
+    // whole-file strategy did not improve the objective. Leave the next move
+    // to a causally distinct, model-authored focused repair.
+    return undefined;
+  }
   const aggregateVerifierRepair = input.latestVerificationFailed
     && !hasLocalizedVerificationFailureSinceLastMutation(input.calls)
     && input.calls.some(call =>
@@ -1333,9 +1368,7 @@ function verificationFailureIsLocalized(latestFailure: ToolLoopCallRecord): bool
 function hasLocalizedVerificationFailureSinceLastMutation(
   calls: ToolLoopCallRecord[]
 ): boolean {
-  const lastMutationIndex = findLastToolCallIndex(calls, call =>
-    isSuccessfulWorkspaceMutation(call)
-  );
+  const lastMutationIndex = lastEffectiveWorkspaceMutationCallIndex(calls);
   return calls.slice(lastMutationIndex + 1).some(call =>
     isWorkspaceVerificationCall(call)
     && !isSuccessfulWorkspaceVerification(call)
@@ -1357,9 +1390,7 @@ function recoverPostMutationVerificationPlan(input: {
     || input.latestVerificationFailed) {
     return undefined;
   }
-  const lastMutationIndex = findLastToolCallIndex(input.calls, call =>
-    isSuccessfulWorkspaceMutation(call)
-  );
+  const lastMutationIndex = lastEffectiveWorkspaceMutationCallIndex(input.calls);
   if (lastMutationIndex < 0) return undefined;
   for (let index = lastMutationIndex - 1; index >= 0; index -= 1) {
     const call = input.calls[index]!;
@@ -1645,9 +1676,9 @@ function shouldSuppressRepeatedPlannedCall(
     }
   }
   if (previousIndex < 0) return false;
-  const mutationAfterPrevious = completed
-    .slice(previousIndex + 1)
-    .some(call => isSuccessfulWorkspaceMutation(call));
+  const mutationAfterPrevious = hasEffectiveWorkspaceMutationCall(
+    completed.slice(previousIndex + 1)
+  );
   const repeatCanObserveNewWorkspaceState = planned.toolName === 'fs.list'
     || planned.toolName === 'fs.read'
     || planned.toolName === 'fs.search'
@@ -1738,6 +1769,81 @@ function recoverCompleteToolPlanningResponse(
     reason: 'Recovered complete tool calls from a truncated structured response.',
     calls: recoveredCalls,
   };
+}
+
+function recoverProseToolPlanningResponse(
+  error: unknown,
+  authorized: Set<string>,
+  completed: ToolLoopCallRecord[]
+): {
+  action: 'call_tools';
+  reason: string;
+  calls: Array<{ toolName: string; params: Record<string, unknown> }>;
+} | undefined {
+  const message = error instanceof Error ? error.message : String(error);
+  const prefix = 'Failed to parse JSON response:';
+  if (!message.startsWith(prefix)) return undefined;
+  const raw = message.slice(prefix.length);
+  if (!/\b(?:read|inspect|open|search|run|execute|verify|test|check)\b/i.test(raw)) {
+    return undefined;
+  }
+
+  const filePaths = Array.from(new Set(
+    (raw.match(
+      /(?:^|[\s`'"(])((?:\.\/|\/)?(?:\.roy\/)?[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*\.(?:py|ts|tsx|js|jsx|mjs|cjs|json|ya?ml|toml|md|csv))(?=$|[\s`'"),:;])/g
+    ) ?? [])
+      .map(match => match.trim().replace(/^[`'"(]+|[`'"),:;]+$/g, ''))
+      .map(normalizePlannedWorkspacePath)
+      .filter(Boolean)
+  ));
+  const groupName = raw.match(/\bG_[A-Za-z0-9_]+\b/)?.[0];
+  const verifierPath = filePaths.find(filePath =>
+    filePath.startsWith('.roy/official-verifier/')
+  );
+  if (authorized.has('fs.search') && groupName && verifierPath) {
+    return {
+      action: 'call_tools',
+      reason: 'Recovered the explicit verifier-group inspection intent from a non-JSON planning response.',
+      calls: [{
+        toolName: 'fs.search',
+        params: {
+          path: verifierPath,
+          query: groupName,
+          caseSensitive: true,
+          maxResults: 20,
+        },
+      }],
+    };
+  }
+
+  if (authorized.has('fs.read') && filePaths.length > 0) {
+    const line = Number(
+      raw.match(/\b(?:from|around|near|line)\s+(?:line\s+)?(\d{1,7})\b/i)?.[1]
+        ?? raw.match(/\b(\d{1,7})\s*(?:-|through|to)\s*\d{1,7}\b/i)?.[1]
+    );
+    const calls = filePaths.slice(0, 3).map(filePath => ({
+      toolName: 'fs.read',
+      params: Number.isSafeInteger(line) && line > 0
+        ? {
+          path: filePath,
+          startLine: Math.max(1, line - 20),
+          endLine: line + 120,
+        }
+        : { path: filePath },
+    }));
+    if (calls.some(call => !shouldSuppressRepeatedPlannedCall({
+      ...call,
+      reason: 'Recovered prose inspection intent.',
+      groundingRequired: true,
+    }, completed))) {
+      return {
+        action: 'call_tools',
+        reason: 'Recovered explicit file-inspection intent from a non-JSON planning response.',
+        calls,
+      };
+    }
+  }
+  return undefined;
 }
 
 function extractBalancedJsonObject(input: string, start: number): string | undefined {
@@ -1916,10 +2022,44 @@ function extractPartialJsonStringField(
   return { value, complete: false };
 }
 
+function compactToolDefinitionForPlanning(tool: {
+  name: string;
+  description?: string;
+  parameters?: Record<string, unknown>;
+}): {
+  name: string;
+  description?: string;
+  parameters?: Record<string, unknown>;
+} {
+  const compactParameters = tool.parameters
+    ? Object.fromEntries(
+      Object.entries(tool.parameters).map(([name, value]) => {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) {
+          return [name, value];
+        }
+        const parameter = value as Record<string, unknown>;
+        return [name, {
+          type: parameter.type,
+          required: parameter.required === true || undefined,
+          enum: Array.isArray(parameter.enum) ? parameter.enum.slice(0, 20) : undefined,
+          description: typeof parameter.description === 'string'
+            ? parameter.description.slice(0, 180)
+            : undefined,
+        }];
+      })
+    )
+    : undefined;
+  return {
+    name: tool.name,
+    description: tool.description?.slice(0, 240),
+    parameters: compactParameters,
+  };
+}
+
 function compactToolPlanningTask(task: string): string {
-  const maxChars = 12_000;
+  const maxChars = 6_000;
   if (task.length <= maxChars) return task;
-  const headChars = 7_000;
+  const headChars = 3_500;
   const tailChars = maxChars - headChars;
   return [
     task.slice(0, headChars),
@@ -1986,6 +2126,7 @@ function compactToolObservation(
       exitCode?: unknown;
       timedOut?: unknown;
       verifierDiagnostics?: unknown;
+      candidateRollback?: unknown;
       regressionRollback?: unknown;
     };
     return {
@@ -1999,6 +2140,7 @@ function compactToolObservation(
       exitCode: shell.exitCode,
       timedOut: shell.timedOut,
       verifierDiagnostics: compactObservationValue(shell.verifierDiagnostics, 0),
+      candidateRollback: compactObservationValue(shell.candidateRollback, 0),
       regressionRollback: compactObservationValue(shell.regressionRollback, 0),
     };
   }
@@ -2014,7 +2156,14 @@ function compactToolObservation(
     };
     return {
       path: read.path,
-      content: String(read.content ?? '').slice(0, latest ? 6_000 : 800),
+      content: String(read.content ?? '').slice(0, latest ? 3_500 : 600),
+      contentOmittedChars: Math.max(
+        0,
+        String(read.content ?? '').length - (latest ? 3_500 : 600)
+      ),
+      runtimeCoverage: read.truncated === true
+        ? 'partial_file_observation'
+        : 'complete_file_observed_and_cached',
       bytes: read.bytes,
       truncated: read.truncated,
       startLine: read.startLine,

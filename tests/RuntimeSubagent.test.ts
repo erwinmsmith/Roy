@@ -478,6 +478,29 @@ describe('Runtime controlled subagent spawning', () => {
     expect(compacted).toContain('Implement the immutable task.');
     expect(compacted).toContain('Preserve the acceptance criteria.');
     expect(compacted).not.toContain('derived member context');
+    const compactEvidence = (runtime as unknown as {
+      compactFileSynthesisEvidence: (
+        calls: Array<Record<string, unknown>>,
+        targetPath: string,
+        maxChars: number
+      ) => string;
+    }).compactFileSynthesisEvidence;
+    const verifierEvidence = compactEvidence.call(
+      runtime,
+      [{
+        toolName: 'fs.read',
+        params: { path: '.roy/official-verifier/grade.py' },
+        success: true,
+        result: {
+          path: '.roy/official-verifier/grade.py',
+          content: `${'head\n'.repeat(1_200)}UNIQUE_HIDDEN_ASSERTION\n${'tail\n'.repeat(1_200)}`,
+          truncated: false,
+        },
+      }],
+      'app.js',
+      30_000
+    );
+    expect(verifierEvidence).toContain('UNIQUE_HIDDEN_ASSERTION');
     await runtime.shutdown();
   });
 

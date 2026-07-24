@@ -367,6 +367,20 @@ class TruncatedMutationPlanningLLM extends PlanningLLM {
   }
 }
 
+class ProseVerifierInspectionPlanningLLM extends PlanningLLM {
+  constructor() {
+    super('none');
+  }
+
+  override async completeJSON<T>(): Promise<T> {
+    this.jsonCalls += 1;
+    throw new Error([
+      'Failed to parse JSON response: We need to inspect the hidden verifier group.',
+      'Search .roy/official-verifier/grade.py for G_hidden_wrapper_schema before the focused repair.',
+    ].join('\n'));
+  }
+}
+
 class RecoverableTruncatedWritePlanningLLM extends PlanningLLM {
   constructor(private readonly content = 'first line\\nsecond line\\nthird partial') {
     super('none');
@@ -1401,9 +1415,58 @@ describe('UnifiedAgent capability execution', () => {
     expect(retrySystemPrompt).toContain('use fs.replace');
     expect(retryPrompt).toContain('Causal observations');
     expect(retryPrompt).not.toContain('Authorized tools:');
-    expect(llm.optionsByAttempt[0]?.maxTokens).toBe(8192);
-    expect(llm.optionsByAttempt[1]?.maxTokens).toBe(8192);
+    expect(llm.optionsByAttempt[0]?.maxTokens).toBe(2048);
+    expect(llm.optionsByAttempt[1]?.maxTokens).toBe(2048);
     expect(agent.getLastToolPlanningFailure()).toBeUndefined();
+  });
+
+  it('recovers a concrete verifier search from a non-JSON planning response', async () => {
+    const llm = new ProseVerifierInspectionPlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'prose-verifier-inspection-planner',
+      goal: 'inspect one hidden verifier group before a focused repair',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.read', 'fs.search', 'fs.replace'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: 'Repair src/table_recon/audit.py using the official verifier evidence.',
+      executionRequired: true,
+      round: 4,
+      remainingCalls: 2,
+      tools: [
+        { name: 'fs.read' },
+        { name: 'fs.search' },
+        { name: 'fs.replace' },
+      ],
+      calls: [{
+        toolName: 'fs.read',
+        params: { path: 'src/table_recon/audit.py' },
+        reason: 'Inspect the target.',
+        groundingRequired: true,
+        success: true,
+        result: {
+          path: 'src/table_recon/audit.py',
+          content: 'def run():\n    return 0\n',
+          startLine: 1,
+          endLine: 2,
+          totalLines: 2,
+          truncated: false,
+        },
+      }],
+    });
+
+    expect(llm.jsonCalls).toBe(1);
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.search',
+        params: expect.objectContaining({
+          path: '.roy/official-verifier/grade.py',
+          query: 'G_hidden_wrapper_schema',
+        }),
+      }),
+    ]);
   });
 
   it('executes a bounded prefix recovered from a truncated fs.write response', async () => {
@@ -1841,6 +1904,88 @@ describe('UnifiedAgent capability execution', () => {
         instructions: expect.stringContaining('aggregate official-verifier failures'),
       },
     })]);
+  });
+
+  it('does not repeat generic whole-file synthesis after a no-gain verifier rollback', async () => {
+    const llm = new CapturingToolPlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'rejected-candidate-repair-agent',
+      goal: 'choose a causally distinct focused repair',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.read', 'fs.replace', 'fs.synthesize', 'shell.exec'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: 'Repair src/table_recon/audit.py until the official verifier reward is 1.',
+      executionRequired: true,
+      round: 6,
+      remainingCalls: 3,
+      tools: [
+        { name: 'fs.read' },
+        { name: 'fs.replace' },
+        { name: 'fs.synthesize' },
+        { name: 'shell.exec' },
+      ],
+      calls: [
+        {
+          toolName: 'fs.read',
+          params: { path: '.roy/official-verifier/grade.py' },
+          reason: 'Inspect the hidden assertions.',
+          groundingRequired: true,
+          success: true,
+          result: {
+            path: '.roy/official-verifier/grade.py',
+            content: 'GROUPS = ["G_hidden_wrapper_schema"]',
+          },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/table_recon/audit.py' },
+          reason: 'Inspect the current implementation.',
+          groundingRequired: true,
+          success: true,
+          result: {
+            path: 'src/table_recon/audit.py',
+            content: 'def run():\n    return reconstruct_public()\n',
+          },
+        },
+        {
+          toolName: 'fs.synthesize',
+          params: {
+            path: 'src/table_recon/audit.py',
+            instructions: 'Structurally repair all aggregate hidden groups.',
+          },
+          reason: 'Try one broad candidate.',
+          groundingRequired: true,
+          success: true,
+        },
+        {
+          toolName: 'shell.exec',
+          params: { command: 'python .roy/official-verifier/grade.py' },
+          reason: 'Score the candidate.',
+          groundingRequired: true,
+          success: true,
+          result: {
+            exitCode: 0,
+            stdout: '0.055\n',
+            candidateRollback: {
+              restored: true,
+              path: 'src/table_recon/audit.py',
+              reason: 'no_objective_gain',
+              baselineReward: 0.055,
+              candidateReward: 0.055,
+            },
+          },
+        },
+      ],
+    });
+
+    expect(llm.jsonCalls).toBe(2);
+    expect(plans).toEqual([]);
+    const systemPrompt = llm.messages.find(message => message.role === 'system')?.content ?? '';
+    expect(systemPrompt).toContain('failed path');
+    expect(systemPrompt).toContain('Do not repeat the same broad synthesis');
   });
 
   it('prefers a focused repair when a local traceback exists alongside an aggregate score', async () => {

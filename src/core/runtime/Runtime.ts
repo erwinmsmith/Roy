@@ -45,6 +45,7 @@ import { actionRegistry } from '../actions/index.js';
 import {
   AgentToolExecutionLoop,
   completedWorkspaceReadCoversPlan,
+  effectiveWorkspaceMutationCallIndices,
   FsListTool,
   FsReadTool,
   FsReplaceTool,
@@ -52,6 +53,7 @@ import {
   FsSynthesizeTool,
   FsWriteTool,
   findParallelSourceMutation,
+  hasEffectiveWorkspaceMutationCall,
   isSuccessfulWorkspaceMutationCall,
   isSuccessfulWorkspaceVerificationCall,
   isWorkspaceVerificationCall,
@@ -742,6 +744,7 @@ interface WorkspaceMutationCheckpoint {
   path: string;
   previousContent: string;
   baseline?: VerifierScorecard;
+  candidateFingerprint: string;
   createdAt: number;
 }
 
@@ -2720,6 +2723,7 @@ export class Runtime {
       exitCode?: unknown;
       timedOut?: unknown;
       verifierDiagnostics?: unknown;
+      candidateRollback?: unknown;
       regressionRollback?: unknown;
     };
     const compactTail = (value: unknown, maxChars = 8_000): string | undefined => {
@@ -2736,6 +2740,7 @@ export class Runtime {
       stdout: compactTail(shell.stdout),
       stderr: compactTail(shell.stderr),
       verifierDiagnostics: shell.verifierDiagnostics,
+      candidateRollback: shell.candidateRollback,
       regressionRollback: shell.regressionRollback,
     };
   }
@@ -2816,6 +2821,14 @@ export class Runtime {
         path: normalizedPath,
         previousContent,
         baseline: this.latestVerifierScorecardFromCalls(groundingCalls),
+        candidateFingerprint: this.fingerprint({
+          toolName,
+          path: normalizedPath,
+          params,
+          previousContentHash: createHash('sha256')
+            .update(previousContent)
+            .digest('hex'),
+        }),
         createdAt: Date.now(),
       };
     } catch {
@@ -2880,7 +2893,7 @@ export class Runtime {
     if (!checkpoint || !checkpoint.baseline || !current) return toolResult;
     this.mutationCheckpointsByCorrelation.delete(correlationId);
     const baseline = checkpoint.baseline;
-    if (current.reward + 1e-12 >= baseline.reward) return toolResult;
+    if (current.reward > baseline.reward + 1e-12) return toolResult;
     const regressedGroups = Object.keys(baseline.groups)
       .filter(group => (current.groups[group] ?? 0) + 1e-12 < baseline.groups[group]!)
       .map(group => ({
@@ -2888,6 +2901,16 @@ export class Runtime {
         before: baseline.groups[group],
         after: current.groups[group] ?? 0,
       }));
+    const improvedGroups = Object.keys(current.groups)
+      .filter(group => (current.groups[group] ?? 0) > (baseline.groups[group] ?? 0) + 1e-12)
+      .map(group => ({
+        group,
+        before: baseline.groups[group] ?? 0,
+        after: current.groups[group],
+      }));
+    const reason = current.reward + 1e-12 < baseline.reward
+      ? 'reward_regression'
+      : 'no_objective_gain';
     const restored = await new FsWriteTool(this.workspaceRoot).execute({
       path: checkpoint.path,
       content: checkpoint.previousContent,
@@ -2899,7 +2922,7 @@ export class Runtime {
         ...toolResult,
         error: [
           toolResult.error,
-          `Verifier reward regressed from ${baseline.reward} to ${current.reward}, and rollback of ${checkpoint.path} failed: ${restored.error}`,
+          `Verifier candidate changed reward from ${baseline.reward} to ${current.reward} without objective improvement, and rollback of ${checkpoint.path} failed: ${restored.error}`,
         ].filter(Boolean).join('\n'),
       };
     }
@@ -2907,28 +2930,57 @@ export class Runtime {
     changed.add(checkpoint.path);
     this.changedPathsByCorrelation.set(correlationId, changed);
     this.emit({
-      type: 'workspace.mutation.regression_rolled_back',
+      type: 'workspace.mutation.candidate_rolled_back',
       agentId,
       correlationId,
       data: {
         path: checkpoint.path,
+        reason,
+        candidateFingerprint: checkpoint.candidateFingerprint,
         baselineReward: baseline.reward,
-        regressedReward: current.reward,
+        candidateReward: current.reward,
         regressedGroups,
+        improvedGroups,
         checkpointAgeMs: Date.now() - checkpoint.createdAt,
       },
     });
-    return {
-      ...toolResult,
-      result: {
-        ...(toolResult.result as Record<string, unknown>),
-        regressionRollback: {
-          restored: true,
+    if (reason === 'reward_regression') {
+      this.emit({
+        type: 'workspace.mutation.regression_rolled_back',
+        agentId,
+        correlationId,
+        data: {
           path: checkpoint.path,
           baselineReward: baseline.reward,
           regressedReward: current.reward,
           regressedGroups,
+          checkpointAgeMs: Date.now() - checkpoint.createdAt,
         },
+      });
+    }
+    const candidateRollback = {
+      restored: true,
+      path: checkpoint.path,
+      reason,
+      candidateFingerprint: checkpoint.candidateFingerprint,
+      baselineReward: baseline.reward,
+      candidateReward: current.reward,
+      regressedGroups,
+      improvedGroups,
+    };
+    return {
+      ...toolResult,
+      result: {
+        ...(toolResult.result as Record<string, unknown>),
+        candidateRollback,
+        ...(reason === 'reward_regression'
+          ? {
+            regressionRollback: {
+              ...candidateRollback,
+              regressedReward: current.reward,
+            },
+          }
+          : {}),
       },
     };
   }
@@ -4062,9 +4114,12 @@ export class Runtime {
         const read = call.result as { content?: unknown; truncated?: unknown } | undefined;
         const content = typeof read?.content === 'string' ? read.content : '';
         if (content) {
-          const compact = content.length <= 6_000
+          const perFileLimit = callPath.startsWith('.roy/official-verifier/')
+            ? 18_000
+            : 6_000;
+          const compact = content.length <= perFileLimit
             ? content
-            : `${content.slice(0, 4_000)}\n[runtime_compacted_file_middle]\n${content.slice(-2_000)}`;
+            : `${content.slice(0, Math.floor(perFileLimit * 0.67))}\n[runtime_compacted_file_middle]\n${content.slice(-Math.ceil(perFileLimit * 0.33))}`;
           section = `File ${callPath}${read?.truncated ? ' (observed prefix)' : ''}:\n${compact}`;
         }
       } else if (call.toolName === 'fs.list' && call.success) {
@@ -4084,6 +4139,7 @@ export class Runtime {
           stderr?: unknown;
           exitCode?: unknown;
           verifierDiagnostics?: unknown;
+          candidateRollback?: unknown;
           regressionRollback?: unknown;
         } | undefined;
         const output = [
@@ -4091,6 +4147,9 @@ export class Runtime {
           String(shell?.stderr ?? ''),
           shell?.verifierDiagnostics
             ? `Verifier diagnostics:\n${JSON.stringify(shell.verifierDiagnostics)}`
+            : '',
+          shell?.candidateRollback
+            ? `Rejected verifier candidate:\n${JSON.stringify(shell.candidateRollback)}`
             : '',
           shell?.regressionRollback
             ? `Regression rollback:\n${JSON.stringify(shell.regressionRollback)}`
@@ -9220,8 +9279,14 @@ export class Runtime {
       } else if (semanticVerificationFailure) {
         failedTools.add(toolName);
         const verifierDiagnostics = (
-          result as { verifierDiagnostics?: unknown }
+          result as {
+            verifierDiagnostics?: unknown;
+            candidateRollback?: unknown;
+          }
         ).verifierDiagnostics;
+        const candidateRollback = (
+          result as { candidateRollback?: unknown }
+        ).candidateRollback;
         addFeedback(
           'tool_failure',
           [
@@ -9229,6 +9294,9 @@ export class Runtime {
             verifierDiagnostics
               ? JSON.stringify(verifierDiagnostics)
               : JSON.stringify(result).slice(-4_000),
+            candidateRollback
+              ? `The latest workspace candidate was restored and is a failed path: ${JSON.stringify(candidateRollback)}`
+              : '',
           ].join(' '),
           { actorId: message.metadata?.agentId, toolName }
         );
@@ -15359,10 +15427,12 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     if (previousIndex < 0) return { skip: false };
     const previous = priorCalls[previousIndex]!;
     const laterCalls = priorCalls.slice(previousIndex + 1);
+    const effectiveLaterMutations = effectiveWorkspaceMutationCallIndices(laterCalls)
+      .map(index => laterCalls[index]!);
 
     if (plan.toolName === 'fs.read') {
       const target = this.normalizeToolWorkspacePath(String(plan.params.path ?? ''));
-      const invalidated = laterCalls.some(call =>
+      const invalidated = effectiveLaterMutations.some(call =>
         this.workspaceMutationTouchesPath(call, target)
       );
       return invalidated
@@ -15377,7 +15447,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
             .map(entry => this.normalizeToolWorkspacePath(entry))
           : []
       );
-      const structureInvalidated = laterCalls.some(call => {
+      const structureInvalidated = effectiveLaterMutations.some(call => {
         if (!call.success) return false;
         if (call.toolName === 'fs.replace') return false;
         if (call.toolName === 'fs.write' || call.toolName === 'fs.synthesize') {
@@ -15393,7 +15463,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     }
     if (plan.toolName === 'fs.search') {
       const searchRoot = this.normalizeToolWorkspacePath(String(plan.params.path ?? '.'));
-      const invalidated = laterCalls.some(call =>
+      const invalidated = effectiveLaterMutations.some(call =>
         this.workspaceMutationTouchesPath(call, searchRoot, true)
       );
       return invalidated
@@ -15405,9 +15475,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         (previous.result as { timedOut?: unknown } | undefined)?.timedOut
       );
       if (timedOut) return { skip: false };
-      const mutationAfterPrevious = laterCalls.some(call =>
-        isSuccessfulWorkspaceMutationCall(call)
-      );
+      const mutationAfterPrevious = effectiveLaterMutations.length > 0;
       return mutationAfterPrevious
         ? { skip: false }
         : {
@@ -16230,7 +16298,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
   }
 
   private hasSuccessfulWorkspaceMutation(calls: ToolCallRecord[]): boolean {
-    return calls.some(call => isSuccessfulWorkspaceMutationCall(call));
+    return hasEffectiveWorkspaceMutationCall(calls);
   }
 
   private hasSuccessfulWorkspaceVerification(calls: ToolCallRecord[]): boolean {
@@ -16242,10 +16310,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     acceptanceAudit?: WorkspaceAcceptanceAudit,
     acceptanceAuditRequired = false
   ): WorkspaceExecutionClosureStatus {
-    let lastMutationCallIndex = -1;
-    for (let index = 0; index < calls.length; index += 1) {
-      if (isSuccessfulWorkspaceMutationCall(calls[index]!)) lastMutationCallIndex = index;
-    }
+    const lastMutationCallIndex = effectiveWorkspaceMutationCallIndices(calls).at(-1) ?? -1;
     const verificationCalls = calls
       .map((call, index) => ({ call, index }))
       .filter(item => item.index >= lastMutationCallIndex && isWorkspaceVerificationCall(item.call));

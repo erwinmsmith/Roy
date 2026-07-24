@@ -11,6 +11,16 @@ export interface ParallelSourceMutation {
   packageName: string;
 }
 
+export interface WorkspaceCandidateRollback {
+  restored: boolean;
+  path?: string;
+  reason?: string;
+  baselineReward?: number;
+  candidateReward?: number;
+  regressedReward?: number;
+  candidateFingerprint?: string;
+}
+
 export function workspaceToolIntentFingerprint(
   call: Pick<ExecutionIntentCall, 'toolName' | 'params'>
 ): string {
@@ -113,6 +123,88 @@ export function isSuccessfulWorkspaceMutationCall(call: ExecutionIntentCall): bo
     return true;
   }
   return extractRedirectionTargets(command).some(target => !isNonWorkspaceOutputTarget(target));
+}
+
+/**
+ * Return the mutation calls whose workspace effects are still present.
+ *
+ * A verifier can transactionally restore the source snapshot that preceded a
+ * candidate. The original mutation remains useful trace evidence, but it must
+ * not invalidate cached reads, extend a convergence horizon, or satisfy the
+ * mutation side of execution closure after its effects have been rolled back.
+ */
+export function effectiveWorkspaceMutationCallIndices(
+  calls: ExecutionIntentCall[]
+): number[] {
+  const effective: number[] = [];
+  for (let index = 0; index < calls.length; index += 1) {
+    const call = calls[index]!;
+    if (isSuccessfulWorkspaceMutationCall(call)) {
+      effective.push(index);
+      continue;
+    }
+    const rollback = workspaceCandidateRollbackFromCall(call);
+    if (!rollback?.restored || effective.length === 0) continue;
+    const rollbackPath = normalizeWorkspaceRelativePath(String(rollback.path ?? ''));
+    let matchedPosition = -1;
+    for (let position = effective.length - 1; position >= 0; position -= 1) {
+      const mutation = calls[effective[position]!]!;
+      if (!rollbackPath || mutation.toolName === 'shell.exec') {
+        matchedPosition = position;
+        break;
+      }
+      const mutationPath = normalizeWorkspaceRelativePath(String(mutation.params.path ?? ''));
+      if (mutationPath === rollbackPath) {
+        matchedPosition = position;
+        break;
+      }
+    }
+    if (matchedPosition >= 0) effective.splice(matchedPosition, 1);
+  }
+  return effective;
+}
+
+export function hasEffectiveWorkspaceMutationCall(
+  calls: ExecutionIntentCall[]
+): boolean {
+  return effectiveWorkspaceMutationCallIndices(calls).length > 0;
+}
+
+export function lastEffectiveWorkspaceMutationCallIndex(
+  calls: ExecutionIntentCall[]
+): number {
+  return effectiveWorkspaceMutationCallIndices(calls).at(-1) ?? -1;
+}
+
+export function workspaceCandidateRollbackFromCall(
+  call: ExecutionIntentCall
+): WorkspaceCandidateRollback | undefined {
+  if (!call.result || typeof call.result !== 'object') return undefined;
+  const result = call.result as {
+    candidateRollback?: unknown;
+    regressionRollback?: unknown;
+  };
+  const value = result.candidateRollback ?? result.regressionRollback;
+  if (!value || typeof value !== 'object') return undefined;
+  const rollback = value as Record<string, unknown>;
+  if (rollback.restored !== true) return undefined;
+  return {
+    restored: true,
+    path: typeof rollback.path === 'string' ? rollback.path : undefined,
+    reason: typeof rollback.reason === 'string' ? rollback.reason : undefined,
+    baselineReward: typeof rollback.baselineReward === 'number'
+      ? rollback.baselineReward
+      : undefined,
+    candidateReward: typeof rollback.candidateReward === 'number'
+      ? rollback.candidateReward
+      : undefined,
+    regressedReward: typeof rollback.regressedReward === 'number'
+      ? rollback.regressedReward
+      : undefined,
+    candidateFingerprint: typeof rollback.candidateFingerprint === 'string'
+      ? rollback.candidateFingerprint
+      : undefined,
+  };
 }
 
 export function isSuccessfulWorkspaceVerificationCall(call: ExecutionIntentCall): boolean {
