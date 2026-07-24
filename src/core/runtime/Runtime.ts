@@ -11878,7 +11878,43 @@ Produce the final response to the user as Roy, the root agent.`;
       );
     } catch (error) {
       this.releaseTeamSynthesisBudget(team.identity.id, allocation, correlationId, 'team_synthesis_failed');
-      throw error;
+      const message = error instanceof Error ? error.message : String(error);
+      this.emit({
+        type: 'team.synthesis.recovered',
+        agentId: team.identity.id,
+        sessionId: ctx.sessionId,
+        correlationId,
+        data: {
+          teamId: team.identity.id,
+          reason: 'llm_synthesis_failed',
+          error: message.slice(0, 1000),
+          recovery: 'deterministic_member_aggregation',
+          completedMembers: members.length,
+          failedMembers: failures.length,
+        },
+      });
+      this.emit({
+        type: 'team.synthesis.completed',
+        agentId: team.identity.id,
+        sessionId: ctx.sessionId,
+        correlationId,
+        data: {
+          teamId: team.identity.id,
+          totalTokens: 0,
+          limited: true,
+          reason: 'llm_synthesis_failed',
+        },
+      });
+      return {
+        content: this.buildTeamSynthesisFallback(
+          team,
+          task,
+          orderedMembers,
+          failures,
+          `llm_synthesis_failed: ${message.slice(0, 240)}`
+        ),
+        usage: this.zeroTokenUsage(),
+      };
     }
     let content = completion.content;
     if (!content.trim()) {

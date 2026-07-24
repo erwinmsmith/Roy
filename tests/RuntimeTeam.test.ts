@@ -89,6 +89,18 @@ class EmptyVisibleTeamSynthesisLLM extends TeamTestLLM {
   }
 }
 
+class FailedTeamSynthesisLLM extends TeamTestLLM {
+  override async *stream(messages: LLMMessage[]): AsyncGenerator<LLMStreamChunk, void, unknown> {
+    const systemPrompt = messages.find(message => message.role === 'system')?.content ?? '';
+    if (systemPrompt.includes('formal subteam actor')) {
+      const error = new Error('Request timed out after 120000ms') as Error & { code: string };
+      error.code = 'ETIMEDOUT';
+      throw error;
+    }
+    yield* super.stream(messages);
+  }
+}
+
 class CapacityBurnTeamLLM extends TeamTestLLM {
   override async *stream(messages: LLMMessage[]): AsyncGenerator<LLMStreamChunk, void, unknown> {
     const prompt = messages.map(message => message.content).join('\n');
@@ -361,6 +373,44 @@ describe('Phase 3 subteam runtime', () => {
     expect(result.result).toContain('# FallbackTeam Result');
     expect(result.result).toContain('Summarizer produced a concise evidence-based report.');
     expect(runtime.getEvents().some(event => event.type === 'team.synthesis.fallback')).toBe(true);
+    await runtime.shutdown();
+  });
+
+  it('preserves completed member reports when team synthesis requests time out', async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), 'roy-phase3-team-synthesis-timeout-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'phase3-team-synthesis-timeout',
+      workspaceCwd: cwd,
+      llmProvider: new FailedTeamSynthesisLLM(),
+      workspaceConfig: {
+        llm: {
+          streamMaxAttempts: 1,
+          retryInitialDelayMs: 0,
+          retryMaxDelayMs: 0,
+        },
+      },
+    });
+    const team = await runtime.spawnTeam({
+      name: 'TimeoutRecoveryTeam',
+      description: 'Preserve member reports when synthesis exceeds its request deadline.',
+      members: [{ archetype: 'summarizer', task: 'Summarize the bounded input.' }],
+    });
+
+    const result = await runtime.runTeam(team.identity.id, 'Summarize the bounded input.');
+
+    expect(result.team.status).toBe('done');
+    expect(result.result).toContain('[runtime_team_synthesis_fallback]');
+    expect(result.result).toContain('llm_synthesis_failed');
+    expect(result.result).toContain('Summarizer produced a concise evidence-based report.');
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'team.synthesis.recovered',
+      agentId: team.identity.id,
+      data: expect.objectContaining({
+        reason: 'llm_synthesis_failed',
+        recovery: 'deterministic_member_aggregation',
+      }),
+    }));
     await runtime.shutdown();
   });
 

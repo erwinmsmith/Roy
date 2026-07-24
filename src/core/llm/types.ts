@@ -128,6 +128,10 @@ export interface ProviderConfig {
   model?: string;
   temperature?: number;
   maxTokens?: number;
+  /** End-to-end deadline for one provider HTTP request. */
+  timeoutMs?: number;
+  /** Provider-internal retries. Runtime orchestration normally owns retries. */
+  maxRetries?: number;
 }
 
 /**

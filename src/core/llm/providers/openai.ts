@@ -30,6 +30,8 @@ export class OpenAIProvider implements LLMProvider {
       this.client = new OpenAI({
         apiKey: this.config.apiKey,
         baseURL: this.config.baseUrl,
+        timeout: this.config.timeoutMs ?? 120_000,
+        maxRetries: this.config.maxRetries ?? 0,
       });
     }
   }
@@ -227,6 +229,14 @@ export function createOpenAIProvider(): LLMProvider {
     apiKey: apiKey || undefined,
     baseUrl: baseUrl || undefined,
     model: model || undefined,
+    timeoutMs: readPositiveInteger(
+      process.env.OPENAI_REQUEST_TIMEOUT_MS ?? process.env.ROY_LLM_REQUEST_TIMEOUT_MS,
+      120_000
+    ),
+    maxRetries: readNonNegativeInteger(
+      process.env.OPENAI_PROVIDER_MAX_RETRIES ?? process.env.ROY_LLM_PROVIDER_MAX_RETRIES,
+      0
+    ),
   });
 }
 
@@ -238,5 +248,23 @@ export function createDeepSeekProvider(): LLMProvider {
     apiKey: process.env.DEEPSEEK_API_KEY || undefined,
     baseUrl: process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com',
     model: process.env.DEFAULT_MODEL || 'deepseek-v4-flash',
+    timeoutMs: readPositiveInteger(
+      process.env.DEEPSEEK_REQUEST_TIMEOUT_MS ?? process.env.ROY_LLM_REQUEST_TIMEOUT_MS,
+      120_000
+    ),
+    maxRetries: readNonNegativeInteger(
+      process.env.DEEPSEEK_PROVIDER_MAX_RETRIES ?? process.env.ROY_LLM_PROVIDER_MAX_RETRIES,
+      0
+    ),
   });
+}
+
+function readPositiveInteger(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function readNonNegativeInteger(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : fallback;
 }
