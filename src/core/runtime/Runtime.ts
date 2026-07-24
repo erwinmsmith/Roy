@@ -1923,6 +1923,10 @@ export class Runtime {
       });
     }
     const membersBefore = new Set(team.memberAgentIds);
+    const memberSkills = Array.from(new Set([
+      ...(spec.skills ?? this.getDefaultSkillBindings(spec.archetype).map(binding => binding.name)),
+      ...(recursiveDelegation ? ['delegate_to_subagent'] : []),
+    ])).filter(skill => recursiveDelegation || skill !== 'delegate_to_subagent');
     let execution: Awaited<ReturnType<Runtime['createAgentComputeNode']>>;
     try {
       execution = await this.createAgentComputeNode({
@@ -1933,7 +1937,7 @@ export class Runtime {
         role: spec.role,
         style: spec.style,
         tools: spec.tools,
-        skills: spec.skills,
+        skills: memberSkills,
         budgetTokens: spec.budgetTokens,
         tomProfile: spec.tomProfile ?? (spec.tomLevel === undefined
           ? undefined
@@ -3311,7 +3315,7 @@ export class Runtime {
       maxChildren: delegation?.maxChildrenPerParent ?? 5,
       maxDepth: delegation?.maxDepth ?? 3,
       maxTotalAgentsPerTurn: delegation?.maxTotalAgentsPerTurn ?? 10,
-      allowCustomAgents: isRoot && (delegation?.allowCustomAgents ?? true),
+      allowCustomAgents: delegation?.allowCustomAgents ?? true,
       budgetAware: delegation?.budgetAware ?? true,
       allowedStates: isRoot
         ? ['S_solo', 'S_delegate_planning', 'S_spawn_subagents']
@@ -5026,6 +5030,10 @@ export class Runtime {
       this.getDefaultSpawnPolicy('subagent', request.archetype),
       { ...cachedSpawnPolicy, ...request.spawnPolicy }
     );
+    if (request.spawnPolicy?.canSpawn === undefined
+      && skills.includes('delegate_to_subagent')) {
+      requestedSpawnPolicy.canSpawn = true;
+    }
     const spawnPolicy = this.constrainChildSpawnPolicy(parentId, requestedSpawnPolicy, skills);
     const agentPatternId = typeof cachedAgentPattern?.id === 'string' ? cachedAgentPattern.id : undefined;
     const delegationPatternId = typeof cachedDelegationPattern?.id === 'string' ? cachedDelegationPattern.id : undefined;

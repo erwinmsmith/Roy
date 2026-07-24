@@ -102,6 +102,35 @@ class CapacityBurnTeamLLM extends TeamTestLLM {
   }
 }
 
+class RecursiveCustomTeamLLM extends TeamTestLLM {
+  private delegated = false;
+
+  override async completeJSON<T>(messages: LLMMessage[]): Promise<T> {
+    const prompt = messages.map(message => message.content).join('\n');
+    if (prompt.includes('If no tool is needed, return {"action":"none"')) {
+      return { action: 'none', params: {} } as T;
+    }
+    if (prompt.includes('delegation controller') && !this.delegated) {
+      this.delegated = true;
+      return {
+        action: 'spawn_subagents',
+        reason: 'A task-specific child should independently check the bounded semantic result.',
+        continuationPolicy: 'finalize_after_round',
+        agents: [{
+          archetype: 'custom',
+          name: 'NestedSemanticChecker',
+          role: 'nested semantic checker',
+          task: 'Check the supplied bounded semantic result and return one correction.',
+          tools: [],
+          skills: [],
+          existenceReason: 'Close the parent member verification gap.',
+        }],
+      } as T;
+    }
+    return { action: 'solve_directly', reason: 'The bounded actor can finish directly.' } as T;
+  }
+}
+
 describe('Phase 3 subteam runtime', () => {
   it('enforces the formal team FSM', () => {
     const registry = new TeamRegistry();
@@ -267,6 +296,47 @@ describe('Phase 3 subteam runtime', () => {
       event.type === 'spawn.policy.rejected'
       && event.data?.reason === 'max_children_exceeded'
     )).toBe(false);
+    await runtime.shutdown();
+  });
+
+  it('lets an allowed custom team member create a custom second-generation child', async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), 'roy-team-recursive-custom-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'team-recursive-custom',
+      workspaceCwd: cwd,
+      llmProvider: new RecursiveCustomTeamLLM(),
+    });
+
+    const team = await runtime.spawnTeam({
+      name: 'RecursiveSemanticTeam',
+      description: 'Validate team-first recursive custom delegation.',
+      members: [{
+        archetype: 'custom',
+        name: 'SemanticLead',
+        task: 'Produce a bounded semantic result and delegate one independent check.',
+        skills: [],
+      }],
+    });
+    await runtime.runTeam(team.identity.id, 'Produce and independently check the semantic result.');
+
+    const spawned = runtime.getEvents().filter(event => event.type === 'agent.spawned');
+    const lead = spawned.find(event => event.data?.name === 'SemanticLead');
+    const nested = spawned.find(event => event.data?.name === 'NestedSemanticChecker');
+    expect(lead?.agentId).toBeTruthy();
+    expect(nested?.data?.parentId).toBe(lead?.agentId);
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'agent.create.approved',
+      agentId: 'root',
+      data: expect.objectContaining({
+        skills: expect.arrayContaining(['delegate_to_subagent']),
+      }),
+    }));
+    expect(runtime.getEvents().some(event =>
+      event.type === 'delegation.decision'
+      && event.agentId === lead?.agentId
+      && event.data?.action === 'spawn_subagents'
+    )).toBe(true);
     await runtime.shutdown();
   });
 
