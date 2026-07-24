@@ -618,6 +618,7 @@ describe('UnifiedAgent capability execution', () => {
     const firstSystemPrompt = llm.messagesByAttempt[0]
       ?.find(message => message.role === 'system')?.content ?? '';
     expect(firstSystemPrompt).toContain('Limit one fs.write/fs.replace payload to 6000 characters');
+    expect(firstSystemPrompt).toContain('Do not embed multiline source');
     const retryPrompt = llm.messagesByAttempt[1]
       ?.findLast(message => message.role === 'user')?.content ?? '';
     expect(retryPrompt).toContain('one complete compact JSON object');
