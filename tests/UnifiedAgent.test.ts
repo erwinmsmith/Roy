@@ -313,6 +313,27 @@ class CapturingToolPlanningLLM extends PlanningLLM {
   }
 }
 
+class AggregateVerifierSearchPlanningLLM extends PlanningLLM {
+  constructor() {
+    super('none');
+  }
+
+  override async completeJSON<T>(): Promise<T> {
+    this.jsonCalls += 1;
+    return {
+      action: 'call_tools',
+      reason: 'Keep searching the verifier instead of repairing.',
+      calls: [{
+        toolName: 'fs.search',
+        params: {
+          path: '.roy/official-verifier/grade.py',
+          query: 'G_hidden_end_to_end_stress',
+        },
+      }],
+    } as T;
+  }
+}
+
 class WrongRepairTargetPlanningLLM extends PlanningLLM {
   constructor() {
     super('none');
@@ -1842,13 +1863,13 @@ describe('UnifiedAgent capability execution', () => {
   });
 
   it('allows one grounded structural synthesis for an aggregate official-verifier failure', async () => {
-    const llm = new CapturingToolPlanningLLM();
+    const llm = new AggregateVerifierSearchPlanningLLM();
     const agent = new UnifiedAgent({
       name: 'aggregate-verifier-repair-agent',
       goal: 'repair broad hidden capability gaps after reading the official verifier',
       llm,
       mode: 'hybrid',
-      allowedTools: ['fs.read', 'fs.replace', 'fs.synthesize', 'shell.exec'],
+      allowedTools: ['fs.read', 'fs.search', 'fs.replace', 'fs.synthesize', 'shell.exec'],
     });
 
     const plans = await agent.planNextToolRound({
@@ -1858,6 +1879,7 @@ describe('UnifiedAgent capability execution', () => {
       remainingCalls: 3,
       tools: [
         { name: 'fs.read' },
+        { name: 'fs.search' },
         { name: 'fs.replace' },
         { name: 'fs.synthesize' },
         { name: 'shell.exec' },
@@ -1880,6 +1902,7 @@ describe('UnifiedAgent capability execution', () => {
           result: {
             path: '.roy/official-verifier/grade.py',
             content: 'GROUPS = ["hidden_wrapper", "layout_qc", "end_to_end_stress"]',
+            truncated: false,
           },
         },
         {
@@ -1891,6 +1914,7 @@ describe('UnifiedAgent capability execution', () => {
           result: {
             path: 'src/table_recon/audit.py',
             content: 'def run_audit(manifest, outputs):\n    return reconstruct_public(manifest, outputs)\n',
+            truncated: false,
           },
         },
       ],

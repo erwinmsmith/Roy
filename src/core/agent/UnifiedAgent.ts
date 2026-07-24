@@ -137,6 +137,12 @@ export class UnifiedAgent extends BaseAgent {
           || call.toolName === 'fs.search'
         )
       );
+    const aggregateVerifierEvidenceReady = latestVerificationFailed
+      && aggregateVerifierEvidenceIsReadyForRepair(
+        input.calls,
+        input.task,
+        lastVerificationIndex
+      );
     const successfulInspection = input.calls.some(call =>
       call.success && (
         call.toolName === 'fs.list'
@@ -191,7 +197,9 @@ export class UnifiedAgent extends BaseAgent {
             : '',
           executionRequired && latestVerificationFailed
             ? inspectedAfterLatestFailure
-              ? 'The newest verification failed after the latest mutation. Apply a focused fs.replace repair now unless a distinct task-relevant input, rule, test, or source file has not yet been read; batch only those novel reads and never repeat broad discovery. Do not regenerate a complete existing implementation with fs.synthesize for a localized traceback unless concrete evidence requires a structural rewrite.'
+              ? aggregateVerifierEvidenceReady
+                ? 'The newest aggregate verifier failure, complete verifier source, and current implementation source are grounded. Evidence collection is complete: request a preserving structural repair now. Do not read or search the verifier again.'
+                : 'The newest verification failed after the latest mutation. Apply a focused fs.replace repair now unless a distinct task-relevant input, rule, test, or source file has not yet been read; batch only those novel reads and never repeat broad discovery. Do not regenerate a complete existing implementation with fs.synthesize for a localized traceback unless concrete evidence requires a structural rewrite.'
               : 'The newest verification failed after the latest mutation. Preserve its detailed causal frontier and inspect only the reported source location before applying a focused repair.'
             : '',
           latestCandidateRollback(input.calls)
@@ -234,6 +242,7 @@ export class UnifiedAgent extends BaseAgent {
             verificationPassed,
             latestVerificationFailed,
             inspectedAfterLatestFailure,
+            aggregateVerifierEvidenceReady,
           })}`,
           `Authorized tools:\n${JSON.stringify(
             input.tools.map(compactToolDefinitionForPlanning),
@@ -323,6 +332,7 @@ export class UnifiedAgent extends BaseAgent {
                       verificationPassed,
                       latestVerificationFailed,
                       inspectedAfterLatestFailure,
+                      aggregateVerifierEvidenceReady,
                     })}`,
                     `Causal observations:\n${JSON.stringify(observations.slice(-4), null, 2)}`,
                     `Malformed prior response tail:\n${compactTail(
@@ -371,6 +381,8 @@ export class UnifiedAgent extends BaseAgent {
             );
             plannedCalls = focusedRepairs.length > 0
               ? [focusedRepairs[0]!]
+              : aggregateVerifierEvidenceReady
+                ? []
               : localizedFailure
                 ? novelExplicitReads
                 : plannedCalls.filter(call =>
@@ -456,7 +468,9 @@ export class UnifiedAgent extends BaseAgent {
               latestVerificationFailed && inspectedAfterLatestFailure
                 ? rejectedDestructiveRepairOverwrite
                   ? 'The latest verifier failure concerns an existing file. Preserve working code: use fs.replace for a focused repair instead of overwriting that file, then verify.'
-                  : 'The latest verifier failure is grounded. Request a focused repair, or batch only distinct task-relevant files that are still genuinely necessary before repairing.'
+                  : aggregateVerifierEvidenceReady
+                    ? 'The aggregate verifier and current implementation are fully grounded. Stop inspecting and request a preserving structural repair now.'
+                    : 'The latest verifier failure is grounded. Request a focused repair, or batch only distinct task-relevant files that are still genuinely necessary before repairing.'
                 : '',
               mutationRequirementSatisfied && !verificationPassed && !latestVerificationFailed
                 ? 'Finish, read-only, masked-failure, and repeated plans are insufficient. Request a concrete remaining edit or repair, or a distinct verification command whose exit status is preserved.'
@@ -1374,6 +1388,45 @@ function hasLocalizedVerificationFailureSinceLastMutation(
     && !isSuccessfulWorkspaceVerification(call)
     && verificationFailureIsLocalized(call)
   );
+}
+
+function aggregateVerifierEvidenceIsReadyForRepair(
+  calls: ToolLoopCallRecord[],
+  task: string,
+  latestVerificationIndex: number
+): boolean {
+  if (latestVerificationIndex < 0
+    || verificationFailureIsLocalized(calls[latestVerificationIndex]!)) {
+    return false;
+  }
+  const candidatePaths = new Set(
+    rankGroundedSynthesisTargets(calls, task).map(candidate => candidate.filePath)
+  );
+  const readsAfterFailure = calls.slice(latestVerificationIndex + 1).filter(call => {
+    if (!call.success || call.toolName !== 'fs.read') return false;
+    const result = call.result as {
+      content?: unknown;
+      truncated?: unknown;
+    } | undefined;
+    return typeof result?.content === 'string' && result.truncated !== true;
+  });
+  const verifierObserved = readsAfterFailure.some(call => {
+    const filePath = normalizePlannedWorkspacePath(String(
+      (call.result as { path?: unknown } | undefined)?.path
+        ?? call.params.path
+        ?? ''
+    ));
+    return filePath.startsWith('.roy/official-verifier/');
+  });
+  const implementationObserved = readsAfterFailure.some(call => {
+    const filePath = normalizePlannedWorkspacePath(String(
+      (call.result as { path?: unknown } | undefined)?.path
+        ?? call.params.path
+        ?? ''
+    ));
+    return candidatePaths.has(filePath);
+  });
+  return verifierObserved && implementationObserved;
 }
 
 function recoverPostMutationVerificationPlan(input: {
