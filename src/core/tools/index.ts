@@ -1,13 +1,21 @@
 // Tools module exports
 
 export { toolRegistry, registerTool } from './registry.js';
-export { FsListTool, FsReadTool, FsReplaceTool, FsSearchTool, FsWriteTool } from './fsTools.js';
+export {
+  FsListTool,
+  FsReadTool,
+  FsReplaceTool,
+  FsSearchTool,
+  FsSynthesizeTool,
+  FsWriteTool,
+} from './fsTools.js';
 export type {
   FsListResult,
   FsReadResult,
   FsReplaceResult,
   FsSearchMatch,
   FsSearchResult,
+  FsSynthesizeResult,
   FsWriteResult,
 } from './fsTools.js';
 export { ShellExecTool } from './shellExec.js';

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Runtime from '../src/core/runtime/Runtime.js';
@@ -110,6 +110,45 @@ class CapturingStreamLLM extends EchoLLM {
       content: 'Completed the assigned bounded task.',
       done: true,
       usage: { promptTokens: 20, completionTokens: 6, totalTokens: 26 },
+    };
+  }
+}
+
+class FileSynthesisLLM extends EchoLLM {
+  readonly streamedPrompts: string[] = [];
+
+  override async completeJSON<T>(messages: LLMMessage[]): Promise<T> {
+    const prompt = messages.map(message => message.content).join('\n');
+    if (prompt.includes('"toolName":"fs.synthesize"')
+      || prompt.includes('"toolName": "fs.synthesize"')) {
+      return {
+        action: 'call_tools',
+        reason: 'Verify the synthesized implementation.',
+        calls: [{ toolName: 'shell.exec', params: { command: 'npm test' } }],
+      } as T;
+    }
+    return {
+      action: 'call_tools',
+      reason: 'Generate the complete implementation outside structured tool JSON.',
+      calls: [{
+        toolName: 'fs.synthesize',
+        params: {
+          path: 'app.js',
+          instructions: 'Replace the stub with the complete assigned implementation.',
+        },
+      }],
+    } as T;
+  }
+
+  override async *stream(messages: LLMMessage[]): AsyncGenerator<LLMStreamChunk, void, unknown> {
+    const prompt = messages.map(message => message.content).join('\n');
+    this.streamedPrompts.push(prompt);
+    yield {
+      content: prompt.includes('[runtime_workspace_file_synthesis]')
+        ? 'export function value() { return 42; }\n'
+        : 'Implemented app.js and verified it with npm test.',
+      done: true,
+      usage: { promptTokens: 40, completionTokens: 12, totalTokens: 52 },
     };
   }
 }
@@ -258,6 +297,78 @@ describe('Runtime controlled subagent spawning', () => {
       type: 'agent.run.completed',
       agentId: coder.identity.id,
     }));
+    await runtime.shutdown();
+  });
+
+  it('synthesizes an observed source file through a separate payload channel and verifies it', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-file-synthesis-'));
+    await writeFile(path.join(workspaceCwd, 'app.js'), 'throw new Error("stub");\n');
+    await writeFile(
+      path.join(workspaceCwd, 'package.json'),
+      JSON.stringify({
+        name: 'runtime-file-synthesis-test',
+        type: 'module',
+        scripts: { test: 'node --check app.js' },
+      })
+    );
+    await mkdir(path.join(workspaceCwd, '.roy'), { recursive: true });
+    await writeFile(
+      path.join(workspaceCwd, '.roy', 'config.json'),
+      JSON.stringify({
+        tools: {
+          approval: {
+            write: 'auto',
+            execute: 'auto',
+          },
+        },
+      })
+    );
+    const llm = new FileSynthesisLLM();
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'file-synthesis-test',
+      llmProvider: llm,
+      workspaceCwd,
+    });
+    const coder = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'coder',
+      name: 'SynthesisCoder-1',
+      description: 'Implement one observed source file and verify it.',
+      task: 'Inspect and implement app.js, then verify it with npm test.',
+      tools: ['fs.read', 'fs.synthesize', 'shell.exec'],
+    });
+
+    const grounding = await (runtime as unknown as {
+      runGroundingCheck: (
+        agentId: string,
+        task: string,
+        options: Record<string, unknown>
+      ) => Promise<{ toolCalls: Array<{ toolName: string; success: boolean }> }>;
+    }).runGroundingCheck(
+      coder.identity.id,
+      'Inspect and implement app.js, then verify it with npm test.',
+      { archetype: 'coder', correlationId: 'file-synthesis-correlation' }
+    );
+
+    expect(grounding.toolCalls).toEqual(expect.arrayContaining([
+      expect.objectContaining({ toolName: 'fs.read', success: true }),
+      expect.objectContaining({ toolName: 'fs.synthesize', success: true }),
+      expect.objectContaining({ toolName: 'shell.exec', success: true }),
+    ]));
+    expect(await readFile(path.join(workspaceCwd, 'app.js'), 'utf8')).toBe(
+      'export function value() { return 42; }\n'
+    );
+    const synthesisPrompt = llm.streamedPrompts.find(prompt =>
+      prompt.includes('[runtime_workspace_file_synthesis]')
+    ) ?? '';
+    expect(synthesisPrompt).toContain('Current target snapshot');
+    expect(synthesisPrompt).toContain('throw new Error("stub")');
+    expect(synthesisPrompt.length).toBeLessThan(70_000);
+    expect(runtime.getEvents().map(event => event.type)).toEqual(expect.arrayContaining([
+      'tool.synthesis.started',
+      'tool.synthesis.completed',
+    ]));
     await runtime.shutdown();
   });
 

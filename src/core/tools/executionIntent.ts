@@ -95,7 +95,9 @@ export function taskRequestsWorkspaceMutation(task: string): boolean {
 
 export function isSuccessfulWorkspaceMutationCall(call: ExecutionIntentCall): boolean {
   if (!call.success) return false;
-  if (call.toolName === 'fs.write' || call.toolName === 'fs.replace') return true;
+  if (call.toolName === 'fs.write'
+    || call.toolName === 'fs.replace'
+    || call.toolName === 'fs.synthesize') return true;
   if (call.toolName !== 'shell.exec') return false;
   const command = String(call.params.command ?? '');
   if (/(?:^|[;&|]\s*)(?:apply_patch|touch|mkdir|cp|mv|rm|install|chmod|truncate|git\s+apply|npm\s+(?:install|uninstall)|pnpm\s+(?:add|remove|install)|yarn\s+(?:add|remove|install)|uv\s+(?:add|remove)|sed\s+-i|perl\s+-pi)\b/i.test(command)) {
@@ -135,7 +137,9 @@ export function findParallelSourceMutation(
   call: Pick<ExecutionIntentCall, 'toolName' | 'params'>,
   observations: ExecutionIntentCall[]
 ): ParallelSourceMutation | undefined {
-  if (call.toolName !== 'fs.write' && call.toolName !== 'fs.replace') return undefined;
+  if (call.toolName !== 'fs.write'
+    && call.toolName !== 'fs.replace'
+    && call.toolName !== 'fs.synthesize') return undefined;
   const requestedPath = normalizeWorkspaceRelativePath(String(call.params.path ?? ''));
   if (!requestedPath || requestedPath.startsWith('/')) return undefined;
 

@@ -23,6 +23,8 @@ const TOOL_PERMISSIONS: Record<string, GenomeToolPolicy['permission']> = {
   'fs.list': 'read_only',
   'fs.read': 'read_only',
   'fs.write': 'write',
+  'fs.replace': 'write',
+  'fs.synthesize': 'write',
   'shell.exec': 'execute',
 };
 

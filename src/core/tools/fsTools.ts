@@ -47,6 +47,13 @@ export interface FsReplaceResult {
   endLine?: number;
 }
 
+export interface FsSynthesizeResult {
+  path: string;
+  bytes: number;
+  operation: 'create' | 'replace';
+  synthesized: true;
+}
+
 const DEFAULT_MAX_DEPTH = 2;
 const DEFAULT_MAX_BYTES = 80_000;
 const DEFAULT_SEARCH_RESULTS = 100;
@@ -252,6 +259,45 @@ export class FsWriteTool implements Tool {
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : String(error) };
     }
+  }
+}
+
+/**
+ * Runtime-mediated file synthesis metadata.
+ *
+ * The ordinary tool executor deliberately cannot execute this tool because the
+ * implementation payload is produced by the owning runtime agent. Keeping the
+ * planner payload limited to a path and concise instructions avoids embedding a
+ * large source file in structured tool-call JSON.
+ */
+export class FsSynthesizeTool implements Tool {
+  readonly name = 'fs.synthesize';
+  readonly description = 'Generate the complete contents of one already-inspected workspace file from grounded evidence. Pass only the path and concise implementation instructions; Runtime generates the source outside structured tool JSON and writes it transactionally.';
+  readonly version = '0.1.0';
+  readonly parameters = {
+    path: { type: 'string' as const, required: true, description: 'Relative file path inside the workspace. Inspect it or its parent first.' },
+    instructions: { type: 'string' as const, required: true, description: 'Concise implementation or repair requirements. Do not include the file contents.' },
+  };
+
+  validate(params: Record<string, unknown>): { valid: boolean; errors?: string[] } {
+    const errors: string[] = [];
+    if (typeof params.path !== 'string' || params.path.trim().length === 0) {
+      errors.push('path must be a non-empty string');
+    }
+    if (typeof params.instructions !== 'string' || params.instructions.trim().length === 0) {
+      errors.push('instructions must be a non-empty string');
+    }
+    if (typeof params.instructions === 'string' && params.instructions.length > 4_000) {
+      errors.push('instructions must be at most 4000 characters; source content belongs in the runtime synthesis channel');
+    }
+    return { valid: errors.length === 0, errors: errors.length > 0 ? errors : undefined };
+  }
+
+  async execute(_params: Record<string, unknown>): Promise<ToolResult> {
+    return {
+      success: false,
+      error: 'fs.synthesize requires Runtime-mediated agent generation',
+    };
   }
 }
 

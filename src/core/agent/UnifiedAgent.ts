@@ -101,7 +101,12 @@ export class UnifiedAgent extends BaseAgent {
       .map(tool => tool.name));
     if (authorized.size === 0) return [];
     const executionRequired = (input.executionRequired ?? requestsWorkspaceMutation(input.task))
-      && (authorized.has('fs.write') || authorized.has('fs.replace') || authorized.has('shell.exec'));
+      && (
+        authorized.has('fs.write')
+        || authorized.has('fs.replace')
+        || authorized.has('fs.synthesize')
+        || authorized.has('shell.exec')
+      );
     const mutationApplied = input.calls.some(call => isSuccessfulWorkspaceMutation(call));
     const freshMutationRequired = input.requiredMutationAfterCallIndex !== undefined;
     const freshMutationApplied = !freshMutationRequired || input.calls
@@ -175,8 +180,8 @@ export class UnifiedAgent extends BaseAgent {
           executionRequired && !mutationRequirementSatisfied
             ? successfulInspection
               ? freshMutationRequired
-                ? 'A prior acceptance audit found unmet requirements. Existing mutations and passing commands do not close this repair phase. Request a new focused fs.replace, fs.write, or mutating shell.exec call that fixes the reported unmet item.'
-                : 'The workspace layout has been grounded. If a distinct task-relevant input, rule, test, or source file is still necessary, request the novel reads together now; otherwise request fs.replace, fs.write, or a mutating shell.exec call that advances the actual task.'
+                ? 'A prior acceptance audit found unmet requirements. Existing mutations and passing commands do not close this repair phase. Request a new focused fs.synthesize, fs.replace, fs.write, or mutating shell.exec call that fixes the reported unmet item.'
+                : 'The workspace layout has been grounded. If a distinct task-relevant input, rule, test, or source file is still necessary, request the novel reads together now; otherwise request fs.synthesize, fs.replace, fs.write, or a mutating shell.exec call that advances the actual task.'
               : 'No authoritative workspace inspection has succeeded yet. Recover failed paths with fs.list, fs.read, or fs.search before requesting a mutation.'
             : '',
           executionRequired && latestVerificationFailed
@@ -190,8 +195,13 @@ export class UnifiedAgent extends BaseAgent {
           'When verification fails, use its output to repair the workspace before retrying. Never hide a failing exit status with `|| true`, `; true`, `|| :`, or equivalent shell constructs.',
           'Before creating or replacing a module, use observed package metadata and directory layout to identify the authoritative source root. Never create a parallel top-level package when the project installs from src/, lib/, packages/, or another configured source directory.',
           'Keep mutations transactional: prefer fs.replace for focused edits and request at most one file mutation per plan. A complete fs.write/fs.replace payload may contain up to 24000 characters. Do not combine companion-file writes with a large implementation write; Runtime will request the next file in a later round.',
+          executionRequired && authorized.has('fs.synthesize')
+            ? 'For a complete implementation or repair that would require a large multiline source payload, prefer fs.synthesize with only {"path":"...","instructions":"..."}. Runtime generates the file through a separate plain-text channel using grounded evidence. Never put source content in fs.synthesize instructions.'
+            : '',
           'When malformed quoting or embedded newlines make exact oldText fragile, inspect the reported lines and call fs.replace with path, startLine, endLine, and newText instead of guessing escaped oldText repeatedly.',
-          'Use fs.write or fs.replace for file content. Do not embed multiline source, Markdown backticks, or shell-sensitive content inside python -c, echo, sed, or similar shell.exec writers; shell substitution can execute unintended commands and corrupt the edit.',
+          authorized.has('fs.synthesize')
+            ? 'Use fs.synthesize, fs.write, or fs.replace for file content. Do not embed multiline source, Markdown backticks, or shell-sensitive content inside python -c, echo, sed, or similar shell.exec writers; shell substitution can execute unintended commands and corrupt the edit.'
+            : 'Use fs.write or fs.replace for file content. Do not embed multiline source, Markdown backticks, or shell-sensitive content inside python -c, echo, sed, or similar shell.exec writers; shell substitution can execute unintended commands and corrupt the edit.',
           'Never repeat an equivalent call. Search snippets are discovery evidence; fetch relevant result pages before making source-backed claims.',
           'Reject search results that do not match the core entities and topic in the task. Never fetch an irrelevant result merely because it is available.',
           'After two web.search calls, do not keep reformulating the same search. Fetch a likely official public URL if one can be identified, or finish with an explicit evidence limitation.',
@@ -348,6 +358,18 @@ export class UnifiedAgent extends BaseAgent {
                   success: true,
                 }))));
         if (advancesExecution) break;
+        const synthesisFallback = recoverGroundedSynthesisPlan({
+          authorized,
+          calls: input.calls,
+          task: input.task,
+          mutationRequirementSatisfied,
+          latestVerificationFailed,
+          round: input.round,
+        });
+        if (synthesisFallback) {
+          plannedCalls = [synthesisFallback];
+          break;
+        }
         planningMessages = [
           ...planningMessages,
           { role: 'assistant', content: JSON.stringify(response) },
@@ -359,7 +381,7 @@ export class UnifiedAgent extends BaseAgent {
                 ? successfulInspection
                   ? freshMutationRequired
                     ? 'The previous acceptance audit is still open. Request a new focused mutation that addresses one of its failed or unverified items now.'
-                    : 'Do not repeat grounded paths. Batch any distinct task-relevant files that are still necessary, or request a concrete fs.replace, fs.write, or mutating shell.exec call now.'
+                    : 'Do not repeat grounded paths. Batch any distinct task-relevant files that are still necessary, or request a concrete fs.synthesize, fs.replace, fs.write, or mutating shell.exec call now.'
                   : 'The previous inspection failed or was absent. Request a corrected fs.list, fs.read, or fs.search call before mutating.'
                 : '',
               latestVerificationFailed && inspectedAfterLatestFailure
@@ -399,7 +421,17 @@ export class UnifiedAgent extends BaseAgent {
                 ...call,
                 success: true,
               })));
-        if (!advancesExecution) return [];
+        if (!advancesExecution) {
+          const synthesisFallback = recoverGroundedSynthesisPlan({
+            authorized,
+            calls: input.calls,
+            task: input.task,
+            mutationRequirementSatisfied,
+            latestVerificationFailed,
+            round: input.round,
+          });
+          return synthesisFallback ? [synthesisFallback] : [];
+        }
       }
       return plannedCalls;
     } catch (error) {
@@ -421,6 +453,15 @@ export class UnifiedAgent extends BaseAgent {
           }));
         }
       }
+      const synthesisFallback = recoverGroundedSynthesisPlan({
+        authorized,
+        calls: input.calls,
+        task: input.task,
+        mutationRequirementSatisfied,
+        latestVerificationFailed,
+        round: input.round,
+      });
+      if (synthesisFallback) return [synthesisFallback];
       return [];
     }
   }
@@ -1156,6 +1197,70 @@ function mutationPayloadLength(call: PlannedToolCall): number {
   return ['content', 'newText', 'oldText']
     .map(key => typeof call.params[key] === 'string' ? String(call.params[key]).length : 0)
     .reduce((sum, length) => sum + length, 0);
+}
+
+function recoverGroundedSynthesisPlan(input: {
+  authorized: Set<string>;
+  calls: ToolLoopCallRecord[];
+  task: string;
+  mutationRequirementSatisfied: boolean;
+  latestVerificationFailed: boolean;
+  round: number;
+}): PlannedToolCall | undefined {
+  if (!input.authorized.has('fs.synthesize')
+    || (input.mutationRequirementSatisfied && !input.latestVerificationFailed)) {
+    return undefined;
+  }
+  const taskLower = input.task.toLowerCase();
+  const failureText = input.calls
+    .filter(call => isWorkspaceVerificationCall(call) && !isSuccessfulWorkspaceVerification(call))
+    .slice(-2)
+    .map(call => `${String(call.error ?? '')}\n${JSON.stringify(call.result ?? '')}`)
+    .join('\n')
+    .toLowerCase();
+  const candidates = input.calls
+    .map((call, index) => {
+      if (call.toolName !== 'fs.read' || !call.success) return undefined;
+      const filePath = normalizePlannedWorkspacePath(String(
+        (call.result as { path?: unknown } | undefined)?.path
+          ?? call.params.path
+          ?? ''
+      ));
+      if (!/\.(?:py|ts|tsx|js|jsx|mjs|cjs|java|go|rs|rb|php|sh)$/i.test(filePath)) {
+        return undefined;
+      }
+      const content = String((call.result as { content?: unknown } | undefined)?.content ?? '');
+      let score = index / Math.max(1, input.calls.length);
+      if (/(?:^|\/)(?:src|lib|app|packages)\//i.test(filePath)) score += 6;
+      if (/(?:^|\/)(?:tests?|fixtures?|examples?|data|rules)\//i.test(filePath)) score -= 8;
+      if (/\b(?:todo|notimplemented|not implemented|placeholder|stub)\b|^\s*pass\s*(?:#.*)?$/im.test(content)) {
+        score += 12;
+      }
+      if (taskLower.includes(filePath.toLowerCase())
+        || taskLower.includes(filePath.split('/').at(-1)?.toLowerCase() ?? '')) {
+        score += 7;
+      }
+      if (failureText.includes(filePath.toLowerCase())
+        || failureText.includes(filePath.split('/').at(-1)?.toLowerCase() ?? '')) {
+        score += 10;
+      }
+      return { filePath, score };
+    })
+    .filter((candidate): candidate is { filePath: string; score: number } => Boolean(candidate))
+    .sort((left, right) => right.score - left.score);
+  const candidate = candidates[0];
+  if (!candidate) return undefined;
+  return {
+    toolName: 'fs.synthesize',
+    params: {
+      path: candidate.filePath,
+      instructions: input.latestVerificationFailed
+        ? 'Repair the implementation to satisfy the latest grounded verifier failure and the immutable assignment while preserving working behavior.'
+        : 'Implement the complete assigned workspace behavior in this authoritative source file using the grounded inputs, rules, and project structure.',
+    },
+    reason: `Runtime recovered a grounded file-synthesis action after structured planning did not advance execution in round ${input.round}.`,
+    groundingRequired: true,
+  };
 }
 
 function isDestructiveRepairOverwrite(

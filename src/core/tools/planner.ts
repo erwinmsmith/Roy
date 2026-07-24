@@ -279,7 +279,9 @@ export class AgentToolPlanner {
         }
         if (latestReadIndex < 0) return true;
         return input.calls.slice(latestReadIndex + 1).some(call =>
-          call.success && (call.toolName === 'fs.write' || call.toolName === 'fs.replace'
+          call.success && (call.toolName === 'fs.write'
+            || call.toolName === 'fs.replace'
+            || call.toolName === 'fs.synthesize'
             || call.toolName === 'shell.exec' && this.looksLikeShellMutation(String(call.params.command ?? '')))
         );
       })

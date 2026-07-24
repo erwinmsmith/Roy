@@ -47,6 +47,7 @@ import {
   FsReadTool,
   FsReplaceTool,
   FsSearchTool,
+  FsSynthesizeTool,
   FsWriteTool,
   findParallelSourceMutation,
   isSuccessfulWorkspaceMutationCall,
@@ -866,6 +867,7 @@ export class Runtime {
     this.runtimeToolOverrides.set('fs.search', new FsSearchTool(workspaceRoot));
     this.runtimeToolOverrides.set('fs.replace', new FsReplaceTool(workspaceRoot));
     this.runtimeToolOverrides.set('fs.write', new FsWriteTool(workspaceRoot));
+    this.runtimeToolOverrides.set('fs.synthesize', new FsSynthesizeTool());
     this.runtimeToolOverrides.set('shell.exec', new ShellExecTool({
       ...this.workspaceRuntimeConfig.tools.shell,
       workspaceRoot,
@@ -2472,7 +2474,14 @@ export class Runtime {
     agentId: string,
     toolName: string,
     params: Record<string, unknown>,
-    options: { reason?: string; approvalId?: string; correlationId?: string; nodeId?: string } = {}
+    options: {
+      reason?: string;
+      approvalId?: string;
+      correlationId?: string;
+      nodeId?: string;
+      synthesisTask?: string;
+      groundingCalls?: ToolCallRecord[];
+    } = {}
   ): Promise<ToolResult> {
     const ctx = this.getContext();
     const agent = ctx.manager.getAgentById(agentId);
@@ -2577,9 +2586,17 @@ export class Runtime {
       nodeId: options.nodeId,
       data: { toolName, params, correlationId: options.correlationId },
     });
-    const result = runtimeTool
-      ? await this.executeRuntimeTool(runtimeTool, params)
-      : await toolRegistry.execute(toolName, params);
+    const result = toolName === 'fs.synthesize'
+      ? await this.executeSynthesizedFileForAgent(
+        agent,
+        params,
+        options.synthesisTask ?? this.agentRestoreSpecs.get(agentId)?.task ?? '',
+        options.groundingCalls ?? [],
+        options.correlationId ?? ctx.sessionId
+      )
+      : runtimeTool
+        ? await this.executeRuntimeTool(runtimeTool, params)
+        : await toolRegistry.execute(toolName, params);
     this.recordToolPathOutcome(agentId, toolName, params, result, options.correlationId);
     this.toolCallCounts.set(callKey, calls + 1);
     const resultMessage = await this.enqueueMessage({
@@ -2723,7 +2740,9 @@ export class Runtime {
     const observedPath = this.normalizeCachedPath(params.path);
     if (result.success) {
       this.failedPathObservations.get(correlationKey)?.delete(observedPath);
-      if (toolName === 'fs.write' || toolName === 'fs.replace') {
+      if (toolName === 'fs.write'
+        || toolName === 'fs.replace'
+        || toolName === 'fs.synthesize') {
         const changed = this.changedPathsByCorrelation.get(correlationKey) ?? new Set<string>();
         changed.add(observedPath);
         this.changedPathsByCorrelation.set(correlationKey, changed);
@@ -3348,6 +3367,263 @@ export class Runtime {
     }
   }
 
+  private async executeSynthesizedFileForAgent(
+    agent: BaseAgent,
+    params: Record<string, unknown>,
+    task: string,
+    groundingCalls: ToolCallRecord[],
+    correlationId: string
+  ): Promise<ToolResult> {
+    const tool = new FsSynthesizeTool();
+    const validation = tool.validate(params);
+    if (!validation.valid) {
+      return { success: false, error: `Validation failed: ${validation.errors?.join(', ')}` };
+    }
+    const requestedPath = String(params.path);
+    const normalizedPath = this.normalizeToolWorkspacePath(requestedPath);
+    const directlyObserved = groundingCalls.some(call =>
+      this.normalizeToolWorkspacePath(String(call.params.path ?? '')) === normalizedPath
+      && (
+        call.toolName === 'fs.read'
+        || call.toolName === 'fs.write'
+        || call.toolName === 'fs.replace'
+        || call.toolName === 'fs.synthesize'
+      )
+    );
+    if (!directlyObserved) {
+      return {
+        success: false,
+        error: `fs.synthesize requires a prior direct observation of ${normalizedPath}; inspect the authoritative target with fs.read first`,
+      };
+    }
+
+    const currentRead = await new FsReadTool(this.workspaceRoot).execute({
+      path: requestedPath,
+      maxBytes: 80_000,
+    });
+    const existing = currentRead.success
+      ? currentRead.result as {
+        content?: unknown;
+        truncated?: unknown;
+        path?: unknown;
+      }
+      : undefined;
+    if (existing?.truncated === true) {
+      return {
+        success: false,
+        error: `fs.synthesize refuses to replace ${normalizedPath} because its current snapshot exceeds 80000 bytes`,
+      };
+    }
+    const currentContent = typeof existing?.content === 'string'
+      ? existing.content
+      : undefined;
+    if (!currentRead.success
+      && !/\b(?:enoent|no such file|cannot find)\b/i.test(currentRead.error ?? '')) {
+      return {
+        success: false,
+        error: `Unable to read the current target snapshot before synthesis: ${currentRead.error ?? 'unknown error'}`,
+      };
+    }
+
+    const assignedTask = this.compactDelegatedTask(
+      this.agentRestoreSpecs.get(agent.id)?.task?.trim() || task.trim(),
+      16_000
+    );
+    const evidence = this.compactFileSynthesisEvidence(
+      groundingCalls,
+      normalizedPath,
+      52_000
+    );
+    const prompt = [
+      '[runtime_workspace_file_synthesis]',
+      `Generate the exact complete UTF-8 contents for workspace file: ${normalizedPath}`,
+      '',
+      'Immutable assignment:',
+      assignedTask || 'Implement the current grounded workspace task.',
+      '',
+      'Focused implementation instructions:',
+      String(params.instructions).trim(),
+      '',
+      'Current target snapshot:',
+      currentContent === undefined
+        ? '[target does not exist]'
+        : currentContent,
+      '',
+      'Grounded supporting evidence:',
+      evidence || '[no additional supporting evidence]',
+      '',
+      'Output contract:',
+      '- Return only the complete file contents.',
+      '- Do not use Markdown fences, prose, a diff, or tool-call JSON.',
+      '- Preserve working behavior not contradicted by the assignment or verifier evidence.',
+      '- Implement the actual task; do not leave TODOs, placeholders, pseudocode, or NotImplemented stubs.',
+      '- Use only paths, schemas, APIs, and requirements supported by the grounded evidence.',
+    ].join('\n');
+    this.emit({
+      type: 'tool.synthesis.started',
+      agentId: agent.id,
+      sessionId: this.getContext().sessionId,
+      correlationId,
+      data: {
+        path: normalizedPath,
+        evidenceCalls: groundingCalls.length,
+        promptChars: prompt.length,
+        operation: currentContent === undefined ? 'create' : 'replace',
+      },
+    });
+    let generated = await this.completeAsAgent(
+      agent,
+      prompt,
+      'workspace.file_synthesis',
+      correlationId,
+      {
+        isolatedContext: true,
+        temperature: 0,
+        maxOutputTokens: 32_000,
+      }
+    );
+    generated = this.stripSingleMarkdownCodeFence(generated);
+    if (!generated.trim()) {
+      return { success: false, error: `File synthesis for ${normalizedPath} returned empty content` };
+    }
+    if (generated === currentContent) {
+      return { success: false, error: `File synthesis for ${normalizedPath} produced no workspace change` };
+    }
+    if (/^\s*(?:here(?:'s| is)|the (?:complete )?file|implementation:)/i.test(generated)
+      && !this.looksLikeSourceFileContent(normalizedPath, generated)) {
+      return {
+        success: false,
+        error: `File synthesis for ${normalizedPath} returned narrative text instead of file contents`,
+      };
+    }
+
+    const mutation = currentContent === undefined
+      ? await new FsWriteTool(this.workspaceRoot).execute({
+        path: requestedPath,
+        content: generated,
+        mode: 'overwrite',
+        createDirectories: true,
+      })
+      : currentContent.length === 0
+        ? await new FsWriteTool(this.workspaceRoot).execute({
+          path: requestedPath,
+          content: generated,
+          mode: 'overwrite',
+          createDirectories: false,
+        })
+        : await new FsReplaceTool(this.workspaceRoot).execute({
+          path: requestedPath,
+          oldText: currentContent,
+          newText: generated,
+          expectedReplacements: 1,
+        });
+    if (!mutation.success) return mutation;
+    const result = mutation.result as { path?: unknown; bytes?: unknown } | undefined;
+    const operation = currentContent === undefined ? 'create' : 'replace';
+    this.emit({
+      type: 'tool.synthesis.completed',
+      agentId: agent.id,
+      sessionId: this.getContext().sessionId,
+      correlationId,
+      data: {
+        path: String(result?.path ?? normalizedPath),
+        bytes: Number(result?.bytes ?? Buffer.byteLength(generated, 'utf8')),
+        operation,
+      },
+    });
+    return {
+      success: true,
+      result: {
+        path: String(result?.path ?? normalizedPath),
+        bytes: Number(result?.bytes ?? Buffer.byteLength(generated, 'utf8')),
+        operation,
+        synthesized: true,
+      },
+    };
+  }
+
+  private compactFileSynthesisEvidence(
+    calls: ToolCallRecord[],
+    targetPath: string,
+    maxChars: number
+  ): string {
+    const sections: string[] = [];
+    const seen = new Set<string>();
+    let remaining = maxChars;
+    for (const call of [...calls].reverse()) {
+      const callPath = this.normalizeToolWorkspacePath(String(call.params.path ?? ''));
+      const key = call.toolName === 'shell.exec'
+        ? `shell:${String(call.params.command ?? '')}`
+        : `${call.toolName}:${callPath}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      let section = '';
+      if (call.toolName === 'fs.read' && call.success && callPath !== targetPath) {
+        const read = call.result as { content?: unknown; truncated?: unknown } | undefined;
+        const content = typeof read?.content === 'string' ? read.content : '';
+        if (content) {
+          const compact = content.length <= 6_000
+            ? content
+            : `${content.slice(0, 4_000)}\n[runtime_compacted_file_middle]\n${content.slice(-2_000)}`;
+          section = `File ${callPath}${read?.truncated ? ' (observed prefix)' : ''}:\n${compact}`;
+        }
+      } else if (call.toolName === 'fs.list' && call.success) {
+        const entries = (call.result as { entries?: unknown } | undefined)?.entries;
+        if (Array.isArray(entries)) {
+          section = `Workspace listing:\n${entries.filter(item => typeof item === 'string').slice(0, 160).join('\n')}`;
+        }
+      } else if (call.toolName === 'fs.search' && call.success) {
+        const result = call.result as { matches?: unknown } | undefined;
+        if (Array.isArray(result?.matches)) {
+          section = `Workspace search evidence:\n${JSON.stringify(result.matches.slice(0, 60))}`;
+        }
+      } else if (call.toolName === 'shell.exec') {
+        const shell = call.result as {
+          command?: unknown;
+          stdout?: unknown;
+          stderr?: unknown;
+          exitCode?: unknown;
+        } | undefined;
+        const output = [
+          String(shell?.stdout ?? ''),
+          String(shell?.stderr ?? ''),
+          String(call.error ?? ''),
+        ].filter(Boolean).join('\n');
+        if (output) {
+          section = [
+            `Command ${String(shell?.command ?? call.params.command ?? '')} (exit ${String(shell?.exitCode ?? 'unknown')}):`,
+            output.length <= 8_000
+              ? output
+              : `${output.slice(0, 3_000)}\n[runtime_compacted_command_middle]\n${output.slice(-5_000)}`,
+          ].join('\n');
+        }
+      }
+      if (!section) continue;
+      const bounded = section.slice(0, remaining);
+      sections.push(bounded);
+      remaining -= bounded.length;
+      if (remaining <= 0) break;
+    }
+    return sections.reverse().join('\n\n');
+  }
+
+  private stripSingleMarkdownCodeFence(content: string): string {
+    const trimmed = content.trim();
+    const fenced = /^```[A-Za-z0-9_+.-]*\s*\n([\s\S]*?)\n```\s*$/.exec(trimmed);
+    return fenced ? fenced[1]! : content;
+  }
+
+  private looksLikeSourceFileContent(filePath: string, content: string): boolean {
+    const extension = path.extname(filePath).toLowerCase();
+    if (extension === '.py') {
+      return /(?:^|\n)\s*(?:from |import |def |class |if __name__|[A-Za-z_]\w*\s*=)/m.test(content);
+    }
+    if (['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'].includes(extension)) {
+      return /(?:^|\n)\s*(?:import |export |const |let |var |function |class |interface |type )/m.test(content);
+    }
+    return true;
+  }
+
   private getRootSkillBindings(): SkillBinding[] {
     return skillRegistry.list().map(skill => this.createSkillBinding(skill.name));
   }
@@ -3357,7 +3633,7 @@ export class Runtime {
       researcher: ['fs.list', 'fs.read', 'fs.search'],
       critic: ['fs.read', 'fs.search'],
       planner: [],
-      coder: ['fs.list', 'fs.read', 'fs.search', 'fs.replace', 'fs.write', 'shell.exec'],
+      coder: ['fs.list', 'fs.read', 'fs.search', 'fs.replace', 'fs.write', 'fs.synthesize', 'shell.exec'],
       summarizer: [],
       tester: ['fs.list', 'fs.read', 'fs.search', 'shell.exec'],
       custom: [],
@@ -3443,7 +3719,7 @@ export class Runtime {
   private createToolBinding(name: string): ToolBinding {
     const permission: ToolBinding['permission'] = name === 'shell.exec'
       ? 'execute'
-      : name === 'fs.write' || name === 'fs.replace'
+      : name === 'fs.write' || name === 'fs.replace' || name === 'fs.synthesize'
         ? 'write'
         : 'read_only';
     return {
@@ -5624,6 +5900,28 @@ export class Runtime {
       }
       await ctx.queue.ack(taskMessage.id);
     } catch (error) {
+      const failedToolCalls = error instanceof Error
+        && Array.isArray((error as Error & { runtimeToolCalls?: unknown }).runtimeToolCalls)
+        ? (error as Error & { runtimeToolCalls: ToolCallRecord[] }).runtimeToolCalls
+        : [];
+      if (payload.teamId && failedToolCalls.length > 0) {
+        const cachedCalls = [
+          ...(this.teamToolEvidenceCache.get(payload.teamId) ?? []),
+          ...failedToolCalls,
+        ].slice(-80);
+        this.teamToolEvidenceCache.set(payload.teamId, cachedCalls);
+        this.emit({
+          type: 'team.tool_evidence.cached_from_failure',
+          agentId: agent.identity.id,
+          sessionId: ctx.sessionId,
+          correlationId,
+          data: {
+            teamId: payload.teamId,
+            addedCalls: failedToolCalls.length,
+            cachedCalls: cachedCalls.length,
+          },
+        });
+      }
       const currentTask = await ctx.queue.getMessage(taskMessage.id);
       if (currentTask?.status === 'pending' || currentTask?.status === 'processing') {
         await ctx.queue.fail(taskMessage.id, error instanceof Error ? error : new Error(String(error)));
@@ -6486,6 +6784,7 @@ export class Runtime {
     });
     this.emit({ type: 'agent.status.changed', agentId, data: { from, to: 'thinking' } });
 
+    let activeGrounding: GroundingRunResult | undefined;
     try {
       await this.transitionAgentFsm(agentId, 'S_context_loading', { task, correlationId: options.correlationId });
       const delegationAssessment = this.shouldAssessAgentDelegation(agent.getInfo(), task);
@@ -6546,6 +6845,7 @@ export class Runtime {
           });
         },
       });
+      activeGrounding = grounding;
       if (this.taskRequiresWorkspaceMutation(task)) {
         let closure = this.analyzeWorkspaceExecutionClosure(grounding.toolCalls);
         let continuation = 0;
@@ -6591,6 +6891,7 @@ export class Runtime {
             );
           }
           grounding = this.combineGroundingRuns([grounding, next]);
+          activeGrounding = grounding;
           closure = this.analyzeWorkspaceExecutionClosure(grounding.toolCalls);
         }
         this.emit({
@@ -6674,6 +6975,7 @@ export class Runtime {
             skipInitialModelPlanning: true,
           });
           grounding = this.combineGroundingRuns([grounding, recovered]);
+          activeGrounding = grounding;
           this.emit({
             type: recovered.toolLoop.successfulCalls > 0
               ? 'agent.output.tool_intent.recovery.completed'
@@ -6826,7 +7128,14 @@ export class Runtime {
       await this.finalizeActorLifecycle(agentId, 'success', options.correlationId);
       return runResult;
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const failure = error instanceof Error ? error : new Error(String(error));
+      if (activeGrounding) {
+        Object.assign(failure, {
+          runtimeToolCalls: activeGrounding.toolCalls,
+          runtimeGrounding: activeGrounding,
+        });
+      }
+      const message = failure.message;
       agent.addToMemory('result', `Error: ${message}`);
       agent.setRuntimeState('failed');
       this.emit({ type: 'agent.status.changed', agentId, data: { from: 'thinking', to: 'failed' } });
@@ -6848,7 +7157,7 @@ export class Runtime {
         totalTokens: 0,
       }, options.patternId);
       await this.finalizeActorLifecycle(agentId, 'failure', options.correlationId);
-      throw error;
+      throw failure;
     }
   }
 
@@ -9220,7 +9529,7 @@ Use delegation only when the task benefits from grounded inspection, critique, p
 Do not spawn more than 3 subagents. Prefer 1-2 unless the task clearly needs more.
 If later work depends on an earlier result, create only the immediately executable first-step agents. Roy will reassess after that step and grow the tree if needed.
 For a long-horizon, multi-step, iterative, or recursive task, prefer a task-specific team of 2-3 complementary members, set continuationPolicy to reassess, and allow member delegation. A single root step may contain many descendant derivations; every member and descendant still needs a distinct gap, bounded task, and synthesis path.
-When the task requests workspace changes, include an executor whose concrete task is to apply changes with fs.write or shell.exec and verify them. Do not assign every agent to analysis or proposal writing.
+When the task requests workspace changes, include an executor whose concrete task is to apply changes with fs.synthesize, fs.write, fs.replace, or shell.exec and verify them. Do not assign every agent to analysis or proposal writing.
 Ask for clarification when the user request is too ambiguous to assign a concrete task safely.
 Design agent names, roles, tasks, tools, and skills from the current task. Do not copy a fixed team template. Use a team only when members require an explicit coordination and synthesis boundary.
 Return strict JSON matching one of:
@@ -9355,7 +9664,7 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
 Decide whether this non-root agent should solve directly or delegate to 1-3 direct child agents. Delegate only to close an explicit evidence, perspective, risk, planning, implementation, verification, or synthesis gap in the parent agent's current model.
 Only delegate when a child with a different specialty materially improves the result.
 For two or more coupled gaps, prefer a team with a clear synthesis boundary. Team members may recursively create their own team when a newly discovered gap cannot be closed locally and depth/budget policy permits.
-When the task requests workspace changes and this agent has fs.write or shell.exec, it must execute the change itself or delegate a concrete implementation task. Do not return a proposed patch without applying it.
+When the task requests workspace changes and this agent has fs.synthesize, fs.write, fs.replace, or shell.exec, it must execute the change itself or delegate a concrete implementation task. Do not return a proposed patch without applying it.
 Treat successful cached paths as authoritative. Do not repeat a cached invalid path or equivalent failed call without a changed hypothesis. Route actionable cached feedback to a child with the capabilities to close it. Cached actors and teams are reusable definitions, not live instances.
 Generate task-specific child definitions rather than selecting a fixed role template. Return strict JSON:
 {"action":"solve_directly","reason":"..."}
@@ -9742,7 +10051,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     }
     if (/\b(?:terminal|shell|command line|cli|container)\b/.test(lower)
       || /\b(?:implement|modify|edit|create|write|patch|repair|fix|refactor)\b[\s\S]*\b(?:file|code|project|repository|workspace|artifact|solution)\b/.test(lower)) {
-      tools.push('fs.list', 'fs.read', 'fs.search', 'fs.replace', 'fs.write', 'shell.exec');
+      tools.push('fs.list', 'fs.read', 'fs.search', 'fs.replace', 'fs.write', 'fs.synthesize', 'shell.exec');
     }
     return Array.from(new Set(tools)).filter(tool => toolRegistry.has(tool));
   }
@@ -10057,7 +10366,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
             'Implement the next unresolved bounded slice, consume failed tool output as repair feedback, and run a focused check before reporting.',
             `Original task: ${task}`,
           ].join('\n'),
-          tools: ['fs.list', 'fs.read', 'fs.search', 'fs.replace', 'fs.write', 'shell.exec'],
+          tools: ['fs.list', 'fs.read', 'fs.search', 'fs.replace', 'fs.write', 'fs.synthesize', 'shell.exec'],
           skills: ['use_tool_when_needed', 'delegate_to_subagent'],
           tomLevel: 1,
           existenceReason: 'A cached mutated path remains partial or unverified and requires another bounded implementation slice.',
@@ -10117,7 +10426,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
           name: 'Executor-2',
           role: 'workspace executor',
           task: `Inspect the actual workspace, implement the next complete bounded slice of the requested change, use failed tool output to repair it, and do not stop at a proposal: ${task}`,
-          tools: ['fs.list', 'fs.read', 'fs.search', 'fs.replace', 'fs.write', 'shell.exec'],
+          tools: ['fs.list', 'fs.read', 'fs.search', 'fs.replace', 'fs.write', 'fs.synthesize', 'shell.exec'],
           skills: ['use_tool_when_needed', 'delegate_to_subagent'],
           tomLevel: 1,
           existenceReason: 'Apply the requested workspace mutation with runtime tools.',
@@ -10295,7 +10604,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
       && !/\b(?:implement|implementation|build|create|write|modify|edit|patch|repair|fix|migrate|executor|coder|engineer)\b/.test(intent);
     if (verifiesOnly) return 2;
     const canMutate = (plan.tools ?? []).some(tool =>
-      tool === 'fs.write' || tool === 'fs.replace'
+      tool === 'fs.write' || tool === 'fs.replace' || tool === 'fs.synthesize'
     );
     if (canMutate
       || /\b(?:implement|implementation|build|create|write|modify|edit|patch|repair|fix|migrate|executor|coder|engineer)\b/.test(
@@ -10420,7 +10729,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
         && (!this.taskRequiresFetchedWebEvidence(task) || names.has('web.fetch'));
     }
     if (this.taskRequiresWorkspaceMutation(task)) {
-      return names.has('fs.write') || names.has('shell.exec');
+      return names.has('fs.write') || names.has('fs.synthesize') || names.has('shell.exec');
     }
     if (/\b(?:run|execute)\b[\s\S]{0,100}\b(?:tests?|build|checks?|commands?)\b|(?:运行|执行)[\s\S]{0,80}(?:测试|构建|检查|命令)/i.test(task)) {
       return names.has('shell.exec');
@@ -12674,7 +12983,17 @@ Produce the final response to the user as Roy, the root agent.`;
     ].join('\n\n');
   }
 
-  private async completeAsAgent(agent: BaseAgent, prompt: string, purpose: string, correlationId: string): Promise<string> {
+  private async completeAsAgent(
+    agent: BaseAgent,
+    prompt: string,
+    purpose: string,
+    correlationId: string,
+    options: {
+      isolatedContext?: boolean;
+      temperature?: number;
+      maxOutputTokens?: number;
+    } = {}
+  ): Promise<string> {
     const ctx = this.getContext();
     if (!ctx.llm) {
       const message = 'Error: LLM not configured';
@@ -12701,7 +13020,9 @@ Produce the final response to the user as Roy, the root agent.`;
       `Purpose: ${purpose}.`,
       `Correlation: ${correlationId}.`,
     ].join('\n');
-    let communicationContext = agent.getCommunicationContext()?.rendered ?? '';
+    let communicationContext = options.isolatedContext
+      ? ''
+      : agent.getCommunicationContext()?.rendered ?? '';
     let effectivePrompt = prompt;
     if (remainingTokens !== undefined && this.budgetAccountingDimension() === 'total_tokens') {
       const outputReserve = Math.min(512, Math.max(64, Math.floor(remainingTokens * 0.2)));
@@ -12768,13 +13089,18 @@ Produce the final response to the user as Roy, the root agent.`;
       });
       throw new Error(`Agent completion rejected: estimated input ${estimatedInputTokens} exceeds remaining allocation ${remainingTokens}`);
     }
-    const maxTokens = remainingTokens === undefined
+    const allocationMaxTokens = remainingTokens === undefined
       ? undefined
       : Math.max(1, this.completionCapacity(remainingTokens, estimatedInputTokens));
+    const maxTokens = options.maxOutputTokens === undefined
+      ? allocationMaxTokens
+      : allocationMaxTokens === undefined
+        ? options.maxOutputTokens
+        : Math.min(options.maxOutputTokens, allocationMaxTokens);
     const completion = await this.collectRuntimeLLMStream(
       ctx.llm,
       messages,
-      { temperature: 0.2, maxTokens },
+      { temperature: options.temperature ?? 0.2, maxTokens },
       { actorId: agent.id, purpose, correlationId }
     );
     const content = completion.content;
@@ -13711,6 +14037,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         binding.name === 'shell.exec'
         || binding.name === 'fs.write'
         || binding.name === 'fs.replace'
+        || binding.name === 'fs.synthesize'
       )
     ) && (
       workspaceExecutionRequired
@@ -13793,6 +14120,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       maxConsecutiveFailures: loopConfig.maxConsecutiveFailures,
       maxWallClockMs: Math.max(1, remainingGroundingMs()),
     });
+    const liveGroundingCalls: ToolCallRecord[] = [...priorPlannerCalls];
     const toolLoop = await loop.run({
       task,
       initialPlans: plans,
@@ -13836,6 +14164,16 @@ For web-grounded work, use only facts present in the subagent report or runtime 
           reason: plan.reason,
           correlationId: options.correlationId,
           nodeId: options.nodeId,
+          synthesisTask: intentTask,
+          groundingCalls: liveGroundingCalls,
+        });
+        liveGroundingCalls.push({
+          toolName: plan.toolName,
+          params: plan.params,
+          reason: plan.reason,
+          result: result.result,
+          success: result.success,
+          error: result.error,
         });
         return { result: result.result, success: result.success, error: result.error };
       },
@@ -14013,6 +14351,16 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         const summary = `Wrote ${String(written?.bytes ?? 'unknown')} bytes to ${String(written?.path ?? 'file')} (${String(written?.mode ?? 'unknown')}).`;
         summaries.push(summary);
         contexts.push(summary);
+      } else if (call.toolName === 'fs.synthesize') {
+        const synthesized = call.result as {
+          path?: unknown;
+          bytes?: unknown;
+          operation?: unknown;
+        } | undefined;
+        if (typeof synthesized?.path === 'string') observedPaths.push(synthesized.path);
+        const summary = `Synthesized ${String(synthesized?.bytes ?? 'unknown')} bytes to ${String(synthesized?.path ?? 'file')} (${String(synthesized?.operation ?? 'unknown')}).`;
+        summaries.push(summary);
+        contexts.push(summary);
       } else if (call.toolName === 'fs.replace') {
         const replaced = call.result as { path?: unknown; replacements?: unknown; bytes?: unknown } | undefined;
         if (typeof replaced?.path === 'string') observedPaths.push(replaced.path);
@@ -14133,6 +14481,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         || call.toolName === 'shell.exec'
         || call.toolName === 'fs.write'
         || call.toolName === 'fs.replace'
+        || call.toolName === 'fs.synthesize'
       )
       || /\b(?:multi-step|continue|iterate|until|cross-check|multiple sources|independent sources)\b/i.test(task);
   }
@@ -14193,7 +14542,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       const structureInvalidated = laterCalls.some(call => {
         if (!call.success) return false;
         if (call.toolName === 'fs.replace') return false;
-        if (call.toolName === 'fs.write') {
+        if (call.toolName === 'fs.write' || call.toolName === 'fs.synthesize') {
           const writtenPath = this.normalizeToolWorkspacePath(String(call.params.path ?? ''));
           return Boolean(writtenPath && !listedEntries.has(writtenPath));
         }
@@ -14315,7 +14664,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         'Execution contract:',
         '- Work on the configured workspace now; do not stop at analysis or a proposed patch.',
         '- The listed tools are already bound to this actor. Request the tool calls directly; Runtime enforces approval policy. Do not ask the user for tool permission.',
-        '- Inspect current files as needed, apply the required changes with fs.write or shell.exec, and run relevant verification commands.',
+        '- Inspect current files as needed, apply the required changes with fs.synthesize, fs.write, fs.replace, or shell.exec, and run relevant verification commands.',
         '- Resolve the authoritative source root from project metadata before writing. Do not create a parallel package outside an existing src/, lib/, packages/, or configured package directory.',
         '- Continue through failed verification when another bounded repair is possible.',
         '- Finish only after the requested workspace mutation has been attempted and the resulting state has been verified or a concrete blocking error has been observed.',
@@ -14507,7 +14856,8 @@ For web-grounded work, use only facts present in the subagent report or runtime 
 
   private collectDelegatedExecutionGrounding(
     subagents: RootMediatedSpawnResult[],
-    teamResults: TeamRunResult[]
+    teamResults: TeamRunResult[],
+    correlationId: string
   ): GroundingRunResult | undefined {
     const results: RunAgentResult[] = [];
     const seenResults = new Set<RunAgentResult>();
@@ -14520,7 +14870,10 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     for (const team of teamResults) {
       for (const member of team.members) addResult(member);
     }
-    if (results.length === 0) return undefined;
+    const cachedTeamCalls = this.getTeams()
+      .filter(team => team.correlationId === correlationId)
+      .flatMap(team => this.teamToolEvidenceCache.get(team.identity.id) ?? []);
+    if (results.length === 0 && cachedTeamCalls.length === 0) return undefined;
 
     const seenCalls = new Set<ToolCallRecord>();
     const indexedCalls = results.flatMap((result, resultIndex) =>
@@ -14535,6 +14888,14 @@ For web-grounded work, use only facts present in the subagent report or runtime 
           originalIndex: resultIndex * 10_000 + callIndex,
         }))
     );
+    for (const call of cachedTeamCalls) {
+      if (seenCalls.has(call)) continue;
+      seenCalls.add(call);
+      indexedCalls.push({
+        call,
+        originalIndex: indexedCalls.length + results.length * 10_000,
+      });
+    }
     const allTimestamped = indexedCalls.every(item =>
       Number.isFinite(item.call.completedAt ?? item.call.startedAt)
     );
@@ -14546,6 +14907,32 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       );
     }
     const toolCalls = indexedCalls.map(item => item.call);
+    const cachedObservedPaths = toolCalls.flatMap(call => {
+      const result = call.result as {
+        path?: unknown;
+        entries?: unknown;
+        matches?: Array<{ path?: unknown }>;
+      } | undefined;
+      return [
+        ...(typeof result?.path === 'string' ? [result.path] : []),
+        ...(Array.isArray(result?.entries)
+          ? result.entries.filter((entry): entry is string => typeof entry === 'string')
+          : []),
+        ...(Array.isArray(result?.matches)
+          ? result.matches
+            .map(match => match.path)
+            .filter((entry): entry is string => typeof entry === 'string')
+          : []),
+      ];
+    });
+    const cachedCallSummary = cachedTeamCalls.length > 0
+      ? [
+        'Cached team tool frontier:',
+        ...cachedTeamCalls.slice(-40).map(call =>
+          `- ${call.success ? 'ok' : 'failed'} ${call.toolName} ${JSON.stringify(call.params).slice(0, 300)}`
+        ),
+      ].join('\n')
+      : '';
     const startedAt = Math.min(
       ...results.map(result => result.toolLoop?.startedAt).filter((value): value is number => Number.isFinite(value)),
       Date.now()
@@ -14556,17 +14943,27 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     );
     return {
       toolCalls,
-      grounded: results.some(result => result.grounded),
-      warnings: results.flatMap(result => result.warnings),
+      grounded: results.some(result => result.grounded) || toolCalls.some(call => call.success),
+      warnings: [
+        ...results.flatMap(result => result.warnings),
+        ...cachedTeamCalls
+          .filter(call => !call.success)
+          .map(call => `${call.toolName} failed: ${call.error ?? 'unknown error'}`),
+      ],
       context: results
         .map(result => result.evidence.toolResultSummary)
         .filter((value): value is string => Boolean(value))
+        .concat(cachedCallSummary ? [cachedCallSummary] : [])
         .join('\n\n'),
       evidence: {
-        toolGrounded: results.some(result => result.evidence.toolGrounded),
+        toolGrounded: results.some(result => result.evidence.toolGrounded)
+          || toolCalls.some(call => call.success),
         outputGrounded: results.every(result => result.evidence.outputGrounded),
         observedPaths: Array.from(new Set(
-          results.flatMap(result => result.evidence.observedPaths)
+          [
+            ...results.flatMap(result => result.evidence.observedPaths),
+            ...cachedObservedPaths,
+          ]
         )),
         observedUrls: Array.from(new Set(
           results.flatMap(result => result.evidence.observedUrls ?? [])
@@ -14580,6 +14977,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         toolResultSummary: results
           .map(result => result.evidence.toolResultSummary)
           .filter((value): value is string => Boolean(value))
+          .concat(cachedCallSummary ? [cachedCallSummary] : [])
           .join('\n\n'),
       },
       toolLoop: {
@@ -14603,7 +15001,11 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     correlationId: string
   ): Promise<GroundingRunResult> {
     const attempts: GroundingRunResult[] = [];
-    const delegatedExecution = this.collectDelegatedExecutionGrounding(subagents, teamResults);
+    const delegatedExecution = this.collectDelegatedExecutionGrounding(
+      subagents,
+      teamResults,
+      correlationId
+    );
     const combineWithDelegatedExecution = (): GroundingRunResult => this.combineGroundingRuns(
       delegatedExecution ? [delegatedExecution, ...attempts] : attempts
     );

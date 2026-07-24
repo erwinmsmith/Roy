@@ -269,6 +269,7 @@ class CapturingToolPlanningLLM extends PlanningLLM {
     messages: LLMMessage[],
     options?: LLMCompletionOptions
   ): Promise<T> {
+    this.jsonCalls += 1;
     this.messages = messages;
     this.options = options;
     if (this.failure) throw this.failure;
@@ -1490,5 +1491,50 @@ describe('UnifiedAgent capability execution', () => {
       expect.objectContaining({ toolName: 'fs.read', params: { path: 'data/input.csv' } }),
       expect.objectContaining({ toolName: 'fs.read', params: { path: 'rules/expectations.yml' } }),
     ]);
+  });
+
+  it('recovers a small fs.synthesize control call when structured planning finishes after grounding a stub', async () => {
+    const llm = new CapturingToolPlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'grounded-synthesis-recovery-agent',
+      goal: 'implement a grounded source file without embedding source in tool JSON',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.read', 'fs.synthesize', 'shell.exec'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: 'Implement src/dq_audit/audit.py and verify it.',
+      executionRequired: true,
+      round: 2,
+      remainingCalls: 3,
+      tools: [
+        { name: 'fs.read' },
+        { name: 'fs.synthesize' },
+        { name: 'shell.exec' },
+      ],
+      calls: [{
+        toolName: 'fs.read',
+        params: { path: 'src/dq_audit/audit.py' },
+        reason: 'Inspect the authoritative implementation file.',
+        groundingRequired: true,
+        success: true,
+        result: {
+          path: 'src/dq_audit/audit.py',
+          content: 'def run():\n    raise NotImplementedError\n',
+          truncated: false,
+        },
+      }],
+    });
+
+    expect(llm.jsonCalls).toBe(1);
+    expect(plans).toEqual([expect.objectContaining({
+      toolName: 'fs.synthesize',
+      params: {
+        path: 'src/dq_audit/audit.py',
+        instructions: expect.stringContaining('complete assigned workspace behavior'),
+      },
+    })]);
+    expect(JSON.stringify(plans)).not.toContain('def run');
   });
 });

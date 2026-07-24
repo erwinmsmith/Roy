@@ -591,7 +591,7 @@ const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
       researcher: ['fs.list', 'fs.read', 'fs.search'],
       critic: ['fs.read', 'fs.search'],
       planner: [],
-      coder: ['fs.list', 'fs.read', 'fs.search', 'fs.replace', 'fs.write', 'shell.exec'],
+      coder: ['fs.list', 'fs.read', 'fs.search', 'fs.replace', 'fs.write', 'fs.synthesize', 'shell.exec'],
       summarizer: [],
       tester: ['fs.list', 'fs.read', 'fs.search', 'shell.exec'],
       custom: [],
