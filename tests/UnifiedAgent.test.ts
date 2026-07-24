@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { UnifiedAgent } from '../src/core/agent/UnifiedAgent.js';
 import { toolRegistry } from '../src/core/tools/index.js';
-import { skillRegistry } from '../src/core/skills/index.js';
+import { skillRegistry, UseToolWhenNeededSkill } from '../src/core/skills/index.js';
 import { actionRegistry } from '../src/core/actions/index.js';
 import { MessageQueue } from '../src/core/message/MessageQueue.js';
 import type { LLMProvider, LLMMessage, LLMCompletionOptions, LLMCompletionResult, LLMStreamChunk } from '../src/core/llm/types.js';
@@ -200,6 +200,25 @@ describe('UnifiedAgent capability execution', () => {
     const output = await queue.receive('env');
     expect(output?.content).toContain('skill:hello');
     expect(output?.metadata?.done).toBe(true);
+  });
+
+  it('falls back to reasoning when an optional tool action omits the tool name', async () => {
+    skillRegistry.register(new UseToolWhenNeededSkill());
+    const agent = new UnifiedAgent({
+      name: 'knowledge-agent',
+      goal: 'answer from available knowledge',
+      llm: new PlanningLLM('use_tool_when_needed'),
+      mode: 'action',
+      allowedSkills: ['use_tool_when_needed'],
+    });
+    const queue = new MessageQueue(['env', 'knowledge-agent']);
+    agent.setMessageQueue(queue);
+    await agent.initialize('knowledge-session');
+
+    await agent.step('check these facts and answer directly');
+
+    expect((await queue.receive('env'))?.content).not.toContain('Action error');
+    expect(agent.getInfo().error).toBeUndefined();
   });
 
   it('passes the stable agent id to system skills instead of the display name', async () => {

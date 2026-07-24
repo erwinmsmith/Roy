@@ -4424,7 +4424,10 @@ export class Runtime {
           const message = error instanceof Error ? error.message : String(error);
           const hasCompletedPriorWork = subagents.length > 0 || teamResults.length > 0;
           const canRecoverWithRootExecution = requiresWorkspaceMutation;
-          const canRecover = hasCompletedPriorWork || canRecoverWithRootExecution;
+          const canRecoverWithRootReasoning = !requiresWorkspaceMutation;
+          const canRecover = hasCompletedPriorWork
+            || canRecoverWithRootExecution
+            || canRecoverWithRootReasoning;
           await this.failRootExecutionStep(correlationId, step, message, !canRecover);
           await this.persistRootExecutionTree(correlationId);
           this.emit({
@@ -4443,7 +4446,9 @@ export class Runtime {
                 error: message,
                 recovery: hasCompletedPriorWork
                   ? 'synthesize_completed_prior_steps'
-                  : 'root_execution_after_failed_delegation',
+                  : canRecoverWithRootExecution
+                    ? 'root_execution_after_failed_delegation'
+                    : 'root_reasoning_after_failed_delegation',
                 completedSubagents: subagents.length,
                 completedTeams: teamResults.length,
               },
@@ -5023,7 +5028,7 @@ export class Runtime {
     const parentId = request.parentId ?? invocation.agentId;
     const reuseMode = request.reuse?.mode ?? 'prefer_cache';
     const patternKey = request.archetype === 'custom' && request.name
-      ? this.safeAgentKey(request.name)
+      ? `custom_${this.safeAgentKey(request.name)}`
       : request.archetype;
     this.emit({
       type: 'agent.node.resolve.started',
@@ -5929,7 +5934,10 @@ export class Runtime {
       });
       await ctx.memory.upsertAgentPattern({
         key: agentMemoryKey,
-        patternId: spec.nodeDefinition?.reuse.targetPatternId,
+        patternId: spec.nodeDefinition?.reuse.targetPatternId
+          ?? (spec.archetype === 'custom'
+            ? `agent_pattern_custom_${this.safeAgentKey(agentMemoryKey)}_v1`
+            : undefined),
         basePatternId: spec.nodeDefinition?.reuse.basePatternId,
         status: spec.nodeDefinition?.reuse.basePatternId ? 'candidate' : undefined,
         name: spec.name ?? this.capitalize(spec.archetype),
@@ -9154,7 +9162,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
       : [];
     const skills = tools.length > 0
       ? Array.from(new Set([...requestedSkills, 'use_tool_when_needed']))
-      : requestedSkills;
+      : requestedSkills.filter(skill => skill !== 'use_tool_when_needed');
     return {
       archetype,
       name: typeof plan.name === 'string' ? plan.name : undefined,

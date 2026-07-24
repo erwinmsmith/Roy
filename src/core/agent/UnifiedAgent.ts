@@ -490,6 +490,22 @@ export class UnifiedAgent extends BaseAgent {
           this.buildActionSynthesisMessages(observation, messages, plan.action, response)
         );
       } else {
+        if (plan.action === 'use_tool_when_needed'
+          && result.error?.includes('toolName is required when needed is not false')) {
+          this.addToMemory(
+            'result',
+            'The optional tool-use action was incomplete, so no tool was executed and reasoning continued.'
+          );
+          this.fsm?.addToTrace('Skipped malformed optional tool-use action');
+          await this.executeConversationalMode([
+            ...messages,
+            {
+              role: 'system',
+              content: 'The attempted optional tool action omitted a tool name. No tool was executed. Answer the task directly from the available context without emitting tool-call markup.',
+            },
+          ]);
+          return;
+        }
         const errorMsg = `Action error: ${result.error}`;
         this.addToMemory('result', errorMsg);
         if (this.messageQueue) {

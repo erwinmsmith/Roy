@@ -1611,7 +1611,7 @@ Keep this agent identity separate from the model provider identity.
     const key = this.safeKey(archetype);
     const patterns = await this.readPatterns('agent-patterns.json') as Array<Record<string, unknown>>;
     return patterns.find(pattern => pattern.id === `agent_pattern_${key}_v1`)
-      ?? patterns.find(pattern => (pattern.key === key || pattern.archetype === key) && !pattern.basePatternId);
+      ?? patterns.find(pattern => pattern.archetype === key && !pattern.basePatternId);
   }
 
   async findAgentPatternById(patternId: string): Promise<Record<string, unknown> | undefined> {

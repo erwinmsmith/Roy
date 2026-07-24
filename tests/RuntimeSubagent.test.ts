@@ -86,6 +86,24 @@ class XmlToolIntentRecoveryLLM extends EchoLLM {
 }
 
 describe('Runtime controlled subagent spawning', () => {
+  it('removes the tool-use skill from a delegation plan that has no tools', () => {
+    const runtime = new Runtime();
+    const normalized = (runtime as unknown as {
+      normalizeDelegationAgentPlan: (
+        plan: Record<string, unknown>,
+        fallbackTask: string
+      ) => { tools?: string[]; skills?: string[] };
+    }).normalizeDelegationAgentPlan({
+      archetype: 'custom',
+      task: 'Answer the supplied trivia questions from model knowledge.',
+      tools: [],
+      skills: ['use_tool_when_needed'],
+    }, 'Answer the question.');
+
+    expect(normalized.tools).toBeUndefined();
+    expect(normalized.skills).toBeUndefined();
+  });
+
   it('allows a semantic researcher to reason without pretending it has an external tool path', async () => {
     const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-semantic-researcher-'));
     await writeFile(path.join(workspaceCwd, '.roy-config-placeholder'), '');
@@ -617,6 +635,37 @@ describe('Runtime controlled subagent spawning', () => {
     const prompt = await readFile(path.join(workspaceCwd, '.roy', 'agents', 'promptauditor-1', 'prompt.md'), 'utf8');
     expect(prompt).toContain('{{agent_identity}}');
 
+    await runtime.shutdown();
+  });
+
+  it('keeps a custom agent name from colliding with a built-in archetype pattern', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-pattern-namespace-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'pattern-namespace-test',
+      llmProvider: new EchoLLM(),
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+
+    await runtime.handleSpawnCommand({
+      archetype: 'custom',
+      name: 'Critic',
+      task: 'Recommend semantic candidates from the supplied prompt.',
+      tools: [],
+      skills: [],
+    });
+    await expect(runtime.handleSpawnCommand({
+      archetype: 'critic',
+      name: 'ArchitectureCritic',
+      task: 'Critique the supplied architecture evidence.',
+    })).resolves.toBeDefined();
+
+    const patterns = await runtime.getCachePatterns('agents');
+    expect(patterns.map(pattern => pattern.id)).toEqual(expect.arrayContaining([
+      'agent_pattern_custom-critic_v1',
+      'agent_pattern_critic_v1',
+    ]));
     await runtime.shutdown();
   });
 
