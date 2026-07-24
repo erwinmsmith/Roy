@@ -1036,15 +1036,15 @@ describe('benchmark terminal capability', () => {
     const attempts = runtime.getEvents().filter(event =>
       event.type === 'root.execution.attempt.completed'
     );
-    expect(attempts).toHaveLength(3);
-    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
-      type: 'root.execution.no_progress.detected',
-      data: expect.objectContaining({
-        attempt: 3,
-        mutationApplied: true,
-        verificationPassed: false,
-      }),
-    }));
+    expect(attempts).toHaveLength(4);
+    const stalls = runtime.getEvents().filter(event =>
+      event.type === 'root.execution.no_progress.detected'
+    );
+    expect(stalls).toHaveLength(2);
+    expect(stalls.at(-1)?.data).toMatchObject({
+      stalledIterations: 2,
+      maxStalledIterations: 2,
+    });
 
     await runtime.shutdown();
   });

@@ -13767,7 +13767,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     const successful = toolCalls.filter(call => call.success);
     const successfulWebFetchCalls = toolCalls.filter(call => call.toolName === 'web.fetch' && call.success);
     const successfulWebFetches = successfulWebFetchCalls.length;
-    const requiredWebFetches = this.requiredWebFetchCount(task);
+    const requiredWebFetches = this.requiredWebFetchCount(intentTask);
     const relevantObservedUrls = successfulWebFetchCalls
       .filter(call => this.toolPlanner.webEvidenceScore(task, call) >= 6)
       .map(call => String(
@@ -14296,7 +14296,12 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       1,
       this.workspaceRuntimeConfig?.delegation.rootSteps.maxExecutionClosureAttempts ?? 3
     );
+    const maxStalledIterations = Math.max(
+      1,
+      this.workspaceRuntimeConfig?.delegation.rootSteps.maxStalledIterations ?? 3
+    );
     let maxAttempts = progressWindow;
+    let stalledIterations = 0;
     const auditRequired = this.taskRequiresAcceptanceAudit(userTask);
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       const remainingMs = this.remainingRootExecutionTimeMs(correlationId);
@@ -14458,6 +14463,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       });
       if (closure.closed) return combined;
       if (current.toolCalls.length === 0) {
+        stalledIterations += 1;
         this.emit({
           type: 'root.execution.no_progress.detected',
           agentId: 'root',
@@ -14465,12 +14471,16 @@ For web-grounded work, use only facts present in the subagent report or runtime 
           data: {
             attempt,
             maxAttempts,
+            stalledIterations,
+            maxStalledIterations,
             reason: 'The grounded repair planner exhausted its internal correction attempts without producing a new tool action.',
             latestFailure: priorExecution?.warnings.at(-1),
             ...closure,
           },
         });
-        break;
+        if (stalledIterations >= maxStalledIterations) break;
+      } else {
+        stalledIterations = 0;
       }
     }
     return combineWithDelegatedExecution();
