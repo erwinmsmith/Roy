@@ -685,7 +685,7 @@ describe('Root dynamic execution tree', () => {
           archetype: 'custom',
           name: 'WorkspaceExplorer',
           role: 'explorer',
-          task: 'Explore the workspace thoroughly and report existing code and data.',
+          task: 'Explore the workspace thoroughly and write the findings report to EXPLORATION.md.',
           tools: ['fs.list', 'fs.read', 'fs.search', 'fs.write', 'fs.synthesize', 'shell.exec'],
         },
         {

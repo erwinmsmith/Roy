@@ -10642,9 +10642,23 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     )
       && !/\b(?:implement|implementation|build|create|write|modify|edit|patch|repair|fix|migrate|executor|coder|engineer)\b/.test(intent);
     if (verifiesOnly) return 2;
-    if (/\b(?:implement|implementation|build|create|write|modify|edit|patch|repair|fix|migrate|executor|coder|engineer)\b/.test(
-      `${intent} ${leadingTaskIntent}`
-    )) {
+    const combinedIntent = `${intent} ${leadingTaskIntent}`;
+    const evidenceDeliverableOnly =
+      /\b(?:explor|research|evidence|path steward|mapper|analyst)\w*\b/.test(intent)
+      && /\b(?:write|create|produce|return)\b[\s\S]{0,100}\b(?:report|summary|findings|analysis|plan|inventory|map|documentation|notes?)\b/.test(
+        leadingTaskIntent
+      )
+      && !/\b(?:implement|implementation|build|modify|edit|patch|repair|fix|migrate|executor|coder|engineer)\b/.test(
+        combinedIntent
+      );
+    const implementationIntent =
+      /\b(?:implement|implementation|build|modify|edit|patch|repair|fix|migrate|executor|coder|engineer)\b/.test(
+        combinedIntent
+      )
+      || /\b(?:create|write)\b[\s\S]{0,100}\b(?:source|code|pipeline|application|module|package|cli|service|required artifacts?|production files?)\b/.test(
+        combinedIntent
+      );
+    if (implementationIntent && !evidenceDeliverableOnly) {
       return 1;
     }
     return 0;
