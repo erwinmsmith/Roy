@@ -153,6 +153,30 @@ class InfeasibleGroundedChildLLM extends RootDelegationLLM {
   }
 }
 
+class InternalKnowledgeChildLLM extends RootDelegationLLM {
+  override async completeJSON<T>(messages: LLMMessage[]): Promise<T> {
+    const text = messages.map(message => String(message.content)).join('\n');
+    if (text.includes("Roy's root delegation controller")) {
+      return {
+        action: 'spawn_subagents',
+        reason: 'An independent knowledge pass improves answer coverage.',
+        continuationPolicy: 'finalize_after_round',
+        agents: [{
+          archetype: 'custom',
+          name: 'KnowledgeSolver-1',
+          task: 'Search your internal knowledge for the supplied trivia answers and return a complete answer map.',
+          tools: [],
+          skills: [],
+        }],
+      } as T;
+    }
+    if (text.includes("'s delegation controller")) {
+      return { action: 'solve_directly', reason: 'The bounded knowledge task can be completed directly.' } as T;
+    }
+    return super.completeJSON<T>(messages);
+  }
+}
+
 class DirectDecisionAuditLLM extends RootDelegationLLM {
   override async completeJSON<T>(messages: LLMMessage[]): Promise<T> {
     const text = messages.map(message => String(message.content)).join('\n');
@@ -348,6 +372,11 @@ describe('Runtime root-controlled delegation', () => {
           custom: [],
         },
       },
+      tom: {
+        autoCompleteGaps: false,
+        enforceMinimumCoverage: false,
+        minimumCoverage: 0,
+      },
     }));
     const runtime = new Runtime();
     await runtime.initialize({
@@ -369,6 +398,53 @@ describe('Runtime root-controlled delegation', () => {
         })],
       }),
     }));
+    await runtime.shutdown();
+  });
+
+  it('keeps internal-knowledge search executable without a web tool path', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-internal-knowledge-child-'));
+    await mkdir(path.join(workspaceCwd, '.roy'), { recursive: true });
+    await writeFile(path.join(workspaceCwd, '.roy', 'config.json'), JSON.stringify({
+      tools: {
+        approval: {
+          readOnly: 'deny',
+          write: 'deny',
+          execute: 'deny',
+          overrides: {},
+        },
+      },
+      agents: {
+        defaultToolsByArchetype: {
+          researcher: [],
+          critic: [],
+          planner: [],
+          coder: [],
+          summarizer: [],
+          tester: [],
+          custom: [],
+        },
+      },
+      tom: {
+        autoCompleteGaps: false,
+        enforceMinimumCoverage: false,
+        minimumCoverage: 0,
+      },
+    }));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'internal-knowledge-child-test',
+      workspaceCwd,
+      llmProvider: new InternalKnowledgeChildLLM(),
+    });
+
+    const result = await runtime.handleUserTurn(
+      'Answer the supplied trivia questions from internal knowledge, then synthesize the result.'
+    );
+
+    expect(result.decision.action).toBe('spawn_subagents');
+    expect(result.subagents).toHaveLength(1);
+    expect(result.subagents[0].subagentResult.result).not.toBe('');
+    expect(runtime.getEvents().some(event => event.type === 'delegation.plan.infeasible')).toBe(false);
     await runtime.shutdown();
   });
 

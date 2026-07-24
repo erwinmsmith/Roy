@@ -3237,7 +3237,9 @@ export class Runtime {
   private taskNeedsWebAccess(task: string): boolean {
     const lower = task.toLowerCase();
     return /https?:\/\//.test(task)
-      || /\b(?:web|internet|online|website|search|browse|news|up-to-date|citations?|official documentation|public documentation)\b/.test(lower)
+      || /\b(?:web|internet|online|website|browse|news|up-to-date|citations?|official documentation|public documentation)\b/.test(lower)
+      || /\bsearch\b[\s\S]{0,100}\b(?:external|official|public)?\s*(?:sources?|documentation|websites?|internet|web)\b/.test(lower)
+      || /\b(?:external|official|public)?\s*(?:sources?|documentation|websites?|internet|web)\b[\s\S]{0,100}\bsearch\b/.test(lower)
       || /\blatest\b[\s\S]*\b(?:documentation|release|version|news|announcement|api)\b/.test(lower)
       || /\b(?:research|compare|verify)\b[\s\S]*\b(?:external|official|independent)\s+sources?\b/.test(lower);
   }
@@ -9497,7 +9499,14 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     correlationId: string
   ): DelegationDecision {
     if (decision.action !== 'spawn_subagents') return decision;
-    const rejected: Array<{ name?: string; archetype: SubAgentArchetype; reason: string }> = [];
+    const rejected: Array<{
+      name?: string;
+      archetype: SubAgentArchetype;
+      reason: string;
+      taskSummary: string;
+      requestedTools: string[];
+      automaticallyAuthorizedTools: string[];
+    }> = [];
     const agents = decision.agents.filter(plan => {
       if (!this.taskRequiresGrounding(plan.archetype, plan.task)) return true;
       const requested = Array.from(new Set([
@@ -9514,6 +9523,9 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
         name: plan.name,
         archetype: plan.archetype,
         reason: 'grounding_required_but_no_automatically_authorized_tool_path',
+        taskSummary: plan.task.slice(0, 1000),
+        requestedTools: requested,
+        automaticallyAuthorizedTools: approved.map(binding => binding.name),
       });
       return false;
     });
