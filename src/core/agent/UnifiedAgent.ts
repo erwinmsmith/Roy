@@ -20,6 +20,7 @@ import { logger } from '../utils/logger.js';
 import type { PlannedToolCall } from '../tools/planner.js';
 import type { ToolLoopCallRecord } from '../tools/executionLoop.js';
 import {
+  completedWorkspaceReadCoversPlan,
   isSuccessfulWorkspaceMutationCall as isSuccessfulWorkspaceMutation,
   isSuccessfulWorkspaceVerificationCall as isSuccessfulWorkspaceVerification,
   isWorkspaceVerificationCall,
@@ -1243,7 +1244,11 @@ function shouldSuppressRepeatedPlannedCall(
   const fingerprint = plannedToolCallFingerprint(planned);
   let previousIndex = -1;
   for (let index = completed.length - 1; index >= 0; index -= 1) {
-    if (plannedToolCallFingerprint(completed[index]!) === fingerprint) {
+    if (plannedToolCallFingerprint(completed[index]!) === fingerprint
+      || completedWorkspaceReadCoversPlan(completed[index]!, {
+        toolName: planned.toolName,
+        params: planned.params,
+      })) {
       previousIndex = index;
       break;
     }

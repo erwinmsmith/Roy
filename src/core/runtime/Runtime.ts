@@ -42,6 +42,7 @@ import type { AgentInfo, AgentUsage, BaseAgent, ToMProfile } from '../agent/Base
 import { actionRegistry } from '../actions/index.js';
 import {
   AgentToolExecutionLoop,
+  completedWorkspaceReadCoversPlan,
   FsListTool,
   FsReadTool,
   FsReplaceTool,
@@ -3397,7 +3398,7 @@ export class Runtime {
               : ['npm', 'node', 'git', 'pwd', 'ls', 'cat', 'rg'],
             maxCalls: this.workspaceRuntimeConfig?.tools.shell.maxCallsPerAgent ?? 5,
           }
-        : { allowedPaths: [this.workspaceRoot], maxCalls: 20 },
+        : { allowedPaths: [this.workspaceRoot] },
     };
   }
 
@@ -13942,7 +13943,11 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     const fingerprint = this.toolPlanFingerprint(plan);
     let previousIndex = -1;
     for (let index = priorCalls.length - 1; index >= 0; index -= 1) {
-      if (this.toolPlanFingerprint(priorCalls[index]!) === fingerprint) {
+      if (this.toolPlanFingerprint(priorCalls[index]!) === fingerprint
+        || completedWorkspaceReadCoversPlan(priorCalls[index]!, {
+          toolName: plan.toolName,
+          params: plan.params,
+        })) {
         previousIndex = index;
         break;
       }

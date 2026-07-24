@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  completedWorkspaceReadCoversPlan,
   findParallelSourceMutation,
   isSuccessfulWorkspaceMutationCall,
   isSuccessfulWorkspaceVerificationCall,
@@ -136,6 +137,33 @@ describe('workspace execution intent', () => {
       toolName: 'fs.list',
       params: { path: '.', maxDepth: 3 },
     }));
+  });
+
+  it('reuses a complete unchanged file read across different pagination parameters', () => {
+    const completed = {
+      toolName: 'fs.read',
+      params: { path: './rules/public_expectations.yml', maxBytes: 4_000 },
+      success: true,
+      result: {
+        path: 'rules/public_expectations.yml',
+        truncated: false,
+        startLine: 1,
+        endLine: 44,
+        totalLines: 44,
+      },
+    };
+
+    expect(completedWorkspaceReadCoversPlan(completed, {
+      toolName: 'fs.read',
+      params: { path: 'rules/public_expectations.yml', startLine: 1, endLine: 100 },
+    })).toBe(true);
+    expect(completedWorkspaceReadCoversPlan({
+      ...completed,
+      result: { ...completed.result, truncated: true, endLine: 20 },
+    }, {
+      toolName: 'fs.read',
+      params: { path: 'rules/public_expectations.yml', startLine: 21, endLine: 44 },
+    })).toBe(false);
   });
 
   it('distinguishes mutation tasks from explicitly read-only work', () => {

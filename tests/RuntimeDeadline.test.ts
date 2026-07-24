@@ -132,4 +132,35 @@ describe('Runtime external wall-clock deadline', () => {
       skip: false,
     });
   });
+
+  it('skips a differently paginated read when a full unchanged file is already cached', () => {
+    const runtime = new Runtime() as unknown as {
+      cachedToolPlanDecision(
+        plan: PlannedToolCall,
+        priorCalls: ToolCallRecord[]
+      ): { skip: boolean; reason?: string };
+    };
+    const completed: ToolCallRecord = {
+      toolName: 'fs.read',
+      params: { path: 'rules/public_expectations.yml', maxBytes: 4_000 },
+      success: true,
+      result: {
+        path: 'rules/public_expectations.yml',
+        truncated: false,
+        startLine: 1,
+        endLine: 44,
+        totalLines: 44,
+      },
+    };
+
+    expect(runtime.cachedToolPlanDecision({
+      toolName: 'fs.read',
+      params: { path: './rules/public_expectations.yml', startLine: 1, endLine: 100 },
+      reason: 'Read the same unchanged rules again.',
+      groundingRequired: true,
+    }, [completed])).toMatchObject({
+      skip: true,
+      reason: 'cached_file_read_still_current',
+    });
+  });
 });

@@ -28,6 +28,43 @@ export function workspaceToolIntentFingerprint(
   return `${call.toolName}:${JSON.stringify(sortedParams)}`;
 }
 
+export function completedWorkspaceReadCoversPlan(
+  completed: ExecutionIntentCall,
+  planned: Pick<ExecutionIntentCall, 'toolName' | 'params'>
+): boolean {
+  if (!completed.success || completed.toolName !== 'fs.read' || planned.toolName !== 'fs.read') {
+    return false;
+  }
+  const completedPath = normalizeWorkspaceRelativePath(String(completed.params.path ?? ''));
+  const plannedPath = normalizeWorkspaceRelativePath(String(planned.params.path ?? ''));
+  if (!completedPath || completedPath !== plannedPath) return false;
+
+  const result = completed.result as {
+    truncated?: unknown;
+    startLine?: unknown;
+    endLine?: unknown;
+    totalLines?: unknown;
+  } | undefined;
+  if (result?.truncated === true) return false;
+  const completedStart = positiveInteger(result?.startLine)
+    ?? positiveInteger(completed.params.startLine)
+    ?? 1;
+  const completedEnd = positiveInteger(result?.endLine);
+  const totalLines = positiveInteger(result?.totalLines);
+  const completedFullFile = completedStart === 1
+    && completedEnd !== undefined
+    && totalLines !== undefined
+    && completedEnd >= totalLines;
+  if (completedFullFile) return true;
+
+  const plannedStart = positiveInteger(planned.params.startLine) ?? 1;
+  const plannedEnd = positiveInteger(planned.params.endLine);
+  return completedEnd !== undefined
+    && plannedEnd !== undefined
+    && completedStart <= plannedStart
+    && completedEnd >= plannedEnd;
+}
+
 const NULL_OUTPUT_TARGETS = new Set([
   '/dev/null',
   '/dev/stdout',
@@ -150,6 +187,11 @@ function extractResultPaths(result: unknown): string[] {
 
 function normalizeWorkspaceRelativePath(value: string): string {
   return value.trim().replace(/\\/g, '/').replace(/^(?:\.\/)+/, '').replace(/\/+/g, '/');
+}
+
+function positiveInteger(value: unknown): number | undefined {
+  const number = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(number) && number >= 1 ? Math.floor(number) : undefined;
 }
 
 function isNonWorkspaceOutputTarget(target: string): boolean {

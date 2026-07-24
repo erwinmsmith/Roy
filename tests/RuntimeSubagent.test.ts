@@ -234,6 +234,38 @@ describe('Runtime controlled subagent spawning', () => {
     await disabled.shutdown();
   });
 
+  it('does not impose a hidden lifetime cap on filesystem evidence calls', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-fs-call-cap-'));
+    await writeFile(path.join(workspaceCwd, 'evidence.txt'), 'reusable evidence\n', 'utf8');
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'fs-call-cap-test',
+      llmProvider: new EchoLLM(),
+      workspaceCwd,
+    });
+    const agent = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'custom',
+      tomLevel: 0,
+      description: 'Inspect evidence repeatedly across a long execution path.',
+      task: 'Inspect evidence repeatedly across a long execution path.',
+      tools: ['fs.read'],
+    });
+
+    const outcomes = [];
+    for (let index = 0; index < 25; index += 1) {
+      outcomes.push(await runtime.executeToolForAgent(agent.identity.id, 'fs.read', {
+        path: 'evidence.txt',
+        startLine: 1,
+        endLine: 1,
+      }));
+    }
+
+    expect(outcomes.every(outcome => outcome.success)).toBe(true);
+    expect(outcomes.some(outcome => outcome.error?.includes('Tool call limit reached'))).toBe(false);
+    await runtime.shutdown();
+  });
+
   it('repairs Markdown tool requests instead of presenting them as final output', async () => {
     const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-markdown-tool-intent-'));
     await writeFile(path.join(workspaceCwd, 'package.json'), '{"name":"tool-repair-test"}\n', 'utf8');

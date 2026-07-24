@@ -17,6 +17,7 @@ export { registerCoreTools } from './builtin.js';
 export { AgentToolPlanner } from './planner.js';
 export { AgentToolExecutionLoop } from './executionLoop.js';
 export {
+  completedWorkspaceReadCoversPlan,
   findParallelSourceMutation,
   isSuccessfulWorkspaceMutationCall,
   isSuccessfulWorkspaceVerificationCall,
