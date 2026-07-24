@@ -1,3 +1,8 @@
+import {
+  isSuccessfulWorkspaceVerificationCall,
+  isWorkspaceVerificationCall,
+} from './executionIntent.js';
+
 export interface ToolPlanBinding {
   name: string;
   enabled: boolean;
@@ -230,7 +235,14 @@ export class AgentToolPlanner {
     let latestFailureIndex = -1;
     for (let index = input.calls.length - 1; index >= 0; index -= 1) {
       const call = input.calls[index]!;
-      if (call.toolName === 'shell.exec' && !call.success) {
+      if (call.toolName === 'shell.exec'
+        && (
+          !call.success
+          || (
+            isWorkspaceVerificationCall(call)
+            && !isSuccessfulWorkspaceVerificationCall(call)
+          )
+        )) {
         latestFailureIndex = index;
         break;
       }
@@ -241,11 +253,13 @@ export class AgentToolPlanner {
       cwd?: unknown;
       stdout?: unknown;
       stderr?: unknown;
+      verifierDiagnostics?: unknown;
     } | undefined;
     const output = [
       String(shell?.stdout ?? ''),
       String(shell?.stderr ?? ''),
       String(failure.error ?? ''),
+      ...this.extractVerifierDiagnosticText(shell?.verifierDiagnostics),
     ].filter(Boolean).join('\n');
     const locations = this.extractFailureLocations(
       output,
@@ -286,6 +300,36 @@ export class AgentToolPlanner {
         );
       })
       .slice(0, 1);
+  }
+
+  private extractVerifierDiagnosticText(value: unknown): string[] {
+    const text: string[] = [];
+    const visit = (item: unknown, depth: number): void => {
+      if (depth > 5 || item === null || item === undefined) return;
+      if (typeof item === 'string') {
+        text.push(item);
+        const trimmed = item.trim();
+        if ((trimmed.startsWith('{') || trimmed.startsWith('[')) && trimmed.length < 100_000) {
+          try {
+            visit(JSON.parse(trimmed), depth + 1);
+          } catch {
+            // The diagnostic may be ordinary traceback text rather than JSON.
+          }
+        }
+        return;
+      }
+      if (Array.isArray(item)) {
+        item.slice(0, 40).forEach(entry => visit(entry, depth + 1));
+        return;
+      }
+      if (typeof item === 'object') {
+        Object.values(item as Record<string, unknown>)
+          .slice(0, 80)
+          .forEach(entry => visit(entry, depth + 1));
+      }
+    };
+    visit(value, 0);
+    return text;
   }
 
   hasSufficientWebEvidence(task: string, calls: ObservedToolCall[]): boolean {

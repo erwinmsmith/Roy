@@ -143,6 +143,49 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('uses a non-perfect official verifier score and nested diagnostic traceback', () => {
+    const plans = new AgentToolPlanner().planWorkspaceFailureFollowUps({
+      workspaceRoot: '/app',
+      bindings: [
+        { name: 'fs.read', enabled: true },
+        { name: 'shell.exec', enabled: true },
+      ],
+      calls: [{
+        toolName: 'shell.exec',
+        params: { command: 'python .roy/official-verifier/grade.py' },
+        success: true,
+        result: {
+          cwd: '/app',
+          stdout: '0.040000000000\n',
+          stderr: '',
+          exitCode: 0,
+          verifierDiagnostics: [{
+            path: '/logs/verifier/grade.log',
+            content: JSON.stringify({
+              public_log_tail: [
+                'Traceback (most recent call last):',
+                '  File "/app/src/table_recon/audit.py", line 433, in run_audit',
+                '    expected.get("tables", [])',
+                "AttributeError: 'list' object has no attribute 'get'",
+              ].join('\n'),
+            }),
+          }],
+        },
+      }],
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.read',
+        params: {
+          path: 'src/table_recon/audit.py',
+          startLine: 408,
+          endLine: 458,
+        },
+      }),
+    ]);
+  });
+
   it('reads the package manifest for an architecture critic', () => {
     const plans = new AgentToolPlanner().plan({
       task: 'Identify architectural coupling risks using filesystem evidence.',
