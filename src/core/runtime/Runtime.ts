@@ -15042,6 +15042,33 @@ For web-grounded work, use only facts present in the subagent report or runtime 
           || binding.name === 'fs.synthesize'
         )
       );
+    if (plans.length === 0 && workspaceExecutionRequired) {
+      const transitionPlans = this.toolPlanner.planWorkspaceRepairTransition({
+        task: intentTask,
+        calls: priorPlannerCalls,
+        bindings,
+        workspaceRoot: this.workspaceRoot,
+      });
+      if (transitionPlans.length > 0) {
+        plans.push(...transitionPlans);
+        this.emit({
+          type: 'tool.plan.causal_transition',
+          agentId,
+          sessionId: this.getContext().sessionId,
+          correlationId: options.correlationId,
+          nodeId: options.nodeId,
+          data: {
+            from: 'aggregate_verifier_evidence',
+            to: 'workspace_repair',
+            plans: transitionPlans.map(plan => ({
+              toolName: plan.toolName,
+              params: plan.params,
+            })),
+            priorToolCalls: priorPlannerCalls.length,
+          },
+        });
+      }
+    }
     const needsModelPlannedAction = bindings.some(binding =>
       binding.enabled && (
         binding.name === 'shell.exec'
@@ -15188,6 +15215,31 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         return { result: result.result, success: result.success, error: result.error };
       },
       planNext: async context => {
+        const causalTransitionPlans = this.toolPlanner.planWorkspaceRepairTransition({
+          task: intentTask,
+          calls: [...priorPlannerCalls, ...context.calls],
+          bindings,
+          workspaceRoot: this.workspaceRoot,
+        });
+        if (causalTransitionPlans.length > 0) {
+          this.emit({
+            type: 'tool.plan.causal_transition',
+            agentId,
+            sessionId: this.getContext().sessionId,
+            correlationId: options.correlationId,
+            nodeId: options.nodeId,
+            data: {
+              from: 'aggregate_verifier_evidence',
+              to: 'workspace_repair',
+              plans: causalTransitionPlans.map(plan => ({
+                toolName: plan.toolName,
+                params: plan.params,
+              })),
+              priorToolCalls: priorPlannerCalls.length + context.calls.length,
+            },
+          });
+          return causalTransitionPlans.slice(0, context.remainingCalls);
+        }
         const failureContextPlans = this.toolPlanner.planWorkspaceFailureFollowUps({
           calls: [...priorPlannerCalls, ...context.calls],
           bindings,

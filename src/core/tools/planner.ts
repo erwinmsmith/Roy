@@ -1,6 +1,8 @@
 import {
+  isSuccessfulWorkspaceMutationCall,
   isSuccessfulWorkspaceVerificationCall,
   isWorkspaceVerificationCall,
+  workspaceCandidateRollbackFromCall,
 } from './executionIntent.js';
 
 export interface ToolPlanBinding {
@@ -232,21 +234,7 @@ export class AgentToolPlanner {
     workspaceRoot?: string;
   }): PlannedToolCall[] {
     if (!input.bindings.some(binding => binding.enabled && binding.name === 'fs.read')) return [];
-    let latestFailureIndex = -1;
-    for (let index = input.calls.length - 1; index >= 0; index -= 1) {
-      const call = input.calls[index]!;
-      if (call.toolName === 'shell.exec'
-        && (
-          !call.success
-          || (
-            isWorkspaceVerificationCall(call)
-            && !isSuccessfulWorkspaceVerificationCall(call)
-          )
-        )) {
-        latestFailureIndex = index;
-        break;
-      }
-    }
+    const latestFailureIndex = this.latestShellFailureIndex(input.calls);
     if (latestFailureIndex < 0) return [];
     const failure = input.calls[latestFailureIndex]!;
     const shell = failure.result as {
@@ -300,6 +288,124 @@ export class AgentToolPlanner {
         );
       })
       .slice(0, 1);
+  }
+
+  planWorkspaceRepairTransition(input: {
+    task: string;
+    calls: ObservedToolCall[];
+    bindings: ToolPlanBinding[];
+    workspaceRoot?: string;
+  }): PlannedToolCall[] {
+    if (!input.bindings.some(binding =>
+      binding.enabled && binding.name === 'fs.synthesize'
+    )) {
+      return [];
+    }
+    const latestFailureIndex = this.latestShellFailureIndex(input.calls);
+    if (latestFailureIndex < 0) return [];
+    const failure = input.calls[latestFailureIndex]!;
+    if (!isWorkspaceVerificationCall(failure)
+      || isSuccessfulWorkspaceVerificationCall(failure)) {
+      return [];
+    }
+    const shell = failure.result as {
+      cwd?: unknown;
+      stdout?: unknown;
+      stderr?: unknown;
+      verifierDiagnostics?: unknown;
+    } | undefined;
+    const failureOutput = [
+      String(shell?.stdout ?? ''),
+      String(shell?.stderr ?? ''),
+      String(failure.error ?? ''),
+      ...this.extractVerifierDiagnosticText(shell?.verifierDiagnostics),
+    ].filter(Boolean).join('\n');
+    if (this.extractFailureLocations(
+      failureOutput,
+      String(shell?.cwd ?? input.workspaceRoot ?? ''),
+      input.workspaceRoot
+    ).length > 0) {
+      return [];
+    }
+
+    const readsAfterFailure = input.calls
+      .slice(latestFailureIndex + 1)
+      .filter(call => {
+        if (!call.success || call.toolName !== 'fs.read') return false;
+        const result = call.result as { content?: unknown; truncated?: unknown } | undefined;
+        return typeof result?.content === 'string' && result.truncated !== true;
+      });
+    const verifierObserved = readsAfterFailure.some(call =>
+      this.normalizeWorkspacePath(String(
+        (call.result as { path?: unknown } | undefined)?.path
+          ?? call.params.path
+          ?? ''
+      )).startsWith('.roy/official-verifier/')
+    );
+    if (!verifierObserved) return [];
+    const taskPath = input.task.toLowerCase().replaceAll('\\', '/');
+    const implementationRead = [...readsAfterFailure].reverse().find(call => {
+      const candidate = this.normalizeWorkspacePath(String(
+        (call.result as { path?: unknown } | undefined)?.path
+          ?? call.params.path
+          ?? ''
+      ));
+      return /(?:^|\/)(?:src|lib|app|packages)\/.+\.(?:py|ts|tsx|js|jsx|mjs|cjs|java|go|rs|rb|php)$/i.test(
+        candidate
+      ) && (
+        taskPath.includes(candidate.toLowerCase())
+        || !/(?:^|\/)(?:tests?|fixtures?|examples?)\//i.test(candidate)
+      );
+    });
+    if (!implementationRead) return [];
+    const implementationReadIndex = input.calls.lastIndexOf(implementationRead);
+    if (input.calls.slice(implementationReadIndex + 1).some(call =>
+      isSuccessfulWorkspaceMutationCall(call)
+    )) {
+      return [];
+    }
+    const targetPath = this.normalizeWorkspacePath(String(
+      (implementationRead.result as { path?: unknown } | undefined)?.path
+        ?? implementationRead.params.path
+        ?? ''
+    ));
+    const rejectedCandidate = [...input.calls].reverse()
+      .map(call => workspaceCandidateRollbackFromCall(call))
+      .find(rollback =>
+        rollback
+        && this.normalizeWorkspacePath(String(rollback.path ?? '')) === targetPath
+      );
+    if (rejectedCandidate) return [];
+    return [{
+      toolName: 'fs.synthesize',
+      params: {
+        path: targetPath,
+        instructions: 'Structurally repair the implementation to satisfy the grounded aggregate official-verifier failures and immutable assignment, preserving behavior already proven by passing verifier groups.',
+      },
+      reason: 'The causal frontier contains a non-perfect aggregate verifier result plus complete verifier and implementation source evidence; transition from inspection to a preserving repair.',
+      groundingRequired: true,
+    }];
+  }
+
+  private latestShellFailureIndex(calls: ObservedToolCall[]): number {
+    for (let index = calls.length - 1; index >= 0; index -= 1) {
+      const call = calls[index]!;
+      if (call.toolName === 'shell.exec'
+        && (
+          !call.success
+          || (
+            isWorkspaceVerificationCall(call)
+            && !isSuccessfulWorkspaceVerificationCall(call)
+          )
+        )) {
+        return index;
+      }
+    }
+    return -1;
+  }
+
+  private normalizeWorkspacePath(value: string): string {
+    return value.trim().replace(/\\/g, '/').replace(/^(?:\.\/)+/, '').replace(/\/+/g, '/');
   }
 
   private extractVerifierDiagnosticText(value: unknown): string[] {

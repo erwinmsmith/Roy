@@ -186,6 +186,80 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('transitions aggregate verifier evidence directly into a preserving repair', () => {
+    const planner = new AgentToolPlanner();
+    const task = 'Repair src/table_recon/audit.py until the official verifier reward is 1.';
+    const bindings = [
+      { name: 'fs.read', enabled: true },
+      { name: 'fs.synthesize', enabled: true },
+      { name: 'shell.exec', enabled: true },
+    ];
+    const calls = [
+        {
+          toolName: 'shell.exec',
+          params: { command: 'python .roy/official-verifier/grade.py' },
+          success: true,
+          result: {
+            cwd: '/app',
+            stdout: '0.020000000000\n',
+            exitCode: 0,
+            verifierDiagnostics: [{
+              path: '/logs/verifier/scorecard.json',
+              content: '{"groups":{"G_public_reconstruction":1,"G_hidden_end_to_end_stress":0}}',
+            }],
+          },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: '.roy/official-verifier/grade.py', maxBytes: 20_000 },
+          success: true,
+          result: {
+            path: '.roy/official-verifier/grade.py',
+            content: 'GROUPS = ["G_public_reconstruction", "G_hidden_end_to_end_stress"]',
+            truncated: false,
+          },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/table_recon/audit.py', maxBytes: 30_000 },
+          success: true,
+          result: {
+            path: 'src/table_recon/audit.py',
+            content: 'def run_audit(manifest, output):\n    reconstruct_public(manifest, output)\n',
+            truncated: false,
+          },
+        },
+      ];
+    const plans = planner.planWorkspaceRepairTransition({
+      task,
+      workspaceRoot: '/app',
+      bindings,
+      calls,
+    });
+
+    expect(plans).toEqual([expect.objectContaining({
+      toolName: 'fs.synthesize',
+      params: {
+        path: 'src/table_recon/audit.py',
+        instructions: expect.stringContaining('preserving behavior already proven'),
+      },
+    })]);
+    expect(planner.planWorkspaceRepairTransition({
+      task,
+      workspaceRoot: '/app',
+      bindings,
+      calls: [
+        ...calls,
+        {
+          toolName: 'fs.synthesize',
+          params: { path: 'src/table_recon/audit.py', instructions: 'Preserving repair.' },
+          success: true,
+          result: { path: 'src/table_recon/audit.py', synthesized: true },
+        },
+      ],
+    })).toEqual([]);
+  });
+
   it('reads the package manifest for an architecture critic', () => {
     const plans = new AgentToolPlanner().plan({
       task: 'Identify architectural coupling risks using filesystem evidence.',
