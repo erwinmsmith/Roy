@@ -1089,6 +1089,14 @@ describe('benchmark terminal capability', () => {
       }),
     }));
     expect(result.executionTree.steps[0].cache?.path.parentPathIds).toContain('prior-path');
+    expect(result.executionTree.steps[0].cache?.path.toolFrontier).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          toolName: 'fs.list',
+          success: true,
+        }),
+      ])
+    );
     expect(result.decision).toMatchObject({ action: 'solve_directly' });
 
     await runtime.shutdown();

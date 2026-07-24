@@ -9419,6 +9419,26 @@ export class Runtime {
       && !parentPathIds.includes(resumeState.anchorPathId)) {
       parentPathIds.push(resumeState.anchorPathId);
     }
+    const inheritedToolFrontier = resumeState?.knowledge.paths
+      .flatMap(path => path.toolFrontier ?? [])
+      ?? [];
+    const boundedToolFrontier = this.boundExecutionToolFrontier([
+      ...inheritedToolFrontier,
+      ...cachedToolFrontier,
+    ]);
+    if (inheritedToolFrontier.length > 0) {
+      this.emit({
+        type: 'execution.tool_frontier.carried_forward',
+        agentId: 'root',
+        correlationId: tree.correlationId,
+        data: {
+          stepId: step.id,
+          inheritedCalls: inheritedToolFrontier.length,
+          currentCalls: cachedToolFrontier.length,
+          persistedCalls: boundedToolFrontier.length,
+        },
+      });
+    }
     const hasFailures = failedTools.size > 0 || feedback.some(item => item.kind === 'actor_failure');
     const hasSuccess = successfulTools.size > 0 || input.actorIds.length > 0 || input.teamIds.length > 0;
     const pathStatus = input.stepStatus === 'failed'
@@ -9460,7 +9480,7 @@ export class Runtime {
         failedTools: [...failedTools],
         mutationObserved,
         verificationObserved,
-        toolFrontier: this.boundExecutionToolFrontier(cachedToolFrontier),
+        toolFrontier: boundedToolFrontier,
         feedbackIds: feedback.map(item => item.id),
         summary: input.resultSummary?.slice(0, 5000),
         createdAt: step.startedAt,
@@ -9535,8 +9555,18 @@ export class Runtime {
     maxSerializedChars = 240_000
   ): ExecutionCachedToolCall[] {
     const selected: ExecutionCachedToolCall[] = [];
+    const seen = new Set<string>();
     let serializedChars = 0;
     for (const call of calls.slice(-Math.max(1, maxCalls)).reverse()) {
+      const fingerprint = [
+        call.toolName,
+        JSON.stringify(call.params),
+        call.success,
+        call.startedAt ?? '',
+        call.completedAt ?? '',
+      ].join(':');
+      if (seen.has(fingerprint)) continue;
+      seen.add(fingerprint);
       const callChars = JSON.stringify(call).length;
       if (selected.length > 0 && serializedChars + callChars > maxSerializedChars) continue;
       selected.push(call);
