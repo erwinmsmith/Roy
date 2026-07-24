@@ -1113,7 +1113,11 @@ describe('UnifiedAgent capability execution', () => {
       mode: 'hybrid',
       allowedTools: ['fs.read', 'fs.replace', 'shell.exec'],
     });
-    const verifierTail = `FAILED hidden dataset\n${'diagnostic-context-'.repeat(120)}`;
+    const verifierTail = [
+      'CAUSE KeyError: amount_cents',
+      'diagnostic-context-'.repeat(300),
+      'FAILED hidden dataset',
+    ].join('\n');
 
     await agent.planNextToolRound({
       task: 'Repair src/app.py and run the official tests.',
@@ -1151,6 +1155,7 @@ describe('UnifiedAgent capability execution', () => {
     const userPrompt = llm.messages.find(message =>
       message.role === 'user' && message.content.includes('Tool observations:')
     )?.content ?? '';
+    expect(userPrompt).toContain('CAUSE KeyError: amount_cents');
     expect(userPrompt).toContain('FAILED hidden dataset');
     expect(userPrompt).toContain('diagnostic-context-diagnostic-context');
     expect(userPrompt).toContain('"latestVerificationFailed":true');
@@ -1687,6 +1692,64 @@ describe('UnifiedAgent capability execution', () => {
       toolName: 'shell.exec',
       params: verifierParams,
       reason: expect.stringContaining('most recent authoritative verification'),
+    })]);
+  });
+
+  it('keeps synthesis on the explicit implementation module instead of a nearby CLI wrapper', async () => {
+    const llm = new WrongRepairTargetPlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'explicit-implementation-target-agent',
+      goal: 'implement behavior in the assigned module',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.read', 'fs.synthesize', 'shell.exec'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: [
+        'Read src/dq_audit/audit.py and src/dq_audit/cli.py.',
+        'Implement the complete dynamic pipeline in src/dq_audit/audit.py.',
+        'Keep cli.py as a thin entry-point wrapper.',
+      ].join('\n'),
+      executionRequired: true,
+      round: 3,
+      remainingCalls: 2,
+      tools: [
+        { name: 'fs.read' },
+        { name: 'fs.synthesize' },
+        { name: 'shell.exec' },
+      ],
+      calls: [
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/dq_audit/audit.py' },
+          reason: 'Inspect the implementation module.',
+          groundingRequired: true,
+          success: true,
+          result: {
+            path: 'src/dq_audit/audit.py',
+            content: 'def run_audit(config, output):\n    return clean_dynamic_inputs(config, output)\n',
+          },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/dq_audit/cli.py' },
+          reason: 'Inspect the wrapper.',
+          groundingRequired: true,
+          success: true,
+          result: {
+            path: 'src/dq_audit/cli.py',
+            content: 'from .audit import run_audit\n',
+          },
+        },
+      ],
+    });
+
+    expect(plans).toEqual([expect.objectContaining({
+      toolName: 'fs.synthesize',
+      params: expect.objectContaining({
+        path: 'src/dq_audit/audit.py',
+      }),
     })]);
   });
 });

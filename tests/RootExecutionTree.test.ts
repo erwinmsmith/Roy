@@ -879,6 +879,56 @@ describe('Root dynamic execution tree', () => {
     });
   });
 
+  it('answers self-contained workspace discovery questions with tools instead of user clarification', () => {
+    const runtime = new Runtime();
+    const requiresMutation = (runtime as unknown as {
+      taskRequiresRootWorkspaceMutation: (task: string) => boolean;
+    }).taskRequiresRootWorkspaceMutation;
+    expect(requiresMutation.call(runtime, [
+      '<official_verifier_feedback>',
+      'Do not modify the verifier mirror. The implementation failed and must be repaired.',
+      '</official_verifier_feedback>',
+    ].join('\n'))).toBe(true);
+    const override = (runtime as unknown as {
+      overrideExecutableTaskClarification: (
+        decision: DelegationDecision,
+        task: string,
+        requiresLongHorizon: boolean,
+        requiresWorkspaceMutation: boolean,
+        correlationId: string
+      ) => DelegationDecision;
+    }).overrideExecutableTaskClarification;
+    const decision = override.call(
+      runtime,
+      {
+        action: 'ask_clarification',
+        reason: 'I need to know which files exist.',
+        question: 'What is the current directory structure?',
+      },
+      'Implement the complete workspace pipeline, inspect its files, and run the verifier.',
+      true,
+      true,
+      'self-contained-clarification-test'
+    );
+
+    expect(decision).toMatchObject({
+      action: 'spawn_subagents',
+      coordination: 'team',
+      agents: [
+        { archetype: 'researcher' },
+        { archetype: 'coder' },
+        { archetype: 'tester' },
+      ],
+    });
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'delegation.clarification.overridden',
+      correlationId: 'self-contained-clarification-test',
+      data: expect.objectContaining({
+        rejectedQuestion: 'What is the current directory structure?',
+      }),
+    }));
+  });
+
   it('hands a long-horizon task back to root as soon as a delegated mutation occurs', () => {
     const runtime = new Runtime();
     const shouldHandoff = (runtime as unknown as {

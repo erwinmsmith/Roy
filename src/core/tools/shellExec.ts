@@ -320,9 +320,16 @@ export class ShellExecTool implements Tool {
   private truncate(value: string, maxBytes: number, preserveTail = false): string {
     const buffer = Buffer.from(value);
     if (buffer.byteLength <= maxBytes) return value;
-    return preserveTail
-      ? `[truncated ${buffer.byteLength - maxBytes} leading bytes]\n${buffer.subarray(-maxBytes).toString('utf8')}`
-      : `${buffer.subarray(0, maxBytes).toString('utf8')}\n[truncated ${buffer.byteLength - maxBytes} trailing bytes]`;
+    if (!preserveTail) {
+      return `${buffer.subarray(0, maxBytes).toString('utf8')}\n[truncated ${buffer.byteLength - maxBytes} trailing bytes]`;
+    }
+    const headBytes = Math.max(1, Math.floor(maxBytes * 0.6));
+    const tailBytes = Math.max(1, maxBytes - headBytes);
+    return [
+      buffer.subarray(0, headBytes).toString('utf8'),
+      `[truncated ${buffer.byteLength - maxBytes} middle bytes]`,
+      buffer.subarray(-tailBytes).toString('utf8'),
+    ].join('\n');
   }
 
   private redactCommand(command: string): string {

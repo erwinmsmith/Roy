@@ -164,7 +164,7 @@ export class UnifiedAgent extends BaseAgent {
         error: call.error
           ? compactTail(String(call.error), detailed ? 3_000 : 400)
           : undefined,
-        result: compactToolObservation(call.result, call.toolName, detailed),
+        result: compactToolObservation(call.result, call.toolName, detailed, !call.success),
       };
     });
     const messages: LLMMessage[] = [
@@ -1300,7 +1300,9 @@ function alignSynthesisRepairTargetWithFailure(
   if (planned.toolName !== 'fs.synthesize') return planned;
   const candidates = rankGroundedSynthesisTargets(calls, task);
   const best = candidates[0];
-  if (!best?.failureMentioned || !best.stubSignal) return planned;
+  const decisiveFailureTarget = Boolean(best?.failureMentioned && best.stubSignal);
+  const explicitImplementationTarget = Boolean(best?.implementationIntent);
+  if (!best || (!decisiveFailureTarget && !explicitImplementationTarget)) return planned;
   const plannedPath = normalizePlannedWorkspacePath(String(planned.params.path ?? ''));
   const plannedCandidate = candidates.find(candidate => candidate.filePath === plannedPath);
   if (best.filePath === plannedPath
@@ -1313,7 +1315,11 @@ function alignSynthesisRepairTargetWithFailure(
       ...planned.params,
       path: best.filePath,
     },
-    reason: `${planned.reason} Runtime bound the repair to ${best.filePath}, which is both cited by the latest failed verification and still contains an implementation stub.`,
+    reason: `${planned.reason} Runtime bound the synthesis to ${best.filePath}, which is ${
+      decisiveFailureTarget
+        ? 'both cited by the latest failed verification and still contains an implementation stub'
+        : 'the explicit implementation target in the immutable assignment'
+    }.`,
   };
 }
 
@@ -1325,6 +1331,7 @@ function rankGroundedSynthesisTargets(
   score: number;
   failureMentioned: boolean;
   stubSignal: boolean;
+  implementationIntent: boolean;
 }> {
   const taskLower = task.toLowerCase();
   const latestFailure = [...calls].reverse().find(call =>
@@ -1338,6 +1345,7 @@ function rankGroundedSynthesisTargets(
     score: number;
     failureMentioned: boolean;
     stubSignal: boolean;
+    implementationIntent: boolean;
   }>();
   calls
     .map((call, index) => {
@@ -1363,10 +1371,16 @@ function rankGroundedSynthesisTargets(
       );
       const stubSignal =
         /\b(?:todo|notimplemented(?:error)?|not implemented|placeholder|stub)\b|^\s*pass\s*(?:#.*)?$/im.test(content);
+      const implementationIntent = taskNamesFileAsImplementationTarget(
+        taskLower,
+        filePathLower,
+        basename
+      );
       let score = index / Math.max(1, calls.length);
       if (/(?:^|\/)(?:src|lib|app|packages)\//i.test(filePath)) score += 6;
       if (/(?:^|\/)(?:tests?|fixtures?|examples?|data|rules)\//i.test(filePath)) score -= 8;
       if (stubSignal) score += 18;
+      if (implementationIntent) score += 20;
       if (taskLower.includes(filePathLower)
         || taskLower.includes(basename)) {
         score += 7;
@@ -1374,13 +1388,14 @@ function rankGroundedSynthesisTargets(
       if (failureMentioned) {
         score += failureText.includes(filePathLower) ? 18 : 8;
       }
-      return { filePath, score, failureMentioned, stubSignal };
+      return { filePath, score, failureMentioned, stubSignal, implementationIntent };
     })
     .filter((candidate): candidate is {
       filePath: string;
       score: number;
       failureMentioned: boolean;
       stubSignal: boolean;
+      implementationIntent: boolean;
     } => Boolean(candidate))
     .forEach(candidate => {
       const previous = byPath.get(candidate.filePath);
@@ -1389,6 +1404,22 @@ function rankGroundedSynthesisTargets(
       }
     });
   return [...byPath.values()].sort((left, right) => right.score - left.score);
+}
+
+function taskNamesFileAsImplementationTarget(
+  taskLower: string,
+  filePathLower: string,
+  basename: string
+): boolean {
+  const targets = [filePathLower, basename]
+    .filter(Boolean)
+    .map(value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  if (targets.length === 0) return false;
+  const target = `(?:${targets.join('|')})`;
+  return new RegExp(
+    `\\b(?:implement|repair|fix|rewrite|complete|move|extract|build|create|write|update)\\b[^.\\n;]{0,180}${target}`,
+    'i'
+  ).test(taskLower);
 }
 
 function isDestructiveRepairOverwrite(
@@ -1674,7 +1705,8 @@ function compactToolPlanningTask(task: string): string {
 function compactToolObservation(
   result: unknown,
   toolName: string,
-  latest = true
+  latest = true,
+  failed = false
 ): unknown {
   if (result && typeof result === 'object' && toolName === 'web.search') {
     const search = result as {
@@ -1719,8 +1751,12 @@ function compactToolObservation(
     };
     return {
       command: String(shell.command ?? '').slice(0, latest ? 800 : 250),
-      stdout: compactTail(String(shell.stdout ?? ''), latest ? 1_500 : 250),
-      stderr: compactTail(String(shell.stderr ?? ''), latest ? 3_000 : 500),
+      stdout: failed
+        ? compactHeadAndTail(String(shell.stdout ?? ''), latest ? 1_500 : 250)
+        : compactTail(String(shell.stdout ?? ''), latest ? 1_500 : 250),
+      stderr: failed
+        ? compactHeadAndTail(String(shell.stderr ?? ''), latest ? 3_000 : 500)
+        : compactTail(String(shell.stderr ?? ''), latest ? 3_000 : 500),
       exitCode: shell.exitCode,
       timedOut: shell.timedOut,
     };
@@ -1765,6 +1801,17 @@ function compactToolObservation(
     };
   }
   return compactObservationValue(result, 0);
+}
+
+function compactHeadAndTail(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  const headChars = Math.max(1, Math.floor(maxChars * 0.6));
+  const tailChars = Math.max(1, maxChars - headChars);
+  return [
+    value.slice(0, headChars),
+    `[${value.length - maxChars} middle chars compacted]`,
+    value.slice(-tailChars),
+  ].join('\n');
 }
 
 function compactToolPlanningParams(

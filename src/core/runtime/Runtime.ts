@@ -4681,7 +4681,8 @@ export class Runtime {
     const ctx = this.getContext();
     const rootUsageBefore = ctx.agent.getUsage();
     const rootStepConfig = this.workspaceRuntimeConfig?.delegation.rootSteps;
-    const requiresWorkspaceMutation = this.taskRequiresWorkspaceMutation(userInput);
+    const externalExecutionFeedback = this.containsExternalExecutionFeedback(userInput);
+    const requiresWorkspaceMutation = this.taskRequiresRootWorkspaceMutation(userInput);
     const reservedFinalSteps = requiresWorkspaceMutation ? 2 : 1;
     const maxSteps = Math.max(
       reservedFinalSteps + 1,
@@ -4728,6 +4729,16 @@ export class Runtime {
     await this.transitionRootTurnState('S_input_received', { correlationId });
     await this.transitionRootTurnState('S_assess_task', { correlationId });
     const requiresLongHorizon = rootStepConfig?.enabled !== false && this.requiresLongHorizonLoop(userInput);
+    this.emit({
+      type: 'root.task.execution.classified',
+      agentId: 'root',
+      correlationId,
+      data: {
+        requiresWorkspaceMutation,
+        requiresLongHorizon,
+        externalExecutionFeedback,
+      },
+    });
     const cachedExecution = requiresLongHorizon && requiresWorkspaceMutation
       ? await ctx.memory.readExecutionKnowledge(
         userInput,
@@ -4773,6 +4784,17 @@ export class Runtime {
       });
     } else if (decision.action === 'spawn_subagents' && requiresLongHorizon) {
       decision = this.ensureLongHorizonTeamDecision(decision, userInput, requiresWorkspaceMutation, correlationId);
+      requiredLongHorizonDecision = decision;
+    }
+    const executableDecision = this.overrideExecutableTaskClarification(
+      decision,
+      userInput,
+      requiresLongHorizon,
+      requiresWorkspaceMutation,
+      correlationId
+    );
+    if (executableDecision !== decision) {
+      decision = executableDecision;
       requiredLongHorizonDecision = decision;
     }
     if (!resumeState) {
@@ -10606,6 +10628,31 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     };
   }
 
+  private overrideExecutableTaskClarification(
+    decision: DelegationDecision,
+    task: string,
+    requiresLongHorizon: boolean,
+    requiresWorkspaceMutation: boolean,
+    correlationId: string
+  ): DelegationDecision {
+    if (decision.action !== 'ask_clarification'
+      || !requiresLongHorizon
+      || !requiresWorkspaceMutation) {
+      return decision;
+    }
+    const replacement = this.buildLongHorizonTeamDecision(task, true);
+    this.emit({
+      type: 'delegation.clarification.overridden',
+      agentId: 'root',
+      correlationId,
+      data: {
+        reason: 'Self-contained workspace evidence must be gathered with authorized tools instead of asking the user.',
+        rejectedQuestion: decision.question,
+      },
+    });
+    return replacement;
+  }
+
   private ensureLongHorizonTeamDecision(
     decision: Extract<DelegationDecision, { action: 'spawn_subagents' }>,
     task: string,
@@ -14813,6 +14860,11 @@ For web-grounded work, use only facts present in the subagent report or runtime 
 
   private taskRequiresWorkspaceMutation(task: string): boolean {
     return taskRequestsWorkspaceMutation(task);
+  }
+
+  private taskRequiresRootWorkspaceMutation(task: string): boolean {
+    return this.taskRequiresWorkspaceMutation(task)
+      || this.containsExternalExecutionFeedback(task);
   }
 
   private buildRootExecutionClosureTask(

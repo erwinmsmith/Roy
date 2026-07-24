@@ -76,7 +76,7 @@ describe('shell.exec tool', () => {
       shell: '/bin/sh',
     });
     const result = await tool.execute({
-      command: `python3 -c "import sys; sys.stderr.write('x' * 100000 + 'FAILURE_AT_END\\\\n'); sys.exit(2)"`,
+      command: `python3 -c "import sys; sys.stderr.write('CAUSE_AT_START\\\\n' + 'x' * 100000 + 'FAILURE_AT_END\\\\n'); sys.exit(2)"`,
       maxOutputBytes: 1024,
     });
 
@@ -84,8 +84,9 @@ describe('shell.exec tool', () => {
     expect(result.error).not.toContain('maxBuffer');
     const output = result.result as ShellExecResult;
     expect(output.exitCode).toBe(2);
+    expect(output.stderr).toContain('CAUSE_AT_START');
     expect(output.stderr).toContain('FAILURE_AT_END');
-    expect(output.stderr).toContain('leading bytes');
+    expect(output.stderr).toContain('middle bytes');
     expect(Buffer.byteLength(output.stderr)).toBeLessThan(1200);
   });
 
