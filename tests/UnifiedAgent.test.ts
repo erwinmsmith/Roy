@@ -440,6 +440,41 @@ describe('UnifiedAgent capability execution', () => {
     ]);
   });
 
+  it('preserves execution intent when Runtime wraps the original mutation task', async () => {
+    const llm = new ReadOnlyThenMutationPlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'wrapped-repair-agent',
+      goal: 'continue the persisted implementation',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.read', 'fs.write', 'shell.exec'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: '[runtime_execution_repair_phase]\nUse cached failure evidence and continue.',
+      executionRequired: true,
+      round: 3,
+      remainingCalls: 4,
+      tools: [{ name: 'fs.read' }, { name: 'fs.write' }, { name: 'shell.exec' }],
+      calls: [{
+        toolName: 'fs.read',
+        params: { path: 'artifact.txt' },
+        reason: 'inspect the current implementation',
+        groundingRequired: true,
+        success: true,
+        result: { content: 'incomplete' },
+      }],
+    });
+
+    expect(llm.jsonCalls).toBe(2);
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.write',
+        params: { path: 'artifact.txt', content: 'implemented' },
+      }),
+    ]);
+  });
+
   it('allows another workspace repair after a mutation when verification failed', async () => {
     const llm = new MutationRepairPlanningLLM();
     const agent = new UnifiedAgent({

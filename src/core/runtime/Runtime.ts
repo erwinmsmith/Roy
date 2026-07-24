@@ -13346,6 +13346,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       1_000,
       Math.min(60_000, Math.floor(remainingGroundingMs() * 0.4))
     );
+    const workspaceExecutionRequired = this.taskRequiresWorkspaceMutation(intentTask);
     const needsModelPlannedAction = bindings.some(binding =>
       binding.enabled && (
         binding.name === 'shell.exec'
@@ -13353,7 +13354,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         || binding.name === 'fs.replace'
       )
     ) && (
-      this.taskRequiresWorkspaceMutation(intentTask)
+      workspaceExecutionRequired
       ||
       /\b(?:terminal|shell|command line|cli|container)\b/i.test(intentTask)
       || /\b(?:implement|modify|edit|create|write|patch|repair|fix|refactor)\b[\s\S]*\b(?:file|code|project|repository|workspace|artifact|solution)\b/i.test(intentTask)
@@ -13372,6 +13373,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       && actor instanceof UnifiedAgent) {
       const modelPlans = await actor.planNextToolRound({
         task,
+        executionRequired: workspaceExecutionRequired,
         round: 0,
         remainingCalls: loopConfig.maxCallsPerRun,
         requestTimeoutMs: planningRequestTimeoutMs(),
@@ -13503,6 +13505,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         }
         const llmPlans = await actor.planNextToolRound({
           task,
+          executionRequired: workspaceExecutionRequired,
           round: context.round,
           remainingCalls: context.remainingCalls,
           requestTimeoutMs: planningRequestTimeoutMs(),

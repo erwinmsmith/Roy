@@ -38,6 +38,7 @@ export interface UnifiedAgentConfig extends AgentConfig {
 
 export interface AgentToolRoundPlanningInput {
   task: string;
+  executionRequired?: boolean;
   round: number;
   remainingCalls: number;
   requestTimeoutMs?: number;
@@ -95,7 +96,7 @@ export class UnifiedAgent extends BaseAgent {
       .filter(tool => !this.allowedTools || this.allowedTools.has(tool.name))
       .map(tool => tool.name));
     if (authorized.size === 0) return [];
-    const executionRequired = requestsWorkspaceMutation(input.task)
+    const executionRequired = (input.executionRequired ?? requestsWorkspaceMutation(input.task))
       && (authorized.has('fs.write') || authorized.has('fs.replace') || authorized.has('shell.exec'));
     const mutationApplied = input.calls.some(call => isSuccessfulWorkspaceMutation(call));
     const verificationRan = input.calls.some(call => isSuccessfulWorkspaceVerification(call));
