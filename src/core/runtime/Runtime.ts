@@ -47,6 +47,7 @@ import {
   FsWriteTool,
   isSuccessfulWorkspaceMutationCall,
   isSuccessfulWorkspaceVerificationCall,
+  isWorkspaceVerificationCall,
   ShellExecTool,
   taskRequestsWorkspaceMutation,
   WebFetchTool,
@@ -463,6 +464,16 @@ interface GroundingRunResult {
   toolLoop: ToolLoopSummary;
 }
 
+interface WorkspaceExecutionClosureStatus {
+  mutationApplied: boolean;
+  verificationAttemptedAfterMutation: boolean;
+  verificationPassed: boolean;
+  closed: boolean;
+  lastMutationCallIndex: number;
+  lastVerificationCallIndex: number;
+  failedVerificationCallsAfterMutation: number;
+}
+
 export interface SpawnCommandPayload {
   archetype: SubAgentArchetype;
   task: string;
@@ -712,6 +723,15 @@ export class Runtime {
   private runtimeToolOverrides = new Map<string, Tool>();
   private readonly teams = new TeamRegistry();
   private teamMemberPlans = new Map<string, TeamMemberSpec[]>();
+  private teamSpawnReservations = new Map<string, {
+    parentId: string;
+    correlationId: string;
+    baseChildren: number;
+    baseTurnAgents: number;
+    plannedMembers: number;
+    consumedMembers: number;
+    allowedChildren: number;
+  }>();
   private readonly toolPlanner = new AgentToolPlanner();
   private candidatePlanner: DefaultDelegationCandidatePlanner | null = null;
   private turnAgentCounts = new Map<string, number>();
@@ -972,6 +992,7 @@ export class Runtime {
     this.toolCallCounts.clear();
     this.teams.clear();
     this.teamMemberPlans.clear();
+    this.teamSpawnReservations.clear();
     this.turnAgentCounts.clear();
     this.tomAnalyses.clear();
     this.evolutionRuns.length = 0;
@@ -1566,6 +1587,25 @@ export class Runtime {
       if (!parentFsmState || !parentPolicy.spawnPolicy.allowedStates.includes(parentFsmState)) {
         throw new Error(`Agent "${parentAgentId}" cannot create a subteam in FSM state "${parentFsmState ?? 'unknown'}"`);
       }
+      const reservedChildren = this.getOutstandingTeamReservations(parentAgentId);
+      const reservedTurnAgents = this.getOutstandingTeamReservations(undefined, correlationId);
+      const reservableChildren = Math.max(
+        0,
+        Math.min(parentPolicy.allowedChildren, parentPolicy.spawnPolicy.maxChildren)
+          - parentPolicy.currentChildren
+          - reservedChildren
+      );
+      const reservableTurnAgents = Math.max(
+        0,
+        this.getRemainingTotalAgentsForTurn(parentAgentId, correlationId) - reservedTurnAgents
+      );
+      const reservableMembers = Math.min(reservableChildren, reservableTurnAgents);
+      if (members.length > reservableMembers) {
+        throw new Error(
+          `Team capacity exceeded: planned ${members.length} members, but only ${reservableMembers} `
+          + `reserved child slots are available for parent "${parentAgentId}" in this turn`
+        );
+      }
       const teamTomProfile = spec.tomProfile ?? this.tomPlanner.createTeamProfile({
         teamId: 'pending-team',
         parentId: parentAgentId,
@@ -1587,6 +1627,31 @@ export class Runtime {
         executionPolicy: { ...executionPolicy },
       });
       createdTeamId = team.identity.id;
+      if (members.length > 0) {
+        this.teamSpawnReservations.set(team.identity.id, {
+          parentId: parentAgentId,
+          correlationId,
+          baseChildren: parentPolicy.currentChildren,
+          baseTurnAgents: this.getTurnAgentCount(correlationId),
+          plannedMembers: members.length,
+          consumedMembers: 0,
+          allowedChildren: parentPolicy.currentChildren + members.length,
+        });
+        this.emit({
+          type: 'team.capacity.reserved',
+          agentId: team.identity.id,
+          sessionId: ctx.sessionId,
+          correlationId,
+          data: {
+            teamId: team.identity.id,
+            parentAgentId,
+            plannedMembers: members.length,
+            baseChildren: parentPolicy.currentChildren,
+            allowedChildren: parentPolicy.currentChildren + members.length,
+            remainingUnreservedChildren: reservableMembers - members.length,
+          },
+        });
+      }
       this.teamMemberPlans.set(team.identity.id, members.map(member => ({ ...member })));
       const lifecycleOrigin = spec.lifecycleOrigin ?? 'manual';
       const lifecyclePolicy = this.resolveLifecyclePolicy(
@@ -1728,6 +1793,7 @@ export class Runtime {
         }
         this.lifecycle.remove(createdTeamId);
         this.teamRestoreSpecs.delete(createdTeamId);
+        this.releaseTeamSpawnReservation(createdTeamId, 'team_creation_failed');
       }
       const rejected = await this.enqueueMessage({
         kind: 'team.create.rejected',
@@ -1965,6 +2031,11 @@ export class Runtime {
     const usageBefore = { ...initial.tokenUsage };
     // A team definition can run repeatedly, but every execution is a distinct trace.
     const correlationId = options.correlationId ?? this.createCorrelationId();
+    const reservation = this.teamSpawnReservations.get(teamId);
+    if (reservation) {
+      reservation.correlationId = correlationId;
+      reservation.baseTurnAgents = this.getTurnAgentCount(correlationId);
+    }
     this.activateActorLifecycle(teamId, correlationId);
     this.teams.setTask(teamId, task, correlationId);
     await this.transitionTeamFsm(teamId, 'S_team_plan', { task });
@@ -2210,6 +2281,7 @@ export class Runtime {
         usage: runUsage,
       };
       await this.finalizeActorLifecycle(teamId, 'success', correlationId);
+      this.releaseTeamSpawnReservation(teamId, 'team_run_completed');
       return teamRunResult;
     } catch (error) {
       const current = await ctx.queue.getMessage(taskMessage.id);
@@ -2235,6 +2307,7 @@ export class Runtime {
         data: { teamId, parentAgentId: initial.identity.parentAgentId, error: error instanceof Error ? error.message : String(error) },
       });
       await this.finalizeActorLifecycle(teamId, 'failure', correlationId);
+      this.releaseTeamSpawnReservation(teamId, 'team_run_failed');
       throw error;
     }
   }
@@ -3297,6 +3370,42 @@ export class Runtime {
     return Math.max(0, this.getMaxTotalAgentsPerTurn(parentId) - this.getTurnAgentCount(correlationId));
   }
 
+  private getOutstandingTeamReservations(
+    parentId: string | undefined,
+    correlationId?: string,
+    excludingTeamId?: string
+  ): number {
+    let total = 0;
+    for (const [teamId, reservation] of this.teamSpawnReservations) {
+      if (teamId === excludingTeamId
+        || (parentId !== undefined && reservation.parentId !== parentId)
+        || (correlationId && reservation.correlationId !== correlationId)) {
+        continue;
+      }
+      total += Math.max(0, reservation.plannedMembers - reservation.consumedMembers);
+    }
+    return total;
+  }
+
+  private releaseTeamSpawnReservation(teamId: string, reason: string): void {
+    const reservation = this.teamSpawnReservations.get(teamId);
+    if (!reservation) return;
+    this.teamSpawnReservations.delete(teamId);
+    this.emit({
+      type: 'team.capacity.released',
+      agentId: teamId,
+      sessionId: this.ctx?.sessionId,
+      correlationId: reservation.correlationId,
+      data: {
+        teamId,
+        parentAgentId: reservation.parentId,
+        plannedMembers: reservation.plannedMembers,
+        consumedMembers: reservation.consumedMembers,
+        reason,
+      },
+    });
+  }
+
   private recordTurnAgentCreated(correlationId?: string): void {
     if (!correlationId) return;
     this.turnAgentCounts.set(correlationId, this.getTurnAgentCount(correlationId) + 1);
@@ -3308,6 +3417,7 @@ export class Runtime {
     tools: ToolBinding[];
     skills: SkillBinding[];
     correlationId?: string;
+    teamId?: string;
   }): {
     allowed: boolean;
     reason?: string;
@@ -3329,7 +3439,20 @@ export class Runtime {
       spawnPolicy: this.getDefaultSpawnPolicy(parentInfo.role === 'root' ? 'root' : 'subagent'),
     };
     const currentChildren = this.getChildren(input.parentId).length;
-    const allowedChildren = this.computeAllowedChildren(parentBindings.spawnPolicy);
+    const dynamicAllowedChildren = this.computeAllowedChildren(parentBindings.spawnPolicy);
+    const reservation = input.teamId ? this.teamSpawnReservations.get(input.teamId) : undefined;
+    const matchingReservation = reservation
+      && reservation.parentId === input.parentId
+      ? reservation
+      : undefined;
+    const outstandingChildReservations = this.getOutstandingTeamReservations(
+      input.parentId,
+      undefined,
+      input.teamId
+    );
+    const allowedChildren = matchingReservation
+      ? Math.max(dynamicAllowedChildren, matchingReservation.allowedChildren)
+      : Math.max(0, dynamicAllowedChildren - outstandingChildReservations);
     const depth = this.getAgentDepth(input.parentId);
     const nextDepth = depth + 1;
 
@@ -3349,7 +3472,15 @@ export class Runtime {
     if (currentChildren >= allowedChildren) {
       return { allowed: false, reason: 'max_children_exceeded', currentChildren, allowedChildren, depth };
     }
-    if (this.getRemainingTotalAgentsForTurn(input.parentId, input.correlationId) <= 0) {
+    const outstandingTurnReservations = this.getOutstandingTeamReservations(
+      undefined,
+      input.correlationId,
+      input.teamId
+    );
+    const turnCapacityAvailable = matchingReservation
+      ? matchingReservation.consumedMembers < matchingReservation.plannedMembers
+      : this.getRemainingTotalAgentsForTurn(input.parentId, input.correlationId) - outstandingTurnReservations > 0;
+    if (!turnCapacityAvailable) {
       return { allowed: false, reason: 'max_total_agents_per_turn_exceeded', currentChildren, allowedChildren, depth };
     }
     if (nextDepth > parentBindings.spawnPolicy.maxDepth) {
@@ -4122,6 +4253,7 @@ export class Runtime {
     const evolutions: EvolutionRunResult[] = [];
     let evolution: EvolutionRunResult | undefined;
     let loopStopReason: RootExecutionTreeState['loop']['stopReason'] = 'completed';
+    let requiredExecutionClosure: WorkspaceExecutionClosureStatus | undefined;
 
     if (decision.action === 'ask_clarification') {
       const step = await this.startRootExecutionStep(correlationId, {
@@ -4170,10 +4302,9 @@ export class Runtime {
           [],
           correlationId
         );
-        const mutationApplied = this.hasSuccessfulWorkspaceMutation(rootExecution.toolCalls);
-        const verificationRan = this.hasSuccessfulWorkspaceVerification(rootExecution.toolCalls);
+        requiredExecutionClosure = this.analyzeWorkspaceExecutionClosure(rootExecution.toolCalls);
         this.emit({
-          type: mutationApplied && verificationRan
+          type: requiredExecutionClosure.closed
             ? 'root.execution.required.completed'
             : 'root.execution.required.unmet',
           agentId: 'root',
@@ -4181,8 +4312,8 @@ export class Runtime {
           data: {
             stepId: step.id,
             source: 'solve_directly',
-            mutationApplied,
-            verificationRan,
+            ...requiredExecutionClosure,
+            verificationRan: requiredExecutionClosure.verificationPassed,
             toolCalls: rootExecution.toolCalls.map(call => ({
               toolName: call.toolName,
               success: call.success,
@@ -4436,22 +4567,21 @@ export class Runtime {
           teamResults,
           correlationId
         );
-        const mutationApplied = this.hasSuccessfulWorkspaceMutation(rootExecution.toolCalls);
-        const verificationRan = this.hasSuccessfulWorkspaceVerification(rootExecution.toolCalls);
+        requiredExecutionClosure = this.analyzeWorkspaceExecutionClosure(rootExecution.toolCalls);
         const completedExecutionStep = await this.completeRootExecutionStep(correlationId, executionStep, {
           resultSummary: this.summarizeRootExecutionClosure(rootExecution),
         });
         previousStepId = completedExecutionStep.id;
         this.emit({
-          type: mutationApplied && verificationRan
+          type: requiredExecutionClosure.closed
             ? 'root.execution.required.completed'
             : 'root.execution.required.unmet',
           agentId: 'root',
           correlationId,
           data: {
             stepId: executionStep.id,
-            mutationApplied,
-            verificationRan,
+            ...requiredExecutionClosure,
+            verificationRan: requiredExecutionClosure.verificationPassed,
             toolCalls: rootExecution.toolCalls.map(call => ({
               toolName: call.toolName,
               success: call.success,
@@ -4462,7 +4592,11 @@ export class Runtime {
 
       const finalStep = await this.startRootExecutionStep(correlationId, {
         action: clarification ? 'ask_clarification' : 'finalize',
-        reason: clarification ? 'More user input is required after delegated inspection.' : 'Roy has sufficient accumulated state to produce the final result.',
+        reason: clarification
+          ? 'More user input is required after delegated inspection.'
+          : requiredExecutionClosure && !requiredExecutionClosure.closed
+            ? 'Execution closure remains unmet; report the concrete mutation and verification state without claiming completion.'
+            : 'Roy has sufficient accumulated state to produce the final result.',
         agentCount: 0,
       }, previousStepId ? [previousStepId] : []);
       if (clarification) {
@@ -4507,6 +4641,21 @@ export class Runtime {
       userInput,
       correlationId
     );
+    if (requiredExecutionClosure && !requiredExecutionClosure.closed) {
+      loopStopReason = 'closure_unmet';
+      finalResponse = [
+        '[runtime_execution_closure_unmet]',
+        'The requested workspace task is not complete: Runtime could not establish a successful verification after the latest mutation.',
+        `Closure evidence: ${JSON.stringify(requiredExecutionClosure)}`,
+        finalResponse,
+      ].join('\n\n');
+      this.emit({
+        type: 'root.execution.closure.unmet',
+        agentId: 'root',
+        correlationId,
+        data: { ...requiredExecutionClosure },
+      });
+    }
     await this.transitionRootTurnState('S_respond', { correlationId });
     const finalMessage = await this.enqueueMessage({
       kind: 'root.final_response',
@@ -5396,6 +5545,7 @@ export class Runtime {
       tools: toolBindings,
       skills: skillBindings,
       correlationId: creationCorrelationId,
+      teamId: spec.teamId,
     });
     this.emit({
       type: 'spawn.policy.checked',
@@ -5728,6 +5878,15 @@ export class Runtime {
     });
 
     const info = agent.getInfo();
+    if (spec.teamId) {
+      const reservation = this.teamSpawnReservations.get(spec.teamId);
+      if (reservation) {
+        reservation.consumedMembers = Math.min(
+          reservation.plannedMembers,
+          reservation.consumedMembers + 1
+        );
+      }
+    }
     this.recordTurnAgentCreated(creationCorrelationId);
     this.emit({
       type: 'tom.profile.assigned',
@@ -6459,6 +6618,7 @@ export class Runtime {
     ]));
     this.archivedTeamStates.set(teamId, team);
     this.teamMemberPlans.delete(teamId);
+    this.releaseTeamSpawnReservation(teamId, 'team_runtime_released');
     this.teamRestoreSpecs.delete(teamId);
   }
 
@@ -6879,7 +7039,7 @@ export class Runtime {
         },
       });
     }
-    return selection.decision;
+    return this.constrainDelegationToExecutablePlans(parentId, selection.decision, correlationId);
   }
 
   private deriveToMAnalysisSignals(
@@ -8328,7 +8488,11 @@ Do not repeat an existing agent task, cached failed path, or equivalent failed t
         agentId: 'root',
         data: { correlationId, reason: 'llm_not_configured' },
       });
-      return this.applyBudgetConstraints(fallback);
+      return this.constrainDelegationToExecutablePlans(
+        'root',
+        this.applyBudgetConstraints(fallback),
+        correlationId
+      );
     }
 
     try {
@@ -8395,12 +8559,28 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
               tools: toolRegistry.list().map(tool => tool.name),
               skills: skillRegistry.list().map(skill => skill.name),
               webEnabled: this.workspaceRuntimeConfig?.tools.web.enabled !== false,
+              automaticallyAuthorizedToolsByArchetype: Object.fromEntries(
+                (['researcher', 'critic', 'planner', 'coder', 'summarizer', 'tester', 'custom'] as SubAgentArchetype[])
+                  .map(archetype => [
+                    archetype,
+                    this.getAutomaticallyApprovedToolBindings(archetype, userInput)
+                      .map(binding => binding.name),
+                  ])
+              ),
             }, null, 2)}</runtime_capabilities>`,
-            '<runtime_policy>Subagents and teams must be runtime actors with identity, state, budget, messages, events, and lifecycle. Propose only registered tools and skills shown above; Runtime will intersect every request with parent-approved capabilities. Each agent must fill a distinct cognitive gap, receive a concrete non-overlapping task, and expose why it exists. Treat successful cached paths as authoritative, explicitly route actionable failure feedback to the actor that can repair it, and do not repeat an equivalent failed path. Reuse cached definitions only as structure for fresh runtime actors. If budget is limited, reduce the structure or solve directly.</runtime_policy>',
+            '<runtime_policy>Subagents and teams must be runtime actors with identity, state, budget, messages, events, and lifecycle. Propose only registered tools and skills shown above; Runtime will intersect every request with parent-approved capabilities. Do not create a tool-grounded evidence collector when its archetype has no automatically authorized route for the required evidence. Pure semantic reasoning, critique, or synthesis may use a tool-free actor when the task does not require external or workspace grounding. Each agent must fill a distinct cognitive gap, receive a concrete non-overlapping task, and expose why it exists. Treat successful cached paths as authoritative, explicitly route actionable failure feedback to the actor that can repair it, and do not repeat an equivalent failed path. Reuse cached definitions only as structure for fresh runtime actors. If budget is limited, reduce the structure or solve directly.</runtime_policy>',
           ].join('\n\n'),
         },
       ], { temperature: 0.1, maxTokens: 1800 }, 'root.delegation_decision', correlationId);
-      const normalized = this.applyBudgetConstraints(this.normalizeDelegationDecision(decision, userInput));
+      let normalized = this.applyBudgetConstraints(this.normalizeDelegationDecision(decision, userInput));
+      if (normalized.action === 'solve_directly') {
+        normalized = await this.auditComplexDirectDecision(
+          userInput,
+          normalized,
+          correlationId
+        );
+      }
+      normalized = this.constrainDelegationToExecutablePlans('root', normalized, correlationId);
       this.emit({
         type: 'delegation.assess.completed',
         agentId: 'root',
@@ -8417,7 +8597,11 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
           error: error instanceof Error ? error.message : String(error),
         },
       });
-      return this.applyBudgetConstraints(fallback);
+      return this.constrainDelegationToExecutablePlans(
+        'root',
+        this.applyBudgetConstraints(fallback),
+        correlationId
+      );
     }
   }
 
@@ -8448,7 +8632,11 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
         agentId: agent.identity.id,
         data: { correlationId, reason: 'llm_not_configured_agent_delegation' },
       });
-      const constrained = this.applyAgentBudgetAndPolicyConstraints(agent.identity.id, fallback);
+      const constrained = this.constrainDelegationToExecutablePlans(
+        agent.identity.id,
+        this.applyAgentBudgetAndPolicyConstraints(agent.identity.id, fallback),
+        correlationId
+      );
       return this.selectDelegationCandidate(agent.identity.id, task, constrained, correlationId, 'agent');
     }
 
@@ -8506,7 +8694,11 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
         correlationId
       );
       const normalized = this.normalizeAgentDelegationDecision(decision, task, fallback);
-      const constrained = this.applyAgentBudgetAndPolicyConstraints(agent.identity.id, normalized);
+      const constrained = this.constrainDelegationToExecutablePlans(
+        agent.identity.id,
+        this.applyAgentBudgetAndPolicyConstraints(agent.identity.id, normalized),
+        correlationId
+      );
       const selected = await this.selectDelegationCandidate(agent.identity.id, task, constrained, correlationId, 'agent');
       this.emit({
         type: 'delegation.assess.completed',
@@ -8526,7 +8718,11 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
           error: error instanceof Error ? error.message : String(error),
         },
       });
-      const constrained = this.applyAgentBudgetAndPolicyConstraints(agent.identity.id, fallback);
+      const constrained = this.constrainDelegationToExecutablePlans(
+        agent.identity.id,
+        this.applyAgentBudgetAndPolicyConstraints(agent.identity.id, fallback),
+        correlationId
+      );
       return this.selectDelegationCandidate(agent.identity.id, task, constrained, correlationId, 'agent');
     }
   }
@@ -8704,6 +8900,89 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     return this.applyBudgetConstraints(this.fallbackDelegationDecision(userInput));
   }
 
+  private countIndependentTaskObligations(task: string): number {
+    const lineItems = task
+      .split(/\r?\n/)
+      .filter(line => /^\s*(?:[-*+]\s+|\d+[.)]\s+|(?:question|q)\s*\d+\s*[:.)])/i.test(line))
+      .length;
+    const inlineQuestions = (task.match(/\b(?:question|q)\s*\d+\s*[:.)]/gi) ?? []).length;
+    const numberedClauses = (task.match(/(?:^|\s)\d+[.)]\s+(?=\S)/g) ?? []).length;
+    return Math.max(lineItems, inlineQuestions, numberedClauses);
+  }
+
+  private async auditComplexDirectDecision(
+    task: string,
+    initial: Extract<DelegationDecision, { action: 'solve_directly' }>,
+    correlationId: string
+  ): Promise<DelegationDecision> {
+    const threshold = Math.max(
+      0,
+      this.workspaceRuntimeConfig?.delegation.rootSteps.directDecisionAuditMinObligations ?? 4
+    );
+    const obligations = this.countIndependentTaskObligations(task);
+    if (threshold === 0 || obligations < threshold) return initial;
+
+    const ctx = this.getContext();
+    if (!ctx.llm) return initial;
+    this.emit({
+      type: 'delegation.direct_decision.audit.started',
+      agentId: 'root',
+      correlationId,
+      data: { obligations, threshold, initialReason: initial.reason },
+    });
+    try {
+      const raw = await this.completeJSONAsAgent<DelegationDecision>(ctx.agent, [
+        {
+          role: 'system',
+          content: `You are Roy's direct-solve complexity auditor.
+The primary controller chose direct execution. Independently check whether the task contains multiple separable answer obligations with distinct knowledge, verification, or perspective gaps.
+Do not delegate merely because the input is long or has many items. Delegate only when one or more concrete gaps benefit from bounded parallel specialists, and keep synthesis with Roy.
+Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"action":"spawn_subagents","reason":"...","coordination":"independent","continuationPolicy":"finalize_after_round","agents":[{"archetype":"custom","name":"...","role":"...","task":"...","tools":[],"skills":[],"existenceReason":"..."}]}. Use at most 3 agents.`,
+        },
+        {
+          role: 'user',
+          content: [
+            `<task>${task}</task>`,
+            `<independent_obligation_count>${obligations}</independent_obligation_count>`,
+            `<initial_direct_reason>${initial.reason}</initial_direct_reason>`,
+            `<runtime_budget>${JSON.stringify(this.getBudgetState(), null, 2)}</runtime_budget>`,
+          ].join('\n\n'),
+        },
+      ], { temperature: 0.1, maxTokens: 1100 }, 'root.direct_decision_audit', correlationId);
+      const rawAction = (raw as { action?: unknown })?.action;
+      if (rawAction !== 'solve_directly' && rawAction !== 'spawn_subagents') {
+        throw new Error('Direct-decision audit returned no explicit supported action');
+      }
+      let audited = this.normalizeDelegationDecision(raw, task);
+      audited = this.applyBudgetConstraints(audited);
+      this.emit({
+        type: audited.action === 'spawn_subagents'
+          ? 'delegation.direct_decision.audit.overridden'
+          : 'delegation.direct_decision.audit.completed',
+        agentId: 'root',
+        correlationId,
+        data: {
+          obligations,
+          initialAction: initial.action,
+          auditedAction: audited.action,
+          reason: audited.reason,
+        },
+      });
+      return audited;
+    } catch (error) {
+      this.emit({
+        type: 'delegation.direct_decision.audit.failed',
+        agentId: 'root',
+        correlationId,
+        data: {
+          obligations,
+          error: error instanceof Error ? error.message : String(error),
+        },
+      });
+      return initial;
+    }
+  }
+
   private normalizeCoordination(value: unknown, agentCount: number): 'independent' | 'team' {
     if (agentCount <= 1) return 'independent';
     const coordination = (value as { coordination?: unknown }).coordination;
@@ -8724,12 +9003,12 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     const archetype = String(plan.archetype) as SubAgentArchetype;
     const task = typeof plan.task === 'string' && plan.task.trim() ? plan.task.trim() : fallbackTask;
     const requestedTools = Array.isArray(plan.tools)
-      ? plan.tools.filter((tool): tool is string => typeof tool === 'string')
+      ? plan.tools.filter((tool): tool is string => typeof tool === 'string' && toolRegistry.has(tool))
       : [];
     const inferredTools = this.inferMinimumTaskTools(task);
     const tools = Array.from(new Set([...requestedTools, ...inferredTools]));
     const requestedSkills = Array.isArray(plan.skills)
-      ? plan.skills.filter((skill): skill is string => typeof skill === 'string')
+      ? plan.skills.filter((skill): skill is string => typeof skill === 'string' && skillRegistry.has(skill))
       : [];
     const skills = tools.length > 0
       ? Array.from(new Set([...requestedSkills, 'use_tool_when_needed']))
@@ -9210,6 +9489,92 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     }
 
     return decision;
+  }
+
+  private constrainDelegationToExecutablePlans(
+    parentId: string,
+    decision: DelegationDecision,
+    correlationId: string
+  ): DelegationDecision {
+    if (decision.action !== 'spawn_subagents') return decision;
+    const rejected: Array<{ name?: string; archetype: SubAgentArchetype; reason: string }> = [];
+    const agents = decision.agents.filter(plan => {
+      if (!this.taskRequiresGrounding(plan.archetype, plan.task)) return true;
+      const requested = Array.from(new Set([
+        ...(plan.tools ?? []),
+        ...this.inferMinimumTaskTools(plan.task),
+      ]));
+      const approved = this.getAutomaticallyApprovedToolBindings(
+        plan.archetype,
+        plan.task,
+        requested
+      );
+      if (this.hasExecutableGroundingPath(plan.task, approved)) return true;
+      rejected.push({
+        name: plan.name,
+        archetype: plan.archetype,
+        reason: 'grounding_required_but_no_automatically_authorized_tool_path',
+      });
+      return false;
+    });
+
+    if (rejected.length > 0) {
+      this.emit({
+        type: 'delegation.plan.infeasible',
+        agentId: parentId,
+        correlationId,
+        data: {
+          rejected,
+          retainedAgents: agents.map(agent => agent.name ?? agent.archetype),
+        },
+      });
+    }
+    if (agents.length === 0) {
+      return {
+        action: 'solve_directly',
+        reason: `${decision.reason} Delegation was skipped because every grounded child plan lacked an executable, automatically authorized tool path.`,
+      };
+    }
+    if (agents.length === decision.agents.length) return decision;
+
+    const team = agents.length > 1 && decision.team
+      ? {
+        ...decision.team,
+        executionPolicy: decision.team.executionPolicy
+          ? {
+            ...decision.team.executionPolicy,
+            minimumSuccessfulMembers: Math.min(
+              agents.length,
+              decision.team.executionPolicy.minimumSuccessfulMembers ?? 1
+            ),
+          }
+          : undefined,
+      }
+      : undefined;
+    return {
+      ...decision,
+      agents,
+      coordination: agents.length > 1 ? decision.coordination : 'independent',
+      team,
+    };
+  }
+
+  private hasExecutableGroundingPath(task: string, bindings: ToolBinding[]): boolean {
+    const names = new Set(bindings.filter(binding => binding.enabled).map(binding => binding.name));
+    if (this.taskNeedsWebAccess(task)) {
+      return names.has('web.search')
+        && (!this.taskRequiresFetchedWebEvidence(task) || names.has('web.fetch'));
+    }
+    if (this.taskRequiresWorkspaceMutation(task)) {
+      return names.has('fs.write') || names.has('shell.exec');
+    }
+    if (/\b(?:run|execute)\b[\s\S]{0,100}\b(?:tests?|build|checks?|commands?)\b|(?:运行|执行)[\s\S]{0,80}(?:测试|构建|检查|命令)/i.test(task)) {
+      return names.has('shell.exec');
+    }
+    if (/\b(?:project|files?|filesystem|repository|repo|codebase|workspace|source|manifest)\b|(?:项目|文件|仓库|代码库|工作区|源码)/i.test(task)) {
+      return names.has('fs.list') || names.has('fs.read') || names.has('shell.exec');
+    }
+    return names.size > 0;
   }
 
   private async runRootSoloReasoning(userInput: string, correlationId: string): Promise<string> {
@@ -12330,15 +12695,17 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       archetype?: SubAgentArchetype;
       nodeId?: string;
       patternId?: string;
+      intentTask?: string;
       onBeforeExecution?: (plans: PlannedToolCall[]) => Promise<void>;
     }
   ): Promise<GroundingRunResult> {
     const bindings = this.agentBindings.get(agentId)?.tools ?? [];
-    const inspectionRoot = this.resolveInspectionRoot(task);
+    const intentTask = options.intentTask ?? task;
+    const inspectionRoot = this.resolveInspectionRoot(intentTask);
     const groundingRequired = this.agentRestoreSpecs.get(agentId)?.outputContract?.groundingRequired
-      ?? this.taskRequiresGrounding(options.archetype ?? 'custom', task);
+      ?? this.taskRequiresGrounding(options.archetype ?? 'custom', intentTask);
     const plans = this.toolPlanner.plan({
-      task,
+      task: intentTask,
       workspacePath: inspectionRoot,
       bindings,
       archetype: options.archetype,
@@ -12356,10 +12723,10 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     const needsModelPlannedAction = bindings.some(binding =>
       binding.enabled && (binding.name === 'shell.exec' || binding.name === 'fs.write')
     ) && (
-      this.taskRequiresWorkspaceMutation(task)
+      this.taskRequiresWorkspaceMutation(intentTask)
       ||
-      /\b(?:terminal|shell|command line|cli|container)\b/i.test(task)
-      || /\b(?:implement|modify|edit|create|write|patch|repair|fix|refactor)\b[\s\S]*\b(?:file|code|project|repository|workspace|artifact|solution)\b/i.test(task)
+      /\b(?:terminal|shell|command line|cli|container)\b/i.test(intentTask)
+      || /\b(?:implement|modify|edit|create|write|patch|repair|fix|refactor)\b[\s\S]*\b(?:file|code|project|repository|workspace|artifact|solution)\b/i.test(intentTask)
     );
     if (needsModelPlannedAction
       && loopConfig.enabled
@@ -12436,15 +12803,15 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       },
       planNext: async context => {
         const deterministic = this.toolPlanner.planWebFollowUps({
-          task,
+          task: intentTask,
           calls: context.calls,
           bindings,
           maxFetches: loopConfig.maxFetchesAfterSearch,
         });
         if (deterministic.length > 0) return deterministic.slice(0, context.remainingCalls);
-        if (this.toolPlanner.hasSufficientWebEvidence(task, context.calls)) return [];
+        if (this.toolPlanner.hasSufficientWebEvidence(intentTask, context.calls)) return [];
         if (!loopConfig.enabled || !loopConfig.llmReplanning || !(actor instanceof UnifiedAgent)) return [];
-        if (!this.shouldReplanToolLoop(task, context.calls)) return [];
+        if (!this.shouldReplanToolLoop(intentTask, context.calls)) return [];
         const llmPlans = await actor.planNextToolRound({
           task,
           round: context.round,
@@ -12729,7 +13096,10 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     correlationId: string
   ): Promise<GroundingRunResult> {
     const attempts: GroundingRunResult[] = [];
-    const maxAttempts = 3;
+    const maxAttempts = Math.max(
+      1,
+      this.workspaceRuntimeConfig?.delegation.rootSteps.maxExecutionClosureAttempts ?? 3
+    );
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       const priorExecution = attempts.length > 0
         ? this.combineGroundingRuns(attempts)
@@ -12754,12 +13124,11 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       const current = await this.runGroundingCheck(
         'root',
         task,
-        { correlationId, archetype: 'coder' }
+        { correlationId, archetype: 'coder', intentTask: userTask }
       );
       attempts.push(current);
       const combined = this.combineGroundingRuns(attempts);
-      const mutationApplied = this.hasSuccessfulWorkspaceMutation(combined.toolCalls);
-      const verificationRan = this.hasSuccessfulWorkspaceVerification(combined.toolCalls);
+      const closure = this.analyzeWorkspaceExecutionClosure(combined.toolCalls);
       this.emit({
         type: 'root.execution.attempt.completed',
         agentId: 'root',
@@ -12767,13 +13136,13 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         data: {
           attempt,
           maxAttempts,
-          mutationApplied,
-          verificationRan,
+          ...closure,
+          verificationRan: closure.verificationPassed,
           toolCalls: current.toolCalls.length,
           stopReason: current.toolLoop.stopReason,
         },
       });
-      if (mutationApplied && verificationRan) return combined;
+      if (closure.closed) return combined;
     }
     return this.combineGroundingRuns(attempts);
   }
@@ -12788,8 +13157,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       `Original task:\n${userTask}`,
       `Execution attempt ${attempt - 1} did not satisfy the required mutation-and-verification closure.`,
       [
-        `Mutation observed: ${this.hasSuccessfulWorkspaceMutation(priorExecution.toolCalls)}`,
-        `Successful verification observed: ${this.hasSuccessfulWorkspaceVerification(priorExecution.toolCalls)}`,
+        `Closure status: ${JSON.stringify(this.analyzeWorkspaceExecutionClosure(priorExecution.toolCalls))}`,
         `Prior tool evidence:\n${priorExecution.evidence.toolResultSummary?.slice(-10_000) || 'No textual tool evidence was available.'}`,
         priorExecution.warnings.length > 0
           ? `Prior warnings:\n${priorExecution.warnings.slice(-8).join('\n')}`
@@ -12854,12 +13222,36 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     return calls.some(call => isSuccessfulWorkspaceVerificationCall(call));
   }
 
+  private analyzeWorkspaceExecutionClosure(calls: ToolCallRecord[]): WorkspaceExecutionClosureStatus {
+    let lastMutationCallIndex = -1;
+    for (let index = 0; index < calls.length; index += 1) {
+      if (isSuccessfulWorkspaceMutationCall(calls[index]!)) lastMutationCallIndex = index;
+    }
+    const verificationCalls = calls
+      .map((call, index) => ({ call, index }))
+      .filter(item => item.index >= lastMutationCallIndex && isWorkspaceVerificationCall(item.call));
+    const lastVerification = verificationCalls.at(-1);
+    const mutationApplied = lastMutationCallIndex >= 0;
+    const verificationAttemptedAfterMutation = mutationApplied && verificationCalls.length > 0;
+    const verificationPassed = verificationAttemptedAfterMutation && lastVerification?.call.success === true;
+    return {
+      mutationApplied,
+      verificationAttemptedAfterMutation,
+      verificationPassed,
+      closed: mutationApplied && verificationPassed,
+      lastMutationCallIndex,
+      lastVerificationCallIndex: lastVerification?.index ?? -1,
+      failedVerificationCallsAfterMutation: verificationCalls.filter(item => !item.call.success).length,
+    };
+  }
+
   private summarizeRootExecutionClosure(execution: GroundingRunResult): string {
-    const mutationApplied = this.hasSuccessfulWorkspaceMutation(execution.toolCalls);
-    const verificationRan = this.hasSuccessfulWorkspaceVerification(execution.toolCalls);
+    const closure = this.analyzeWorkspaceExecutionClosure(execution.toolCalls);
     const successfulCalls = execution.toolCalls.filter(call => call.success).length;
     return [
-      `Root execution closure: mutationApplied=${mutationApplied}, verificationRan=${verificationRan}.`,
+      `Root execution closure: mutationApplied=${closure.mutationApplied}, `
+        + `verificationAttemptedAfterMutation=${closure.verificationAttemptedAfterMutation}, `
+        + `verificationPassed=${closure.verificationPassed}, closed=${closure.closed}.`,
       `Tool calls: ${successfulCalls}/${execution.toolCalls.length} succeeded.`,
       execution.evidence.toolResultSummary?.slice(0, 4000) || 'No runtime tool evidence was produced.',
       execution.warnings.length > 0 ? `Warnings: ${execution.warnings.join('; ')}` : '',
@@ -12872,8 +13264,11 @@ For web-grounded work, use only facts present in the subagent report or runtime 
   }
 
   private taskRequiresGrounding(archetype: SubAgentArchetype, task: string): boolean {
-    if (archetype === 'researcher' || archetype === 'tester') return true;
-    return /\b(?:filesystem|repository|codebase|source|tool)[ -]?(?:grounded|evidence)\b|\busing (?:filesystem|source|tool) evidence\b/i.test(task);
+    void archetype;
+    if (this.taskNeedsWebAccess(task)) return true;
+    return /\b(?:filesystem|repository|repo|codebase|workspace|source files?|package\.json|manifest|runtime trace|tool)[ -]?(?:grounded|evidence)\b|\busing (?:filesystem|repository|repo|workspace|source|tool) evidence\b/i.test(task)
+      || /\b(?:inspect|read|open|list|search|audit|modify|edit|write|patch|implement|run|execute|verify|test)\b[\s\S]{0,160}\b(?:actual|local|current)?\s*(?:project(?:\s+structure)?|files?|filesystem|repository|repo|codebase|workspace|source|tests?|build|commands?|cli|container)\b/i.test(task)
+      || /(?:检查|读取|打开|列出|搜索|审计|修改|编辑|写入|修复|实现|运行|执行|验证|测试)[\s\S]{0,100}(?:文件|仓库|代码库|工作区|源码|测试|构建|命令|CLI|容器)/i.test(task);
   }
 
   private taskRequiresFetchedWebEvidence(task: string): boolean {

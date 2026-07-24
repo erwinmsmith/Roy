@@ -89,6 +89,19 @@ class EmptyVisibleTeamSynthesisLLM extends TeamTestLLM {
   }
 }
 
+class CapacityBurnTeamLLM extends TeamTestLLM {
+  override async *stream(messages: LLMMessage[]): AsyncGenerator<LLMStreamChunk, void, unknown> {
+    const prompt = messages.map(message => message.content).join('\n');
+    yield {
+      content: prompt.includes('formal subteam actor')
+        ? 'Capacity-reserved team synthesis.'
+        : 'Capacity-reserved member result.',
+      done: true,
+      usage: { promptTokens: 2400, completionTokens: 100, totalTokens: 2500 },
+    };
+  }
+}
+
 describe('Phase 3 subteam runtime', () => {
   it('enforces the formal team FSM', () => {
     const registry = new TeamRegistry();
@@ -215,6 +228,45 @@ describe('Phase 3 subteam runtime', () => {
     expect(updatedUsage.averageTokens).toBe(Math.round((result.usage.totalTokens + rerun.usage.totalTokens) / 2));
     expect(updatedPatterns[0].status).toBe('active');
 
+    await runtime.shutdown();
+  });
+
+  it('reserves every planned member slot before a limited-budget team starts', async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), 'roy-team-capacity-reservation-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'team-capacity-reservation',
+      workspaceCwd: cwd,
+      budget: 12_000,
+      llmProvider: new CapacityBurnTeamLLM(),
+    });
+
+    const team = await runtime.spawnTeam({
+      name: 'ReservedReviewTeam',
+      description: 'Keep the planned reviewer runnable after earlier members consume budget.',
+      executionPolicy: { mode: 'sequential', failureMode: 'best_effort', minimumSuccessfulMembers: 3 },
+      members: [
+        { archetype: 'summarizer', name: 'Answerer-1', task: 'Answer the first bounded group.' },
+        { archetype: 'critic', name: 'Checker-2', task: 'Check the second bounded group.' },
+        { archetype: 'summarizer', name: 'Reviewer-3', task: 'Review all bounded answers.' },
+      ],
+    });
+    const result = await runtime.runTeam(team.identity.id, 'Complete and review all bounded groups.');
+
+    expect(result.memberOutcomes.map(outcome => outcome.status)).toEqual([
+      'completed',
+      'completed',
+      'completed',
+    ]);
+    expect(result.team.memberAgentIds).toHaveLength(3);
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'team.capacity.reserved',
+      data: expect.objectContaining({ plannedMembers: 3, allowedChildren: 3 }),
+    }));
+    expect(runtime.getEvents().some(event =>
+      event.type === 'spawn.policy.rejected'
+      && event.data?.reason === 'max_children_exceeded'
+    )).toBe(false);
     await runtime.shutdown();
   });
 

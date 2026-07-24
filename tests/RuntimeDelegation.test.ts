@@ -133,6 +133,65 @@ class EmptyVisibleRootSynthesisLLM extends RootDelegationLLM {
   }
 }
 
+class InfeasibleGroundedChildLLM extends RootDelegationLLM {
+  override async completeJSON<T>(messages: LLMMessage[]): Promise<T> {
+    const text = messages.map(message => String(message.content)).join('\n');
+    if (text.includes("Roy's root delegation controller")) {
+      return {
+        action: 'spawn_subagents',
+        reason: 'Collect repository evidence.',
+        agents: [{
+          archetype: 'researcher',
+          name: 'UnavailableCollector-1',
+          task: 'Inspect the actual repository files and return grounded source evidence.',
+          tools: [],
+          skills: [],
+        }],
+      } as T;
+    }
+    return super.completeJSON<T>(messages);
+  }
+}
+
+class DirectDecisionAuditLLM extends RootDelegationLLM {
+  override async completeJSON<T>(messages: LLMMessage[]): Promise<T> {
+    const text = messages.map(message => String(message.content)).join('\n');
+    if (text.includes("Roy's direct-solve complexity auditor")) {
+      return {
+        action: 'spawn_subagents',
+        reason: 'The independent obligations expose separate knowledge gaps.',
+        coordination: 'independent',
+        continuationPolicy: 'finalize_after_round',
+        agents: [
+          {
+            archetype: 'custom',
+            name: 'CoverageA-1',
+            task: 'Solve obligations 1-5 from supplied prompt knowledge.',
+            tools: [],
+            skills: [],
+            existenceReason: 'Cover the first independent answer group.',
+          },
+          {
+            archetype: 'custom',
+            name: 'CoverageB-2',
+            task: 'Solve obligations 6-10 from supplied prompt knowledge.',
+            tools: [],
+            skills: [],
+            existenceReason: 'Cover the second independent answer group.',
+          },
+        ],
+      } as T;
+    }
+    if (text.includes("Roy's root delegation controller")) {
+      return { action: 'solve_directly', reason: 'Initially judged answerable in one pass.' } as T;
+    }
+    if (text.includes('delegation controller')) {
+      return { action: 'solve_directly', reason: 'The bounded child task is direct.' } as T;
+    }
+    return super.completeJSON<T>(messages);
+  }
+}
+
 class DeepSeekBudgetProbeLLM extends RootDelegationLLM {
   override readonly name = 'deepseek';
   override readonly defaultModel = 'deepseek-v4-flash';
@@ -263,6 +322,79 @@ describe('Runtime root-controlled delegation', () => {
     expect(runtime.getEvents().map(event => event.type)).toContain('root.solo.completed');
     expect(runtime.getEvents().map(event => event.type)).toContain('delegation.skipped');
 
+    await runtime.shutdown();
+  });
+
+  it('drops a grounded child plan when policy exposes no executable tool path', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-infeasible-child-plan-'));
+    await mkdir(path.join(workspaceCwd, '.roy'), { recursive: true });
+    await writeFile(path.join(workspaceCwd, '.roy', 'config.json'), JSON.stringify({
+      tools: {
+        approval: {
+          readOnly: 'deny',
+          write: 'deny',
+          execute: 'deny',
+          overrides: {},
+        },
+      },
+      agents: {
+        defaultToolsByArchetype: {
+          researcher: [],
+          critic: [],
+          planner: [],
+          coder: [],
+          summarizer: [],
+          tester: [],
+          custom: [],
+        },
+      },
+    }));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'infeasible-child-plan-test',
+      workspaceCwd,
+      llmProvider: new InfeasibleGroundedChildLLM(),
+    });
+
+    const result = await runtime.handleUserTurn('Summarize one conclusion from the supplied prompt.');
+
+    expect(result.decision.action).toBe('solve_directly');
+    expect(result.subagents).toHaveLength(0);
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'delegation.plan.infeasible',
+      data: expect.objectContaining({
+        rejected: [expect.objectContaining({
+          name: 'UnavailableCollector-1',
+          reason: 'grounding_required_but_no_automatically_authorized_tool_path',
+        })],
+      }),
+    }));
+    await runtime.shutdown();
+  });
+
+  it('audits a direct decision when a task has many independent obligations', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-direct-decision-audit-'));
+    await mkdir(path.join(workspaceCwd, '.roy'), { recursive: true });
+    await writeFile(path.join(workspaceCwd, '.roy', 'config.json'), JSON.stringify({
+      tom: { autoCompleteGaps: false, minimumCoverage: 0 },
+      teams: { createForMultipleAgents: false },
+    }));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'direct-decision-audit-test',
+      workspaceCwd,
+      llmProvider: new DirectDecisionAuditLLM(),
+    });
+
+    const task = Array.from({ length: 10 }, (_, index) =>
+      `${index + 1}. Answer independent supplied question ${index + 1}.`
+    ).join('\n');
+    const result = await runtime.handleUserTurn(task);
+
+    expect(result.decision.action).toBe('spawn_subagents');
+    expect(result.subagents.length).toBeGreaterThanOrEqual(1);
+    expect(runtime.getEvents().map(event => event.type))
+      .toContain('delegation.direct_decision.audit.overridden');
     await runtime.shutdown();
   });
 

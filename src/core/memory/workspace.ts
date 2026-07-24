@@ -192,6 +192,8 @@ export interface WorkspaceRuntimeConfig {
       teamFirstLongHorizon: boolean;
       maxCachedSteps: number;
       maxFeedbackItemsInPrompt: number;
+      maxExecutionClosureAttempts: number;
+      directDecisionAuditMinObligations: number;
     };
     candidateScoring: {
       enabledScorers: Array<'heuristic' | 'cost' | 'tom' | 'cache_evolution' | 'llm'>;
@@ -553,6 +555,8 @@ const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
       teamFirstLongHorizon: true,
       maxCachedSteps: 200,
       maxFeedbackItemsInPrompt: 24,
+      maxExecutionClosureAttempts: 3,
+      directDecisionAuditMinObligations: 4,
     },
     candidateScoring: {
       enabledScorers: ['heuristic', 'cost', 'tom', 'cache_evolution', 'llm'],

@@ -76,6 +76,40 @@ class MarkdownToolIntentLLM extends EchoLLM {
 }
 
 describe('Runtime controlled subagent spawning', () => {
+  it('allows a semantic researcher to reason without pretending it has an external tool path', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-semantic-researcher-'));
+    await writeFile(path.join(workspaceCwd, '.roy-config-placeholder'), '');
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'semantic-researcher-test',
+      llmProvider: new EchoLLM(),
+      workspaceCwd,
+    });
+    const researcher = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'researcher',
+      name: 'SemanticResearcher-1',
+      tomLevel: 0,
+      description: 'Reason over the supplied word list only.',
+      task: 'Infer which supplied words match the clue using only the prompt.',
+      tools: [],
+      skills: [],
+      outputContract: { format: 'markdown', groundingRequired: false },
+    });
+
+    const result = await runtime.runAgent(
+      researcher.identity.id,
+      'Given only these words and the clue, rank the most likely matches.',
+      { disableRecursiveDelegation: true, archetype: 'researcher' }
+    );
+
+    expect(result.toolCalls).toHaveLength(0);
+    expect(result.grounded).toBe(true);
+    expect(result.result).toBe('subagent result');
+    expect(result.warnings).not.toContain(expect.stringContaining('no authorized tool call'));
+    await runtime.shutdown();
+  });
+
   it('keeps web tool enablement scoped to each runtime workspace', async () => {
     const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-web-scope-'));
     const bootstrap = new Runtime();

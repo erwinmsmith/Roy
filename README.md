@@ -77,6 +77,14 @@ marker contract was requested.
 
 Workspace limits prevent an unbounded reasoning loop:
 
+Planned teams reserve their complete child and per-turn capacity before the
+first member runs. Later token consumption or recursive descendants therefore
+cannot invalidate an already accepted sibling plan. Workspace mutations close
+only when a successful verification occurs at or after the latest successful
+mutation; an older passing check is never reused as proof for newer state.
+Direct decisions with many independently checkable obligations receive one
+configurable second-pass complexity audit.
+
 ```json
 {
   "delegation": {
@@ -91,7 +99,9 @@ Workspace limits prevent an unbounded reasoning loop:
       "cacheExecutionKnowledge": true,
       "teamFirstLongHorizon": true,
       "maxCachedSteps": 200,
-      "maxFeedbackItemsInPrompt": 24
+      "maxFeedbackItemsInPrompt": 24,
+      "maxExecutionClosureAttempts": 3,
+      "directDecisionAuditMinObligations": 4
     }
   }
 }

@@ -53,7 +53,11 @@ export function isSuccessfulWorkspaceMutationCall(call: ExecutionIntentCall): bo
 }
 
 export function isSuccessfulWorkspaceVerificationCall(call: ExecutionIntentCall): boolean {
-  if (!call.success || call.toolName !== 'shell.exec') return false;
+  return call.success && isWorkspaceVerificationCall(call);
+}
+
+export function isWorkspaceVerificationCall(call: ExecutionIntentCall): boolean {
+  if (call.toolName !== 'shell.exec') return false;
   const command = String(call.params.command ?? '');
   if (masksShellFailure(command)) return false;
   return /\b(?:test|pytest|vitest|jest|mocha|cargo\s+test|go\s+test|npm\s+(?:test|run\s+(?:test|check|build|lint|typecheck))|pnpm\s+(?:test|run)|yarn\s+(?:test|run)|ruff|eslint|tsc|mypy|pyright|compileall)\b/i.test(command);

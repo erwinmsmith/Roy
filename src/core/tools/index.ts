@@ -12,6 +12,7 @@ export { AgentToolExecutionLoop } from './executionLoop.js';
 export {
   isSuccessfulWorkspaceMutationCall,
   isSuccessfulWorkspaceVerificationCall,
+  isWorkspaceVerificationCall,
   taskRequestsWorkspaceMutation,
 } from './executionIntent.js';
 export { ToolApprovalManager } from './approval.js';

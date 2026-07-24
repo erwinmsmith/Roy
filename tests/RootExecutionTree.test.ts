@@ -441,7 +441,8 @@ describe('Root dynamic execution tree', () => {
       'solve_directly',
       'finalize',
     ]);
-    expect(result.executionTree.loop.stopReason).toBe('max_iterations');
+    expect(result.executionTree.loop.stopReason).toBe('closure_unmet');
+    expect(result.finalResponse).toContain('[runtime_execution_closure_unmet]');
     await runtime.shutdown();
   });
 

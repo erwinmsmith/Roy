@@ -83,6 +83,8 @@ describe('Workspace memory initialization', () => {
       teamFirstLongHorizon: true,
       maxCachedSteps: 200,
       maxFeedbackItemsInPrompt: 24,
+      maxExecutionClosureAttempts: 3,
+      directDecisionAuditMinObligations: 4,
     });
     expect(workspaceConfig.lifecycle).toMatchObject({
       manual: 'retain_session',
@@ -250,6 +252,8 @@ describe('Workspace memory initialization', () => {
       teamFirstLongHorizon: true,
       maxCachedSteps: 200,
       maxFeedbackItemsInPrompt: 24,
+      maxExecutionClosureAttempts: 3,
+      directDecisionAuditMinObligations: 4,
     });
     expect(migratedConfig.tom.minimumCoverage).toBe(0.6);
     expect(migratedConfig.tom.enforceMinimumCoverage).toBe(false);

@@ -190,6 +190,49 @@ class RetryingDirectExecutionLLM extends TerminalTaskLLM {
 }
 
 describe('benchmark terminal capability', () => {
+  it('requires verification at or after the latest successful mutation', () => {
+    const runtime = new Runtime();
+    const analyze = (runtime as unknown as {
+      analyzeWorkspaceExecutionClosure: (calls: Array<{
+        toolName: string;
+        params: Record<string, unknown>;
+        success: boolean;
+      }>) => {
+        closed: boolean;
+        verificationAttemptedAfterMutation: boolean;
+        verificationPassed: boolean;
+      };
+    }).analyzeWorkspaceExecutionClosure.bind(runtime);
+
+    expect(analyze([
+      { toolName: 'shell.exec', params: { command: 'npm test' }, success: true },
+      { toolName: 'fs.write', params: { path: 'artifact.txt', content: 'changed' }, success: true },
+    ])).toMatchObject({
+      closed: false,
+      verificationAttemptedAfterMutation: false,
+      verificationPassed: false,
+    });
+    expect(analyze([
+      { toolName: 'fs.write', params: { path: 'artifact.txt', content: 'changed' }, success: true },
+      { toolName: 'shell.exec', params: { command: 'npm test' }, success: false },
+    ])).toMatchObject({
+      closed: false,
+      verificationAttemptedAfterMutation: true,
+      verificationPassed: false,
+    });
+    expect(analyze([
+      {
+        toolName: 'shell.exec',
+        params: { command: "printf 'fixed' > artifact.txt && npm test" },
+        success: true,
+      },
+    ])).toMatchObject({
+      closed: true,
+      verificationAttemptedAfterMutation: true,
+      verificationPassed: true,
+    });
+  });
+
   it('reuses persisted invalid-path knowledge in a later correlation', async () => {
     const workspace = await mkdtemp(path.join(tmpdir(), 'roy-persisted-path-cache-'));
     const cacheDirectory = path.join(workspace, '.roy', 'cache');

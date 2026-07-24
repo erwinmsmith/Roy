@@ -49,7 +49,7 @@ export interface RootExecutionLoopState {
   elapsedMs: number;
   stalledIterations: number;
   maxStalledIterations: number;
-  stopReason?: 'completed' | 'clarification' | 'max_iterations' | 'timeout' | 'stalled' | 'failed';
+  stopReason?: 'completed' | 'clarification' | 'max_iterations' | 'timeout' | 'stalled' | 'closure_unmet' | 'failed';
 }
 
 export interface RootExecutionNodeSnapshot {
