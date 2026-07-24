@@ -248,6 +248,12 @@ describe('workspace execution intent', () => {
   it('distinguishes mutation tasks from explicitly read-only work', () => {
     expect(taskRequestsWorkspaceMutation('Migrate the project code and run tests.')).toBe(true);
     expect(taskRequestsWorkspaceMutation('Review the project in read-only mode.')).toBe(false);
+    expect(taskRequestsWorkspaceMutation(
+      'Repair src/table_recon/audit.py. The official verifier is mirrored read-only inside the workspace. Do not modify the verifier.'
+    )).toBe(true);
+    expect(taskRequestsWorkspaceMutation(
+      'Do not modify the source files; analyze the failure only.'
+    )).toBe(false);
   });
 
   it('rejects a parallel top-level package after observing a src layout', () => {

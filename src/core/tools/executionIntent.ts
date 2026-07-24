@@ -98,14 +98,26 @@ const NON_WORKSPACE_OUTPUT_PREFIXES = [
 
 export function taskRequestsWorkspaceMutation(task: string): boolean {
   const normalized = task.toLowerCase().replace(/\s+/g, ' ');
-  if (/\b(?:do not|don't|without)\s+(?:modify|edit|write|change|patch|mutate)\b/.test(normalized)
-    || /\b(?:read[- ]only|analysis only|review only|plan only)\b/.test(normalized)
-    || /(?:不要|无需|仅|只)\s*(?:修改|写入|改动|执行)/.test(task)) {
+  const explicitlyGlobalReadOnly =
+    /^\s*(?:read[- ]only|analysis only|review only|plan only)\b/.test(normalized)
+    || /\b(?:read[- ]only|analysis only|review only|plan only)\s+(?:mode|task|request|work)\b/.test(
+      normalized
+    )
+    || /\b(?:work|operate|proceed|run|review|analy[sz]e)\b[^.;\n]{0,100}\bread[- ]only(?:\s+mode)?\b/.test(
+      normalized
+    );
+  if (explicitlyGlobalReadOnly) {
     return false;
   }
-  return /\b(?:implement|modify|edit|create|write|patch|repair|fix|refactor|migrate|upgrade|downgrade|install|remove|replace|apply|build)\b[\s\S]{0,240}\b(?:file|code|project|repository|repo|workspace|artifact|solution|dependency|dependencies|implementation|migration|application|package|tests?)\b/i.test(task)
-    || /\b(?:fix|repair|migrate|upgrade|refactor|implement)\b[\s\S]{0,160}\b(?:bug|issue|failure|task|feature|api|cli|runtime|system)\b/i.test(task)
-    || /(?:实现|修改|编辑|创建|写入|修复|重构|迁移|升级|安装|替换|落盘|改动)[\s\S]{0,120}(?:文件|代码|项目|仓库|工作区|依赖|实现|测试|系统)/.test(task);
+  const mutationScopedTask = task
+    .replace(
+      /\b(?:do not|don't|without)\s+(?:modify|modifying|edit|editing|write|writing|change|changing|patch|patching|mutate|mutating)\b[^.;\n]*/gi,
+      ' '
+    )
+    .replace(/(?:不要|无需|仅|只)\s*(?:修改|写入|改动|执行)[^。；;\n]*/g, ' ');
+  return /\b(?:implement|modify|edit|create|write|patch|repair|fix|refactor|migrate|upgrade|downgrade|install|remove|replace|apply|build)\b[\s\S]{0,240}\b(?:file|code|project|repository|repo|workspace|artifact|solution|dependency|dependencies|implementation|migration|application|package|tests?)\b/i.test(mutationScopedTask)
+    || /\b(?:fix|repair|migrate|upgrade|refactor|implement)\b[\s\S]{0,160}\b(?:bug|issue|failure|task|feature|api|cli|runtime|system)\b/i.test(mutationScopedTask)
+    || /(?:实现|修改|编辑|创建|写入|修复|重构|迁移|升级|安装|替换|落盘|改动)[\s\S]{0,120}(?:文件|代码|项目|仓库|工作区|依赖|实现|测试|系统)/.test(mutationScopedTask);
 }
 
 export function isSuccessfulWorkspaceMutationCall(call: ExecutionIntentCall): boolean {
