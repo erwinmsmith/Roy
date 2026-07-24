@@ -152,7 +152,10 @@ async function main(): Promise<void> {
       workspace,
       task,
       result,
-      events: runtime.getEvents().filter(event => event.correlationId === result.correlationId),
+      events: runtime.getEvents().filter(event =>
+        event.correlationId === result.correlationId
+        || event.type === 'runtime.wall_clock_limit.applied'
+      ),
       messages: await runtime.getMessages({ correlationId: result.correlationId, limit: 10_000 }),
       completedAt: new Date().toISOString(),
     };
