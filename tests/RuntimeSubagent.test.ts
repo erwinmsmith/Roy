@@ -153,6 +153,26 @@ class FileSynthesisLLM extends EchoLLM {
   }
 }
 
+class ToolMarkupSynthesisLLM extends EchoLLM {
+  override async *stream(messages: LLMMessage[]): AsyncGenerator<LLMStreamChunk, void, unknown> {
+    const prompt = messages.map(message => message.content).join('\n');
+    yield {
+      content: prompt.includes('[runtime_workspace_file_synthesis]')
+        ? [
+          'Let me inspect the verifier.',
+          '<｜｜DSML｜｜tool_calls>',
+          '<｜｜DSML｜｜invoke name="bash">',
+          '<｜｜DSML｜｜parameter name="command">cat .roy/official-verifier/grade.py</｜｜DSML｜｜parameter>',
+          '</｜｜DSML｜｜invoke>',
+          '</｜｜DSML｜｜tool_calls>',
+        ].join('\n')
+        : 'No source mutation was performed.',
+      done: true,
+      usage: { promptTokens: 40, completionTokens: 20, totalTokens: 60 },
+    };
+  }
+}
+
 describe('Runtime controlled subagent spawning', () => {
   it('does not route a local repair through web tools because verifier logs contain URLs', () => {
     const runtime = new Runtime();
@@ -458,6 +478,81 @@ describe('Runtime controlled subagent spawning', () => {
     expect(compacted).toContain('Implement the immutable task.');
     expect(compacted).toContain('Preserve the acceptance criteria.');
     expect(compacted).not.toContain('derived member context');
+    await runtime.shutdown();
+  });
+
+  it('rejects tool-protocol markup from file synthesis without corrupting the existing source', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-rejected-synthesis-'));
+    const original = 'def value():\n    return 41\n';
+    await writeFile(path.join(workspaceCwd, 'app.py'), original);
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'rejected-synthesis-test',
+      llmProvider: new ToolMarkupSynthesisLLM(),
+      workspaceCwd,
+    });
+    const coder = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'coder',
+      name: 'RejectedSynthesisCoder',
+      description: 'Attempt one grounded synthesis while preserving the existing source on rejection.',
+      task: 'Repair app.py using grounded evidence.',
+      tools: ['fs.read', 'fs.synthesize'],
+    });
+    const executeSynthesis = (runtime as unknown as {
+      executeSynthesizedFileForAgent: (
+        agent: unknown,
+        params: Record<string, unknown>,
+        task: string,
+        calls: Array<Record<string, unknown>>,
+        correlationId: string
+      ) => Promise<{
+        success: boolean;
+        error?: string;
+        metadata?: Record<string, unknown>;
+      }>;
+    }).executeSynthesizedFileForAgent.bind(runtime);
+
+    const result = await executeSynthesis(
+      (runtime as unknown as {
+        getContext: () => {
+          manager: { getAgentById: (id: string) => unknown };
+        };
+      }).getContext().manager.getAgentById(coder.identity.id),
+      {
+        path: 'app.py',
+        instructions: 'Repair the implementation without changing its public API.',
+      },
+      'Repair app.py using grounded evidence.',
+      [{
+        toolName: 'fs.read',
+        params: { path: 'app.py' },
+        success: true,
+        result: { path: 'app.py', content: original },
+      }],
+      'rejected-synthesis-correlation'
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      error: expect.stringContaining('rejected before mutation'),
+      metadata: expect.objectContaining({
+        synthesisRejected: true,
+        workspacePreserved: true,
+      }),
+    });
+    expect(await readFile(path.join(workspaceCwd, 'app.py'), 'utf8')).toBe(original);
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'tool.synthesis.rejected',
+      data: expect.objectContaining({ workspacePreserved: true }),
+    }));
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'tool.synthesis.retrying',
+      data: expect.objectContaining({
+        reason: expect.stringContaining('tool-protocol markup'),
+        workspacePreserved: true,
+      }),
+    }));
     await runtime.shutdown();
   });
 

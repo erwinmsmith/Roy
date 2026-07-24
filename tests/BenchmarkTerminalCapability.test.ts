@@ -502,6 +502,109 @@ describe('benchmark terminal capability', () => {
     await runtime.shutdown();
   });
 
+  it('does not cache a valid file as an invalid path when only its requested line range is stale', async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), 'roy-stale-read-range-'));
+    await writeFile(path.join(workspace, 'implementation.py'), 'line one\nline two\n');
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'stale-read-range-test',
+      workspaceCwd: workspace,
+    });
+
+    const staleRange = await runtime.executeToolForAgent(
+      'root',
+      'fs.read',
+      { path: 'implementation.py', startLine: 40, endLine: 60 },
+      { correlationId: 'stale-read-range-turn' }
+    );
+    const correctedRange = await runtime.executeToolForAgent(
+      'root',
+      'fs.read',
+      { path: 'implementation.py', startLine: 1, endLine: 2 },
+      { correlationId: 'stale-read-range-turn' }
+    );
+
+    expect(staleRange).toMatchObject({
+      success: false,
+      error: expect.stringContaining('exceeds'),
+    });
+    expect(correctedRange).toMatchObject({
+      success: true,
+      result: expect.objectContaining({ content: 'line one\nline two' }),
+    });
+    expect(runtime.getEvents().filter(event =>
+      event.type === 'tool.path.cache_rejected'
+      && event.correlationId === 'stale-read-range-turn'
+    )).toHaveLength(0);
+    expect(runtime.getEvents().filter(event =>
+      event.type === 'tool.call'
+      && event.correlationId === 'stale-read-range-turn'
+      && event.data.toolName === 'fs.read'
+    )).toHaveLength(2);
+
+    await runtime.shutdown();
+  });
+
+  it('attaches standard verifier scorecards to an opaque numeric verification result', async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), 'roy-verifier-diagnostics-'));
+    await mkdir(path.join(workspace, '.roy', 'official-verifier'), { recursive: true });
+    await mkdir(path.join(workspace, 'logs', 'verifier'), { recursive: true });
+    await writeFile(
+      path.join(workspace, '.roy', 'official-verifier', 'grade.py'),
+      'print("0.250000000000")\n'
+    );
+    await writeFile(
+      path.join(workspace, '.roy', 'config.json'),
+      JSON.stringify({
+        tools: {
+          approval: { readOnly: 'auto', execute: 'auto' },
+          shell: { mode: 'unrestricted', shell: '/bin/sh' },
+        },
+      })
+    );
+    await writeFile(
+      path.join(workspace, 'logs', 'verifier', 'scorecard.json'),
+      JSON.stringify({
+        groups: { schema: 1, hidden_stress: 0 },
+        reward: 0.25,
+      })
+    );
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'verifier-diagnostics-test',
+      workspaceCwd: workspace,
+    });
+
+    const result = await runtime.executeToolForAgent(
+      'root',
+      'shell.exec',
+      { command: 'python3 .roy/official-verifier/grade.py' },
+      { correlationId: 'verifier-diagnostics-turn' }
+    );
+
+    expect(result).toMatchObject({
+      success: true,
+      result: expect.objectContaining({
+        stdout: expect.stringContaining('0.250000000000'),
+        verifierDiagnostics: expect.arrayContaining([
+          expect.objectContaining({
+            path: path.join(workspace, 'logs', 'verifier', 'scorecard.json'),
+            content: expect.stringContaining('"hidden_stress":0'),
+          }),
+        ]),
+      }),
+    });
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'tool.verifier_diagnostics.attached',
+      data: expect.objectContaining({
+        files: expect.arrayContaining([
+          path.join(workspace, 'logs', 'verifier', 'scorecard.json'),
+        ]),
+      }),
+    }));
+    await runtime.shutdown();
+  });
+
   it('runs an explicitly authorized shell loop and persists its execution tree', async () => {
     const workspace = await mkdtemp(path.join(tmpdir(), 'roy-terminal-task-'));
     await mkdir(path.join(workspace, '.roy'), { recursive: true });

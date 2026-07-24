@@ -1393,10 +1393,14 @@ describe('UnifiedAgent capability execution', () => {
     expect(firstSystemPrompt).toContain('up to 24000 characters');
     expect(firstSystemPrompt).toContain('at most one file mutation per plan');
     expect(firstSystemPrompt).toContain('Do not embed multiline source');
+    const retrySystemPrompt = llm.messagesByAttempt[1]
+      ?.find(message => message.role === 'system')?.content ?? '';
     const retryPrompt = llm.messagesByAttempt[1]
       ?.findLast(message => message.role === 'user')?.content ?? '';
-    expect(retryPrompt).toContain('one complete compact JSON object');
-    expect(retryPrompt).toContain('one complete focused replacement');
+    expect(retrySystemPrompt).toContain('one complete compact JSON object');
+    expect(retrySystemPrompt).toContain('use fs.replace');
+    expect(retryPrompt).toContain('Causal observations');
+    expect(retryPrompt).not.toContain('Authorized tools:');
     expect(llm.optionsByAttempt[0]?.maxTokens).toBe(8192);
     expect(llm.optionsByAttempt[1]?.maxTokens).toBe(8192);
     expect(agent.getLastToolPlanningFailure()).toBeUndefined();
@@ -1421,7 +1425,7 @@ describe('UnifiedAgent capability execution', () => {
       calls: [],
     });
 
-    expect(llm.jsonCalls).toBe(3);
+    expect(llm.jsonCalls).toBe(1);
     expect(plans).toEqual([
       expect.objectContaining({
         toolName: 'fs.write',
@@ -1456,7 +1460,7 @@ describe('UnifiedAgent capability execution', () => {
       calls: [],
     });
 
-    expect(llm.jsonCalls).toBe(3);
+    expect(llm.jsonCalls).toBe(1);
     expect(plans).toEqual([
       expect.objectContaining({
         toolName: 'fs.write',
@@ -1495,7 +1499,7 @@ describe('UnifiedAgent capability execution', () => {
       }],
     });
 
-    expect(llm.jsonCalls).toBe(3);
+    expect(llm.jsonCalls).toBe(1);
     expect(plans).toEqual([
       expect.objectContaining({
         toolName: 'fs.replace',
@@ -1707,8 +1711,71 @@ describe('UnifiedAgent capability execution', () => {
       }],
     });
 
-    expect(llm.jsonCalls).toBe(3);
+    expect(llm.jsonCalls).toBe(2);
     expect(plans).toEqual([]);
+  });
+
+  it('recovers a corrupted source file containing model tool-protocol markup', async () => {
+    const llm = new CapturingToolPlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'tool-markup-source-recovery-agent',
+      goal: 'replace protocol corruption with valid source and resume verification',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.read', 'fs.replace', 'fs.synthesize', 'shell.exec'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: 'Repair src/table_recon/audit.py and rerun the CLI.',
+      executionRequired: true,
+      round: 3,
+      remainingCalls: 3,
+      tools: [
+        { name: 'fs.read' },
+        { name: 'fs.replace' },
+        { name: 'fs.synthesize' },
+        { name: 'shell.exec' },
+      ],
+      calls: [
+        {
+          toolName: 'shell.exec',
+          params: { command: 'python -m table_recon.cli run' },
+          reason: 'Run the CLI.',
+          groundingRequired: true,
+          success: false,
+          error: 'src/table_recon/audit.py:3: SyntaxError: invalid character',
+          result: {
+            exitCode: 1,
+            stderr: 'src/table_recon/audit.py:3: SyntaxError: invalid character',
+          },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/table_recon/audit.py', startLine: 1, endLine: 20 },
+          reason: 'Inspect the localized syntax failure.',
+          groundingRequired: true,
+          success: true,
+          result: {
+            path: 'src/table_recon/audit.py',
+            content: [
+              'Let me inspect the verifier.',
+              '<｜｜DSML｜｜tool_calls>',
+              '<｜｜DSML｜｜invoke name="bash">',
+              '</｜｜DSML｜｜invoke>',
+            ].join('\n'),
+          },
+        },
+      ],
+    });
+
+    expect(llm.jsonCalls).toBe(1);
+    expect(plans).toEqual([expect.objectContaining({
+      toolName: 'fs.synthesize',
+      params: {
+        path: 'src/table_recon/audit.py',
+        instructions: expect.stringContaining('tool-protocol'),
+      },
+    })]);
   });
 
   it('allows one grounded structural synthesis for an aggregate official-verifier failure', async () => {
@@ -1855,7 +1922,7 @@ describe('UnifiedAgent capability execution', () => {
       ],
     });
 
-    expect(llm.jsonCalls).toBe(3);
+    expect(llm.jsonCalls).toBe(2);
     expect(plans).toEqual([]);
   });
 

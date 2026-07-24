@@ -247,7 +247,7 @@ export class UnifiedAgent extends BaseAgent {
       const planningDeadline = input.requestTimeoutMs === undefined
         ? undefined
         : Date.now() + Math.max(1, input.requestTimeoutMs);
-      const maxPlanningAttempts = executionRequired ? 3 : 1;
+      const maxPlanningAttempts = executionRequired ? 2 : 1;
       for (let attempt = 0; attempt < maxPlanningAttempts; attempt += 1) {
         let rejectedDestructiveRepairOverwrite = false;
         const remainingPlanningMs = planningDeadline === undefined
@@ -266,37 +266,58 @@ export class UnifiedAgent extends BaseAgent {
             }
           );
         } catch (error) {
+          const recoveredPlan = recoverCompleteToolPlanningResponse(error, authorized);
           const recoveredMutation = recoverTruncatedWorkspaceMutationResponse(
             error,
             authorized,
             input.calls
           );
-          const canRetry = executionRequired
-            && attempt + 1 < maxPlanningAttempts
-            && isRetryableToolPlanningResponseError(error)
-            && (planningDeadline === undefined || Date.now() < planningDeadline);
-          if (canRetry) {
-            const recoveredPrefix = recoveredMutation?.calls[0]?.params;
-            planningMessages = [
-              ...planningMessages,
-              {
-                role: 'user',
-                content: [
-                  'The previous tool plan was incomplete or was not valid JSON.',
-                  'Return one complete compact JSON object only, with no analysis or markdown.',
-                  'Request exactly one highest-value mutation call in this response; omit empty companion files.',
-                  'Return complete file content or one complete focused replacement, up to 24000 characters.',
-                  recoveredPrefix
-                    ? `The incomplete response began a mutation to ${String(recoveredPrefix.path)}. Reconstruct that file as one complete mutation instead of returning only a continuation. Its last recoverable prefix was:\n${String(recoveredPrefix.content ?? recoveredPrefix.newText ?? '').slice(-1200)}`
-                    : '',
-                ].join('\n'),
-              },
-            ];
-            continue;
-          }
           if (recoveredMutation) {
             response = recoveredMutation;
+          } else if (recoveredPlan) {
+            response = recoveredPlan;
           } else {
+            const canRetry = executionRequired
+              && attempt + 1 < maxPlanningAttempts
+              && isRetryableToolPlanningResponseError(error)
+              && (planningDeadline === undefined || Date.now() < planningDeadline);
+            if (canRetry) {
+              planningMessages = [
+                {
+                  role: 'system',
+                  content: [
+                    `You are the compact repair controller for ${this.name}.`,
+                    'Return one complete compact JSON object only, with no analysis or markdown.',
+                    '{"action":"call_tools","reason":"...","calls":[{"toolName":"...","params":{...}}]}',
+                    `Authorized tool names: ${[...authorized].join(', ')}.`,
+                    'Choose exactly one highest-value action from the causal frontier. For a localized source failure, use fs.replace. For a broad grounded implementation repair, use fs.synthesize with path and concise instructions.',
+                  ].join('\n'),
+                },
+                {
+                  role: 'user',
+                  content: [
+                    `Task contract:\n${compactHeadTail(input.task, 3_000)}`,
+                    `Execution state: ${JSON.stringify({
+                      executionRequired,
+                      successfulInspection,
+                      mutationApplied,
+                      freshMutationRequired,
+                      freshMutationApplied,
+                      verificationAttempted,
+                      verificationPassed,
+                      latestVerificationFailed,
+                      inspectedAfterLatestFailure,
+                    })}`,
+                    `Causal observations:\n${JSON.stringify(observations.slice(-4), null, 2)}`,
+                    `Malformed prior response tail:\n${compactTail(
+                      error instanceof Error ? error.message : String(error),
+                      2_000
+                    )}`,
+                  ].join('\n\n'),
+                },
+              ];
+              continue;
+            }
             throw error;
           }
         }
@@ -315,6 +336,9 @@ export class UnifiedAgent extends BaseAgent {
         );
         if (latestVerificationFailed) {
           if (inspectedAfterLatestFailure) {
+            const localizedFailure = hasLocalizedVerificationFailureSinceLastMutation(
+              input.calls
+            );
             rejectedDestructiveRepairOverwrite = plannedCalls.some(call =>
               isDestructiveRepairOverwrite(call, input.calls)
             );
@@ -322,11 +346,20 @@ export class UnifiedAgent extends BaseAgent {
               isSuccessfulWorkspaceMutation({ ...call, success: true })
               && !isDestructiveRepairOverwrite(call, input.calls)
             );
+            const novelExplicitReads = plannedCalls.filter(call =>
+              (call.toolName === 'fs.read' || call.toolName === 'fs.search')
+              && taskExplicitlyNamesWorkspacePath(
+                input.task,
+                String(call.params.path ?? '')
+              )
+            );
             plannedCalls = focusedRepairs.length > 0
               ? [focusedRepairs[0]!]
-              : plannedCalls.filter(call =>
-                call.toolName === 'fs.read' || call.toolName === 'fs.search'
-              );
+              : localizedFailure
+                ? novelExplicitReads
+                : plannedCalls.filter(call =>
+                  call.toolName === 'fs.read' || call.toolName === 'fs.search'
+                );
           } else {
             const directRepair = plannedCalls.find(call =>
               isSuccessfulWorkspaceMutation({ ...call, success: true })
@@ -1267,7 +1300,7 @@ function recoverGroundedSynthesisPlan(input: {
   // discards working behavior and turns a local repair into another expensive
   // whole-file generation. A broad official-verifier score is the exception:
   // after its source has been read, one structural repair may be necessary.
-  if (!candidate.stubSignal && !aggregateVerifierRepair) {
+  if (!candidate.stubSignal && !candidate.invalidSourceSignal && !aggregateVerifierRepair) {
     return undefined;
   }
   return {
@@ -1275,7 +1308,9 @@ function recoverGroundedSynthesisPlan(input: {
     params: {
       path: candidate.filePath,
       instructions: input.latestVerificationFailed
-        ? aggregateVerifierRepair
+        ? candidate.invalidSourceSignal
+          ? 'Replace model tool-protocol or narrative corruption with the complete valid source implementation required by the grounded assignment, current CLI contract, inputs, and verifier.'
+          : aggregateVerifierRepair
           ? 'Structurally repair the implementation to satisfy the grounded aggregate official-verifier failures and immutable assignment, preserving behavior already proven by passing verifier groups.'
           : 'Repair the implementation to satisfy the latest grounded verifier failure and the immutable assignment while preserving working behavior.'
         : 'Implement the complete assigned workspace behavior in this authoritative source file using the grounded inputs, rules, and project structure.',
@@ -1378,6 +1413,7 @@ function rankGroundedSynthesisTargets(
   score: number;
   failureMentioned: boolean;
   stubSignal: boolean;
+  invalidSourceSignal: boolean;
   implementationIntent: boolean;
 }> {
   const taskLower = task.toLowerCase();
@@ -1392,6 +1428,7 @@ function rankGroundedSynthesisTargets(
     score: number;
     failureMentioned: boolean;
     stubSignal: boolean;
+    invalidSourceSignal: boolean;
     implementationIntent: boolean;
   }>();
   calls
@@ -1418,6 +1455,9 @@ function rankGroundedSynthesisTargets(
       );
       const stubSignal =
         /\b(?:todo|notimplemented(?:error)?|not implemented|placeholder|stub)\b|^\s*pass\s*(?:#.*)?$/im.test(content);
+      const invalidSourceSignal =
+        /(?:<\|?\|?DSML\|?\|?|<tool_calls?>|<invoke\s+name=|<parameter\s+name=|assistant\s+to=)/i.test(content)
+        || /[<｜]\s*[｜|]{0,2}DSML[｜|]{0,2}\s*[>｜]/i.test(content);
       const implementationIntent = taskNamesFileAsImplementationTarget(
         taskLower,
         filePathLower,
@@ -1427,6 +1467,7 @@ function rankGroundedSynthesisTargets(
       if (/(?:^|\/)(?:src|lib|app|packages)\//i.test(filePath)) score += 6;
       if (/(?:^|\/)(?:tests?|fixtures?|examples?|data|rules)\//i.test(filePath)) score -= 8;
       if (stubSignal) score += 18;
+      if (invalidSourceSignal) score += 30;
       if (implementationIntent) score += 20;
       if (taskLower.includes(filePathLower)
         || taskLower.includes(basename)) {
@@ -1435,13 +1476,21 @@ function rankGroundedSynthesisTargets(
       if (failureMentioned) {
         score += failureText.includes(filePathLower) ? 18 : 8;
       }
-      return { filePath, score, failureMentioned, stubSignal, implementationIntent };
+      return {
+        filePath,
+        score,
+        failureMentioned,
+        stubSignal,
+        invalidSourceSignal,
+        implementationIntent,
+      };
     })
     .filter((candidate): candidate is {
       filePath: string;
       score: number;
       failureMentioned: boolean;
       stubSignal: boolean;
+      invalidSourceSignal: boolean;
       implementationIntent: boolean;
     } => Boolean(candidate))
     .forEach(candidate => {
@@ -1467,6 +1516,14 @@ function taskNamesFileAsImplementationTarget(
     `\\b(?:implement|repair|fix|rewrite|complete|move|extract|build|create|write|update)\\b[^.\\n;]{0,180}${target}`,
     'i'
   ).test(taskLower);
+}
+
+function taskExplicitlyNamesWorkspacePath(task: string, candidatePath: string): boolean {
+  const normalized = normalizePlannedWorkspacePath(candidatePath).toLowerCase();
+  if (!normalized || normalized === '.') return false;
+  const normalizedTask = task.toLowerCase().replaceAll('\\', '/');
+  return normalizedTask.includes(normalized)
+    || normalizedTask.includes(`./${normalized}`);
 }
 
 function isDestructiveRepairOverwrite(
@@ -1611,6 +1668,105 @@ function isRetryableToolPlanningResponseError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return message.startsWith('Failed to parse JSON response')
     || message === 'Empty JSON response';
+}
+
+function recoverCompleteToolPlanningResponse(
+  error: unknown,
+  authorized: Set<string>
+): {
+  action: 'call_tools';
+  reason: string;
+  calls: Array<{ toolName: string; params: Record<string, unknown> }>;
+} | undefined {
+  const message = error instanceof Error ? error.message : String(error);
+  const prefix = 'Failed to parse JSON response:';
+  if (!message.startsWith(prefix)) return undefined;
+  const raw = message.slice(prefix.length);
+  const recoveredCalls: Array<{ toolName: string; params: Record<string, unknown> }> = [];
+  for (let start = raw.indexOf('{'); start >= 0; start = raw.indexOf('{', start + 1)) {
+    const candidate = extractBalancedJsonObject(raw, start);
+    if (!candidate) continue;
+    try {
+      const parsed = JSON.parse(candidate) as {
+        action?: unknown;
+        reason?: unknown;
+        calls?: unknown;
+        toolName?: unknown;
+        params?: unknown;
+      };
+      if (parsed.action === 'call_tools' && Array.isArray(parsed.calls)) {
+        const calls = parsed.calls.filter((call): call is {
+          toolName: string;
+          params?: Record<string, unknown>;
+        } => Boolean(
+          call
+          && typeof call === 'object'
+          && typeof (call as { toolName?: unknown }).toolName === 'string'
+          && authorized.has(String((call as { toolName?: unknown }).toolName))
+        )).map(call => ({
+          toolName: call.toolName,
+          params: call.params && typeof call.params === 'object' && !Array.isArray(call.params)
+            ? call.params
+            : {},
+        }));
+        if (calls.length > 0) {
+          return {
+            action: 'call_tools',
+            reason: typeof parsed.reason === 'string'
+              ? parsed.reason
+              : 'Recovered complete tool calls from a malformed structured response.',
+            calls,
+          };
+        }
+      }
+      if (typeof parsed.toolName === 'string' && authorized.has(parsed.toolName)) {
+        recoveredCalls.push({
+          toolName: parsed.toolName,
+          params: parsed.params && typeof parsed.params === 'object' && !Array.isArray(parsed.params)
+            ? parsed.params as Record<string, unknown>
+            : {},
+        });
+      }
+    } catch {
+      // Continue scanning nested objects; an outer response may be truncated
+      // while one or more individual tool call objects are complete.
+    }
+  }
+  if (recoveredCalls.length === 0) return undefined;
+  return {
+    action: 'call_tools',
+    reason: 'Recovered complete tool calls from a truncated structured response.',
+    calls: recoveredCalls,
+  };
+}
+
+function extractBalancedJsonObject(input: string, start: number): string | undefined {
+  if (input[start] !== '{') return undefined;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = start; index < input.length; index += 1) {
+    const char = input[index]!;
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+    } else if (char === '{') {
+      depth += 1;
+    } else if (char === '}') {
+      depth -= 1;
+      if (depth === 0) return input.slice(start, index + 1);
+    }
+  }
+  return undefined;
 }
 
 function recoverTruncatedWorkspaceMutationResponse(
@@ -1772,6 +1928,17 @@ function compactToolPlanningTask(task: string): string {
   ].join('\n');
 }
 
+function compactHeadTail(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  const headChars = Math.floor(maxChars * 0.6);
+  const tailChars = maxChars - headChars;
+  return [
+    value.slice(0, headChars),
+    '[runtime_compacted_middle]',
+    value.slice(-tailChars),
+  ].join('\n');
+}
+
 function compactToolObservation(
   result: unknown,
   toolName: string,
@@ -1818,6 +1985,7 @@ function compactToolObservation(
       stderr?: unknown;
       exitCode?: unknown;
       timedOut?: unknown;
+      verifierDiagnostics?: unknown;
     };
     return {
       command: String(shell.command ?? '').slice(0, latest ? 800 : 250),
@@ -1829,6 +1997,7 @@ function compactToolObservation(
         : compactTail(String(shell.stderr ?? ''), latest ? 3_000 : 500),
       exitCode: shell.exitCode,
       timedOut: shell.timedOut,
+      verifierDiagnostics: compactObservationValue(shell.verifierDiagnostics, 0),
     };
   }
   if (result && typeof result === 'object' && toolName === 'fs.read') {

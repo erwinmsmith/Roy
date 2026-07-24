@@ -3,6 +3,8 @@
 import 'dotenv/config';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
+import { readFile, stat } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
 import { config } from '../../config/index.js';
 import { logger } from '../utils/logger.js';
 import { configureLogging, shutdownLogging } from '../logging/index.js';
@@ -2606,7 +2608,7 @@ export class Runtime {
       nodeId: options.nodeId,
       data: { toolName, params, correlationId: options.correlationId },
     });
-    const result = toolName === 'fs.synthesize'
+    let result = toolName === 'fs.synthesize'
       ? await this.executeSynthesizedFileForAgent(
         agent,
         params,
@@ -2617,6 +2619,14 @@ export class Runtime {
       : runtimeTool
         ? await this.executeRuntimeTool(runtimeTool, params)
         : await toolRegistry.execute(toolName, params);
+    if (toolName === 'shell.exec'
+      && isWorkspaceVerificationCall({
+        toolName,
+        params,
+        success: result.success,
+      })) {
+      result = await this.attachVerifierDiagnostics(result, options.correlationId);
+    }
     this.recordToolPathOutcome(agentId, toolName, params, result, options.correlationId);
     this.toolCallCounts.set(callKey, calls + 1);
     const resultMessage = await this.enqueueMessage({
@@ -2674,6 +2684,7 @@ export class Runtime {
       stderr?: unknown;
       exitCode?: unknown;
       timedOut?: unknown;
+      verifierDiagnostics?: unknown;
     };
     const compactTail = (value: unknown, maxChars = 8_000): string | undefined => {
       if (typeof value !== 'string' || value.length === 0) return undefined;
@@ -2688,6 +2699,55 @@ export class Runtime {
       timedOut: shell.timedOut === true,
       stdout: compactTail(shell.stdout),
       stderr: compactTail(shell.stderr),
+      verifierDiagnostics: shell.verifierDiagnostics,
+    };
+  }
+
+  private async attachVerifierDiagnostics(
+    toolResult: ToolResult,
+    correlationId?: string
+  ): Promise<ToolResult> {
+    if (!toolResult.result || typeof toolResult.result !== 'object') return toolResult;
+    const candidateFiles = [
+      '/logs/verifier/scorecard.json',
+      '/logs/verifier/grade.log',
+      '/logs/verifier/reward.txt',
+      path.join(this.workspaceRoot, 'logs', 'verifier', 'scorecard.json'),
+      path.join(this.workspaceRoot, 'logs', 'verifier', 'grade.log'),
+      path.join(this.workspaceRoot, '.roy', 'verifier', 'scorecard.json'),
+    ];
+    const diagnostics: Array<{ path: string; content: string }> = [];
+    for (const candidate of candidateFiles) {
+      if (diagnostics.some(item => item.path === candidate)) continue;
+      try {
+        const content = await readFile(candidate, 'utf8');
+        if (!content.trim()) continue;
+        diagnostics.push({
+          path: candidate,
+          content: content.length <= 12_000
+            ? content
+            : `${content.slice(0, 7_000)}\n[${content.length - 12_000} middle chars compacted]\n${content.slice(-5_000)}`,
+        });
+      } catch {
+        // Verifier artifacts are optional and environment-dependent.
+      }
+    }
+    if (diagnostics.length === 0) return toolResult;
+    this.emit({
+      type: 'tool.verifier_diagnostics.attached',
+      agentId: 'root',
+      correlationId,
+      data: {
+        files: diagnostics.map(item => item.path),
+        totalChars: diagnostics.reduce((sum, item) => sum + item.content.length, 0),
+      },
+    });
+    return {
+      ...toolResult,
+      result: {
+        ...(toolResult.result as Record<string, unknown>),
+        verifierDiagnostics: diagnostics,
+      },
     };
   }
 
@@ -2742,6 +2802,19 @@ export class Runtime {
       item === requestedPath || requestedPath.startsWith(`${item}/`) || item.startsWith(`${requestedPath}/`)
     )) {
       return undefined;
+    }
+    // Persisted path knowledge is a scheduling hint, not a substitute for the
+    // current filesystem. In particular, a valid file read with an obsolete
+    // line range must never poison the entire path across later repair turns.
+    const absolutePath = path.resolve(this.workspaceRoot, requestedPath);
+    const relativePath = path.relative(this.workspaceRoot, absolutePath);
+    if (!relativePath.startsWith('..') && !path.isAbsolute(relativePath)) {
+      try {
+        await stat(absolutePath);
+        return undefined;
+      } catch {
+        // The path is still absent or inaccessible, so cached rejection remains useful.
+      }
     }
     const liveFailure = this.failedPathObservations.get(correlationKey)?.get(requestedPath);
     const knowledge = await this.getContext().memory.readExecutionKnowledge(undefined, 24);
@@ -2832,6 +2905,7 @@ export class Runtime {
       return;
     }
     if (toolName !== 'fs.read' && toolName !== 'fs.list' && toolName !== 'fs.search') return;
+    if (!this.isAuthoritativeInvalidPathFailure(result.error)) return;
     const failures = this.failedPathObservations.get(correlationKey) ?? new Map();
     failures.set(observedPath, {
       toolName,
@@ -2841,6 +2915,11 @@ export class Runtime {
       observedAt: Date.now(),
     });
     this.failedPathObservations.set(correlationKey, failures);
+  }
+
+  private isAuthoritativeInvalidPathFailure(error: string | undefined): boolean {
+    if (!error) return false;
+    return /\bENOENT\b|no such file or directory|cannot find the (?:file|path)|path must point to a file/i.test(error);
   }
 
   private extractShellMutationPaths(command: string): string[] {
@@ -3564,17 +3643,91 @@ export class Runtime {
       }
     );
     generated = this.stripSingleMarkdownCodeFence(generated);
-    if (!generated.trim()) {
-      return { success: false, error: `File synthesis for ${normalizedPath} returned empty content` };
+    let validationError = await this.synthesizedContentRejectionReason(
+      normalizedPath,
+      generated,
+      currentContent
+    );
+    if (validationError) {
+      this.emit({
+        type: 'tool.synthesis.retrying',
+        agentId: agent.id,
+        sessionId: this.getContext().sessionId,
+        correlationId,
+        data: {
+          path: normalizedPath,
+          reason: validationError,
+          attempt: 1,
+          maxAttempts: 2,
+          workspacePreserved: true,
+        },
+      });
+      const recoveryPrompt = [
+        '[runtime_workspace_file_synthesis_recovery]',
+        `Generate the exact complete UTF-8 contents for ${normalizedPath}.`,
+        `The prior isolated generation was rejected before any workspace mutation: ${validationError}`,
+        'Do not request tools. Tool-protocol markup is data corruption in this channel.',
+        'All available verifier, input-schema, current-file, and assignment evidence is already attached below.',
+        '',
+        'Immutable assignment:',
+        assignedTask || 'Implement the current grounded workspace task.',
+        '',
+        'Focused implementation instructions:',
+        String(params.instructions).trim(),
+        '',
+        'Current target snapshot:',
+        currentContent === undefined ? '[target does not exist]' : currentContent,
+        '',
+        'Grounded supporting evidence:',
+        evidence || '[no additional supporting evidence]',
+        '',
+        'Rejected output tail (do not repeat it):',
+        generated.slice(-2_000),
+        '',
+        'Return source bytes only: no prose, Markdown, diff, JSON, DSML, XML, or tool call.',
+      ].join('\n');
+      generated = await this.completeAsAgent(
+        agent,
+        recoveryPrompt,
+        'workspace.file_synthesis_recovery',
+        correlationId,
+        {
+          isolatedContext: true,
+          temperature: 0,
+          maxOutputTokens: 32_000,
+        }
+      );
+      generated = this.stripSingleMarkdownCodeFence(generated);
+      validationError = await this.synthesizedContentRejectionReason(
+        normalizedPath,
+        generated,
+        currentContent
+      );
     }
-    if (generated === currentContent) {
-      return { success: false, error: `File synthesis for ${normalizedPath} produced no workspace change` };
-    }
-    if (/^\s*(?:here(?:'s| is)|the (?:complete )?file|implementation:)/i.test(generated)
-      && !this.looksLikeSourceFileContent(normalizedPath, generated)) {
+    if (validationError) {
+      this.emit({
+        type: 'tool.synthesis.rejected',
+        agentId: agent.id,
+        sessionId: this.getContext().sessionId,
+        correlationId,
+        data: {
+          path: normalizedPath,
+          reason: validationError,
+          existingBytes: currentContent === undefined
+            ? 0
+            : Buffer.byteLength(currentContent, 'utf8'),
+          generatedBytes: Buffer.byteLength(generated, 'utf8'),
+          workspacePreserved: true,
+        },
+      });
       return {
         success: false,
-        error: `File synthesis for ${normalizedPath} returned narrative text instead of file contents`,
+        error: `File synthesis for ${normalizedPath} was rejected before mutation: ${validationError}`,
+        metadata: {
+          synthesisRejected: true,
+          workspacePreserved: true,
+          path: normalizedPath,
+        },
       };
     }
 
@@ -3623,6 +3776,90 @@ export class Runtime {
     };
   }
 
+  private async synthesizedContentRejectionReason(
+    filePath: string,
+    generated: string,
+    currentContent: string | undefined
+  ): Promise<string | undefined> {
+    if (!generated.trim()) return 'generation returned empty content';
+    if (generated === currentContent) return 'generation produced no workspace change';
+    if (/^\s*(?:here(?:'s| is)|the (?:complete )?file|implementation:)/i.test(generated)
+      && !this.looksLikeSourceFileContent(filePath, generated)) {
+      return 'generation returned narrative text instead of file contents';
+    }
+    return this.validateSynthesizedFileContent(filePath, generated);
+  }
+
+  private async validateSynthesizedFileContent(
+    filePath: string,
+    content: string
+  ): Promise<string | undefined> {
+    if (content.includes(String.fromCharCode(0))) {
+      return 'generated content contains a NUL byte';
+    }
+    if (/(?:<\|?\|?DSML\|?\|?|<tool_calls?>|<invoke\s+name=|<parameter\s+name=|assistant\s+to=|tool_calls?\s*>)/i.test(content)
+      || /[<｜]\s*[｜|]{0,2}DSML[｜|]{0,2}\s*[>｜]/i.test(content)) {
+      return 'generated content contains model tool-protocol markup instead of source code';
+    }
+    if (/^\s*```/m.test(content)) {
+      return 'generated content contains an embedded Markdown code fence';
+    }
+    const extension = path.extname(filePath).toLowerCase();
+    if (extension === '.json') {
+      try {
+        JSON.parse(content);
+      } catch (error) {
+        return `generated JSON is invalid: ${error instanceof Error ? error.message : String(error)}`;
+      }
+      return undefined;
+    }
+    const syntaxCheck = extension === '.py'
+      ? {
+        executable: process.env.ROY_PYTHON_EXECUTABLE || 'python3',
+        args: ['-c', 'import ast,sys; ast.parse(sys.stdin.read())'],
+        label: 'Python',
+      }
+      : extension === '.js' || extension === '.mjs' || extension === '.cjs'
+        ? {
+          executable: process.execPath,
+          args: ['--input-type=module', '--check', '-'],
+          label: 'JavaScript',
+        }
+        : extension === '.sh'
+          ? {
+            executable: '/bin/sh',
+            args: ['-n'],
+            label: 'shell',
+          }
+          : undefined;
+    if (!syntaxCheck) return undefined;
+    const result = await new Promise<{ code: number | null; stderr: string; spawnError?: string }>(resolve => {
+      const child = spawn(syntaxCheck.executable, syntaxCheck.args, {
+        cwd: this.workspaceRoot,
+        stdio: ['pipe', 'ignore', 'pipe'],
+      });
+      let stderr = '';
+      child.stderr.setEncoding('utf8');
+      child.stderr.on('data', chunk => {
+        if (stderr.length < 8_000) stderr += String(chunk);
+      });
+      child.on('error', error => resolve({
+        code: null,
+        stderr,
+        spawnError: error.message,
+      }));
+      child.on('close', code => resolve({ code, stderr }));
+      child.stdin.end(content);
+    });
+    if (result.spawnError) {
+      return `${syntaxCheck.label} syntax validator could not start: ${result.spawnError}`;
+    }
+    if (result.code !== 0) {
+      return `${syntaxCheck.label} syntax validation failed: ${result.stderr.trim().slice(-4_000) || `exit ${result.code}`}`;
+    }
+    return undefined;
+  }
+
   private compactFileSynthesisEvidence(
     calls: ToolCallRecord[],
     targetPath: string,
@@ -3664,10 +3901,14 @@ export class Runtime {
           stdout?: unknown;
           stderr?: unknown;
           exitCode?: unknown;
+          verifierDiagnostics?: unknown;
         } | undefined;
         const output = [
           String(shell?.stdout ?? ''),
           String(shell?.stderr ?? ''),
+          shell?.verifierDiagnostics
+            ? `Verifier diagnostics:\n${JSON.stringify(shell.verifierDiagnostics)}`
+            : '',
           String(call.error ?? ''),
         ].filter(Boolean).join('\n');
         if (output) {
@@ -8776,7 +9017,10 @@ export class Runtime {
         error: typeof resultPayload.error === 'string' ? resultPayload.error : undefined,
         reason: typeof callPayload.reason === 'string' ? callPayload.reason : undefined,
       };
-      if (success) {
+      const semanticVerificationFailure = success
+        && isWorkspaceVerificationCall(callRecord)
+        && !isSuccessfulWorkspaceVerificationCall(callRecord);
+      if (success && !semanticVerificationFailure) {
         successfulTools.add(toolName);
         if (candidatePath) observedPaths.add(this.normalizeCachedPath(candidatePath));
         if (Array.isArray(result.entries)) {
@@ -8787,6 +9031,30 @@ export class Runtime {
         }
         if (isSuccessfulWorkspaceMutationCall(callRecord)) mutationObserved = true;
         if (isSuccessfulWorkspaceVerificationCall(callRecord)) verificationObserved = true;
+      } else if (semanticVerificationFailure) {
+        failedTools.add(toolName);
+        const verifierDiagnostics = (
+          result as { verifierDiagnostics?: unknown }
+        ).verifierDiagnostics;
+        addFeedback(
+          'tool_failure',
+          [
+            `${toolName} completed but did not satisfy the verifier.`,
+            verifierDiagnostics
+              ? JSON.stringify(verifierDiagnostics)
+              : JSON.stringify(result).slice(-4_000),
+          ].join(' '),
+          { actorId: message.metadata?.agentId, toolName }
+        );
+      } else if (!this.isAuthoritativeInvalidPathFailure(
+        typeof resultPayload.error === 'string' ? resultPayload.error : undefined
+      )) {
+        failedTools.add(toolName);
+        addFeedback(
+          'tool_failure',
+          `${toolName} failed without invalidating its path${candidatePath ? ` ${candidatePath}` : ''}: ${String(resultPayload.error ?? 'unknown error')}`,
+          { actorId: message.metadata?.agentId, toolName }
+        );
       } else {
         failedTools.add(toolName);
         if (candidatePath) invalidPaths.add(this.normalizeCachedPath(candidatePath));
@@ -11537,6 +11805,46 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     teamResults: TeamRunResult[] = [],
     rootExecution?: GroundingRunResult
   ): Promise<string> {
+    const executionClosure = rootExecution
+      ? this.analyzeWorkspaceExecutionClosure(
+        rootExecution.toolCalls,
+        rootExecution.acceptanceAudit,
+        this.taskRequiresAcceptanceAudit(userTask)
+      )
+      : undefined;
+    const verifierDrivenWorkspaceRun = Boolean(
+      rootExecution
+      && (
+        /\.roy\/official-verifier\//i.test(userTask)
+        || /<official_verifier_feedback>/i.test(userTask)
+        || /\b(?:harbor|continue_until_timeout)\b/i.test(userTask)
+      )
+    );
+    const failedDirectExecution = Boolean(
+      rootExecution
+      && results.length === 0
+      && teamResults.length === 0
+      && executionClosure
+      && !executionClosure.closed
+    );
+    if (verifierDrivenWorkspaceRun || failedDirectExecution) {
+      const finalResponse = this.buildDeterministicExecutionHandoff(
+        rootExecution!,
+        executionClosure!
+      );
+      this.emit({
+        type: 'root.synthesis.skipped',
+        agentId: 'root',
+        correlationId,
+        data: {
+          reason: verifierDrivenWorkspaceRun
+            ? 'verifier_driven_workspace_state_is_authoritative'
+            : 'failed_direct_execution_requires_compact_handoff',
+          ...executionClosure,
+        },
+      });
+      return finalResponse;
+    }
     const ctx = this.getContext();
     const synthesisMessage = await this.enqueueMessage({
       kind: 'root.synthesis',
@@ -11624,6 +11932,40 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     });
     await ctx.queue.ack(synthesisMessage.id);
     return finalResponse;
+  }
+
+  private buildDeterministicExecutionHandoff(
+    execution: GroundingRunResult,
+    closure: WorkspaceExecutionClosureStatus
+  ): string {
+    const latestVerification = [...execution.toolCalls].reverse().find(call =>
+      isWorkspaceVerificationCall(call)
+    );
+    const latestMutation = [...execution.toolCalls].reverse().find(call =>
+      isSuccessfulWorkspaceMutationCall(call)
+    );
+    const latestFailure = [
+      latestVerification?.error,
+      latestVerification?.result
+        ? JSON.stringify(latestVerification.result)
+        : undefined,
+      execution.warnings.at(-1),
+    ].filter(Boolean).join('\n').slice(-4_000);
+    return [
+      '[runtime_execution_handoff]',
+      closure.closed
+        ? 'The workspace mutation, fresh verification, and required acceptance audit are complete.'
+        : 'The workspace execution remains open and has been checkpointed for focused continuation.',
+      `closure=${JSON.stringify(closure)}`,
+      latestMutation
+        ? `latest_mutation=${latestMutation.toolName} ${JSON.stringify(latestMutation.params).slice(0, 1200)}`
+        : 'latest_mutation=none',
+      latestVerification
+        ? `latest_verification=${latestVerification.toolName} ${JSON.stringify(latestVerification.params).slice(0, 1200)}`
+        : 'latest_verification=none',
+      latestFailure ? `causal_frontier:\n${latestFailure}` : '',
+      'The next continuation should reuse cached paths and repair only the newest unresolved verifier evidence.',
+    ].filter(Boolean).join('\n\n');
   }
 
   private buildMultiAgentSynthesisPrompt(
