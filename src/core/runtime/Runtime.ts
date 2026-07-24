@@ -763,6 +763,7 @@ export class Runtime {
   private runtimeToolOverrides = new Map<string, Tool>();
   private readonly teams = new TeamRegistry();
   private teamMemberPlans = new Map<string, TeamMemberSpec[]>();
+  private teamToolEvidenceCache = new Map<string, ToolCallRecord[]>();
   private teamSpawnReservations = new Map<string, {
     parentId: string;
     correlationId: string;
@@ -1071,6 +1072,7 @@ export class Runtime {
     this.toolCallCounts.clear();
     this.teams.clear();
     this.teamMemberPlans.clear();
+    this.teamToolEvidenceCache.clear();
     this.teamSpawnReservations.clear();
     this.turnAgentCounts.clear();
     this.tomAnalyses.clear();
@@ -5495,6 +5497,22 @@ export class Runtime {
 
     let subagentResult: RunAgentResult;
     try {
+      const sharedTeamToolCalls = payload.teamId
+        ? this.teamToolEvidenceCache.get(payload.teamId) ?? []
+        : [];
+      if (payload.teamId && sharedTeamToolCalls.length > 0) {
+        this.emit({
+          type: 'team.tool_evidence.reused',
+          agentId: agent.identity.id,
+          sessionId: ctx.sessionId,
+          correlationId,
+          data: {
+            teamId: payload.teamId,
+            cachedCalls: sharedTeamToolCalls.length,
+            successfulCalls: sharedTeamToolCalls.filter(call => call.success).length,
+          },
+        });
+      }
       subagentResult = await this.runAgent(agent.identity.id, payload.task, {
         correlationId,
         parentMessageId: taskMessage.id,
@@ -5502,7 +5520,26 @@ export class Runtime {
         disableRecursiveDelegation: payload.disableRecursiveDelegation,
         nodeId: node.nodeId,
         patternId: node.reuse.targetPatternId,
+        priorToolCalls: sharedTeamToolCalls,
       });
+      if (payload.teamId && subagentResult.toolCalls.length > 0) {
+        const cachedCalls = [
+          ...sharedTeamToolCalls,
+          ...subagentResult.toolCalls,
+        ].slice(-80);
+        this.teamToolEvidenceCache.set(payload.teamId, cachedCalls);
+        this.emit({
+          type: 'team.tool_evidence.cached',
+          agentId: agent.identity.id,
+          sessionId: ctx.sessionId,
+          correlationId,
+          data: {
+            teamId: payload.teamId,
+            addedCalls: subagentResult.toolCalls.length,
+            cachedCalls: cachedCalls.length,
+          },
+        });
+      }
       await ctx.queue.ack(taskMessage.id);
     } catch (error) {
       const currentTask = await ctx.queue.getMessage(taskMessage.id);
@@ -6290,6 +6327,7 @@ export class Runtime {
       disableRecursiveDelegation?: boolean;
       nodeId?: string;
       patternId?: string;
+      priorToolCalls?: ToolCallRecord[];
     } = {}
   ): Promise<RunAgentResult> {
     const ctx = this.getContext();
