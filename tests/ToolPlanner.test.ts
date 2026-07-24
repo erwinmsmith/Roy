@@ -184,6 +184,29 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('ignores incidental URLs embedded in terminal feedback for workspace tasks', () => {
+    const plans = new AgentToolPlanner().plan({
+      task: [
+        'Repair the current workspace package and rerun its tests.',
+        'Latest command output:',
+        'WARNING: use a virtual environment: https://pip.pypa.io/warnings/venv',
+      ].join('\n'),
+      workspacePath: '.',
+      archetype: 'coder',
+      bindings: [
+        { name: 'fs.list', enabled: true },
+        { name: 'web.fetch', enabled: true },
+      ],
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.list',
+        params: { path: '.', maxDepth: 4 },
+      }),
+    ]);
+  });
+
   it('prioritizes official API documentation links over unofficial downloads', () => {
     const plans = new AgentToolPlanner().planWebFollowUps({
       task: 'Find official Node.js documentation for the global fetch API and AbortSignal.timeout.',

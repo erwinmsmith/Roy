@@ -13507,6 +13507,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         '- Work on the configured workspace now; do not stop at analysis or a proposed patch.',
         '- The listed tools are already bound to this actor. Request the tool calls directly; Runtime enforces approval policy. Do not ask the user for tool permission.',
         '- Inspect current files as needed, apply the required changes with fs.write or shell.exec, and run relevant verification commands.',
+        '- Resolve the authoritative source root from project metadata before writing. Do not create a parallel package outside an existing src/, lib/, packages/, or configured package directory.',
         '- Continue through failed verification when another bounded repair is possible.',
         '- Finish only after the requested workspace mutation has been attempted and the resulting state has been verified or a concrete blocking error has been observed.',
       ].join('\n'),

@@ -132,6 +132,7 @@ export class UnifiedAgent extends BaseAgent {
             ? 'At least one workspace mutation succeeded, but that does not prove the full implementation is complete. Continue any remaining edits or repairs, then request a relevant test, build, lint, typecheck, or targeted assertion.'
             : '',
           'When verification fails, use its output to repair the workspace before retrying. Never hide a failing exit status with `|| true`, `; true`, `|| :`, or equivalent shell constructs.',
+          'Before creating or replacing a module, use observed package metadata and directory layout to identify the authoritative source root. Never create a parallel top-level package when the project installs from src/, lib/, packages/, or another configured source directory.',
           'Never repeat an equivalent call. Search snippets are discovery evidence; fetch relevant result pages before making source-backed claims.',
           'Reject search results that do not match the core entities and topic in the task. Never fetch an irrelevant result merely because it is available.',
           'After two web.search calls, do not keep reformulating the same search. Fetch a likely official public URL if one can be identified, or finish with an explicit evidence limitation.',

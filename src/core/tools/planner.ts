@@ -35,17 +35,21 @@ export class AgentToolPlanner {
     const referencedUrls = this.extractReferencedUrls(input.task);
     const runtimeApiInspection = /\bruntime\s+apis?\b[\s\S]{0,80}\b(?:exports?|surface|inspection|declarations?|signatures?|source|symbols?)\b|\bexported runtime apis?\b/.test(lower);
     const mutationTask = /\b(?:implement|modify|edit|create|write|patch|repair|fix|refactor|migrate|upgrade|install|replace|apply)\b/.test(lower);
+    const explicitUrlReading = /\b(?:open|read|fetch|visit|consult)\b[\s\S]{0,120}https?:\/\//i.test(input.task);
+    const webEvidenceRequired = this.requiresWebEvidence(lower);
     const broadWorkspaceInspection = /\b(?:actual|current|entire|full|all)\b[\s\S]{0,100}\b(?:workspace|project|repository|repo|codebase|files?|metadata|manifests?)\b/.test(lower)
       || /\b(?:workspace|project|repository|repo|codebase)\b[\s\S]{0,100}\b(?:structure|layout|inventory|metadata|manifests?|all files?)\b/.test(lower);
 
-    if (enabled.has('web.fetch') && referencedUrls.length > 0) {
+    if (enabled.has('web.fetch')
+      && referencedUrls.length > 0
+      && (webEvidenceRequired || explicitUrlReading)) {
       plans.push(...referencedUrls.map(url => ({
         toolName: 'web.fetch',
         params: { url },
         reason: `The task explicitly references ${url}.`,
         groundingRequired: true,
       })));
-    } else if (enabled.has('web.search') && this.requiresWebEvidence(lower)) {
+    } else if (enabled.has('web.search') && webEvidenceRequired) {
       plans.push({
         toolName: 'web.search',
         params: { query: this.buildSearchQuery(input.task), maxResults: 5 },
