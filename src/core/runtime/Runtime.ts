@@ -10104,7 +10104,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     );
     if (available < 2) return decision;
     const agents = [...decision.agents.slice(0, available)];
-    const archetypes = new Set(agents.map(agent => agent.archetype));
+    const coveredPhases = new Set(agents.map(agent => this.longHorizonMemberPhase(agent)));
     const bootstrapAgents = this.buildLongHorizonTeamDecision(task, requiresWorkspaceMutation).agents;
     const additions = requiresWorkspaceMutation
       ? [
@@ -10118,14 +10118,43 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
       ];
     for (const addition of additions) {
       if (agents.length >= available) break;
-      if (archetypes.has(addition.archetype)) continue;
+      const phase = this.longHorizonMemberPhase(addition);
+      if (coveredPhases.has(phase)) continue;
       agents.push(addition);
-      archetypes.add(addition.archetype);
+      coveredPhases.add(phase);
     }
     if (agents.length < 2) return decision;
+    const orderedAgents = agents
+      .map((agent, index) => ({ agent, index, phase: this.longHorizonMemberPhase(agent) }))
+      .sort((left, right) => left.phase - right.phase || left.index - right.index)
+      .map(item => item.agent);
+    const orderedPhases = orderedAgents.map(agent => this.longHorizonMemberPhase(agent));
+    const hasPhaseDependency = new Set(orderedPhases).size > 1;
+    const requestedExecutionPolicy = decision.team?.executionPolicy;
+    if (hasPhaseDependency && (
+      requestedExecutionPolicy?.mode !== 'sequential'
+      || requestedExecutionPolicy.maxConcurrency !== 1
+      || orderedAgents.some((agent, index) => agent !== agents[index])
+    )) {
+      this.emit({
+        type: 'delegation.team.dependencies.normalized',
+        agentId: 'root',
+        correlationId,
+        data: {
+          phases: orderedAgents.map(agent => ({
+            name: agent.name ?? agent.archetype,
+            archetype: agent.archetype,
+            phase: this.longHorizonMemberPhase(agent),
+          })),
+          requestedMode: requestedExecutionPolicy?.mode,
+          appliedMode: 'sequential',
+          reason: 'Long-horizon evidence, implementation, and verification phases must consume prior phase results.',
+        },
+      });
+    }
     return {
       ...decision,
-      agents,
+      agents: orderedAgents,
       coordination: 'team',
       continuationPolicy: 'reassess',
       team: {
@@ -10136,15 +10165,51 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
         synthesisPolicy: decision.team?.synthesisPolicy
           ?? 'Synthesize authoritative paths, completed work, failed paths, verification evidence, and unresolved feedback into the next root checkpoint.',
         tomLevel: decision.team?.tomLevel,
-        executionPolicy: decision.team?.executionPolicy ?? {
-          mode: 'sequential',
-          failureMode: 'best_effort',
-          maxConcurrency: 1,
-          minimumSuccessfulMembers: 1,
-        },
+        executionPolicy: hasPhaseDependency
+          ? {
+            ...requestedExecutionPolicy,
+            mode: 'sequential',
+            failureMode: requestedExecutionPolicy?.failureMode ?? 'best_effort',
+            maxConcurrency: 1,
+            minimumSuccessfulMembers: Math.min(
+              orderedAgents.length,
+              requestedExecutionPolicy?.minimumSuccessfulMembers ?? 1
+            ),
+          }
+          : requestedExecutionPolicy ?? {
+            mode: 'parallel',
+            failureMode: 'best_effort',
+            maxConcurrency: Math.min(orderedAgents.length, 2),
+            minimumSuccessfulMembers: 1,
+          },
         memberDelegationPolicy: 'allow',
       },
     };
+  }
+
+  private longHorizonMemberPhase(plan: DelegationAgentPlan): 0 | 1 | 2 {
+    if (plan.archetype === 'researcher' || plan.archetype === 'planner') return 0;
+    if (plan.archetype === 'coder') return 1;
+    if (plan.archetype === 'tester'
+      || plan.archetype === 'critic'
+      || plan.archetype === 'summarizer') return 2;
+    const intent = [
+      plan.name,
+      plan.role,
+      plan.task,
+      plan.existenceReason,
+    ].filter(Boolean).join(' ').toLowerCase();
+    const verifiesOnly = /\b(?:verify|verification|validate|validation|test|tester|review|reviewer|audit|acceptance|check)\b/.test(intent)
+      && !/\b(?:implement|implementation|build|create|write|modify|edit|patch|repair|fix|migrate|executor|coder|engineer)\b/.test(intent);
+    if (verifiesOnly) return 2;
+    const canMutate = (plan.tools ?? []).some(tool =>
+      tool === 'fs.write' || tool === 'fs.replace'
+    );
+    if (canMutate
+      || /\b(?:implement|implementation|build|create|write|modify|edit|patch|repair|fix|migrate|executor|coder|engineer)\b/.test(intent)) {
+      return 1;
+    }
+    return 0;
   }
 
   private applyBudgetConstraints(decision: DelegationDecision): DelegationDecision {

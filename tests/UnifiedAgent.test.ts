@@ -342,6 +342,18 @@ class RecoverableLaterTruncatedWritePlanningLLM extends PlanningLLM {
   }
 }
 
+class RecoverableTruncatedReplacePlanningLLM extends PlanningLLM {
+  override async completeJSON<T>(): Promise<T> {
+    this.jsonCalls += 1;
+    throw new Error(
+      'Failed to parse JSON response: '
+      + '{"action":"call_tools","reason":"replace stub","calls":[{"toolName":"fs.replace",'
+      + '"params":{"path":"src/app.py","startLine":1,"endLine":3,"newText":'
+      + '"def run_pipeline():\\n    value = 42\\n    return value\\n\\n# unfinished'
+    );
+  }
+}
+
 class MultipleMutationPlanningLLM extends PlanningLLM {
   constructor() {
     super('none');
@@ -1320,6 +1332,48 @@ describe('UnifiedAgent capability execution', () => {
         }),
       }),
     ]);
+  });
+
+  it('executes a bounded replacement recovered from a truncated fs.replace response', async () => {
+    const llm = new RecoverableTruncatedReplacePlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'recover-truncated-source-replacer',
+      goal: 'preserve a generated replacement chunk',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.replace', 'shell.exec'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: 'Replace the stub in src/app.py and run verification.',
+      executionRequired: true,
+      round: 1,
+      remainingCalls: 2,
+      tools: [{ name: 'fs.replace' }, { name: 'shell.exec' }],
+      calls: [{
+        toolName: 'fs.read',
+        params: { path: 'src/app.py', startLine: 1, endLine: 3 },
+        reason: 'Inspect the stub.',
+        groundingRequired: true,
+        success: true,
+        result: { content: 'def run_pipeline():\\n    raise NotImplementedError\\n' },
+      }],
+    });
+
+    expect(llm.jsonCalls).toBe(3);
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.replace',
+        params: {
+          path: 'src/app.py',
+          startLine: 1,
+          endLine: 3,
+          newText: 'def run_pipeline():\n    value = 42\n    return value\n\n',
+        },
+        reason: expect.stringContaining('truncated structured fs.replace'),
+      }),
+    ]);
+    expect(agent.getLastToolPlanningFailure()).toBeUndefined();
   });
 
   it('appends the next recovered source chunk after an earlier recovered write', async () => {

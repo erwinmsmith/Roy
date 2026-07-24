@@ -559,6 +559,71 @@ describe('Root dynamic execution tree', () => {
     await runtime.shutdown();
   });
 
+  it('orders long-horizon evidence, implementation, and verification without duplicating a custom executor', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-long-horizon-dependencies-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'long-horizon-dependencies-test',
+      workspaceCwd,
+      fsmEnabled: true,
+      llmProvider: new DirectInitialDecisionLLM(),
+    });
+    const normalize = (runtime as unknown as {
+      ensureLongHorizonTeamDecision: (
+        decision: Extract<DelegationDecision, { action: 'spawn_subagents' }>,
+        task: string,
+        requiresWorkspaceMutation: boolean,
+        correlationId: string
+      ) => Extract<DelegationDecision, { action: 'spawn_subagents' }>;
+    }).ensureLongHorizonTeamDecision;
+    const decision = normalize.call(runtime, {
+      action: 'spawn_subagents',
+      reason: 'Build and verify the pipeline.',
+      coordination: 'team',
+      agents: [
+        {
+          archetype: 'custom',
+          name: 'PipelineCoder',
+          role: 'implementation engineer',
+          task: 'Implement the data pipeline in the authoritative source tree.',
+          tools: ['fs.read', 'fs.replace', 'fs.write', 'shell.exec'],
+        },
+        {
+          archetype: 'tester',
+          name: 'PipelineTester',
+          role: 'acceptance verifier',
+          task: 'After PipelineCoder completes, run the pipeline and verify every artifact.',
+          tools: ['fs.read', 'shell.exec'],
+        },
+      ],
+      team: {
+        name: 'PipelineTeam',
+        description: 'Build and verify the pipeline.',
+        executionPolicy: {
+          mode: 'parallel',
+          maxConcurrency: 2,
+          minimumSuccessfulMembers: 1,
+        },
+      },
+    }, 'Implement the complete long-horizon workspace pipeline and verify it.', true, 'dependency-order-test');
+
+    expect(decision.agents.map(agent => agent.name)).toEqual([
+      'PathSteward-1',
+      'PipelineCoder',
+      'PipelineTester',
+    ]);
+    expect(decision.agents.filter(agent => agent.archetype === 'coder')).toHaveLength(0);
+    expect(decision.team?.executionPolicy).toMatchObject({
+      mode: 'sequential',
+      maxConcurrency: 1,
+    });
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'delegation.team.dependencies.normalized',
+      correlationId: 'dependency-order-test',
+    }));
+    await runtime.shutdown();
+  });
+
   it('rejects premature finalize when a long-horizon mutation path is still unverified', () => {
     const runtime = new Runtime();
     const ensureRecovery = (runtime as unknown as {

@@ -251,7 +251,7 @@ export class UnifiedAgent extends BaseAgent {
             }
           );
         } catch (error) {
-          const recoveredMutation = recoverTruncatedFsWriteResponse(
+          const recoveredMutation = recoverTruncatedWorkspaceMutationResponse(
             error,
             authorized,
             input.calls
@@ -272,7 +272,7 @@ export class UnifiedAgent extends BaseAgent {
                   'Request exactly one highest-value mutation call in this response; omit empty companion files.',
                   'Return complete file content or one complete focused replacement, up to 24000 characters.',
                   recoveredPrefix
-                    ? `The incomplete response began a write to ${String(recoveredPrefix.path)}. Reconstruct that file as one complete mutation instead of returning only a continuation. Its last recoverable prefix was:\n${String(recoveredPrefix.content ?? '').slice(-1200)}`
+                    ? `The incomplete response began a mutation to ${String(recoveredPrefix.path)}. Reconstruct that file as one complete mutation instead of returning only a continuation. Its last recoverable prefix was:\n${String(recoveredPrefix.content ?? recoveredPrefix.newText ?? '').slice(-1200)}`
                     : '',
                 ].join('\n'),
               },
@@ -1279,49 +1279,81 @@ function isRetryableToolPlanningResponseError(error: unknown): boolean {
     || message === 'Empty JSON response';
 }
 
-function recoverTruncatedFsWriteResponse(
+function recoverTruncatedWorkspaceMutationResponse(
   error: unknown,
   authorized: Set<string>,
   completed: ToolLoopCallRecord[]
 ): {
   action: 'call_tools';
   reason: string;
-  calls: Array<{ toolName: 'fs.write'; params: Record<string, unknown> }>;
+  calls: Array<{ toolName: 'fs.write' | 'fs.replace'; params: Record<string, unknown> }>;
 } | undefined {
-  if (!authorized.has('fs.write')) return undefined;
   const message = error instanceof Error ? error.message : String(error);
   const prefix = 'Failed to parse JSON response:';
   if (!message.startsWith(prefix)) return undefined;
   const raw = message.slice(prefix.length);
-  const writeIndices = [...raw.matchAll(/"toolName"\s*:\s*"fs\.write"/g)]
-    .map(match => match.index)
-    .filter((index): index is number => index !== undefined);
-  let filePath = '';
-  let contentField: { value: string; complete: boolean } | undefined;
-  for (const writeIndex of writeIndices) {
-    const writePayload = raw.slice(writeIndex);
-    const pathField = extractPartialJsonStringField(writePayload, 'path');
-    const candidateContent = extractPartialJsonStringField(writePayload, 'content');
-    const candidatePath = pathField?.value.trim() ?? '';
-    if (!candidatePath || !candidateContent || candidateContent.value.length < 32) continue;
-    filePath = candidatePath;
-    contentField = candidateContent;
+  const mutationMatches = [...raw.matchAll(/"toolName"\s*:\s*"(fs\.(?:write|replace))"/g)]
+    .map(match => ({ index: match.index, toolName: match[1] }))
+    .filter((item): item is { index: number; toolName: 'fs.write' | 'fs.replace' } =>
+      item.index !== undefined && (item.toolName === 'fs.write' || item.toolName === 'fs.replace')
+    );
+  let recovered: {
+    toolName: 'fs.write' | 'fs.replace';
+    filePath: string;
+    contentField: { value: string; complete: boolean };
+    payload: string;
+  } | undefined;
+  for (const mutation of mutationMatches) {
+    if (!authorized.has(mutation.toolName)) continue;
+    const payload = raw.slice(mutation.index);
+    const pathField = extractPartialJsonStringField(payload, 'path');
+    const contentField = extractPartialJsonStringField(
+      payload,
+      mutation.toolName === 'fs.write' ? 'content' : 'newText'
+    );
+    const filePath = pathField?.value.trim() ?? '';
+    if (!filePath || !contentField || contentField.value.length < 32) continue;
+    recovered = {
+      toolName: mutation.toolName,
+      filePath,
+      contentField,
+      payload,
+    };
     break;
   }
-  if (!filePath || !contentField) return undefined;
+  if (!recovered) return undefined;
 
-  let content = contentField.value.slice(0, 6_000);
-  if (!contentField.complete) {
+  let content = recovered.contentField.value.slice(0, 6_000);
+  if (!recovered.contentField.complete) {
     const lastNewline = content.lastIndexOf('\n');
     const completeLines = lastNewline >= 0 ? content.slice(0, lastNewline + 1) : '';
     if (completeLines.trim().length >= 16) content = completeLines;
   }
   if (content.trim().length < 16) return undefined;
 
+  if (recovered.toolName === 'fs.replace') {
+    const startLine = extractPartialJsonNumberField(recovered.payload, 'startLine');
+    const endLine = extractPartialJsonNumberField(recovered.payload, 'endLine');
+    if (!startLine || !endLine) return undefined;
+    return {
+      action: 'call_tools',
+      reason: 'Recovered a bounded source chunk from a truncated structured fs.replace response so generated implementation work is not discarded.',
+      calls: [{
+        toolName: 'fs.replace',
+        params: {
+          path: recovered.filePath,
+          startLine,
+          endLine,
+          newText: content,
+        },
+      }],
+    };
+  }
+
   const priorRecoveredChunk = [...completed].reverse().find(call =>
     call.toolName === 'fs.write'
     && call.success
-    && String(call.params.path ?? '') === filePath
+    && String(call.params.path ?? '') === recovered.filePath
     && call.reason?.includes('truncated structured fs.write')
   );
   const priorContent = String(priorRecoveredChunk?.params.content ?? '');
@@ -1336,13 +1368,20 @@ function recoverTruncatedFsWriteResponse(
     calls: [{
       toolName: 'fs.write',
       params: {
-        path: filePath,
+        path: recovered.filePath,
         content,
         mode,
         createDirectories: true,
       },
     }],
   };
+}
+
+function extractPartialJsonNumberField(input: string, field: string): number | undefined {
+  const match = new RegExp(`"${field}"\\s*:\\s*(\\d+)`).exec(input);
+  if (!match) return undefined;
+  const value = Number(match[1]);
+  return Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }
 
 function extractPartialJsonStringField(
