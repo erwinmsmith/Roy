@@ -88,7 +88,10 @@ class MutationRepairPlanningLLM extends PlanningLLM {
       return {
         action: 'call_tools',
         reason: 'Repeat the already failed verification.',
-        calls: [{ toolName: 'shell.exec', params: { command: 'pytest -q' } }],
+        calls: [{
+          toolName: 'shell.exec',
+          params: { command: 'pytest -q', timeoutMs: 60_000 },
+        }],
       } as T;
     }
     return {
@@ -130,6 +133,43 @@ class FragileWriterThenReplacePlanningLLM extends PlanningLLM {
           path: 'src/app.py',
           oldText: 'broken',
           newText: 'fixed',
+        },
+      }],
+    } as T;
+  }
+}
+
+class DestructiveRepairThenReplacePlanningLLM extends PlanningLLM {
+  constructor() {
+    super('none');
+  }
+
+  override async completeJSON<T>(): Promise<T> {
+    this.jsonCalls += 1;
+    if (this.jsonCalls === 1) {
+      return {
+        action: 'call_tools',
+        reason: 'Replace the entire existing source after one verifier failure.',
+        calls: [{
+          toolName: 'fs.write',
+          params: {
+            path: 'src/app.py',
+            content: 'full rewrite that discards working behavior',
+            mode: 'overwrite',
+          },
+        }],
+      } as T;
+    }
+    return {
+      action: 'call_tools',
+      reason: 'Preserve the implementation and repair only the reported line.',
+      calls: [{
+        toolName: 'fs.replace',
+        params: {
+          path: 'src/app.py',
+          oldText: 'broken assertion',
+          newText: 'fixed assertion',
+          expectedReplacements: 1,
         },
       }],
     } as T;
@@ -649,7 +689,7 @@ describe('UnifiedAgent capability execution', () => {
     expect(plans).toEqual([
       expect.objectContaining({
         toolName: 'shell.exec',
-        params: { command: 'pytest -q' },
+        params: expect.objectContaining({ command: 'pytest -q' }),
       }),
     ]);
   });
@@ -698,6 +738,67 @@ describe('UnifiedAgent capability execution', () => {
     ]);
   });
 
+  it('rejects destructive overwrites of existing files during verifier repair', async () => {
+    const llm = new DestructiveRepairThenReplacePlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'focused-verifier-repair-agent',
+      goal: 'repair without regressing working behavior',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.read', 'fs.replace', 'fs.write', 'shell.exec'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: 'Repair src/app.py and run the official tests.',
+      executionRequired: true,
+      round: 4,
+      remainingCalls: 3,
+      tools: [
+        { name: 'fs.read' },
+        { name: 'fs.replace' },
+        { name: 'fs.write' },
+        { name: 'shell.exec' },
+      ],
+      calls: [
+        {
+          toolName: 'fs.write',
+          params: { path: 'src/app.py', content: 'working base', mode: 'overwrite' },
+          reason: 'Initial implementation.',
+          groundingRequired: true,
+          success: true,
+        },
+        {
+          toolName: 'shell.exec',
+          params: { command: 'pytest -q /tests/test_outputs.py' },
+          reason: 'Run official verifier.',
+          groundingRequired: true,
+          success: false,
+          error: 'line 52: broken assertion',
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/app.py', startLine: 45, endLine: 60 },
+          reason: 'Inspect failing source.',
+          groundingRequired: true,
+          success: true,
+          result: { content: 'broken assertion' },
+        },
+      ],
+    });
+
+    expect(llm.jsonCalls).toBe(2);
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.replace',
+        params: expect.objectContaining({
+          path: 'src/app.py',
+          oldText: 'broken assertion',
+          newText: 'fixed assertion',
+        }),
+      }),
+    ]);
+  });
+
   it('compacts long tool-planning tasks and propagates the planning deadline', async () => {
     const llm = new CapturingToolPlanningLLM();
     const agent = new UnifiedAgent({
@@ -718,7 +819,9 @@ describe('UnifiedAgent capability execution', () => {
       calls: [],
     });
 
-    const userPrompt = llm.messages.findLast(message => message.role === 'user')?.content ?? '';
+    const userPrompt = llm.messages.find(message =>
+      message.role === 'user' && message.content.includes('Tool observations:')
+    )?.content ?? '';
     expect(userPrompt).toContain('TASK_HEAD');
     expect(userPrompt).toContain('TASK_TAIL');
     expect(userPrompt).toContain('[runtime_compacted_middle_for_tool_planning]');
@@ -759,11 +862,66 @@ describe('UnifiedAgent capability execution', () => {
       calls,
     });
 
-    const userPrompt = llm.messages.findLast(message => message.role === 'user')?.content ?? '';
+    const userPrompt = llm.messages.find(message =>
+      message.role === 'user' && message.content.includes('Tool observations:')
+    )?.content ?? '';
     expect(userPrompt).toContain('TASK_HEAD');
     expect(userPrompt).toContain('LATEST_FAILURE');
     expect(userPrompt).toContain('earlier chars compacted');
     expect(userPrompt.length).toBeLessThan(38_000);
+  });
+
+  it('retains the newest failed verifier frontier after a later source read', async () => {
+    const llm = new CapturingToolPlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'causal-verifier-planner',
+      goal: 'repair from the official verifier failure',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.read', 'fs.replace', 'shell.exec'],
+    });
+    const verifierTail = `FAILED hidden dataset\n${'diagnostic-context-'.repeat(120)}`;
+
+    await agent.planNextToolRound({
+      task: 'Repair src/app.py and run the official tests.',
+      round: 3,
+      remainingCalls: 2,
+      tools: [{ name: 'fs.read' }, { name: 'fs.replace' }, { name: 'shell.exec' }],
+      calls: [
+        {
+          toolName: 'fs.replace',
+          params: { path: 'src/app.py', oldText: 'broken', newText: 'almost fixed' },
+          reason: 'Apply an initial repair.',
+          groundingRequired: true,
+          success: true,
+        },
+        {
+          toolName: 'shell.exec',
+          params: { command: 'pytest -q /tests/test_outputs.py' },
+          reason: 'Run the official verifier.',
+          groundingRequired: true,
+          success: false,
+          error: verifierTail,
+          result: { stderr: verifierTail, exitCode: 1 },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/app.py', startLine: 40, endLine: 70 },
+          reason: 'Inspect the reported source location.',
+          groundingRequired: true,
+          success: true,
+          result: { content: 'almost fixed' },
+        },
+      ],
+    });
+
+    const userPrompt = llm.messages.find(message =>
+      message.role === 'user' && message.content.includes('Tool observations:')
+    )?.content ?? '';
+    expect(userPrompt).toContain('FAILED hidden dataset');
+    expect(userPrompt).toContain('diagnostic-context-diagnostic-context');
+    expect(userPrompt).toContain('"latestVerificationFailed":true');
+    expect(userPrompt).toContain('"inspectedAfterLatestFailure":true');
   });
 
   it('classifies a tool-planning request timeout for runtime telemetry', async () => {

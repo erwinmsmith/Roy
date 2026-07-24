@@ -11,6 +11,23 @@ export interface ParallelSourceMutation {
   packageName: string;
 }
 
+export function workspaceToolIntentFingerprint(
+  call: Pick<ExecutionIntentCall, 'toolName' | 'params'>
+): string {
+  const params = { ...call.params };
+  if (call.toolName === 'shell.exec') {
+    delete params.timeoutMs;
+    if (typeof params.command === 'string') params.command = params.command.trim();
+  }
+  if (call.toolName === 'fs.read' || call.toolName === 'fs.list' || call.toolName === 'fs.search') {
+    params.path = normalizeWorkspaceRelativePath(String(params.path ?? '.')) || '.';
+  }
+  const sortedParams = Object.fromEntries(
+    Object.entries(params).sort(([left], [right]) => left.localeCompare(right))
+  );
+  return `${call.toolName}:${JSON.stringify(sortedParams)}`;
+}
+
 const NULL_OUTPUT_TARGETS = new Set([
   '/dev/null',
   '/dev/stdout',

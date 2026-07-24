@@ -71,6 +71,16 @@ describe('Runtime external wall-clock deadline', () => {
       skip: true,
       reason: 'cached_failed_verification_without_later_mutation',
     });
+    expect(runtime.cachedToolPlanDecision({
+      ...verification,
+      params: { command: 'pytest -q', timeoutMs: 60_000 },
+    }, [{
+      ...failed,
+      params: { command: 'pytest -q', timeoutMs: 30_000 },
+    }])).toMatchObject({
+      skip: true,
+      reason: 'cached_failed_verification_without_later_mutation',
+    });
     expect(runtime.cachedToolPlanDecision(verification, [
       failed,
       {

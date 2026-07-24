@@ -22,6 +22,7 @@ export {
   isSuccessfulWorkspaceVerificationCall,
   isWorkspaceVerificationCall,
   taskRequestsWorkspaceMutation,
+  workspaceToolIntentFingerprint,
 } from './executionIntent.js';
 export { ToolApprovalManager } from './approval.js';
 export type { Tool, ToolConfig, ToolResult, ToolMetadata } from './types.js';

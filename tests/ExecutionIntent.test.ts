@@ -4,6 +4,7 @@ import {
   isSuccessfulWorkspaceMutationCall,
   isSuccessfulWorkspaceVerificationCall,
   taskRequestsWorkspaceMutation,
+  workspaceToolIntentFingerprint,
 } from '../src/core/tools/executionIntent.js';
 
 describe('workspace execution intent', () => {
@@ -93,6 +94,30 @@ describe('workspace execution intent', () => {
       success: true,
       result: { exitCode: 0, stdout: '12 passed' },
     })).toBe(true);
+  });
+
+  it('canonicalizes execution controls without conflating output contracts', () => {
+    expect(workspaceToolIntentFingerprint({
+      toolName: 'shell.exec',
+      params: { command: ' pytest -q ', timeoutMs: 30_000 },
+    })).toBe(workspaceToolIntentFingerprint({
+      toolName: 'shell.exec',
+      params: { command: 'pytest -q', timeoutMs: 60_000 },
+    }));
+    expect(workspaceToolIntentFingerprint({
+      toolName: 'shell.exec',
+      params: { command: 'pytest -q', maxOutputBytes: 5_000 },
+    })).not.toBe(workspaceToolIntentFingerprint({
+      toolName: 'shell.exec',
+      params: { command: 'pytest -q' },
+    }));
+    expect(workspaceToolIntentFingerprint({
+      toolName: 'fs.list',
+      params: { maxDepth: 3 },
+    })).toBe(workspaceToolIntentFingerprint({
+      toolName: 'fs.list',
+      params: { path: '.', maxDepth: 3 },
+    }));
   });
 
   it('distinguishes mutation tasks from explicitly read-only work', () => {

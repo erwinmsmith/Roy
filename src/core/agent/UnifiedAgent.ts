@@ -22,7 +22,9 @@ import type { ToolLoopCallRecord } from '../tools/executionLoop.js';
 import {
   isSuccessfulWorkspaceMutationCall as isSuccessfulWorkspaceMutation,
   isSuccessfulWorkspaceVerificationCall as isSuccessfulWorkspaceVerification,
+  isWorkspaceVerificationCall,
   taskRequestsWorkspaceMutation as requestsWorkspaceMutation,
+  workspaceToolIntentFingerprint,
 } from '../tools/executionIntent.js';
 
 export type AgentMode = 'conversational' | 'action' | 'hybrid';
@@ -99,7 +101,24 @@ export class UnifiedAgent extends BaseAgent {
     const executionRequired = (input.executionRequired ?? requestsWorkspaceMutation(input.task))
       && (authorized.has('fs.write') || authorized.has('fs.replace') || authorized.has('shell.exec'));
     const mutationApplied = input.calls.some(call => isSuccessfulWorkspaceMutation(call));
-    const verificationRan = input.calls.some(call => isSuccessfulWorkspaceVerification(call));
+    const lastMutationIndex = findLastToolCallIndex(input.calls, call =>
+      isSuccessfulWorkspaceMutation(call)
+    );
+    const lastVerificationIndex = findLastToolCallIndex(input.calls, call =>
+      isWorkspaceVerificationCall(call)
+    );
+    const verificationAttempted = lastVerificationIndex >= 0;
+    const verificationPassed = lastVerificationIndex > lastMutationIndex
+      && isSuccessfulWorkspaceVerification(input.calls[lastVerificationIndex]!);
+    const latestVerificationFailed = lastVerificationIndex > lastMutationIndex
+      && !isSuccessfulWorkspaceVerification(input.calls[lastVerificationIndex]!);
+    const inspectedAfterLatestFailure = latestVerificationFailed
+      && input.calls.slice(lastVerificationIndex + 1).some(call =>
+        call.success && (
+          call.toolName === 'fs.read'
+          || call.toolName === 'fs.search'
+        )
+      );
     const successfulInspection = input.calls.some(call =>
       call.success && (
         call.toolName === 'fs.list'
@@ -108,16 +127,31 @@ export class UnifiedAgent extends BaseAgent {
       )
     );
     const recentCalls = input.calls.slice(-8);
+    const detailedObservationIndices = new Set<number>([recentCalls.length - 1]);
+    for (let index = recentCalls.length - 1; index >= 0; index -= 1) {
+      const call = recentCalls[index]!;
+      if (isWorkspaceVerificationCall(call)
+        && !isSuccessfulWorkspaceVerification(call)) {
+        detailedObservationIndices.add(index);
+        break;
+      }
+    }
+    for (let index = recentCalls.length - 1; index >= 0; index -= 1) {
+      if (isSuccessfulWorkspaceMutation(recentCalls[index]!)) {
+        detailedObservationIndices.add(index);
+        break;
+      }
+    }
     const observations = recentCalls.map((call, index) => {
-      const latest = index === recentCalls.length - 1;
+      const detailed = detailedObservationIndices.has(index);
       return {
         toolName: call.toolName,
-        params: compactToolPlanningParams(call.params, latest),
+        params: compactToolPlanningParams(call.params, detailed),
         success: call.success,
         error: call.error
-          ? compactTail(String(call.error), latest ? 800 : 400)
+          ? compactTail(String(call.error), detailed ? 3_000 : 400)
           : undefined,
-        result: compactToolObservation(call.result, call.toolName, latest),
+        result: compactToolObservation(call.result, call.toolName, detailed),
       };
     });
     const messages: LLMMessage[] = [
@@ -135,8 +169,13 @@ export class UnifiedAgent extends BaseAgent {
               ? 'The workspace layout has been grounded. Request fs.replace, fs.write, or a mutating shell.exec call that advances the actual task.'
               : 'No authoritative workspace inspection has succeeded yet. Recover failed paths with fs.list, fs.read, or fs.search before requesting a mutation.'
             : '',
-          executionRequired && mutationApplied && !verificationRan
-            ? 'At least one workspace mutation succeeded, but that does not prove the full implementation is complete. Continue any remaining edits or repairs, then request a relevant test, build, lint, typecheck, or targeted assertion.'
+          executionRequired && latestVerificationFailed
+            ? inspectedAfterLatestFailure
+              ? 'The newest verification failed after the latest mutation, and relevant source evidence has already been inspected. Apply a focused repair now; do not rerun verification or broaden inspection before changing the workspace.'
+              : 'The newest verification failed after the latest mutation. Preserve its detailed causal frontier and inspect only the reported source location before applying a focused repair.'
+            : '',
+          executionRequired && mutationApplied && !verificationPassed && !latestVerificationFailed
+            ? 'At least one workspace mutation succeeded, but no verification has passed. Continue any remaining edits or repairs, then request a relevant test, build, lint, typecheck, or targeted assertion.'
             : '',
           'When verification fails, use its output to repair the workspace before retrying. Never hide a failing exit status with `|| true`, `; true`, `|| :`, or equivalent shell constructs.',
           'Before creating or replacing a module, use observed package metadata and directory layout to identify the authoritative source root. Never create a parallel top-level package when the project installs from src/, lib/, packages/, or another configured source directory.',
@@ -158,7 +197,10 @@ export class UnifiedAgent extends BaseAgent {
             executionRequired,
             successfulInspection,
             mutationApplied,
-            verificationRan,
+            verificationAttempted,
+            verificationPassed,
+            latestVerificationFailed,
+            inspectedAfterLatestFailure,
           })}`,
           `Authorized tools:\n${JSON.stringify(input.tools, null, 2)}`,
           `Tool observations:\n${JSON.stringify(observations, null, 2)}`,
@@ -179,6 +221,7 @@ export class UnifiedAgent extends BaseAgent {
         : Date.now() + Math.max(1, input.requestTimeoutMs);
       const maxPlanningAttempts = executionRequired ? 3 : 1;
       for (let attempt = 0; attempt < maxPlanningAttempts; attempt += 1) {
+        let rejectedDestructiveRepairOverwrite = false;
         const remainingPlanningMs = planningDeadline === undefined
           ? undefined
           : Math.max(0, planningDeadline - Date.now());
@@ -230,22 +273,38 @@ export class UnifiedAgent extends BaseAgent {
           input.remainingCalls,
           input.round
         ).filter(call => !shouldSuppressRepeatedPlannedCall(call, input.calls));
+        if (latestVerificationFailed && inspectedAfterLatestFailure) {
+          rejectedDestructiveRepairOverwrite = plannedCalls.some(call =>
+            isDestructiveRepairOverwrite(call, input.calls)
+          );
+          plannedCalls = plannedCalls.filter(call =>
+            !isDestructiveRepairOverwrite(call, input.calls)
+          );
+        }
         const plannedInspection = plannedCalls.some(call =>
           call.toolName === 'fs.list'
           || call.toolName === 'fs.read'
           || call.toolName === 'fs.search'
         );
         const advancesExecution = !executionRequired
-          || (mutationApplied
-            ? verificationRan || plannedCalls.some(call =>
-              isSuccessfulWorkspaceMutation({ ...call, success: true })
-              || isSuccessfulWorkspaceVerification({ ...call, success: true })
-            )
-            : ((!successfulInspection && plannedInspection)
-              || plannedCalls.some(call => isSuccessfulWorkspaceMutation({
-                ...call,
-                success: true,
-              }))));
+          || (latestVerificationFailed
+            ? inspectedAfterLatestFailure
+              ? plannedCalls.some(call =>
+                isSuccessfulWorkspaceMutation({ ...call, success: true })
+              )
+              : plannedInspection || plannedCalls.some(call =>
+                isSuccessfulWorkspaceMutation({ ...call, success: true })
+              )
+            : mutationApplied
+              ? verificationPassed || plannedCalls.some(call =>
+                isSuccessfulWorkspaceMutation({ ...call, success: true })
+                || isSuccessfulWorkspaceVerification({ ...call, success: true })
+              )
+              : ((!successfulInspection && plannedInspection)
+                || plannedCalls.some(call => isSuccessfulWorkspaceMutation({
+                  ...call,
+                  success: true,
+                }))));
         if (advancesExecution) break;
         planningMessages = [
           ...planningMessages,
@@ -259,7 +318,12 @@ export class UnifiedAgent extends BaseAgent {
                   ? 'The workspace is already grounded. Request a concrete fs.replace, fs.write, or mutating shell.exec call now.'
                   : 'The previous inspection failed or was absent. Request a corrected fs.list, fs.read, or fs.search call before mutating.'
                 : '',
-              mutationApplied && !verificationRan
+              latestVerificationFailed && inspectedAfterLatestFailure
+                ? rejectedDestructiveRepairOverwrite
+                  ? 'The latest verifier failure concerns an existing file. Preserve working code: use fs.replace for a focused repair instead of overwriting that file, then verify.'
+                  : 'The latest verifier failure and its relevant source evidence are already grounded. Request a concrete fs.replace, fs.write for a new file, or mutating shell.exec repair before any further verification.'
+                : '',
+              mutationApplied && !verificationPassed && !latestVerificationFailed
                 ? 'Finish, read-only, masked-failure, and repeated plans are insufficient. Request a concrete remaining edit or repair, or a distinct verification command whose exit status is preserved.'
                 : '',
               'Return the required call_tools JSON. Do not ask for permission.',
@@ -273,16 +337,24 @@ export class UnifiedAgent extends BaseAgent {
           || call.toolName === 'fs.read'
           || call.toolName === 'fs.search'
         );
-        const advancesExecution = mutationApplied
-          ? verificationRan || plannedCalls.some(call =>
-            isSuccessfulWorkspaceMutation({ ...call, success: true })
-            || isSuccessfulWorkspaceVerification({ ...call, success: true })
-          )
-          : ((!successfulInspection && plannedInspection)
-            || plannedCalls.some(call => isSuccessfulWorkspaceMutation({
-              ...call,
-              success: true,
-            })));
+        const advancesExecution = latestVerificationFailed
+          ? inspectedAfterLatestFailure
+            ? plannedCalls.some(call =>
+              isSuccessfulWorkspaceMutation({ ...call, success: true })
+            )
+            : plannedInspection || plannedCalls.some(call =>
+              isSuccessfulWorkspaceMutation({ ...call, success: true })
+            )
+          : mutationApplied
+            ? verificationPassed || plannedCalls.some(call =>
+              isSuccessfulWorkspaceMutation({ ...call, success: true })
+              || isSuccessfulWorkspaceVerification({ ...call, success: true })
+            )
+            : ((!successfulInspection && plannedInspection)
+              || plannedCalls.some(call => isSuccessfulWorkspaceMutation({
+                ...call,
+                success: true,
+              })));
         if (!advancesExecution) return [];
       }
       return plannedCalls;
@@ -1011,6 +1083,41 @@ function normalizePlannedToolCalls(
     }));
 }
 
+function findLastToolCallIndex(
+  calls: ToolLoopCallRecord[],
+  predicate: (call: ToolLoopCallRecord) => boolean
+): number {
+  for (let index = calls.length - 1; index >= 0; index -= 1) {
+    if (predicate(calls[index]!)) return index;
+  }
+  return -1;
+}
+
+function isDestructiveRepairOverwrite(
+  planned: PlannedToolCall,
+  completed: ToolLoopCallRecord[]
+): boolean {
+  if (planned.toolName !== 'fs.write'
+    || String(planned.params.mode ?? 'overwrite') !== 'overwrite') {
+    return false;
+  }
+  const target = normalizePlannedWorkspacePath(String(planned.params.path ?? ''));
+  if (!target) return false;
+  return completed.some(call => {
+    if (!call.success
+      || (call.toolName !== 'fs.read'
+        && call.toolName !== 'fs.write'
+        && call.toolName !== 'fs.replace')) {
+      return false;
+    }
+    return normalizePlannedWorkspacePath(String(call.params.path ?? '')) === target;
+  });
+}
+
+function normalizePlannedWorkspacePath(value: string): string {
+  return value.trim().replace(/\\/g, '/').replace(/^(?:\.\/)+/, '').replace(/\/+/g, '/');
+}
+
 function isFragileShellFileWriter(
   call: { toolName?: unknown; params?: unknown },
   authorized: Set<string>
@@ -1052,10 +1159,10 @@ function shouldSuppressRepeatedPlannedCall(
 function plannedToolCallFingerprint(
   call: Pick<PlannedToolCall, 'toolName' | 'params'>
 ): string {
-  const sortedParams = Object.fromEntries(
-    Object.entries(call.params).sort(([left], [right]) => left.localeCompare(right))
-  );
-  return `${call.toolName}:${JSON.stringify(sortedParams)}`;
+  return workspaceToolIntentFingerprint({
+    toolName: call.toolName,
+    params: call.params,
+  });
 }
 
 function isRetryableToolPlanningResponseError(error: unknown): boolean {

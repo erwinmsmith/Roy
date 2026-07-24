@@ -53,6 +53,7 @@ import {
   isWorkspaceVerificationCall,
   ShellExecTool,
   taskRequestsWorkspaceMutation,
+  workspaceToolIntentFingerprint,
   WebFetchTool,
   WebSearchTool,
   registerCoreTools,
@@ -13789,7 +13790,10 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       const query = String(plan.params.query ?? '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
       return `${plan.toolName}:${query}`;
     }
-    return `${plan.toolName}:${JSON.stringify(plan.params, Object.keys(plan.params).sort())}`;
+    return workspaceToolIntentFingerprint({
+      toolName: plan.toolName,
+      params: plan.params,
+    });
   }
 
   private cachedToolPlanDecision(
