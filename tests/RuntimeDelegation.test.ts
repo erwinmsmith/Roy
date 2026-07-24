@@ -661,4 +661,30 @@ describe('Runtime root-controlled delegation', () => {
 
     await runtime.shutdown();
   });
+
+  it('removes requested web tools from local workspace agent tasks', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-local-tool-routing-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'local-tool-routing-test',
+      workspaceCwd,
+      fsmEnabled: true,
+      llmProvider: new RootDelegationLLM(),
+    });
+    const bindings = (runtime as unknown as {
+      getAutomaticallyApprovedToolBindings: (
+        archetype: string,
+        task: string,
+        requestedTools: string[]
+      ) => Array<{ name: string }>;
+    }).getAutomaticallyApprovedToolBindings(
+      'custom',
+      'Read /app/src/dq_audit/audit.py and inspect the local verifier.',
+      ['web.search', 'web.fetch', 'fs.read']
+    );
+
+    expect(bindings.map(binding => binding.name)).toEqual(['fs.read']);
+
+    await runtime.shutdown();
+  });
 });

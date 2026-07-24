@@ -3319,6 +3319,9 @@ export class Runtime {
     const bindings = task ? this.getToolBindingsForTask(archetype, task) : this.getDefaultToolBindings(archetype);
     const names = new Set(bindings.map(binding => binding.name));
     for (const name of requestedTools) {
+      if (name.startsWith('web.') && (!task || !this.taskNeedsWebAccess(task))) {
+        continue;
+      }
       if (!names.has(name) && toolRegistry.has(name)) {
         bindings.push(this.createToolBinding(name));
         names.add(name);
@@ -9489,7 +9492,11 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     const archetype = String(plan.archetype) as SubAgentArchetype;
     const task = typeof plan.task === 'string' && plan.task.trim() ? plan.task.trim() : fallbackTask;
     const requestedTools = Array.isArray(plan.tools)
-      ? plan.tools.filter((tool): tool is string => typeof tool === 'string' && toolRegistry.has(tool))
+      ? plan.tools.filter((tool): tool is string =>
+          typeof tool === 'string'
+          && toolRegistry.has(tool)
+          && (!tool.startsWith('web.') || this.taskNeedsWebAccess(task))
+        )
       : [];
     const inferredTools = this.inferMinimumTaskTools(task);
     const tools = Array.from(new Set([...requestedTools, ...inferredTools]));
@@ -13338,12 +13345,14 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       onBeforeExecution?: (plans: PlannedToolCall[]) => Promise<void>;
     }
   ): Promise<GroundingRunResult> {
+    const intentTask = options.intentTask ?? task;
+    const webToolsRequired = this.taskNeedsWebAccess(intentTask);
     const allowedTools = options.toolAllowlist
       ? new Set(options.toolAllowlist)
       : undefined;
     const bindings = (this.agentBindings.get(agentId)?.tools ?? [])
-      .filter(binding => !allowedTools || allowedTools.has(binding.name));
-    const intentTask = options.intentTask ?? task;
+      .filter(binding => !allowedTools || allowedTools.has(binding.name))
+      .filter(binding => webToolsRequired || !binding.name.startsWith('web.'));
     const inspectionRoot = this.resolveInspectionRoot(intentTask);
     const groundingRequired = this.agentRestoreSpecs.get(agentId)?.outputContract?.groundingRequired
       ?? this.taskRequiresGrounding(options.archetype ?? 'custom', intentTask);
