@@ -273,13 +273,28 @@ export class UnifiedAgent extends BaseAgent {
           input.remainingCalls,
           input.round
         ).filter(call => !shouldSuppressRepeatedPlannedCall(call, input.calls));
-        if (latestVerificationFailed && inspectedAfterLatestFailure) {
-          rejectedDestructiveRepairOverwrite = plannedCalls.some(call =>
-            isDestructiveRepairOverwrite(call, input.calls)
-          );
-          plannedCalls = plannedCalls.filter(call =>
-            !isDestructiveRepairOverwrite(call, input.calls)
-          );
+        if (latestVerificationFailed) {
+          if (inspectedAfterLatestFailure) {
+            rejectedDestructiveRepairOverwrite = plannedCalls.some(call =>
+              isDestructiveRepairOverwrite(call, input.calls)
+            );
+            plannedCalls = plannedCalls.filter(call =>
+              isSuccessfulWorkspaceMutation({ ...call, success: true })
+              && !isDestructiveRepairOverwrite(call, input.calls)
+            );
+          } else {
+            const directRepair = plannedCalls.find(call =>
+              isSuccessfulWorkspaceMutation({ ...call, success: true })
+            );
+            const targetedInspection = plannedCalls.find(call =>
+              call.toolName === 'fs.read' || call.toolName === 'fs.search'
+            );
+            plannedCalls = directRepair
+              ? [directRepair]
+              : targetedInspection
+                ? [targetedInspection]
+                : [];
+          }
         }
         const plannedInspection = plannedCalls.some(call =>
           call.toolName === 'fs.list'

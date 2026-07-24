@@ -176,6 +176,34 @@ class DestructiveRepairThenReplacePlanningLLM extends PlanningLLM {
   }
 }
 
+class NoisyFailureInspectionPlanningLLM extends PlanningLLM {
+  constructor() {
+    super('none');
+  }
+
+  override async completeJSON<T>(): Promise<T> {
+    this.jsonCalls += 1;
+    return {
+      action: 'call_tools',
+      reason: 'Inspect the reported line and several unrelated paths.',
+      calls: [
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/app.py', startLine: 40, endLine: 70 },
+        },
+        {
+          toolName: 'shell.exec',
+          params: { command: 'head -20 unrelated.csv' },
+        },
+        {
+          toolName: 'fs.list',
+          params: { path: '.', maxDepth: 5 },
+        },
+      ],
+    } as T;
+  }
+}
+
 class EchoTool implements Tool {
   readonly name = 'echo-tool';
   readonly description = 'Echoes a value';
@@ -795,6 +823,59 @@ describe('UnifiedAgent capability execution', () => {
           oldText: 'broken assertion',
           newText: 'fixed assertion',
         }),
+      }),
+    ]);
+  });
+
+  it('executes only one targeted inspection after a verifier failure', async () => {
+    const llm = new NoisyFailureInspectionPlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'targeted-verifier-inspection-agent',
+      goal: 'inspect only the causal failure location',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.list', 'fs.read', 'fs.replace', 'shell.exec'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: 'Repair src/app.py and run the official tests.',
+      executionRequired: true,
+      round: 3,
+      remainingCalls: 3,
+      tools: [
+        { name: 'fs.list' },
+        { name: 'fs.read' },
+        { name: 'fs.replace' },
+        { name: 'shell.exec' },
+      ],
+      calls: [
+        {
+          toolName: 'fs.replace',
+          params: { path: 'src/app.py', oldText: 'broken', newText: 'almost fixed' },
+          reason: 'Apply initial repair.',
+          groundingRequired: true,
+          success: true,
+        },
+        {
+          toolName: 'shell.exec',
+          params: { command: 'pytest -q /tests/test_outputs.py' },
+          reason: 'Run official verifier.',
+          groundingRequired: true,
+          success: false,
+          error: 'src/app.py:52 assertion failed',
+        },
+      ],
+    });
+
+    expect(llm.jsonCalls).toBe(1);
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.read',
+        params: {
+          path: 'src/app.py',
+          startLine: 40,
+          endLine: 70,
+        },
       }),
     ]);
   });
