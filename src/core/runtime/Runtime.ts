@@ -8259,6 +8259,7 @@ export class Runtime {
           role: 'system',
           content: `You are Roy's dynamic root-step controller.
 Reassess the original task after completed execution steps. The execution tree may grow only when the current evidence exposes a concrete unresolved gap.
+Return exactly one strict JSON object and no surrounding prose.
 Choose exactly one action:
 {"action":"finalize","reason":"..."}
 {"action":"ask_clarification","reason":"...","question":"..."}

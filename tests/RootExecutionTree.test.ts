@@ -301,6 +301,7 @@ describe('Root dynamic execution tree', () => {
     expect(llm.continuationPrompt).toContain('<execution_knowledge>');
     expect(llm.continuationPrompt).toContain('<acceptance_checklist>');
     expect(llm.continuationPrompt).toContain('LongHorizonCheckpointTeam');
+    expect(llm.continuationPrompt).toContain('strict JSON object');
 
     const executionKnowledge = JSON.parse(
       await readFile(path.join(workspaceCwd, '.roy', 'cache', 'execution-knowledge.json'), 'utf8')
