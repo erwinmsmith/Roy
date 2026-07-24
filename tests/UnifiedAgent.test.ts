@@ -277,6 +277,27 @@ class CapturingToolPlanningLLM extends PlanningLLM {
   }
 }
 
+class WrongRepairTargetPlanningLLM extends PlanningLLM {
+  constructor() {
+    super('none');
+  }
+
+  override async completeJSON<T>(): Promise<T> {
+    this.jsonCalls += 1;
+    return {
+      action: 'call_tools',
+      reason: 'Repair the implementation after the failed command.',
+      calls: [{
+        toolName: 'fs.synthesize',
+        params: {
+          path: 'src/dq_audit/cli.py',
+          instructions: 'Repair the latest grounded failure.',
+        },
+      }],
+    } as T;
+  }
+}
+
 class TruncatedMutationPlanningLLM extends PlanningLLM {
   messagesByAttempt: LLMMessage[][] = [];
   optionsByAttempt: Array<LLMCompletionOptions | undefined> = [];
@@ -1536,5 +1557,136 @@ describe('UnifiedAgent capability execution', () => {
       },
     })]);
     expect(JSON.stringify(plans)).not.toContain('def run');
+  });
+
+  it('binds a synthesized repair to the failed observed stub instead of a working wrapper', async () => {
+    const llm = new WrongRepairTargetPlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'causal-repair-target-agent',
+      goal: 'repair the actual failed source location',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.read', 'fs.synthesize', 'shell.exec'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: 'Run both supported entry points and repair the implementation.',
+      executionRequired: true,
+      round: 4,
+      remainingCalls: 3,
+      tools: [
+        { name: 'fs.read' },
+        { name: 'fs.synthesize' },
+        { name: 'shell.exec' },
+      ],
+      calls: [
+        {
+          toolName: 'shell.exec',
+          params: { command: 'python experiments/run_suite.py' },
+          reason: 'Verify the secondary entry point.',
+          groundingRequired: true,
+          success: false,
+          error: [
+            'Traceback (most recent call last):',
+            '  File "/app/src/dq_audit/audit.py", line 7, in run_audit',
+            '    raise NotImplementedError("Build the pipeline.")',
+          ].join('\n'),
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/dq_audit/audit.py' },
+          reason: 'Inspect the reported source.',
+          groundingRequired: true,
+          success: true,
+          result: {
+            path: 'src/dq_audit/audit.py',
+            content: 'def run_audit():\n    raise NotImplementedError("Build the pipeline.")\n',
+          },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/dq_audit/cli.py' },
+          reason: 'Inspect the working wrapper.',
+          groundingRequired: true,
+          success: true,
+          result: {
+            path: 'src/dq_audit/cli.py',
+            content: 'from .audit import run_audit\n',
+          },
+        },
+      ],
+    });
+
+    expect(plans).toEqual([expect.objectContaining({
+      toolName: 'fs.synthesize',
+      params: {
+        path: 'src/dq_audit/audit.py',
+        instructions: 'Repair the latest grounded failure.',
+      },
+    })]);
+  });
+
+  it('reruns the most recent authoritative verification after a repair', async () => {
+    const llm = new CapturingToolPlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'post-repair-verification-agent',
+      goal: 'close repair loops with current verification evidence',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.read', 'fs.synthesize', 'shell.exec'],
+    });
+
+    const verifierParams = {
+      command: 'python -m pytest -q .roy/official-verifier/test_outputs.py',
+      timeoutMs: 60_000,
+      maxOutputBytes: 20_000,
+    };
+    const plans = await agent.planNextToolRound({
+      task: 'Repair the pipeline and continue until the official verifier passes.',
+      executionRequired: true,
+      round: 6,
+      remainingCalls: 2,
+      tools: [
+        { name: 'fs.read' },
+        { name: 'fs.synthesize' },
+        { name: 'shell.exec' },
+      ],
+      calls: [
+        {
+          toolName: 'shell.exec',
+          params: verifierParams,
+          reason: 'Run the authoritative verifier.',
+          groundingRequired: true,
+          success: false,
+          error: '1 failed',
+          result: { exitCode: 1, stderr: 'KeyError: amount_cents' },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/dq_audit/audit.py' },
+          reason: 'Inspect the failed implementation.',
+          groundingRequired: true,
+          success: true,
+          result: { path: 'src/dq_audit/audit.py', content: 'row["amount_cents"]' },
+        },
+        {
+          toolName: 'fs.synthesize',
+          params: {
+            path: 'src/dq_audit/audit.py',
+            instructions: 'Repair the reported schema mismatch.',
+          },
+          reason: 'Apply the grounded repair.',
+          groundingRequired: true,
+          success: true,
+          result: { path: 'src/dq_audit/audit.py', bytes: 12_000 },
+        },
+      ],
+    });
+
+    expect(plans).toEqual([expect.objectContaining({
+      toolName: 'shell.exec',
+      params: verifierParams,
+      reason: expect.stringContaining('most recent authoritative verification'),
+    })]);
   });
 });

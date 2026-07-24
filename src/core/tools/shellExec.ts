@@ -50,6 +50,7 @@ const COMMAND_POLICIES: CommandPolicy[] = [
 const DEFAULT_TIMEOUT_MS = 10_000;
 const MAX_TIMEOUT_MS = 60_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 40_000;
+const MIN_PROCESS_CAPTURE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_CONFIG: ShellExecConfig = {
   mode: 'allowlist',
   workspaceRoot: process.cwd(),
@@ -126,13 +127,14 @@ export class ShellExecTool implements Tool {
 
     const timeoutMs = Math.min(Number(params.timeoutMs ?? this.config.defaultTimeoutMs), this.config.maxTimeoutMs);
     const maxOutputBytes = Number(params.maxOutputBytes ?? this.config.defaultMaxOutputBytes);
+    const processCaptureBytes = Math.max(maxOutputBytes * 2, MIN_PROCESS_CAPTURE_BYTES);
 
     try {
       if (this.config.mode === 'unrestricted') {
         const output = await execAsync(command, {
           cwd,
           timeout: timeoutMs,
-          maxBuffer: Math.max(maxOutputBytes * 2, 1024),
+          maxBuffer: processCaptureBytes,
           windowsHide: true,
           shell: this.config.shell,
         });
@@ -168,7 +170,7 @@ export class ShellExecTool implements Tool {
       const output = await execFileAsync(executable, args, {
         cwd,
         timeout: timeoutMs,
-        maxBuffer: Math.max(maxOutputBytes * 2, 1024),
+        maxBuffer: processCaptureBytes,
         windowsHide: true,
       });
       return {
@@ -229,8 +231,8 @@ export class ShellExecTool implements Tool {
       executable,
       args,
       cwd,
-      stdout: this.truncate(this.outputToString(stdout), maxOutputBytes),
-      stderr: this.truncate(this.outputToString(stderr), maxOutputBytes),
+      stdout: this.truncate(this.outputToString(stdout), maxOutputBytes, exitCode !== 0),
+      stderr: this.truncate(this.outputToString(stderr), maxOutputBytes, exitCode !== 0),
       exitCode,
       timedOut,
       mode: this.config.mode,
@@ -315,10 +317,12 @@ export class ShellExecTool implements Tool {
     return Buffer.isBuffer(value) ? value.toString('utf8') : String(value);
   }
 
-  private truncate(value: string, maxBytes: number): string {
+  private truncate(value: string, maxBytes: number, preserveTail = false): string {
     const buffer = Buffer.from(value);
     if (buffer.byteLength <= maxBytes) return value;
-    return buffer.subarray(0, maxBytes).toString('utf8') + '\n[truncated]';
+    return preserveTail
+      ? `[truncated ${buffer.byteLength - maxBytes} leading bytes]\n${buffer.subarray(-maxBytes).toString('utf8')}`
+      : `${buffer.subarray(0, maxBytes).toString('utf8')}\n[truncated ${buffer.byteLength - maxBytes} trailing bytes]`;
   }
 
   private redactCommand(command: string): string {

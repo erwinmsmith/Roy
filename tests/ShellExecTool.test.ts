@@ -68,6 +68,27 @@ describe('shell.exec tool', () => {
     expect(await readFile(path.join(workspaceCwd, 'artifact.txt'), 'utf8')).toBe('benchmark-ready');
   });
 
+  it('lets verbose commands finish while returning a bounded causal failure tail', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-verbose-shell-'));
+    const tool = new ShellExecTool({
+      mode: 'unrestricted',
+      workspaceRoot: workspaceCwd,
+      shell: '/bin/sh',
+    });
+    const result = await tool.execute({
+      command: `python3 -c "import sys; sys.stderr.write('x' * 100000 + 'FAILURE_AT_END\\\\n'); sys.exit(2)"`,
+      maxOutputBytes: 1024,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).not.toContain('maxBuffer');
+    const output = result.result as ShellExecResult;
+    expect(output.exitCode).toBe(2);
+    expect(output.stderr).toContain('FAILURE_AT_END');
+    expect(output.stderr).toContain('leading bytes');
+    expect(Buffer.byteLength(output.stderr)).toBeLessThan(1200);
+  });
+
   it('registers as a core tool available to Runtime agents', async () => {
     toolRegistry.clear();
     registerCoreTools();

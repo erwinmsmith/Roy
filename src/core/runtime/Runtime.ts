@@ -2490,6 +2490,26 @@ export class Runtime {
     if (!binding) return { success: false, error: `Tool "${toolName}" is not authorized for agent "${agentId}"` };
     const runtimeTool = this.runtimeToolOverrides.get(toolName);
     if (!runtimeTool && !toolRegistry.has(toolName)) return { success: false, error: `Tool "${toolName}" not found` };
+    const immutableMutationError = this.immutableRuntimeEvidenceMutationError(toolName, params);
+    if (immutableMutationError) {
+      this.emit({
+        type: 'tool.policy.rejected',
+        agentId,
+        sessionId: ctx.sessionId,
+        correlationId: options.correlationId,
+        nodeId: options.nodeId,
+        data: {
+          toolName,
+          params,
+          reason: immutableMutationError,
+        },
+      });
+      return {
+        success: false,
+        error: immutableMutationError,
+        metadata: { immutableRuntimeEvidence: true },
+      };
+    }
     const cachedPathRejection = await this.getCachedInvalidPathRejection(
       agentId,
       toolName,
@@ -2619,7 +2639,13 @@ export class Runtime {
       sessionId: ctx.sessionId,
       correlationId: options.correlationId,
       nodeId: options.nodeId,
-      data: { toolName, correlationId: options.correlationId, success: result.success, error: result.error },
+      data: {
+        toolName,
+        correlationId: options.correlationId,
+        success: result.success,
+        error: result.error,
+        result: this.compactToolTraceResult(toolName, result.result),
+      },
     });
     if (!result.success && /\b(?:timed?\s*out|timeout|deadline exceeded)\b/i.test(result.error ?? '')) {
       this.emit({
@@ -2636,6 +2662,62 @@ export class Runtime {
       });
     }
     return result;
+  }
+
+  private compactToolTraceResult(toolName: string, result: unknown): unknown {
+    if (!result || typeof result !== 'object') return undefined;
+    if (toolName !== 'shell.exec') return undefined;
+    const shell = result as {
+      command?: unknown;
+      cwd?: unknown;
+      stdout?: unknown;
+      stderr?: unknown;
+      exitCode?: unknown;
+      timedOut?: unknown;
+    };
+    const compactTail = (value: unknown, maxChars = 8_000): string | undefined => {
+      if (typeof value !== 'string' || value.length === 0) return undefined;
+      return value.length <= maxChars
+        ? value
+        : `[runtime_trace_compacted_${value.length - maxChars}_leading_chars]\n${value.slice(-maxChars)}`;
+    };
+    return {
+      command: typeof shell.command === 'string' ? shell.command.slice(0, 2_000) : undefined,
+      cwd: typeof shell.cwd === 'string' ? shell.cwd : undefined,
+      exitCode: typeof shell.exitCode === 'number' ? shell.exitCode : undefined,
+      timedOut: shell.timedOut === true,
+      stdout: compactTail(shell.stdout),
+      stderr: compactTail(shell.stderr),
+    };
+  }
+
+  private immutableRuntimeEvidenceMutationError(
+    toolName: string,
+    params: Record<string, unknown>
+  ): string | undefined {
+    const immutableRoot = '.roy/official-verifier';
+    if (toolName === 'fs.write'
+      || toolName === 'fs.replace'
+      || toolName === 'fs.synthesize') {
+      const target = this.normalizeCachedPath(String(params.path ?? ''));
+      if (target === immutableRoot || target.startsWith(`${immutableRoot}/`)) {
+        return `${immutableRoot} is immutable runtime evidence; repair the implementation under test instead of modifying the verifier mirror`;
+      }
+      return undefined;
+    }
+    if (toolName !== 'shell.exec') return undefined;
+    const command = String(params.command ?? '');
+    if (!command.includes(immutableRoot)) return undefined;
+    const explicitTargets = this.extractShellMutationPaths(command)
+      .map(target => this.normalizeCachedPath(target));
+    const directInPlaceMutation =
+      /\b(?:sed\s+-i|perl\s+-pi|chmod|chown|truncate|touch|rm|rmdir)\b[^;&|\n]*\.roy\/official-verifier(?:\/|\b)/i.test(command);
+    if (explicitTargets.some(target =>
+      target === immutableRoot || target.startsWith(`${immutableRoot}/`)
+    ) || directInPlaceMutation) {
+      return `${immutableRoot} is immutable runtime evidence; shell mutations that target the verifier mirror are not allowed`;
+    }
+    return undefined;
   }
 
   private async getCachedInvalidPathRejection(
@@ -8827,12 +8909,16 @@ export class Runtime {
     task: string,
     knowledge: ExecutionKnowledgeCacheState
   ): ExecutionResumeState | undefined {
-    const relevantSteps = knowledge.steps
+    const externalContinuation = this.containsExternalExecutionFeedback(task);
+    let relevantSteps = knowledge.steps
       .map(step => ({
         step,
         similarity: this.executionTaskSimilarity(task, step.task),
       }))
       .filter(item => item.similarity >= 0.3);
+    if (relevantSteps.length === 0 && externalContinuation) {
+      relevantSteps = knowledge.steps.map(step => ({ step, similarity: 0 }));
+    }
     if (relevantSteps.length === 0) return undefined;
 
     const grouped = new Map<string, typeof relevantSteps>();
@@ -8842,14 +8928,35 @@ export class Runtime {
       grouped.set(item.step.correlationId, values);
     }
     const selected = [...grouped.entries()]
-      .map(([correlationId, items]) => ({
-        correlationId,
-        items,
-        similarity: Math.max(...items.map(item => item.similarity)),
-        updatedAt: Math.max(...items.map(item => item.step.updatedAt)),
-      }))
+      .map(([correlationId, items]) => {
+        const stepIds = new Set(items.map(item => item.step.stepId));
+        const groupPaths = knowledge.paths.filter(path =>
+          path.correlationId === correlationId && stepIds.has(path.stepId)
+        );
+        const groupFeedback = knowledge.feedback.filter(item =>
+          item.correlationId === correlationId && stepIds.has(item.stepId)
+        );
+        return {
+          correlationId,
+          items,
+          similarity: Math.max(...items.map(item => item.similarity)),
+          updatedAt: Math.max(...items.map(item => item.step.updatedAt)),
+          resumable: groupPaths.some(path =>
+            path.status !== 'completed'
+            || (path.mutationObserved && !path.verificationObserved)
+          ) || groupFeedback.some(item => item.actionable),
+          externalFeedback: groupFeedback.some(item =>
+            item.actionable && item.kind === 'external_feedback'
+          ),
+        };
+      })
       .sort((left, right) =>
-        right.similarity - left.similarity || right.updatedAt - left.updatedAt
+        externalContinuation
+          ? Number(right.externalFeedback) - Number(left.externalFeedback)
+            || Number(right.resumable) - Number(left.resumable)
+            || right.updatedAt - left.updatedAt
+            || right.similarity - left.similarity
+          : right.similarity - left.similarity || right.updatedAt - left.updatedAt
       )[0];
     if (!selected) return undefined;
 
@@ -8860,16 +8967,21 @@ export class Runtime {
       steps: selected.items
         .map(item => item.step)
         .sort((left, right) => left.updatedAt - right.updatedAt),
-      paths: knowledge.paths.filter(path => stepIds.has(path.stepId)),
-      actors: knowledge.actors.filter(actor => stepIds.has(actor.stepId)),
-      feedback: knowledge.feedback.filter(item => stepIds.has(item.stepId)),
+      paths: knowledge.paths.filter(path =>
+        path.correlationId === selected.correlationId && stepIds.has(path.stepId)
+      ),
+      actors: knowledge.actors.filter(actor =>
+        actor.correlationId === selected.correlationId && stepIds.has(actor.stepId)
+      ),
+      feedback: knowledge.feedback.filter(item =>
+        item.correlationId === selected.correlationId && stepIds.has(item.stepId)
+      ),
     };
     const openPaths = selectedKnowledge.paths.filter(path =>
       path.status !== 'completed'
       || (path.mutationObserved && !path.verificationObserved)
     );
     const actionableFeedback = selectedKnowledge.feedback.filter(item => item.actionable);
-    const externalContinuation = this.containsExternalExecutionFeedback(task);
     if (openPaths.length === 0
       && actionableFeedback.length === 0
       && !externalContinuation) {
@@ -14658,8 +14770,14 @@ For web-grounded work, use only facts present in the subagent report or runtime 
   }
 
   private normalizeToolWorkspacePath(value: string): string {
-    const normalized = value.trim().replace(/\\/g, '/').replace(/^\.\/+/, '').replace(/\/+/g, '/');
-    return normalized.replace(/\/+$/, '') || '.';
+    let normalized = value.trim().replace(/\\/g, '/').replace(/^\.\/+/, '').replace(/\/+/g, '/');
+    normalized = normalized.replace(/\/+$/, '');
+    const workspaceRoot = this.workspaceRoot.replace(/\\/g, '/').replace(/\/+$/, '');
+    if (normalized === workspaceRoot) return '.';
+    if (normalized.startsWith(`${workspaceRoot}/`)) {
+      normalized = normalized.slice(workspaceRoot.length + 1);
+    }
+    return normalized || '.';
   }
 
   private buildGroundedTask(task: string, grounding: { context: string; warnings: string[] }): string {

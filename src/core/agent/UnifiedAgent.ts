@@ -193,7 +193,9 @@ export class UnifiedAgent extends BaseAgent {
             ? 'At least one workspace mutation succeeded, but no verification has passed. Continue any remaining edits or repairs, then request a relevant test, build, lint, typecheck, or targeted assertion.'
             : '',
           'When verification fails, use its output to repair the workspace before retrying. Never hide a failing exit status with `|| true`, `; true`, `|| :`, or equivalent shell constructs.',
+          'Shell commands must be portable to the configured shell. Do not use Bash-only PIPESTATUS, arrays, process substitution, or `[[ ... ]]` when the workspace shell is /bin/sh; run the verifier directly and use maxOutputBytes to bound returned context.',
           'Before creating or replacing a module, use observed package metadata and directory layout to identify the authoritative source root. Never create a parallel top-level package when the project installs from src/, lib/, packages/, or another configured source directory.',
+          'Treat .roy/official-verifier/ as immutable runtime evidence. Read and run it to understand acceptance failures, but repair the implementation under test and never write, replace, synthesize, or shell-edit the verifier mirror.',
           'Keep mutations transactional: prefer fs.replace for focused edits and request at most one file mutation per plan. A complete fs.write/fs.replace payload may contain up to 24000 characters. Do not combine companion-file writes with a large implementation write; Runtime will request the next file in a later round.',
           executionRequired && authorized.has('fs.synthesize')
             ? 'For a complete implementation or repair that would require a large multiline source payload, prefer fs.synthesize with only {"path":"...","instructions":"..."}. Runtime generates the file through a separate plain-text channel using grounded evidence. Never put source content in fs.synthesize instructions.'
@@ -305,6 +307,9 @@ export class UnifiedAgent extends BaseAgent {
         plannedCalls = plannedCalls.map(call =>
           convertObservedOverwriteToExactReplace(call, input.calls, authorized) ?? call
         );
+        plannedCalls = plannedCalls.map(call =>
+          alignSynthesisRepairTargetWithFailure(call, input.calls, input.task)
+        );
         if (latestVerificationFailed) {
           if (inspectedAfterLatestFailure) {
             rejectedDestructiveRepairOverwrite = plannedCalls.some(call =>
@@ -358,6 +363,18 @@ export class UnifiedAgent extends BaseAgent {
                   success: true,
                 }))));
         if (advancesExecution) break;
+        const verificationFallback = recoverPostMutationVerificationPlan({
+          authorized,
+          calls: input.calls,
+          mutationRequirementSatisfied,
+          verificationPassed,
+          latestVerificationFailed,
+          round: input.round,
+        });
+        if (verificationFallback) {
+          plannedCalls = [verificationFallback];
+          break;
+        }
         const synthesisFallback = recoverGroundedSynthesisPlan({
           authorized,
           calls: input.calls,
@@ -422,6 +439,15 @@ export class UnifiedAgent extends BaseAgent {
                 success: true,
               })));
         if (!advancesExecution) {
+          const verificationFallback = recoverPostMutationVerificationPlan({
+            authorized,
+            calls: input.calls,
+            mutationRequirementSatisfied,
+            verificationPassed,
+            latestVerificationFailed,
+            round: input.round,
+          });
+          if (verificationFallback) return [verificationFallback];
           const synthesisFallback = recoverGroundedSynthesisPlan({
             authorized,
             calls: input.calls,
@@ -453,6 +479,15 @@ export class UnifiedAgent extends BaseAgent {
           }));
         }
       }
+      const verificationFallback = recoverPostMutationVerificationPlan({
+        authorized,
+        calls: input.calls,
+        mutationRequirementSatisfied,
+        verificationPassed,
+        latestVerificationFailed,
+        round: input.round,
+      });
+      if (verificationFallback) return [verificationFallback];
       const synthesisFallback = recoverGroundedSynthesisPlan({
         authorized,
         calls: input.calls,
@@ -1211,44 +1246,7 @@ function recoverGroundedSynthesisPlan(input: {
     || (input.mutationRequirementSatisfied && !input.latestVerificationFailed)) {
     return undefined;
   }
-  const taskLower = input.task.toLowerCase();
-  const failureText = input.calls
-    .filter(call => isWorkspaceVerificationCall(call) && !isSuccessfulWorkspaceVerification(call))
-    .slice(-2)
-    .map(call => `${String(call.error ?? '')}\n${JSON.stringify(call.result ?? '')}`)
-    .join('\n')
-    .toLowerCase();
-  const candidates = input.calls
-    .map((call, index) => {
-      if (call.toolName !== 'fs.read' || !call.success) return undefined;
-      const filePath = normalizePlannedWorkspacePath(String(
-        (call.result as { path?: unknown } | undefined)?.path
-          ?? call.params.path
-          ?? ''
-      ));
-      if (!/\.(?:py|ts|tsx|js|jsx|mjs|cjs|java|go|rs|rb|php|sh)$/i.test(filePath)) {
-        return undefined;
-      }
-      const content = String((call.result as { content?: unknown } | undefined)?.content ?? '');
-      let score = index / Math.max(1, input.calls.length);
-      if (/(?:^|\/)(?:src|lib|app|packages)\//i.test(filePath)) score += 6;
-      if (/(?:^|\/)(?:tests?|fixtures?|examples?|data|rules)\//i.test(filePath)) score -= 8;
-      if (/\b(?:todo|notimplemented|not implemented|placeholder|stub)\b|^\s*pass\s*(?:#.*)?$/im.test(content)) {
-        score += 12;
-      }
-      if (taskLower.includes(filePath.toLowerCase())
-        || taskLower.includes(filePath.split('/').at(-1)?.toLowerCase() ?? '')) {
-        score += 7;
-      }
-      if (failureText.includes(filePath.toLowerCase())
-        || failureText.includes(filePath.split('/').at(-1)?.toLowerCase() ?? '')) {
-        score += 10;
-      }
-      return { filePath, score };
-    })
-    .filter((candidate): candidate is { filePath: string; score: number } => Boolean(candidate))
-    .sort((left, right) => right.score - left.score);
-  const candidate = candidates[0];
+  const candidate = rankGroundedSynthesisTargets(input.calls, input.task)[0];
   if (!candidate) return undefined;
   return {
     toolName: 'fs.synthesize',
@@ -1261,6 +1259,136 @@ function recoverGroundedSynthesisPlan(input: {
     reason: `Runtime recovered a grounded file-synthesis action after structured planning did not advance execution in round ${input.round}.`,
     groundingRequired: true,
   };
+}
+
+function recoverPostMutationVerificationPlan(input: {
+  authorized: Set<string>;
+  calls: ToolLoopCallRecord[];
+  mutationRequirementSatisfied: boolean;
+  verificationPassed: boolean;
+  latestVerificationFailed: boolean;
+  round: number;
+}): PlannedToolCall | undefined {
+  if (!input.authorized.has('shell.exec')
+    || !input.mutationRequirementSatisfied
+    || input.verificationPassed
+    || input.latestVerificationFailed) {
+    return undefined;
+  }
+  const lastMutationIndex = findLastToolCallIndex(input.calls, call =>
+    isSuccessfulWorkspaceMutation(call)
+  );
+  if (lastMutationIndex < 0) return undefined;
+  for (let index = lastMutationIndex - 1; index >= 0; index -= 1) {
+    const call = input.calls[index]!;
+    if (!isWorkspaceVerificationCall(call)) continue;
+    return {
+      toolName: 'shell.exec',
+      params: { ...call.params },
+      reason: `Runtime recovered the most recent authoritative verification after a repair in round ${input.round}; the new workspace state has not been checked yet.`,
+      groundingRequired: true,
+    };
+  }
+  return undefined;
+}
+
+function alignSynthesisRepairTargetWithFailure(
+  planned: PlannedToolCall,
+  calls: ToolLoopCallRecord[],
+  task: string
+): PlannedToolCall {
+  if (planned.toolName !== 'fs.synthesize') return planned;
+  const candidates = rankGroundedSynthesisTargets(calls, task);
+  const best = candidates[0];
+  if (!best?.failureMentioned || !best.stubSignal) return planned;
+  const plannedPath = normalizePlannedWorkspacePath(String(planned.params.path ?? ''));
+  const plannedCandidate = candidates.find(candidate => candidate.filePath === plannedPath);
+  if (best.filePath === plannedPath
+    || (plannedCandidate && best.score < plannedCandidate.score + 6)) {
+    return planned;
+  }
+  return {
+    ...planned,
+    params: {
+      ...planned.params,
+      path: best.filePath,
+    },
+    reason: `${planned.reason} Runtime bound the repair to ${best.filePath}, which is both cited by the latest failed verification and still contains an implementation stub.`,
+  };
+}
+
+function rankGroundedSynthesisTargets(
+  calls: ToolLoopCallRecord[],
+  task: string
+): Array<{
+  filePath: string;
+  score: number;
+  failureMentioned: boolean;
+  stubSignal: boolean;
+}> {
+  const taskLower = task.toLowerCase();
+  const latestFailure = [...calls].reverse().find(call =>
+    isWorkspaceVerificationCall(call) && !isSuccessfulWorkspaceVerification(call)
+  );
+  const failureText = latestFailure
+    ? `${String(latestFailure.error ?? '')}\n${JSON.stringify(latestFailure.result ?? '')}`.toLowerCase()
+    : '';
+  const byPath = new Map<string, {
+    filePath: string;
+    score: number;
+    failureMentioned: boolean;
+    stubSignal: boolean;
+  }>();
+  calls
+    .map((call, index) => {
+      if (call.toolName !== 'fs.read' || !call.success) return undefined;
+      const filePath = normalizePlannedWorkspacePath(String(
+        (call.result as { path?: unknown } | undefined)?.path
+          ?? call.params.path
+          ?? ''
+      ));
+      if (!/\.(?:py|ts|tsx|js|jsx|mjs|cjs|java|go|rs|rb|php|sh)$/i.test(filePath)) {
+        return undefined;
+      }
+      if (filePath === '.roy/official-verifier'
+        || filePath.startsWith('.roy/official-verifier/')) {
+        return undefined;
+      }
+      const content = String((call.result as { content?: unknown } | undefined)?.content ?? '');
+      const filePathLower = filePath.toLowerCase();
+      const basename = filePath.split('/').at(-1)?.toLowerCase() ?? '';
+      const failureMentioned = Boolean(
+        failureText.includes(filePathLower)
+        || (basename && failureText.includes(basename))
+      );
+      const stubSignal =
+        /\b(?:todo|notimplemented(?:error)?|not implemented|placeholder|stub)\b|^\s*pass\s*(?:#.*)?$/im.test(content);
+      let score = index / Math.max(1, calls.length);
+      if (/(?:^|\/)(?:src|lib|app|packages)\//i.test(filePath)) score += 6;
+      if (/(?:^|\/)(?:tests?|fixtures?|examples?|data|rules)\//i.test(filePath)) score -= 8;
+      if (stubSignal) score += 18;
+      if (taskLower.includes(filePathLower)
+        || taskLower.includes(basename)) {
+        score += 7;
+      }
+      if (failureMentioned) {
+        score += failureText.includes(filePathLower) ? 18 : 8;
+      }
+      return { filePath, score, failureMentioned, stubSignal };
+    })
+    .filter((candidate): candidate is {
+      filePath: string;
+      score: number;
+      failureMentioned: boolean;
+      stubSignal: boolean;
+    } => Boolean(candidate))
+    .forEach(candidate => {
+      const previous = byPath.get(candidate.filePath);
+      if (!previous || candidate.score >= previous.score) {
+        byPath.set(candidate.filePath, candidate);
+      }
+    });
+  return [...byPath.values()].sort((left, right) => right.score - left.score);
 }
 
 function isDestructiveRepairOverwrite(

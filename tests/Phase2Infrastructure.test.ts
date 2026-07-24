@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdir, mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { FSM, InvalidFSMTransitionError } from '../src/core/executor/FSM.js';
@@ -334,6 +334,107 @@ describe('Phase 2 engineering infrastructure', () => {
     expect((await runtime.resolveToolApproval(approvalId, 'approved'))?.status).toBe('approved');
     const executed = await runtime.executeToolForAgent(tester.identity.id, 'shell.exec', { command: 'node --version' }, { approvalId });
     expect(executed.success).toBe(true);
+    await runtime.shutdown();
+  });
+
+  it('keeps bounded shell failure output in trace events for causal repair', async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), 'roy-tool-failure-trace-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'tool-failure-trace',
+      workspaceCwd: cwd,
+      llmProvider: new EngineeringLLM(),
+    });
+    const tester = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'tester',
+      name: 'Tester-Failure-Trace',
+      tomLevel: 0,
+      description: 'Run a failing validation command and preserve its output.',
+      task: 'Run npm test and report its causal failure.',
+    });
+    const pending = await runtime.executeToolForAgent(
+      tester.identity.id,
+      'shell.exec',
+      { command: 'npm test' }
+    );
+    const approvalId = String(pending.metadata?.approvalId);
+    await runtime.resolveToolApproval(approvalId, 'approved');
+    const failed = await runtime.executeToolForAgent(
+      tester.identity.id,
+      'shell.exec',
+      { command: 'npm test' },
+      { approvalId }
+    );
+
+    expect(failed.success).toBe(false);
+    const event = runtime.getEvents().find(item =>
+      item.type === 'tool.error'
+      && item.agentId === tester.identity.id
+      && item.data?.toolName === 'shell.exec'
+    );
+    expect(event?.data?.result).toMatchObject({
+      command: 'npm test',
+      exitCode: expect.any(Number),
+      timedOut: false,
+    });
+    expect(JSON.stringify(event?.data?.result)).toContain('package.json');
+    await runtime.shutdown();
+  });
+
+  it('treats the official verifier mirror as immutable runtime evidence', async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), 'roy-immutable-verifier-'));
+    await mkdir(path.join(cwd, '.roy', 'official-verifier'), { recursive: true });
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'immutable-verifier',
+      workspaceCwd: cwd,
+      llmProvider: new EngineeringLLM(),
+    });
+    const coder = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'coder',
+      name: 'Coder-Immutable-Verifier',
+      tomLevel: 0,
+      description: 'Repair implementation code while preserving verifier evidence.',
+      task: 'Repair the implementation and run the official verifier.',
+    });
+
+    const writeRejected = await runtime.executeToolForAgent(
+      coder.identity.id,
+      'fs.write',
+      {
+        path: '.roy/official-verifier/test_outputs.py',
+        content: 'def test_fake(): pass\n',
+      }
+    );
+    const shellRejected = await runtime.executeToolForAgent(
+      coder.identity.id,
+      'shell.exec',
+      {
+        command: "sed -i 's/fail/pass/' .roy/official-verifier/test_outputs.py",
+      }
+    );
+    const verifierRun = await runtime.executeToolForAgent(
+      coder.identity.id,
+      'shell.exec',
+      {
+        command: 'python -m pytest -q .roy/official-verifier/test_outputs.py',
+      }
+    );
+
+    expect(writeRejected).toMatchObject({
+      success: false,
+      metadata: { immutableRuntimeEvidence: true },
+    });
+    expect(shellRejected).toMatchObject({
+      success: false,
+      metadata: { immutableRuntimeEvidence: true },
+    });
+    expect(verifierRun.metadata?.immutableRuntimeEvidence).not.toBe(true);
+    expect(runtime.getEvents().filter(event =>
+      event.type === 'tool.policy.rejected'
+    )).toHaveLength(2);
     await runtime.shutdown();
   });
 });

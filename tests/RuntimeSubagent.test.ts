@@ -409,6 +409,10 @@ describe('Runtime controlled subagent spawning', () => {
       'tool.synthesis.started',
       'tool.synthesis.completed',
     ]));
+    const normalizePath = (runtime as unknown as {
+      normalizeToolWorkspacePath: (value: string) => string;
+    }).normalizeToolWorkspacePath;
+    expect(normalizePath.call(runtime, path.join(workspaceCwd, 'app.js'))).toBe('app.js');
     await runtime.shutdown();
   });
 

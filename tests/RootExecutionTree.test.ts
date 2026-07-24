@@ -781,6 +781,104 @@ describe('Root dynamic execution tree', () => {
     }));
   });
 
+  it('resumes the newest externally failed execution path instead of rebuilding an exact older task', () => {
+    const runtime = new Runtime();
+    const findResume = (runtime as unknown as {
+      findExecutionResumeState: (
+        task: string,
+        knowledge: {
+          version: 1;
+          updatedAt: number;
+          steps: unknown[];
+          paths: unknown[];
+          actors: unknown[];
+          feedback: unknown[];
+        }
+      ) => {
+        sourceCorrelationId: string;
+        openPaths: number;
+        actionableFeedback: number;
+      } | undefined;
+    }).findExecutionResumeState;
+    const originalTask = 'Implement the complete data audit pipeline in the workspace and run its tests.';
+    const continuationTask = [
+      originalTask,
+      '<official_verifier_feedback>',
+      'The previous attempt failed with KeyError in src/dq_audit/audit.py. Continue working.',
+      '</official_verifier_feedback>',
+    ].join('\n');
+    const step = (correlationId: string, task: string, updatedAt: number) => ({
+      id: `${correlationId}.step.cache`,
+      correlationId,
+      stepId: `${correlationId}.step`,
+      index: 1,
+      task,
+      taskFingerprint: correlationId,
+      pathId: `${correlationId}.path`,
+      dependsOn: [],
+      action: 'delegate',
+      status: 'completed',
+      actorIds: [],
+      teamIds: [],
+      feedbackIds: [`${correlationId}.feedback`],
+      createdAt: updatedAt,
+      updatedAt,
+    });
+    const pathRecord = (correlationId: string, updatedAt: number) => ({
+      id: `${correlationId}.path`,
+      correlationId,
+      stepId: `${correlationId}.step`,
+      parentPathIds: [],
+      taskFingerprint: correlationId,
+      status: 'partial',
+      actorIds: [],
+      teamIds: [],
+      observedPaths: ['src/dq_audit/audit.py'],
+      invalidPaths: [],
+      successfulTools: ['fs.synthesize'],
+      failedTools: ['shell.exec'],
+      mutationObserved: true,
+      verificationObserved: false,
+      feedbackIds: [`${correlationId}.feedback`],
+      createdAt: updatedAt,
+      updatedAt,
+    });
+    const feedback = (correlationId: string, updatedAt: number, kind: string) => ({
+      id: `${correlationId}.feedback`,
+      kind,
+      correlationId,
+      stepId: `${correlationId}.step`,
+      pathId: `${correlationId}.path`,
+      summary: 'Repair the latest failed verifier location and rerun it.',
+      actionable: true,
+      createdAt: updatedAt,
+    });
+
+    const resume = findResume.call(runtime, continuationTask, {
+      version: 1,
+      updatedAt: 20,
+      steps: [
+        step('older-exact-task', originalTask, 10),
+        step('newer-failed-continuation', continuationTask, 20),
+      ],
+      paths: [
+        pathRecord('older-exact-task', 10),
+        pathRecord('newer-failed-continuation', 20),
+      ],
+      actors: [],
+      feedback: [
+        feedback('older-exact-task', 10, 'tool_failure'),
+        feedback('newer-failed-continuation', 20, 'external_feedback'),
+      ],
+    });
+
+    expect(resume).toMatchObject({
+      sourceCorrelationId: 'newer-failed-continuation',
+      openPaths: 1,
+      actionableFeedback: 1,
+    });
+  });
+
   it('hands a long-horizon task back to root as soon as a delegated mutation occurs', () => {
     const runtime = new Runtime();
     const shouldHandoff = (runtime as unknown as {
