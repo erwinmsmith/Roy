@@ -44,6 +44,40 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('executes a task-declared required CLI command before optional file reads', () => {
+    const plans = new AgentToolPlanner().plan({
+      task: [
+        'Implement the workspace pipeline.',
+        '## Required Command',
+        '```bash',
+        'python -m dq_audit.cli run --config configs/public_audit.yml --out-dir outputs',
+        '```',
+        'Inspect configs/public_audit.yml when repairing failures.',
+      ].join('\n'),
+      workspacePath: '.',
+      archetype: 'coder',
+      bindings: [
+        { name: 'fs.list', enabled: true },
+        { name: 'fs.read', enabled: true },
+        { name: 'shell.exec', enabled: true },
+      ],
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({ toolName: 'fs.list' }),
+      expect.objectContaining({
+        toolName: 'shell.exec',
+        params: {
+          command: 'python -m dq_audit.cli run --config configs/public_audit.yml --out-dir outputs',
+        },
+      }),
+      expect.objectContaining({
+        toolName: 'fs.read',
+        params: { path: 'configs/public_audit.yml' },
+      }),
+    ]);
+  });
+
   it('reads the package manifest for an architecture critic', () => {
     const plans = new AgentToolPlanner().plan({
       task: 'Identify architectural coupling risks using filesystem evidence.',

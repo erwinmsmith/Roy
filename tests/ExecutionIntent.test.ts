@@ -49,6 +49,14 @@ describe('workspace execution intent', () => {
       params: { command: 'pytest -q' },
       success: true,
     })).toBe(true);
+    expect(isSuccessfulWorkspaceVerificationCall({
+      toolName: 'shell.exec',
+      params: {
+        command: 'python -m dq_audit.cli run --config configs/public_audit.yml --out-dir outputs',
+      },
+      success: true,
+      result: { exitCode: 0 },
+    })).toBe(true);
   });
 
   it('does not accept verification commands that mask a failing exit status', () => {

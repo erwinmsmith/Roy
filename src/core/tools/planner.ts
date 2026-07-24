@@ -33,6 +33,7 @@ export class AgentToolPlanner {
     const referencedDirectories = referencedPaths.filter(item => item.endsWith('/'));
     const referencedFiles = referencedPaths.filter(item => !item.endsWith('/'));
     const referencedUrls = this.extractReferencedUrls(input.task);
+    const explicitShellCommands = this.extractExplicitShellCommands(input.task);
     const runtimeApiInspection = /\bruntime\s+apis?\b[\s\S]{0,80}\b(?:exports?|surface|inspection|declarations?|signatures?|source|symbols?)\b|\bexported runtime apis?\b/.test(lower);
     const mutationTask = /\b(?:implement|modify|edit|create|write|patch|repair|fix|refactor|migrate|upgrade|install|replace|apply)\b/.test(lower);
     const explicitUrlReading = /\b(?:open|read|fetch|visit|consult)\b[\s\S]{0,120}https?:\/\//i.test(input.task);
@@ -85,6 +86,15 @@ export class AgentToolPlanner {
       });
     }
 
+    if (enabled.has('shell.exec') && explicitShellCommands.length > 0) {
+      plans.push(...explicitShellCommands.map(command => ({
+        toolName: 'shell.exec',
+        params: { command },
+        reason: 'The task marks this as an explicit command to execute and preserve the real exit status.',
+        groundingRequired: true,
+      })));
+    }
+
     const inferredFilePaths: string[] = [];
     if (/\b(?:package exports?|export map|package manifest|package entr(?:y|ies))\b/.test(lower)
       || input.archetype === 'critic'
@@ -127,7 +137,13 @@ export class AgentToolPlanner {
       }
     }
 
-    return plans.slice(0, 3);
+    const seen = new Set<string>();
+    return plans.filter(plan => {
+      const fingerprint = `${plan.toolName}:${JSON.stringify(plan.params)}`;
+      if (seen.has(fingerprint)) return false;
+      seen.add(fingerprint);
+      return true;
+    }).slice(0, 3);
   }
 
   planWebFollowUps(input: {
@@ -221,6 +237,31 @@ export class AgentToolPlanner {
     return [...new Set([...matches]
       .map(match => match[1].replace(/^\.\//, ''))
       .filter(value => value.length > 0))];
+  }
+
+  private extractExplicitShellCommands(task: string): string[] {
+    const commands: string[] = [];
+    for (const match of task.matchAll(/```(?:bash|sh|shell|zsh|console)\s*\n([\s\S]*?)```/gi)) {
+      const index = match.index ?? 0;
+      const leadIn = task.slice(Math.max(0, index - 240), index);
+      if (!/(?:required|run|execute|verification|verify|test)[^\n]{0,80}(?:command|with|using)?/i.test(leadIn)) {
+        continue;
+      }
+      const lines = String(match[1] ?? '')
+        .split(/\r?\n/)
+        .map(line => line.trim())
+        .filter(line => line && !line.startsWith('#'));
+      for (const line of lines) {
+        const command = line.replace(/^\$\s+/, '');
+        if (command.length > 1_000
+          || command.endsWith('\\')
+          || /\b(?:rm\s+-rf|mkfs|shutdown|reboot|halt)\b/i.test(command)) {
+          continue;
+        }
+        commands.push(command);
+      }
+    }
+    return [...new Set(commands)].slice(0, 3);
   }
 
   private extractReferencedUrls(task: string): string[] {
