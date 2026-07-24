@@ -13540,6 +13540,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         const failureContextPlans = this.toolPlanner.planWorkspaceFailureFollowUps({
           calls: [...priorPlannerCalls, ...context.calls],
           bindings,
+          workspaceRoot: this.workspaceRoot,
         });
         if (failureContextPlans.length > 0) {
           return failureContextPlans.slice(0, context.remainingCalls);
@@ -14420,6 +14421,21 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         },
       });
       if (closure.closed) return combined;
+      if (current.toolCalls.length === 0) {
+        this.emit({
+          type: 'root.execution.no_progress.detected',
+          agentId: 'root',
+          correlationId,
+          data: {
+            attempt,
+            maxAttempts,
+            reason: 'The grounded repair planner exhausted its internal correction attempts without producing a new tool action.',
+            latestFailure: priorExecution?.warnings.at(-1),
+            ...closure,
+          },
+        });
+        break;
+      }
     }
     return combineWithDelegatedExecution();
   }

@@ -22,6 +22,7 @@ export interface ObservedToolCall {
   params: Record<string, unknown>;
   result?: unknown;
   success: boolean;
+  error?: unknown;
 }
 
 export class AgentToolPlanner {
@@ -223,6 +224,7 @@ export class AgentToolPlanner {
   planWorkspaceFailureFollowUps(input: {
     calls: ObservedToolCall[];
     bindings: ToolPlanBinding[];
+    workspaceRoot?: string;
   }): PlannedToolCall[] {
     if (!input.bindings.some(binding => binding.enabled && binding.name === 'fs.read')) return [];
     let latestFailureIndex = -1;
@@ -243,17 +245,26 @@ export class AgentToolPlanner {
     const output = [
       String(shell?.stdout ?? ''),
       String(shell?.stderr ?? ''),
+      String(failure.error ?? ''),
     ].filter(Boolean).join('\n');
-    const locations = this.extractFailureLocations(output, String(shell?.cwd ?? ''));
+    const locations = this.extractFailureLocations(
+      output,
+      String(shell?.cwd ?? input.workspaceRoot ?? ''),
+      input.workspaceRoot
+    );
     return locations
       .map(location => ({
         toolName: 'fs.read',
-        params: {
-          path: location.path,
-          startLine: Math.max(1, location.line - 25),
-          endLine: location.line + 25,
-        },
-        reason: `Read bounded source context around the verifier-reported failure at ${location.path}:${location.line}.`,
+        params: location.line === undefined
+          ? { path: location.path }
+          : {
+              path: location.path,
+              startLine: Math.max(1, location.line - 25),
+              endLine: location.line + 25,
+            },
+        reason: location.line === undefined
+          ? `Read the source module named by the verifier failure at ${location.path}.`
+          : `Read bounded source context around the verifier-reported failure at ${location.path}:${location.line}.`,
         groundingRequired: true,
       } satisfies PlannedToolCall))
       .filter(plan => {
@@ -272,7 +283,7 @@ export class AgentToolPlanner {
             || call.toolName === 'shell.exec' && this.looksLikeShellMutation(String(call.params.command ?? '')))
         );
       })
-      .slice(0, 2);
+      .slice(0, 1);
   }
 
   hasSufficientWebEvidence(task: string, calls: ObservedToolCall[]): boolean {
@@ -294,15 +305,35 @@ export class AgentToolPlanner {
       .filter(value => value.length > 0))];
   }
 
-  private extractFailureLocations(output: string, cwd: string): Array<{ path: string; line: number }> {
-    const locations: Array<{ path: string; line: number }> = [];
-    const add = (rawPath: string, rawLine: string): void => {
-      const line = Number(rawLine);
-      if (!Number.isInteger(line) || line <= 0) return;
+  private extractFailureLocations(
+    output: string,
+    cwd: string,
+    workspaceRoot?: string
+  ): Array<{ path: string; line?: number }> {
+    const locations: Array<{ path: string; line?: number }> = [];
+    const add = (rawPath: string, rawLine?: string): void => {
+      const parsedLine = rawLine === undefined ? undefined : Number(rawLine);
+      const line = Number.isInteger(parsedLine) && Number(parsedLine) > 0
+        ? Number(parsedLine)
+        : undefined;
       let candidate = rawPath.trim().replace(/\\/g, '/');
       const normalizedCwd = cwd.trim().replace(/\\/g, '/').replace(/\/+$/, '');
-      if (normalizedCwd && candidate.startsWith(`${normalizedCwd}/`)) {
-        candidate = candidate.slice(normalizedCwd.length + 1);
+      const normalizedWorkspaceRoot = String(workspaceRoot ?? '')
+        .trim()
+        .replace(/\\/g, '/')
+        .replace(/\/+$/, '');
+      const roots = [normalizedWorkspaceRoot, normalizedCwd]
+        .filter(Boolean)
+        .sort((left, right) => right.length - left.length);
+      for (const root of roots) {
+        if (candidate === root) {
+          candidate = '.';
+          break;
+        }
+        if (candidate.startsWith(`${root}/`)) {
+          candidate = candidate.slice(root.length + 1);
+          break;
+        }
       }
       candidate = candidate.replace(/^\.\//, '');
       if (!candidate
@@ -319,9 +350,12 @@ export class AgentToolPlanner {
     for (const match of output.matchAll(/(?:^|\n)\s*([A-Za-z0-9_./-]+\.(?:py|ts|tsx|js|jsx|mjs|cjs|java|go|rs|rb|php)):(\d+)(?::\d+)?/g)) {
       add(String(match[1]), String(match[2]));
     }
+    for (const match of output.matchAll(/\(([^()\s]+\.(?:py|ts|tsx|js|jsx|mjs|cjs|java|go|rs|rb|php))\)/g)) {
+      add(String(match[1]));
+    }
     const seen = new Set<string>();
     return locations.reverse().filter(location => {
-      const key = `${location.path}:${location.line}`;
+      const key = location.path;
       if (seen.has(key)) return false;
       seen.add(key);
       return true;

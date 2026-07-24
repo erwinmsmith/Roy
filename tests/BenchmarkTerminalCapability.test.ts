@@ -272,6 +272,31 @@ class RetryingDirectExecutionLLM extends TerminalTaskLLM {
   }
 }
 
+class NoProgressDirectExecutionLLM extends TerminalTaskLLM {
+  override async completeJSON<T>(messages: LLMMessage[]): Promise<T> {
+    const system = messages.find(message => message.role === 'system')?.content ?? '';
+    const user = messages.findLast(message => message.role === 'user')?.content ?? '';
+    if (system.includes("root delegation controller")) {
+      return { action: 'solve_directly', reason: 'Execute the workspace task directly.' } as T;
+    }
+    if (system.includes('plan authorized tool calls')) {
+      if (user.includes('[runtime_execution_phase]')
+        && user.includes('Completed tool round:')) {
+        return {
+          action: 'call_tools',
+          reason: 'Apply one incomplete edit.',
+          calls: [{
+            toolName: 'fs.write',
+            params: { path: 'artifact.txt', content: 'incomplete' },
+          }],
+        } as T;
+      }
+      return { action: 'finish', reason: 'No repair action can be selected.', calls: [] } as T;
+    }
+    return super.completeJSON<T>(messages);
+  }
+}
+
 describe('benchmark terminal capability', () => {
   it('requires verification at or after the latest successful mutation', () => {
     const runtime = new Runtime();
@@ -949,6 +974,68 @@ describe('benchmark terminal capability', () => {
         source: 'solve_directly',
         mutationApplied: true,
         verificationRan: true,
+      }),
+    }));
+
+    await runtime.shutdown();
+  });
+
+  it('stops repeating root closure attempts after a fully corrected planner returns no action', async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), 'roy-direct-execution-no-progress-'));
+    await mkdir(path.join(workspace, '.roy'), { recursive: true });
+    await writeFile(path.join(workspace, '.roy', 'config.json'), JSON.stringify({
+      delegation: {
+        rootSteps: {
+          maxExecutionClosureAttempts: 8,
+        },
+      },
+      tools: {
+        approval: {
+          readOnly: 'auto',
+          write: 'auto',
+          execute: 'auto',
+          overrides: {},
+        },
+        shell: {
+          mode: 'unrestricted',
+          shell: '/bin/sh',
+          defaultTimeoutMs: 10_000,
+          maxTimeoutMs: 60_000,
+          defaultMaxOutputBytes: 40_000,
+          maxCallsPerAgent: 10,
+        },
+        executionLoop: {
+          enabled: true,
+          maxRounds: 4,
+          maxCallsPerRun: 8,
+          maxConsecutiveFailures: 2,
+          maxWallClockMs: 30_000,
+          maxFetchesAfterSearch: 2,
+          llmReplanning: true,
+        },
+      },
+    }, null, 2));
+
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'direct-execution-no-progress-test',
+      workspaceCwd: workspace,
+      llmProvider: new NoProgressDirectExecutionLLM(),
+    });
+    await runtime.handleUserTurn(
+      'Implement the workspace change in artifact.txt and run a verification.'
+    );
+
+    const attempts = runtime.getEvents().filter(event =>
+      event.type === 'root.execution.attempt.completed'
+    );
+    expect(attempts).toHaveLength(3);
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'root.execution.no_progress.detected',
+      data: expect.objectContaining({
+        attempt: 3,
+        mutationApplied: true,
+        verificationPassed: false,
       }),
     }));
 

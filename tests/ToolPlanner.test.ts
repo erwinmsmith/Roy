@@ -113,6 +113,36 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('uses shell error text to inspect an imported workspace module', () => {
+    const plans = new AgentToolPlanner().planWorkspaceFailureFollowUps({
+      workspaceRoot: '/app',
+      bindings: [
+        { name: 'fs.read', enabled: true },
+        { name: 'shell.exec', enabled: true },
+      ],
+      calls: [{
+        toolName: 'shell.exec',
+        params: {
+          command: 'python -m dq_audit.cli run --config configs/public_audit.yml --out-dir outputs',
+        },
+        success: false,
+        error: [
+          'Traceback (most recent call last):',
+          '  File "/app/src/dq_audit/cli.py", line 6, in <module>',
+          '    from .audit import run_audit',
+          "ImportError: cannot import name 'run_audit' from 'dq_audit.audit' (/app/src/dq_audit/audit.py)",
+        ].join('\n'),
+      }],
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.read',
+        params: { path: 'src/dq_audit/audit.py' },
+      }),
+    ]);
+  });
+
   it('reads the package manifest for an architecture critic', () => {
     const plans = new AgentToolPlanner().plan({
       task: 'Identify architectural coupling risks using filesystem evidence.',
