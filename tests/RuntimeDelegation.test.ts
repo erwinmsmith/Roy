@@ -424,11 +424,6 @@ describe('Runtime root-controlled delegation', () => {
           custom: [],
         },
       },
-      tom: {
-        autoCompleteGaps: false,
-        enforceMinimumCoverage: false,
-        minimumCoverage: 0,
-      },
     }));
     const runtime = new Runtime();
     await runtime.initialize({
@@ -444,7 +439,18 @@ describe('Runtime root-controlled delegation', () => {
     expect(result.decision.action).toBe('spawn_subagents');
     expect(result.subagents).toHaveLength(1);
     expect(result.subagents[0].subagentResult.result).not.toBe('');
-    expect(runtime.getEvents().some(event => event.type === 'delegation.plan.infeasible')).toBe(false);
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'delegation.plan.infeasible',
+      data: expect.objectContaining({
+        rejected: expect.arrayContaining([
+          expect.objectContaining({
+            reason: 'grounding_required_but_no_automatically_authorized_tool_path',
+            automaticallyAuthorizedTools: [],
+          }),
+        ]),
+        retainedAgents: ['KnowledgeSolver-1'],
+      }),
+    }));
     await runtime.shutdown();
   });
 

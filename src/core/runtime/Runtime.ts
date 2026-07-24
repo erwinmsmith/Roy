@@ -6935,10 +6935,6 @@ export class Runtime {
         reason: `${decision.reason} Delegation skipped because no policy-approved agent slots remain.`,
       };
     }
-    const enrichedDecision: DelegationDecision = {
-      ...decision,
-      agents: completedPlans,
-    };
     this.tomAnalyses.set(correlationId, tomAnalysis);
     this.emit({
       type: 'tom.task.analyzed',
@@ -6977,7 +6973,28 @@ export class Runtime {
       });
     }
 
-    const cacheHits = await Promise.all(completedPlans.map(async agent => {
+    const explicitPlanCount = Math.min(decision.agents.length, completedPlans.length);
+    const automaticallyCompletedGroundingPlans = new Set(
+      completedPlans
+        .slice(explicitPlanCount)
+        .filter(plan =>
+          /\bgrounded evidence\b/i.test(plan.tomProfile?.perspective ?? '')
+          || (plan.tomProfile?.capabilityScope ?? []).some(capability =>
+            /^(?:inspect_project|fs\.(?:list|read)|web\.(?:search|fetch))$/.test(capability)
+          )
+        )
+        .map(plan => `${plan.archetype}\u0000${plan.name ?? ''}\u0000${plan.task}`)
+    );
+    const executableDecision = this.constrainDelegationToExecutablePlans(
+      parentId,
+      { ...decision, agents: completedPlans },
+      correlationId,
+      automaticallyCompletedGroundingPlans
+    );
+    if (executableDecision.action !== 'spawn_subagents') return executableDecision;
+    const executablePlans = executableDecision.agents;
+
+    const cacheHits = await Promise.all(executablePlans.map(async agent => {
       const [agentPattern, delegationPattern] = await Promise.all([
         ctx.memory.findAgentPattern(agent.archetype),
         ctx.memory.findDelegationPattern(agent.archetype, agent.task),
@@ -6988,12 +7005,12 @@ export class Runtime {
       ctx.memory.getCachePatterns('agents'),
       ctx.memory.getCachePatterns('delegations'),
     ]);
-    const archetypes = [...new Set(completedPlans.map(agent => agent.archetype))];
+    const archetypes = [...new Set(executablePlans.map(agent => agent.archetype))];
     const selection = await this.requireCandidatePlanner().select({
       parentId,
       correlationId,
       task,
-      decision: enrichedDecision,
+      decision: executableDecision,
       allowedChildren: policy ? Math.max(0, policy.allowedChildren - policy.currentChildren) : 0,
       remainingTotalAgentsForTurn: this.getRemainingTotalAgentsForTurn(parentId, correlationId),
       budgetMode: budget.mode,
@@ -7004,8 +7021,8 @@ export class Runtime {
         archetype,
         this.getAutomaticallyApprovedToolBindings(
           archetype,
-          completedPlans.filter(plan => plan.archetype === archetype).map(plan => plan.task).join('\n'),
-          completedPlans
+          executablePlans.filter(plan => plan.archetype === archetype).map(plan => plan.task).join('\n'),
+          executablePlans
             .filter(plan => plan.archetype === archetype)
             .flatMap(plan => plan.tools ?? [])
         ).map(binding => binding.name),
@@ -7014,7 +7031,7 @@ export class Runtime {
         archetype,
         Array.from(new Set([
           ...this.getDefaultSkillBindings(archetype).filter(binding => binding.enabled).map(binding => binding.name),
-          ...completedPlans
+          ...executablePlans
             .filter(plan => plan.archetype === archetype)
             .flatMap(plan => plan.skills ?? [])
             .filter(skill => skillRegistry.has(skill)),
@@ -9497,7 +9514,8 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
   private constrainDelegationToExecutablePlans(
     parentId: string,
     decision: DelegationDecision,
-    correlationId: string
+    correlationId: string,
+    forcedGroundingPlanKeys: ReadonlySet<string> = new Set()
   ): DelegationDecision {
     if (decision.action !== 'spawn_subagents') return decision;
     const rejected: Array<{
@@ -9509,7 +9527,9 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
       automaticallyAuthorizedTools: string[];
     }> = [];
     const agents = decision.agents.filter(plan => {
-      if (!this.taskRequiresGrounding(plan.archetype, plan.task)) return true;
+      const planKey = `${plan.archetype}\u0000${plan.name ?? ''}\u0000${plan.task}`;
+      if (!forcedGroundingPlanKeys.has(planKey)
+        && !this.taskRequiresGrounding(plan.archetype, plan.task)) return true;
       const requested = Array.from(new Set([
         ...(plan.tools ?? []),
         ...this.inferMinimumTaskTools(plan.task),
@@ -13280,6 +13300,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     void archetype;
     if (this.taskNeedsWebAccess(task)) return true;
     return /\b(?:filesystem|repository|repo|codebase|workspace|source files?|package\.json|manifest|runtime trace|tool)[ -]?(?:grounded|evidence)\b|\busing (?:filesystem|repository|repo|workspace|source|tool) evidence\b/i.test(task)
+      || /\bcollect (?:concrete|grounded) evidence\b[\s\S]{0,180}\b(?:tools?|source files?|filesystem|repository|repo|workspace)\b/i.test(task)
       || /\b(?:inspect|read|open|list|search|audit|modify|edit|write|patch|implement|run|execute|verify|test)\b[\s\S]{0,160}\b(?:actual|local|current)?\s*(?:project(?:\s+structure)?|files?|filesystem|repository|repo|codebase|workspace|source|tests?|build|commands?|cli|container)\b/i.test(task)
       || /(?:检查|读取|打开|列出|搜索|审计|修改|编辑|写入|修复|实现|运行|执行|验证|测试)[\s\S]{0,100}(?:文件|仓库|代码库|工作区|源码|测试|构建|命令|CLI|容器)/i.test(task);
   }
