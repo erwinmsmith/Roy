@@ -60,7 +60,7 @@ export class OpenAIProvider implements LLMProvider {
       max_tokens: options?.maxTokens ?? this.config.maxTokens ?? 4096,
       top_p: options?.topP,
       stop: options?.stop,
-    });
+    }, requestOptions(options, this.config.timeoutMs));
 
     const choice = response.choices[0];
     return {
@@ -93,7 +93,7 @@ export class OpenAIProvider implements LLMProvider {
       stop: options?.stop,
       stream: true,
       stream_options: { include_usage: true },
-    });
+    }, requestOptions(options, this.config.timeoutMs));
 
     let rawUsage: unknown;
     let finishReason: string | undefined;
@@ -147,7 +147,7 @@ export class OpenAIProvider implements LLMProvider {
       temperature: options?.temperature ?? this.config.temperature ?? 0.5,
       max_tokens: options?.maxTokens ?? this.config.maxTokens ?? 4096,
       response_format: { type: 'json_object' },
-    });
+    }, requestOptions(options, this.config.timeoutMs));
 
     const message = response.choices[0].message as unknown as {
       content?: string | null;
@@ -267,4 +267,17 @@ function readPositiveInteger(value: string | undefined, fallback: number): numbe
 function readNonNegativeInteger(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function requestOptions(
+  options: LLMCompletionOptions | undefined,
+  configuredTimeoutMs: number | undefined
+): { timeout: number } {
+  const configured = configuredTimeoutMs ?? 120_000;
+  const requested = options?.timeoutMs;
+  return {
+    timeout: Number.isFinite(requested) && Number(requested) > 0
+      ? Math.max(1, Math.min(configured, Math.floor(Number(requested))))
+      : configured,
+  };
 }

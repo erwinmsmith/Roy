@@ -457,6 +457,8 @@ export interface ToolCallRecord {
   error?: string;
   reason?: string;
   round?: number;
+  startedAt?: number;
+  completedAt?: number;
 }
 
 interface GroundingRunResult {
@@ -2523,6 +2525,20 @@ export class Runtime {
       nodeId: options.nodeId,
       data: { toolName, correlationId: options.correlationId, success: result.success, error: result.error },
     });
+    if (!result.success && /\b(?:timed?\s*out|timeout|deadline exceeded)\b/i.test(result.error ?? '')) {
+      this.emit({
+        type: 'tool.timeout',
+        agentId,
+        sessionId: ctx.sessionId,
+        correlationId: options.correlationId,
+        nodeId: options.nodeId,
+        data: {
+          toolName,
+          correlationId: options.correlationId,
+          error: result.error,
+        },
+      });
+    }
     return result;
   }
 
@@ -12945,6 +12961,30 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     };
   }
 
+  private emitToolPlanningFailure(
+    actor: UnifiedAgent,
+    agentId: string,
+    options: { correlationId?: string; nodeId?: string },
+    round: number
+  ): void {
+    const failure = actor.getLastToolPlanningFailure();
+    if (!failure) return;
+    this.emit({
+      type: failure.timedOut
+        ? 'agent.tool_planning.timeout'
+        : 'agent.tool_planning.failed',
+      agentId,
+      sessionId: this.getContext().sessionId,
+      correlationId: options.correlationId,
+      nodeId: options.nodeId,
+      data: {
+        round,
+        message: failure.message,
+        occurredAt: failure.occurredAt,
+      },
+    });
+  }
+
   private async runGroundingCheck(
     agentId: string,
     task: string,
@@ -12959,6 +12999,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       initialPlans?: PlannedToolCall[];
       skipInitialModelPlanning?: boolean;
       toolAllowlist?: string[];
+      priorToolCalls?: ToolCallRecord[];
       onBeforeExecution?: (plans: PlannedToolCall[]) => Promise<void>;
     }
   ): Promise<GroundingRunResult> {
@@ -12980,6 +13021,17 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         archetype: options.archetype,
       });
     const actor = this.getContext().manager.getAgentById(agentId);
+    const priorPlannerCalls = (options.priorToolCalls ?? []).map(call => ({
+      toolName: call.toolName,
+      params: call.params,
+      reason: call.reason ?? 'Completed by a prior actor or execution attempt.',
+      groundingRequired: true,
+      result: call.result,
+      success: call.success,
+      error: call.error,
+      startedAt: call.startedAt,
+      completedAt: call.completedAt,
+    }));
     const loopConfig = this.workspaceRuntimeConfig?.tools.executionLoop ?? {
       enabled: true,
       maxRounds: 6,
@@ -12989,6 +13041,16 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       maxFetchesAfterSearch: 2,
       llmReplanning: true,
     };
+    const groundingMaxWallClockMs = Math.max(
+      1,
+      Math.min(loopConfig.maxWallClockMs, options.maxWallClockMs ?? loopConfig.maxWallClockMs)
+    );
+    const groundingDeadline = Date.now() + groundingMaxWallClockMs;
+    const remainingGroundingMs = (): number => Math.max(0, groundingDeadline - Date.now());
+    const planningRequestTimeoutMs = (): number => Math.max(
+      1_000,
+      Math.min(60_000, Math.floor(remainingGroundingMs() * 0.4))
+    );
     const needsModelPlannedAction = bindings.some(binding =>
       binding.enabled && (
         binding.name === 'shell.exec'
@@ -13011,11 +13073,13 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       && loopConfig.llmReplanning
       && !options.skipInitialModelPlanning
       && !hasInitialInspection
+      && remainingGroundingMs() > 1_000
       && actor instanceof UnifiedAgent) {
       const modelPlans = await actor.planNextToolRound({
         task,
         round: 0,
         remainingCalls: loopConfig.maxCallsPerRun,
+        requestTimeoutMs: planningRequestTimeoutMs(),
         tools: bindings
           .filter(binding => binding.enabled)
           .map(binding => {
@@ -13026,8 +13090,9 @@ For web-grounded work, use only facts present in the subagent report or runtime 
               parameters: metadata?.parameters as Record<string, unknown> | undefined,
             };
           }),
-        calls: [],
+        calls: priorPlannerCalls,
       });
+      this.emitToolPlanningFailure(actor, agentId, options, 0);
       const plannedFingerprints = new Set(plans.map(plan => this.toolPlanFingerprint(plan)));
       plans.push(...modelPlans.filter(plan => !plannedFingerprints.has(this.toolPlanFingerprint(plan))));
     }
@@ -13067,16 +13132,47 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       maxRounds: loopConfig.enabled ? loopConfig.maxRounds : 1,
       maxCalls: loopConfig.enabled ? loopConfig.maxCallsPerRun : Math.max(1, plans.length),
       maxConsecutiveFailures: loopConfig.maxConsecutiveFailures,
-      maxWallClockMs: Math.max(
-        1,
-        Math.min(loopConfig.maxWallClockMs, options.maxWallClockMs ?? loopConfig.maxWallClockMs)
-      ),
+      maxWallClockMs: Math.max(1, remainingGroundingMs()),
     });
     const toolLoop = await loop.run({
       task,
       initialPlans: plans,
       fingerprint: plan => this.toolPlanFingerprint(plan),
       execute: async (plan, _round) => {
+        if (plan.toolName === 'shell.exec') {
+          const remainingMs = remainingGroundingMs();
+          const executionReserveMs = Math.max(
+            1_000,
+            Math.min(30_000, Math.floor(remainingMs * 0.2))
+          );
+          const deadlineTimeoutMs = Math.max(1_000, remainingMs - executionReserveMs);
+          const configuredDefaultTimeoutMs = this.workspaceRuntimeConfig?.tools.shell.defaultTimeoutMs
+            ?? 10_000;
+          const requestedTimeoutMs = plan.params.timeoutMs === undefined
+            ? configuredDefaultTimeoutMs
+            : Number(plan.params.timeoutMs);
+          if (Number.isFinite(requestedTimeoutMs)
+            && requestedTimeoutMs > 0
+            && deadlineTimeoutMs < requestedTimeoutMs) {
+            plan.params = {
+              ...plan.params,
+              timeoutMs: deadlineTimeoutMs,
+            };
+            this.emit({
+              type: 'tool.deadline.applied',
+              agentId,
+              sessionId: this.getContext().sessionId,
+              correlationId: options.correlationId,
+              nodeId: options.nodeId,
+              data: {
+                toolName: plan.toolName,
+                requestedTimeoutMs,
+                effectiveTimeoutMs: deadlineTimeoutMs,
+                remainingGroundingMs: remainingMs,
+              },
+            });
+          }
+        }
         const result = await this.executeToolForAgent(agentId, plan.toolName, plan.params, {
           reason: plan.reason,
           correlationId: options.correlationId,
@@ -13095,10 +13191,26 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         if (this.toolPlanner.hasSufficientWebEvidence(intentTask, context.calls)) return [];
         if (!loopConfig.enabled || !loopConfig.llmReplanning || !(actor instanceof UnifiedAgent)) return [];
         if (!this.shouldReplanToolLoop(intentTask, context.calls)) return [];
+        if (remainingGroundingMs() <= 1_000) {
+          this.emit({
+            type: 'agent.tool_planning.time_budget.exhausted',
+            agentId,
+            sessionId: this.getContext().sessionId,
+            correlationId: options.correlationId,
+            nodeId: options.nodeId,
+            data: {
+              round: context.round,
+              remainingMs: remainingGroundingMs(),
+              groundingMaxWallClockMs,
+            },
+          });
+          return [];
+        }
         const llmPlans = await actor.planNextToolRound({
           task,
           round: context.round,
           remainingCalls: context.remainingCalls,
+          requestTimeoutMs: planningRequestTimeoutMs(),
           tools: bindings
             .filter(binding => binding.enabled)
             .map(binding => {
@@ -13109,8 +13221,9 @@ For web-grounded work, use only facts present in the subagent report or runtime 
                 parameters: metadata?.parameters as Record<string, unknown> | undefined,
               };
           }),
-          calls: context.calls,
+          calls: [...priorPlannerCalls, ...context.calls],
         });
+        this.emitToolPlanningFailure(actor, agentId, options, context.round);
         return llmPlans.filter(plan => {
           if (plan.toolName === 'web.fetch') {
             return this.toolPlanner.isWebCandidateAligned(task, String(plan.params.url ?? ''));
@@ -13174,6 +13287,8 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       error: call.error,
       reason: call.reason,
       round: round.round,
+      startedAt: call.startedAt,
+      completedAt: call.completedAt,
     })));
     const warnings: string[] = [];
     const observedPaths: string[] = [];
@@ -13434,24 +13549,34 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       maxWallClockMs,
       toolAllowlist: ['fs.list', 'fs.read', 'fs.search', 'shell.exec'],
     });
+    const globalCalls = [...priorExecution.toolCalls, ...grounding.toolCalls];
     const items = this.extractTaskAcceptanceItems(userTask);
     const expectedIds = items.map((_, index) =>
       `acceptance_${String(index + 1).padStart(2, '0')}`
     );
-    const inventoryObserved = grounding.toolCalls.some(call =>
+    const inventoryObserved = globalCalls.some(call =>
       call.toolName === 'fs.list' && call.success
     );
-    const stateInspected = grounding.toolCalls.some(call =>
+    const stateInspected = globalCalls.some(call =>
       call.success && (
         call.toolName === 'fs.read'
         || call.toolName === 'fs.search'
         || call.toolName === 'shell.exec'
       )
     );
-    const verificationPassed = grounding.toolCalls.some(call =>
-      isSuccessfulWorkspaceVerificationCall(call)
+    const auditStateInspected = grounding.toolCalls.some(call =>
+      call.success && (
+        call.toolName === 'fs.list'
+        || call.toolName === 'fs.read'
+        || call.toolName === 'fs.search'
+        || call.toolName === 'shell.exec'
+      )
     );
-    const toolEvidenceSufficient = inventoryObserved && stateInspected && verificationPassed;
+    const verificationPassed = this.analyzeWorkspaceExecutionClosure(globalCalls).verificationPassed;
+    const toolEvidenceSufficient = inventoryObserved
+      && stateInspected
+      && auditStateInspected
+      && verificationPassed;
     let normalizedItems: WorkspaceAcceptanceAuditItem[] = expectedIds.map(id => ({
       id,
       status: 'unverified',
@@ -13479,13 +13604,20 @@ For web-grounded work, use only facts present in the subagent report or runtime 
             role: 'user',
             content: [
               `<acceptance_checklist>${this.buildTaskAcceptanceChecklist(userTask)}</acceptance_checklist>`,
-              `<audit_tool_evidence>${grounding.evidence.toolResultSummary?.slice(0, 20_000) || 'none'}</audit_tool_evidence>`,
+              `<global_tool_evidence>${[
+                priorExecution.evidence.toolResultSummary,
+                grounding.evidence.toolResultSummary,
+              ].filter(Boolean).join('\n\n').slice(-24_000) || 'none'}</global_tool_evidence>`,
               `<audit_warnings>${grounding.warnings.join('\n') || 'none'}</audit_warnings>`,
               `<audit_structure>${JSON.stringify({
                 inventoryObserved,
                 stateInspected,
+                auditStateInspected,
                 verificationPassed,
-                observedPaths: grounding.evidence.observedPaths.slice(0, 120),
+                observedPaths: Array.from(new Set([
+                  ...priorExecution.evidence.observedPaths,
+                  ...grounding.evidence.observedPaths,
+                ])).slice(0, 120),
               })}</audit_structure>`,
             ].join('\n\n'),
           },
@@ -13543,8 +13675,9 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         ...audit,
         inventoryObserved,
         stateInspected,
+        auditStateInspected,
         verificationPassed,
-        toolCalls: grounding.toolCalls.map(call => ({
+        toolCalls: globalCalls.map(call => ({
           toolName: call.toolName,
           success: call.success,
         })),
@@ -13562,6 +13695,97 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     };
   }
 
+  private collectDelegatedExecutionGrounding(
+    subagents: RootMediatedSpawnResult[],
+    teamResults: TeamRunResult[]
+  ): GroundingRunResult | undefined {
+    const results: RunAgentResult[] = [];
+    const seenResults = new Set<RunAgentResult>();
+    const addResult = (result: RunAgentResult): void => {
+      if (seenResults.has(result)) return;
+      seenResults.add(result);
+      results.push(result);
+    };
+    for (const subagent of subagents) addResult(subagent.subagentResult);
+    for (const team of teamResults) {
+      for (const member of team.members) addResult(member);
+    }
+    if (results.length === 0) return undefined;
+
+    const seenCalls = new Set<ToolCallRecord>();
+    const indexedCalls = results.flatMap((result, resultIndex) =>
+      result.toolCalls
+        .filter(call => {
+          if (seenCalls.has(call)) return false;
+          seenCalls.add(call);
+          return true;
+        })
+        .map((call, callIndex) => ({
+          call,
+          originalIndex: resultIndex * 10_000 + callIndex,
+        }))
+    );
+    const allTimestamped = indexedCalls.every(item =>
+      Number.isFinite(item.call.completedAt ?? item.call.startedAt)
+    );
+    if (allTimestamped) {
+      indexedCalls.sort((left, right) =>
+        (left.call.completedAt ?? left.call.startedAt ?? 0)
+        - (right.call.completedAt ?? right.call.startedAt ?? 0)
+        || left.originalIndex - right.originalIndex
+      );
+    }
+    const toolCalls = indexedCalls.map(item => item.call);
+    const startedAt = Math.min(
+      ...results.map(result => result.toolLoop?.startedAt).filter((value): value is number => Number.isFinite(value)),
+      Date.now()
+    );
+    const completedAt = Math.max(
+      ...results.map(result => result.toolLoop?.completedAt).filter((value): value is number => Number.isFinite(value)),
+      startedAt
+    );
+    return {
+      toolCalls,
+      grounded: results.some(result => result.grounded),
+      warnings: results.flatMap(result => result.warnings),
+      context: results
+        .map(result => result.evidence.toolResultSummary)
+        .filter((value): value is string => Boolean(value))
+        .join('\n\n'),
+      evidence: {
+        toolGrounded: results.some(result => result.evidence.toolGrounded),
+        outputGrounded: results.every(result => result.evidence.outputGrounded),
+        observedPaths: Array.from(new Set(
+          results.flatMap(result => result.evidence.observedPaths)
+        )),
+        observedUrls: Array.from(new Set(
+          results.flatMap(result => result.evidence.observedUrls ?? [])
+        )),
+        relevantObservedUrls: Array.from(new Set(
+          results.flatMap(result => result.evidence.relevantObservedUrls ?? [])
+        )),
+        discoveredUrls: Array.from(new Set(
+          results.flatMap(result => result.evidence.discoveredUrls ?? [])
+        )),
+        toolResultSummary: results
+          .map(result => result.evidence.toolResultSummary)
+          .filter((value): value is string => Boolean(value))
+          .join('\n\n'),
+      },
+      toolLoop: {
+        rounds: [],
+        totalCalls: toolCalls.length,
+        successfulCalls: toolCalls.filter(call => call.success).length,
+        failedCalls: toolCalls.filter(call => !call.success).length,
+        stopReason: results.some(result => result.toolLoop?.stopReason === 'max_wall_clock')
+          ? 'max_wall_clock'
+          : 'completed',
+        startedAt,
+        completedAt,
+      },
+    };
+  }
+
   private async runRequiredRootExecution(
     userTask: string,
     subagents: RootMediatedSpawnResult[],
@@ -13569,6 +13793,10 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     correlationId: string
   ): Promise<GroundingRunResult> {
     const attempts: GroundingRunResult[] = [];
+    const delegatedExecution = this.collectDelegatedExecutionGrounding(subagents, teamResults);
+    const combineWithDelegatedExecution = (): GroundingRunResult => this.combineGroundingRuns(
+      delegatedExecution ? [delegatedExecution, ...attempts] : attempts
+    );
     const maxAttempts = Math.max(
       1,
       this.workspaceRuntimeConfig?.delegation.rootSteps.maxExecutionClosureAttempts ?? 3
@@ -13603,11 +13831,34 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         },
       });
       const priorExecution = attempts.length > 0
-        ? this.combineGroundingRuns(attempts)
+        ? combineWithDelegatedExecution()
         : undefined;
-      const baseTask = priorExecution
+      let baseTask = priorExecution
         ? this.buildRootExecutionRepairTask(userTask, priorExecution, attempt)
         : this.buildRootExecutionClosureTask(userTask, subagents, teamResults);
+      if (!priorExecution && delegatedExecution && delegatedExecution.toolCalls.length > 0) {
+        const delegatedClosure = this.analyzeWorkspaceExecutionClosure(
+          delegatedExecution.toolCalls
+        );
+        baseTask = [
+          baseTask,
+          '<delegated_execution_state>',
+          JSON.stringify({
+            toolCalls: delegatedExecution.toolCalls.length,
+            successfulToolCalls: delegatedExecution.toolCalls.filter(call => call.success).length,
+            mutationApplied: delegatedClosure.mutationApplied,
+            verificationPassedAfterLatestMutation: delegatedClosure.verificationPassed,
+            observedPaths: delegatedExecution.evidence.observedPaths.slice(0, 120),
+          }),
+          '</delegated_execution_state>',
+          [
+            'Global closure attention:',
+            '- Treat successful delegated mutations as existing workspace state; inspect them before deciding whether another edit is necessary.',
+            '- If the delegated state already implements the request, prioritize an independent root verification instead of repeating the edit.',
+            '- Repair only concrete remaining defects, then run verification after the latest mutation performed by any actor.',
+          ].join('\n'),
+        ].join('\n\n');
+      }
       const executionKnowledge = await this.getContext().memory.readExecutionKnowledge(
         userTask,
         this.workspaceRuntimeConfig?.delegation.rootSteps.maxFeedbackItemsInPrompt ?? 24
@@ -13630,10 +13881,11 @@ For web-grounded work, use only facts present in the subagent report or runtime 
           archetype: 'coder',
           intentTask: userTask,
           maxWallClockMs: attemptWallClockMs,
+          priorToolCalls: priorExecution?.toolCalls ?? delegatedExecution?.toolCalls,
         }
       );
       attempts.push(current);
-      let combined = this.combineGroundingRuns(attempts);
+      let combined = combineWithDelegatedExecution();
       if (this.hasSuccessfulWorkspaceMutation(current.toolCalls)) {
         combined.acceptanceAudit = undefined;
       }
@@ -13655,7 +13907,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
             Math.max(1_000, auditRemainingMs)
           );
           attempts.push(audit);
-          combined = this.combineGroundingRuns(attempts);
+          combined = combineWithDelegatedExecution();
           closure = this.analyzeWorkspaceExecutionClosure(
             combined.toolCalls,
             combined.acceptanceAudit,
@@ -13681,7 +13933,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       });
       if (closure.closed) return combined;
     }
-    return this.combineGroundingRuns(attempts);
+    return combineWithDelegatedExecution();
   }
 
   private buildRootExecutionRepairTask(

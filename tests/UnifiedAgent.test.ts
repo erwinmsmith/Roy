@@ -155,6 +155,25 @@ class ContextIdentitySkill extends EchoSkill {
   }
 }
 
+class CapturingToolPlanningLLM extends PlanningLLM {
+  messages: LLMMessage[] = [];
+  options?: LLMCompletionOptions;
+
+  constructor(private readonly failure?: Error) {
+    super('none');
+  }
+
+  override async completeJSON<T>(
+    messages: LLMMessage[],
+    options?: LLMCompletionOptions
+  ): Promise<T> {
+    this.messages = messages;
+    this.options = options;
+    if (this.failure) throw this.failure;
+    return { action: 'finish', reason: 'No more calls are needed.', calls: [] } as T;
+  }
+}
+
 describe('UnifiedAgent capability execution', () => {
   beforeEach(() => {
     actionRegistry.clear();
@@ -472,5 +491,58 @@ describe('UnifiedAgent capability execution', () => {
         params: { path: 'artifact.txt', content: 'repaired' },
       }),
     ]);
+  });
+
+  it('compacts long tool-planning tasks and propagates the planning deadline', async () => {
+    const llm = new CapturingToolPlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'bounded-tool-planner',
+      goal: 'plan bounded evidence collection',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.read'],
+    });
+    const longTask = `TASK_HEAD\n${'middle-context\n'.repeat(2_000)}TASK_TAIL`;
+
+    await agent.planNextToolRound({
+      task: longTask,
+      round: 1,
+      remainingCalls: 1,
+      requestTimeoutMs: 1_234,
+      tools: [{ name: 'fs.read' }],
+      calls: [],
+    });
+
+    const userPrompt = llm.messages.findLast(message => message.role === 'user')?.content ?? '';
+    expect(userPrompt).toContain('TASK_HEAD');
+    expect(userPrompt).toContain('TASK_TAIL');
+    expect(userPrompt).toContain('[runtime_compacted_middle_for_tool_planning]');
+    expect(userPrompt.length).toBeLessThan(22_000);
+    expect(llm.options?.timeoutMs).toBeGreaterThan(0);
+    expect(llm.options?.timeoutMs).toBeLessThanOrEqual(1_234);
+  });
+
+  it('classifies a tool-planning request timeout for runtime telemetry', async () => {
+    const llm = new CapturingToolPlanningLLM(new Error('Request timed out after 250ms'));
+    const agent = new UnifiedAgent({
+      name: 'timeout-tool-planner',
+      goal: 'plan bounded evidence collection',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.read'],
+    });
+
+    await expect(agent.planNextToolRound({
+      task: 'Inspect the current file.',
+      round: 1,
+      remainingCalls: 1,
+      requestTimeoutMs: 250,
+      tools: [{ name: 'fs.read' }],
+      calls: [],
+    })).resolves.toEqual([]);
+    expect(agent.getLastToolPlanningFailure()).toMatchObject({
+      timedOut: true,
+      message: 'Request timed out after 250ms',
+    });
   });
 });

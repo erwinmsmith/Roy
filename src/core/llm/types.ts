@@ -12,6 +12,8 @@ export interface LLMCompletionOptions {
   topP?: number;
   stop?: string[];
   stream?: boolean;
+  /** Per-call request deadline. Providers clamp this against their configured default. */
+  timeoutMs?: number;
 }
 
 export type TokenMetricAvailability = 'reported' | 'estimated' | 'unavailable';

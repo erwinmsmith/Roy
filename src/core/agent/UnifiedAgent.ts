@@ -40,6 +40,7 @@ export interface AgentToolRoundPlanningInput {
   task: string;
   round: number;
   remainingCalls: number;
+  requestTimeoutMs?: number;
   tools: Array<{ name: string; description?: string; parameters?: Record<string, unknown> }>;
   calls: ToolLoopCallRecord[];
 }
@@ -52,6 +53,11 @@ export class UnifiedAgent extends BaseAgent {
   private allowedActions?: Set<string>;
   private allowedTools?: Set<string>;
   private allowedSkills?: Set<string>;
+  private lastToolPlanningFailure?: {
+    message: string;
+    timedOut: boolean;
+    occurredAt: number;
+  };
 
   constructor(config: UnifiedAgentConfig) {
     super({
@@ -83,6 +89,7 @@ export class UnifiedAgent extends BaseAgent {
    * Runtime remains responsible for authorization and execution.
    */
   async planNextToolRound(input: AgentToolRoundPlanningInput): Promise<PlannedToolCall[]> {
+    this.lastToolPlanningFailure = undefined;
     if (!this.llm || input.remainingCalls <= 0 || input.tools.length === 0) return [];
     const authorized = new Set(input.tools
       .filter(tool => !this.allowedTools || this.allowedTools.has(tool.name))
@@ -134,7 +141,7 @@ export class UnifiedAgent extends BaseAgent {
       {
         role: 'user',
         content: [
-          `Task:\n${input.task}`,
+          `Task:\n${compactToolPlanningTask(input.task)}`,
           `Completed tool round: ${input.round}`,
           `Remaining call capacity: ${input.remainingCalls}`,
           `Execution state: ${JSON.stringify({
@@ -157,13 +164,24 @@ export class UnifiedAgent extends BaseAgent {
       let planningMessages = messages;
       let response: PlanningResponse = {};
       let plannedCalls: PlannedToolCall[] = [];
+      const planningDeadline = input.requestTimeoutMs === undefined
+        ? undefined
+        : Date.now() + Math.max(1, input.requestTimeoutMs);
       const completedCallFingerprints = new Set(input.calls.map(call =>
         plannedToolCallFingerprint(call)
       ));
       for (let attempt = 0; attempt < (executionRequired ? 3 : 1); attempt += 1) {
+        const remainingPlanningMs = planningDeadline === undefined
+          ? undefined
+          : Math.max(0, planningDeadline - Date.now());
+        if (remainingPlanningMs === 0) break;
         response = await this.completeJSONWithAccounting<PlanningResponse>(
           planningMessages,
-          { temperature: 0, maxTokens: executionRequired ? 4096 : 640 }
+          {
+            temperature: 0,
+            maxTokens: executionRequired ? 4096 : 640,
+            timeoutMs: remainingPlanningMs,
+          }
         );
         plannedCalls = normalizePlannedToolCalls(
           response,
@@ -229,8 +247,14 @@ export class UnifiedAgent extends BaseAgent {
       return plannedCalls;
     } catch (error) {
       logger.warn(`Agent ${this.name} could not plan another tool round:`, error);
+      const message = error instanceof Error ? error.message : String(error);
+      this.lastToolPlanningFailure = {
+        message: message.slice(0, 2_000),
+        timedOut: /\b(?:timed?\s*out|timeout|deadline|aborted?)\b/i.test(message),
+        occurredAt: Date.now(),
+      };
       if (authorized.has('web.fetch')) {
-        const urls = extractPlannerFallbackUrls(error instanceof Error ? error.message : String(error));
+        const urls = extractPlannerFallbackUrls(message);
         if (urls.length > 0) {
           return urls.slice(0, input.remainingCalls).map(url => ({
             toolName: 'web.fetch',
@@ -242,6 +266,16 @@ export class UnifiedAgent extends BaseAgent {
       }
       return [];
     }
+  }
+
+  getLastToolPlanningFailure(): {
+    message: string;
+    timedOut: boolean;
+    occurredAt: number;
+  } | undefined {
+    return this.lastToolPlanningFailure
+      ? { ...this.lastToolPlanningFailure }
+      : undefined;
   }
 
   /**
@@ -942,6 +976,18 @@ function plannedToolCallFingerprint(
     Object.entries(call.params).sort(([left], [right]) => left.localeCompare(right))
   );
   return `${call.toolName}:${JSON.stringify(sortedParams)}`;
+}
+
+function compactToolPlanningTask(task: string): string {
+  const maxChars = 18_000;
+  if (task.length <= maxChars) return task;
+  const headChars = 10_000;
+  const tailChars = maxChars - headChars;
+  return [
+    task.slice(0, headChars),
+    '[runtime_compacted_middle_for_tool_planning]',
+    task.slice(-tailChars),
+  ].join('\n');
 }
 
 function compactToolObservation(result: unknown, toolName: string): unknown {

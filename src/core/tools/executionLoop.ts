@@ -10,6 +10,8 @@ export interface ToolLoopCallRecord {
   result?: unknown;
   success: boolean;
   error?: string;
+  startedAt?: number;
+  completedAt?: number;
 }
 
 export interface ToolLoopRound {
@@ -91,8 +93,14 @@ export class AgentToolExecutionLoop {
           wallClockExceeded = true;
           break;
         }
+        const callStartedAt = Date.now();
         const outcome = await input.execute(plan, roundNumber);
-        calls.push({ ...plan, ...outcome });
+        calls.push({
+          ...plan,
+          ...outcome,
+          startedAt: callStartedAt,
+          completedAt: Date.now(),
+        });
         consecutiveFailures = outcome.success ? 0 : consecutiveFailures + 1;
         if (Date.now() - startedAt >= this.options.maxWallClockMs) {
           wallClockExceeded = true;

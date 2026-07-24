@@ -180,6 +180,55 @@ class FailedDelegationRecoveryLLM extends TerminalTaskLLM {
   }
 }
 
+class DelegatedMutationRootVerificationLLM extends TerminalTaskLLM {
+  override async *stream(messages: LLMMessage[]): AsyncGenerator<LLMStreamChunk, void, unknown> {
+    const text = messages.map(message => message.content).join('\n');
+    const content = text.includes('<root_execution_report>')
+      ? 'Accepted the delegated mutation after an independent root verification.'
+      : 'Created delegated-global.txt for root verification.';
+    yield { content, done: true };
+  }
+
+  override async completeJSON<T>(messages: LLMMessage[]): Promise<T> {
+    const system = messages.find(message => message.role === 'system')?.content ?? '';
+    const user = messages.findLast(message => message.role === 'user')?.content ?? '';
+    if (system.includes("root delegation controller")) {
+      return {
+        action: 'spawn_subagents',
+        reason: 'Delegate the implementation, then have root verify the resulting global state.',
+        continuationPolicy: 'finalize_after_round',
+        agents: [{
+          archetype: 'coder',
+          name: 'DelegatedWriter',
+          task: 'Create delegated-global.txt in the workspace with the exact content delegated.',
+          tools: ['fs.list', 'shell.exec'],
+          tomLevel: 0,
+        }],
+      } as T;
+    }
+    if (system.includes("delegation controller")) {
+      return { action: 'solve_directly', reason: 'The child should implement its assigned change.' } as T;
+    }
+    if (system.includes('plan authorized tool calls')) {
+      if (user.includes('Completed tool round:')
+        && !user.includes("test \"$(cat delegated-global.txt)\" = delegated")) {
+        return {
+          action: 'call_tools',
+          reason: 'Independently verify the delegated workspace mutation.',
+          calls: [{
+            toolName: 'shell.exec',
+            params: {
+              command: 'test -f delegated-global.txt && test "$(cat delegated-global.txt)" = delegated',
+            },
+          }],
+        } as T;
+      }
+      return { action: 'finish', reason: 'Root verification passed.', calls: [] } as T;
+    }
+    return {} as T;
+  }
+}
+
 class RetryingDirectExecutionLLM extends TerminalTaskLLM {
   override async *stream(): AsyncGenerator<LLMStreamChunk, void, unknown> {
     yield { content: 'Recovered the incomplete execution and verified artifact.txt.', done: true };
@@ -585,6 +634,135 @@ describe('benchmark terminal capability', () => {
       agentId: 'root',
       data: expect.objectContaining({ toolName: 'shell.exec' }),
     }));
+
+    await runtime.shutdown();
+  });
+
+  it('closes execution from a delegated mutation followed by root verification', async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), 'roy-delegated-global-closure-'));
+    await mkdir(path.join(workspace, '.roy'), { recursive: true });
+    await writeFile(path.join(workspace, 'delegated-global.txt'), 'delegated');
+    await writeFile(path.join(workspace, '.roy', 'config.json'), JSON.stringify({
+      tools: {
+        approval: {
+          readOnly: 'auto',
+          write: 'auto',
+          execute: 'auto',
+          overrides: {},
+        },
+        shell: {
+          mode: 'unrestricted',
+          shell: '/bin/sh',
+          defaultTimeoutMs: 10_000,
+          maxTimeoutMs: 60_000,
+          defaultMaxOutputBytes: 40_000,
+          maxCallsPerAgent: 10,
+        },
+        executionLoop: {
+          enabled: true,
+          maxRounds: 4,
+          maxCallsPerRun: 8,
+          maxConsecutiveFailures: 2,
+          maxWallClockMs: 30_000,
+          maxFetchesAfterSearch: 2,
+          llmReplanning: true,
+        },
+      },
+    }, null, 2));
+
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'delegated-global-closure-test',
+      workspaceCwd: workspace,
+      llmProvider: new DelegatedMutationRootVerificationLLM(),
+    });
+    const now = Date.now();
+    const delegatedResults = [{
+      node: { identity: { archetype: 'coder' } },
+      agent: { identity: { name: 'DelegatedWriter' } },
+      subagentResult: {
+        toolCalls: [{
+          toolName: 'shell.exec',
+          params: { command: "printf 'delegated' > delegated-global.txt" },
+          result: { exitCode: 0, stdout: '', stderr: '' },
+          success: true,
+          startedAt: now - 20,
+          completedAt: now - 10,
+        }],
+        grounded: true,
+        warnings: [],
+        context: '',
+        evidence: {
+          toolGrounded: true,
+          outputGrounded: true,
+          observedPaths: ['delegated-global.txt'],
+          toolResultSummary: 'DelegatedWriter wrote delegated-global.txt.',
+        },
+        toolLoop: {
+          rounds: [],
+          totalCalls: 1,
+          successfulCalls: 1,
+          failedCalls: 0,
+          stopReason: 'completed',
+          startedAt: now - 20,
+          completedAt: now - 10,
+        },
+        result: 'Created delegated-global.txt.',
+        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        agent: { identity: { name: 'DelegatedWriter' } },
+      },
+    }];
+    const runRequiredRootExecution = (runtime as unknown as {
+      runRequiredRootExecution: (
+        task: string,
+        subagents: unknown[],
+        teams: unknown[],
+        correlationId: string
+      ) => Promise<{
+        toolCalls: Array<{
+          toolName: string;
+          params: Record<string, unknown>;
+          success: boolean;
+        }>;
+      }>;
+    }).runRequiredRootExecution.bind(runtime);
+    const execution = await runRequiredRootExecution(
+      'Implement and verify delegated-global.txt in the workspace with the exact content delegated.',
+      delegatedResults,
+      [],
+      'delegated-global-closure-correlation'
+    );
+    const analyze = (runtime as unknown as {
+      analyzeWorkspaceExecutionClosure: (calls: Array<{
+        toolName: string;
+        params: Record<string, unknown>;
+        success: boolean;
+      }>) => {
+        closed: boolean;
+        mutationApplied: boolean;
+        verificationPassed: boolean;
+        lastMutationCallIndex: number;
+        lastVerificationCallIndex: number;
+      };
+    }).analyzeWorkspaceExecutionClosure.bind(runtime);
+
+    expect(analyze(execution.toolCalls)).toMatchObject({
+      closed: true,
+      mutationApplied: true,
+      verificationPassed: true,
+      lastMutationCallIndex: 0,
+    });
+    const rootShellCommands = runtime.getEvents()
+      .filter(event =>
+        event.type === 'tool.call'
+        && event.agentId === 'root'
+        && event.data?.toolName === 'shell.exec'
+      )
+      .map(event => String((event.data?.params as { command?: unknown } | undefined)?.command ?? ''));
+    expect(rootShellCommands).toContain(
+      'test -f delegated-global.txt && test "$(cat delegated-global.txt)" = delegated'
+    );
+    expect(rootShellCommands.some(command => command.includes('> delegated-global.txt'))).toBe(false);
 
     await runtime.shutdown();
   });
