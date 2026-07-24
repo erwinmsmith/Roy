@@ -78,6 +78,41 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('turns a verifier traceback into a bounded source read', () => {
+    const plans = new AgentToolPlanner().planWorkspaceFailureFollowUps({
+      bindings: [
+        { name: 'fs.read', enabled: true },
+        { name: 'shell.exec', enabled: true },
+      ],
+      calls: [{
+        toolName: 'shell.exec',
+        params: { command: 'pytest -q' },
+        success: false,
+        result: {
+          cwd: '/app',
+          stdout: '',
+          stderr: [
+            'Traceback (most recent call last):',
+            '  File "/app/src/dq_audit/audit.py", line 612',
+            '    batch = batch_def.get_batch()',
+            'IndentationError: unexpected indent',
+          ].join('\n'),
+        },
+      }],
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.read',
+        params: {
+          path: 'src/dq_audit/audit.py',
+          startLine: 587,
+          endLine: 637,
+        },
+      }),
+    ]);
+  });
+
   it('reads the package manifest for an architecture critic', () => {
     const plans = new AgentToolPlanner().plan({
       task: 'Identify architectural coupling risks using filesystem evidence.',

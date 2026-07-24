@@ -220,6 +220,61 @@ export class AgentToolPlanner {
       }));
   }
 
+  planWorkspaceFailureFollowUps(input: {
+    calls: ObservedToolCall[];
+    bindings: ToolPlanBinding[];
+  }): PlannedToolCall[] {
+    if (!input.bindings.some(binding => binding.enabled && binding.name === 'fs.read')) return [];
+    let latestFailureIndex = -1;
+    for (let index = input.calls.length - 1; index >= 0; index -= 1) {
+      const call = input.calls[index]!;
+      if (call.toolName === 'shell.exec' && !call.success) {
+        latestFailureIndex = index;
+        break;
+      }
+    }
+    if (latestFailureIndex < 0) return [];
+    const failure = input.calls[latestFailureIndex]!;
+    const shell = failure.result as {
+      cwd?: unknown;
+      stdout?: unknown;
+      stderr?: unknown;
+    } | undefined;
+    const output = [
+      String(shell?.stdout ?? ''),
+      String(shell?.stderr ?? ''),
+    ].filter(Boolean).join('\n');
+    const locations = this.extractFailureLocations(output, String(shell?.cwd ?? ''));
+    return locations
+      .map(location => ({
+        toolName: 'fs.read',
+        params: {
+          path: location.path,
+          startLine: Math.max(1, location.line - 25),
+          endLine: location.line + 25,
+        },
+        reason: `Read bounded source context around the verifier-reported failure at ${location.path}:${location.line}.`,
+        groundingRequired: true,
+      } satisfies PlannedToolCall))
+      .filter(plan => {
+        let latestReadIndex = -1;
+        for (let index = input.calls.length - 1; index > latestFailureIndex; index -= 1) {
+          const call = input.calls[index]!;
+          if (call.toolName === plan.toolName
+            && JSON.stringify(call.params) === JSON.stringify(plan.params)) {
+            latestReadIndex = index;
+            break;
+          }
+        }
+        if (latestReadIndex < 0) return true;
+        return input.calls.slice(latestReadIndex + 1).some(call =>
+          call.success && (call.toolName === 'fs.write' || call.toolName === 'fs.replace'
+            || call.toolName === 'shell.exec' && this.looksLikeShellMutation(String(call.params.command ?? '')))
+        );
+      })
+      .slice(0, 2);
+  }
+
   hasSufficientWebEvidence(task: string, calls: ObservedToolCall[]): boolean {
     return this.relevantWebDocuments(task, calls).size >= this.requiredWebSourceCount(task);
   }
@@ -237,6 +292,46 @@ export class AgentToolPlanner {
     return [...new Set([...matches]
       .map(match => match[1].replace(/^\.\//, ''))
       .filter(value => value.length > 0))];
+  }
+
+  private extractFailureLocations(output: string, cwd: string): Array<{ path: string; line: number }> {
+    const locations: Array<{ path: string; line: number }> = [];
+    const add = (rawPath: string, rawLine: string): void => {
+      const line = Number(rawLine);
+      if (!Number.isInteger(line) || line <= 0) return;
+      let candidate = rawPath.trim().replace(/\\/g, '/');
+      const normalizedCwd = cwd.trim().replace(/\\/g, '/').replace(/\/+$/, '');
+      if (normalizedCwd && candidate.startsWith(`${normalizedCwd}/`)) {
+        candidate = candidate.slice(normalizedCwd.length + 1);
+      }
+      candidate = candidate.replace(/^\.\//, '');
+      if (!candidate
+        || candidate.startsWith('/')
+        || candidate.startsWith('../')
+        || !/\.(?:py|ts|tsx|js|jsx|mjs|cjs|java|go|rs|rb|php)$/i.test(candidate)) {
+        return;
+      }
+      locations.push({ path: candidate, line });
+    };
+    for (const match of output.matchAll(/\bFile\s+["']([^"']+)["'],\s+line\s+(\d+)/g)) {
+      add(String(match[1]), String(match[2]));
+    }
+    for (const match of output.matchAll(/(?:^|\n)\s*([A-Za-z0-9_./-]+\.(?:py|ts|tsx|js|jsx|mjs|cjs|java|go|rs|rb|php)):(\d+)(?::\d+)?/g)) {
+      add(String(match[1]), String(match[2]));
+    }
+    const seen = new Set<string>();
+    return locations.reverse().filter(location => {
+      const key = `${location.path}:${location.line}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
+  private looksLikeShellMutation(command: string): boolean {
+    return /\b(?:apply_patch|touch|mkdir|cp|mv|rm|install|chmod|truncate|sed\s+-i|perl\s+-pi)\b/i.test(command)
+      || /\b(?:python|python3|node)\b[\s\S]*(?:writeFile|write_text|write_bytes|open\s*\([^)]*['"][wa]['"])/i.test(command)
+      || /(?:^|[;&|]\s*)(?:echo|printf)\b[^\n]*(?:>>?|tee)\s*\S+/i.test(command);
   }
 
   private extractExplicitShellCommands(task: string): string[] {

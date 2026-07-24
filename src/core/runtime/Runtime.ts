@@ -13327,6 +13327,25 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       startedAt: call.startedAt,
       completedAt: call.completedAt,
     }));
+    for (let index = plans.length - 1; index >= 0; index -= 1) {
+      const plan = plans[index]!;
+      if (!this.shouldSkipUnchangedFailedVerification(plan, options.priorToolCalls ?? [])) {
+        continue;
+      }
+      plans.splice(index, 1);
+      this.emit({
+        type: 'tool.plan.cached_failure.skipped',
+        agentId,
+        sessionId: this.getContext().sessionId,
+        correlationId: options.correlationId,
+        nodeId: options.nodeId,
+        data: {
+          toolName: plan.toolName,
+          params: plan.params,
+          reason: 'equivalent_verification_failed_without_later_mutation',
+        },
+      });
+    }
     const loopConfig = this.workspaceRuntimeConfig?.tools.executionLoop ?? {
       enabled: true,
       maxRounds: 6,
@@ -13478,6 +13497,13 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         return { result: result.result, success: result.success, error: result.error };
       },
       planNext: async context => {
+        const failureContextPlans = this.toolPlanner.planWorkspaceFailureFollowUps({
+          calls: [...priorPlannerCalls, ...context.calls],
+          bindings,
+        });
+        if (failureContextPlans.length > 0) {
+          return failureContextPlans.slice(0, context.remainingCalls);
+        }
         const deterministic = this.toolPlanner.planWebFollowUps({
           task: intentTask,
           calls: context.calls,
@@ -13752,7 +13778,9 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       || /\b(?:multi-step|continue|iterate|until|cross-check|multiple sources|independent sources)\b/i.test(task);
   }
 
-  private toolPlanFingerprint(plan: PlannedToolCall): string {
+  private toolPlanFingerprint(
+    plan: Pick<PlannedToolCall, 'toolName' | 'params'>
+  ): string {
     if (plan.toolName === 'web.fetch') {
       return `${plan.toolName}:${this.canonicalWebDocumentUrl(String(plan.params.url ?? ''))}`;
     }
@@ -13761,6 +13789,25 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       return `${plan.toolName}:${query}`;
     }
     return `${plan.toolName}:${JSON.stringify(plan.params, Object.keys(plan.params).sort())}`;
+  }
+
+  private shouldSkipUnchangedFailedVerification(
+    plan: PlannedToolCall,
+    priorCalls: ToolCallRecord[]
+  ): boolean {
+    if (!isWorkspaceVerificationCall({ ...plan, success: true })) return false;
+    const fingerprint = this.toolPlanFingerprint(plan);
+    let previousIndex = -1;
+    for (let index = priorCalls.length - 1; index >= 0; index -= 1) {
+      if (this.toolPlanFingerprint(priorCalls[index]!) === fingerprint) {
+        previousIndex = index;
+        break;
+      }
+    }
+    if (previousIndex < 0 || priorCalls[previousIndex]!.success) return false;
+    return !priorCalls
+      .slice(previousIndex + 1)
+      .some(call => isSuccessfulWorkspaceMutationCall(call));
   }
 
   private buildGroundedTask(task: string, grounding: { context: string; warnings: string[] }): string {

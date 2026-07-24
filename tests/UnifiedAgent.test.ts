@@ -102,6 +102,40 @@ class MutationRepairPlanningLLM extends PlanningLLM {
   }
 }
 
+class FragileWriterThenReplacePlanningLLM extends PlanningLLM {
+  constructor() {
+    super('none');
+  }
+
+  override async completeJSON<T>(): Promise<T> {
+    this.jsonCalls += 1;
+    if (this.jsonCalls === 1) {
+      return {
+        action: 'call_tools',
+        reason: 'Rewrite a source line through an inline interpreter.',
+        calls: [{
+          toolName: 'shell.exec',
+          params: {
+            command: "python -c \"from pathlib import Path; p=Path('src/app.py'); p.write_text('fixed')\"",
+          },
+        }],
+      } as T;
+    }
+    return {
+      action: 'call_tools',
+      reason: 'Use the dedicated exact replacement tool.',
+      calls: [{
+        toolName: 'fs.replace',
+        params: {
+          path: 'src/app.py',
+          oldText: 'broken',
+          newText: 'fixed',
+        },
+      }],
+    } as T;
+  }
+}
+
 class EchoTool implements Tool {
   readonly name = 'echo-tool';
   readonly description = 'Echoes a value';
@@ -557,6 +591,93 @@ describe('UnifiedAgent capability execution', () => {
       expect.objectContaining({
         toolName: 'fs.write',
         params: { path: 'artifact.txt', content: 'repaired' },
+      }),
+    ]);
+  });
+
+  it('allows the same verification command after a newer repair mutation', async () => {
+    const llm = new MutationRepairPlanningLLM(true);
+    const agent = new UnifiedAgent({
+      name: 'post-repair-verifier',
+      goal: 'verify the newest workspace state',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.write', 'shell.exec'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: 'Implement the project change and run tests.',
+      round: 3,
+      remainingCalls: 2,
+      tools: [{ name: 'fs.write' }, { name: 'shell.exec' }],
+      calls: [
+        {
+          toolName: 'shell.exec',
+          params: { command: 'pytest -q' },
+          reason: 'verify initial implementation',
+          groundingRequired: true,
+          success: false,
+          error: 'tests failed',
+        },
+        {
+          toolName: 'fs.write',
+          params: { path: 'artifact.txt', content: 'repaired' },
+          reason: 'repair the failure',
+          groundingRequired: true,
+          success: true,
+        },
+      ],
+    });
+
+    expect(llm.jsonCalls).toBe(1);
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'shell.exec',
+        params: { command: 'pytest -q' },
+      }),
+    ]);
+  });
+
+  it('rejects fragile inline shell writers when dedicated file tools are available', async () => {
+    const llm = new FragileWriterThenReplacePlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'safe-source-repair-agent',
+      goal: 'repair source without shell quoting corruption',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.read', 'fs.replace', 'fs.write', 'shell.exec'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: 'Repair src/app.py and run its verification.',
+      executionRequired: true,
+      round: 2,
+      remainingCalls: 3,
+      tools: [
+        { name: 'fs.read' },
+        { name: 'fs.replace' },
+        { name: 'fs.write' },
+        { name: 'shell.exec' },
+      ],
+      calls: [{
+        toolName: 'fs.read',
+        params: { path: 'src/app.py', startLine: 10, endLine: 20 },
+        reason: 'Inspect the reported failure.',
+        groundingRequired: true,
+        success: true,
+        result: { content: 'broken' },
+      }],
+    });
+
+    expect(llm.jsonCalls).toBe(2);
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.replace',
+        params: {
+          path: 'src/app.py',
+          oldText: 'broken',
+          newText: 'fixed',
+        },
       }),
     ]);
   });

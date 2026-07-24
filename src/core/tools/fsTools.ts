@@ -13,6 +13,9 @@ export interface FsReadResult {
   content: string;
   bytes: number;
   truncated: boolean;
+  startLine: number;
+  endLine: number;
+  totalLines: number;
 }
 
 export interface FsWriteResult {
@@ -96,10 +99,12 @@ export class FsListTool implements Tool {
 
 export class FsReadTool implements Tool {
   readonly name = 'fs.read';
-  readonly description = 'Read a text file inside the current workspace.';
+  readonly description = 'Read a text file inside the current workspace. Use inclusive 1-based startLine/endLine ranges around reported errors or symbols instead of rereading a large file from the beginning.';
   readonly version = '0.1.0';
   readonly parameters = {
     path: { type: 'string' as const, required: true, description: 'Relative file path inside the workspace.' },
+    startLine: { type: 'number' as const, required: false, description: 'Optional inclusive 1-based first line to return.' },
+    endLine: { type: 'number' as const, required: false, description: 'Optional inclusive 1-based last line to return.' },
     maxBytes: { type: 'number' as const, required: false, description: 'Maximum bytes to return.' },
   };
 
@@ -112,6 +117,19 @@ export class FsReadTool implements Tool {
     }
     if (params.maxBytes !== undefined && (typeof params.maxBytes !== 'number' || !Number.isFinite(params.maxBytes) || params.maxBytes <= 0)) {
       errors.push('maxBytes must be a positive number when provided');
+    }
+    for (const field of ['startLine', 'endLine'] as const) {
+      if (params[field] !== undefined
+        && (typeof params[field] !== 'number'
+          || !Number.isInteger(params[field])
+          || Number(params[field]) <= 0)) {
+        errors.push(`${field} must be a positive integer when provided`);
+      }
+    }
+    if (typeof params.startLine === 'number'
+      && typeof params.endLine === 'number'
+      && params.endLine < params.startLine) {
+      errors.push('endLine must be greater than or equal to startLine');
     }
     return { valid: errors.length === 0, errors: errors.length > 0 ? errors : undefined };
   }
@@ -130,14 +148,41 @@ export class FsReadTool implements Tool {
       }
       const maxBytes = Math.min(Number(params.maxBytes ?? DEFAULT_MAX_BYTES), DEFAULT_MAX_BYTES);
       const content = await readFile(target, 'utf8');
-      const truncated = Buffer.byteLength(content, 'utf8') > maxBytes;
+      const lines = content.length === 0 ? [] : content.split(/\r?\n/);
+      const totalLines = lines.length;
+      const hasLineRange = params.startLine !== undefined || params.endLine !== undefined;
+      const requestedStartLine = Number(params.startLine ?? 1);
+      const requestedEndLine = Number(params.endLine ?? Math.max(totalLines, 1));
+      if (totalLines > 0 && requestedStartLine > totalLines) {
+        return {
+          success: false,
+          error: `startLine ${requestedStartLine} exceeds the file's ${totalLines} lines`,
+        };
+      }
+      const startLine = totalLines === 0 ? 1 : requestedStartLine;
+      const endLine = totalLines === 0
+        ? 0
+        : Math.min(requestedEndLine, totalLines);
+      const selectedContent = !hasLineRange
+        ? content
+        : totalLines === 0
+          ? ''
+          : lines.slice(startLine - 1, endLine).join('\n');
+      const selectedBytes = Buffer.byteLength(selectedContent, 'utf8');
+      const truncated = selectedBytes > maxBytes;
+      const returnedContent = truncated
+        ? Buffer.from(selectedContent).subarray(0, maxBytes).toString('utf8')
+        : selectedContent;
       return {
         success: true,
         result: {
           path: path.relative(workspaceRoot, target),
-          content: truncated ? Buffer.from(content).subarray(0, maxBytes).toString('utf8') : content,
-          bytes: Math.min(Buffer.byteLength(content, 'utf8'), maxBytes),
+          content: returnedContent,
+          bytes: Buffer.byteLength(returnedContent, 'utf8'),
           truncated,
+          startLine,
+          endLine,
+          totalLines,
         } satisfies FsReadResult,
       };
     } catch (error) {

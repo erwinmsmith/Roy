@@ -171,9 +171,6 @@ export class UnifiedAgent extends BaseAgent {
       const planningDeadline = input.requestTimeoutMs === undefined
         ? undefined
         : Date.now() + Math.max(1, input.requestTimeoutMs);
-      const completedCallFingerprints = new Set(input.calls.map(call =>
-        plannedToolCallFingerprint(call)
-      ));
       const maxPlanningAttempts = executionRequired ? 3 : 1;
       for (let attempt = 0; attempt < maxPlanningAttempts; attempt += 1) {
         const remainingPlanningMs = planningDeadline === undefined
@@ -217,7 +214,7 @@ export class UnifiedAgent extends BaseAgent {
           authorized,
           input.remainingCalls,
           input.round
-        ).filter(call => !completedCallFingerprints.has(plannedToolCallFingerprint(call)));
+        ).filter(call => !shouldSuppressRepeatedPlannedCall(call, input.calls));
         const plannedInspection = plannedCalls.some(call =>
           call.toolName === 'fs.list'
           || call.toolName === 'fs.read'
@@ -987,6 +984,7 @@ function normalizePlannedToolCalls(
   if (response.action !== 'call_tools' || !Array.isArray(response.calls)) return [];
   return response.calls
     .filter(call => typeof call.toolName === 'string' && authorized.has(call.toolName))
+    .filter(call => !isFragileShellFileWriter(call, authorized))
     .slice(0, remainingCalls)
     .map(call => ({
       toolName: String(call.toolName),
@@ -996,6 +994,44 @@ function normalizePlannedToolCalls(
       reason: response.reason?.trim() || `Agent requested another tool round after observing round ${round}.`,
       groundingRequired: true,
     }));
+}
+
+function isFragileShellFileWriter(
+  call: { toolName?: unknown; params?: unknown },
+  authorized: Set<string>
+): boolean {
+  if (call.toolName !== 'shell.exec'
+    || (!authorized.has('fs.write') && !authorized.has('fs.replace'))) {
+    return false;
+  }
+  const params = call.params && typeof call.params === 'object' && !Array.isArray(call.params)
+    ? call.params as Record<string, unknown>
+    : {};
+  const command = String(params.command ?? '');
+  return /\b(?:python|python3|node)\b[\s\S]*(?:writeFile(?:Sync)?|write_text|write_bytes|writelines|open\s*\([^)]*['"][wa]['"])/i.test(command);
+}
+
+function shouldSuppressRepeatedPlannedCall(
+  planned: PlannedToolCall,
+  completed: ToolLoopCallRecord[]
+): boolean {
+  const fingerprint = plannedToolCallFingerprint(planned);
+  let previousIndex = -1;
+  for (let index = completed.length - 1; index >= 0; index -= 1) {
+    if (plannedToolCallFingerprint(completed[index]!) === fingerprint) {
+      previousIndex = index;
+      break;
+    }
+  }
+  if (previousIndex < 0) return false;
+  const mutationAfterPrevious = completed
+    .slice(previousIndex + 1)
+    .some(call => isSuccessfulWorkspaceMutation(call));
+  const repeatCanObserveNewWorkspaceState = planned.toolName === 'fs.list'
+    || planned.toolName === 'fs.read'
+    || planned.toolName === 'fs.search'
+    || isSuccessfulWorkspaceVerification({ ...planned, success: true });
+  return !repeatCanObserveNewWorkspaceState || !mutationAfterPrevious;
 }
 
 function plannedToolCallFingerprint(

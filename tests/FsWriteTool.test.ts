@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { FsReplaceTool, FsSearchTool, FsWriteTool } from '../src/core/tools/index.js';
+import { FsReadTool, FsReplaceTool, FsSearchTool, FsWriteTool } from '../src/core/tools/index.js';
 
 describe('fs.write tool', () => {
   it('writes and appends text inside the configured workspace', async () => {
@@ -28,6 +28,51 @@ describe('fs.write tool', () => {
 
     expect(result.success).toBe(false);
     expect(result.error).toContain('inside the configured workspace');
+  });
+});
+
+describe('fs.read tool', () => {
+  it('reads an inclusive line range around a reported failure', async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), 'roy-fs-read-range-'));
+    await writeFile(
+      path.join(workspace, 'implementation.py'),
+      Array.from({ length: 20 }, (_, index) => `line ${index + 1}`).join('\n'),
+      'utf8'
+    );
+    const tool = new FsReadTool(workspace);
+    const result = await tool.execute({
+      path: 'implementation.py',
+      startLine: 8,
+      endLine: 12,
+    });
+
+    expect(result).toEqual({
+      success: true,
+      result: {
+        path: 'implementation.py',
+        content: 'line 8\nline 9\nline 10\nline 11\nline 12',
+        bytes: 37,
+        truncated: false,
+        startLine: 8,
+        endLine: 12,
+        totalLines: 20,
+      },
+    });
+  });
+
+  it('validates line ranges and reports a start beyond the file', async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), 'roy-fs-read-range-invalid-'));
+    await writeFile(path.join(workspace, 'short.txt'), 'one\ntwo', 'utf8');
+    const tool = new FsReadTool(workspace);
+
+    expect(tool.validate({ path: 'short.txt', startLine: 3, endLine: 2 })).toEqual({
+      valid: false,
+      errors: ['endLine must be greater than or equal to startLine'],
+    });
+    await expect(tool.execute({ path: 'short.txt', startLine: 3 })).resolves.toMatchObject({
+      success: false,
+      error: "startLine 3 exceeds the file's 2 lines",
+    });
   });
 });
 
