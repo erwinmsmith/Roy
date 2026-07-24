@@ -195,25 +195,34 @@ export class UnifiedAgent extends BaseAgent {
             }
           );
         } catch (error) {
-          const canRetry = executionRequired
-            && attempt + 1 < maxPlanningAttempts
-            && isRetryableToolPlanningResponseError(error)
-            && (planningDeadline === undefined || Date.now() < planningDeadline);
-          if (!canRetry) throw error;
-          planningMessages = [
-            ...planningMessages,
-            {
-              role: 'user',
-              content: [
-                'The previous tool plan was incomplete or was not valid JSON.',
-                'Return one complete compact JSON object only, with no analysis or markdown.',
-                'Request at most one mutation call in this response.',
-                'Keep fs.write content or fs.replace replacement text within 6000 characters.',
-                'For a larger rewrite, emit only the next bounded chunk and continue with fs.write mode=append in a later tool round.',
-              ].join('\n'),
-            },
-          ];
-          continue;
+          const recoveredMutation = recoverTruncatedFsWriteResponse(
+            error,
+            authorized,
+            input.calls
+          );
+          if (recoveredMutation) {
+            response = recoveredMutation;
+          } else {
+            const canRetry = executionRequired
+              && attempt + 1 < maxPlanningAttempts
+              && isRetryableToolPlanningResponseError(error)
+              && (planningDeadline === undefined || Date.now() < planningDeadline);
+            if (!canRetry) throw error;
+            planningMessages = [
+              ...planningMessages,
+              {
+                role: 'user',
+                content: [
+                  'The previous tool plan was incomplete or was not valid JSON.',
+                  'Return one complete compact JSON object only, with no analysis or markdown.',
+                  'Request at most one mutation call in this response.',
+                  'Keep fs.write content or fs.replace replacement text within 6000 characters.',
+                  'For a larger rewrite, emit only the next bounded chunk and continue with fs.write mode=append in a later tool round.',
+                ].join('\n'),
+              },
+            ];
+            continue;
+          }
         }
         plannedCalls = normalizePlannedToolCalls(
           response,
@@ -1053,6 +1062,105 @@ function isRetryableToolPlanningResponseError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return message.startsWith('Failed to parse JSON response')
     || message === 'Empty JSON response';
+}
+
+function recoverTruncatedFsWriteResponse(
+  error: unknown,
+  authorized: Set<string>,
+  completed: ToolLoopCallRecord[]
+): {
+  action: 'call_tools';
+  reason: string;
+  calls: Array<{ toolName: 'fs.write'; params: Record<string, unknown> }>;
+} | undefined {
+  if (!authorized.has('fs.write')) return undefined;
+  const message = error instanceof Error ? error.message : String(error);
+  const prefix = 'Failed to parse JSON response:';
+  if (!message.startsWith(prefix)) return undefined;
+  const raw = message.slice(prefix.length);
+  const writeIndex = raw.search(/"toolName"\s*:\s*"fs\.write"/);
+  if (writeIndex < 0) return undefined;
+  const writePayload = raw.slice(writeIndex);
+  const pathField = extractPartialJsonStringField(writePayload, 'path');
+  const contentField = extractPartialJsonStringField(writePayload, 'content');
+  const filePath = pathField?.value.trim() ?? '';
+  if (!filePath || !contentField || contentField.value.length < 32) return undefined;
+
+  let content = contentField.value.slice(0, 6_000);
+  if (!contentField.complete) {
+    const lastNewline = content.lastIndexOf('\n');
+    const completeLines = lastNewline >= 0 ? content.slice(0, lastNewline + 1) : '';
+    if (completeLines.trim().length >= 16) content = completeLines;
+  }
+  if (content.trim().length < 16) return undefined;
+
+  const priorRecoveredChunk = [...completed].reverse().find(call =>
+    call.toolName === 'fs.write'
+    && call.success
+    && String(call.params.path ?? '') === filePath
+    && call.reason?.includes('truncated structured fs.write')
+  );
+  const priorContent = String(priorRecoveredChunk?.params.content ?? '');
+  const restartsFromPriorPrefix = priorContent.length > 0
+    && content.startsWith(priorContent.slice(0, Math.min(160, priorContent.length)));
+  const mode = priorRecoveredChunk && !restartsFromPriorPrefix
+    ? 'append'
+    : 'overwrite';
+  return {
+    action: 'call_tools',
+    reason: 'Recovered a bounded source chunk from a truncated structured fs.write response so generated implementation work is not discarded.',
+    calls: [{
+      toolName: 'fs.write',
+      params: {
+        path: filePath,
+        content,
+        mode,
+        createDirectories: true,
+      },
+    }],
+  };
+}
+
+function extractPartialJsonStringField(
+  input: string,
+  field: string
+): { value: string; complete: boolean } | undefined {
+  const fieldMatch = new RegExp(`"${field}"\\s*:\\s*"`).exec(input);
+  if (!fieldMatch || fieldMatch.index === undefined) return undefined;
+  let index = fieldMatch.index + fieldMatch[0].length;
+  let value = '';
+  while (index < input.length) {
+    const char = input[index]!;
+    if (char === '"') return { value, complete: true };
+    if (char !== '\\') {
+      value += char;
+      index += 1;
+      continue;
+    }
+    index += 1;
+    if (index >= input.length) break;
+    const escaped = input[index]!;
+    const simpleEscapes: Record<string, string> = {
+      '"': '"',
+      '\\': '\\',
+      '/': '/',
+      b: '\b',
+      f: '\f',
+      n: '\n',
+      r: '\r',
+      t: '\t',
+    };
+    if (escaped === 'u') {
+      const hex = input.slice(index + 1, index + 5);
+      if (!/^[0-9a-f]{4}$/i.test(hex)) break;
+      value += String.fromCharCode(Number.parseInt(hex, 16));
+      index += 5;
+      continue;
+    }
+    value += simpleEscapes[escaped] ?? escaped;
+    index += 1;
+  }
+  return { value, complete: false };
 }
 
 function compactToolPlanningTask(task: string): string {

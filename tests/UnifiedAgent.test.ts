@@ -241,6 +241,22 @@ class TruncatedMutationPlanningLLM extends PlanningLLM {
   }
 }
 
+class RecoverableTruncatedWritePlanningLLM extends PlanningLLM {
+  constructor(private readonly content = 'first line\\nsecond line\\nthird partial') {
+    super('none');
+  }
+
+  override async completeJSON<T>(): Promise<T> {
+    this.jsonCalls += 1;
+    throw new Error(
+      'Failed to parse JSON response: '
+      + '{"action":"call_tools","reason":"write source","calls":[{"toolName":"fs.write",'
+      + '"params":{"path":"src/app.py","content":"'
+      + this.content
+    );
+  }
+}
+
 describe('UnifiedAgent capability execution', () => {
   beforeEach(() => {
     actionRegistry.clear();
@@ -826,5 +842,83 @@ describe('UnifiedAgent capability execution', () => {
     expect(llm.optionsByAttempt[0]?.maxTokens).toBe(4096);
     expect(llm.optionsByAttempt[1]?.maxTokens).toBe(8192);
     expect(agent.getLastToolPlanningFailure()).toBeUndefined();
+  });
+
+  it('executes a bounded prefix recovered from a truncated fs.write response', async () => {
+    const llm = new RecoverableTruncatedWritePlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'recover-truncated-source-writer',
+      goal: 'preserve generated implementation chunks',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.write', 'shell.exec'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: 'Implement src/app.py and run verification.',
+      executionRequired: true,
+      round: 1,
+      remainingCalls: 2,
+      tools: [{ name: 'fs.write' }, { name: 'shell.exec' }],
+      calls: [],
+    });
+
+    expect(llm.jsonCalls).toBe(1);
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.write',
+        params: {
+          path: 'src/app.py',
+          content: 'first line\nsecond line\n',
+          mode: 'overwrite',
+          createDirectories: true,
+        },
+        reason: expect.stringContaining('truncated structured fs.write'),
+      }),
+    ]);
+    expect(agent.getLastToolPlanningFailure()).toBeUndefined();
+  });
+
+  it('appends the next recovered source chunk after an earlier recovered write', async () => {
+    const llm = new RecoverableTruncatedWritePlanningLLM(
+      'continuation helper line\\nnext partial'
+    );
+    const agent = new UnifiedAgent({
+      name: 'continue-truncated-source-writer',
+      goal: 'continue a recovered implementation',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.write', 'shell.exec'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: 'Implement src/app.py and run verification.',
+      executionRequired: true,
+      round: 2,
+      remainingCalls: 2,
+      tools: [{ name: 'fs.write' }, { name: 'shell.exec' }],
+      calls: [{
+        toolName: 'fs.write',
+        params: {
+          path: 'src/app.py',
+          content: 'first line\nsecond line\n',
+          mode: 'overwrite',
+        },
+        reason: 'Recovered a bounded source chunk from a truncated structured fs.write response.',
+        groundingRequired: true,
+        success: true,
+      }],
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.write',
+        params: expect.objectContaining({
+          path: 'src/app.py',
+          content: 'continuation helper line\n',
+          mode: 'append',
+        }),
+      }),
+    ]);
   });
 });
