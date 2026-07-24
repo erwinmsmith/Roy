@@ -49,10 +49,10 @@ describe('Runtime external wall-clock deadline', () => {
 
   it('skips an unchanged failed verification but retries after a real mutation', () => {
     const runtime = new Runtime() as unknown as {
-      shouldSkipUnchangedFailedVerification(
+      cachedToolPlanDecision(
         plan: PlannedToolCall,
         priorCalls: ToolCallRecord[]
-      ): boolean;
+      ): { skip: boolean; reason?: string };
     };
     const verification: PlannedToolCall = {
       toolName: 'shell.exec',
@@ -67,14 +67,59 @@ describe('Runtime external wall-clock deadline', () => {
       error: 'tests failed',
     };
 
-    expect(runtime.shouldSkipUnchangedFailedVerification(verification, [failed])).toBe(true);
-    expect(runtime.shouldSkipUnchangedFailedVerification(verification, [
+    expect(runtime.cachedToolPlanDecision(verification, [failed])).toMatchObject({
+      skip: true,
+      reason: 'cached_failed_verification_without_later_mutation',
+    });
+    expect(runtime.cachedToolPlanDecision(verification, [
       failed,
       {
         toolName: 'fs.replace',
         params: { path: 'src/app.py', oldText: 'broken', newText: 'fixed' },
         success: true,
       },
-    ])).toBe(false);
+    ])).toEqual({ skip: false });
+  });
+
+  it('invalidates cached inspection only when a relevant workspace path changes', () => {
+    const runtime = new Runtime() as unknown as {
+      cachedToolPlanDecision(
+        plan: PlannedToolCall,
+        priorCalls: ToolCallRecord[]
+      ): { skip: boolean; reason?: string };
+    };
+    const configRead: PlannedToolCall = {
+      toolName: 'fs.read',
+      params: { path: 'configs/public_audit.yml' },
+      reason: 'Read configuration.',
+      groundingRequired: true,
+    };
+    const sourceRead: PlannedToolCall = {
+      toolName: 'fs.read',
+      params: { path: 'src/dq_audit/audit.py', startLine: 580, endLine: 630 },
+      reason: 'Read failing source.',
+      groundingRequired: true,
+    };
+    const priorReads: ToolCallRecord[] = [
+      { ...configRead, success: true, result: { content: 'config' } },
+      { ...sourceRead, success: true, result: { content: 'broken source' } },
+      {
+        toolName: 'fs.replace',
+        params: {
+          path: 'src/dq_audit/audit.py',
+          oldText: 'broken',
+          newText: 'fixed',
+        },
+        success: true,
+      },
+    ];
+
+    expect(runtime.cachedToolPlanDecision(configRead, priorReads)).toMatchObject({
+      skip: true,
+      reason: 'cached_file_read_still_current',
+    });
+    expect(runtime.cachedToolPlanDecision(sourceRead, priorReads)).toEqual({
+      skip: false,
+    });
   });
 });

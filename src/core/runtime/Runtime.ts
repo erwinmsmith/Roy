@@ -13329,12 +13329,13 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     }));
     for (let index = plans.length - 1; index >= 0; index -= 1) {
       const plan = plans[index]!;
-      if (!this.shouldSkipUnchangedFailedVerification(plan, options.priorToolCalls ?? [])) {
+      const cached = this.cachedToolPlanDecision(plan, options.priorToolCalls ?? []);
+      if (!cached.skip) {
         continue;
       }
       plans.splice(index, 1);
       this.emit({
-        type: 'tool.plan.cached_failure.skipped',
+        type: 'tool.plan.cached.skipped',
         agentId,
         sessionId: this.getContext().sessionId,
         correlationId: options.correlationId,
@@ -13342,7 +13343,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         data: {
           toolName: plan.toolName,
           params: plan.params,
-          reason: 'equivalent_verification_failed_without_later_mutation',
+          reason: cached.reason,
         },
       });
     }
@@ -13791,11 +13792,10 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     return `${plan.toolName}:${JSON.stringify(plan.params, Object.keys(plan.params).sort())}`;
   }
 
-  private shouldSkipUnchangedFailedVerification(
+  private cachedToolPlanDecision(
     plan: PlannedToolCall,
     priorCalls: ToolCallRecord[]
-  ): boolean {
-    if (!isWorkspaceVerificationCall({ ...plan, success: true })) return false;
+  ): { skip: boolean; reason?: string } {
     const fingerprint = this.toolPlanFingerprint(plan);
     let previousIndex = -1;
     for (let index = priorCalls.length - 1; index >= 0; index -= 1) {
@@ -13804,10 +13804,92 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         break;
       }
     }
-    if (previousIndex < 0 || priorCalls[previousIndex]!.success) return false;
-    return !priorCalls
-      .slice(previousIndex + 1)
-      .some(call => isSuccessfulWorkspaceMutationCall(call));
+    if (previousIndex < 0) return { skip: false };
+    const previous = priorCalls[previousIndex]!;
+    const laterCalls = priorCalls.slice(previousIndex + 1);
+
+    if (plan.toolName === 'fs.read') {
+      const target = this.normalizeToolWorkspacePath(String(plan.params.path ?? ''));
+      const invalidated = laterCalls.some(call =>
+        this.workspaceMutationTouchesPath(call, target)
+      );
+      return invalidated
+        ? { skip: false }
+        : { skip: true, reason: 'cached_file_read_still_current' };
+    }
+    if (plan.toolName === 'fs.list') {
+      const listedEntries = new Set(
+        Array.isArray((previous.result as { entries?: unknown } | undefined)?.entries)
+          ? (previous.result as { entries: unknown[] }).entries
+            .filter((entry): entry is string => typeof entry === 'string')
+            .map(entry => this.normalizeToolWorkspacePath(entry))
+          : []
+      );
+      const structureInvalidated = laterCalls.some(call => {
+        if (!call.success) return false;
+        if (call.toolName === 'fs.replace') return false;
+        if (call.toolName === 'fs.write') {
+          const writtenPath = this.normalizeToolWorkspacePath(String(call.params.path ?? ''));
+          return Boolean(writtenPath && !listedEntries.has(writtenPath));
+        }
+        return call.toolName === 'shell.exec'
+          && isSuccessfulWorkspaceMutationCall(call);
+      });
+      return structureInvalidated
+        ? { skip: false }
+        : { skip: true, reason: 'cached_workspace_listing_still_current' };
+    }
+    if (plan.toolName === 'fs.search') {
+      const searchRoot = this.normalizeToolWorkspacePath(String(plan.params.path ?? '.'));
+      const invalidated = laterCalls.some(call =>
+        this.workspaceMutationTouchesPath(call, searchRoot, true)
+      );
+      return invalidated
+        ? { skip: false }
+        : { skip: true, reason: 'cached_workspace_search_still_current' };
+    }
+    if (isWorkspaceVerificationCall({ ...plan, success: true })) {
+      const timedOut = Boolean(
+        (previous.result as { timedOut?: unknown } | undefined)?.timedOut
+      );
+      if (timedOut) return { skip: false };
+      const mutationAfterPrevious = laterCalls.some(call =>
+        isSuccessfulWorkspaceMutationCall(call)
+      );
+      return mutationAfterPrevious
+        ? { skip: false }
+        : {
+          skip: true,
+          reason: previous.success
+            ? 'cached_verification_still_current'
+            : 'cached_failed_verification_without_later_mutation',
+        };
+    }
+    return {
+      skip: previous.success,
+      reason: previous.success ? 'equivalent_successful_call_already_completed' : undefined,
+    };
+  }
+
+  private workspaceMutationTouchesPath(
+    call: ToolCallRecord,
+    target: string,
+    includeDescendants = false
+  ): boolean {
+    if (!isSuccessfulWorkspaceMutationCall(call)) return false;
+    if (call.toolName === 'shell.exec') return true;
+    const mutated = this.normalizeToolWorkspacePath(String(call.params.path ?? ''));
+    if (!mutated || !target) return true;
+    return mutated === target
+      || (includeDescendants && (
+        target === '.'
+        || mutated.startsWith(`${target.replace(/\/+$/, '')}/`)
+      ));
+  }
+
+  private normalizeToolWorkspacePath(value: string): string {
+    const normalized = value.trim().replace(/\\/g, '/').replace(/^\.\/+/, '').replace(/\/+/g, '/');
+    return normalized.replace(/\/+$/, '') || '.';
   }
 
   private buildGroundedTask(task: string, grounding: { context: string; warnings: string[] }): string {
