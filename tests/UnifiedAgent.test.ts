@@ -176,14 +176,19 @@ class CapturingToolPlanningLLM extends PlanningLLM {
 
 class TruncatedMutationPlanningLLM extends PlanningLLM {
   messagesByAttempt: LLMMessage[][] = [];
+  optionsByAttempt: Array<LLMCompletionOptions | undefined> = [];
 
   constructor() {
     super('none');
   }
 
-  override async completeJSON<T>(messages: LLMMessage[]): Promise<T> {
+  override async completeJSON<T>(
+    messages: LLMMessage[],
+    options?: LLMCompletionOptions
+  ): Promise<T> {
     this.jsonCalls += 1;
     this.messagesByAttempt.push(messages);
+    this.optionsByAttempt.push(options);
     if (this.jsonCalls === 1) {
       throw new Error('Failed to parse JSON response: {"action":"call_tools","calls":[{"toolName":"fs.write"');
     }
@@ -623,6 +628,8 @@ describe('UnifiedAgent capability execution', () => {
       ?.findLast(message => message.role === 'user')?.content ?? '';
     expect(retryPrompt).toContain('one complete compact JSON object');
     expect(retryPrompt).toContain('mode=append');
+    expect(llm.optionsByAttempt[0]?.maxTokens).toBe(4096);
+    expect(llm.optionsByAttempt[1]?.maxTokens).toBe(8192);
     expect(agent.getLastToolPlanningFailure()).toBeUndefined();
   });
 });

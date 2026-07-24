@@ -47,6 +47,7 @@ import {
   FsReplaceTool,
   FsSearchTool,
   FsWriteTool,
+  findParallelSourceMutation,
   isSuccessfulWorkspaceMutationCall,
   isSuccessfulWorkspaceVerificationCall,
   isWorkspaceVerificationCall,
@@ -13225,6 +13226,24 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         });
         this.emitToolPlanningFailure(actor, agentId, options, context.round);
         return llmPlans.filter(plan => {
+          const parallelMutation = findParallelSourceMutation(
+            plan,
+            [...priorPlannerCalls, ...context.calls]
+          );
+          if (parallelMutation) {
+            this.emit({
+              type: 'tool.path.authoritative_rejected',
+              agentId,
+              sessionId: this.getContext().sessionId,
+              correlationId: options.correlationId,
+              nodeId: options.nodeId,
+              data: {
+                toolName: plan.toolName,
+                ...parallelMutation,
+              },
+            });
+            return false;
+          }
           if (plan.toolName === 'web.fetch') {
             return this.toolPlanner.isWebCandidateAligned(task, String(plan.params.url ?? ''));
           }

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  findParallelSourceMutation,
   isSuccessfulWorkspaceMutationCall,
   isSuccessfulWorkspaceVerificationCall,
   taskRequestsWorkspaceMutation,
@@ -89,5 +90,33 @@ describe('workspace execution intent', () => {
   it('distinguishes mutation tasks from explicitly read-only work', () => {
     expect(taskRequestsWorkspaceMutation('Migrate the project code and run tests.')).toBe(true);
     expect(taskRequestsWorkspaceMutation('Review the project in read-only mode.')).toBe(false);
+  });
+
+  it('rejects a parallel top-level package after observing a src layout', () => {
+    const observations = [{
+      toolName: 'fs.list',
+      params: { path: '.' },
+      success: true,
+      result: {
+        entries: [
+          'pyproject.toml',
+          'src/dq_audit/audit.py',
+          'src/dq_audit/cli.py',
+        ],
+      },
+    }];
+
+    expect(findParallelSourceMutation({
+      toolName: 'fs.write',
+      params: { path: 'dq_audit/cleaning.py', content: 'implementation' },
+    }, observations)).toEqual({
+      requestedPath: 'dq_audit/cleaning.py',
+      authoritativeRoot: 'src/dq_audit',
+      packageName: 'dq_audit',
+    });
+    expect(findParallelSourceMutation({
+      toolName: 'fs.write',
+      params: { path: 'src/dq_audit/cleaning.py', content: 'implementation' },
+    }, observations)).toBeUndefined();
   });
 });

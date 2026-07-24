@@ -5,6 +5,12 @@ export interface ExecutionIntentCall {
   success: boolean;
 }
 
+export interface ParallelSourceMutation {
+  requestedPath: string;
+  authoritativeRoot: string;
+  packageName: string;
+}
+
 const NULL_OUTPUT_TARGETS = new Set([
   '/dev/null',
   '/dev/stdout',
@@ -70,9 +76,62 @@ export function isWorkspaceVerificationCall(call: ExecutionIntentCall): boolean 
   return /\b(?:test|pytest|vitest|jest|mocha|cargo\s+test|go\s+test|npm\s+(?:test|run\s+(?:test|check|build|lint|typecheck))|pnpm\s+(?:test|run)|yarn\s+(?:test|run)|ruff|eslint|tsc|mypy|pyright|compileall)\b/i.test(command);
 }
 
+export function findParallelSourceMutation(
+  call: Pick<ExecutionIntentCall, 'toolName' | 'params'>,
+  observations: ExecutionIntentCall[]
+): ParallelSourceMutation | undefined {
+  if (call.toolName !== 'fs.write' && call.toolName !== 'fs.replace') return undefined;
+  const requestedPath = normalizeWorkspaceRelativePath(String(call.params.path ?? ''));
+  if (!requestedPath || requestedPath.startsWith('/')) return undefined;
+
+  const authoritativeRoots = new Map<string, string>();
+  for (const observation of observations) {
+    if (!observation.success) continue;
+    const observedPaths = [
+      String(observation.params.path ?? ''),
+      ...extractResultPaths(observation.result),
+    ];
+    for (const observedPath of observedPaths) {
+      const normalized = normalizeWorkspaceRelativePath(observedPath);
+      const sourceMatch = normalized.match(/^(src|lib)\/([^/]+)\/.*\.(?:py|ts|tsx|js|mjs|cjs)$/i);
+      const packageMatch = normalized.match(/^packages\/([^/]+)\/(?:src\/)?.*\.(?:py|ts|tsx|js|mjs|cjs)$/i);
+      if (sourceMatch) {
+        authoritativeRoots.set(sourceMatch[2]!, `${sourceMatch[1]}/${sourceMatch[2]}`);
+      } else if (packageMatch) {
+        authoritativeRoots.set(packageMatch[1]!, `packages/${packageMatch[1]}`);
+      }
+    }
+  }
+
+  const requestedPackage = requestedPath.split('/')[0] ?? '';
+  const authoritativeRoot = authoritativeRoots.get(requestedPackage);
+  if (!authoritativeRoot || requestedPath.startsWith(`${authoritativeRoot}/`)) return undefined;
+  return {
+    requestedPath,
+    authoritativeRoot,
+    packageName: requestedPackage,
+  };
+}
+
 function masksShellFailure(command: string): boolean {
   return /\|\|\s*(?:true|:)(?:\s*(?:[;&|]|$))|;\s*(?:true|:)\s*;?\s*$|\bset\s+\+e\b/i.test(command)
     || /;\s*(?:printf|echo)\b[^;\n]*(?:\$\?|exit(?:_code)?|status)/i.test(command);
+}
+
+function extractResultPaths(result: unknown): string[] {
+  if (!result || typeof result !== 'object') return [];
+  const value = result as { path?: unknown; entries?: unknown };
+  const entries = Array.isArray(value.entries)
+    ? value.entries.filter((entry): entry is string => typeof entry === 'string')
+    : [];
+  return [
+    ...(typeof value.path === 'string' ? [value.path] : []),
+    ...entries,
+  ];
+}
+
+function normalizeWorkspaceRelativePath(value: string): string {
+  return value.trim().replace(/\\/g, '/').replace(/^(?:\.\/)+/, '').replace(/\/+/g, '/');
 }
 
 function isNonWorkspaceOutputTarget(target: string): boolean {

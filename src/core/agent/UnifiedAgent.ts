@@ -184,7 +184,9 @@ export class UnifiedAgent extends BaseAgent {
             planningMessages,
             {
               temperature: 0,
-              maxTokens: executionRequired ? 4096 : 640,
+              maxTokens: executionRequired
+                ? attempt === 0 ? 4096 : 8192
+                : 640,
               timeoutMs: remainingPlanningMs,
             }
           );
