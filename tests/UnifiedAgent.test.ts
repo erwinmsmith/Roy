@@ -174,6 +174,34 @@ class CapturingToolPlanningLLM extends PlanningLLM {
   }
 }
 
+class TruncatedMutationPlanningLLM extends PlanningLLM {
+  messagesByAttempt: LLMMessage[][] = [];
+
+  constructor() {
+    super('none');
+  }
+
+  override async completeJSON<T>(messages: LLMMessage[]): Promise<T> {
+    this.jsonCalls += 1;
+    this.messagesByAttempt.push(messages);
+    if (this.jsonCalls === 1) {
+      throw new Error('Failed to parse JSON response: {"action":"call_tools","calls":[{"toolName":"fs.write"');
+    }
+    return {
+      action: 'call_tools',
+      reason: 'Apply the first bounded implementation chunk.',
+      calls: [{
+        toolName: 'fs.write',
+        params: {
+          path: 'src/implementation.py',
+          content: 'first bounded chunk',
+          mode: 'overwrite',
+        },
+      }],
+    } as T;
+  }
+}
+
 describe('UnifiedAgent capability execution', () => {
   beforeEach(() => {
     actionRegistry.clear();
@@ -544,5 +572,56 @@ describe('UnifiedAgent capability execution', () => {
       timedOut: true,
       message: 'Request timed out after 250ms',
     });
+  });
+
+  it('retries a truncated mutation plan with bounded chunking guidance', async () => {
+    const llm = new TruncatedMutationPlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'chunked-mutation-planner',
+      goal: 'implement a large source repair',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.read', 'fs.replace', 'fs.write', 'shell.exec'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: 'Repair the project implementation and run its verification suite.',
+      round: 1,
+      remainingCalls: 4,
+      requestTimeoutMs: 5_000,
+      tools: [
+        { name: 'fs.read' },
+        { name: 'fs.replace' },
+        { name: 'fs.write' },
+        { name: 'shell.exec' },
+      ],
+      calls: [{
+        toolName: 'fs.read',
+        params: { path: 'src/implementation.py' },
+        reason: 'Inspect the authoritative source.',
+        groundingRequired: true,
+        success: true,
+        result: { content: 'broken implementation' },
+      }],
+    });
+
+    expect(llm.jsonCalls).toBe(2);
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.write',
+        params: expect.objectContaining({
+          path: 'src/implementation.py',
+          content: 'first bounded chunk',
+        }),
+      }),
+    ]);
+    const firstSystemPrompt = llm.messagesByAttempt[0]
+      ?.find(message => message.role === 'system')?.content ?? '';
+    expect(firstSystemPrompt).toContain('Limit one fs.write/fs.replace payload to 6000 characters');
+    const retryPrompt = llm.messagesByAttempt[1]
+      ?.findLast(message => message.role === 'user')?.content ?? '';
+    expect(retryPrompt).toContain('one complete compact JSON object');
+    expect(retryPrompt).toContain('mode=append');
+    expect(agent.getLastToolPlanningFailure()).toBeUndefined();
   });
 });

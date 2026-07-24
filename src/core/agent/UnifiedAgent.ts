@@ -133,6 +133,7 @@ export class UnifiedAgent extends BaseAgent {
             : '',
           'When verification fails, use its output to repair the workspace before retrying. Never hide a failing exit status with `|| true`, `; true`, `|| :`, or equivalent shell constructs.',
           'Before creating or replacing a module, use observed package metadata and directory layout to identify the authoritative source root. Never create a parallel top-level package when the project installs from src/, lib/, packages/, or another configured source directory.',
+          'Keep mutation payloads bounded: prefer fs.replace for focused edits. Limit one fs.write/fs.replace payload to 6000 characters. For a larger full-file rewrite, write one bounded chunk with fs.write mode=overwrite, then append later chunks with mode=append in subsequent tool rounds before verification.',
           'Never repeat an equivalent call. Search snippets are discovery evidence; fetch relevant result pages before making source-backed claims.',
           'Reject search results that do not match the core entities and topic in the task. Never fetch an irrelevant result merely because it is available.',
           'After two web.search calls, do not keep reformulating the same search. Fetch a likely official public URL if one can be identified, or finish with an explicit evidence limitation.',
@@ -171,19 +172,42 @@ export class UnifiedAgent extends BaseAgent {
       const completedCallFingerprints = new Set(input.calls.map(call =>
         plannedToolCallFingerprint(call)
       ));
-      for (let attempt = 0; attempt < (executionRequired ? 3 : 1); attempt += 1) {
+      const maxPlanningAttempts = executionRequired ? 3 : 1;
+      for (let attempt = 0; attempt < maxPlanningAttempts; attempt += 1) {
         const remainingPlanningMs = planningDeadline === undefined
           ? undefined
           : Math.max(0, planningDeadline - Date.now());
         if (remainingPlanningMs === 0) break;
-        response = await this.completeJSONWithAccounting<PlanningResponse>(
-          planningMessages,
-          {
-            temperature: 0,
-            maxTokens: executionRequired ? 4096 : 640,
-            timeoutMs: remainingPlanningMs,
-          }
-        );
+        try {
+          response = await this.completeJSONWithAccounting<PlanningResponse>(
+            planningMessages,
+            {
+              temperature: 0,
+              maxTokens: executionRequired ? 4096 : 640,
+              timeoutMs: remainingPlanningMs,
+            }
+          );
+        } catch (error) {
+          const canRetry = executionRequired
+            && attempt + 1 < maxPlanningAttempts
+            && isRetryableToolPlanningResponseError(error)
+            && (planningDeadline === undefined || Date.now() < planningDeadline);
+          if (!canRetry) throw error;
+          planningMessages = [
+            ...planningMessages,
+            {
+              role: 'user',
+              content: [
+                'The previous tool plan was incomplete or was not valid JSON.',
+                'Return one complete compact JSON object only, with no analysis or markdown.',
+                'Request at most one mutation call in this response.',
+                'Keep fs.write content or fs.replace replacement text within 6000 characters.',
+                'For a larger rewrite, emit only the next bounded chunk and continue with fs.write mode=append in a later tool round.',
+              ].join('\n'),
+            },
+          ];
+          continue;
+        }
         plannedCalls = normalizePlannedToolCalls(
           response,
           authorized,
@@ -977,6 +1001,12 @@ function plannedToolCallFingerprint(
     Object.entries(call.params).sort(([left], [right]) => left.localeCompare(right))
   );
   return `${call.toolName}:${JSON.stringify(sortedParams)}`;
+}
+
+function isRetryableToolPlanningResponseError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.startsWith('Failed to parse JSON response')
+    || message === 'Empty JSON response';
 }
 
 function compactToolPlanningTask(task: string): string {
