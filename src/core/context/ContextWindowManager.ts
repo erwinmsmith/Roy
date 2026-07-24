@@ -28,9 +28,15 @@ export class ContextWindowManager {
       0,
       Math.min(request.memoryScope.sessionWindowTurns, this.policy.sessionWindowTurns)
     );
-    const [rootContext, privateBundle, conversation] = await Promise.all([
+    const [rawRootContext, taskExecutionKnowledge, privateBundle, conversation] = await Promise.all([
       request.memoryScope.public && this.policy.includePublicMemory
         ? this.memory.loadRootContext()
+        : Promise.resolve(undefined),
+      request.memoryScope.public && this.policy.includePublicMemory
+        ? this.memory.readExecutionKnowledge(
+          request.task,
+          Math.max(4, Math.min(12, effectiveTurns || 8))
+        )
         : Promise.resolve(undefined),
       request.memoryScope.private && this.policy.includePrivateMemory
         ? this.memory.loadAgentMemory(request.agentKey)
@@ -40,6 +46,9 @@ export class ContextWindowManager {
         : Promise.resolve([]),
     ]);
 
+    const rootContext = rawRootContext && taskExecutionKnowledge
+      ? { ...rawRootContext, executionKnowledge: taskExecutionKnowledge }
+      : rawRootContext;
     const publicContext = rootContext ? this.formatPublicContext(rootContext) : '';
     const privateMemory = privateBundle
       ? [privateBundle.memory.trim(), privateBundle.context.trim()].filter(Boolean).join('\n\n')
@@ -183,10 +192,55 @@ export class ContextWindowManager {
       '<project_memory>', context.projectMemory.trim(), '</project_memory>',
       '<decisions>', context.decisions.trim(), '</decisions>',
       '<glossary>', context.glossary.trim(), '</glossary>',
-      `<agent_patterns>${JSON.stringify(context.agentPatterns)}</agent_patterns>`,
-      `<team_patterns>${JSON.stringify(context.teamPatterns)}</team_patterns>`,
-      `<delegation_patterns>${JSON.stringify(context.delegationPatterns)}</delegation_patterns>`,
+      `<agent_patterns>${JSON.stringify(this.compactPatterns(context.agentPatterns, 'agent'))}</agent_patterns>`,
+      `<team_patterns>${JSON.stringify(this.compactPatterns(context.teamPatterns, 'team'))}</team_patterns>`,
+      `<delegation_patterns>${JSON.stringify(this.compactPatterns(context.delegationPatterns, 'delegation'))}</delegation_patterns>`,
     ].join('\n');
+  }
+
+  private compactPatterns(
+    patterns: unknown[],
+    kind: 'agent' | 'team' | 'delegation'
+  ): Array<Record<string, unknown>> {
+    return patterns
+      .filter((pattern): pattern is Record<string, unknown> =>
+        Boolean(pattern) && typeof pattern === 'object' && !Array.isArray(pattern)
+      )
+      .slice(-8)
+      .map(pattern => {
+        if (kind === 'agent') {
+          return {
+            id: pattern.id,
+            key: pattern.key,
+            name: pattern.name,
+            archetype: pattern.archetype,
+            tools: pattern.tools,
+            skills: pattern.skills,
+            spawnPolicy: pattern.spawnPolicy,
+            status: pattern.status,
+            evaluation: pattern.evaluation,
+          };
+        }
+        if (kind === 'team') {
+          return {
+            id: pattern.id,
+            key: pattern.key,
+            name: pattern.name,
+            memberArchetypes: pattern.memberArchetypes,
+            leadArchetype: pattern.leadArchetype,
+            executionPolicy: pattern.executionPolicy,
+            status: pattern.status,
+            usage: pattern.usage,
+          };
+        }
+        return {
+          id: pattern.id,
+          signature: pattern.signature,
+          archetype: pattern.archetype,
+          agentPatternId: pattern.agentPatternId,
+          usage: pattern.usage,
+        };
+      });
   }
 
   private truncate(value: string, maxChars: number): string {

@@ -827,6 +827,61 @@ describe('UnifiedAgent capability execution', () => {
     ]);
   });
 
+  it('converts a full observed-file overwrite into an exact snapshot replacement', async () => {
+    const llm = new DestructiveRepairThenReplacePlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'snapshot-repair-agent',
+      goal: 'recover a structurally incomplete rewrite without blind overwrite',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.read', 'fs.replace', 'fs.write', 'shell.exec'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: 'Repair src/app.py and run the official tests.',
+      executionRequired: true,
+      round: 3,
+      remainingCalls: 3,
+      tools: [
+        { name: 'fs.read' },
+        { name: 'fs.replace' },
+        { name: 'fs.write' },
+        { name: 'shell.exec' },
+      ],
+      calls: [
+        {
+          toolName: 'shell.exec',
+          params: { command: 'pytest -q .roy/official-verifier/test_outputs.py' },
+          reason: 'Run official verifier.',
+          groundingRequired: true,
+          success: false,
+          error: 'ImportError: missing run_pipeline',
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/app.py' },
+          reason: 'Read the complete structurally incomplete file.',
+          groundingRequired: true,
+          success: true,
+          result: { content: 'working base\nmissing run_pipeline\n', truncated: false },
+        },
+      ],
+    });
+
+    expect(llm.jsonCalls).toBe(1);
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.replace',
+        params: {
+          path: 'src/app.py',
+          oldText: 'working base\nmissing run_pipeline\n',
+          newText: 'full rewrite that discards working behavior',
+          expectedReplacements: 1,
+        },
+      }),
+    ]);
+  });
+
   it('executes only one targeted inspection after a verifier failure', async () => {
     const llm = new NoisyFailureInspectionPlanningLLM();
     const agent = new UnifiedAgent({

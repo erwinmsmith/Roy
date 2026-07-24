@@ -143,6 +143,16 @@ class RecursiveCustomTeamLLM extends TeamTestLLM {
   }
 }
 
+class CountingDelegationTeamLLM extends TeamTestLLM {
+  delegationAssessments = 0;
+
+  override async completeJSON<T>(messages: LLMMessage[]): Promise<T> {
+    const prompt = messages.map(message => message.content).join('\n');
+    if (prompt.includes('delegation controller')) this.delegationAssessments += 1;
+    return super.completeJSON<T>(messages);
+  }
+}
+
 describe('Phase 3 subteam runtime', () => {
   it('enforces the formal team FSM', () => {
     const registry = new TeamRegistry();
@@ -357,6 +367,43 @@ describe('Phase 3 subteam runtime', () => {
       && event.agentId === lead?.agentId
       && event.data?.action === 'spawn_subagents'
     )).toBe(true);
+    await runtime.shutdown();
+  });
+
+  it('keeps an inherited long-horizon objective bounded unless the lead explicitly owns delegation', async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), 'roy-team-bounded-long-horizon-'));
+    const llm = new CountingDelegationTeamLLM();
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'team-bounded-long-horizon',
+      workspaceCwd: cwd,
+      llmProvider: llm,
+    });
+    const task = [
+      'Implement the bounded next slice of this long-horizon terminal benchmark.',
+      'A'.repeat(20_000),
+      'PRESERVE_THIS_LATEST_FAILURE_FRONTIER',
+    ].join('\n');
+    const team = await runtime.spawnTeam({
+      name: 'BoundedLongHorizonTeam',
+      description: 'Execute one bounded inherited role.',
+      members: [{
+        archetype: 'researcher',
+        name: 'BoundedLead',
+        task,
+        lead: true,
+      }],
+    });
+
+    await runtime.runTeam(team.identity.id, task);
+
+    expect(llm.delegationAssessments).toBe(0);
+    const startedTask = String(runtime.getEvents().find(event =>
+      event.type === 'agent.run.started' && event.data?.task
+    )?.data?.task ?? '');
+    expect(startedTask.length).toBeLessThanOrEqual(12_000);
+    expect(startedTask).toContain('[runtime_compacted_delegated_task_middle]');
+    expect(startedTask).toContain('PRESERVE_THIS_LATEST_FAILURE_FRONTIER');
     await runtime.shutdown();
   });
 

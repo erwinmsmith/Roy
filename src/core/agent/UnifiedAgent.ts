@@ -285,6 +285,9 @@ export class UnifiedAgent extends BaseAgent {
           input.remainingCalls,
           input.round
         ).filter(call => !shouldSuppressRepeatedPlannedCall(call, input.calls));
+        plannedCalls = plannedCalls.map(call =>
+          convertObservedOverwriteToExactReplace(call, input.calls, authorized) ?? call
+        );
         if (latestVerificationFailed) {
           if (inspectedAfterLatestFailure) {
             rejectedDestructiveRepairOverwrite = plannedCalls.some(call =>
@@ -1141,6 +1144,45 @@ function isDestructiveRepairOverwrite(
     }
     return normalizePlannedWorkspacePath(String(call.params.path ?? '')) === target;
   });
+}
+
+function convertObservedOverwriteToExactReplace(
+  planned: PlannedToolCall,
+  completed: ToolLoopCallRecord[],
+  authorized: Set<string>
+): PlannedToolCall | undefined {
+  if (!authorized.has('fs.replace')
+    || planned.toolName !== 'fs.write'
+    || String(planned.params.mode ?? 'overwrite') !== 'overwrite') {
+    return undefined;
+  }
+  const target = normalizePlannedWorkspacePath(String(planned.params.path ?? ''));
+  const newText = planned.params.content;
+  if (!target
+    || typeof newText !== 'string'
+    || /\bbounded\b.{0,40}\bchunk\b|\bnext\s+chunk\b/i.test(planned.reason)) {
+    return undefined;
+  }
+  const observed = [...completed].reverse().find(call => {
+    if (!call.success || call.toolName !== 'fs.read') return false;
+    if (normalizePlannedWorkspacePath(String(call.params.path ?? '')) !== target) return false;
+    if (call.params.startLine !== undefined || call.params.endLine !== undefined) return false;
+    const result = call.result as { content?: unknown; truncated?: unknown } | undefined;
+    return typeof result?.content === 'string' && result.truncated !== true;
+  });
+  const oldText = (observed?.result as { content?: unknown } | undefined)?.content;
+  if (typeof oldText !== 'string' || oldText === newText) return undefined;
+  return {
+    toolName: 'fs.replace',
+    params: {
+      path: String(planned.params.path),
+      oldText,
+      newText,
+      expectedReplacements: 1,
+    },
+    reason: `${planned.reason} Runtime converted the overwrite into an exact observed-snapshot replacement.`,
+    groundingRequired: planned.groundingRequired,
+  };
 }
 
 function normalizePlannedWorkspacePath(value: string): string {

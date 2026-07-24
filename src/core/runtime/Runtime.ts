@@ -2074,11 +2074,12 @@ export class Runtime {
   }
 
   private buildTeamMemberTaskWithStepCache(team: TeamRuntimeState, task: string): string {
+    const boundedTask = this.compactDelegatedTask(task);
     const completed = Object.entries(team.memberResults);
     const failed = Object.entries(team.memberErrors);
-    if (completed.length === 0 && failed.length === 0) return task;
+    if (completed.length === 0 && failed.length === 0) return boundedTask;
     return [
-      task,
+      boundedTask,
       '<team_step_cache>',
       JSON.stringify({
         teamId: team.identity.id,
@@ -2099,9 +2100,17 @@ export class Runtime {
         '- Treat grounded prior member evidence as shared state, but independently verify it when your role requires verification.',
         '- Consume failure output and do not repeat an equivalent failed path without a changed hypothesis.',
         '- Add new authoritative paths, mutations, verification evidence, and unresolved feedback for team synthesis.',
-        '- You may recursively form a child team only for a newly exposed gap that cannot be closed with your own bound tools.',
+        '- Escalate a newly exposed gap in your result; runtime coordination handles follow-up structure only when explicitly assigned.',
       ].join('\n'),
     ].join('\n\n');
+  }
+
+  private compactDelegatedTask(task: string, maxChars = 12_000): string {
+    if (task.length <= maxChars) return task;
+    const marker = '\n\n[runtime_compacted_delegated_task_middle]\n\n';
+    const available = Math.max(2_000, maxChars - marker.length);
+    const headChars = Math.floor(available * 0.42);
+    return `${task.slice(0, headChars)}${marker}${task.slice(-(available - headChars))}`;
   }
 
   async runTeam(
@@ -5935,11 +5944,16 @@ export class Runtime {
       parentContext: `Parent agent ${parentIdentity.name} (${parentIdentity.id}) spawned this agent for: ${spec.description}`,
       memoryScope,
     });
+    const boundedAgentMemory = {
+      ...agentMemory,
+      memory: contextWindow.privateMemory,
+      context: '',
+    };
     let goal = this.buildAgentPromptFromMemory({
       name,
       role: spec.customRole ?? spec.archetype,
       parentName: parentIdentity.name,
-      task: spec.task ?? '',
+      task: contextWindow.task,
       description: [
           spec.description,
           spec.customRole ? `Custom role: ${spec.customRole}` : undefined,
@@ -5951,16 +5965,18 @@ export class Runtime {
           .filter(Boolean)
           .join('\n'),
         systemPrompt: spec.systemPrompt,
-        bundle: agentMemory,
+        bundle: boundedAgentMemory,
         publicContext: [
           contextWindow.publicContext,
           contextWindow.sessionContext,
+          contextWindow.multiPartyTraceContext,
           cacheHits.length > 0 ? this.formatCachedPublicContext(cacheHits) : '',
         ]
           .filter(Boolean)
           .join('\n\n'),
         tomProfile: resolvedTomProfile,
         communicationProtocol: spec.communicationProtocol ?? ctx.communication.getDefaultProtocolId(),
+        communicationContext: contextWindow.communicationContext,
         availableSkills: skillBindings.map((binding) => binding.name),
         availableTools: toolBindings.map((binding) => binding.name),
         parentContext: contextWindow.parentContext,
@@ -9490,7 +9506,9 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     fallbackTask: string
   ): DelegationAgentPlan {
     const archetype = String(plan.archetype) as SubAgentArchetype;
-    const task = typeof plan.task === 'string' && plan.task.trim() ? plan.task.trim() : fallbackTask;
+    const task = this.compactDelegatedTask(
+      typeof plan.task === 'string' && plan.task.trim() ? plan.task.trim() : fallbackTask
+    );
     const requestedTools = Array.isArray(plan.tools)
       ? plan.tools.filter((tool): tool is string =>
           typeof tool === 'string'
@@ -9704,9 +9722,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
           reason: 'This bounded team-member task should execute directly; recursive structure is coordinated by the team lead.',
         };
       }
-      if (explicitRecursiveResponsibility
-        || this.requiresLongHorizonLoop(task)
-        || this.requiresStagedDelegation(task)) {
+      if (explicitRecursiveResponsibility || this.requiresStagedDelegation(task)) {
         return {
           assess: true,
           reason: 'The team lead owns an explicit or staged recursive coordination responsibility.',
