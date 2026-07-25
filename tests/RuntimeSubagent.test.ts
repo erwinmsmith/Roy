@@ -916,10 +916,10 @@ describe('Runtime controlled subagent spawning', () => {
       '--- a/app.py',
       '+++ b/app.py',
       '@@ -80,7 +80,7 @@',
-      ' # stale generated edge one',
-      ' # stale generated edge two',
-      ' # stale generated edge three',
-      ' # stale generated edge four',
+      ...Array.from(
+        { length: 18 },
+        (_, index) => ` # stale generated edge ${index + 1}`
+      ),
       '-    answer = 41',
       '+    answer = 42',
       '     return answer',
@@ -933,6 +933,87 @@ describe('Runtime controlled subagent spawning', () => {
         '',
       ].join('\n'),
     });
+  });
+
+  it('recovers independently anchored change blocks separated by stale context', () => {
+    const runtime = new Runtime();
+    const applyPatch = (runtime as unknown as {
+      applyUnifiedPatchToContent: (
+        current: string,
+        patch: string
+      ) => { content?: string; error?: string };
+    }).applyUnifiedPatchToContent.bind(runtime);
+    const current = [
+      'def first_value():',
+      '    first = 41',
+      '    return first',
+      '',
+      'def second_value():',
+      '    second = False',
+      '    return second',
+      '',
+    ].join('\n');
+    const patch = [
+      '--- a/app.py',
+      '+++ b/app.py',
+      '@@ -80,9 +80,9 @@',
+      ' def first_value():',
+      '-    first = 41',
+      '+    first = 42',
+      ' # stale context omitted from the current snapshot',
+      ' def second_value():',
+      '-    second = False',
+      '+    second = True',
+      '     return second',
+    ].join('\n');
+
+    expect(applyPatch(current, patch)).toEqual({
+      content: [
+        'def first_value():',
+        '    first = 42',
+        '    return first',
+        '',
+        'def second_value():',
+        '    second = True',
+        '    return second',
+        '',
+      ].join('\n'),
+    });
+  });
+
+  it('builds patch recovery context around exact rejected anchors', () => {
+    const runtime = new Runtime();
+    const focusedSnapshot = (runtime as unknown as {
+      focusedPatchRecoverySnapshot: (
+        current: string,
+        patch: string,
+        maxChars?: number
+      ) => string;
+    }).focusedPatchRecoverySnapshot.bind(runtime);
+    const current = [
+      ...Array.from({ length: 180 }, (_, index) => `before_${index} = ${index}`),
+      'def repair_target():',
+      '    answer = 41',
+      '    return answer',
+      ...Array.from({ length: 180 }, (_, index) => `after_${index} = ${index}`),
+      '',
+    ].join('\n');
+    const patch = [
+      '--- a/app.py',
+      '+++ b/app.py',
+      '@@ -999,3 +999,3 @@',
+      ' def repair_target():',
+      '-    answer = 41',
+      '+    answer = 42',
+      '     return answer',
+    ].join('\n');
+
+    const focused = focusedSnapshot(current, patch, 3_000);
+    expect(focused).toContain('def repair_target():');
+    expect(focused).toContain('    answer = 41');
+    expect(focused).not.toContain('before_0 = 0');
+    expect(focused).not.toContain('after_179 = 179');
+    expect(focused.length).toBeLessThanOrEqual(3_100);
   });
 
   it('extracts a unified diff from model prose and a trailing Markdown fence', () => {
@@ -1849,7 +1930,8 @@ describe('Runtime controlled subagent spawning', () => {
     const authoritative = (
       runtime as unknown as {
         selectAuthoritativePriorVerification: (
-          calls: RunAgentResult['toolCalls']
+          calls: RunAgentResult['toolCalls'],
+          task?: string
         ) => RunAgentResult['toolCalls'][number] | undefined;
       }
     ).selectAuthoritativePriorVerification([
@@ -1863,6 +1945,12 @@ describe('Runtime controlled subagent spawning', () => {
       {
         toolName: 'shell.exec',
         params: { command: 'python .roy/official-verifier/grade.py' },
+        result: {
+          candidateRollback: {
+            restored: true,
+            reason: 'reward_regression',
+          },
+        },
         success: true,
       },
       {
@@ -1872,7 +1960,131 @@ describe('Runtime controlled subagent spawning', () => {
       },
     ]);
     expect(authoritative?.params.command).toBe('python .roy/official-verifier/grade.py');
+    const taskAuthoritative = (
+      runtime as unknown as {
+        selectAuthoritativePriorVerification: (
+          calls: RunAgentResult['toolCalls'],
+          task?: string
+        ) => RunAgentResult['toolCalls'][number] | undefined;
+      }
+    ).selectAuthoritativePriorVerification(
+      [{
+        toolName: 'shell.exec',
+        params: {
+          command: 'python -m table_recon.cli run --manifest data/public/manifest.json --out-dir outputs',
+        },
+        success: true,
+      }],
+      [
+        'Public reproduction:',
+        '```bash',
+        'python -m table_recon.cli run --manifest data/public/manifest.json --out-dir outputs',
+        '```',
+        'Authoritative acceptance:',
+        '```bash',
+        'python .roy/official-verifier/grade.py',
+        '```',
+      ].join('\n')
+    );
+    expect(taskAuthoritative?.params.command).toBe(
+      'python .roy/official-verifier/grade.py'
+    );
     await runtime.shutdown();
+  });
+
+  it('requires fresh diagnosis after a verifier rolls back the current hypothesis', () => {
+    const runtime = new Runtime();
+    const latestRejected = (runtime as unknown as {
+      latestRejectedVerifierCandidate: (
+        calls: RunAgentResult['toolCalls']
+      ) => Record<string, unknown> | undefined;
+    }).latestRejectedVerifierCandidate.bind(runtime);
+    const calls: RunAgentResult['toolCalls'] = [
+      {
+        toolName: 'fs.synthesize',
+        params: { path: 'app.py', instructions: 'repair', strategy: 'patch' },
+        result: { path: 'app.py', synthesized: true },
+        success: true,
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python .roy/official-verifier/grade.py' },
+        result: {
+          candidateRollback: {
+            restored: true,
+            path: 'app.py',
+            reason: 'reward_regression',
+            baselineReward: 0.8,
+            candidateReward: 0.7,
+          },
+        },
+        success: true,
+      },
+    ];
+
+    expect(latestRejected(calls)).toEqual(expect.objectContaining({
+      path: 'app.py',
+      reason: 'reward_regression',
+    }));
+    expect(latestRejected([
+      ...calls,
+      {
+        toolName: 'shell.exec',
+        params: {
+          command: 'ROY_VERIFIER_PROBE=1 python diagnostic.py',
+        },
+        result: { stdout: 'new causal evidence' },
+        success: true,
+      },
+    ])).toBeUndefined();
+  });
+
+  it('passes the preceding sequential diagnosis into a focused repair plan', () => {
+    const runtime = new Runtime();
+    const enrich = (runtime as unknown as {
+      enrichRepairPlansWithTeamStepEvidence: (
+        plans: Array<{
+          toolName: string;
+          params: Record<string, unknown>;
+          reason: string;
+          groundingRequired: boolean;
+        }>,
+        task: string
+      ) => Array<{
+        toolName: string;
+        params: Record<string, unknown>;
+      }>;
+    }).enrichRepairPlansWithTeamStepEvidence.bind(runtime);
+    const diagnosis = [
+      'The first grid boundary is a page-border decoy.',
+      'Repair _assign_tokens_to_grid at its sufficient-lines branch.',
+    ].join(' ');
+    const task = [
+      'Repair app.py.',
+      '<team_step_cache>',
+      JSON.stringify({
+        completedMembers: [{
+          agentId: 'agent_tester_001',
+          result: diagnosis,
+        }],
+      }),
+      '</team_step_cache>',
+    ].join('\n');
+    const [plan] = enrich([{
+      toolName: 'fs.synthesize',
+      params: {
+        path: 'app.py',
+        instructions: 'Apply the smallest grounded repair.',
+        strategy: 'patch',
+      },
+      reason: 'repair',
+      groundingRequired: true,
+    }], task);
+
+    expect(String(plan?.params.instructions)).toContain(diagnosis);
+    expect(String(plan?.params.instructions)).toContain(
+      'immediately preceding sequential team member'
+    );
   });
 
   it('spawns, registers, runs, and tracks a subagent', async () => {

@@ -2148,6 +2148,49 @@ export class Runtime {
     return summary.replace(/\s+/g, ' ').slice(0, 500);
   }
 
+  private enrichRepairPlansWithTeamStepEvidence(
+    plans: PlannedToolCall[],
+    task: string
+  ): PlannedToolCall[] {
+    const cacheMatch = /<team_step_cache>\s*([\s\S]*?)\s*<\/team_step_cache>/i.exec(
+      task
+    );
+    if (!cacheMatch) return plans;
+    let latestResult: string;
+    try {
+      const cache = JSON.parse(cacheMatch[1]!) as {
+        completedMembers?: Array<{ result?: unknown }>;
+      };
+      const completed = Array.isArray(cache.completedMembers)
+        ? cache.completedMembers
+        : [];
+      latestResult = String(completed.at(-1)?.result ?? '').trim();
+    } catch {
+      return plans;
+    }
+    if (!latestResult) return plans;
+    const causalResult = latestResult.length <= 4_000
+      ? latestResult
+      : `${latestResult.slice(0, 2_400)}\n[preceding member report compacted]\n${latestResult.slice(-1_600)}`;
+    return plans.map(plan => {
+      if (plan.toolName !== 'fs.synthesize') return plan;
+      const instructions = String(plan.params.instructions ?? '').trim();
+      if (!instructions || instructions.includes(causalResult)) return plan;
+      return {
+        ...plan,
+        params: {
+          ...plan.params,
+          instructions: [
+            instructions,
+            'Grounded diagnosis from the immediately preceding sequential team member:',
+            causalResult,
+            'Use this diagnosis only where it agrees with the authoritative current source and executable verifier evidence.',
+          ].join('\n\n'),
+        },
+      };
+    });
+  }
+
   private compactDelegatedTask(task: string, maxChars = 12_000): string {
     if (task.length <= maxChars) return task;
     const marker = '\n\n[runtime_compacted_delegated_task_middle]\n\n';
@@ -3933,10 +3976,14 @@ export class Runtime {
     const synthesisStrategy = params.strategy === 'patch' && currentContent !== undefined
       ? 'patch'
       : 'complete';
+    const focusedInstructions = String(params.instructions).trim();
     const evidence = this.compactFileSynthesisEvidence(
       groundingCalls,
       normalizedPath,
-      synthesisStrategy === 'patch' ? 20_000 : 30_000
+      synthesisStrategy === 'patch'
+        ? focusedInstructions.includes('VERIFIER_PROBE_') ? 12_000 : 20_000
+        : 30_000,
+      focusedInstructions
     );
     const prompt = [
       synthesisStrategy === 'patch'
@@ -3950,7 +3997,7 @@ export class Runtime {
       assignedTask || 'Implement the current grounded workspace task.',
       '',
       'Focused implementation instructions:',
-      String(params.instructions).trim(),
+      focusedInstructions,
       '',
       'Current target snapshot:',
       currentContent === undefined
@@ -4031,18 +4078,23 @@ export class Runtime {
         '[runtime_workspace_file_patch_recovery]',
         `Generate a new minimal unified diff for ${normalizedPath}.`,
         `The prior patch was rejected before any workspace mutation: ${validationError}`,
-        'Correct the rejected anchors against the exact current snapshot below.',
+        'Correct the rejected anchors against the exact current source excerpts below.',
         'Discard unrelated and no-op hunks from the prior attempt. Do not duplicate a line already present in the snapshot.',
         'Change only the smallest source region directly supported by the focused verifier evidence.',
         '',
         'Focused implementation instructions:',
-        String(params.instructions).trim(),
+        focusedInstructions,
         '',
-        'Current target snapshot:',
-        currentContent!,
+        'Exact current target excerpts around the rejected patch anchors:',
+        this.focusedPatchRecoverySnapshot(currentContent!, generatedPayload),
         '',
         'Grounded supporting evidence:',
-        evidence || '[no additional supporting evidence]',
+        this.compactFileSynthesisEvidence(
+          groundingCalls,
+          normalizedPath,
+          6_000,
+          focusedInstructions
+        ) || '[no additional supporting evidence]',
         '',
         'Rejected patch (failed path; do not repeat it):',
         generatedPayload.length <= 4_000
@@ -4306,7 +4358,8 @@ export class Runtime {
   private compactFileSynthesisEvidence(
     calls: ToolCallRecord[],
     targetPath: string,
-    maxChars: number
+    maxChars: number,
+    focusText = ''
   ): string {
     const sections: string[] = [];
     const seen = new Set<string>();
@@ -4365,6 +4418,13 @@ export class Runtime {
             : '',
           String(call.error ?? ''),
         ].filter(Boolean).join('\n');
+        const verifierProbeDuplicatedByFocus =
+          focusText.includes('VERIFIER_PROBE_EVIDENCE_VERSION')
+          && (
+            String(shell?.command ?? call.params.command ?? '').includes('ROY_VERIFIER_PROBE=1')
+            || output.includes('VERIFIER_PROBE_EVIDENCE_VERSION')
+          );
+        if (verifierProbeDuplicatedByFocus) continue;
         if (output) {
           const command = this.compactShellCommandForEvidence(
             String(shell?.command ?? call.params.command ?? '')
@@ -4392,7 +4452,87 @@ export class Runtime {
       .replace(/<system_communication_context\b[\s\S]*?<\/system_communication_context>/gi, '')
       .replace(/\n{3,}/g, '\n\n')
       .trim();
-    return this.compactDelegatedTask(withoutDerivedCaches, 8_000);
+    return this.compactDelegatedTask(withoutDerivedCaches, 6_000);
+  }
+
+  private focusedPatchRecoverySnapshot(
+    currentContent: string,
+    rejectedPatch: string,
+    maxChars = 12_000
+  ): string {
+    if (currentContent.length <= maxChars) return currentContent;
+    const sourceLines = currentContent.replace(/\r\n/g, '\n').split('\n');
+    const patchLines = rejectedPatch.replace(/\r\n/g, '\n').split('\n');
+    const occurrenceCounts = new Map<string, number>();
+    for (const line of sourceLines) {
+      occurrenceCounts.set(line, (occurrenceCounts.get(line) ?? 0) + 1);
+    }
+    const anchors = patchLines
+      .filter(line => (line.startsWith(' ') || line.startsWith('-'))
+        && line.slice(1).trim().length >= 4)
+      .map(line => line.slice(1))
+      .filter((line, index, lines) => lines.indexOf(line) === index)
+      .sort((left, right) =>
+        (occurrenceCounts.get(left) ?? 0) - (occurrenceCounts.get(right) ?? 0)
+        || right.length - left.length
+      );
+    const centers: number[] = [];
+    for (const anchor of anchors) {
+      const index = sourceLines.indexOf(anchor);
+      if (index >= 0 && !centers.some(center => Math.abs(center - index) <= 20)) {
+        centers.push(index);
+      }
+      if (centers.length >= 4) break;
+    }
+    if (centers.length === 0) {
+      for (const line of patchLines) {
+        const match = /^@@ -(\d+)/.exec(line);
+        const declaredIndex = match ? Number(match[1]) - 1 : -1;
+        if (declaredIndex >= 0 && declaredIndex < sourceLines.length) {
+          centers.push(declaredIndex);
+        }
+      }
+    }
+    if (centers.length === 0) {
+      const head = Math.floor(maxChars * 0.5);
+      return [
+        currentContent.slice(0, head),
+        '[current source middle omitted: rejected patch contained no resolvable anchor]',
+        currentContent.slice(-(maxChars - head)),
+      ].join('\n');
+    }
+    const ranges = centers
+      .map(center => ({
+        start: Math.max(0, center - 45),
+        end: Math.min(sourceLines.length, center + 46),
+      }))
+      .sort((left, right) => left.start - right.start)
+      .reduce<Array<{ start: number; end: number }>>((merged, range) => {
+        const previous = merged.at(-1);
+        if (previous && range.start <= previous.end + 8) {
+          previous.end = Math.max(previous.end, range.end);
+        } else {
+          merged.push({ ...range });
+        }
+        return merged;
+      }, []);
+    const excerpts: string[] = [];
+    let remaining = maxChars;
+    for (const range of ranges) {
+      const header = `[exact current source excerpt lines ${range.start + 1}-${range.end}]`;
+      const body = sourceLines.slice(range.start, range.end).join('\n');
+      const section = `${header}\n${body}\n[end exact current source excerpt]`;
+      if (section.length <= remaining) {
+        excerpts.push(section);
+        remaining -= section.length + 2;
+        continue;
+      }
+      if (excerpts.length === 0) {
+        excerpts.push(`${section.slice(0, Math.max(1, remaining - 36))}\n[excerpt compacted at character budget]`);
+      }
+      break;
+    }
+    return excerpts.join('\n\n');
   }
 
   private compactRecoveryAssignment(task: string): string {
@@ -4514,11 +4654,8 @@ export class Runtime {
           const trailingContextLines = [...hunkLines]
             .reverse()
             .findIndex(line => line[0] !== ' ');
-          const maximumEdgeTrim = Math.min(
-            16,
-            Math.max(0, leadingContextLines)
-              + Math.max(0, trailingContextLines)
-          );
+          const maximumEdgeTrim = Math.max(0, leadingContextLines)
+            + Math.max(0, trailingContextLines);
           outer: for (let totalTrim = 1; totalTrim <= maximumEdgeTrim; totalTrim += 1) {
             for (let leadingTrim = 0; leadingTrim <= totalTrim; leadingTrim += 1) {
               const trailingTrim = totalTrim - leadingTrim;
@@ -4553,6 +4690,46 @@ export class Runtime {
               candidates = fuzzyCandidates;
               break outer;
             }
+          }
+        }
+        if (candidates.length === 0) {
+          const changeBlocks: string[][] = [];
+          let activeBlock: string[] = [];
+          for (const line of hunkLines) {
+            if (line[0] === '+' || line[0] === '-') {
+              activeBlock.push(line);
+            } else if (activeBlock.length > 0) {
+              changeBlocks.push(activeBlock);
+              activeBlock = [];
+            }
+          }
+          if (activeBlock.length > 0) changeBlocks.push(activeBlock);
+          const resolvedBlocks = changeBlocks.map(lines => {
+            const deletionPattern = lines
+              .filter(line => line[0] === '-')
+              .map(line => line.slice(1));
+            const indices = deletionPattern.length > 0
+              ? matchingIndices(deletionPattern)
+              : [];
+            return {
+              lines,
+              deletionPattern,
+              indices,
+            };
+          });
+          if (resolvedBlocks.length > 0
+            && resolvedBlocks.every(block => block.indices.length === 1)) {
+            for (const block of resolvedBlocks) {
+              hunks.push({
+                oldStart,
+                declaredIndex,
+                sourceIndex: block.indices[0]!,
+                sourcePattern: block.deletionPattern,
+                lines: block.lines,
+              });
+            }
+            patchIndex = hunkEnd;
+            continue;
           }
         }
         if (candidates.length === 0) {
@@ -7916,7 +8093,10 @@ export class Runtime {
     const priorIndependentVerification = actorVerificationEvidenceRequired
       && !actorDiagnosticProbeRequired
       && !actorWorkspaceExecutionRequired
-      ? this.selectAuthoritativePriorVerification(options.priorToolCalls ?? [])
+      ? this.selectAuthoritativePriorVerification(
+        options.priorToolCalls ?? [],
+        immutableActorTask
+      )
       : undefined;
 
     const session = ctx.manager.getSession(ctx.sessionId);
@@ -12166,6 +12346,21 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
         (left.completedAt ?? left.startedAt ?? 0)
         - (right.completedAt ?? right.startedAt ?? 0)
       );
+    const authoritativeVerifierCommand = calls
+      .filter(call => call.toolName === 'shell.exec'
+        && isWorkspaceVerificationCall(call))
+      .map((call, index) => ({
+        command: String(call.params.command ?? '').trim(),
+        index,
+      }))
+      .filter(item => item.command)
+      .map(item => ({
+        ...item,
+        authority: this.verificationCommandAuthority(item.command),
+      }))
+      .sort((left, right) =>
+        right.authority - left.authority || right.index - left.index
+      )[0]?.command;
     let latestScorecardIndex = -1;
     let latestScorecard: ReturnType<Runtime['latestVerifierScorecardFromCalls']>;
     for (let index = calls.length - 1; index >= 0; index -= 1) {
@@ -12216,7 +12411,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
         (call.result as { stdout?: unknown } | undefined)?.stdout ?? ''
       );
       if (this.isFocusedVerifierDiagnosticCall(call)
-        && stdout.includes('VERIFIER_PROBE_EVIDENCE_VERSION 2')) {
+        && /VERIFIER_PROBE_EVIDENCE_VERSION [23]\b/.test(stdout)) {
         latestDiagnosticIndex = index;
         break;
       }
@@ -12233,8 +12428,18 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
         }
       }
     }
-    const cachedDiagnostic = latestDiagnosticIndex > causalAnchorIndex
+    const rejectedBeforeMutation = Boolean(
+      latestRejected
+      && !workspaceCandidateRollbackFromCall(latestRejected)
+      && (latestRejected.result as { synthesisRejected?: unknown } | undefined)
+        ?.synthesisRejected === true
+    );
+    const cachedDiagnostic = latestDiagnosticIndex >= 0
       && netMutationDepthAfterDiagnostic === 0
+      && (
+        latestDiagnosticIndex > causalAnchorIndex
+        || rejectedBeforeMutation
+      )
       ? calls[latestDiagnosticIndex]
       : undefined;
     const rollback = latestRejected
@@ -12283,6 +12488,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
         }
         : undefined,
       currentWorkspacePolicy: 'Re-observe the current source and run a fresh verifier probe; cached source bytes and rejected payloads are not authoritative.',
+      authoritativeVerifierCommand,
     }, null, 2);
     const immutableAssignment = this.compactRecoveryAssignment(task);
     const focusedRecoveryMemory: AgentMemoryScope = {
@@ -12323,6 +12529,9 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
           : `Consume the diagnostic member result and repair ${target}.`,
         'Inspect the authoritative current snapshot and use the smallest coherent fs.replace or focused fs.synthesize patch supported by the diagnostic evidence.',
         'Preserve all verifier groups already passing at the accepted baseline. Run the focused reproduction and official verifier after the mutation; consume failures as feedback before reporting.',
+        authoritativeVerifierCommand
+          ? `Configured authoritative verifier command:\n\`\`\`bash\n${authoritativeVerifierCommand}\n\`\`\``
+          : '',
         'Do not perform another broad whole-file rewrite and do not modify immutable verifier evidence.',
         `<recovery_capsule>\n${recoveryCapsule}\n</recovery_capsule>`,
         `Immutable assignment:\n${immutableAssignment}`,
@@ -12344,6 +12553,9 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
       task: [
         'Independently verify the workspace state produced by the recovery executor.',
         'Run the configured official verifier and inspect its scorecard. Confirm that accepted baseline groups remain passing and report exact remaining mismatches.',
+        authoritativeVerifierCommand
+          ? `Configured authoritative verifier command:\n\`\`\`bash\n${authoritativeVerifierCommand}\n\`\`\``
+          : '',
         'Do not mutate the implementation or verifier and do not claim closure unless the official verifier succeeds.',
         `<recovery_capsule>\n${recoveryCapsule}\n</recovery_capsule>`,
         `Immutable assignment:\n${immutableAssignment}`,
@@ -16402,13 +16614,48 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       if (shellAvailable) diagnosticPlans.push(diagnosticExecution);
       plans.unshift(...diagnosticPlans);
     }
-    if (plans.length === 0 && workspaceExecutionRequired) {
-      const transitionPlans = this.toolPlanner.planWorkspaceRepairTransition({
-        task: intentTask,
-        calls: priorPlannerCalls,
-        bindings,
-        workspaceRoot: this.workspaceRoot,
-      });
+    const priorRejectedVerifierCandidate = this.latestRejectedVerifierCandidate(
+      priorPlannerCalls
+    );
+    if (priorRejectedVerifierCandidate) {
+      const deferredMutations = plans.filter(plan =>
+        isSuccessfulWorkspaceMutationCall({
+          toolName: plan.toolName,
+          params: plan.params,
+          success: true,
+        })
+      );
+      if (deferredMutations.length > 0) {
+        plans = plans.filter(plan => !deferredMutations.includes(plan));
+        this.emit({
+          type: 'tool.plan.rejected_candidate.mutation_deferred',
+          agentId,
+          sessionId: this.getContext().sessionId,
+          correlationId: options.correlationId,
+          nodeId: options.nodeId,
+          data: {
+            reason: 'prior_verifier_rejection_requires_fresh_diagnosis',
+            path: priorRejectedVerifierCandidate.path,
+            deferred: deferredMutations.map(plan => ({
+              toolName: plan.toolName,
+              params: plan.params,
+            })),
+          },
+        });
+      }
+    }
+    if (plans.length === 0
+      && workspaceExecutionRequired
+      && !priorRejectedVerifierCandidate) {
+      const transitionPlans = this.enrichRepairPlansWithTeamStepEvidence(
+        this.toolPlanner.planWorkspaceRepairTransition({
+          task: intentTask,
+          calls: priorPlannerCalls,
+          bindings,
+          workspaceRoot: this.workspaceRoot,
+        }),
+        task
+      );
       if (transitionPlans.length > 0) {
         plans.push(...transitionPlans);
         this.emit({
@@ -16429,7 +16676,9 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         });
       }
     }
-    if (plans.length === 0 && workspaceExecutionRequired) {
+    if (plans.length === 0
+      && workspaceExecutionRequired
+      && !priorRejectedVerifierCandidate) {
       const externalFeedbackRepair = this.toolPlanner.planExternalFeedbackRepair({
         task: intentTask,
         calls: priorPlannerCalls,
@@ -16519,7 +16768,24 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     }
     plans = this.keepSingleWorkspaceMutationHypothesis(plans, agentId, options);
     if (plans.length === 0) {
-      const warning = groundingRequired
+      if (priorRejectedVerifierCandidate) {
+        this.emit({
+          type: 'agent.tool_loop.rejected_candidate.closed',
+          agentId,
+          sessionId: this.getContext().sessionId,
+          correlationId: options.correlationId,
+          nodeId: options.nodeId,
+          data: {
+            round: 0,
+            reason: 'prior_verifier_rejection_requires_fresh_diagnosis',
+            path: priorRejectedVerifierCandidate.path,
+            candidateReason: priorRejectedVerifierCandidate.reason,
+            baselineReward: priorRejectedVerifierCandidate.baselineReward,
+            candidateReward: priorRejectedVerifierCandidate.candidateReward,
+          },
+        });
+      }
+      const warning = groundingRequired && !priorRejectedVerifierCandidate
         ? 'Grounding was required, but no authorized tool call could be planned for this task.'
         : undefined;
       if (warning) {
@@ -16533,10 +16799,18 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       }
       return {
         toolCalls: [],
-        grounded: !groundingRequired,
+        grounded: Boolean(priorRejectedVerifierCandidate) || !groundingRequired,
         warnings: warning ? [warning] : [],
-        context: '',
-        evidence: { toolGrounded: false, outputGrounded: !groundingRequired, observedPaths: [] },
+        context: priorRejectedVerifierCandidate
+          ? 'The latest verifier-rejected workspace hypothesis was rolled back. A fresh diagnostic phase is required before another mutation.'
+          : '',
+        evidence: {
+          toolGrounded: Boolean(priorRejectedVerifierCandidate),
+          outputGrounded: Boolean(priorRejectedVerifierCandidate) || !groundingRequired,
+          observedPaths: typeof priorRejectedVerifierCandidate?.path === 'string'
+            ? [priorRejectedVerifierCandidate.path]
+            : [],
+        },
         toolLoop: {
           rounds: [],
           totalCalls: 0,
@@ -16635,12 +16909,36 @@ For web-grounded work, use only facts present in the subagent report or runtime 
           });
           return postMutationVerification.slice(0, context.remainingCalls);
         }
-        const causalTransitionPlans = this.toolPlanner.planWorkspaceRepairTransition({
-          task: intentTask,
-          calls: [...priorPlannerCalls, ...context.calls],
-          bindings,
-          workspaceRoot: this.workspaceRoot,
-        });
+        const rejectedCandidate = this.latestRejectedVerifierCandidate(
+          [...priorPlannerCalls, ...context.calls]
+        );
+        if (rejectedCandidate) {
+          this.emit({
+            type: 'agent.tool_loop.rejected_candidate.closed',
+            agentId,
+            sessionId: this.getContext().sessionId,
+            correlationId: options.correlationId,
+            nodeId: options.nodeId,
+            data: {
+              round: context.round,
+              reason: 'verifier_rejected_current_hypothesis_require_fresh_diagnosis',
+              path: rejectedCandidate.path,
+              candidateReason: rejectedCandidate.reason,
+              baselineReward: rejectedCandidate.baselineReward,
+              candidateReward: rejectedCandidate.candidateReward,
+            },
+          });
+          return [];
+        }
+        const causalTransitionPlans = this.enrichRepairPlansWithTeamStepEvidence(
+          this.toolPlanner.planWorkspaceRepairTransition({
+            task: intentTask,
+            calls: [...priorPlannerCalls, ...context.calls],
+            bindings,
+            workspaceRoot: this.workspaceRoot,
+          }),
+          task
+        );
         if (causalTransitionPlans.length > 0) {
           this.emit({
             type: 'tool.plan.causal_transition',
@@ -16923,7 +17221,35 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       } else if (call.toolName === 'fs.read') {
         const read = call.result as { path?: unknown; content?: unknown } | undefined;
         if (typeof read?.path === 'string') observedPaths.push(read.path);
-        const content = typeof read?.content === 'string' ? read.content.slice(0, 8000) : '';
+        const readPath = this.normalizeToolWorkspacePath(String(
+          read?.path ?? call.params.path ?? ''
+        ));
+        const diagnosticSourcePath = diagnosticProbeRequired
+          ? this.extractTaskDiagnosticSourcePaths(intentTask)[0]
+          : undefined;
+        const contentLimit = diagnosticSourcePath
+          && readPath === diagnosticSourcePath
+          ? 24_000
+          : 8_000;
+        const content = typeof read?.content === 'string'
+          ? read.content.slice(0, contentLimit)
+          : '';
+        if (diagnosticSourcePath && readPath === diagnosticSourcePath) {
+          this.emit({
+            type: 'agent.verifier_diagnostic.source_context.loaded',
+            agentId,
+            sessionId: this.getContext().sessionId,
+            correlationId: options.correlationId,
+            nodeId: options.nodeId,
+            data: {
+              path: readPath,
+              contentChars: content.length,
+              availableChars: typeof read?.content === 'string'
+                ? read.content.length
+                : 0,
+            },
+          });
+        }
         summaries.push(`${String(read?.path ?? 'file')}: ${content.slice(0, 1000)}`);
         contexts.push(`File read result for ${String(read?.path ?? 'file')}:\n${content}`);
       } else if (call.toolName === 'fs.write') {
@@ -17152,28 +17478,78 @@ For web-grounded work, use only facts present in the subagent report or runtime 
   }
 
   private selectAuthoritativePriorVerification(
-    calls: ToolCallRecord[]
+    calls: ToolCallRecord[],
+    task = ''
   ): ToolCallRecord | undefined {
     const candidates = calls
       .map((call, index) => ({ call, index }))
-      .filter(item => isSuccessfulWorkspaceVerificationCall(item.call))
+      // Command authority is independent of whether the prior candidate
+      // passed. A failed official verifier remains the command that an
+      // independent tester must rerun after the next mutation.
+      .filter(item => item.call.success && isWorkspaceVerificationCall(item.call))
       .map(item => {
-        const command = String(item.call.params.command ?? '').toLowerCase();
-        let authority = 10;
-        if (command.includes('.roy/official-verifier/')
-          && !command.includes('roy_verifier_probe=1')) {
-          authority = 100;
-        } else if (/\b(?:pytest|unittest|npm test|pnpm test|yarn test|cargo test|go test)\b/.test(command)) {
-          authority = 80;
-        } else if (/\b(?:grade|verifier|verify|test|check)\b/.test(command)) {
-          authority = command.includes('roy_verifier_probe=1') ? 30 : 60;
-        }
-        return { ...item, authority };
+        const command = String(item.call.params.command ?? '');
+        return {
+          ...item,
+          authority: this.verificationCommandAuthority(command),
+        };
       })
       .sort((left, right) =>
         right.authority - left.authority || right.index - left.index
       );
-    return candidates[0]?.call;
+    const cached = candidates[0];
+    const taskCommand = this.extractAuthoritativeVerificationCommand(task);
+    if (taskCommand
+      && this.verificationCommandAuthority(taskCommand) > (cached?.authority ?? 0)) {
+      return {
+        toolName: 'shell.exec',
+        params: { command: taskCommand },
+        success: true,
+        reason: 'Authoritative verification command extracted from the immutable task.',
+      };
+    }
+    return cached?.call;
+  }
+
+  private verificationCommandAuthority(command: string): number {
+    const normalized = command.toLowerCase();
+    if (normalized.includes('.roy/official-verifier/')
+      && !normalized.includes('roy_verifier_probe=1')) {
+      return 100;
+    }
+    if (/\b(?:pytest|unittest|npm test|pnpm test|yarn test|cargo test|go test)\b/.test(normalized)) {
+      return 80;
+    }
+    if (/\b(?:grade|verifier|verify|test|check)\b/.test(normalized)) {
+      return normalized.includes('roy_verifier_probe=1') ? 30 : 60;
+    }
+    return 10;
+  }
+
+  private extractAuthoritativeVerificationCommand(task: string): string | undefined {
+    const commands = [...task.matchAll(
+      /```(?:bash|sh|shell)?\s*\n([\s\S]*?)```/gi
+    )]
+      .flatMap(match => String(match[1] ?? '')
+        .split('\n')
+        .map(line => line.trim())
+        .filter(line => line
+          && !line.startsWith('#')
+          && !line.includes('ROY_VERIFIER_PROBE=1')))
+      .filter(command =>
+        /\b(?:grade|verifier|verify|pytest|unittest|npm test|pnpm test|yarn test|cargo test|go test|check)\b/i.test(
+          command
+        )
+      )
+      .map((command, index) => ({
+        command,
+        index,
+        authority: this.verificationCommandAuthority(command),
+      }))
+      .sort((left, right) =>
+        right.authority - left.authority || right.index - left.index
+      );
+    return commands[0]?.command;
   }
 
   private hasUnresolvedSynthesisRejection(
@@ -17194,6 +17570,25 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       );
     }
     return false;
+  }
+
+  private latestRejectedVerifierCandidate(
+    calls: Array<Pick<ToolCallRecord, 'toolName' | 'params' | 'result' | 'success'>>
+  ): Record<string, unknown> | undefined {
+    for (let index = calls.length - 1; index >= 0; index -= 1) {
+      const call = calls[index]!;
+      if (this.isFocusedVerifierDiagnosticCall(call)
+        || isSuccessfulWorkspaceMutationCall(call)) {
+        return undefined;
+      }
+      const candidateRollback = (
+        call.result as { candidateRollback?: unknown } | undefined
+      )?.candidateRollback;
+      if (candidateRollback && typeof candidateRollback === 'object') {
+        return candidateRollback as Record<string, unknown>;
+      }
+    }
+    return undefined;
   }
 
   private buildPythonVerifierDiagnosticCommand(task = ''): string {

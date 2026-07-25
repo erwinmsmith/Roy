@@ -519,6 +519,12 @@ describe('benchmark terminal capability', () => {
     expect(recovery?.agents[0]?.task).toContain('[runtime_verifier_diagnostic_probe]');
     expect(recovery?.agents[0]?.task).toContain('<recovery_capsule>');
     expect(recovery?.agents[0]?.task).not.toContain('<resume_ledger>');
+    expect(recovery?.agents[1]?.task).toContain(
+      'python .roy/official-verifier/grade.py'
+    );
+    expect(recovery?.agents[2]?.task).toContain(
+      'python .roy/official-verifier/grade.py'
+    );
     expect(recovery?.agents.every(agent =>
       agent.memoryScope?.public === false
       && agent.memoryScope.private === false
@@ -561,7 +567,7 @@ describe('benchmark terminal capability', () => {
       },
       success: true,
       result: {
-        stdout: 'VERIFIER_PROBE_EVIDENCE_VERSION 2\nVERIFIER_PROBE_RESULT 1.0\nVERIFIER_PROBE_ARTIFACT {"path":"outputs/layout_qc.json"}',
+        stdout: 'VERIFIER_PROBE_EVIDENCE_VERSION 3\nVERIFIER_PROBE_RESULT 1.0\nVERIFIER_PROBE_ARTIFACT {"path":"outputs/layout_qc.json"}',
       },
       startedAt: now + 1,
       completedAt: now + 2,
@@ -610,6 +616,33 @@ describe('benchmark terminal capability', () => {
     expect(buildRecovery(
       'Repair implementation.py until the official verifier succeeds.',
       freshDiagnostic
+    )).toMatchObject({
+      agents: [
+        expect.objectContaining({ name: 'FocusedRepairer-5' }),
+        expect.objectContaining({ name: 'RecoveryVerifier-6' }),
+      ],
+      team: expect.objectContaining({ name: 'VerifierGuidedRecoveryTeam-2' }),
+    });
+
+    const diagnosticThenInvalidPatch = structuredClone(failedAttempt);
+    diagnosticThenInvalidPatch.knowledge.paths[0]!.toolFrontier.push(
+      diagnosticFrontier.at(-3)!,
+      {
+        toolName: 'fs.synthesize',
+        params: { path: 'implementation.py', strategy: 'patch' },
+        success: false,
+        result: {
+          path: 'implementation.py',
+          synthesisRejected: true,
+          reason: 'focused patch source anchor does not match',
+        },
+        startedAt: now + 3,
+        completedAt: now + 4,
+      } as never
+    );
+    expect(buildRecovery(
+      'Repair implementation.py until the official verifier succeeds.',
+      diagnosticThenInvalidPatch
     )).toMatchObject({
       agents: [
         expect.objectContaining({ name: 'FocusedRepairer-5' }),
