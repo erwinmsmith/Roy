@@ -2970,6 +2970,7 @@ export class Runtime {
       exitCode?: unknown;
       timedOut?: unknown;
       verifierDiagnostics?: unknown;
+      candidateRetention?: unknown;
       candidateRollback?: unknown;
       regressionRollback?: unknown;
     };
@@ -2987,6 +2988,7 @@ export class Runtime {
       stdout: compactTail(shell.stdout),
       stderr: compactTail(shell.stderr),
       verifierDiagnostics: shell.verifierDiagnostics,
+      candidateRetention: shell.candidateRetention,
       candidateRollback: shell.candidateRollback,
       regressionRollback: shell.regressionRollback,
     };
@@ -3233,6 +3235,44 @@ export class Runtime {
         before: baseline.groups[group] ?? 0,
         after: current.groups[group],
       }));
+    const hardGateComposition = baseline.reward <= 1e-12
+      && current.reward <= 1e-12
+      && regressedGroups.length === 0;
+    if (hardGateComposition) {
+      await this.persistAcceptedVerifierWorkspaceCheckpoint(
+        current,
+        checkpoints,
+        agentId,
+        correlationId
+      );
+      const retainedPaths = checkpoints.map(item => item.path);
+      const candidateRetention = {
+        retained: true,
+        path: checkpoint.path,
+        retainedPaths,
+        reason: 'hard_gate_composition',
+        candidateFingerprint: checkpoint.candidateFingerprint,
+        baselineReward: baseline.reward,
+        candidateReward: current.reward,
+        baselineGroups: baseline.groups,
+        candidateGroups: current.groups,
+        regressedGroups,
+        improvedGroups,
+      };
+      this.emit({
+        type: 'workspace.mutation.candidate_retained',
+        agentId,
+        correlationId,
+        data: candidateRetention,
+      });
+      return {
+        ...toolResult,
+        result: {
+          ...(toolResult.result as Record<string, unknown>),
+          candidateRetention,
+        },
+      };
+    }
     const reason = current.reward + 1e-12 < baseline.reward
       ? 'reward_regression'
       : 'no_objective_gain';
@@ -4877,6 +4917,7 @@ export class Runtime {
           stderr?: unknown;
           exitCode?: unknown;
           verifierDiagnostics?: unknown;
+          candidateRetention?: unknown;
           candidateRollback?: unknown;
           regressionRollback?: unknown;
         } | undefined;
@@ -4885,6 +4926,9 @@ export class Runtime {
           String(shell?.stderr ?? ''),
           shell?.verifierDiagnostics
             ? `Verifier diagnostics:\n${JSON.stringify(shell.verifierDiagnostics)}`
+            : '',
+          shell?.candidateRetention
+            ? `Retained verifier candidate for coordinated hard-gate composition:\n${JSON.stringify(shell.candidateRetention)}`
             : '',
           shell?.candidateRollback
             ? `Rejected verifier candidate:\n${JSON.stringify(shell.candidateRollback)}`

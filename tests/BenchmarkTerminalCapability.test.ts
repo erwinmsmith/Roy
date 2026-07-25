@@ -1509,6 +1509,172 @@ describe('benchmark terminal capability', () => {
     await runtime.shutdown();
   });
 
+  it('retains zero-reward hard-gate candidates so coordinated file changes can compose', async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), 'roy-hard-gate-composition-'));
+    await mkdir(path.join(workspace, '.roy', 'official-verifier'), { recursive: true });
+    await mkdir(path.join(workspace, 'logs', 'verifier'), { recursive: true });
+    await writeFile(path.join(workspace, 'part-a.py'), 'VALUE = 0\n');
+    await writeFile(path.join(workspace, 'part-b.py'), 'VALUE = 0\n');
+    await writeFile(
+      path.join(workspace, '.roy', 'config.json'),
+      JSON.stringify({
+        tools: {
+          approval: { readOnly: 'auto', write: 'auto', execute: 'auto' },
+          shell: { mode: 'unrestricted', shell: '/bin/sh' },
+        },
+      })
+    );
+    const gradePath = path.join(workspace, '.roy', 'official-verifier', 'grade.py');
+    const scorecardPath = path.join(workspace, 'logs', 'verifier', 'scorecard.json');
+    await writeFile(gradePath, 'print("0.000000000000")\n');
+    await writeFile(
+      scorecardPath,
+      JSON.stringify({ groups: { coordinated_gate: 0 }, reward: 0 })
+    );
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'hard-gate-composition-test',
+      workspaceCwd: workspace,
+    });
+
+    const firstBaseline = await runtime.executeToolForAgent(
+      'root',
+      'shell.exec',
+      { command: 'python3 .roy/official-verifier/grade.py' },
+      { correlationId: 'hard-gate-part-a' }
+    );
+    const firstBaselineCall = {
+      toolName: 'shell.exec',
+      params: { command: 'python3 .roy/official-verifier/grade.py' },
+      reason: 'Establish the all-or-nothing verifier baseline.',
+      groundingRequired: true,
+      success: firstBaseline.success,
+      result: firstBaseline.result,
+      error: firstBaseline.error,
+    };
+    const firstMutation = await runtime.executeToolForAgent(
+      'root',
+      'fs.replace',
+      {
+        path: 'part-a.py',
+        oldText: 'VALUE = 0',
+        newText: 'VALUE = 1',
+        expectedReplacements: 1,
+      },
+      {
+        correlationId: 'hard-gate-part-a',
+        groundingCalls: [firstBaselineCall],
+      }
+    );
+    const firstCandidate = await runtime.executeToolForAgent(
+      'root',
+      'shell.exec',
+      { command: 'python3 .roy/official-verifier/grade.py' },
+      {
+        correlationId: 'hard-gate-part-a',
+        groundingCalls: [
+          firstBaselineCall,
+          {
+            toolName: 'fs.replace',
+            params: { path: 'part-a.py' },
+            reason: 'Apply the first half of a coordinated repair.',
+            groundingRequired: true,
+            success: firstMutation.success,
+            result: firstMutation.result,
+            error: firstMutation.error,
+          },
+        ],
+      }
+    );
+    expect(firstCandidate).toMatchObject({
+      success: true,
+      result: expect.objectContaining({
+        candidateRetention: expect.objectContaining({
+          retained: true,
+          path: 'part-a.py',
+          retainedPaths: ['part-a.py'],
+          reason: 'hard_gate_composition',
+          baselineReward: 0,
+          candidateReward: 0,
+        }),
+      }),
+    });
+    expect((firstCandidate.result as { candidateRollback?: unknown }).candidateRollback)
+      .toBeUndefined();
+    expect(await readFile(path.join(workspace, 'part-a.py'), 'utf8')).toBe('VALUE = 1\n');
+
+    const secondBaselineCall = {
+      toolName: 'shell.exec',
+      params: { command: 'python3 .roy/official-verifier/grade.py' },
+      reason: 'Carry forward the retained hard-gate candidate.',
+      groundingRequired: true,
+      success: firstCandidate.success,
+      result: firstCandidate.result,
+      error: firstCandidate.error,
+    };
+    const secondMutation = await runtime.executeToolForAgent(
+      'root',
+      'fs.replace',
+      {
+        path: 'part-b.py',
+        oldText: 'VALUE = 0',
+        newText: 'VALUE = 1',
+        expectedReplacements: 1,
+      },
+      {
+        correlationId: 'hard-gate-part-b',
+        groundingCalls: [secondBaselineCall],
+      }
+    );
+    await writeFile(gradePath, 'print("1.000000000000")\n');
+    await writeFile(
+      scorecardPath,
+      JSON.stringify({ groups: { coordinated_gate: 1 }, reward: 1 })
+    );
+    const completedCandidate = await runtime.executeToolForAgent(
+      'root',
+      'shell.exec',
+      { command: 'python3 .roy/official-verifier/grade.py' },
+      {
+        correlationId: 'hard-gate-part-b',
+        groundingCalls: [
+          secondBaselineCall,
+          {
+            toolName: 'fs.replace',
+            params: { path: 'part-b.py' },
+            reason: 'Apply the second half of a coordinated repair.',
+            groundingRequired: true,
+            success: secondMutation.success,
+            result: secondMutation.result,
+            error: secondMutation.error,
+          },
+        ],
+      }
+    );
+    expect(completedCandidate.success).toBe(true);
+    expect((completedCandidate.result as { candidateRollback?: unknown }).candidateRollback)
+      .toBeUndefined();
+    expect(await readFile(path.join(workspace, 'part-a.py'), 'utf8')).toBe('VALUE = 1\n');
+    expect(await readFile(path.join(workspace, 'part-b.py'), 'utf8')).toBe('VALUE = 1\n');
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'workspace.mutation.candidate_retained',
+      data: expect.objectContaining({
+        path: 'part-a.py',
+        reason: 'hard_gate_composition',
+      }),
+    }));
+    const persisted = JSON.parse(await readFile(
+      path.join(workspace, '.roy', 'cache', 'accepted-workspace-checkpoint.json'),
+      'utf8'
+    )) as {
+      scorecard: { reward: number };
+      files: Array<{ path: string }>;
+    };
+    expect(persisted.scorecard.reward).toBe(1);
+    expect(persisted.files.map(file => file.path)).toEqual(['part-a.py', 'part-b.py']);
+    await runtime.shutdown();
+  });
+
   it('persists an accepted workspace checkpoint and restores it across runtime processes', async () => {
     const workspace = await mkdtemp(path.join(tmpdir(), 'roy-persistent-verifier-checkpoint-'));
     await mkdir(path.join(workspace, '.roy', 'official-verifier'), { recursive: true });

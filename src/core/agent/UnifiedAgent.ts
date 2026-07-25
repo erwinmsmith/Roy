@@ -2364,6 +2364,7 @@ function compactToolObservation(
       exitCode?: unknown;
       timedOut?: unknown;
       verifierDiagnostics?: unknown;
+      candidateRetention?: unknown;
       candidateRollback?: unknown;
       regressionRollback?: unknown;
     };
@@ -2378,6 +2379,7 @@ function compactToolObservation(
       exitCode: shell.exitCode,
       timedOut: shell.timedOut,
       verifierDiagnostics: compactObservationValue(shell.verifierDiagnostics, 0),
+      candidateRetention: compactObservationValue(shell.candidateRetention, 0),
       candidateRollback: compactObservationValue(shell.candidateRollback, 0),
       regressionRollback: compactObservationValue(shell.regressionRollback, 0),
     };
