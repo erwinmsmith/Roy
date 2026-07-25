@@ -18303,6 +18303,36 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       const plannedFingerprints = new Set(plans.map(plan => this.toolPlanFingerprint(plan)));
       plans.push(...modelPlans.filter(plan => !plannedFingerprints.has(this.toolPlanFingerprint(plan))));
     }
+    if (plans.length === 0
+      && workspaceExecutionRequired
+      && !priorRejectedVerifierCandidate
+      && actor instanceof UnifiedAgent) {
+      const groundedTransition = actor.planGroundedExecutionTransition({
+        task: intentTask,
+        round: 0,
+        tools: bindings
+          .filter(binding => binding.enabled)
+          .map(binding => ({ name: binding.name })),
+        calls: priorPlannerCalls,
+      });
+      if (groundedTransition.length > 0) {
+        plans.push(...groundedTransition);
+        this.emit({
+          type: 'tool.plan.grounded_execution_transition',
+          agentId,
+          sessionId: this.getContext().sessionId,
+          correlationId: options.correlationId,
+          nodeId: options.nodeId,
+          data: {
+            plans: groundedTransition.map(plan => ({
+              toolName: plan.toolName,
+              params: plan.params,
+            })),
+            priorToolCalls: priorPlannerCalls.length,
+          },
+        });
+      }
+    }
     plans = this.keepSingleWorkspaceMutationHypothesis(plans, agentId, options);
     const pendingInitialMirroredVerifier = pendingMirroredVerifierPlan(
       priorPlannerCalls

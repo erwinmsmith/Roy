@@ -866,6 +866,51 @@ describe('UnifiedAgent capability execution', () => {
     ]);
   });
 
+  it('forms a preserving execution slice directly from one grounded explicit source target', () => {
+    const llm = new NovelInspectionOnlyPlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'grounded-transition-agent',
+      goal: 'implement a verifiable bounded slice',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.read', 'fs.synthesize'],
+    });
+    const task = [
+      'Migrate the project implementation to the modern runtime.',
+      'Additional compatibility details and constraints. '.repeat(12),
+      'Relevant source targets include src/app.py and src/router.py.',
+    ].join('\n');
+
+    const plans = agent.planGroundedExecutionTransition({
+      task,
+      round: 9,
+      tools: [{ name: 'fs.read' }, { name: 'fs.synthesize' }],
+      calls: [{
+        toolName: 'fs.read',
+        params: { path: 'src/app.py' },
+        reason: 'Read the first explicit implementation target.',
+        groundingRequired: true,
+        success: true,
+        result: {
+          path: 'src/app.py',
+          content: 'def run(config):\n    return legacy_run(config)\n',
+          truncated: false,
+        },
+      }],
+    });
+
+    expect(llm.jsonCalls).toBe(0);
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.synthesize',
+        params: expect.objectContaining({
+          path: 'src/app.py',
+          strategy: 'patch',
+        }),
+      }),
+    ]);
+  });
+
   it('allows another workspace repair after a mutation when verification failed', async () => {
     const llm = new MutationRepairPlanningLLM();
     const agent = new UnifiedAgent({

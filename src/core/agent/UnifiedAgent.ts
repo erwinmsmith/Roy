@@ -641,6 +641,28 @@ export class UnifiedAgent extends BaseAgent {
     }
   }
 
+  planGroundedExecutionTransition(input: {
+    task: string;
+    round: number;
+    tools: Array<{ name: string }>;
+    calls: ToolLoopCallRecord[];
+  }): PlannedToolCall[] {
+    const authorized = new Set(input.tools
+      .filter(tool => !this.allowedTools || this.allowedTools.has(tool.name))
+      .map(tool => tool.name));
+    if (hasEffectiveWorkspaceMutationCall(input.calls)) return [];
+    const plan = recoverGroundedSynthesisPlan({
+      authorized,
+      calls: input.calls,
+      task: input.task,
+      mutationRequirementSatisfied: false,
+      latestVerificationFailed: false,
+      workspaceEvidenceSaturated: true,
+      round: input.round,
+    });
+    return plan ? [plan] : [];
+  }
+
   getLastToolPlanningFailure(): {
     message: string;
     timedOut: boolean;
