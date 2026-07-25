@@ -543,6 +543,15 @@ describe('AgentToolPlanner', () => {
           content: '[project]\ndependencies = ["runtime>=0.3"]\n',
         },
       },
+      {
+        toolName: 'fs.read',
+        params: { path: 'src/app/models.py' },
+        success: true,
+        result: {
+          path: 'src/app/models.py',
+          content: 'class LegacyRuntimeModel:\n    pass\n',
+        },
+      },
     ];
 
     const first = planner.planExternalFeedbackRepair({

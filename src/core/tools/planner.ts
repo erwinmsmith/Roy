@@ -1007,8 +1007,10 @@ export class AgentToolPlanner {
           score += 600 + Math.min(200, matchingIdentifiers.length * 40);
         }
         if (dependencyFeedback) {
-          score += manifestPriority(lowerPath);
-          if (/\blegacy\b/i.test(feedback)
+          const dependencyManifestPriority = manifestPriority(lowerPath);
+          score += dependencyManifestPriority;
+          if (dependencyManifestPriority > 0
+            && /\blegacy\b/i.test(feedback)
             && /(?:\blegacy\b|(?:={2,3}|~=)\s*0\.\d|pydantic\s*<\s*2)/im.test(
               candidate.content
             )) {
