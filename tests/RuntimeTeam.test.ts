@@ -566,6 +566,76 @@ describe('Phase 3 subteam runtime', () => {
     await runtime.shutdown();
   });
 
+  it('keeps completed-team evidence available to root after the live team registry is gone', () => {
+    const runtime = new Runtime();
+    const correlationId = 'completed-team-root-frontier';
+    const installCall = {
+      toolName: 'shell.exec',
+      params: { command: 'python -m pip install -e .' },
+      success: true,
+      result: { exitCode: 0 },
+      startedAt: 10,
+      completedAt: 20,
+    };
+    (runtime as unknown as {
+      teamToolEvidenceCache: Map<string, unknown[]>;
+    }).teamToolEvidenceCache.set('archived-team', [installCall]);
+    (runtime as unknown as {
+      teamToolEvidenceCorrelations: Map<string, string>;
+    }).teamToolEvidenceCorrelations.set('archived-team', correlationId);
+
+    const collected = (runtime as unknown as {
+      collectDelegatedExecutionGrounding: (
+        subagents: unknown[],
+        teams: unknown[],
+        correlationId: string
+      ) => { toolCalls: Array<{ toolName: string; params: Record<string, unknown> }> } | undefined;
+    }).collectDelegatedExecutionGrounding([], [], correlationId);
+
+    expect(collected?.toolCalls).toEqual([
+      expect.objectContaining({
+        toolName: 'shell.exec',
+        params: { command: 'python -m pip install -e .' },
+      }),
+    ]);
+  });
+
+  it('preserves successful dependency setup when a long team frontier is compacted', () => {
+    const runtime = new Runtime();
+    const calls = [
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m pip install -e .' },
+        success: true,
+        result: { exitCode: 0 },
+      },
+      ...Array.from({ length: 100 }, (_, index) => ({
+        toolName: 'fs.read',
+        params: { path: `src/module_${index}.py` },
+        success: true,
+        result: {
+          path: `src/module_${index}.py`,
+          content: `value = ${index}\n`,
+          truncated: false,
+        },
+      })),
+    ];
+
+    const bounded = (runtime as unknown as {
+      boundExecutionToolFrontier: (
+        calls: unknown[],
+        maxCalls: number,
+        maxSerializedChars: number
+      ) => Array<{ toolName: string; params: Record<string, unknown> }>;
+    }).boundExecutionToolFrontier(calls, 12, 100_000);
+
+    expect(bounded).toHaveLength(12);
+    expect(bounded).toContainEqual(expect.objectContaining({
+      toolName: 'shell.exec',
+      params: { command: 'python -m pip install -e .' },
+    }));
+  });
+
   it('reserves every planned member slot before a limited-budget team starts', async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), 'roy-team-capacity-reservation-'));
     const runtime = new Runtime();

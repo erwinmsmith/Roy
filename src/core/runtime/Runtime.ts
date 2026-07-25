@@ -7839,8 +7839,12 @@ export class Runtime {
           .sort((left, right) =>
             (left.completedAt ?? left.startedAt ?? 0)
             - (right.completedAt ?? right.startedAt ?? 0)
-          )
-          .slice(-80);
+          );
+        sharedTeamToolCalls = this.boundExecutionToolFrontier(
+          sharedTeamToolCalls,
+          80,
+          720_000
+        );
         if (sharedTeamToolCalls.length > 0) {
           this.teamToolEvidenceCache.set(payload.teamId, sharedTeamToolCalls);
           this.teamToolEvidenceCorrelations.set(payload.teamId, correlationId);
@@ -7900,10 +7904,14 @@ export class Runtime {
         intentTask: node.assignment.intentTask,
       });
       if (payload.teamId && subagentResult.toolCalls.length > 0) {
-        const cachedCalls = [
-          ...sharedTeamToolCalls,
-          ...subagentResult.toolCalls,
-        ].slice(-80);
+        const cachedCalls = this.boundExecutionToolFrontier(
+          [
+            ...sharedTeamToolCalls,
+            ...subagentResult.toolCalls,
+          ],
+          80,
+          720_000
+        );
         this.teamToolEvidenceCache.set(payload.teamId, cachedCalls);
         this.teamToolEvidenceCorrelations.set(payload.teamId, correlationId);
         this.emit({
@@ -7925,10 +7933,14 @@ export class Runtime {
         ? (error as Error & { runtimeToolCalls: ToolCallRecord[] }).runtimeToolCalls
         : [];
       if (payload.teamId && failedToolCalls.length > 0) {
-        const cachedCalls = [
-          ...(this.teamToolEvidenceCache.get(payload.teamId) ?? []),
-          ...failedToolCalls,
-        ].slice(-80);
+        const cachedCalls = this.boundExecutionToolFrontier(
+          [
+            ...(this.teamToolEvidenceCache.get(payload.teamId) ?? []),
+            ...failedToolCalls,
+          ],
+          80,
+          720_000
+        );
         this.teamToolEvidenceCache.set(payload.teamId, cachedCalls);
         this.teamToolEvidenceCorrelations.set(payload.teamId, correlationId);
         this.emit({
@@ -11526,6 +11538,11 @@ export class Runtime {
       if (isWorkspaceVerificationCall(call)) priority += 950;
       if (this.isFocusedVerifierDiagnosticCall(call)) priority += 925;
       if (isSuccessfulWorkspaceMutationCall(call)) priority += 900;
+      if (call.toolName === 'shell.exec'
+        && call.success
+        && this.isDependencyInstallCommand(String(call.params.command ?? ''))) {
+        priority += 1_500;
+      }
       if (call.toolName === 'fs.read' && mutatedPaths.has(target)) priority += 875;
       if (call.toolName === 'fs.read' && target.startsWith('.roy/official-verifier/')) {
         priority += 825;
@@ -20295,9 +20312,11 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     for (const team of teamResults) {
       for (const member of team.members) addResult(member);
     }
-    const cachedTeamCalls = this.getTeams()
-      .filter(team => team.correlationId === correlationId)
-      .flatMap(team => this.teamToolEvidenceCache.get(team.identity.id) ?? []);
+    const cachedTeamCalls = [...this.teamToolEvidenceCache.entries()]
+      .filter(([teamId]) =>
+        this.teamToolEvidenceCorrelations.get(teamId) === correlationId
+      )
+      .flatMap(([, calls]) => calls);
     if (results.length === 0 && cachedTeamCalls.length === 0) return undefined;
 
     const seenCalls = new Set<ToolCallRecord>();
