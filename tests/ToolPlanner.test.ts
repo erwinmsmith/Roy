@@ -816,6 +816,7 @@ describe('AgentToolPlanner', () => {
       params: {
         path: 'src/table_recon/audit.py',
         instructions: expect.stringContaining('preserving behavior already proven'),
+        strategy: 'patch',
       },
     })]);
     expect(planner.planWorkspaceRepairTransition({

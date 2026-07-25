@@ -1491,7 +1491,9 @@ function recoverGroundedSynthesisPlan(input: {
         : groundedInitialRepair
           ? 'Apply a focused, interface-preserving implementation patch to satisfy the immutable assignment using the grounded input contract and observed baseline behavior. Preserve working code and do not rewrite unrelated behavior.'
           : 'Implement the complete assigned workspace behavior in this authoritative source file using the grounded inputs, rules, and project structure.',
-      ...(groundedInitialRepair ? { strategy: 'patch' } : {}),
+      ...(groundedInitialRepair || aggregateVerifierRepair
+        ? { strategy: 'patch' }
+        : {}),
     },
     reason: groundedInitialRepair
       ? `Runtime transitioned from completed baseline inspection to a grounded preserving implementation patch in round ${input.round}; a zero-exit baseline does not satisfy a mutation-required assignment.`

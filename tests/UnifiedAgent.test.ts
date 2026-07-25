@@ -2093,6 +2093,7 @@ describe('UnifiedAgent capability execution', () => {
       params: {
         path: 'src/table_recon/audit.py',
         instructions: expect.stringContaining('aggregate official-verifier failures'),
+        strategy: 'patch',
       },
     })]);
   });

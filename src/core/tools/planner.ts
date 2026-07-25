@@ -832,7 +832,7 @@ export class AgentToolPlanner {
       params: {
         path: targetPath,
         instructions,
-        ...(targetRejectedCandidate ? { strategy: 'patch' } : {}),
+        strategy: 'patch',
       },
       reason: targetRejectedCandidate
         ? 'The prior candidate was rolled back; change the repair hypothesis to the unresolved verifier capabilities while preserving the accepted baseline.'
