@@ -1515,9 +1515,22 @@ describe('Runtime controlled subagent spawning', () => {
       fsmEnabled: false,
       workspaceCwd,
     });
+    await mkdir(path.join(workspaceCwd, 'data'), { recursive: true });
+    await writeFile(
+      path.join(workspaceCwd, 'data', 'tokens.json'),
+      JSON.stringify({ tokens: [{ text: 'causal-input-token' }] }),
+      'utf8'
+    );
+    await writeFile(
+      path.join(workspaceCwd, 'data', 'manifest.json'),
+      JSON.stringify({ token_file: 'tokens.json' }),
+      'utf8'
+    );
     const command = (runtime as unknown as {
-      buildPythonVerifierDiagnosticCommand: () => string;
-    }).buildPythonVerifierDiagnosticCommand();
+      buildPythonVerifierDiagnosticCommand: (task?: string) => string;
+    }).buildPythonVerifierDiagnosticCommand(
+      'Repair the implementation using data/manifest.json as the authoritative input.'
+    );
     const probe = await runtime.executeToolForAgent(
       'root',
       'shell.exec',
@@ -1536,6 +1549,10 @@ describe('Runtime controlled subagent spawning', () => {
     expect(stdout).toContain('layout_qc.json');
     expect(stdout).toContain('cropped_pages_detected');
     expect(stdout).toContain('VERIFIER_PROBE_SPEC');
+    expect(stdout).toContain('VERIFIER_PROBE_TASK_INPUT');
+    expect(stdout).toContain('data/manifest.json');
+    expect(stdout).toContain('data/tokens.json');
+    expect(stdout).toContain('causal-input-token');
     expect(stdout).toContain('VERIFIER_PROBE_RETAINED_DIRS');
     expect(stdout).toContain('VERIFIER_PROBE_MIRROR');
     const probeDirectories = await readdir(
@@ -1566,11 +1583,13 @@ describe('Runtime controlled subagent spawning', () => {
         path: 'hidden_input_manifest.json',
         content: 'x'.repeat(8_000),
       })}`,
+      'VERIFIER_PROBE_TASK_INPUT {"path":"data/manifest.json","content":"{\\"token_file\\":\\"tokens.json\\"}"}',
       'VERIFIER_PROBE_SPEC {"artifact":"layout_qc.json","content":"qc.get(\\"cropped_pages_detected\\", 0) >= 1"}',
       'VERIFIER_PROBE_ARTIFACT {"path":"outputs/layout_qc.json","content":"{\\"cropped_pages_detected\\": []}"}',
       'VERIFIER_PROBE_REWARD 0.04',
     ].join('\n'), 2_000);
     expect(compactProbe).toContain('VERIFIER_PROBE_EVIDENCE_VERSION 2');
+    expect(compactProbe).toContain('VERIFIER_PROBE_TASK_INPUT');
     expect(compactProbe).toContain('VERIFIER_PROBE_SPEC');
     expect(compactProbe).toContain('outputs/layout_qc.json');
     expect(compactProbe).not.toContain('x'.repeat(1_000));

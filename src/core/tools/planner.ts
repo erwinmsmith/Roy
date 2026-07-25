@@ -935,7 +935,9 @@ export class AgentToolPlanner {
           line
         )
       );
-      const specs = lines.filter(line => /^VERIFIER_PROBE_SPEC\b/.test(line));
+      const specs = lines.filter(line =>
+        /^VERIFIER_PROBE_(?:SPEC|TASK_INPUT)\b/.test(line)
+      );
       const artifacts = lines
         .filter(line => /^VERIFIER_PROBE_ARTIFACT\b/.test(line))
         .map((line, position) => {

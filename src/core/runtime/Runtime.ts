@@ -10174,6 +10174,9 @@ export class Runtime {
         } else if (marker === 'SPEC') {
           priority = 190;
           perItemLimit = 2_400;
+        } else if (marker === 'TASK_INPUT') {
+          priority = 180;
+          perItemLimit = 2_400;
         } else if (marker === 'ARTIFACT') {
           priority = 80;
           perItemLimit = 2_400;
@@ -10195,7 +10198,10 @@ export class Runtime {
         if (/(?:qc|summary|report|journal|diagnostic|result|reward|log)/.test(evidencePath)) {
           priority += 60;
         }
-        if (/(?:manifest|ocr|token|fixture|expected)/.test(evidencePath)) priority -= 80;
+        if (marker !== 'TASK_INPUT'
+          && /(?:manifest|ocr|token|fixture|expected)/.test(evidencePath)) {
+          priority -= 80;
+        }
         if (/(?:reconstructed|prediction)/.test(evidencePath)) priority -= 20;
         return { line, position, priority, perItemLimit };
       })
@@ -16108,7 +16114,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       const diagnosticExecution: PlannedToolCall = {
         toolName: 'shell.exec',
         params: {
-          command: this.buildPythonVerifierDiagnosticCommand(),
+          command: this.buildPythonVerifierDiagnosticCommand(intentTask),
           timeoutMs: 120_000,
           maxOutputBytes: 24_000,
         },
@@ -16691,12 +16697,17 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         contexts.push(summary);
       } else if (call.toolName === 'shell.exec') {
         const shell = call.result as { command?: unknown; stdout?: unknown; stderr?: unknown } | undefined;
+        const rawCommand = String(shell?.command ?? call.params.command ?? 'command');
         const output = [shell?.stdout, shell?.stderr].filter(value => typeof value === 'string' && value).join('\n');
         const command = this.compactShellCommandForEvidence(
-          String(shell?.command ?? call.params.command ?? 'command')
+          rawCommand
         );
-        summaries.push(`${command}: ${output.slice(0, 1600)}`);
-        contexts.push(`Command result for ${command}:\n${output.slice(0, 8000)}`);
+        const evidenceOutput = rawCommand.includes('ROY_VERIFIER_PROBE=1')
+          || output.includes('VERIFIER_PROBE_EVIDENCE_VERSION')
+          ? this.compactVerifierProbeEvidenceText(output, 12_000)
+          : output;
+        summaries.push(`${command}: ${evidenceOutput.slice(0, 2400)}`);
+        contexts.push(`Command result for ${command}:\n${evidenceOutput.slice(0, 12_000)}`);
       } else if (call.toolName === 'web.search') {
         const search = call.result as {
           query?: unknown;
@@ -16892,7 +16903,8 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     return false;
   }
 
-  private buildPythonVerifierDiagnosticCommand(): string {
+  private buildPythonVerifierDiagnosticCommand(task = ''): string {
+    const taskInputPaths = this.extractTaskDiagnosticInputPaths(task);
     const script = [
       'import functools',
       'import json',
@@ -16925,6 +16937,57 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       '    if len(rendered) <= 6000:',
       '        return rendered',
       '    return rendered[:3000] + "\\n[verifier_probe_compacted]\\n" + rendered[-3000:]',
+      '',
+      `task_input_candidates = ${JSON.stringify(taskInputPaths)}`,
+      'task_input_seen = set()',
+      'task_input_queue = [(candidate, 0) for candidate in task_input_candidates]',
+      'task_input_files_remaining = 10',
+      'task_input_bytes_remaining = 16000',
+      'workspace_root = os.path.realpath(os.getcwd())',
+      'text_suffixes = {".json", ".jsonl", ".csv", ".md", ".txt", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".xml"}',
+      'while task_input_queue and task_input_files_remaining > 0 and task_input_bytes_remaining > 0:',
+      '    raw_path, depth = task_input_queue.pop(0)',
+      '    candidate = os.path.normpath(str(raw_path))',
+      '    absolute = os.path.realpath(candidate if os.path.isabs(candidate) else os.path.join(workspace_root, candidate))',
+      '    if absolute != workspace_root and not absolute.startswith(workspace_root + os.sep):',
+      '        continue',
+      '    if absolute in task_input_seen or not os.path.isfile(absolute):',
+      '        continue',
+      '    suffix = os.path.splitext(absolute)[1].lower()',
+      '    if suffix not in text_suffixes:',
+      '        continue',
+      '    task_input_seen.add(absolute)',
+      '    try:',
+      '        size = os.path.getsize(absolute)',
+      '        with open(absolute, "r", encoding="utf-8", errors="replace") as handle:',
+      '            content = handle.read(min(4000, task_input_bytes_remaining))',
+      '    except OSError:',
+      '        continue',
+      '    relative = os.path.relpath(absolute, workspace_root)',
+      '    print("VERIFIER_PROBE_TASK_INPUT", compact({"path": relative, "size": size, "content": content}))',
+      '    task_input_files_remaining -= 1',
+      '    task_input_bytes_remaining -= len(content)',
+      '    if depth >= 2 or suffix != ".json" or size > 262144:',
+      '        continue',
+      '    try:',
+      '        with open(absolute, "r", encoding="utf-8", errors="replace") as handle:',
+      '            payload = json.load(handle)',
+      '    except Exception:',
+      '        continue',
+      '    discovered = []',
+      '    def collect_paths(value):',
+      '        if isinstance(value, str) and os.path.splitext(value)[1].lower() in text_suffixes:',
+      '            discovered.append(value)',
+      '        elif isinstance(value, list):',
+      '            for item in value[:200]:',
+      '                collect_paths(item)',
+      '        elif isinstance(value, dict):',
+      '            for item in list(value.values())[:200]:',
+      '                collect_paths(item)',
+      '    collect_paths(payload)',
+      '    for discovered_path in discovered[:20]:',
+      '        resolved = discovered_path if os.path.isabs(discovered_path) else os.path.join(os.path.dirname(absolute), discovered_path)',
+      '        task_input_queue.append((resolved, depth + 1))',
       '',
       'def mismatch_summary(args):',
       '    if len(args) < 2 or not isinstance(args[0], dict) or not isinstance(args[1], list):',
@@ -17061,6 +17124,26 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     ].join('\n');
     const encoded = Buffer.from(script, 'utf8').toString('base64');
     return `ROY_VERIFIER_PROBE=1 python -c "import base64;exec(base64.b64decode('${encoded}'))"`;
+  }
+
+  private extractTaskDiagnosticInputPaths(task: string): string[] {
+    const paths = [...task.matchAll(
+      /(?:^|[\s`'"(])((?:\.{1,2}\/)?(?:[A-Za-z0-9._@-]+\/)*[A-Za-z0-9._@-]+\.(?:json|jsonl|csv|md|txt|ya?ml|toml|ini|cfg|xml))(?=$|[\s`'"),:;])/gi
+    )]
+      .map(match => this.normalizeToolWorkspacePath(match[1]!))
+      .filter(path => path !== '.'
+        && !path.startsWith('.roy/official-verifier/')
+        && !path.startsWith('outputs/'));
+    const rank = (value: string): number => {
+      let score = 0;
+      if (/(?:^|\/)(?:data|input|fixture|sample)s?(?:\/|$)/i.test(value)) score += 30;
+      if (/(?:manifest|config|metadata|meta|schema|expected)/i.test(value)) score += 20;
+      if (/\.json$/i.test(value)) score += 10;
+      return score;
+    };
+    return Array.from(new Set(paths))
+      .sort((left, right) => rank(right) - rank(left) || left.localeCompare(right))
+      .slice(0, 8);
   }
 
   private toolPlanFingerprint(
