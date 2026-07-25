@@ -246,4 +246,51 @@ describe('root response completion', () => {
     ]));
     await runtime.shutdown();
   });
+
+  it('keeps independent factual references inside the runtime tool evidence boundary', async () => {
+    const workspaceCwd = await createWorkspace('roy-root-grounded-references-');
+    const llm = new AcceptanceRepairLLM();
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'root-grounded-references-test',
+      workspaceCwd,
+      llmProvider: llm,
+    });
+
+    const internal = runtime as unknown as {
+      resolveRootResponseAcceptanceReferences(
+        userTask: string,
+        correlationId: string,
+        supportingToolEvidence: string[]
+      ): Promise<Array<{
+        requirement: string;
+        acceptedAnswers: string[];
+        confidence: number;
+        evidenceGrounded: boolean;
+      }>>;
+    };
+    const references = await internal.resolveRootResponseAcceptanceReferences(
+      [
+        'Answer every question.',
+        '1. What is alpha?',
+        '2. What is beta?',
+        '3. What is gamma?',
+        '4. What is delta?',
+      ].join('\n'),
+      'grounded_reference_test',
+      ['Observed tool evidence directly supports alpha and gamma.']
+    );
+
+    expect(references.map(reference => reference.requirement)).toEqual([
+      'Include alpha',
+      'Include gamma',
+    ]);
+    expect(references.every(reference =>
+      reference.evidenceGrounded && reference.confidence === 1
+    )).toBe(true);
+    expect(references.flatMap(reference => reference.acceptedAnswers)).not.toContain('beta');
+    expect(references.flatMap(reference => reference.acceptedAnswers)).not.toContain('delta');
+
+    await runtime.shutdown();
+  });
 });

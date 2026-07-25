@@ -640,6 +640,7 @@ interface RootResponseAcceptanceReference {
   requirement: string;
   acceptedAnswers: string[];
   confidence: number;
+  evidenceGrounded: boolean;
 }
 
 export interface RootMediatedSpawnResult {
@@ -7010,6 +7011,12 @@ export class Runtime {
         [
           ...teamResults.map(result => result.result),
           ...subagents.map(result => result.subagentResult.result),
+        ],
+        [
+          ...teamResults.flatMap(result =>
+            result.members.map(member => member.evidence.toolResultSummary ?? '')
+          ),
+          ...subagents.map(result => result.subagentResult.evidence.toolResultSummary ?? ''),
         ]
       );
     }
@@ -13911,6 +13918,19 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
       || /(?:未能|没有|尚未|无法)(?:完整|全部)?(?:满足|回答|包括|纳入|覆盖|完成)|(?:遗漏|缺少|未满足|未覆盖)(?:的)?(?:要求|问题|项目|部分)/.test(response);
   }
 
+  private acceptanceEvidenceSupportsAnswer(evidence: string, answer: string): boolean {
+    const normalize = (value: string): string => value
+      .normalize('NFKC')
+      .toLocaleLowerCase()
+      .replace(/[^\p{L}\p{N}]+/gu, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const normalizedEvidence = normalize(evidence);
+    const normalizedAnswer = normalize(answer);
+    return Boolean(normalizedAnswer)
+      && ` ${normalizedEvidence} `.includes(` ${normalizedAnswer} `);
+  }
+
   private shouldAuditRootResponse(response: string, userTask: string): boolean {
     if (this.workspaceRuntimeConfig?.delegation.rootSteps.requireAcceptanceAudit === false) {
       return false;
@@ -13940,9 +13960,14 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
 
   private async resolveRootResponseAcceptanceReferences(
     userTask: string,
-    correlationId: string
+    correlationId: string,
+    supportingToolEvidence: string[]
   ): Promise<RootResponseAcceptanceReference[]> {
     if (!this.taskHasMultipleFactualQuestions(userTask)) return [];
+    const evidenceCorpus = supportingToolEvidence
+      .filter(item => item.trim())
+      .join('\n\n')
+      .slice(0, 32_000);
     this.emit({
       type: 'root.response.acceptance.references.started',
       agentId: 'root',
@@ -13950,6 +13975,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
       data: {
         independentObligations: this.countIndependentTaskObligations(userTask),
         candidateVisible: false,
+        evidenceCharacters: evidenceCorpus.length,
       },
     });
     try {
@@ -13961,8 +13987,10 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
             content: [
               'You are an independent factual requirement resolver.',
               'You cannot see any candidate response. Resolve each numbered factual question in the original task independently to avoid confirmation bias.',
+              'The supplied runtime tool evidence is your only factual source. Do not use unsupported memory to fill a missing answer.',
+              'If the evidence supports materially different scope interpretations or historical milestones, preserve all of them as accepted alternatives.',
               'Return the precise canonical answer plus common aliases, alternate titles, stage names, or equivalent forms that would unambiguously answer that exact question.',
-              'Do not substitute a related entity. If uncertain, lower confidence rather than inventing certainty.',
+              'Do not substitute a related entity. If the evidence is insufficient, return low confidence rather than inventing certainty.',
               'Return concise strict JSON only with a references array.',
             ].join('\n'),
           },
@@ -13970,6 +13998,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
             role: 'user',
             content: JSON.stringify({
               originalTask: userTask,
+              runtimeToolEvidence: evidenceCorpus || 'No runtime tool evidence was available.',
               requiredSchema: {
                 references: [{
                   requirement: 'the exact numbered factual question',
@@ -13989,23 +14018,39 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
           .filter((item): item is Record<string, unknown> =>
             Boolean(item) && typeof item === 'object'
           )
-          .map(item => ({
-            requirement: typeof item.requirement === 'string'
-              ? item.requirement.trim().slice(0, 800)
-              : '',
-            acceptedAnswers: Array.isArray(item.acceptedAnswers)
+          .map(item => {
+            const acceptedAnswers = Array.isArray(item.acceptedAnswers)
               ? item.acceptedAnswers
                 .filter((answer): answer is string =>
                   typeof answer === 'string' && answer.trim().length >= 2
                 )
                 .map(answer => answer.trim().slice(0, 200))
                 .slice(0, 12)
-              : [],
-            confidence: typeof item.confidence === 'number'
+              : [];
+            const evidenceGroundedAnswers = evidenceCorpus
+              ? acceptedAnswers.filter(answer =>
+                this.acceptanceEvidenceSupportsAnswer(evidenceCorpus, answer)
+              )
+              : acceptedAnswers;
+            const evidenceGrounded = Boolean(
+              evidenceCorpus
+              && evidenceGroundedAnswers.length > 0
+            );
+            const reportedConfidence = typeof item.confidence === 'number'
               && Number.isFinite(item.confidence)
               ? Math.max(0, Math.min(1, item.confidence))
-              : 0,
-          }))
+              : 0;
+            return {
+              requirement: typeof item.requirement === 'string'
+              ? item.requirement.trim().slice(0, 800)
+              : '',
+              acceptedAnswers: evidenceGroundedAnswers,
+              confidence: evidenceGrounded
+                ? reportedConfidence
+                : Math.min(reportedConfidence, 0.49),
+              evidenceGrounded,
+            };
+          })
           .filter(item => item.requirement && item.acceptedAnswers.length > 0)
           .slice(0, 24)
         : [];
@@ -14016,6 +14061,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
         data: {
           references: references.length,
           highConfidenceReferences: references.filter(item => item.confidence >= 0.65).length,
+          evidenceGroundedReferences: references.filter(item => item.evidenceGrounded).length,
           candidateVisible: false,
         },
       });
@@ -14160,7 +14206,8 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     response: string,
     userTask: string,
     correlationId: string,
-    supportingResults: string[]
+    supportingResults: string[],
+    supportingToolEvidence: string[] = []
   ): Promise<string> {
     if (!this.shouldAuditRootResponse(response, userTask)) return response;
     this.emit({
@@ -14175,7 +14222,8 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     });
     const references = await this.resolveRootResponseAcceptanceReferences(
       userTask,
-      correlationId
+      correlationId,
+      supportingToolEvidence
     );
     let audit: RootResponseAcceptanceAudit;
     try {
@@ -14252,18 +14300,28 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
       .map((result, index) => `<delegated_result index="${index + 1}">\n${result}\n</delegated_result>`)
       .join('\n\n')
       .slice(0, 32_000);
+    const authoritativeToolEvidence = supportingToolEvidence
+      .filter(result => result.trim())
+      .map((result, index) => `<tool_evidence index="${index + 1}">\n${result}\n</tool_evidence>`)
+      .join('\n\n')
+      .slice(0, 32_000);
     const usageBefore = this.getContext().agent.getUsage();
     try {
       const repaired = await this.completeAsRoot(
         [
           'Repair the candidate into one complete final response to the original user task.',
           'Close every listed unmet requirement. Preserve correct completed content and the requested output format.',
-          'Use delegated results only as supporting evidence. Do not mention this audit or expose chain-of-thought.',
+          'Acceptance feedback identifies coverage gaps; it is not itself a factual source.',
+          'Use runtime tool evidence as the factual authority. Never replace a candidate fact with an answer absent from that evidence.',
+          'Use delegated results only as secondary supporting reports. Do not mention this audit or expose chain-of-thought.',
           `<original_task>\n${userTask}\n</original_task>`,
           `<acceptance_feedback>\n${JSON.stringify(audit, null, 2)}\n</acceptance_feedback>`,
           `<candidate_response>\n${response}\n</candidate_response>`,
           supportingEvidence
             ? `<supporting_evidence>\n${supportingEvidence}\n</supporting_evidence>`
+            : '',
+          authoritativeToolEvidence
+            ? `<authoritative_tool_evidence>\n${authoritativeToolEvidence}\n</authoritative_tool_evidence>`
             : '',
         ].filter(Boolean).join('\n\n'),
         'root.response_acceptance.repair',
@@ -14300,6 +14358,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
           unmetRequirements: repairedAudit.unmetRequirements,
           reason: repairedAudit.reason,
           repairedCharacters: candidate.length,
+          retainedOriginal: !repairedAudit.complete,
         },
       });
       if (repairStep) {
@@ -14307,7 +14366,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
           resultSummary: candidate,
         });
       }
-      return candidate;
+      return repairedAudit.complete ? candidate : response;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.emit({
