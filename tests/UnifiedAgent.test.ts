@@ -77,6 +77,38 @@ class ReadOnlyThenMutationPlanningLLM extends PlanningLLM {
   }
 }
 
+class NovelInspectionThenMutationPlanningLLM extends PlanningLLM {
+  constructor() {
+    super('none');
+  }
+
+  override async completeJSON<T>(): Promise<T> {
+    this.jsonCalls += 1;
+    if (this.jsonCalls === 1) {
+      return {
+        action: 'call_tools',
+        reason: 'Continue broad discovery in another directory.',
+        calls: [{
+          toolName: 'fs.list',
+          params: { path: 'configs', maxDepth: 4 },
+        }],
+      } as T;
+    }
+    return {
+      action: 'call_tools',
+      reason: 'Apply a preserving implementation patch from the grounded contract.',
+      calls: [{
+        toolName: 'fs.synthesize',
+        params: {
+          path: 'src/app.py',
+          instructions: 'Migrate the implementation using the grounded runtime config.',
+          strategy: 'patch',
+        },
+      }],
+    } as T;
+  }
+}
+
 class MutationRepairPlanningLLM extends PlanningLLM {
   constructor(private readonly repeatVerificationFirst = false) {
     super('none');
@@ -784,6 +816,61 @@ describe('UnifiedAgent capability execution', () => {
       expect.objectContaining({
         toolName: 'fs.write',
         params: { path: 'artifact.txt', content: 'implemented' },
+      }),
+    ]);
+  });
+
+  it('closes saturated research and requires a mutation instead of a novel broad listing', async () => {
+    const llm = new NovelInspectionThenMutationPlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'saturated-research-agent',
+      goal: 'transition grounded research into implementation',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.list', 'fs.read', 'fs.synthesize'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: 'Migrate src/app.py using configs/runtime.yaml and preserve its interface.',
+      executionRequired: true,
+      workspaceEvidenceSaturated: true,
+      round: 6,
+      remainingCalls: 4,
+      tools: [{ name: 'fs.list' }, { name: 'fs.read' }, { name: 'fs.synthesize' }],
+      calls: [
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/app.py' },
+          reason: 'Read the implementation target.',
+          groundingRequired: true,
+          success: true,
+          result: {
+            path: 'src/app.py',
+            content: 'def run(config):\n    return legacy_run(config)\n',
+          },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'configs/runtime.yaml' },
+          reason: 'Read the runtime contract.',
+          groundingRequired: true,
+          success: true,
+          result: {
+            path: 'configs/runtime.yaml',
+            content: 'runtime: modern\n',
+          },
+        },
+      ],
+    });
+
+    expect(llm.jsonCalls).toBe(2);
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.synthesize',
+        params: expect.objectContaining({
+          path: 'src/app.py',
+          strategy: 'patch',
+        }),
       }),
     ]);
   });

@@ -18710,6 +18710,11 @@ For web-grounded work, use only facts present in the subagent report or runtime 
           executionRequired: workspaceExecutionRequired,
           diagnosticProbeRequired,
           requiredDiagnosticAfterCallIndex: priorPlannerCalls.length - 1,
+          workspaceEvidenceSaturated: workspaceExecutionRequired
+            && workspaceEvidencePlans.length === 0
+            && combinedCalls.some(call =>
+              call.toolName === 'fs.read' && call.success
+            ),
           round: context.round,
           remainingCalls: context.remainingCalls,
           requestTimeoutMs: planningRequestTimeoutMs(),

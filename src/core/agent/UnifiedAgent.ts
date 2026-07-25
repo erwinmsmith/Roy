@@ -48,6 +48,7 @@ export interface AgentToolRoundPlanningInput {
   diagnosticProbeRequired?: boolean;
   requiredDiagnosticAfterCallIndex?: number;
   requiredMutationAfterCallIndex?: number;
+  workspaceEvidenceSaturated?: boolean;
   round: number;
   remainingCalls: number;
   requestTimeoutMs?: number;
@@ -155,6 +156,12 @@ export class UnifiedAgent extends BaseAgent {
         input.task,
         lastVerificationIndex
       );
+    const groundedImplementationTarget = rankGroundedSynthesisTargets(
+      input.calls,
+      input.task
+    ).some(candidate => candidate.implementationIntent);
+    const workspaceEvidenceSaturated = input.workspaceEvidenceSaturated === true
+      && groundedImplementationTarget;
     const successfulInspection = input.calls.some(call =>
       call.success && (
         call.toolName === 'fs.list'
@@ -214,7 +221,9 @@ export class UnifiedAgent extends BaseAgent {
             : '',
           executionRequired && !mutationRequirementSatisfied
             ? successfulInspection
-              ? freshMutationRequired
+              ? workspaceEvidenceSaturated
+                ? 'All task-declared workspace evidence and an explicit implementation target are grounded. The research phase is closed: read, list, and search calls are now non-progress. Request one focused fs.synthesize, fs.replace, fs.write, or mutating shell.exec call that advances the implementation.'
+                : freshMutationRequired
                 ? 'A prior acceptance audit found unmet requirements. Existing mutations and passing commands do not close this repair phase. Request a new focused fs.synthesize, fs.replace, fs.write, or mutating shell.exec call that fixes the reported unmet item.'
                 : 'The workspace layout has been grounded. If a distinct task-relevant input, rule, test, or source file is still necessary, request the novel reads together now; otherwise request fs.synthesize, fs.replace, fs.write, or a mutating shell.exec call that advances the actual task.'
               : 'No authoritative workspace inspection has succeeded yet. Recover failed paths with fs.list, fs.read, or fs.search before requesting a mutation.'
@@ -267,6 +276,7 @@ export class UnifiedAgent extends BaseAgent {
             latestVerificationFailed,
             inspectedAfterLatestFailure,
             aggregateVerifierEvidenceReady,
+            workspaceEvidenceSaturated,
             diagnosticProbeRequired,
             diagnosticProbeCompleted,
           })}`,
@@ -363,6 +373,7 @@ export class UnifiedAgent extends BaseAgent {
                       latestVerificationFailed,
                       inspectedAfterLatestFailure,
                       aggregateVerifierEvidenceReady,
+                      workspaceEvidenceSaturated,
                       diagnosticProbeRequired,
                       diagnosticProbeCompleted,
                     })}`,
@@ -439,6 +450,10 @@ export class UnifiedAgent extends BaseAgent {
           || call.toolName === 'fs.read'
           || call.toolName === 'fs.search'
         );
+        const plannedInspectionAdvances = plannedInspection
+          && !(executionRequired
+            && !mutationRequirementSatisfied
+            && workspaceEvidenceSaturated);
         const advancesExecution = diagnosticProbeRequired && !diagnosticProbeCompleted
           ? plannedCalls.some(call => isExecutableDiagnosticProbeCall({
             ...call,
@@ -446,11 +461,11 @@ export class UnifiedAgent extends BaseAgent {
           }) || isVerifierDiagnosticInspectionCall(call))
           : !executionRequired
           || (latestVerificationFailed
-            ? inspectedAfterLatestFailure
-              ? plannedInspection || plannedCalls.some(call =>
+              ? inspectedAfterLatestFailure
+              ? plannedInspectionAdvances || plannedCalls.some(call =>
                 isSuccessfulWorkspaceMutation({ ...call, success: true })
               )
-              : plannedInspection || plannedCalls.some(call =>
+              : plannedInspectionAdvances || plannedCalls.some(call =>
                 isSuccessfulWorkspaceMutation({ ...call, success: true })
               )
               : mutationRequirementSatisfied
@@ -458,7 +473,7 @@ export class UnifiedAgent extends BaseAgent {
                 isSuccessfulWorkspaceMutation({ ...call, success: true })
                 || isSuccessfulWorkspaceVerification({ ...call, success: true })
               )
-              : (plannedInspection
+              : (plannedInspectionAdvances
                 || plannedCalls.some(call => isSuccessfulWorkspaceMutation({
                   ...call,
                   success: true,
@@ -499,7 +514,9 @@ export class UnifiedAgent extends BaseAgent {
                 ? successfulInspection
                   ? freshMutationRequired
                     ? 'The previous acceptance audit is still open. Request a new focused mutation that addresses one of its failed or unverified items now.'
-                    : 'Do not repeat grounded paths. Batch any distinct task-relevant files that are still necessary, or request a concrete fs.synthesize, fs.replace, fs.write, or mutating shell.exec call now.'
+                    : workspaceEvidenceSaturated
+                      ? 'The task-declared evidence phase is complete. Do not request another read, list, or search; request one concrete fs.synthesize, fs.replace, fs.write, or mutating shell.exec call now.'
+                      : 'Do not repeat grounded paths. Batch any distinct task-relevant files that are still necessary, or request a concrete fs.synthesize, fs.replace, fs.write, or mutating shell.exec call now.'
                   : 'The previous inspection failed or was absent. Request a corrected fs.list, fs.read, or fs.search call before mutating.'
                 : '',
               latestVerificationFailed && inspectedAfterLatestFailure
@@ -534,12 +551,16 @@ export class UnifiedAgent extends BaseAgent {
           || call.toolName === 'fs.read'
           || call.toolName === 'fs.search'
         );
+        const plannedInspectionAdvances = plannedInspection
+          && !(executionRequired
+            && !mutationRequirementSatisfied
+            && workspaceEvidenceSaturated);
         const advancesExecution = latestVerificationFailed
           ? inspectedAfterLatestFailure
-            ? plannedInspection || plannedCalls.some(call =>
+            ? plannedInspectionAdvances || plannedCalls.some(call =>
               isSuccessfulWorkspaceMutation({ ...call, success: true })
             )
-            : plannedInspection || plannedCalls.some(call =>
+            : plannedInspectionAdvances || plannedCalls.some(call =>
               isSuccessfulWorkspaceMutation({ ...call, success: true })
             )
           : mutationRequirementSatisfied
@@ -547,7 +568,7 @@ export class UnifiedAgent extends BaseAgent {
               isSuccessfulWorkspaceMutation({ ...call, success: true })
               || isSuccessfulWorkspaceVerification({ ...call, success: true })
             )
-            : (plannedInspection
+            : (plannedInspectionAdvances
               || plannedCalls.some(call => isSuccessfulWorkspaceMutation({
                 ...call,
                 success: true,
@@ -1776,7 +1797,7 @@ function taskNamesFileAsImplementationTarget(
   if (targets.length === 0) return false;
   const target = `(?:${targets.join('|')})`;
   return new RegExp(
-    `\\b(?:implement|repair|fix|rewrite|complete|move|extract|build|create|write|update)\\b[^.\\n;]{0,180}${target}`,
+    `\\b(?:implement|repair|fix|rewrite|complete|move|extract|build|create|write|update|migrate|upgrade|replace|modify|edit|refactor|apply)\\b[^.\\n;]{0,180}${target}`,
     'i'
   ).test(taskLower);
 }
