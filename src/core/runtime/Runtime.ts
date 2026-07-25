@@ -11699,6 +11699,7 @@ Do not repeat an existing agent task, cached failed path, or equivalent failed t
       ], { temperature: 0.1, maxTokens: 1400 }, 'root.dynamic_step_decision', correlationId);
       return this.normalizeRootContinuation(raw, userTask, completedTasks.map(item => `${item.archetype}:${item.task ?? ''}`));
     } catch (error) {
+      this.rethrowRetryableLLMTransportError(error);
       this.emit({
         type: 'root.step.decision.fallback',
         agentId: 'root',
@@ -12011,6 +12012,7 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
       });
       return normalized;
     } catch (error) {
+      this.rethrowRetryableLLMTransportError(error);
       this.emit({
         type: 'delegation.decision.fallback',
         agentId: 'root',
@@ -12132,6 +12134,7 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
         ? { action: 'solve_directly', reason: selected.reason }
         : selected;
     } catch (error) {
+      this.rethrowRetryableLLMTransportError(error);
       this.emit({
         type: 'delegation.decision.fallback',
         agentId: agent.identity.id,
@@ -12393,6 +12396,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
       });
       return audited;
     } catch (error) {
+      this.rethrowRetryableLLMTransportError(error);
       this.emit({
         type: 'delegation.direct_decision.audit.failed',
         agentId: 'root',
@@ -13716,6 +13720,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
       if (repairStep) {
         await this.failRootExecutionStep(correlationId, repairStep, message, false);
       }
+      this.rethrowRetryableLLMTransportError(error);
       return response;
     }
   }
@@ -13788,6 +13793,10 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     }
     if (status !== undefined && [408, 409, 425, 429, 500, 502, 503, 504].includes(status)) return true;
     return /premature close|socket hang up|connection (?:error|(?:was )?(?:closed|reset))|stream (?:was )?(?:closed|terminated)|fetch failed|network error|timed? ?out|temporarily unavailable|service unavailable/.test(message);
+  }
+
+  private rethrowRetryableLLMTransportError(error: unknown): void {
+    if (this.isRetryableLLMStreamError(error)) throw error;
   }
 
   private async completeAsRoot(prompt: string, purpose: string, correlationId: string): Promise<string> {
@@ -18890,6 +18899,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         ? response.reason.slice(0, 2000)
         : 'Acceptance items classified from runtime evidence.';
     } catch (error) {
+      this.rethrowRetryableLLMTransportError(error);
       classificationReason = `Acceptance classification failed: ${error instanceof Error ? error.message : String(error)}`;
     }
     const missingItemIds = normalizedItems

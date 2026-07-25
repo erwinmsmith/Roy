@@ -158,6 +158,7 @@ class StreamResilienceLLM implements LLMProvider {
   private retryTurnAttempts = 0;
   private connectionRetryAttempts = 0;
   private recoveredTurnAttempts = 0;
+  private decisionConnectionAttempts = 0;
   private jsonRetryAttempts = 0;
   lastJSONMaxTokens?: number;
 
@@ -189,6 +190,10 @@ class StreamResilienceLLM implements LLMProvider {
 
   async completeJSON<T>(messages: LLMMessage[]): Promise<T> {
     const text = messages.map(message => message.content).join('\n');
+    if (text.includes('DECISION_CONNECTION_RETRY')
+      && this.decisionConnectionAttempts++ === 0) {
+      throw new Error('Connection error.');
+    }
     if (text.includes('JSON_RETRY') && this.jsonRetryAttempts++ === 0) {
       throw new Error('Failed to parse JSON response: {"action":"solve_directly"');
     }
@@ -528,6 +533,46 @@ describe('Autonomous multi-turn actor design', () => {
         retryable: true,
         persistedState: true,
       }),
+    }));
+    await runtime.shutdown();
+  });
+
+  it('propagates a root decision transport failure to turn recovery instead of returning a fallback', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-decision-transport-recovery-'));
+    await mkdir(path.join(workspaceCwd, '.roy'), { recursive: true });
+    await writeFile(path.join(workspaceCwd, '.roy', 'config.json'), JSON.stringify({
+      llm: {
+        jsonMaxAttempts: 1,
+        turnMaxAttempts: 2,
+        retryInitialDelayMs: 0,
+        retryMaxDelayMs: 0,
+      },
+      tom: { autoCompleteGaps: false, minimumCoverage: 0 },
+    }, null, 2));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'decision-transport-recovery-test',
+      workspaceCwd,
+      llmProvider: new StreamResilienceLLM(),
+    });
+
+    const recovery = await runtime.handleUserTurnWithRecovery(
+      'DECISION_CONNECTION_RETRY: answer this concrete bounded task directly.'
+    );
+
+    expect(recovery.recovered).toBe(true);
+    expect(recovery.attempts).toBe(2);
+    expect(recovery.result.finalResponse).toBe('The retried turn completed once.');
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'runtime.transient_turn.retrying',
+      data: expect.objectContaining({
+        attempt: 1,
+        error: 'Connection error.',
+      }),
+    }));
+    expect(runtime.getEvents()).not.toContainEqual(expect.objectContaining({
+      type: 'delegation.decision.fallback',
+      data: expect.objectContaining({ reason: 'llm_decision_failed' }),
     }));
     await runtime.shutdown();
   });
