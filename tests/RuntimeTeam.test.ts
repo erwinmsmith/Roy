@@ -636,6 +636,39 @@ describe('Phase 3 subteam runtime', () => {
     }));
   });
 
+  it('renders cached mutations and verifier failures from members without reports', () => {
+    const runtime = new Runtime();
+    (runtime as unknown as {
+      teamToolEvidenceCache: Map<string, unknown[]>;
+    }).teamToolEvidenceCache.set('partial-team', [
+      {
+        toolName: 'fs.synthesize',
+        params: { path: 'src/app.py', instructions: 'Repair it.' },
+        success: true,
+        result: { path: 'src/app.py' },
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m pytest -q' },
+        success: false,
+        error: 'Command failed',
+        result: {
+          exitCode: 1,
+          stderr: 'src/app.py:12: assertion failed',
+        },
+      },
+    ]);
+
+    const rendered = (runtime as unknown as {
+      formatTeamCachedToolEvidence: (teamId: string) => string;
+    }).formatTeamCachedToolEvidence('partial-team');
+
+    expect(rendered).toContain('ok fs.synthesize');
+    expect(rendered).toContain('src/app.py');
+    expect(rendered).toContain('failed shell.exec');
+    expect(rendered).toContain('assertion failed');
+  });
+
   it('reserves every planned member slot before a limited-budget team starts', async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), 'roy-team-capacity-reservation-'));
     const runtime = new Runtime();

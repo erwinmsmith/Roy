@@ -16721,6 +16721,9 @@ Produce the final response to the user as Roy, the root agent.`;
       failure.error ?? 'unknown member execution failure',
       '</member_failure>',
     ].join('\n')).join('\n\n');
+    const cachedTeamToolEvidence = this.formatTeamCachedToolEvidence(
+      team.identity.id
+    );
     const prompt = [
       `Team task: ${task}`,
       `<acceptance_checklist>\n${this.buildTaskAcceptanceChecklist(task)}\n</acceptance_checklist>`,
@@ -16745,6 +16748,8 @@ Produce the final response to the user as Roy, the root agent.`;
       'Do not infer file contents merely because a path was observed. Do not invent example values and present them as observations.',
       'A member report claim is usable only when supported by that member structured evidence or clearly labeled as analysis.',
       'Do not claim any tool call, file read, command output, or project fact absent from the structured member evidence.',
+      'The cached team tool frontier is authoritative partial execution evidence from members that may have failed before returning a narrative report. Reconcile it explicitly; never describe a recorded mutation or verification as unattempted.',
+      `<cached_team_tool_frontier>\n${cachedTeamToolEvidence}\n</cached_team_tool_frontier>`,
       reports,
       failureReports,
     ].join('\n\n');
@@ -16934,6 +16939,9 @@ Produce the final response to the user as Roy, the root agent.`;
       ...failures.map(failure => `${failure.key}: ${failure.error ?? 'member execution failed'}`),
       ...members.flatMap(member => member.warnings),
     ];
+    const cachedTeamToolEvidence = this.formatTeamCachedToolEvidence(
+      team.identity.id
+    );
     return [
       '[runtime_team_synthesis_fallback]',
       `# ${team.identity.name} Result`,
@@ -16946,11 +16954,62 @@ Produce the final response to the user as Roy, the root agent.`;
       observedPaths.length > 0
         ? observedPaths.map(item => `- ${item}`).join('\n')
         : 'No structured filesystem paths were observed.',
+      '## Cached Partial Execution Frontier',
+      cachedTeamToolEvidence,
       '## Limitations',
       limitations.length > 0
         ? limitations.map(item => `- ${item}`).join('\n')
         : '- The model returned no visible team synthesis, so the runtime preserved member reports and evidence without adding new claims.',
     ].join('\n\n');
+  }
+
+  private formatTeamCachedToolEvidence(
+    teamId: string,
+    maxCalls = 32,
+    maxChars = 12_000
+  ): string {
+    const calls = this.boundExecutionToolFrontier(
+      this.teamToolEvidenceCache.get(teamId) ?? [],
+      maxCalls,
+      240_000
+    );
+    if (calls.length === 0) {
+      return 'No cached partial tool execution was recorded for this team.';
+    }
+    const lines = calls.map(call => {
+      const result = call.result && typeof call.result === 'object'
+        ? call.result as {
+          path?: unknown;
+          exitCode?: unknown;
+          timedOut?: unknown;
+          stdout?: unknown;
+          stderr?: unknown;
+        }
+        : undefined;
+      const details = {
+        path: result?.path,
+        exitCode: result?.exitCode,
+        timedOut: result?.timedOut,
+        stdout: typeof result?.stdout === 'string'
+          ? result.stdout.slice(-800)
+          : undefined,
+        stderr: typeof result?.stderr === 'string'
+          ? result.stderr.slice(-1_200)
+          : undefined,
+        error: call.error ? String(call.error).slice(-1_200) : undefined,
+      };
+      return [
+        `- ${call.success ? 'ok' : 'failed'} ${call.toolName} ${JSON.stringify(call.params).slice(0, 500)}`,
+        JSON.stringify(details),
+      ].join('\n  ');
+    });
+    const rendered = [
+      `Recorded calls: ${calls.length}; successful: ${calls.filter(call => call.success).length}; failed: ${calls.filter(call => !call.success).length}.`,
+      ...lines,
+    ].join('\n');
+    return rendered.length <= maxChars
+      ? rendered
+      : `${rendered.slice(0, Math.floor(maxChars * 0.45))}\n[runtime_compacted_team_tool_frontier]\n${rendered.slice(-Math.ceil(maxChars * 0.55))}`;
   }
 
   private buildStructuredSequentialTeamClosure(
