@@ -241,6 +241,15 @@ describe('AgentToolPlanner', () => {
     const calls = [
       {
         toolName: 'fs.read',
+        params: { path: '.roy/official-verifier/test_outputs.py' },
+        success: true,
+        result: {
+          path: '.roy/official-verifier/test_outputs.py',
+          content: 'raise AssertionError("project metadata still targets the legacy runtime dependency version")',
+        },
+      },
+      {
+        toolName: 'fs.read',
         params: { path: 'requirements.txt' },
         success: true,
         result: {
@@ -321,7 +330,7 @@ describe('AgentToolPlanner', () => {
           success: true,
           result: { entries: ['pyproject.toml', 'requirements.txt'] },
         },
-        calls[1]!,
+        calls[2]!,
       ],
       currentCalls: [],
       bindings,

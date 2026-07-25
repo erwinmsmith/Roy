@@ -508,7 +508,12 @@ export class AgentToolPlanner {
           content: typeof result?.content === 'string' ? result.content : '',
         };
       })
-      .filter(candidate => candidate.path && candidate.content && !mutatedPaths.has(candidate.path))
+      .filter(candidate =>
+        candidate.path
+        && candidate.content
+        && !candidate.path.startsWith('.roy/official-verifier/')
+        && !mutatedPaths.has(candidate.path)
+      )
       .map(candidate => {
         const lowerPath = candidate.path.toLowerCase();
         let score = explicitFeedbackPaths.has(candidate.path) ? 500 : 0;
