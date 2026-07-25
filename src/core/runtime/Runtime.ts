@@ -16232,7 +16232,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         }
         const externalFeedbackRepair = this.toolPlanner.planExternalFeedbackRepair({
           task: intentTask,
-          calls: context.calls,
+          calls: [...priorPlannerCalls, ...context.calls],
           bindings,
           workspaceRoot: this.workspaceRoot,
         });
