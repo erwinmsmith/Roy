@@ -1571,10 +1571,21 @@ describe('Runtime controlled subagent spawning', () => {
       }),
       'utf8'
     );
+    await mkdir(path.join(workspaceCwd, 'outputs'), { recursive: true });
+    await Promise.all(['a.json', 'b.json', 'c.json', 'd.json'].map(filename =>
+      writeFile(
+        path.join(workspaceCwd, 'outputs', filename),
+        JSON.stringify({ generated: 'x'.repeat(3_900) }),
+        'utf8'
+      )
+    ));
     const command = (runtime as unknown as {
       buildPythonVerifierDiagnosticCommand: (task?: string) => string;
     }).buildPythonVerifierDiagnosticCommand(
-      'Repair the implementation using data/manifest.json as the authoritative input.'
+      [
+        'Repair the implementation using data/manifest.json as the authoritative input.',
+        'Expected artifacts: outputs/a.json outputs/b.json outputs/c.json outputs/d.json.',
+      ].join('\n')
     );
     const probe = await runtime.executeToolForAgent(
       'root',
@@ -1781,6 +1792,15 @@ describe('Runtime controlled subagent spawning', () => {
       agentId: tester.identity.id,
       data: expect.objectContaining({ attempts: 1, successful: 1 }),
     }));
+    expect(result.result).toContain('[runtime_independent_verification_closure]');
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'agent.verification.summary.deterministic',
+      agentId: tester.identity.id,
+    }));
+    expect(runtime.getEvents().some(event =>
+      event.type === 'agent.llm.called'
+      && event.agentId === tester.identity.id
+    )).toBe(false);
     await runtime.shutdown();
   });
 

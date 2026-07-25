@@ -2,7 +2,10 @@ import { describe, expect, it } from 'vitest';
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import Runtime, { type DelegationDecision } from '../src/core/runtime/Runtime.js';
+import Runtime, {
+  type DelegationDecision,
+  type RunAgentResult,
+} from '../src/core/runtime/Runtime.js';
 import { InvalidTeamTransitionError, TeamRegistry } from '../src/core/team/index.js';
 import type { LLMCompletionOptions, LLMCompletionResult, LLMJSONCompletionResult, LLMMessage, LLMProvider, LLMStreamChunk } from '../src/core/llm/types.js';
 
@@ -174,6 +177,114 @@ describe('Phase 3 subteam runtime', () => {
     registry.transitionFsm(team.identity.id, 'S_team_synthesize');
     const completed = registry.transitionFsm(team.identity.id, 'S_team_done');
     expect(completed.status).toBe('done');
+  });
+
+  it('aggregates a structured sequential mutation-verification chain without another model call', async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), 'roy-structured-team-closure-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'structured-team-closure',
+      workspaceCwd: cwd,
+      fsmEnabled: false,
+      llmProvider: new TeamTestLLM(),
+    });
+    const registry = new TeamRegistry();
+    const team = registry.create({
+      name: 'RepairClosureTeam',
+      parentAgentId: 'root',
+      description: 'Apply a focused repair and independently verify it.',
+      generation: 1,
+      tomLevel: 2,
+      executionPolicy: {
+        mode: 'sequential',
+        failureMode: 'best_effort',
+        maxConcurrency: 1,
+        minimumSuccessfulMembers: 1,
+      },
+    });
+    const rootInfo = runtime.getAgentTree().agent;
+    const member = (
+      id: string,
+      name: string,
+      toolCalls: RunAgentResult['toolCalls'],
+      summary: string
+    ): RunAgentResult => ({
+      agent: {
+        ...rootInfo,
+        identity: {
+          ...rootInfo.identity,
+          id,
+          name,
+        },
+      },
+      result: summary,
+      usage: {
+        llmCalls: 0,
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        thinkingTokens: null,
+        cachedInputTokens: null,
+        cacheCreationInputTokens: null,
+      },
+      toolCalls,
+      evidence: {
+        toolGrounded: true,
+        outputGrounded: true,
+        observedPaths: ['src/app.ts'],
+        toolResultSummary: summary,
+      },
+      grounded: true,
+      warnings: [],
+    });
+    const members = [
+      member('agent_coder_001', 'Repairer', [{
+        toolName: 'fs.write',
+        params: { path: 'src/app.ts', content: 'export const ok = true;\n' },
+        result: { path: 'src/app.ts', bytes: 24 },
+        success: true,
+      }], 'Applied the focused mutation to src/app.ts.'),
+      member('agent_tester_002', 'Verifier', [{
+        toolName: 'shell.exec',
+        params: { command: 'npm test' },
+        result: { command: 'npm test', exitCode: 0, stdout: 'all tests passed' },
+        success: true,
+      }], 'npm test completed successfully: all tests passed.'),
+    ];
+    const synthesis = await (
+      runtime as unknown as {
+        completeAsTeam: (
+          targetTeam: typeof team,
+          task: string,
+          results: RunAgentResult[],
+          failures: [],
+          correlationId: string
+        ) => Promise<{ content: string; usage: { totalTokens: number } }>;
+      }
+    ).completeAsTeam(
+      team,
+      'Repair src/app.ts and run npm test.',
+      members,
+      [],
+      'structured-team-closure-correlation'
+    );
+
+    expect(synthesis.content).toContain('[runtime_structured_sequential_team_closure]');
+    expect(synthesis.content).toContain('all tests passed');
+    expect(synthesis.usage.totalTokens).toBe(0);
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'team.synthesis.completed',
+      data: expect.objectContaining({
+        deterministic: true,
+        reason: 'structured_sequential_closure',
+      }),
+    }));
+    expect(runtime.getEvents().some(event =>
+      event.type === 'team.context.loaded'
+    )).toBe(false);
+    await runtime.shutdown();
   });
 
   it('runs a three-member team through team messages, synthesis, budget, and persistence', async () => {

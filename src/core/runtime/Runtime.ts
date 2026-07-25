@@ -7894,6 +7894,12 @@ export class Runtime {
       );
     const actorDiagnosticProbeRequired =
       /\[runtime_verifier_diagnostic_probe\]/.test(immutableActorTask);
+    const priorIndependentVerification = actorVerificationEvidenceRequired
+      && !actorDiagnosticProbeRequired
+      && !actorWorkspaceExecutionRequired
+      ? [...(options.priorToolCalls ?? [])].reverse()
+        .find(call => isSuccessfulWorkspaceVerificationCall(call))
+      : undefined;
 
     const session = ctx.manager.getSession(ctx.sessionId);
     if (session) {
@@ -7973,6 +7979,17 @@ export class Runtime {
       let grounding = await this.runGroundingCheck(agentId, task, {
         ...options,
         intentTask: immutableActorTask,
+        ...(priorIndependentVerification
+          ? {
+            initialPlans: [{
+              toolName: 'shell.exec',
+              params: { ...priorIndependentVerification.params },
+              reason: 'Rerun the current authoritative verifier independently against the post-mutation workspace.',
+              groundingRequired: true,
+            }],
+            skipInitialModelPlanning: true,
+          }
+          : {}),
         onBeforeExecution: async initialPlans => {
           await this.transitionAgentFsm(agentId, 'S_tool_calling', {
             toolCalls: initialPlans.map(call => call.toolName),
@@ -8114,29 +8131,57 @@ export class Runtime {
         });
       }
       await this.transitionAgentFsm(agentId, 'S_reasoning', { task, correlationId: options.correlationId });
-      this.emit({ type: 'agent.llm.called', agentId, data: { task } });
-      const communicationContext = agent.getCommunicationContext();
-      const rawObservation = [
-        this.buildGroundedTask(
-          this.agentTaskObservationReference(agentId, task),
-          grounding
-        ),
-        communicationContext
-          ? `<system_communication_context protocol="${communicationContext.protocolId}">\n${communicationContext.rendered}\n</system_communication_context>`
-          : '',
-      ].filter(Boolean).join('\n\n');
-      const observation = this.constrainAgentObservation(
-        agent,
-        rawObservation,
-        options.correlationId,
-        'agent.task_execution'
-      );
-      await agent.step(observation);
-      const stepError = agent.getInfo().error;
-      if (stepError) {
-        throw new Error(stepError.replace(/^Error:\s*/, ''));
+      let result = '';
+      const freshIndependentVerification = priorIndependentVerification
+        && grounding.toolCalls.some(call =>
+          isSuccessfulWorkspaceVerificationCall(call)
+        );
+      if (freshIndependentVerification) {
+        result = [
+          '[runtime_independent_verification_closure]',
+          'The runtime reran the authoritative post-mutation verifier for this tester role.',
+          (grounding.evidence.toolResultSummary ?? grounding.context).slice(-8_000),
+        ].join('\n\n');
+        this.emit({
+          type: 'agent.verification.summary.deterministic',
+          agentId,
+          sessionId: ctx.sessionId,
+          correlationId: options.correlationId,
+          nodeId: options.nodeId,
+          data: {
+            successfulVerificationCalls: grounding.toolCalls.filter(call =>
+              isSuccessfulWorkspaceVerificationCall(call)
+            ).length,
+            reason: 'authoritative_verifier_result_requires_no_additional_inference',
+          },
+        });
+      } else {
+        this.emit({ type: 'agent.llm.called', agentId, data: { task } });
+        const communicationContext = agent.getCommunicationContext();
+        const rawObservation = [
+          this.buildGroundedTask(
+            this.agentTaskObservationReference(agentId, task),
+            grounding
+          ),
+          communicationContext
+            ? `<system_communication_context protocol="${communicationContext.protocolId}">\n${communicationContext.rendered}\n</system_communication_context>`
+            : '',
+        ].filter(Boolean).join('\n\n');
+        const observation = this.constrainAgentObservation(
+          agent,
+          rawObservation,
+          options.correlationId,
+          'agent.task_execution'
+        );
+        await agent.step(observation);
+        const stepError = agent.getInfo().error;
+        if (stepError) {
+          throw new Error(stepError.replace(/^Error:\s*/, ''));
+        }
+        result = session
+          ? await this.drainAgentOutput(session.messageQueue, agent.name)
+          : agent.getInfo().lastResult ?? '';
       }
-      let result = session ? await this.drainAgentOutput(session.messageQueue, agent.name) : agent.getInfo().lastResult ?? '';
       let forcedExecutionContinuationAttempted = false;
       while (true) {
         const unresolvedToolIntent = this.containsUnresolvedToolIntent(result);
@@ -14762,6 +14807,76 @@ Produce the final response to the user as Roy, the root agent.`;
     correlationId: string
   ): Promise<{ content: string; usage: TokenUsage }> {
     const ctx = this.getContext();
+    const orderedMembers = [...members].sort((left, right) => {
+      if (left.agent.identity.id === team.leadAgentId) return -1;
+      if (right.agent.identity.id === team.leadAgentId) return 1;
+      return 0;
+    });
+    const hasStructuredVerifierEvidence = orderedMembers.some(member =>
+      member.toolCalls.some(call =>
+        isSuccessfulWorkspaceVerificationCall(call)
+        || this.isFocusedVerifierDiagnosticCall(call)
+      )
+    );
+    const hasStructuredMutationOrFailure = failures.length > 0
+      || orderedMembers.some(member =>
+        member.toolCalls.some(call => isSuccessfulWorkspaceMutationCall(call))
+      );
+    const canAggregateSequentialClosure =
+      team.executionPolicy.mode === 'sequential'
+      && orderedMembers.length > 0
+      && orderedMembers.every(member => member.evidence.toolGrounded)
+      && hasStructuredVerifierEvidence
+      && hasStructuredMutationOrFailure;
+    if (canAggregateSequentialClosure) {
+      this.emit({
+        type: 'team.synthesis.started',
+        agentId: team.identity.id,
+        sessionId: ctx.sessionId,
+        correlationId,
+        data: {
+          teamId: team.identity.id,
+          memberAgentIds: team.memberAgentIds,
+          leadAgentId: team.leadAgentId,
+          failedMembers: failures.length,
+          mode: 'structured_sequential_closure',
+        },
+      });
+      this.emit({
+        type: 'team.synthesis.recovered',
+        agentId: team.identity.id,
+        sessionId: ctx.sessionId,
+        correlationId,
+        data: {
+          teamId: team.identity.id,
+          reason: 'structured_sequential_closure',
+          recovery: 'deterministic_evidence_aggregation',
+          completedMembers: members.length,
+          failedMembers: failures.length,
+        },
+      });
+      this.emit({
+        type: 'team.synthesis.completed',
+        agentId: team.identity.id,
+        sessionId: ctx.sessionId,
+        correlationId,
+        data: {
+          teamId: team.identity.id,
+          totalTokens: 0,
+          deterministic: true,
+          reason: 'structured_sequential_closure',
+        },
+      });
+      return {
+        content: this.buildStructuredSequentialTeamClosure(
+          team,
+          task,
+          orderedMembers,
+          failures
+        ),
+        usage: this.zeroTokenUsage(),
+      };
+    }
     const teamKey = this.safeAgentKey(team.identity.name);
     const [teamDefinition, teamMemory, rootContext] = await Promise.all([
       ctx.memory.readTeamDoc(teamKey, 'team'),
@@ -14788,11 +14903,6 @@ Produce the final response to the user as Roy, the root agent.`;
         teamMemoryChars: teamMemory.length,
         publicContextChars: publicContext.length,
       },
-    });
-    const orderedMembers = [...members].sort((left, right) => {
-      if (left.agent.identity.id === team.leadAgentId) return -1;
-      if (right.agent.identity.id === team.leadAgentId) return 1;
-      return 0;
     });
     const reports = orderedMembers.map(member => [
       `<member id="${member.agent.identity.id}" name="${member.agent.identity.name}">`,
@@ -15050,6 +15160,61 @@ Produce the final response to the user as Roy, the root agent.`;
       limitations.length > 0
         ? limitations.map(item => `- ${item}`).join('\n')
         : '- The model returned no visible team synthesis, so the runtime preserved member reports and evidence without adding new claims.',
+    ].join('\n\n');
+  }
+
+  private buildStructuredSequentialTeamClosure(
+    team: TeamRuntimeState,
+    task: string,
+    members: RunAgentResult[],
+    failures: Array<TeamExecutionOutcome<unknown>>
+  ): string {
+    const memberEvidence = members.map((member, index) => {
+      const successfulTools = member.toolCalls
+        .filter(call => call.success)
+        .map(call => call.toolName);
+      const failedTools = member.toolCalls
+        .filter(call => !call.success)
+        .map(call => `${call.toolName}: ${call.error ?? 'failed'}`);
+      return [
+        `### ${index + 1}. ${member.agent.identity.name}`,
+        `Grounded: ${member.grounded}; successful tools: ${successfulTools.join(', ') || 'none'}`,
+        member.evidence.observedPaths.length > 0
+          ? `Observed paths: ${member.evidence.observedPaths.join(', ')}`
+          : 'Observed paths: none',
+        failedTools.length > 0
+          ? `Failed tools: ${failedTools.join('; ')}`
+          : '',
+        'Structured tool evidence:',
+        (member.evidence.toolResultSummary ?? 'No structured tool summary.').slice(-3_600),
+        'Member report:',
+        (member.result.trim() || 'No visible member report.').slice(-1_800),
+      ].filter(Boolean).join('\n');
+    }).join('\n\n');
+    const failureEvidence = failures.length > 0
+      ? failures.map(failure =>
+        `- ${failure.key}: ${failure.error ?? 'member execution failed'}`
+      ).join('\n')
+      : '- None.';
+    const observedPaths = Array.from(new Set(
+      members.flatMap(member => member.evidence.observedPaths)
+    )).slice(0, 80);
+    return [
+      '[runtime_structured_sequential_team_closure]',
+      `# ${team.identity.name} Evidence Closure`,
+      `Task reference: ${this.compactDelegatedTask(task, 1_200)}`,
+      `Synthesis policy: ${team.synthesisPolicy ?? 'Preserve authoritative member evidence in execution order.'}`,
+      'The runtime aggregated this sequential mutation-and-verification chain directly from structured tool results. No additional model inference or unsupported completion claim was added.',
+      '## Ordered Member Evidence',
+      memberEvidence,
+      '## Member Failures',
+      failureEvidence,
+      '## Authoritative Paths',
+      observedPaths.length > 0
+        ? observedPaths.map(item => `- ${item}`).join('\n')
+        : '- No filesystem path was recorded.',
+      '## Closure Rule',
+      'Treat the newest verifier result as authoritative. If it is not fully passing, carry its exact scorecard or mismatch forward as actionable feedback; do not repeat an unchanged repair hypothesis.',
     ].join('\n\n');
   }
 
@@ -16500,6 +16665,24 @@ For web-grounded work, use only facts present in the subagent report or runtime 
           });
           return [];
         }
+        if (options.archetype === 'tester'
+          && !diagnosticProbeRequired
+          && context.calls.some(call =>
+            isSuccessfulWorkspaceVerificationCall(call)
+          )) {
+          this.emit({
+            type: 'agent.tool_loop.verification_closed',
+            agentId,
+            sessionId: this.getContext().sessionId,
+            correlationId: options.correlationId,
+            nodeId: options.nodeId,
+            data: {
+              round: context.round,
+              reason: 'fresh_authoritative_verifier_completed',
+            },
+          });
+          return [];
+        }
         const workspaceEvidencePlans = this.toolPlanner.planWorkspaceEvidenceFollowUps({
           task: intentTask,
           calls: combinedCalls,
@@ -17028,15 +17211,20 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       '            for item in list(value.values())[:200]:',
       '                collect_paths(item)',
       '    collect_paths(payload)',
+      '    dependency_candidates = []',
       '    for discovered_path in discovered[:20]:',
       '        if os.path.isabs(discovered_path):',
-      '            task_input_queue.append((discovered_path, depth + 1))',
+      '            dependency_candidates.append((discovered_path, depth + 1))',
       '            continue',
       '        # Manifests commonly mix paths relative to the manifest with',
       '        # paths relative to the workspace root. Queue both; canonical',
       '        # path deduplication keeps the traversal bounded.',
-      '        task_input_queue.append((os.path.join(os.path.dirname(absolute), discovered_path), depth + 1))',
-      '        task_input_queue.append((os.path.join(workspace_root, discovered_path), depth + 1))',
+      '        dependency_candidates.append((os.path.join(os.path.dirname(absolute), discovered_path), depth + 1))',
+      '        dependency_candidates.append((os.path.join(workspace_root, discovered_path), depth + 1))',
+      '    # Follow dependencies before unrelated paths mentioned later in the',
+      '    # task (which are often expected output artifacts). This preserves',
+      '    # the causal input chain without increasing the evidence budget.',
+      '    task_input_queue = dependency_candidates + task_input_queue',
       '',
       'def mismatch_summary(args):',
       '    if len(args) < 2 or not isinstance(args[0], dict) or not isinstance(args[1], list):',
