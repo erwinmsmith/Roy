@@ -4506,14 +4506,26 @@ export class Runtime {
       if (!matchesAt(sourcePattern, hunkSourceIndex) && sourcePattern.length > 0) {
         let candidates = matchingIndices(sourcePattern);
         // Match the behavior of a conservative patch fuzz factor: a model may
-        // carry one or two stale context lines at a hunk edge even though its
-        // deletion anchor is exact. Only context lines may be discarded;
-        // additions and deletions always remain authoritative.
+        // carry stale context lines at a hunk edge even though its deletion
+        // anchor is exact. Only context lines may be discarded; wider fuzz
+        // additionally requires one unique exact deletion anchor.
         if (candidates.length === 0) {
-          outer: for (let totalTrim = 1; totalTrim <= 4; totalTrim += 1) {
+          const leadingContextLines = hunkLines.findIndex(line => line[0] !== ' ');
+          const trailingContextLines = [...hunkLines]
+            .reverse()
+            .findIndex(line => line[0] !== ' ');
+          const maximumEdgeTrim = Math.min(
+            16,
+            Math.max(0, leadingContextLines)
+              + Math.max(0, trailingContextLines)
+          );
+          outer: for (let totalTrim = 1; totalTrim <= maximumEdgeTrim; totalTrim += 1) {
             for (let leadingTrim = 0; leadingTrim <= totalTrim; leadingTrim += 1) {
               const trailingTrim = totalTrim - leadingTrim;
-              if (leadingTrim > 2 || trailingTrim > 2) continue;
+              if (leadingTrim > Math.max(0, leadingContextLines)
+                || trailingTrim > Math.max(0, trailingContextLines)) {
+                continue;
+              }
               if (!hunkLines.slice(0, leadingTrim).every(line => line[0] === ' ')) {
                 continue;
               }
@@ -4529,6 +4541,13 @@ export class Runtime {
               if (fuzzyPattern.length === 0) continue;
               const fuzzyCandidates = matchingIndices(fuzzyPattern);
               if (fuzzyCandidates.length === 0) continue;
+              // Wider fuzz is allowed only when an exact deletion anchor
+              // remains and resolves uniquely in the immutable snapshot.
+              if (totalTrim > 4
+                && (!fuzzyLines.some(line => line[0] === '-')
+                  || fuzzyCandidates.length !== 1)) {
+                continue;
+              }
               effectiveHunkLines = fuzzyLines;
               sourcePattern = fuzzyPattern;
               candidates = fuzzyCandidates;
@@ -16306,6 +16325,18 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     const diagnosticProbeRequired =
       /\[runtime_verifier_diagnostic_probe\]/.test(intentTask);
     if (diagnosticProbeRequired) {
+      const diagnosticSourcePath = this.extractTaskDiagnosticSourcePaths(
+        intentTask
+      )[0];
+      const diagnosticSourceRead: PlannedToolCall | undefined =
+        diagnosticSourcePath
+          ? {
+            toolName: 'fs.read',
+            params: { path: diagnosticSourcePath },
+            reason: 'Re-read the authoritative current implementation snapshot before forming a verifier repair hypothesis.',
+            groundingRequired: true,
+          }
+          : undefined;
       const diagnosticSearch: PlannedToolCall = {
         toolName: 'fs.search',
         params: {
@@ -16331,6 +16362,9 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       const searchAvailable = bindings.some(binding =>
         binding.enabled && binding.name === diagnosticSearch.toolName
       );
+      const readAvailable = bindings.some(binding =>
+        binding.enabled && binding.name === diagnosticSourceRead?.toolName
+      );
       const shellAvailable = bindings.some(binding =>
         binding.enabled && binding.name === diagnosticExecution.toolName
       );
@@ -16346,6 +16380,15 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         }
       }
       const diagnosticPlans: PlannedToolCall[] = [];
+      if (diagnosticSourceRead
+        && readAvailable
+        && !plans.some(plan =>
+          this.toolPlanFingerprint(plan) === this.toolPlanFingerprint(diagnosticSourceRead)
+        )) {
+        // This read is intentionally fresh. The recovery capsule explicitly
+        // invalidates cached source bytes after each rejected candidate.
+        diagnosticPlans.push(diagnosticSourceRead);
+      }
       if (searchAvailable
         && !this.cachedToolPlanDecision(
           diagnosticSearch,
@@ -17421,6 +17464,25 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     return Array.from(new Set(paths))
       .sort((left, right) => rank(right) - rank(left) || left.localeCompare(right))
       .slice(0, 8);
+  }
+
+  private extractTaskDiagnosticSourcePaths(task: string): string[] {
+    const paths = [...task.matchAll(
+      /(?:^|[\s`'"(])((?:\.{1,2}\/)?(?:[A-Za-z0-9._@-]+\/)*[A-Za-z0-9._@-]+\.(?:py|ts|tsx|js|jsx|mjs|cjs|java|go|rs|rb|php|sh))(?=$|[\s`'"),:;])/gi
+    )]
+      .map(match => this.normalizeToolWorkspacePath(match[1]!))
+      .filter(path => path !== '.'
+        && !path.startsWith('.roy/')
+        && !path.startsWith('outputs/'));
+    const rank = (value: string): number => {
+      let score = 0;
+      if (/(?:^|\/)src(?:\/|$)/i.test(value)) score += 30;
+      if (/(?:audit|implementation|solution|main|app)/i.test(value)) score += 10;
+      return score;
+    };
+    return Array.from(new Set(paths))
+      .sort((left, right) => rank(right) - rank(left) || left.localeCompare(right))
+      .slice(0, 4);
   }
 
   private toolPlanFingerprint(

@@ -898,6 +898,43 @@ describe('Runtime controlled subagent spawning', () => {
     });
   });
 
+  it('applies wider edge fuzz only around an exact unique deletion anchor', () => {
+    const runtime = new Runtime();
+    const applyPatch = (runtime as unknown as {
+      applyUnifiedPatchToContent: (
+        current: string,
+        patch: string
+      ) => { content?: string; error?: string };
+    }).applyUnifiedPatchToContent.bind(runtime);
+    const current = [
+      'def unique_value():',
+      '    answer = 41',
+      '    return answer',
+      '',
+    ].join('\n');
+    const patch = [
+      '--- a/app.py',
+      '+++ b/app.py',
+      '@@ -80,7 +80,7 @@',
+      ' # stale generated edge one',
+      ' # stale generated edge two',
+      ' # stale generated edge three',
+      ' # stale generated edge four',
+      '-    answer = 41',
+      '+    answer = 42',
+      '     return answer',
+    ].join('\n');
+
+    expect(applyPatch(current, patch)).toEqual({
+      content: [
+        'def unique_value():',
+        '    answer = 42',
+        '    return answer',
+        '',
+      ].join('\n'),
+    });
+  });
+
   it('extracts a unified diff from model prose and a trailing Markdown fence', () => {
     const runtime = new Runtime();
     const extract = (runtime as unknown as {
@@ -1587,6 +1624,14 @@ describe('Runtime controlled subagent spawning', () => {
         'Expected artifacts: outputs/a.json outputs/b.json outputs/c.json outputs/d.json.',
       ].join('\n')
     );
+    const diagnosticSources = (
+      runtime as unknown as {
+        extractTaskDiagnosticSourcePaths: (task: string) => string[];
+      }
+    ).extractTaskDiagnosticSourcePaths(
+      'Diagnose src/table_recon/audit.py against .roy/official-verifier/grade.py.'
+    );
+    expect(diagnosticSources).toEqual(['src/table_recon/audit.py']);
     const probe = await runtime.executeToolForAgent(
       'root',
       'shell.exec',
