@@ -278,16 +278,30 @@ describe('AgentToolPlanner', () => {
       }),
     ]);
 
+    const priorTurnMutation = {
+      toolName: 'fs.synthesize',
+      params: first[0]!.params,
+      success: true,
+    };
+    expect(planner.planExternalFeedbackRepair({
+      task,
+      calls: [...calls, priorTurnMutation],
+      currentCalls: [],
+      bindings,
+      workspaceRoot: '/app',
+    })).toEqual([
+      expect.objectContaining({
+        params: expect.objectContaining({ path: 'pyproject.toml' }),
+      }),
+    ]);
+
     const second = planner.planExternalFeedbackRepair({
       task,
       calls: [
         ...calls,
-        {
-          toolName: 'fs.synthesize',
-          params: first[0]!.params,
-          success: true,
-        },
+        priorTurnMutation,
       ],
+      currentCalls: [priorTurnMutation],
       bindings,
       workspaceRoot: '/app',
     });

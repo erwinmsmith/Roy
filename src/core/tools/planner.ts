@@ -421,6 +421,7 @@ export class AgentToolPlanner {
   planExternalFeedbackRepair(input: {
     task: string;
     calls: ObservedToolCall[];
+    currentCalls?: ObservedToolCall[];
     bindings: ToolPlanBinding[];
     workspaceRoot?: string;
   }): PlannedToolCall[] {
@@ -447,7 +448,7 @@ export class AgentToolPlanner {
       ...this.extractReferencedPaths(feedback),
       ...feedbackLocations.map(location => location.path),
     ].map(path => this.normalizeWorkspacePath(path)));
-    const mutatedPaths = new Set(input.calls
+    const mutatedPaths = new Set((input.currentCalls ?? input.calls)
       .filter(call => isSuccessfulWorkspaceMutationCall(call))
       .map(call => this.normalizeWorkspacePath(String(call.params.path ?? '')))
       .filter(Boolean));

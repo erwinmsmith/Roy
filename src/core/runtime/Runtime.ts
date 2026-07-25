@@ -16022,6 +16022,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       const externalFeedbackRepair = this.toolPlanner.planExternalFeedbackRepair({
         task: intentTask,
         calls: priorPlannerCalls,
+        currentCalls: [],
         bindings,
         workspaceRoot: this.workspaceRoot,
       });
@@ -16259,6 +16260,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         const externalFeedbackRepair = this.toolPlanner.planExternalFeedbackRepair({
           task: intentTask,
           calls: [...priorPlannerCalls, ...context.calls],
+          currentCalls: context.calls,
           bindings,
           workspaceRoot: this.workspaceRoot,
         });
