@@ -1727,6 +1727,7 @@ describe('Runtime controlled subagent spawning', () => {
     ).extractVerifierDiagnosticScopes([
       '<recovery_capsule>',
       JSON.stringify({
+        latestAcceptedScorecard: { reward: 0.998125 },
         unresolvedGroups: [
           'G_public_reconstruction=0.625',
         ],
@@ -1734,6 +1735,17 @@ describe('Runtime controlled subagent spawning', () => {
       '</recovery_capsule>',
     ].join('\n'));
     expect(diagnosticScopes).toEqual(['public']);
+    expect((
+      runtime as unknown as {
+        extractAcceptedVerifierReward: (task: string) => number | undefined;
+      }
+    ).extractAcceptedVerifierReward([
+      '<recovery_capsule>',
+      JSON.stringify({
+        latestAcceptedScorecard: { reward: 0.998125 },
+      }),
+      '</recovery_capsule>',
+    ].join('\n'))).toBe(0.998125);
     const probe = await runtime.executeToolForAgent(
       'root',
       'shell.exec',

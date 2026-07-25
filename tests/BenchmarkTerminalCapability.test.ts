@@ -1330,6 +1330,35 @@ describe('benchmark terminal capability', () => {
     expect(await readFile(path.join(workspace, 'implementation.py'), 'utf8')).toBe(
       'VALUE = 0\n'
     );
+    const followUpMutation = await runtime.executeToolForAgent(
+      'root',
+      'fs.replace',
+      {
+        path: 'implementation.py',
+        oldText: 'VALUE = 0',
+        newText: 'VALUE = -1',
+        expectedReplacements: 1,
+      },
+      {
+        correlationId: 'verifier-regression-turn',
+        groundingCalls: [
+          baselineCall,
+          {
+            toolName: 'fs.replace',
+            params: { path: 'implementation.py' },
+            reason: 'Apply the first unverified candidate slice.',
+            groundingRequired: true,
+            success: mutation.success,
+            result: mutation.result,
+            error: mutation.error,
+          },
+        ],
+      }
+    );
+    expect(followUpMutation.success).toBe(true);
+    expect(await readFile(path.join(workspace, 'implementation.py'), 'utf8')).toBe(
+      'VALUE = -1\n'
+    );
     await writeFile(gradePath, 'print("0.100000000000")\n');
     await writeFile(
       scorecardPath,
@@ -1388,6 +1417,13 @@ describe('benchmark terminal capability', () => {
         path: 'implementation.py',
         baselineReward: 0.5,
         regressedReward: 0.1,
+      }),
+    }));
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'workspace.mutation.checkpoint.retained',
+      data: expect.objectContaining({
+        path: 'implementation.py',
+        reason: 'preserve_accepted_snapshot_across_unverified_mutation_chain',
       }),
     }));
 

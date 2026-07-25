@@ -783,7 +783,7 @@ export class Runtime {
   }>>();
   private readonly changedPathsByCorrelation = new Map<string, Set<string>>();
   private readonly mutationCheckpointsByCorrelation =
-    new Map<string, WorkspaceMutationCheckpoint>();
+    new Map<string, Map<string, WorkspaceMutationCheckpoint>>();
   private readonly resumedExecutionByCorrelation = new Map<string, ExecutionResumeState>();
   private runtimeToolOverrides = new Map<string, Tool>();
   private readonly teams = new TeamRegistry();
@@ -2740,10 +2740,25 @@ export class Runtime {
         ? await this.executeRuntimeTool(runtimeTool, params)
         : await toolRegistry.execute(toolName, params);
     if (result.success && mutationCheckpoint) {
-      this.mutationCheckpointsByCorrelation.set(
-        options.correlationId ?? ctx.sessionId,
-        mutationCheckpoint
-      );
+      const transactionId = options.correlationId ?? ctx.sessionId;
+      const checkpoints = this.mutationCheckpointsByCorrelation.get(transactionId)
+        ?? new Map<string, WorkspaceMutationCheckpoint>();
+      const existing = checkpoints.get(mutationCheckpoint.path);
+      if (!existing) {
+        checkpoints.set(mutationCheckpoint.path, mutationCheckpoint);
+        this.mutationCheckpointsByCorrelation.set(transactionId, checkpoints);
+      } else {
+        this.emit({
+          type: 'workspace.mutation.checkpoint.retained',
+          agentId,
+          correlationId: transactionId,
+          data: {
+            path: existing.path,
+            reason: 'preserve_accepted_snapshot_across_unverified_mutation_chain',
+            checkpointAgeMs: Date.now() - existing.createdAt,
+          },
+        });
+      }
     }
     if (toolName === 'shell.exec'
       && isWorkspaceVerificationCall({
@@ -3016,7 +3031,11 @@ export class Runtime {
     agentId: string,
     correlationId: string
   ): Promise<ToolResult> {
-    const checkpoint = this.mutationCheckpointsByCorrelation.get(correlationId);
+    const checkpointMap = this.mutationCheckpointsByCorrelation.get(correlationId);
+    const checkpoints = [...(checkpointMap?.values() ?? [])]
+      .sort((left, right) => left.createdAt - right.createdAt);
+    const checkpoint = checkpoints.find(item => item.baseline)
+      ?? checkpoints[0];
     const current = this.verifierScorecardFromToolResult(toolResult.result);
     if (!checkpoint || !checkpoint.baseline || !current) return toolResult;
     this.mutationCheckpointsByCorrelation.delete(correlationId);
@@ -3039,24 +3058,37 @@ export class Runtime {
     const reason = current.reward + 1e-12 < baseline.reward
       ? 'reward_regression'
       : 'no_objective_gain';
-    const restored = await new FsWriteTool(this.workspaceRoot).execute({
-      path: checkpoint.path,
-      content: checkpoint.previousContent,
-      mode: 'overwrite',
-      createDirectories: false,
-    });
-    if (!restored.success) {
+    const restoreFailures: Array<{ path: string; error: string }> = [];
+    for (const item of [...checkpoints].reverse()) {
+      const restored = await new FsWriteTool(this.workspaceRoot).execute({
+        path: item.path,
+        content: item.previousContent,
+        mode: 'overwrite',
+        createDirectories: false,
+      });
+      if (!restored.success) {
+        restoreFailures.push({
+          path: item.path,
+          error: restored.error ?? 'unknown restore failure',
+        });
+      }
+    }
+    if (restoreFailures.length > 0) {
       return {
         ...toolResult,
         error: [
           toolResult.error,
-          `Verifier candidate changed reward from ${baseline.reward} to ${current.reward} without objective improvement, and rollback of ${checkpoint.path} failed: ${restored.error}`,
+          `Verifier candidate changed reward from ${baseline.reward} to ${current.reward} without objective improvement, and rollback failed: ${JSON.stringify(restoreFailures)}`,
         ].filter(Boolean).join('\n'),
       };
     }
     const changed = this.changedPathsByCorrelation.get(correlationId) ?? new Set<string>();
-    changed.add(checkpoint.path);
+    for (const item of checkpoints) changed.add(item.path);
     this.changedPathsByCorrelation.set(correlationId, changed);
+    const checkpointAgeMs = Date.now() - Math.min(
+      ...checkpoints.map(item => item.createdAt)
+    );
+    const restoredPaths = checkpoints.map(item => item.path);
     this.emit({
       type: 'workspace.mutation.candidate_rolled_back',
       agentId,
@@ -3065,11 +3097,12 @@ export class Runtime {
         path: checkpoint.path,
         reason,
         candidateFingerprint: checkpoint.candidateFingerprint,
+        restoredPaths,
         baselineReward: baseline.reward,
         candidateReward: current.reward,
         regressedGroups,
         improvedGroups,
-        checkpointAgeMs: Date.now() - checkpoint.createdAt,
+        checkpointAgeMs,
       },
     });
     if (reason === 'reward_regression') {
@@ -3079,16 +3112,18 @@ export class Runtime {
         correlationId,
         data: {
           path: checkpoint.path,
+          restoredPaths,
           baselineReward: baseline.reward,
           regressedReward: current.reward,
           regressedGroups,
-          checkpointAgeMs: Date.now() - checkpoint.createdAt,
+          checkpointAgeMs,
         },
       });
     }
     const candidateRollback = {
       restored: true,
       path: checkpoint.path,
+      restoredPaths,
       reason,
       candidateFingerprint: checkpoint.candidateFingerprint,
       baselineReward: baseline.reward,
@@ -17624,6 +17659,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
   private buildPythonVerifierDiagnosticCommand(task = ''): string {
     const taskInputPaths = this.extractTaskDiagnosticInputPaths(task);
     const diagnosticScopes = this.extractVerifierDiagnosticScopes(task);
+    const acceptedReward = this.extractAcceptedVerifierReward(task);
     const script = [
       'import functools',
       'import json',
@@ -17743,6 +17779,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       '',
       'probe_observations = []',
       `diagnostic_scopes = ${JSON.stringify(diagnosticScopes)}`,
+      `accepted_reward = ${acceptedReward === undefined ? 'None' : String(acceptedReward)}`,
       '',
       'def instrument(label, function):',
       '    @functools.wraps(function)',
@@ -17784,8 +17821,10 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       '        if isinstance(key, (list, tuple)) and key',
       '    ):',
       '        scoped_observations.append(observation)',
-      'selected_observations = scoped_observations if scoped_observations else probe_observations',
-      'print("VERIFIER_PROBE_SCOPE", compact({"requested": diagnostic_scopes, "matched_observations": len(scoped_observations), "total_observations": len(probe_observations)}))',
+      'current_reward = float(reward) if isinstance(reward, (int, float)) else None',
+      'workspace_regressed = accepted_reward is not None and current_reward is not None and current_reward + 1e-12 < accepted_reward',
+      'selected_observations = probe_observations if workspace_regressed else (scoped_observations if scoped_observations else probe_observations)',
+      'print("VERIFIER_PROBE_SCOPE", compact({"requested": diagnostic_scopes, "matched_observations": len(scoped_observations), "total_observations": len(probe_observations), "accepted_reward": accepted_reward, "current_reward": current_reward, "expanded_for_workspace_regression": workspace_regressed}))',
       'for observation in selected_observations[-20:]:',
       '    print("VERIFIER_PROBE_CALL", observation["label"])',
       '    if observation["summary"] is not None:',
@@ -17905,6 +17944,24 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       return scopes;
     } catch {
       return [];
+    }
+  }
+
+  private extractAcceptedVerifierReward(task: string): number | undefined {
+    const capsuleMatch = /<recovery_capsule>\s*([\s\S]*?)\s*<\/recovery_capsule>/i.exec(
+      task
+    );
+    if (!capsuleMatch) return undefined;
+    try {
+      const capsule = JSON.parse(capsuleMatch[1]!) as {
+        latestAcceptedScorecard?: { reward?: unknown };
+      };
+      const reward = capsule.latestAcceptedScorecard?.reward;
+      return typeof reward === 'number' && Number.isFinite(reward)
+        ? reward
+        : undefined;
+    } catch {
+      return undefined;
     }
   }
 
