@@ -475,6 +475,69 @@ describe('AgentToolPlanner', () => {
     })).toEqual([]);
   });
 
+  it('does not keep repairing from stale failures after a newer mutation passes its declared command', () => {
+    const planner = new AgentToolPlanner();
+    const command = 'python -m dq_audit.cli run --config configs/public_audit.yml --out-dir outputs';
+    const plans = planner.planWorkspaceRepairTransition({
+      task: [
+        'Repair src/dq_audit/audit.py.',
+        '## Required Command',
+        '```bash',
+        command,
+        '```',
+      ].join('\n'),
+      workspaceRoot: '/app',
+      bindings: [
+        { name: 'fs.read', enabled: true },
+        { name: 'fs.synthesize', enabled: true },
+        { name: 'shell.exec', enabled: true },
+      ],
+      calls: [
+        {
+          toolName: 'shell.exec',
+          params: { command },
+          success: false,
+          result: {
+            cwd: '/app',
+            exitCode: 1,
+            stderr: 'NotImplementedError: implement the pipeline',
+          },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: '.roy/official-verifier/test_outputs.py' },
+          success: true,
+          result: {
+            path: '.roy/official-verifier/test_outputs.py',
+            content: 'def test_outputs(): ...',
+          },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/dq_audit/audit.py' },
+          success: true,
+          result: {
+            path: 'src/dq_audit/audit.py',
+            content: 'def run_audit(): pass',
+          },
+        },
+        {
+          toolName: 'fs.synthesize',
+          params: { path: 'src/dq_audit/audit.py', instructions: 'Implement it.' },
+          success: true,
+        },
+        {
+          toolName: 'shell.exec',
+          params: { command },
+          success: true,
+          result: { cwd: '/app', exitCode: 0, stdout: '' },
+        },
+      ],
+    });
+
+    expect(plans).toEqual([]);
+  });
+
   it('transitions aggregate verifier evidence directly into a preserving repair', () => {
     const planner = new AgentToolPlanner();
     const task = 'Repair src/table_recon/audit.py until the official verifier reward is 1.';

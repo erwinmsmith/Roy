@@ -488,6 +488,24 @@ export class AgentToolPlanner {
       || isSuccessfulWorkspaceVerificationCall(failure)) {
       return [];
     }
+    let latestScorecard: {
+      groups: Record<string, number>;
+      weights: Record<string, number>;
+    } | undefined;
+    let latestScorecardIndex = -1;
+    for (let index = input.calls.length - 1; index >= 0; index -= 1) {
+      const state = this.verifierScorecardState(input.calls[index]!);
+      if (!state) continue;
+      latestScorecard = state;
+      latestScorecardIndex = index;
+      break;
+    }
+    const latestMutationIndex = effectiveWorkspaceMutationCallIndices(input.calls).at(-1) ?? -1;
+    const freshUnresolvedScorecard = latestScorecardIndex > latestMutationIndex
+      && Object.values(latestScorecard?.groups ?? {}).some(score => score < 1);
+    if (latestFailureIndex < latestMutationIndex && !freshUnresolvedScorecard) {
+      return [];
+    }
     const shell = failure.result as {
       cwd?: unknown;
       stdout?: unknown;
@@ -604,12 +622,6 @@ export class AgentToolPlanner {
       input.calls,
       targetPath
     );
-    const latestScorecard = [...input.calls].reverse()
-      .map(call => this.verifierScorecardState(call))
-      .find((state): state is {
-        groups: Record<string, number>;
-        weights: Record<string, number>;
-      } => Boolean(state));
     const verifierGroups = {
       ...(targetRejectedCandidate?.baselineGroups
         ?? latestScorecard?.groups
