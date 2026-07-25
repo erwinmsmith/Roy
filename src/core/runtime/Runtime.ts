@@ -2653,7 +2653,8 @@ export class Runtime {
     const mutationCheckpoint = await this.captureWorkspaceMutationCheckpoint(
       toolName,
       params,
-      options.groundingCalls ?? []
+      options.groundingCalls ?? [],
+      options.correlationId ?? ctx.sessionId
     );
     let result = toolName === 'fs.synthesize'
       ? await this.executeSynthesizedFileForAgent(
@@ -2828,7 +2829,8 @@ export class Runtime {
   private async captureWorkspaceMutationCheckpoint(
     toolName: string,
     params: Record<string, unknown>,
-    groundingCalls: ToolCallRecord[]
+    groundingCalls: ToolCallRecord[],
+    correlationId?: string
   ): Promise<WorkspaceMutationCheckpoint | undefined> {
     if (toolName !== 'fs.write'
       && toolName !== 'fs.replace'
@@ -2845,7 +2847,12 @@ export class Runtime {
       return {
         path: normalizedPath,
         previousContent,
-        baseline: this.latestVerifierScorecardFromCalls(groundingCalls),
+        baseline: this.latestVerifierScorecardFromCalls(groundingCalls)
+          ?? (correlationId
+            ? this.latestVerifierScorecardFromCalls(
+                this.restoredToolCallsFromResume(correlationId)
+              )
+            : undefined),
         candidateFingerprint: this.fingerprint({
           toolName,
           path: normalizedPath,

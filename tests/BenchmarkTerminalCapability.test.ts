@@ -966,6 +966,65 @@ describe('benchmark terminal capability', () => {
     await runtime.shutdown();
   });
 
+  it('protects the first resumed mutation with the persisted verifier baseline', async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), 'roy-resumed-verifier-baseline-'));
+    await writeFile(path.join(workspace, 'implementation.py'), 'VALUE = 41\n');
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'resumed-verifier-baseline-test',
+      workspaceCwd: workspace,
+    });
+    const correlationId = 'resumed-verifier-baseline-turn';
+    (runtime as unknown as {
+      resumedExecutionByCorrelation: Map<string, unknown>;
+    }).resumedExecutionByCorrelation.set(correlationId, {
+      sourceCorrelationId: 'prior-turn',
+      anchorPathId: 'prior-path',
+      knowledge: {
+        paths: [{
+          toolFrontier: [{
+            toolName: 'shell.exec',
+            params: { command: 'python .roy/official-verifier/grade.py' },
+            success: true,
+            result: {
+              verifierDiagnostics: [{
+                path: '/logs/verifier/scorecard.json',
+                content: JSON.stringify({
+                  reward: 0.75,
+                  groups: { public: 1, hidden: 0.5 },
+                }),
+              }],
+            },
+            startedAt: Date.now() - 10,
+            completedAt: Date.now() - 5,
+          }],
+        }],
+      },
+    });
+
+    const checkpoint = await (runtime as unknown as {
+      captureWorkspaceMutationCheckpoint: (
+        toolName: string,
+        params: Record<string, unknown>,
+        calls: Array<Record<string, unknown>>,
+        correlationId: string
+      ) => Promise<{
+        baseline?: { reward: number; groups: Record<string, number> };
+      } | undefined>;
+    }).captureWorkspaceMutationCheckpoint(
+      'fs.replace',
+      { path: 'implementation.py' },
+      [],
+      correlationId
+    );
+
+    expect(checkpoint?.baseline).toEqual({
+      reward: 0.75,
+      groups: { public: 1, hidden: 0.5 },
+    });
+    await runtime.shutdown();
+  });
+
   it('rolls back an existing source mutation when the verifier reward regresses', async () => {
     const workspace = await mkdtemp(path.join(tmpdir(), 'roy-verifier-regression-'));
     await mkdir(path.join(workspace, '.roy', 'official-verifier'), { recursive: true });
