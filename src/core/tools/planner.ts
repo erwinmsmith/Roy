@@ -448,6 +448,50 @@ export class AgentToolPlanner {
       ...this.extractReferencedPaths(feedback),
       ...feedbackLocations.map(location => location.path),
     ].map(path => this.normalizeWorkspacePath(path)));
+    const manifestPriority = (candidatePath: string): number => {
+      const lowerPath = candidatePath.toLowerCase();
+      if (/(?:^|\/)pyproject\.toml$/.test(lowerPath)) return 420;
+      if (/(?:^|\/)requirements[^/]*\.txt$/.test(lowerPath)) return 400;
+      if (/(?:^|\/)package\.json$/.test(lowerPath)) return 380;
+      if (/(?:^|\/)(?:cargo\.toml|go\.mod|pom\.xml|build\.gradle|gemfile)$/.test(lowerPath)) return 360;
+      if (/(?:^|\/)[^/]*(?:lock|manifest|dependencies)[^/]*\.(?:json|toml|ya?ml|txt)$/.test(lowerPath)) return 320;
+      return 0;
+    };
+    const observedReads = new Set(input.calls
+      .filter(call => call.toolName === 'fs.read' && call.success)
+      .map(call => this.normalizeWorkspacePath(String(
+        (call.result as { path?: unknown } | undefined)?.path
+          ?? call.params.path
+          ?? ''
+      )))
+      .filter(Boolean));
+    if (dependencyFeedback
+      && input.bindings.some(binding => binding.enabled && binding.name === 'fs.read')) {
+      const unreadManifest = input.calls
+        .filter(call => call.toolName === 'fs.list' && call.success)
+        .flatMap(call => {
+          const entries = (call.result as { entries?: unknown } | undefined)?.entries;
+          return Array.isArray(entries)
+            ? entries.filter((entry): entry is string => typeof entry === 'string')
+            : [];
+        })
+        .map(candidatePath => this.normalizeWorkspacePath(candidatePath))
+        .filter(candidatePath =>
+          manifestPriority(candidatePath) > 0 && !observedReads.has(candidatePath)
+        )
+        .sort((left, right) =>
+          manifestPriority(right) - manifestPriority(left)
+          || left.localeCompare(right)
+        )[0];
+      if (unreadManifest) {
+        return [{
+          toolName: 'fs.read',
+          params: { path: unreadManifest },
+          reason: `External dependency feedback requires checking the parallel manifest ${unreadManifest} before changing an already observed declaration.`,
+          groundingRequired: true,
+        }];
+      }
+    }
     const mutatedPaths = new Set((input.currentCalls ?? input.calls)
       .filter(call => isSuccessfulWorkspaceMutationCall(call))
       .map(call => this.normalizeWorkspacePath(String(call.params.path ?? '')))
@@ -469,11 +513,13 @@ export class AgentToolPlanner {
         const lowerPath = candidate.path.toLowerCase();
         let score = explicitFeedbackPaths.has(candidate.path) ? 500 : 0;
         if (dependencyFeedback) {
-          if (/(?:^|\/)pyproject\.toml$/.test(lowerPath)) score += 420;
-          else if (/(?:^|\/)requirements[^/]*\.txt$/.test(lowerPath)) score += 400;
-          else if (/(?:^|\/)package\.json$/.test(lowerPath)) score += 380;
-          else if (/(?:^|\/)(?:cargo\.toml|go\.mod|pom\.xml|build\.gradle|gemfile)$/.test(lowerPath)) score += 360;
-          else if (/(?:^|\/)[^/]*(?:lock|manifest|dependencies)[^/]*\.(?:json|toml|ya?ml|txt)$/.test(lowerPath)) score += 320;
+          score += manifestPriority(lowerPath);
+          if (/\blegacy\b/i.test(feedback)
+            && /(?:\blegacy\b|(?:={2,3}|~=)\s*0\.\d|pydantic\s*<\s*2)/im.test(
+              candidate.content
+            )) {
+            score += 300;
+          }
         }
         const basename = candidate.path.slice(candidate.path.lastIndexOf('/') + 1);
         if (feedback.toLowerCase().includes(basename.toLowerCase())) score += 160;

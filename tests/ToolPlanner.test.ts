@@ -269,7 +269,7 @@ describe('AgentToolPlanner', () => {
       expect.objectContaining({
         toolName: 'fs.synthesize',
         params: expect.objectContaining({
-          path: 'pyproject.toml',
+          path: 'requirements.txt',
           strategy: 'patch',
           instructions: expect.stringContaining(
             'project metadata still targets the legacy runtime dependency version'
@@ -291,7 +291,7 @@ describe('AgentToolPlanner', () => {
       workspaceRoot: '/app',
     })).toEqual([
       expect.objectContaining({
-        params: expect.objectContaining({ path: 'pyproject.toml' }),
+        params: expect.objectContaining({ path: 'requirements.txt' }),
       }),
     ]);
 
@@ -308,7 +308,28 @@ describe('AgentToolPlanner', () => {
     expect(second).toEqual([
       expect.objectContaining({
         toolName: 'fs.synthesize',
-        params: expect.objectContaining({ path: 'requirements.txt' }),
+        params: expect.objectContaining({ path: 'pyproject.toml' }),
+      }),
+    ]);
+
+    expect(planner.planExternalFeedbackRepair({
+      task,
+      calls: [
+        {
+          toolName: 'fs.list',
+          params: { path: '.', maxDepth: 3 },
+          success: true,
+          result: { entries: ['pyproject.toml', 'requirements.txt'] },
+        },
+        calls[1]!,
+      ],
+      currentCalls: [],
+      bindings,
+      workspaceRoot: '/app',
+    })).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.read',
+        params: { path: 'requirements.txt' },
       }),
     ]);
   });
