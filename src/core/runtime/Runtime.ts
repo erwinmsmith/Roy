@@ -8082,7 +8082,12 @@ export class Runtime {
               'Otherwise emit the next concrete authorized tool request. Runtime will execute it; do not merely describe the command or ask for permission.',
             ].join('\n\n'),
             'agent.output_execution_continue',
-            options.correlationId ?? this.createCorrelationId()
+            options.correlationId ?? this.createCorrelationId(),
+            {
+              isolatedContext: true,
+              temperature: 0,
+              maxOutputTokens: 4_000,
+            }
           );
           continue;
         }
@@ -8134,7 +8139,12 @@ export class Runtime {
                 'If another tool call is necessary, emit the next concrete authorized tool request instead of describing future work. Runtime will continue this execution path.',
               ].join('\n\n'),
               'agent.output_tool_continue',
-              options.correlationId ?? this.createCorrelationId()
+              options.correlationId ?? this.createCorrelationId(),
+              {
+                isolatedContext: true,
+                temperature: 0,
+                maxOutputTokens: 4_000,
+              }
             );
             continue;
           }
@@ -8161,7 +8171,12 @@ export class Runtime {
             'Do not emit tool-call markup, JSON tool requests, or claim that a tool still needs to run.',
           ].join('\n\n'),
           'agent.output_repair',
-          options.correlationId ?? this.createCorrelationId()
+          options.correlationId ?? this.createCorrelationId(),
+          {
+            isolatedContext: true,
+            temperature: 0,
+            maxOutputTokens: 2_000,
+          }
         );
         if (this.containsUnresolvedToolIntent(result)) {
           throw new Error('Agent output repair still contained an unexecuted tool request');
