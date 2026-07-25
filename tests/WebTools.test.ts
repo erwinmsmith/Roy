@@ -32,24 +32,20 @@ describe('web tools', () => {
     }));
   });
 
-  it('uses keyless Brave HTML search in auto mode and parses relevant evidence', async () => {
+  it('uses keyless Yahoo search in auto mode and parses relevant evidence', async () => {
     const html = `
       <html><body>
-        <div class="snippet" data-type="web">
-          <div class="result-content">
+        <div class="dd fst algo algo-sr">
+          <div class="compTitle">
             <a href="https://history.example/prohibition">
-              <div class="search-snippet-title" title="The Night Prohibition Ended"></div>
+              <h3>The Night Prohibition Ended</h3>
             </a>
-            <div class="generic-snippet">
-              <div class="content">Utah was the final state needed to ratify the 21st Amendment.</div>
-            </div>
           </div>
+          <div class="compText"><p>Utah was the final state needed to ratify the 21st Amendment.</p></div>
         </div>
-        <div class="snippet" data-type="web">
-          <div class="result-content">
-            <a href="http://127.0.0.1/private">
-              <div class="search-snippet-title" title="Unsafe"></div>
-            </a>
+        <div class="dd algo algo-sr">
+          <div class="compTitle">
+            <a href="http://127.0.0.1/private"><h3>Unsafe</h3></a>
           </div>
         </div>
       </body></html>`;
@@ -67,7 +63,7 @@ describe('web tools', () => {
 
     expect(result.success).toBe(true);
     expect(result.result).toEqual(expect.objectContaining({
-      provider: 'brave_html',
+      provider: 'yahoo',
       results: [{
         title: 'The Night Prohibition Ended',
         url: 'https://history.example/prohibition',
@@ -77,8 +73,8 @@ describe('web tools', () => {
     }));
     expect(fetchMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        hostname: 'search.brave.com',
-        search: expect.stringContaining('source=web'),
+        hostname: 'search.yahoo.com',
+        search: expect.stringContaining('p=last+state+needed+to+end+prohibition'),
       }),
       expect.objectContaining({
         headers: expect.objectContaining({
@@ -88,8 +84,9 @@ describe('web tools', () => {
     );
   });
 
-  it('recovers an unavailable keyless provider through Wikipedia search', async () => {
+  it('recovers unavailable keyless providers through Wikipedia search', async () => {
     const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response('rate limited', { status: 429 }))
       .mockResolvedValueOnce(new Response('rate limited', { status: 429 }))
       .mockResolvedValueOnce(new Response(JSON.stringify({
         query: {
@@ -119,7 +116,14 @@ describe('web tools', () => {
         source: 'en.wikipedia.org',
       }],
     }));
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(result.metadata).toEqual(expect.objectContaining({
+      providerAttempts: [
+        expect.objectContaining({ provider: 'yahoo', outcome: 'error' }),
+        expect.objectContaining({ provider: 'brave_html', outcome: 'error' }),
+        expect.objectContaining({ provider: 'wikipedia', outcome: 'success' }),
+      ],
+    }));
   });
 
   it('rejects localhost and cloud metadata URLs before fetching', async () => {

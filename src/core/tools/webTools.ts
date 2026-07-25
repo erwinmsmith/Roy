@@ -6,6 +6,7 @@ import type { Tool, ToolResult } from './types.js';
 export type WebSearchProviderName =
   | 'auto'
   | 'brave'
+  | 'yahoo'
   | 'brave_html'
   | 'wikipedia'
   | 'bing';
@@ -96,31 +97,46 @@ export class WebSearchTool implements Tool {
     const maxResults = Math.min(Math.max(1, Number(params.maxResults ?? this.config.maxResults)), 10);
     const configuredKey = process.env[this.config.braveApiKeyEnv]?.trim();
     const configuredProvider = this.config.searchProvider;
-    const provider = configuredProvider === 'auto'
-      ? configuredKey ? 'brave' : 'brave_html'
-      : configuredProvider;
+    const providerChain: Array<Exclude<WebSearchProviderName, 'auto'>> = configuredProvider === 'auto'
+      ? configuredKey
+        ? ['brave', 'yahoo', 'brave_html', 'wikipedia']
+        : ['yahoo', 'brave_html', 'wikipedia']
+      : [configuredProvider];
+    const providerAttempts: Array<{
+      provider: Exclude<WebSearchProviderName, 'auto'>;
+      outcome: 'success' | 'empty' | 'error';
+      error?: string;
+    }> = [];
 
     try {
-      let actualProvider = provider;
-      let results: WebSearchResultItem[];
-      if (provider === 'brave') {
-        results = await this.searchBrave(query, maxResults, configuredKey);
-      } else if (provider === 'brave_html') {
+      let actualProvider = providerChain[0];
+      let results: WebSearchResultItem[] = [];
+      for (const candidate of providerChain) {
+        actualProvider = candidate;
         try {
-          results = await this.searchBraveHtml(query, maxResults);
-          if (configuredProvider === 'auto' && results.length === 0) {
-            actualProvider = 'wikipedia';
+          if (candidate === 'brave') {
+            results = await this.searchBrave(query, maxResults, configuredKey);
+          } else if (candidate === 'yahoo') {
+            results = await this.searchYahoo(query, maxResults);
+          } else if (candidate === 'brave_html') {
+            results = await this.searchBraveHtml(query, maxResults);
+          } else if (candidate === 'wikipedia') {
             results = await this.searchWikipedia(query, maxResults);
+          } else {
+            results = await this.searchBing(query, maxResults);
           }
+          providerAttempts.push({ provider: candidate, outcome: results.length > 0 ? 'success' : 'empty' });
+          if (results.length > 0 || configuredProvider !== 'auto') break;
         } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          providerAttempts.push({ provider: candidate, outcome: 'error', error: message });
           if (configuredProvider !== 'auto') throw error;
-          actualProvider = 'wikipedia';
-          results = await this.searchWikipedia(query, maxResults);
         }
-      } else if (provider === 'wikipedia') {
-        results = await this.searchWikipedia(query, maxResults);
-      } else {
-        results = await this.searchBing(query, maxResults);
+      }
+      if (providerAttempts.every(attempt => attempt.outcome === 'error')) {
+        throw new Error(`All web search providers failed: ${providerAttempts
+          .map(attempt => `${attempt.provider}: ${attempt.error ?? 'unknown error'}`)
+          .join('; ')}`);
       }
       return {
         success: true,
@@ -135,10 +151,15 @@ export class WebSearchTool implements Tool {
           configuredProvider,
           resultCount: results.length,
           domain,
+          providerAttempts,
         },
       };
     } catch (error) {
-      return { success: false, error: error instanceof Error ? error.message : String(error), metadata: { provider } };
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+        metadata: { provider: providerChain[0], configuredProvider, providerAttempts },
+      };
     }
   }
 
@@ -191,6 +212,46 @@ export class WebSearchTool implements Tool {
         return { title, url: resultUrl, snippet, source: new URL(resultUrl).hostname } satisfies WebSearchResultItem;
       })
       .filter((item): item is WebSearchResultItem => Boolean(item))
+      .slice(0, maxResults);
+  }
+
+  private async searchYahoo(query: string, maxResults: number): Promise<WebSearchResultItem[]> {
+    const url = new URL('https://search.yahoo.com/search');
+    url.searchParams.set('p', query);
+    const response = await fetchWithTimeout(url, {
+      timeoutMs: this.config.timeoutMs,
+      headers: {
+        Accept: 'text/html',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'User-Agent': this.config.userAgent,
+      },
+    });
+    if (!response.ok) throw new Error(`Yahoo web search returned HTTP ${response.status}`);
+    const html = await response.text();
+    const $ = load(html);
+    return $('div.algo.algo-sr').toArray()
+      .map(item => {
+        const container = $(item);
+        const anchor = container.find('.compTitle > a[href]').first();
+        const resultUrl = anchor.attr('href')?.trim() ?? '';
+        const title = cleanText(anchor.find('h3').first().text());
+        const snippet = cleanText(container.find('.compText').first().text());
+        if (!resultUrl
+          || !title
+          || !isPublicHttpUrl(resultUrl, this.config.allowHttp)) {
+          return undefined;
+        }
+        return {
+          title,
+          url: resultUrl,
+          snippet,
+          source: new URL(resultUrl).hostname,
+        } satisfies WebSearchResultItem;
+      })
+      .filter((item): item is WebSearchResultItem => Boolean(item))
+      .filter((item, index, items) =>
+        items.findIndex(candidate => candidate.url === item.url) === index
+      )
       .slice(0, maxResults);
   }
 
