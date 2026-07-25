@@ -246,6 +246,80 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('transitions a freshly inspected localized traceback into a minimal patch', () => {
+    const planner = new AgentToolPlanner();
+    const task = 'Repair src/table_recon/audit.py and rerun the CLI.';
+    const bindings = [
+      { name: 'fs.read', enabled: true },
+      { name: 'fs.synthesize', enabled: true },
+      { name: 'shell.exec', enabled: true },
+    ];
+    const calls = [
+      {
+        toolName: 'shell.exec',
+        params: {
+          command: 'python -m table_recon.cli run --manifest data/public/manifest.json --out-dir outputs',
+        },
+        success: false,
+        result: {
+          cwd: '/app',
+          exitCode: 1,
+          stderr: [
+            'Traceback (most recent call last):',
+            '  File "/app/src/table_recon/audit.py", line 191, in run_audit',
+            '    if cell_boxes and texts:',
+            "UnboundLocalError: cannot access local variable 'cell_boxes'",
+          ].join('\n'),
+        },
+      },
+      {
+        toolName: 'fs.read',
+        params: {
+          path: 'src/table_recon/audit.py',
+          startLine: 166,
+          endLine: 216,
+        },
+        success: true,
+        result: {
+          path: 'src/table_recon/audit.py',
+          content: 'def run_audit(...):\n    if cell_boxes and texts:\n        pass\n',
+          truncated: false,
+        },
+      },
+    ];
+
+    const plans = planner.planWorkspaceRepairTransition({
+      task,
+      workspaceRoot: '/app',
+      bindings,
+      calls,
+    });
+
+    expect(plans).toEqual([expect.objectContaining({
+      toolName: 'fs.synthesize',
+      params: expect.objectContaining({
+        path: 'src/table_recon/audit.py',
+        strategy: 'patch',
+        instructions: expect.stringMatching(/cell_boxes[\s\S]*every control-flow path/),
+      }),
+      reason: expect.stringContaining('exact traceback location'),
+    })]);
+    expect(planner.planWorkspaceRepairTransition({
+      task,
+      workspaceRoot: '/app',
+      bindings,
+      calls: [
+        ...calls,
+        {
+          toolName: plans[0]!.toolName,
+          params: plans[0]!.params,
+          success: false,
+          result: { synthesisRejected: true },
+        },
+      ],
+    })).toEqual([]);
+  });
+
   it('transitions aggregate verifier evidence directly into a preserving repair', () => {
     const planner = new AgentToolPlanner();
     const task = 'Repair src/table_recon/audit.py until the official verifier reward is 1.';

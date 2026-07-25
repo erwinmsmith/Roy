@@ -456,12 +456,59 @@ export class AgentToolPlanner {
       String(failure.error ?? ''),
       ...this.extractVerifierDiagnosticText(shell?.verifierDiagnostics),
     ].filter(Boolean).join('\n');
-    if (this.extractFailureLocations(
+    const failureLocations = this.extractFailureLocations(
       failureOutput,
       String(shell?.cwd ?? input.workspaceRoot ?? ''),
       input.workspaceRoot
-    ).length > 0 && !rejectedCandidate) {
-      return [];
+    );
+    if (failureLocations.length > 0 && !rejectedCandidate) {
+      const targetPath = failureLocations[0]!.path;
+      let sourceReadIndex = -1;
+      for (let index = input.calls.length - 1; index > latestFailureIndex; index -= 1) {
+        const call = input.calls[index]!;
+        const readPath = this.normalizeWorkspacePath(String(
+          (call.result as { path?: unknown } | undefined)?.path
+            ?? call.params.path
+            ?? ''
+        ));
+        if (call.toolName === 'fs.read'
+          && call.success
+          && readPath === targetPath
+          && typeof (call.result as { content?: unknown } | undefined)?.content === 'string') {
+          sourceReadIndex = index;
+          break;
+        }
+      }
+      if (sourceReadIndex < 0
+        || effectiveWorkspaceMutationCallIndices(input.calls)
+          .some(index => index > sourceReadIndex)) {
+        return [];
+      }
+      const localizedFailure = failureOutput.length <= 2_400
+        ? failureOutput
+        : `[earlier failure output compacted]\n${failureOutput.slice(-2_400)}`;
+      const instructions = [
+        'Apply the smallest interface-preserving patch that fixes this exact localized execution failure.',
+        `Authoritative failure:\n${localizedFailure}`,
+        'Use the freshly read current source as the only patch base. Initialize values on every control-flow path, preserve already working behavior, and do not broaden the change beyond the causal failure.',
+      ].join('\n\n');
+      const duplicate = input.calls.slice(sourceReadIndex + 1).some(call =>
+        call.toolName === 'fs.synthesize'
+        && this.normalizeWorkspacePath(String(call.params.path ?? '')) === targetPath
+        && call.params.strategy === 'patch'
+        && String(call.params.instructions ?? '') === instructions
+      );
+      if (duplicate) return [];
+      return [{
+        toolName: 'fs.synthesize',
+        params: {
+          path: targetPath,
+          instructions,
+          strategy: 'patch',
+        },
+        reason: 'A fresh source read now grounds the exact traceback location; transition directly from diagnosis to a minimal local repair.',
+        groundingRequired: true,
+      }];
     }
 
     const authoritativeReads = input.calls
