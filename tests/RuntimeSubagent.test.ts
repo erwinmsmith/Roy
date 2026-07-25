@@ -826,6 +826,31 @@ describe('Runtime controlled subagent spawning', () => {
     });
   });
 
+  it('extracts a unified diff from model prose and a trailing Markdown fence', () => {
+    const runtime = new Runtime();
+    const extract = (runtime as unknown as {
+      extractUnifiedDiffPayload: (content: string) => string;
+    }).extractUnifiedDiffPayload.bind(runtime);
+
+    expect(extract([
+      'Here is the focused repair:',
+      '```diff',
+      '--- a/app.py',
+      '+++ b/app.py',
+      '@@ -1,1 +1,1 @@',
+      '-value = 1',
+      '+value = 2',
+      '```',
+      'This preserves the remaining behavior.',
+    ].join('\n'))).toBe([
+      '--- a/app.py',
+      '+++ b/app.py',
+      '@@ -1,1 +1,1 @@',
+      '-value = 1',
+      '+value = 2',
+    ].join('\n'));
+  });
+
   it('retries a rejected focused patch once with exact anchor feedback', async () => {
     const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-file-patch-recovery-'));
     await writeFile(

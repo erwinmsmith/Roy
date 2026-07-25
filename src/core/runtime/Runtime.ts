@@ -3993,6 +3993,9 @@ export class Runtime {
       }
     );
     generatedPayload = this.stripSingleMarkdownCodeFence(generatedPayload);
+    if (synthesisStrategy === 'patch') {
+      generatedPayload = this.extractUnifiedDiffPayload(generatedPayload);
+    }
     let materialized = synthesisStrategy === 'patch'
       ? this.applyUnifiedPatchToContent(currentContent!, generatedPayload)
       : { content: generatedPayload };
@@ -4053,6 +4056,7 @@ export class Runtime {
         }
       );
       generatedPayload = this.stripSingleMarkdownCodeFence(generatedPayload);
+      generatedPayload = this.extractUnifiedDiffPayload(generatedPayload);
       materialized = this.applyUnifiedPatchToContent(currentContent!, generatedPayload);
       validationError = materialized.error
         ?? await this.synthesizedContentRejectionReason(
@@ -4398,6 +4402,23 @@ export class Runtime {
     const trimmed = content.trim();
     const fenced = /^```[A-Za-z0-9_+.-]*\s*\n([\s\S]*?)\n```\s*$/.exec(trimmed);
     return fenced ? fenced[1]! : content;
+  }
+
+  private extractUnifiedDiffPayload(content: string): string {
+    const lines = content.replace(/\r\n/g, '\n').trim().split('\n');
+    const headerIndex = lines.findIndex((line, index) =>
+      line.startsWith('--- ')
+      && lines.slice(index + 1, index + 4).some(candidate => candidate.startsWith('+++ '))
+    );
+    if (headerIndex < 0) return content;
+    const payload = lines.slice(headerIndex);
+    const closingFenceIndex = payload.findIndex((line, index) =>
+      index > 0 && /^```(?:[A-Za-z0-9_+.-]*)?\s*$/.test(line.trim())
+    );
+    return (closingFenceIndex < 0
+      ? payload
+      : payload.slice(0, closingFenceIndex)
+    ).join('\n');
   }
 
   private applyUnifiedPatchToContent(
