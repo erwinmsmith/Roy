@@ -5,6 +5,7 @@ import {
   isWorkspaceVerificationCall,
   workspaceCandidateRollbackFromCall,
 } from './executionIntent.js';
+import yaml from 'js-yaml';
 
 export interface ToolPlanBinding {
   name: string;
@@ -280,7 +281,8 @@ export class AgentToolPlanner {
       );
     const candidates: Array<{ path: string; reason: string; priority: number }> = [];
     for (const explicitPath of this.extractReferencedPaths(input.task)) {
-      const path = resolvePath(explicitPath);
+      const taskDeclaredPath = this.taskDeclaredDirectoryPath(input.task, explicitPath);
+      const path = resolvePath(taskDeclaredPath ?? explicitPath);
       if (!path || !readablePath(path)) continue;
       const lower = path.toLowerCase();
       const priority = /(?:^|\/)(?:src|lib|app|packages)\/.+\.(?:py|ts|tsx|js|jsx|mjs|cjs|java|go|rs|rb|php|sh)$/i.test(
@@ -307,13 +309,15 @@ export class AgentToolPlanner {
       const sourcePath = this.normalizeWorkspacePath(String(
         result?.path ?? call.params.path ?? ''
       ));
-      if (!/(?:^|\/)[^/]*manifest[^/]*\.json$/i.test(sourcePath)
+      if (!/(?:^|\/)(?:[^/]*manifest[^/]*\.json|[^/]*(?:config|configuration|settings|rules|expectations|audit)[^/]*\.(?:json|ya?ml))$/i.test(sourcePath)
         || typeof result?.content !== 'string') {
         continue;
       }
       let parsed: unknown;
       try {
-        parsed = JSON.parse(result.content);
+        parsed = /\.ya?ml$/i.test(sourcePath)
+          ? yaml.load(result.content)
+          : JSON.parse(result.content);
       } catch {
         continue;
       }
@@ -863,6 +867,30 @@ export class AgentToolPlanner {
     return [...new Set([...matches]
       .map(match => match[1].replace(/^\.\//, ''))
       .filter(value => value.length > 0))];
+  }
+
+  private taskDeclaredDirectoryPath(task: string, rawPath: string): string | undefined {
+    const normalizedPath = this.normalizeWorkspacePath(rawPath);
+    if (!normalizedPath || normalizedPath.includes('/')) return undefined;
+    const escapedPath = normalizedPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    for (const match of task.matchAll(new RegExp(`(?:^|\\n)[^\\n]*[\\x60'"]?${escapedPath}[\\x60'"]?(?=$|[.\\s\\x60'"),:;])`, 'gi'))) {
+      const occurrence = match.index ?? 0;
+      const context = task.slice(Math.max(0, occurrence - 1_200), occurrence);
+      const headingBoundary = Math.max(
+        context.lastIndexOf('\n## '),
+        context.lastIndexOf('\n# ')
+      );
+      const section = context.slice(Math.max(0, headingBoundary));
+      const directoryMatches = [...section.matchAll(
+        /\b(?:under|inside|into|within|to)\s+[`'"]?((?:\.{1,2}\/)?(?:[A-Za-z0-9._@-]+\/)+)[`'"]?/gi
+      )];
+      const directory = directoryMatches.at(-1)?.[1];
+      if (directory
+        && /\b(?:artifacts?|outputs?|reports?|files?|write|create|produce|emit|save)\b/i.test(section)) {
+        return `${directory}${normalizedPath}`;
+      }
+    }
+    return undefined;
   }
 
   private extractFailureLocations(

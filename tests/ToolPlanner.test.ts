@@ -168,6 +168,78 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('resolves artifact basenames beneath the output directory declared by the task', () => {
+    const plans = new AgentToolPlanner().planWorkspaceEvidenceFollowUps({
+      task: [
+        'Implement the data audit.',
+        '## Required Artifacts',
+        'Write all of these files under `outputs/`:',
+        '- `cleaned_customers.csv`',
+        '- `validation_report.json`',
+      ].join('\n'),
+      workspaceRoot: '/app',
+      bindings: [{ name: 'fs.read', enabled: true }],
+      calls: [{
+        toolName: 'fs.list',
+        params: { path: '.', maxDepth: 4 },
+        success: true,
+        result: {
+          entries: [
+            'outputs/cleaned_customers.csv',
+            'outputs/validation_report.json',
+          ],
+        },
+      }],
+    });
+
+    expect(plans.map(plan => plan.params.path)).toEqual([
+      'outputs/cleaned_customers.csv',
+      'outputs/validation_report.json',
+    ]);
+  });
+
+  it('follows file dependencies from a grounded YAML configuration', () => {
+    const plans = new AgentToolPlanner().planWorkspaceEvidenceFollowUps({
+      task: 'Inspect configs/public_audit.yml and implement the configured audit.',
+      workspaceRoot: '/app',
+      bindings: [{ name: 'fs.read', enabled: true }],
+      calls: [
+        {
+          toolName: 'fs.list',
+          params: { path: '.', maxDepth: 4 },
+          success: true,
+          result: {
+            entries: [
+              'configs/public_audit.yml',
+              'data/public/messy_customers.csv',
+              'data/public/messy_orders.csv',
+              'rules/public_expectations.yml',
+            ],
+          },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'configs/public_audit.yml' },
+          success: true,
+          result: {
+            path: 'configs/public_audit.yml',
+            content: [
+              'customers_path: data/public/messy_customers.csv',
+              'orders_path: data/public/messy_orders.csv',
+              'rules_path: rules/public_expectations.yml',
+            ].join('\n'),
+          },
+        },
+      ],
+    });
+
+    expect(plans.map(plan => plan.params.path)).toEqual([
+      'rules/public_expectations.yml',
+      'data/public/messy_customers.csv',
+      'data/public/messy_orders.csv',
+    ]);
+  });
+
   it('turns a verifier traceback into a bounded source read', () => {
     const plans = new AgentToolPlanner().planWorkspaceFailureFollowUps({
       bindings: [
