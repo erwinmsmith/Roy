@@ -394,11 +394,21 @@ export class AgentToolPlanner {
     if (latestMutationIndex === undefined) return [];
     const commands = this.extractExplicitShellCommands(input.task);
     return commands
-      .filter(command => !input.calls.some((call, index) =>
-        index > latestMutationIndex
-        && call.toolName === 'shell.exec'
-        && String(call.params.command ?? '').trim() === command.trim()
-      ))
+      .filter(command => {
+        const matchingCalls = input.calls.filter(call =>
+          call.toolName === 'shell.exec'
+          && String(call.params.command ?? '').trim() === command.trim()
+        );
+        if (this.isEnvironmentSetupCommand(command)
+          && matchingCalls.some(call => call.success)) {
+          return false;
+        }
+        return !input.calls.some((call, index) =>
+          index > latestMutationIndex
+          && call.toolName === 'shell.exec'
+          && String(call.params.command ?? '').trim() === command.trim()
+        );
+      })
       .slice(0, 2)
       .map(command => ({
         toolName: 'shell.exec',
@@ -995,6 +1005,14 @@ export class AgentToolPlanner {
     return /\b(?:apply_patch|touch|mkdir|cp|mv|rm|install|chmod|truncate|sed\s+-i|perl\s+-pi)\b/i.test(command)
       || /\b(?:python|python3|node)\b[\s\S]*(?:writeFile|write_text|write_bytes|open\s*\([^)]*['"][wa]['"])/i.test(command)
       || /(?:^|[;&|]\s*)(?:echo|printf)\b[^\n]*(?:>>?|tee)\s*\S+/i.test(command);
+  }
+
+  private isEnvironmentSetupCommand(command: string): boolean {
+    const normalized = command.trim();
+    return /^(?:cd|pushd|popd)\b/i.test(normalized)
+      || /^(?:python(?:3)?\s+-m\s+pip|pip(?:3)?|uv)\s+install\b/i.test(normalized)
+      || /^(?:npm|pnpm|yarn|bun)\s+(?:install|ci)\b/i.test(normalized)
+      || /^(?:apt-get|apt|apk|brew)\s+install\b/i.test(normalized);
   }
 
   private extractExplicitShellCommands(task: string): string[] {

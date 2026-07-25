@@ -131,6 +131,48 @@ describe('AgentToolPlanner', () => {
     })).toEqual([]);
   });
 
+  it('does not reinstall an already prepared environment after source-only mutations', () => {
+    const planner = new AgentToolPlanner();
+    const task = [
+      '## Required Commands',
+      '```bash',
+      'python -m pip install -e .',
+      'python -m support_rag.cli answer --question "hello"',
+      '```',
+    ].join('\n');
+
+    const plans = planner.planPostMutationVerification({
+      task,
+      calls: [
+        {
+          toolName: 'shell.exec',
+          params: { command: 'python -m pip install -e .' },
+          success: true,
+        },
+        {
+          toolName: 'shell.exec',
+          params: { command: 'python -m support_rag.cli answer --question "hello"' },
+          success: false,
+        },
+        {
+          toolName: 'fs.synthesize',
+          params: { path: 'src/support_rag/chain.py', instructions: 'Migrate imports.' },
+          success: true,
+        },
+      ],
+      bindings: [{ name: 'shell.exec', enabled: true }],
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'shell.exec',
+        params: {
+          command: 'python -m support_rag.cli answer --question "hello"',
+        },
+      }),
+    ]);
+  });
+
   it('follows explicit files and text dependencies from a grounded manifest without another model plan', () => {
     const planner = new AgentToolPlanner();
     const plans = planner.planWorkspaceEvidenceFollowUps({
