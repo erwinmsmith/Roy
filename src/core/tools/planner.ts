@@ -1063,7 +1063,11 @@ export class AgentToolPlanner {
         }
       }
     }
-    return locations
+    const prioritizedLocations = [...locations].sort((left, right) =>
+      Number(this.isMutableImplementationPath(right.path))
+      - Number(this.isMutableImplementationPath(left.path))
+    );
+    return prioritizedLocations
       .map(location => ({
         toolName: 'fs.read',
         params: location.line === undefined

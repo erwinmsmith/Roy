@@ -956,6 +956,42 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('prioritizes the implementation path over verifier traceback frames', () => {
+    const plans = new AgentToolPlanner().planWorkspaceFailureFollowUps({
+      workspaceRoot: '/app',
+      bindings: [
+        { name: 'fs.read', enabled: true },
+        { name: 'shell.exec', enabled: true },
+      ],
+      calls: [{
+        toolName: 'shell.exec',
+        params: {
+          command: 'python -m pytest -q .roy/official-verifier/test_outputs.py',
+        },
+        success: false,
+        result: {
+          cwd: '/app',
+          exitCode: 1,
+          stdout: [
+            'message = source violations in stubs:',
+            'src/support_rag/models.py contains forbidden shortcut ROUTE_KEYWORDS',
+            '/tests/test_outputs.py:254: in test_langchain_runtime_migration',
+            'E AssertionError: source violations in stubs:',
+            'src/support_rag/models.py contains forbidden shortcut ROUTE_KEYWORDS',
+            'FAILED .roy/official-verifier/test_outputs.py::test_langchain_runtime_migration',
+          ].join('\n'),
+        },
+      }],
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.read',
+        params: { path: 'src/support_rag/models.py' },
+      }),
+    ]);
+  });
+
   it('uses shell error text to inspect an imported workspace module', () => {
     const plans = new AgentToolPlanner().planWorkspaceFailureFollowUps({
       workspaceRoot: '/app',
