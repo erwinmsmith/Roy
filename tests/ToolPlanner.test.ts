@@ -2241,6 +2241,32 @@ describe('AgentToolPlanner', () => {
     })).toEqual([]);
   });
 
+  it('does not synthesize files from title-case prose or generic acronyms', () => {
+    const planner = new AgentToolPlanner();
+    const calls = [{
+      toolName: 'fs.read',
+      params: { path: 'src/app/api.py' },
+      success: true,
+      result: {
+        path: 'src/app/api.py',
+        content: [
+          'def load_payload(path):',
+          '    return JSONDecoder().decode(path.read_text())',
+        ].join('\n'),
+        truncated: false,
+      },
+    }];
+
+    expect(planner.planGroundedImplementationTransition({
+      task: 'Migrate the project. Load runtime configuration and preserve JSON output.',
+      calls,
+      bindings: [
+        { name: 'fs.read', enabled: true },
+        { name: 'fs.synthesize', enabled: true },
+      ],
+    })).toEqual([]);
+  });
+
   it('extracts explicitly quoted natural-language commands from a team task', () => {
     const planner = new AgentToolPlanner();
     const plans = planner.plan({

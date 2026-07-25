@@ -2203,7 +2203,9 @@ export class AgentToolPlanner {
       ...task.matchAll(
         /\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+\b/g
       ),
-      ...task.matchAll(/\b[A-Z][A-Za-z0-9_]{3,}\b/g),
+      ...task.matchAll(
+        /\b(?:[A-Z][a-z0-9]+(?:[A-Z][A-Za-z0-9]*)+|[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+)\b/g
+      ),
       ...task.matchAll(/[`'"]([A-Za-z_][A-Za-z0-9_.]{3,})[`'"]/g),
     ].map(match => String(match[1] ?? match[0] ?? '').replace(/[()]+$/, ''));
     const ignored = new Set([
