@@ -624,6 +624,63 @@ describe('Root dynamic execution tree', () => {
     await runtime.shutdown();
   });
 
+  it('does not rebuild an evidence steward for a cached recovery team', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-cached-recovery-team-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'cached-recovery-team-test',
+      workspaceCwd,
+      fsmEnabled: true,
+      llmProvider: new DirectInitialDecisionLLM(),
+    });
+    const normalize = (runtime as unknown as {
+      ensureLongHorizonTeamDecision: (
+        decision: Extract<DelegationDecision, { action: 'spawn_subagents' }>,
+        task: string,
+        requiresWorkspaceMutation: boolean,
+        correlationId: string
+      ) => Extract<DelegationDecision, { action: 'spawn_subagents' }>;
+    }).ensureLongHorizonTeamDecision;
+    const decision = normalize.call(runtime, {
+      action: 'spawn_subagents',
+      reason: 'Continue the cached failed path.',
+      coordination: 'team',
+      continuationPolicy: 'reassess',
+      agents: [
+        {
+          archetype: 'coder',
+          name: 'RecoveryExecutor-2',
+          role: 'cached-state recovery executor',
+          task: 'Repair the unresolved cached verifier mismatch.',
+          tools: ['fs.read', 'fs.replace', 'shell.exec'],
+        },
+        {
+          archetype: 'tester',
+          name: 'RecoveryVerifier-2',
+          role: 'independent cached-path verifier',
+          task: 'Verify the repaired cached path.',
+          tools: ['fs.read', 'shell.exec'],
+        },
+      ],
+      team: {
+        name: 'LongHorizonRecoveryTeam-2',
+        description: 'Resume a grounded path.',
+        executionPolicy: {
+          mode: 'sequential',
+          maxConcurrency: 1,
+          minimumSuccessfulMembers: 1,
+        },
+      },
+    }, 'Continue the long-horizon repair until verification succeeds.', true, 'cached-recovery');
+
+    expect(decision.agents.map(agent => agent.name)).toEqual([
+      'RecoveryExecutor-2',
+      'RecoveryVerifier-2',
+    ]);
+    expect(decision.agents.some(agent => agent.name === 'PathSteward-1')).toBe(false);
+    await runtime.shutdown();
+  });
+
   it('keeps a read-only custom evidence mapper before implementation instead of treating a generic check as verification', () => {
     const runtime = new Runtime();
     const classify = (runtime as unknown as {
@@ -803,6 +860,7 @@ describe('Root dynamic execution tree', () => {
         }
       ) => {
         sourceCorrelationId: string;
+        anchorPathId: string;
         openPaths: number;
         actionableFeedback: number;
       } | undefined;
@@ -884,6 +942,63 @@ describe('Root dynamic execution tree', () => {
       openPaths: 1,
       actionableFeedback: 1,
     });
+
+    const mixedResume = findResume.call(runtime, continuationTask, {
+      version: 1,
+      updatedAt: 30,
+      steps: [
+        {
+          ...step('mixed-correlation', continuationTask, 21),
+          id: 'mixed.step_01.cache',
+          stepId: 'mixed.step_01',
+          pathId: 'mixed.step_01.path',
+        },
+        {
+          ...step('mixed-correlation', continuationTask, 30),
+          id: 'mixed.step_02.cache',
+          stepId: 'mixed.step_02',
+          pathId: 'mixed.step_02.path',
+        },
+      ],
+      paths: [
+        {
+          ...pathRecord('mixed-correlation', 21),
+          id: 'mixed.step_01.path',
+          stepId: 'mixed.step_01',
+        },
+        {
+          ...pathRecord('mixed-correlation', 30),
+          id: 'mixed.step_02.path',
+          stepId: 'mixed.step_02',
+          status: 'completed',
+          mutationObserved: false,
+          verificationObserved: false,
+          failedTools: [],
+        },
+      ],
+      actors: [],
+      feedback: [],
+    });
+    expect(mixedResume).toMatchObject({
+      sourceCorrelationId: 'mixed-correlation',
+      anchorPathId: 'mixed.step_01.path',
+      openPaths: 1,
+    });
+
+    expect(findResume.call(runtime, continuationTask, {
+      version: 1,
+      updatedAt: 40,
+      steps: [step('completed-exact-continuation', continuationTask, 40)],
+      paths: [{
+        ...pathRecord('completed-exact-continuation', 40),
+        status: 'completed',
+        mutationObserved: false,
+        verificationObserved: false,
+        failedTools: [],
+      }],
+      actors: [],
+      feedback: [],
+    })).toBeUndefined();
   });
 
   it('answers self-contained workspace discovery questions with tools instead of user clarification', () => {

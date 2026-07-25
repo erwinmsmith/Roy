@@ -294,6 +294,89 @@ describe('Phase 3 subteam runtime', () => {
     await runtime.shutdown();
   });
 
+  it('seeds the first resumed team member with the persisted causal tool frontier', async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), 'roy-resumed-team-frontier-'));
+    await writeFile(path.join(cwd, 'README.md'), '# Cached workspace\n');
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'resumed-team-frontier',
+      workspaceCwd: cwd,
+      fsmEnabled: true,
+      llmProvider: new TeamTestLLM(),
+    });
+    const correlationId = 'resumed-team-frontier-correlation';
+    const now = Date.now();
+    const resumedStates = (runtime as unknown as {
+      resumedExecutionByCorrelation: Map<string, unknown>;
+    }).resumedExecutionByCorrelation;
+    resumedStates.set(correlationId, {
+      sourceCorrelationId: 'prior-correlation',
+      anchorPathId: 'prior-path',
+      openPaths: 1,
+      actionableFeedback: 0,
+      knowledge: {
+        paths: [{
+          toolFrontier: [{
+            toolName: 'fs.read',
+            params: { path: 'README.md' },
+            result: {
+              path: 'README.md',
+              content: '# Cached workspace\n',
+              truncated: false,
+            },
+            success: true,
+            reason: 'Prior actor observed the authoritative workspace.',
+            startedAt: now - 20,
+            completedAt: now - 10,
+          }],
+        }],
+      },
+    });
+    const team = await runtime.spawnTeam({
+      parentAgentId: 'root',
+      name: 'ResumedRepairTeam',
+      description: 'Continue from cached evidence.',
+      task: 'Inspect README.md and verify the cached workspace.',
+      executionPolicy: {
+        mode: 'sequential',
+        maxConcurrency: 1,
+        minimumSuccessfulMembers: 1,
+      },
+      members: [
+        {
+          archetype: 'researcher',
+          name: 'CachedResearcher',
+          task: 'Inspect README.md and report grounded workspace evidence.',
+        },
+        {
+          archetype: 'tester',
+          name: 'CachedVerifier',
+          task: 'Verify the preceding grounded evidence.',
+        },
+      ],
+    });
+    await runtime.runTeam(team.identity.id, 'Continue the cached repair.', { correlationId });
+
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'team.tool_evidence.seeded_from_resume',
+      correlationId,
+      data: expect.objectContaining({
+        teamId: team.identity.id,
+        cachedCalls: 1,
+        successfulCalls: 1,
+      }),
+    }));
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'team.tool_evidence.reused',
+      correlationId,
+      data: expect.objectContaining({
+        teamId: team.identity.id,
+        cachedCalls: 1,
+      }),
+    }));
+    await runtime.shutdown();
+  });
+
   it('reserves every planned member slot before a limited-budget team starts', async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), 'roy-team-capacity-reservation-'));
     const runtime = new Runtime();

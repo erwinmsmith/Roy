@@ -1,4 +1,5 @@
 import {
+  effectiveWorkspaceMutationCallIndices,
   isSuccessfulWorkspaceMutationCall,
   isSuccessfulWorkspaceVerificationCall,
   isWorkspaceVerificationCall,
@@ -314,6 +315,7 @@ export class AgentToolPlanner {
       stderr?: unknown;
       verifierDiagnostics?: unknown;
     } | undefined;
+    const rejectedCandidate = this.latestRollbackForCurrentWorkspace(input.calls);
     const failureOutput = [
       String(shell?.stdout ?? ''),
       String(shell?.stderr ?? ''),
@@ -324,18 +326,18 @@ export class AgentToolPlanner {
       failureOutput,
       String(shell?.cwd ?? input.workspaceRoot ?? ''),
       input.workspaceRoot
-    ).length > 0) {
+    ).length > 0 && !rejectedCandidate) {
       return [];
     }
 
-    const readsAfterFailure = input.calls
-      .slice(latestFailureIndex + 1)
+    const authoritativeReads = input.calls
+      .slice(rejectedCandidate ? 0 : latestFailureIndex + 1)
       .filter(call => {
         if (!call.success || call.toolName !== 'fs.read') return false;
-        const result = call.result as { content?: unknown; truncated?: unknown } | undefined;
-        return typeof result?.content === 'string' && result.truncated !== true;
+        const result = call.result as { content?: unknown } | undefined;
+        return typeof result?.content === 'string';
       });
-    const verifierObserved = readsAfterFailure.some(call =>
+    const verifierObserved = authoritativeReads.some(call =>
       this.normalizeWorkspacePath(String(
         (call.result as { path?: unknown } | undefined)?.path
           ?? call.params.path
@@ -344,24 +346,27 @@ export class AgentToolPlanner {
     );
     if (!verifierObserved) return [];
     const taskPath = input.task.toLowerCase().replaceAll('\\', '/');
-    const implementationRead = [...readsAfterFailure].reverse().find(call => {
+    const implementationReads = [...authoritativeReads].reverse().filter(call => {
       const candidate = this.normalizeWorkspacePath(String(
         (call.result as { path?: unknown } | undefined)?.path
           ?? call.params.path
           ?? ''
       ));
-      return /(?:^|\/)(?:src|lib|app|packages)\/.+\.(?:py|ts|tsx|js|jsx|mjs|cjs|java|go|rs|rb|php)$/i.test(
-        candidate
-      ) && (
-        taskPath.includes(candidate.toLowerCase())
-        || !/(?:^|\/)(?:tests?|fixtures?|examples?)\//i.test(candidate)
-      );
+      return /(?:^|\/)(?:src|lib|app|packages)\/.+\.(?:py|ts|tsx|js|jsx|mjs|cjs|java|go|rs|rb|php)$/i.test(candidate)
+        && !/(?:^|\/)(?:tests?|fixtures?|examples?)\//i.test(candidate);
     });
+    const implementationRead = implementationReads.find(call => {
+      const candidate = this.normalizeWorkspacePath(String(
+        (call.result as { path?: unknown } | undefined)?.path
+          ?? call.params.path
+          ?? ''
+      ));
+      return taskPath.includes(candidate.toLowerCase());
+    }) ?? implementationReads[0];
     if (!implementationRead) return [];
     const implementationReadIndex = input.calls.lastIndexOf(implementationRead);
-    if (input.calls.slice(implementationReadIndex + 1).some(call =>
-      isSuccessfulWorkspaceMutationCall(call)
-    )) {
+    if (effectiveWorkspaceMutationCallIndices(input.calls)
+      .some(index => index > implementationReadIndex)) {
       return [];
     }
     const targetPath = this.normalizeWorkspacePath(String(
@@ -369,22 +374,204 @@ export class AgentToolPlanner {
         ?? implementationRead.params.path
         ?? ''
     ));
-    const rejectedCandidate = [...input.calls].reverse()
-      .map(call => workspaceCandidateRollbackFromCall(call))
-      .find(rollback =>
-        rollback
-        && this.normalizeWorkspacePath(String(rollback.path ?? '')) === targetPath
-      );
-    if (rejectedCandidate) return [];
+    const targetRejectedCandidate = this.latestRollbackForCurrentWorkspace(
+      input.calls,
+      targetPath
+    );
+    const verifierGroups = {
+      ...(targetRejectedCandidate?.baselineGroups
+        ?? this.verifierGroupState(failure)
+        ?? {}),
+    };
+    for (const group of [
+      ...(targetRejectedCandidate?.regressedGroups ?? []),
+      ...(targetRejectedCandidate?.improvedGroups ?? []),
+    ]) {
+      if (typeof group.before === 'number') verifierGroups[group.group] = group.before;
+    }
+    const failedGroups = Object.entries(verifierGroups ?? {})
+      .filter(([, score]) => score < 1)
+      .map(([group]) => group);
+    const passingGroups = Object.entries(verifierGroups ?? {})
+      .filter(([, score]) => score >= 1)
+      .map(([group]) => group);
+    const diagnosticSummary = this.verifierDiagnosticSummary(input.calls);
+    const instructions = targetRejectedCandidate
+      ? [
+        'Apply a focused semantics-preserving repair after the prior candidate was transactionally rejected.',
+        failedGroups.length > 0
+          ? `Repair only the unresolved verifier capabilities: ${failedGroups.join(', ')}.`
+          : 'Repair only the newest unresolved verifier behavior.',
+        passingGroups.length > 0
+          ? `Preserve the currently passing capabilities exactly: ${passingGroups.join(', ')}.`
+          : 'Preserve all behavior not contradicted by the verifier evidence.',
+        targetRejectedCandidate.regressedGroups?.length
+          ? `Do not repeat the rejected regression in: ${targetRejectedCandidate.regressedGroups.map(item => item.group).join(', ')}.`
+          : 'Do not repeat the rejected whole-file strategy; make the smallest coherent semantic change supported by the official verifier source.',
+        diagnosticSummary
+          ? `Use this newest focused expected-versus-actual verifier reproduction as the causal repair evidence:\n${diagnosticSummary}`
+          : '',
+        'Treat the grounded official verifier implementation as the executable specification and keep public interfaces stable.',
+      ].filter(Boolean).join(' ')
+      : 'Structurally repair the implementation to satisfy the grounded aggregate official-verifier failures and immutable assignment, preserving behavior already proven by passing verifier groups.';
+    if (targetRejectedCandidate && input.calls.some(call =>
+      call.toolName === 'fs.synthesize'
+      && this.normalizeWorkspacePath(String(call.params.path ?? '')) === targetPath
+      && String(call.params.instructions ?? '') === instructions
+      && call.params.strategy === 'patch'
+      && (
+        call.success
+        || (call.result as { synthesisRejected?: unknown } | undefined)
+          ?.synthesisRejected === true
+      )
+    )) {
+      return [];
+    }
     return [{
       toolName: 'fs.synthesize',
       params: {
         path: targetPath,
-        instructions: 'Structurally repair the implementation to satisfy the grounded aggregate official-verifier failures and immutable assignment, preserving behavior already proven by passing verifier groups.',
+        instructions,
+        ...(targetRejectedCandidate ? { strategy: 'patch' } : {}),
       },
-      reason: 'The causal frontier contains a non-perfect aggregate verifier result plus complete verifier and implementation source evidence; transition from inspection to a preserving repair.',
+      reason: targetRejectedCandidate
+        ? 'The prior candidate was rolled back; change the repair hypothesis to the unresolved verifier capabilities while preserving the accepted baseline.'
+        : 'The causal frontier contains a non-perfect aggregate verifier result plus complete verifier and implementation source evidence; transition from inspection to a preserving repair.',
       groundingRequired: true,
     }];
+  }
+
+  private verifierGroupState(call: ObservedToolCall): Record<string, number> | undefined {
+    const diagnostics = (call.result as { verifierDiagnostics?: unknown } | undefined)
+      ?.verifierDiagnostics;
+    if (!Array.isArray(diagnostics)) return undefined;
+    for (const item of diagnostics) {
+      if (!item || typeof item !== 'object') continue;
+      const content = (item as { content?: unknown }).content;
+      if (typeof content !== 'string') continue;
+      try {
+        const parsed = JSON.parse(content) as { groups?: unknown };
+        if (!parsed.groups
+          || typeof parsed.groups !== 'object'
+          || Array.isArray(parsed.groups)) {
+          continue;
+        }
+        const groups = Object.fromEntries(
+          Object.entries(parsed.groups)
+            .filter((entry): entry is [string, number] =>
+              typeof entry[1] === 'number' && Number.isFinite(entry[1])
+            )
+        );
+        if (Object.keys(groups).length > 0) return groups;
+      } catch {
+        // Other verifier diagnostics can be free-form logs.
+      }
+    }
+    return undefined;
+  }
+
+  private latestRollbackForCurrentWorkspace(
+    calls: ObservedToolCall[],
+    targetPath?: string
+  ): ReturnType<typeof workspaceCandidateRollbackFromCall> {
+    const normalizedTarget = targetPath
+      ? this.normalizeWorkspacePath(targetPath)
+      : undefined;
+    let unrolledMutationObserved = false;
+    for (let index = calls.length - 1; index >= 0; index -= 1) {
+      const call = calls[index]!;
+      const rollback = workspaceCandidateRollbackFromCall(call);
+      const rollbackPath = this.normalizeWorkspacePath(String(rollback?.path ?? ''));
+      if (rollback?.restored === true
+        && (!normalizedTarget || rollbackPath === normalizedTarget)) {
+        if (!unrolledMutationObserved) return rollback;
+        return undefined;
+      }
+      const mutationPath = this.normalizeWorkspacePath(String(call.params.path ?? ''));
+      if (isSuccessfulWorkspaceMutationCall(call)
+        && (!normalizedTarget || mutationPath === normalizedTarget)) {
+        unrolledMutationObserved = true;
+      }
+    }
+    return undefined;
+  }
+
+  private verifierDiagnosticSummary(calls: ObservedToolCall[]): string | undefined {
+    for (let index = calls.length - 1; index >= 0; index -= 1) {
+      const call = calls[index]!;
+      if (call.toolName !== 'shell.exec' || !call.success) continue;
+      const result = call.result as {
+        command?: unknown;
+        stdout?: unknown;
+        stderr?: unknown;
+      } | undefined;
+      const command = String(result?.command ?? call.params.command ?? '');
+      const output = [
+        String(result?.stdout ?? ''),
+        String(result?.stderr ?? ''),
+      ].filter(Boolean).join('\n');
+      if (!command.includes('ROY_VERIFIER_PROBE=1')
+        && !output.includes('VERIFIER_PROBE_')) {
+        continue;
+      }
+      if (!output.trim()) return undefined;
+      const maxChars = 2_600;
+      const lines = output.split('\n').map(line => line.trim()).filter(Boolean);
+      const core = lines.filter(line =>
+        /^VERIFIER_PROBE_(?:EVIDENCE_VERSION|CALL|MISMATCHES|ARGS|KWARGS|RESULT|REWARD|RETAINED_DIRS)\b/.test(
+          line
+        )
+      );
+      const specs = lines.filter(line => /^VERIFIER_PROBE_SPEC\b/.test(line));
+      const artifacts = lines
+        .filter(line => /^VERIFIER_PROBE_ARTIFACT\b/.test(line))
+        .map((line, position) => {
+          let evidencePath = '';
+          const payloadStart = line.indexOf('{');
+          if (payloadStart >= 0) {
+            try {
+              const payload = JSON.parse(line.slice(payloadStart)) as {
+                path?: unknown;
+              };
+              evidencePath = String(payload.path ?? '').toLowerCase();
+            } catch {
+              // A compacted artifact is still lower-priority usable evidence.
+            }
+          }
+          let priority = 0;
+          if (/(?:error|failure|traceback)/.test(evidencePath)) priority += 120;
+          if (/(?:^|\/)outputs?(?:\/|$)/.test(evidencePath)) priority += 60;
+          if (/(?:qc|summary|report|journal|diagnostic|result|reward|log)/.test(evidencePath)) {
+            priority += 50;
+          }
+          if (/\.json\b/.test(evidencePath)) priority += 15;
+          if (/(?:manifest|ocr|token|fixture|expected)/.test(evidencePath)) priority -= 80;
+          if (/(?:reconstructed|prediction)/.test(evidencePath)) priority -= 20;
+          return { line, position, priority };
+        })
+        .sort((left, right) =>
+          right.priority - left.priority || left.position - right.position
+        );
+      const selected: string[] = [];
+      let remaining = maxChars;
+      const append = (line: string, perItemLimit: number): void => {
+        if (remaining <= 0) return;
+        const clipped = line.length <= perItemLimit
+          ? line
+          : `${line.slice(0, Math.max(0, perItemLimit - 28))}[diagnostic item compacted]`;
+        if (clipped.length > remaining) return;
+        selected.push(clipped);
+        remaining -= clipped.length + 1;
+      };
+      core.forEach(line => append(line, 700));
+      specs.forEach(line => append(line, 1_400));
+      artifacts.forEach(item => append(item.line, 1_400));
+      if (selected.length > 0) return selected.join('\n');
+      return output.length <= maxChars
+        ? output
+        : `[${output.length - maxChars} earlier diagnostic chars compacted]\n${output.slice(-maxChars)}`;
+    }
+    return undefined;
   }
 
   private latestShellFailureIndex(calls: ObservedToolCall[]): number {

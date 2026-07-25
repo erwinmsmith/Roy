@@ -105,6 +105,33 @@ class MutationRepairPlanningLLM extends PlanningLLM {
   }
 }
 
+class FinishThenDiagnosticPlanningLLM extends PlanningLLM {
+  constructor() {
+    super('none');
+  }
+
+  override async completeJSON<T>(): Promise<T> {
+    this.jsonCalls += 1;
+    if (this.jsonCalls === 1) {
+      return {
+        action: 'finish',
+        reason: 'The aggregate score is sufficient.',
+        calls: [],
+      } as T;
+    }
+    return {
+      action: 'call_tools',
+      reason: 'Reproduce one hidden fixture and print its actual and expected output.',
+      calls: [{
+        toolName: 'shell.exec',
+        params: {
+          command: 'python /tmp/reproduce_hidden_fixture.py --show-actual-expected',
+        },
+      }],
+    } as T;
+  }
+}
+
 class FragileWriterThenReplacePlanningLLM extends PlanningLLM {
   constructor() {
     super('none');
@@ -802,6 +829,72 @@ describe('UnifiedAgent capability execution', () => {
         params: { path: 'artifact.txt', content: 'repaired' },
       }),
     ]);
+  });
+
+  it('requires a fresh focused reproduction after an aggregate verifier rerun', async () => {
+    const llm = new FinishThenDiagnosticPlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'verifier-diagnostic-probe',
+      goal: 'reproduce the unresolved verifier behavior without mutating source',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.read', 'shell.exec'],
+    });
+    const priorCalls = [
+      {
+        toolName: 'fs.read',
+        params: { path: '.roy/official-verifier/grade.py' },
+        reason: 'Read the executable specification.',
+        groundingRequired: true,
+        success: true,
+        result: { content: 'def make_hidden_manifest(): ...' },
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python .roy/official-verifier/grade.py' },
+        reason: 'Observe the aggregate baseline.',
+        groundingRequired: true,
+        success: true,
+        result: { stdout: '0.04\n', exitCode: 0 },
+      },
+    ];
+
+    const plans = await agent.planNextToolRound({
+      task: '[runtime_verifier_diagnostic_probe]\nReproduce a hidden fixture and compare actual and expected output.',
+      diagnosticProbeRequired: true,
+      requiredDiagnosticAfterCallIndex: priorCalls.length - 1,
+      round: 1,
+      remainingCalls: 2,
+      tools: [{ name: 'fs.read' }, { name: 'shell.exec' }],
+      calls: priorCalls,
+    });
+
+    expect(llm.jsonCalls).toBe(2);
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'shell.exec',
+        params: {
+          command: 'python /tmp/reproduce_hidden_fixture.py --show-actual-expected',
+        },
+      }),
+    ]);
+    expect(await agent.planNextToolRound({
+      task: '[runtime_verifier_diagnostic_probe]\nReproduce a hidden fixture and compare actual and expected output.',
+      diagnosticProbeRequired: true,
+      requiredDiagnosticAfterCallIndex: priorCalls.length - 1,
+      round: 2,
+      remainingCalls: 1,
+      tools: [{ name: 'fs.read' }, { name: 'shell.exec' }],
+      calls: [
+        ...priorCalls,
+        {
+          ...plans[0]!,
+          success: true,
+          result: { stdout: 'expected=A actual=B\n', exitCode: 0 },
+        },
+      ],
+    })).toEqual([]);
+    expect(llm.jsonCalls).toBe(2);
   });
 
   it('rejects an equivalent failed verification call before planning a repair', async () => {

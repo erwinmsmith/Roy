@@ -367,6 +367,191 @@ describe('benchmark terminal capability', () => {
     });
   });
 
+  it('resumes rejected repairs by causal recovery round and reuses fresh diagnostics', () => {
+    const runtime = new Runtime();
+    const now = Date.now();
+    const buildRecovery = (runtime as unknown as {
+      buildVerifierGuidedResumeRecoveryDecision: (
+        task: string,
+        state: Record<string, unknown>
+      ) => {
+        action: string;
+        agents: Array<{ name?: string; role?: string; tools?: string[] }>;
+        coordination?: string;
+        team?: { name?: string; executionPolicy?: { mode?: string } };
+      } | undefined;
+    }).buildVerifierGuidedResumeRecoveryDecision.bind(runtime);
+    const state = {
+      sourceCorrelationId: 'prior-correlation',
+      anchorPathId: 'prior-path',
+      openPaths: 1,
+      actionableFeedback: 1,
+      knowledge: {
+        version: 1,
+        updatedAt: now,
+        steps: [{
+          id: 'prior-step.cache',
+          correlationId: 'prior-correlation',
+          stepId: 'prior-step',
+          index: 1,
+          task: 'Repair implementation.py.',
+          taskFingerprint: 'task',
+          pathId: 'prior-path',
+          dependsOn: [],
+          action: 'solve_directly',
+          status: 'failed',
+          actorIds: [],
+          teamIds: [],
+          feedbackIds: [],
+          createdAt: now,
+          updatedAt: now,
+        }],
+        paths: [{
+          id: 'prior-path',
+          correlationId: 'prior-correlation',
+          stepId: 'prior-step',
+          parentPathIds: [],
+          taskFingerprint: 'task',
+          status: 'partial',
+          actorIds: [],
+          teamIds: [],
+          observedPaths: ['implementation.py'],
+          invalidPaths: [],
+          successfulTools: ['fs.synthesize'],
+          failedTools: [],
+          mutationObserved: true,
+          verificationObserved: true,
+          toolFrontier: [{
+            toolName: 'shell.exec',
+            params: { command: 'python .roy/official-verifier/grade.py' },
+            success: true,
+            result: {
+              stdout: '0.4\n',
+              candidateRollback: {
+                restored: true,
+                path: 'implementation.py',
+                reason: 'reward_regression',
+                baselineReward: 0.5,
+                candidateReward: 0.4,
+              },
+            },
+            startedAt: now - 100,
+            completedAt: now,
+          }],
+          feedbackIds: [],
+          createdAt: now,
+          updatedAt: now,
+        }],
+        actors: [] as Array<Record<string, unknown>>,
+        feedback: [],
+      },
+    };
+
+    const recovery = buildRecovery(
+      'Repair implementation.py until the official verifier succeeds.',
+      state
+    );
+    expect(recovery).toMatchObject({
+      action: 'spawn_subagents',
+      coordination: 'team',
+      agents: [
+        expect.objectContaining({ name: 'VerifierProbe-1', role: 'verifier-guided diagnostic probe' }),
+        expect.objectContaining({ name: 'FocusedRepairer-2', role: 'verifier-guided recovery executor' }),
+        expect.objectContaining({ name: 'RecoveryVerifier-3', role: 'independent recovery verifier' }),
+      ],
+      team: expect.objectContaining({
+        name: 'VerifierGuidedRecoveryTeam',
+        memberDelegationPolicy: 'deny',
+        executionPolicy: expect.objectContaining({ mode: 'sequential' }),
+      }),
+    });
+    expect(recovery?.agents[0]?.task).toContain('[runtime_verifier_diagnostic_probe]');
+    expect(recovery?.agents[0]?.task).toContain('<recovery_capsule>');
+    expect(recovery?.agents[0]?.task).not.toContain('<resume_ledger>');
+    expect(recovery?.agents.every(agent =>
+      agent.memoryScope?.public === false
+      && agent.memoryScope.private === false
+      && agent.memoryScope.sessionWindowTurns === 0
+      && !agent.skills?.includes('delegate_to_subagent')
+    )).toBe(true);
+    const failedAttempt = structuredClone(state);
+    failedAttempt.knowledge.actors.push({
+      id: 'actor',
+      runtimeActorId: 'actor',
+      kind: 'agent',
+      correlationId: 'prior-correlation',
+      stepId: 'prior-step',
+      pathId: 'prior-path',
+      name: 'VerifierProbe-1',
+      role: 'verifier-guided diagnostic probe',
+      generation: 1,
+      status: 'failed',
+      createdAt: now,
+      updatedAt: now,
+    });
+    expect(buildRecovery(
+      'Repair implementation.py until the official verifier succeeds.',
+      failedAttempt
+    )).toMatchObject({
+      agents: [
+        expect.objectContaining({ name: 'VerifierProbe-4' }),
+        expect.objectContaining({ name: 'FocusedRepairer-5' }),
+        expect.objectContaining({ name: 'RecoveryVerifier-6' }),
+      ],
+      team: expect.objectContaining({ name: 'VerifierGuidedRecoveryTeam-2' }),
+    });
+
+    const cachedDiagnostic = structuredClone(failedAttempt);
+    const diagnosticFrontier = cachedDiagnostic.knowledge.paths[0]!.toolFrontier;
+    diagnosticFrontier.push({
+      toolName: 'shell.exec',
+      params: {
+        command: 'ROY_VERIFIER_PROBE=1 python -c "print(1)"',
+      },
+      success: true,
+      result: {
+        stdout: 'VERIFIER_PROBE_EVIDENCE_VERSION 2\nVERIFIER_PROBE_RESULT 1.0\nVERIFIER_PROBE_ARTIFACT {"path":"outputs/layout_qc.json"}',
+      },
+      startedAt: now + 1,
+      completedAt: now + 2,
+    } as never);
+    diagnosticFrontier.push({
+      toolName: 'fs.synthesize',
+      params: { path: 'implementation.py', strategy: 'patch' },
+      success: true,
+      result: { path: 'implementation.py', synthesized: true },
+      startedAt: now + 3,
+      completedAt: now + 4,
+    } as never);
+    diagnosticFrontier.push({
+      toolName: 'shell.exec',
+      params: { command: 'python .roy/official-verifier/grade.py' },
+      success: true,
+      result: {
+        stdout: '0.4\n',
+        candidateRollback: {
+          restored: true,
+          path: 'implementation.py',
+          reason: 'reward_regression',
+          baselineReward: 0.5,
+          candidateReward: 0.4,
+        },
+      },
+      startedAt: now + 5,
+      completedAt: now + 6,
+    } as never);
+    expect(buildRecovery(
+      'Repair implementation.py until the official verifier succeeds.',
+      cachedDiagnostic
+    )).toMatchObject({
+      agents: [
+        expect.objectContaining({ name: 'FocusedRepairer-5' }),
+        expect.objectContaining({ name: 'RecoveryVerifier-6' }),
+      ],
+      team: expect.objectContaining({ name: 'VerifierGuidedRecoveryTeam-2' }),
+    });
+  });
+
   it('reuses persisted invalid-path knowledge in a later correlation', async () => {
     const workspace = await mkdtemp(path.join(tmpdir(), 'roy-persisted-path-cache-'));
     const cacheDirectory = path.join(workspace, '.roy', 'cache');
@@ -725,8 +910,19 @@ describe('benchmark terminal capability', () => {
           path: 'implementation.py',
           baselineReward: 0.5,
           regressedReward: 0.1,
+          baselineGroups: { public: 1, hidden: 0 },
+          candidateGroups: { public: 0, hidden: 0.1 },
         }),
       }),
+    });
+    const restoredScorecard = (runtime as unknown as {
+      verifierScorecardFromToolResult: (
+        result: unknown
+      ) => { reward: number; groups: Record<string, number> } | undefined;
+    }).verifierScorecardFromToolResult(regressed.result);
+    expect(restoredScorecard).toEqual({
+      reward: 0.5,
+      groups: { public: 1, hidden: 0 },
     });
     expect(await readFile(path.join(workspace, 'implementation.py'), 'utf8')).toBe(
       'VALUE = 41\n'
@@ -1028,6 +1224,13 @@ describe('benchmark terminal capability', () => {
             success: true,
             startedAt: now - 2900,
             completedAt: now - 2800,
+          }, {
+            toolName: 'fs.list',
+            params: { path: '.', maxDepth: 2 },
+            result: { root: '.', entries: ['.roy/config.json', 'task-note.txt'] },
+            success: true,
+            startedAt: now - 1900,
+            completedAt: now - 1800,
           }],
           feedbackIds: ['prior-feedback'],
           summary: 'artifact.txt is missing',
@@ -1093,7 +1296,7 @@ describe('benchmark terminal capability', () => {
       data: expect.objectContaining({
         sourceCorrelationId: 'prior-correlation',
         paths: 2,
-        toolCalls: 1,
+        toolCalls: 2,
       }),
     }));
     expect(result.executionTree.steps[0].cache?.path.parentPathIds).toContain('prior-path');
@@ -1518,14 +1721,16 @@ describe('benchmark terminal capability', () => {
     const attempts = runtime.getEvents().filter(event =>
       event.type === 'root.execution.attempt.completed'
     );
-    expect(attempts).toHaveLength(4);
+    expect(attempts).toHaveLength(3);
     const stalls = runtime.getEvents().filter(event =>
       event.type === 'root.execution.no_progress.detected'
     );
-    expect(stalls).toHaveLength(2);
+    expect(stalls).toHaveLength(1);
     expect(stalls.at(-1)?.data).toMatchObject({
-      stalledIterations: 2,
+      stalledIterations: 1,
       maxStalledIterations: 2,
+      stateUnchanged: true,
+      reason: expect.stringContaining('unchanged causal frontier'),
     });
 
     await runtime.shutdown();

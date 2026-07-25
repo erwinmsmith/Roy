@@ -45,6 +45,8 @@ export interface UnifiedAgentConfig extends AgentConfig {
 export interface AgentToolRoundPlanningInput {
   task: string;
   executionRequired?: boolean;
+  diagnosticProbeRequired?: boolean;
+  requiredDiagnosticAfterCallIndex?: number;
   requiredMutationAfterCallIndex?: number;
   round: number;
   remainingCalls: number;
@@ -110,6 +112,13 @@ export class UnifiedAgent extends BaseAgent {
         || authorized.has('fs.synthesize')
         || authorized.has('shell.exec')
       );
+    const diagnosticProbeRequired = input.diagnosticProbeRequired === true
+      && authorized.has('shell.exec');
+    const freshDiagnosticCalls = input.calls.slice(
+      Math.max(0, Number(input.requiredDiagnosticAfterCallIndex ?? -1) + 1)
+    );
+    const diagnosticProbeCompleted = !diagnosticProbeRequired
+      || freshDiagnosticCalls.some(isExecutableDiagnosticProbeCall);
     const mutationApplied = hasEffectiveWorkspaceMutationCall(input.calls);
     const freshMutationRequired = input.requiredMutationAfterCallIndex !== undefined;
     const freshMutationApplied = !freshMutationRequired
@@ -128,6 +137,9 @@ export class UnifiedAgent extends BaseAgent {
     const latestVerificationFailed = lastVerificationIndex > lastMutationIndex
       && !isSuccessfulWorkspaceVerification(input.calls[lastVerificationIndex]!);
     if (executionRequired && mutationRequirementSatisfied && verificationPassed) {
+      return [];
+    }
+    if (!executionRequired && diagnosticProbeRequired && diagnosticProbeCompleted) {
       return [];
     }
     const inspectedAfterLatestFailure = latestVerificationFailed
@@ -150,8 +162,17 @@ export class UnifiedAgent extends BaseAgent {
         || call.toolName === 'fs.search'
       )
     );
-    const recentCalls = input.calls.slice(-8);
+    const recentCalls = diagnosticProbeRequired
+      ? selectVerifierDiagnosticPlanningCalls(input.calls)
+      : input.calls.slice(-8);
     const detailedObservationIndices = new Set<number>([recentCalls.length - 1]);
+    if (diagnosticProbeRequired) {
+      for (let index = 0; index < recentCalls.length; index += 1) {
+        if (isVerifierDiagnosticInspectionCall(recentCalls[index]!)) {
+          detailedObservationIndices.add(index);
+        }
+      }
+    }
     for (let index = recentCalls.length - 1; index >= 0; index -= 1) {
       const call = recentCalls[index]!;
       if (isWorkspaceVerificationCall(call)
@@ -187,6 +208,9 @@ export class UnifiedAgent extends BaseAgent {
           'The listed tools are bound to this actor. Request the call directly and let Runtime enforce approval policy; never ask the user conversationally for tool permission.',
           executionRequired
             ? 'This is an execution task. Do not finish after analysis or a proposed patch. Apply the workspace change, then run relevant verification.'
+            : '',
+          diagnosticProbeRequired && !diagnosticProbeCompleted
+            ? 'This is a verifier-diagnostic task. Do not finish after rerunning the aggregate verifier. Request one novel read-only shell.exec reproduction that constructs or invokes a focused fixture from the grounded verifier source and exposes expected-versus-actual behavior. Do not mutate the implementation or verifier.'
             : '',
           executionRequired && !mutationRequirementSatisfied
             ? successfulInspection
@@ -243,6 +267,8 @@ export class UnifiedAgent extends BaseAgent {
             latestVerificationFailed,
             inspectedAfterLatestFailure,
             aggregateVerifierEvidenceReady,
+            diagnosticProbeRequired,
+            diagnosticProbeCompleted,
           })}`,
           `Authorized tools:\n${JSON.stringify(
             input.tools.map(compactToolDefinitionForPlanning),
@@ -265,7 +291,7 @@ export class UnifiedAgent extends BaseAgent {
       const planningDeadline = input.requestTimeoutMs === undefined
         ? undefined
         : Date.now() + Math.max(1, input.requestTimeoutMs);
-      const maxPlanningAttempts = executionRequired ? 2 : 1;
+      const maxPlanningAttempts = executionRequired || diagnosticProbeRequired ? 2 : 1;
       for (let attempt = 0; attempt < maxPlanningAttempts; attempt += 1) {
         let rejectedDestructiveRepairOverwrite = false;
         const remainingPlanningMs = planningDeadline === undefined
@@ -277,7 +303,9 @@ export class UnifiedAgent extends BaseAgent {
             planningMessages,
             {
               temperature: 0,
-              maxTokens: executionRequired
+              maxTokens: diagnosticProbeRequired
+                ? 4096
+                : executionRequired
                 ? 2048
                 : 640,
               timeoutMs: remainingPlanningMs,
@@ -302,7 +330,7 @@ export class UnifiedAgent extends BaseAgent {
           } else if (recoveredProsePlan) {
             response = recoveredProsePlan;
           } else {
-            const canRetry = executionRequired
+            const canRetry = (executionRequired || diagnosticProbeRequired)
               && attempt + 1 < maxPlanningAttempts
               && isRetryableToolPlanningResponseError(error)
               && (planningDeadline === undefined || Date.now() < planningDeadline);
@@ -313,9 +341,11 @@ export class UnifiedAgent extends BaseAgent {
                   content: [
                     `You are the compact repair controller for ${this.name}.`,
                     'Return one complete compact JSON object only, with no analysis or markdown.',
-                    '{"action":"call_tools","reason":"...","calls":[{"toolName":"...","params":{...}}]}',
+                    '{"action":"call_tools","calls":[{"toolName":"...","params":{...}}],"reason":"brief"}',
                     `Authorized tool names: ${[...authorized].join(', ')}.`,
-                    'Choose exactly one highest-value action from the causal frontier. For a localized source failure, use fs.replace. For a broad grounded implementation repair, use fs.synthesize with path and concise instructions.',
+                    diagnosticProbeRequired && !diagnosticProbeCompleted
+                      ? 'Put calls before reason. Choose exactly one read-only action: inspect a named verifier helper with fs.read/fs.search, or run a focused shell.exec fixture reproduction that prints expected and actual behavior. The aggregate grade command is not a diagnostic.'
+                      : 'Choose exactly one highest-value action from the causal frontier. For a localized source failure, use fs.replace. For a broad grounded implementation repair, use fs.synthesize with path and concise instructions.',
                   ].join('\n'),
                 },
                 {
@@ -333,6 +363,8 @@ export class UnifiedAgent extends BaseAgent {
                       latestVerificationFailed,
                       inspectedAfterLatestFailure,
                       aggregateVerifierEvidenceReady,
+                      diagnosticProbeRequired,
+                      diagnosticProbeCompleted,
                     })}`,
                     `Causal observations:\n${JSON.stringify(observations.slice(-4), null, 2)}`,
                     `Malformed prior response tail:\n${compactTail(
@@ -360,7 +392,7 @@ export class UnifiedAgent extends BaseAgent {
         plannedCalls = plannedCalls.map(call =>
           alignSynthesisRepairTargetWithFailure(call, input.calls, input.task)
         );
-        if (latestVerificationFailed) {
+        if (executionRequired && latestVerificationFailed) {
           if (inspectedAfterLatestFailure) {
             const localizedFailure = hasLocalizedVerificationFailureSinceLastMutation(
               input.calls
@@ -407,7 +439,12 @@ export class UnifiedAgent extends BaseAgent {
           || call.toolName === 'fs.read'
           || call.toolName === 'fs.search'
         );
-        const advancesExecution = !executionRequired
+        const advancesExecution = diagnosticProbeRequired && !diagnosticProbeCompleted
+          ? plannedCalls.some(call => isExecutableDiagnosticProbeCall({
+            ...call,
+            success: true,
+          }) || isVerifierDiagnosticInspectionCall(call))
+          : !executionRequired
           || (latestVerificationFailed
             ? inspectedAfterLatestFailure
               ? plannedInspection || plannedCalls.some(call =>
@@ -475,10 +512,21 @@ export class UnifiedAgent extends BaseAgent {
               mutationRequirementSatisfied && !verificationPassed && !latestVerificationFailed
                 ? 'Finish, read-only, masked-failure, and repeated plans are insufficient. Request a concrete remaining edit or repair, or a distinct verification command whose exit status is preserved.'
                 : '',
+              diagnosticProbeRequired && !diagnosticProbeCompleted
+                ? 'The aggregate verifier rerun is not a diagnostic. Request one new read-only shell.exec command that reproduces a focused verifier fixture and prints the expected-versus-actual mismatch.'
+                : '',
               'Return the required call_tools JSON. Do not ask for permission.',
             ].filter(Boolean).join('\n'),
           },
         ];
+      }
+      if (diagnosticProbeRequired && !diagnosticProbeCompleted) {
+        return plannedCalls.filter(call =>
+          isExecutableDiagnosticProbeCall({
+            ...call,
+            success: true,
+          }) || isVerifierDiagnosticInspectionCall(call)
+        ).slice(0, 1);
       }
       if (executionRequired) {
         const plannedInspection = plannedCalls.some(call =>
@@ -1258,6 +1306,7 @@ function normalizePlannedToolCalls(
   return response.calls
     .filter(call => typeof call.toolName === 'string' && authorized.has(call.toolName))
     .filter(call => !isFragileShellFileWriter(call, authorized))
+    .filter(call => hasValidPlannedToolParams(call))
     .slice(0, remainingCalls)
     .map(call => ({
       toolName: String(call.toolName),
@@ -1269,6 +1318,22 @@ function normalizePlannedToolCalls(
     }));
 }
 
+function hasValidPlannedToolParams(
+  call: { toolName?: unknown; params?: unknown }
+): boolean {
+  if (typeof call.toolName !== 'string') return false;
+  const tool = toolRegistry.get(call.toolName);
+  // UnifiedAgent can be tested or embedded with an authorized capability list
+  // before Runtime has registered concrete tool instances. Authorization still
+  // applies; defer parameter validation until a validator is available.
+  if (!tool) return true;
+  const params = call.params && typeof call.params === 'object' && !Array.isArray(call.params)
+    ? call.params as Record<string, unknown>
+    : {};
+  const validation = tool.validate?.(params);
+  return validation?.valid !== false;
+}
+
 function findLastToolCallIndex(
   calls: ToolLoopCallRecord[],
   predicate: (call: ToolLoopCallRecord) => boolean
@@ -1277,6 +1342,55 @@ function findLastToolCallIndex(
     if (predicate(calls[index]!)) return index;
   }
   return -1;
+}
+
+function isExecutableDiagnosticProbeCall(
+  call: Pick<ToolLoopCallRecord, 'toolName' | 'params' | 'success'>
+): boolean {
+  if (call.toolName !== 'shell.exec' || !call.success) return false;
+  const command = String(call.params.command ?? '').trim();
+  if (!command) return false;
+  if (/\bROY_VERIFIER_PROBE=1\b/.test(command)) return true;
+  if (/\bpython(?:3)?\s+\.roy\/official-verifier\/grade\.py(?:\s|$)/i.test(command)) {
+    return false;
+  }
+  if (/\bpython(?:3)?\s+-m\s+table_recon\.cli\s+run\b[\s\S]*\bdata\/public\/manifest\.json\b/i.test(
+    command
+  )) {
+    return false;
+  }
+  return /\b(?:python3?|pytest|unittest|node|npm|npx)\b/i.test(command)
+    && /\b(?:actual|expected|fixture|hidden|manifest|repro|test|audit|table_recon|verifier)\b/i.test(
+      command
+    );
+}
+
+function isVerifierDiagnosticInspectionCall(
+  call: Pick<ToolLoopCallRecord, 'toolName' | 'params'>
+): boolean {
+  if (call.toolName !== 'fs.read' && call.toolName !== 'fs.search') return false;
+  const target = String(call.params.path ?? '').replaceAll('\\', '/').toLowerCase();
+  return target === '.roy/official-verifier'
+    || target.startsWith('.roy/official-verifier/');
+}
+
+function selectVerifierDiagnosticPlanningCalls(
+  calls: ToolLoopCallRecord[]
+): ToolLoopCallRecord[] {
+  const selected = new Set<number>();
+  for (let index = Math.max(0, calls.length - 5); index < calls.length; index += 1) {
+    selected.add(index);
+  }
+  for (let index = calls.length - 1; index >= 0; index -= 1) {
+    if (isVerifierDiagnosticInspectionCall(calls[index]!)) {
+      selected.add(index);
+      if (selected.size >= 8) break;
+    }
+  }
+  return [...selected]
+    .sort((left, right) => left - right)
+    .slice(-8)
+    .map(index => calls[index]!);
 }
 
 function latestCandidateRollback(
@@ -1615,12 +1729,18 @@ function isDestructiveRepairOverwrite(
   completed: ToolLoopCallRecord[]
 ): boolean {
   if (planned.toolName === 'fs.synthesize') {
+    const target = normalizePlannedWorkspacePath(String(planned.params.path ?? ''));
+    const rejectedCandidate = latestCandidateRollback(completed);
+    if (rejectedCandidate
+      && normalizePlannedWorkspacePath(String(rejectedCandidate.path ?? '')) === target
+      && planned.params.strategy !== 'patch') {
+      return true;
+    }
     const instructions = String(planned.params.instructions ?? '');
     if (!hasLocalizedVerificationFailureSinceLastMutation(completed)
       && /\b(?:structural|cross-cutting|rewrite (?:the )?entire|replace (?:the )?architecture|multiple independent failures)\b/i.test(instructions)) {
       return false;
     }
-    const target = normalizePlannedWorkspacePath(String(planned.params.path ?? ''));
     if (!target || !completed.some(call => isSuccessfulWorkspaceMutation(call))) return false;
     const observed = [...completed].reverse().find(call =>
       call.toolName === 'fs.read'

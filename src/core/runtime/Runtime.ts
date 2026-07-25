@@ -60,6 +60,7 @@ import {
   isWorkspaceVerificationCall,
   ShellExecTool,
   taskRequestsWorkspaceMutation,
+  workspaceCandidateRollbackFromCall,
   workspaceToolIntentFingerprint,
   WebFetchTool,
   WebSearchTool,
@@ -371,6 +372,7 @@ export interface TeamMemberSpec {
   tomProfile?: ToMProfile;
   cognitiveGapIds?: string[];
   existenceReason?: string;
+  memoryScope?: AgentMemoryScope;
   lead?: boolean;
   communicationProtocol?: string;
   systemPrompt?: string;
@@ -583,6 +585,7 @@ export interface DelegationAgentPlan {
   tomProfile?: ToMProfile;
   cognitiveGapIds?: string[];
   existenceReason?: string;
+  memoryScope?: AgentMemoryScope;
   systemPrompt?: string;
 }
 
@@ -2037,12 +2040,14 @@ export class Runtime {
         parentId: team.identity.parentAgentId,
         archetype: spec.archetype,
         task: effectiveTask,
+        intentTask: spec.task,
         name: spec.name,
         role: spec.role,
         style: spec.style,
         tools: spec.tools,
         skills: memberSkills,
         budgetTokens: spec.budgetTokens,
+        memoryScope: spec.memoryScope,
         tomProfile: spec.tomProfile ?? (spec.tomLevel === undefined
           ? undefined
           : {
@@ -2224,6 +2229,7 @@ export class Runtime {
       if (plans.length > 0) {
         await this.transitionTeamFsm(teamId, 'S_member_spawn', { count: plans.length });
         await this.transitionTeamFsm(teamId, 'S_member_execute', { count: plans.length });
+        let diagnosticPhaseFailed = false;
         let implementationPhaseFailed = false;
         executionOutcomes = await executeTeamItems(plans.map((plan, index) => {
           const key = `planned:${index + 1}:${plan.archetype}`;
@@ -2231,6 +2237,21 @@ export class Runtime {
           return {
             key,
             execute: async (): Promise<TeamWorkValue> => {
+              if (phase > 0 && diagnosticPhaseFailed) {
+                this.emit({
+                  type: 'team.member.dependency_blocked',
+                  agentId: teamId,
+                  sessionId: ctx.sessionId,
+                  correlationId,
+                  data: {
+                    teamId,
+                    memberKey: key,
+                    archetype: plan.archetype,
+                    reason: 'The required verifier-diagnostic phase failed before producing focused executable evidence.',
+                  },
+                });
+                throw new Error('dependent_repair_blocked_by_failed_diagnostic');
+              }
               if (phase === 2 && implementationPhaseFailed) {
                 this.emit({
                   type: 'team.member.dependency_blocked',
@@ -2267,6 +2288,9 @@ export class Runtime {
                   execution,
                 };
               } catch (error) {
+                if (phase === 0 && plan.role === 'verifier-guided diagnostic probe') {
+                  diagnosticPhaseFailed = true;
+                }
                 if (phase === 1) implementationPhaseFailed = true;
                 this.teams.recordMemberFailure(
                   teamId,
@@ -2851,9 +2875,12 @@ export class Runtime {
 
   private verifierScorecardFromToolResult(result: unknown): VerifierScorecard | undefined {
     if (!result || typeof result !== 'object') return undefined;
-    const diagnostics = (result as {
+    const resultRecord = result as {
       verifierDiagnostics?: unknown;
-    }).verifierDiagnostics;
+      candidateRollback?: unknown;
+      regressionRollback?: unknown;
+    };
+    const diagnostics = resultRecord.verifierDiagnostics;
     if (!Array.isArray(diagnostics)) return undefined;
     for (const item of diagnostics) {
       if (!item || typeof item !== 'object') continue;
@@ -2876,7 +2903,28 @@ export class Runtime {
               typeof entry[1] === 'number' && Number.isFinite(entry[1])
             )
         );
-        return { reward: parsed.reward, groups };
+        const rollback = workspaceCandidateRollbackFromCall({
+          toolName: 'shell.exec',
+          params: {},
+          result,
+          success: true,
+        });
+        if (!rollback || typeof rollback.baselineReward !== 'number') {
+          return { reward: parsed.reward, groups };
+        }
+        const baselineGroups = {
+          ...(rollback.baselineGroups ?? groups),
+        };
+        for (const group of [
+          ...(rollback.regressedGroups ?? []),
+          ...(rollback.improvedGroups ?? []),
+        ]) {
+          if (typeof group.before === 'number') baselineGroups[group.group] = group.before;
+        }
+        return {
+          reward: rollback.baselineReward,
+          groups: baselineGroups,
+        };
       } catch {
         // grade.log and other diagnostic files may not be scorecards.
       }
@@ -2966,6 +3014,8 @@ export class Runtime {
       candidateFingerprint: checkpoint.candidateFingerprint,
       baselineReward: baseline.reward,
       candidateReward: current.reward,
+      baselineGroups: baseline.groups,
+      candidateGroups: current.groups,
       regressedGroups,
       improvedGroups,
     };
@@ -3763,6 +3813,55 @@ export class Runtime {
     }
   }
 
+  /**
+   * Execute one source-changing hypothesis at a time.
+   *
+   * Deterministic causal repair plans are assembled before optional model
+   * planning. Running two mutations from that combined frontier makes the
+   * second call operate on an unverified state, duplicates synthesis context,
+   * and can overwrite a successful focused patch. Read-only inspections and
+   * verification calls remain in the frontier.
+   */
+  private keepSingleWorkspaceMutationHypothesis(
+    plans: PlannedToolCall[],
+    agentId?: string,
+    options?: { correlationId?: string; nodeId?: string }
+  ): PlannedToolCall[] {
+    let mutationSeen = false;
+    const skipped: PlannedToolCall[] = [];
+    const selected = plans.filter(plan => {
+      const isMutation = isSuccessfulWorkspaceMutationCall({
+        toolName: plan.toolName,
+        params: plan.params,
+        success: true,
+      });
+      if (!isMutation) return true;
+      if (!mutationSeen) {
+        mutationSeen = true;
+        return true;
+      }
+      skipped.push(plan);
+      return false;
+    });
+    if (skipped.length > 0 && agentId) {
+      this.emit({
+        type: 'tool.plan.mutation_hypothesis.deferred',
+        agentId,
+        sessionId: this.getContext().sessionId,
+        correlationId: options?.correlationId,
+        nodeId: options?.nodeId,
+        data: {
+          reason: 'verify_current_workspace_hypothesis_before_another_mutation',
+          deferred: skipped.map(plan => ({
+            toolName: plan.toolName,
+            params: plan.params,
+          })),
+        },
+      });
+    }
+    return selected;
+  }
+
   private async executeSynthesizedFileForAgent(
     agent: BaseAgent,
     params: Record<string, unknown>,
@@ -3824,14 +3923,21 @@ export class Runtime {
     const assignedTask = this.compactFileSynthesisAssignment(
       this.agentRestoreSpecs.get(agent.id)?.task?.trim() || task.trim()
     );
+    const synthesisStrategy = params.strategy === 'patch' && currentContent !== undefined
+      ? 'patch'
+      : 'complete';
     const evidence = this.compactFileSynthesisEvidence(
       groundingCalls,
       normalizedPath,
-      30_000
+      synthesisStrategy === 'patch' ? 20_000 : 30_000
     );
     const prompt = [
-      '[runtime_workspace_file_synthesis]',
-      `Generate the exact complete UTF-8 contents for workspace file: ${normalizedPath}`,
+      synthesisStrategy === 'patch'
+        ? '[runtime_workspace_file_patch_synthesis]'
+        : '[runtime_workspace_file_synthesis]',
+      synthesisStrategy === 'patch'
+        ? `Generate a minimal unified diff that repairs workspace file: ${normalizedPath}`
+        : `Generate the exact complete UTF-8 contents for workspace file: ${normalizedPath}`,
       '',
       'Immutable assignment:',
       assignedTask || 'Implement the current grounded workspace task.',
@@ -3848,8 +3954,16 @@ export class Runtime {
       evidence || '[no additional supporting evidence]',
       '',
       'Output contract:',
-      '- Return only the complete file contents.',
-      '- Do not use Markdown fences, prose, a diff, or tool-call JSON.',
+      synthesisStrategy === 'patch'
+        ? `- Return only a valid unified diff for ${normalizedPath}, with ---/+++ headers and @@ hunks.`
+        : '- Return only the complete file contents.',
+      synthesisStrategy === 'patch'
+        ? '- Use exact unchanged context from the current snapshot. Keep the patch minimal and do not replace the whole file.'
+        : '- Do not use Markdown fences, prose, a diff, or tool-call JSON.',
+      synthesisStrategy === 'patch'
+        ? '- Change only lines directly required by the focused verifier evidence. Do not emit no-op hunks, duplicate existing lines, or alter unrelated constants, algorithms, formatting, identifiers, or output fields.'
+        : '',
+      '- Do not use Markdown fences, prose, or tool-call JSON.',
       '- Preserve working behavior not contradicted by the assignment or verifier evidence.',
       '- Implement the actual task; do not leave TODOs, placeholders, pseudocode, or NotImplemented stubs.',
       '- Use only paths, schemas, APIs, and requirements supported by the grounded evidence.',
@@ -3864,9 +3978,10 @@ export class Runtime {
         evidenceCalls: groundingCalls.length,
         promptChars: prompt.length,
         operation: currentContent === undefined ? 'create' : 'replace',
+        strategy: synthesisStrategy,
       },
     });
-    let generated = await this.completeAsAgent(
+    let generatedPayload = await this.completeAsAgent(
       agent,
       prompt,
       'workspace.file_synthesis',
@@ -3877,13 +3992,76 @@ export class Runtime {
         maxOutputTokens: 32_000,
       }
     );
-    generated = this.stripSingleMarkdownCodeFence(generated);
-    let validationError = await this.synthesizedContentRejectionReason(
-      normalizedPath,
-      generated,
-      currentContent
-    );
-    if (validationError) {
+    generatedPayload = this.stripSingleMarkdownCodeFence(generatedPayload);
+    let materialized = synthesisStrategy === 'patch'
+      ? this.applyUnifiedPatchToContent(currentContent!, generatedPayload)
+      : { content: generatedPayload };
+    let validationError = materialized.error
+      ?? await this.synthesizedContentRejectionReason(
+        normalizedPath,
+        materialized.content ?? '',
+        currentContent
+      );
+    if (validationError && synthesisStrategy === 'patch') {
+      this.emit({
+        type: 'tool.synthesis.retrying',
+        agentId: agent.id,
+        sessionId: this.getContext().sessionId,
+        correlationId,
+        data: {
+          path: normalizedPath,
+          reason: validationError,
+          attempt: 1,
+          maxAttempts: 2,
+          workspacePreserved: true,
+          strategy: synthesisStrategy,
+        },
+      });
+      const recoveryPrompt = [
+        '[runtime_workspace_file_patch_recovery]',
+        `Generate a new minimal unified diff for ${normalizedPath}.`,
+        `The prior patch was rejected before any workspace mutation: ${validationError}`,
+        'Correct the rejected anchors against the exact current snapshot below.',
+        'Discard unrelated and no-op hunks from the prior attempt. Do not duplicate a line already present in the snapshot.',
+        'Change only the smallest source region directly supported by the focused verifier evidence.',
+        '',
+        'Focused implementation instructions:',
+        String(params.instructions).trim(),
+        '',
+        'Current target snapshot:',
+        currentContent!,
+        '',
+        'Grounded supporting evidence:',
+        evidence || '[no additional supporting evidence]',
+        '',
+        'Rejected patch (failed path; do not repeat it):',
+        generatedPayload.length <= 4_000
+          ? generatedPayload
+          : `${generatedPayload.slice(0, 2_000)}\n[runtime_compacted_rejected_patch]\n${generatedPayload.slice(-2_000)}`,
+        '',
+        `Return only a valid unified diff for ${normalizedPath}, with exact ---/+++ headers and @@ hunks.`,
+      ].join('\n');
+      generatedPayload = await this.completeAsAgent(
+        agent,
+        recoveryPrompt,
+        'workspace.file_patch_recovery',
+        correlationId,
+        {
+          isolatedContext: true,
+          temperature: 0,
+          maxOutputTokens: 12_000,
+        }
+      );
+      generatedPayload = this.stripSingleMarkdownCodeFence(generatedPayload);
+      materialized = this.applyUnifiedPatchToContent(currentContent!, generatedPayload);
+      validationError = materialized.error
+        ?? await this.synthesizedContentRejectionReason(
+          normalizedPath,
+          materialized.content ?? '',
+          currentContent
+        );
+    }
+    if (validationError && synthesisStrategy === 'complete') {
       this.emit({
         type: 'tool.synthesis.retrying',
         agentId: agent.id,
@@ -3917,11 +4095,11 @@ export class Runtime {
         evidence || '[no additional supporting evidence]',
         '',
         'Rejected output tail (do not repeat it):',
-        generated.slice(-2_000),
+        generatedPayload.slice(-2_000),
         '',
         'Return source bytes only: no prose, Markdown, diff, JSON, DSML, XML, or tool call.',
       ].join('\n');
-      generated = await this.completeAsAgent(
+      generatedPayload = await this.completeAsAgent(
         agent,
         recoveryPrompt,
         'workspace.file_synthesis_recovery',
@@ -3932,12 +4110,14 @@ export class Runtime {
           maxOutputTokens: 32_000,
         }
       );
-      generated = this.stripSingleMarkdownCodeFence(generated);
-      validationError = await this.synthesizedContentRejectionReason(
-        normalizedPath,
-        generated,
-        currentContent
-      );
+      generatedPayload = this.stripSingleMarkdownCodeFence(generatedPayload);
+      materialized = { content: generatedPayload };
+      validationError = materialized.error
+        ?? await this.synthesizedContentRejectionReason(
+          normalizedPath,
+          materialized.content ?? '',
+          currentContent
+        );
     }
     if (validationError) {
       this.emit({
@@ -3951,13 +4131,27 @@ export class Runtime {
           existingBytes: currentContent === undefined
             ? 0
             : Buffer.byteLength(currentContent, 'utf8'),
-          generatedBytes: Buffer.byteLength(generated, 'utf8'),
+          generatedBytes: Buffer.byteLength(generatedPayload, 'utf8'),
           workspacePreserved: true,
+          strategy: synthesisStrategy,
+          generatedPreview: generatedPayload.length <= 6_000
+            ? generatedPayload
+            : `${generatedPayload.slice(0, 3_000)}\n[runtime_rejected_payload_compacted]\n${generatedPayload.slice(-3_000)}`,
         },
       });
       return {
         success: false,
         error: `File synthesis for ${normalizedPath} was rejected before mutation: ${validationError}`,
+        result: {
+          synthesisRejected: true,
+          workspacePreserved: true,
+          path: normalizedPath,
+          strategy: synthesisStrategy,
+          reason: validationError,
+          generatedPreview: generatedPayload.length <= 6_000
+            ? generatedPayload
+            : `${generatedPayload.slice(0, 3_000)}\n[runtime_rejected_payload_compacted]\n${generatedPayload.slice(-3_000)}`,
+        },
         metadata: {
           synthesisRejected: true,
           workspacePreserved: true,
@@ -3965,6 +4159,7 @@ export class Runtime {
         },
       };
     }
+    const generated = materialized.content!;
 
     const mutation = currentContent === undefined
       ? await new FsWriteTool(this.workspaceRoot).execute({
@@ -3998,6 +4193,7 @@ export class Runtime {
         path: String(result?.path ?? normalizedPath),
         bytes: Number(result?.bytes ?? Buffer.byteLength(generated, 'utf8')),
         operation,
+        strategy: synthesisStrategy,
       },
     });
     return {
@@ -4007,6 +4203,7 @@ export class Runtime {
         bytes: Number(result?.bytes ?? Buffer.byteLength(generated, 'utf8')),
         operation,
         synthesized: true,
+        strategy: synthesisStrategy,
       },
     };
   }
@@ -4184,10 +4381,166 @@ export class Runtime {
     return this.compactDelegatedTask(withoutDerivedCaches, 8_000);
   }
 
+  private compactRecoveryAssignment(task: string): string {
+    const immutableHead = task
+      .replace(
+        /\n(?:---\s*\n)?##\s+VERIFICATION FAILED[\s\S]*$/i,
+        ''
+      )
+      .replace(/<official_verifier_feedback>[\s\S]*?<\/official_verifier_feedback>/gi, '')
+      .replace(/<team_step_cache>[\s\S]*?<\/team_step_cache>/gi, '')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+    return this.compactDelegatedTask(immutableHead || task.trim(), 5_000);
+  }
+
   private stripSingleMarkdownCodeFence(content: string): string {
     const trimmed = content.trim();
     const fenced = /^```[A-Za-z0-9_+.-]*\s*\n([\s\S]*?)\n```\s*$/.exec(trimmed);
     return fenced ? fenced[1]! : content;
+  }
+
+  private applyUnifiedPatchToContent(
+    currentContent: string,
+    patch: string
+  ): { content?: string; error?: string } {
+    const patchLines = patch.replace(/\r\n/g, '\n').trim().split('\n');
+    const firstHunk = patchLines.findIndex(line => line.startsWith('@@ '));
+    if (firstHunk < 0) {
+      return { error: 'focused patch generation returned no unified-diff hunks' };
+    }
+    const preamble = patchLines.slice(0, firstHunk).filter(Boolean);
+    if (!preamble.some(line => line.startsWith('--- '))
+      || !preamble.some(line => line.startsWith('+++ '))) {
+      return { error: 'focused patch generation omitted the ---/+++ unified-diff headers' };
+    }
+
+    const hadTrailingNewline = currentContent.endsWith('\n');
+    const currentLines = currentContent.replace(/\r\n/g, '\n').split('\n');
+    if (hadTrailingNewline) currentLines.pop();
+    const hunks: Array<{
+      oldStart: number;
+      declaredIndex: number;
+      sourceIndex: number;
+      sourcePattern: string[];
+      lines: string[];
+    }> = [];
+    let patchIndex = firstHunk;
+    while (patchIndex < patchLines.length) {
+      const header = patchLines[patchIndex]!;
+      if (!header.trim()) {
+        patchIndex += 1;
+        continue;
+      }
+      const match = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(header);
+      if (!match) {
+        return { error: `focused patch contains invalid hunk header: ${header.slice(0, 200)}` };
+      }
+      const oldStart = Number(match[1]);
+      const hunkEnd = (() => {
+        for (let index = patchIndex + 1; index < patchLines.length; index += 1) {
+          if (patchLines[index]!.startsWith('@@ ')) return index;
+        }
+        return patchLines.length;
+      })();
+      const hunkLines = patchLines
+        .slice(patchIndex + 1, hunkEnd)
+        .filter(line => line !== '\\ No newline at end of file');
+      const sourcePattern = hunkLines
+        .filter(line => line[0] === ' ' || line[0] === '-')
+        .map(line => line.slice(1));
+      const declaredIndex = Math.max(0, oldStart - 1);
+      const matchesAt = (index: number): boolean =>
+        index >= 0
+        && index + sourcePattern.length <= currentLines.length
+        && sourcePattern.every((line, offset) => currentLines[index + offset] === line);
+      let hunkSourceIndex = declaredIndex;
+      if (!matchesAt(hunkSourceIndex) && sourcePattern.length > 0) {
+        const candidates: number[] = [];
+        for (
+          let index = 0;
+          index + sourcePattern.length <= currentLines.length;
+          index += 1
+        ) {
+          if (matchesAt(index)) candidates.push(index);
+        }
+        if (candidates.length === 0) {
+          return {
+            error: `focused patch source anchor does not match the current snapshot near line ${oldStart}`,
+          };
+        }
+        candidates.sort((left, right) =>
+          Math.abs(left - declaredIndex) - Math.abs(right - declaredIndex)
+          || left - right
+        );
+        hunkSourceIndex = candidates[0]!;
+      }
+      if (hunkSourceIndex > currentLines.length) {
+        return { error: `focused patch hunk starts outside the current snapshot at line ${oldStart}` };
+      }
+      hunks.push({
+        oldStart,
+        declaredIndex,
+        sourceIndex: hunkSourceIndex,
+        sourcePattern,
+        lines: hunkLines,
+      });
+      patchIndex = hunkEnd;
+    }
+
+    // Models occasionally preserve exact hunk context while emitting stale line
+    // numbers or putting hunks in declared rather than actual source order.
+    // Resolve every hunk against the immutable snapshot first, then apply the
+    // non-overlapping exact anchors in real source order.
+    hunks.sort((left, right) =>
+      left.sourceIndex - right.sourceIndex
+      || left.declaredIndex - right.declaredIndex
+    );
+    const output: string[] = [];
+    let sourceIndex = 0;
+    let changedLines = 0;
+    for (const hunk of hunks) {
+      if (hunk.sourceIndex < sourceIndex) {
+        return {
+          error: `focused patch contains overlapping source anchors near line ${hunk.oldStart}`,
+        };
+      }
+      output.push(...currentLines.slice(sourceIndex, hunk.sourceIndex));
+      sourceIndex = hunk.sourceIndex;
+      for (const line of hunk.lines) {
+        const prefix = line[0];
+        const text = line.slice(1);
+        if (prefix === ' ') {
+          if (currentLines[sourceIndex] !== text) {
+            return {
+              error: `focused patch context does not match current snapshot at line ${sourceIndex + 1}`,
+            };
+          }
+          output.push(text);
+          sourceIndex += 1;
+        } else if (prefix === '-') {
+          if (currentLines[sourceIndex] !== text) {
+            return {
+              error: `focused patch deletion does not match current snapshot at line ${sourceIndex + 1}`,
+            };
+          }
+          sourceIndex += 1;
+          changedLines += 1;
+        } else if (prefix === '+') {
+          output.push(text);
+          changedLines += 1;
+        } else if (!line.trim()) {
+          return { error: 'focused patch contains an unprefixed blank line inside a hunk' };
+        } else {
+          return { error: `focused patch contains invalid hunk content: ${line.slice(0, 200)}` };
+        }
+      }
+    }
+    if (changedLines === 0) return { error: 'focused patch contains no source changes' };
+    output.push(...currentLines.slice(sourceIndex));
+    return {
+      content: `${output.join('\n')}${hadTrailingNewline ? '\n' : ''}`,
+    };
   }
 
   private looksLikeSourceFileContent(filePath: string, content: string): boolean {
@@ -5266,12 +5619,29 @@ export class Runtime {
         },
       });
     }
+    const resumeRecoveryDecision = resumeState
+      ? this.buildVerifierGuidedResumeRecoveryDecision(userInput, resumeState)
+      : undefined;
     let decision: DelegationDecision = resumeState
-      ? {
+      ? resumeRecoveryDecision ?? {
         action: 'solve_directly',
         reason: 'Resume the persisted execution ledger and close its unresolved workspace paths without rebuilding the initial team.',
       }
       : await this.decideDelegation(userInput, correlationId);
+    if (resumeRecoveryDecision) {
+      this.emit({
+        type: 'root.task_loop.resume_strategy_changed',
+        agentId: 'root',
+        correlationId,
+        data: {
+          sourceCorrelationId: resumeState!.sourceCorrelationId,
+          from: 'root_direct_repair',
+          to: 'verifier_guided_recovery_team',
+          agents: resumeRecoveryDecision.agents.map(agent => agent.name),
+          reason: resumeRecoveryDecision.reason,
+        },
+      });
+    }
     let requiredLongHorizonDecision: DelegationDecision | undefined;
     if (decision.action === 'solve_directly'
       && requiresLongHorizon
@@ -5441,6 +5811,7 @@ export class Runtime {
       let previousStepId: string | undefined;
       let clarification: string | undefined;
       let rootExecution: GroundingRunResult | undefined;
+      let diagnosticPrerequisiteFailed = false;
 
       while (roundDecision.action === 'spawn_subagents') {
         delegationRounds += 1;
@@ -5489,9 +5860,16 @@ export class Runtime {
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           const hasCompletedPriorWork = subagents.length > 0 || teamResults.length > 0;
-          const canRecoverWithRootExecution = requiresWorkspaceMutation;
+          const failedFocusedDiagnostic = this.getEvents().some(event =>
+            event.correlationId === correlationId
+            && event.type === 'agent.verifier_diagnostic.missing'
+          );
+          if (failedFocusedDiagnostic) diagnosticPrerequisiteFailed = true;
+          const canRecoverWithRootExecution = requiresWorkspaceMutation
+            && !failedFocusedDiagnostic;
           const canRecoverWithRootReasoning = !requiresWorkspaceMutation;
-          const canRecover = hasCompletedPriorWork
+          const canRecover = failedFocusedDiagnostic
+            || hasCompletedPriorWork
             || canRecoverWithRootExecution
             || canRecoverWithRootReasoning;
           await this.failRootExecutionStep(correlationId, step, message, !canRecover);
@@ -5510,7 +5888,9 @@ export class Runtime {
               data: {
                 stepId: step.id,
                 error: message,
-                recovery: hasCompletedPriorWork
+                recovery: failedFocusedDiagnostic
+                  ? 'checkpoint_failed_diagnostic_without_mutation'
+                  : hasCompletedPriorWork
                   ? 'synthesize_completed_prior_steps'
                   : canRecoverWithRootExecution
                     ? 'root_execution_after_failed_delegation'
@@ -5569,7 +5949,11 @@ export class Runtime {
             0,
             tree.loop.maxWallClockMs - executionReserveMs
           );
+        const verifierGuidedRecoveryRound = round.teams.some(result =>
+          result.team.identity.name.startsWith('VerifierGuidedRecoveryTeam')
+        );
         const executionHandoffRequired = timeReserveHandoffRequired
+          || verifierGuidedRecoveryRound
           || this.shouldHandoffToRootExecution({
           requiresWorkspaceMutation,
           requiresLongHorizon,
@@ -5602,6 +5986,8 @@ export class Runtime {
                 delegationRounds,
                 reason: timeReserveHandoffRequired
                   ? 'execution_time_reserve_reached'
+                  : verifierGuidedRecoveryRound
+                    ? 'verifier_guided_recovery_round_completed'
                   : roundMutationApplied
                     ? 'delegated_workspace_mutation_observed'
                     : 'delegation_round_cap_without_mutation',
@@ -5684,7 +6070,7 @@ export class Runtime {
         break;
       }
 
-      if (!clarification && requiresWorkspaceMutation) {
+      if (!clarification && requiresWorkspaceMutation && !diagnosticPrerequisiteFailed) {
         const executionStep = await this.startRootExecutionStep(correlationId, {
           action: 'solve_directly',
           reason: 'Delegated analysis is complete; the root must apply and verify the requested workspace changes.',
@@ -5725,6 +6111,21 @@ export class Runtime {
               toolName: call.toolName,
               success: call.success,
             })),
+          },
+        });
+      } else if (!clarification && requiresWorkspaceMutation) {
+        rootExecution = this.collectResumedToolGrounding(correlationId);
+        requiredExecutionClosure = this.analyzeWorkspaceExecutionClosure(
+          rootExecution?.toolCalls ?? []
+        );
+        this.emit({
+          type: 'root.execution.required.blocked',
+          agentId: 'root',
+          correlationId,
+          data: {
+            reason: 'focused_verifier_diagnostic_missing',
+            nextAction: 'Retry the focused diagnostic checkpoint before any further workspace mutation.',
+            ...requiredExecutionClosure,
           },
         });
       }
@@ -6093,6 +6494,7 @@ export class Runtime {
 
     const parentId = request.parentId ?? invocation.agentId;
     const reuseMode = request.reuse?.mode ?? 'prefer_cache';
+    const intentTask = request.intentTask?.trim() || request.task;
     const patternKey = request.archetype === 'custom' && request.name
       ? `custom_${this.safeAgentKey(request.name)}`
       : request.archetype;
@@ -6112,7 +6514,7 @@ export class Runtime {
         : canonicalAgentPattern
       : undefined;
     const cachedDelegationPattern = canReadCache
-      ? await ctx.memory.findDelegationPattern(request.archetype, request.task)
+      ? await ctx.memory.findDelegationPattern(request.archetype, intentTask)
       : undefined;
     if (reuseMode === 'require_cache' && !cachedAgentPattern) {
       throw new Error(`Agent creation requires a cached pattern for archetype "${request.archetype}"`);
@@ -6129,7 +6531,10 @@ export class Runtime {
 
     const cachedTools = this.stringArray(cachedAgentPattern?.tools);
     const cachedSkills = this.stringArray(cachedAgentPattern?.skills);
-    const defaultToolBindings = this.getToolBindingsForTask(request.archetype, request.task);
+    const defaultToolBindings = this.getToolBindingsForTask(
+      request.archetype,
+      intentTask
+    );
     const defaultTools = defaultToolBindings.map(item => item.name);
     const defaultReadOnlyTools = defaultToolBindings
       .filter(item => item.permission === 'read_only')
@@ -6245,7 +6650,11 @@ export class Runtime {
         cognitiveGapIds: [...(request.cognitiveGapIds ?? [])],
         existenceReason: request.existenceReason,
       },
-      assignment: { task: request.task, outputContract },
+      assignment: {
+        task: request.task,
+        ...(request.intentTask ? { intentTask: request.intentTask } : {}),
+        outputContract,
+      },
       capabilities: { tools: [...tools], skills: [...skills] },
       context: { memoryScope, communicationProtocol },
       resources: { budgetTokens: request.budgetTokens },
@@ -6421,7 +6830,7 @@ export class Runtime {
     }
     const delegationPattern = await ctx.memory.upsertDelegationPattern({
       archetype: payload.archetype,
-      task: payload.task,
+      task: node.assignment.intentTask ?? payload.task,
       parentId,
       agentPatternId: node.reuse.targetPatternId,
       tomProfile: agent.identity.tomProfile,
@@ -6461,9 +6870,26 @@ export class Runtime {
 
     let subagentResult: RunAgentResult;
     try {
-      const sharedTeamToolCalls = payload.teamId
+      let sharedTeamToolCalls = payload.teamId
         ? this.teamToolEvidenceCache.get(payload.teamId) ?? []
         : [];
+      if (payload.teamId && sharedTeamToolCalls.length === 0) {
+        sharedTeamToolCalls = this.restoredToolCallsFromResume(correlationId, 48);
+        if (sharedTeamToolCalls.length > 0) {
+          this.teamToolEvidenceCache.set(payload.teamId, sharedTeamToolCalls);
+          this.emit({
+            type: 'team.tool_evidence.seeded_from_resume',
+            agentId: agent.identity.id,
+            sessionId: ctx.sessionId,
+            correlationId,
+            data: {
+              teamId: payload.teamId,
+              cachedCalls: sharedTeamToolCalls.length,
+              successfulCalls: sharedTeamToolCalls.filter(call => call.success).length,
+            },
+          });
+        }
+      }
       if (payload.teamId && sharedTeamToolCalls.length > 0) {
         this.emit({
           type: 'team.tool_evidence.reused',
@@ -6485,6 +6911,7 @@ export class Runtime {
         nodeId: node.nodeId,
         patternId: node.reuse.targetPatternId,
         priorToolCalls: sharedTeamToolCalls,
+        intentTask: node.assignment.intentTask,
       });
       if (payload.teamId && subagentResult.toolCalls.length > 0) {
         const cachedCalls = [
@@ -7327,6 +7754,7 @@ export class Runtime {
       nodeId?: string;
       patternId?: string;
       priorToolCalls?: ToolCallRecord[];
+      intentTask?: string;
     } = {}
   ): Promise<RunAgentResult> {
     const ctx = this.getContext();
@@ -7335,6 +7763,11 @@ export class Runtime {
       throw new Error(`Agent "${agentId}" not found`);
     }
     const actorArchetype = options.archetype ?? this.inferAgentArchetype(agent.getInfo());
+    const assignedActorTask = this.agentRestoreSpecs.get(agentId)?.task?.trim();
+    const immutableActorTask = options.intentTask?.trim()
+      || (task.includes('<team_step_cache>')
+        ? assignedActorTask || task.trim()
+        : task.trim());
 
     this.activateActorLifecycle(agentId, options.correlationId);
 
@@ -7366,7 +7799,9 @@ export class Runtime {
     const activeAllocationId = this.agentBudgetAllocations.get(agentId);
     const activeAllocation = activeAllocationId ? this.budgetMarket?.getAllocation(activeAllocationId) : undefined;
     agent.setCompletionTokenLimit(activeAllocation?.allocatedTokens, this.budgetAccountingDimension());
-    const actorWorkspaceExecutionRequired = this.taskRequiresWorkspaceMutation(task)
+    const actorWorkspaceExecutionRequired = this.taskRequiresWorkspaceMutation(
+      immutableActorTask
+    )
       && (this.agentBindings.get(agentId)?.tools ?? []).some(binding =>
         binding.enabled && (
           binding.name === 'fs.write'
@@ -7378,6 +7813,8 @@ export class Runtime {
       && (this.agentBindings.get(agentId)?.tools ?? []).some(binding =>
         binding.enabled && binding.name === 'shell.exec'
       );
+    const actorDiagnosticProbeRequired =
+      /\[runtime_verifier_diagnostic_probe\]/.test(immutableActorTask);
 
     const session = ctx.manager.getSession(ctx.sessionId);
     if (session) {
@@ -7456,6 +7893,7 @@ export class Runtime {
       }
       let grounding = await this.runGroundingCheck(agentId, task, {
         ...options,
+        intentTask: immutableActorTask,
         onBeforeExecution: async initialPlans => {
           await this.transitionAgentFsm(agentId, 'S_tool_calling', {
             toolCalls: initialPlans.map(call => call.toolName),
@@ -7465,12 +7903,14 @@ export class Runtime {
       });
       activeGrounding = grounding;
       if (actorVerificationEvidenceRequired
+        && !actorDiagnosticProbeRequired
         && !grounding.toolCalls.some(call => isWorkspaceVerificationCall(call))) {
         const priorVerification = [...(options.priorToolCalls ?? [])].reverse()
           .find(call => isWorkspaceVerificationCall(call));
         if (priorVerification) {
           const verification = await this.runGroundingCheck(agentId, task, {
             ...options,
+            intentTask: immutableActorTask,
             priorToolCalls: grounding.toolCalls,
             initialPlans: [{
               toolName: 'shell.exec',
@@ -7484,7 +7924,7 @@ export class Runtime {
           activeGrounding = grounding;
         }
       }
-      if (actorVerificationEvidenceRequired) {
+      if (actorVerificationEvidenceRequired && !actorDiagnosticProbeRequired) {
         const verificationCalls = grounding.toolCalls.filter(call =>
           isWorkspaceVerificationCall(call)
         );
@@ -7509,6 +7949,31 @@ export class Runtime {
           );
         }
       }
+      if (actorDiagnosticProbeRequired) {
+        const diagnosticCalls = grounding.toolCalls.filter(call =>
+          this.isFocusedVerifierDiagnosticCall(call)
+        );
+        this.emit({
+          type: diagnosticCalls.length > 0
+            ? 'agent.verifier_diagnostic.completed'
+            : 'agent.verifier_diagnostic.missing',
+          agentId,
+          sessionId: ctx.sessionId,
+          correlationId: options.correlationId,
+          nodeId: options.nodeId,
+          data: {
+            focusedReproductions: diagnosticCalls.length,
+            commands: diagnosticCalls.map(call =>
+              String(call.params.command ?? '').slice(0, 500)
+            ),
+          },
+        });
+        if (diagnosticCalls.length === 0) {
+          throw new Error(
+            'Verifier diagnostic probe produced no fresh focused fixture reproduction'
+          );
+        }
+      }
       if (actorWorkspaceExecutionRequired) {
         let closure = this.analyzeWorkspaceExecutionClosure(grounding.toolCalls);
         let continuation = 0;
@@ -7519,8 +7984,11 @@ export class Runtime {
             this.buildAgentExecutionClosureTask(task, grounding, closure, continuation),
             {
               ...options,
-              intentTask: task,
-              priorToolCalls: grounding.toolCalls,
+              intentTask: immutableActorTask,
+              priorToolCalls: [
+                ...(options.priorToolCalls ?? []),
+                ...grounding.toolCalls,
+              ],
             }
           );
           this.emit({
@@ -7633,6 +8101,7 @@ export class Runtime {
           });
           const recovered = await this.runGroundingCheck(agentId, task, {
             ...options,
+            intentTask: immutableActorTask,
             initialPlans: recoveryPlans,
             priorToolCalls: grounding.toolCalls,
             skipInitialModelPlanning: true,
@@ -9528,9 +9997,15 @@ export class Runtime {
           matches: Array.isArray(record.matches) ? record.matches.slice(0, 80) : record.matches,
         };
       } else if (call.toolName === 'shell.exec') {
+        const command = String(call.params.command ?? record.command ?? '');
+        const stdout = typeof record.stdout === 'string' ? record.stdout : '';
+        const verifierProbe = command.includes('ROY_VERIFIER_PROBE=1')
+          || stdout.includes('VERIFIER_PROBE_');
         result = {
           ...record,
-          stdout: compactText(record.stdout, 6_000),
+          stdout: verifierProbe
+            ? this.compactVerifierProbeEvidenceText(stdout, 12_000)
+            : compactText(record.stdout, 6_000),
           stderr: compactText(record.stderr, 8_000),
         };
       }
@@ -9549,6 +10024,76 @@ export class Runtime {
     };
   }
 
+  private compactVerifierProbeEvidenceText(
+    output: string,
+    maxChars: number
+  ): string {
+    if (!output.trim()) return output;
+    const lines = output.split('\n').map(line => line.trim()).filter(Boolean);
+    const candidates = lines
+      .map((line, position) => {
+        const marker = /^VERIFIER_PROBE_([A-Z_]+)\b/.exec(line)?.[1];
+        if (!marker) return undefined;
+        let priority = 20;
+        let perItemLimit = 1_200;
+        if (marker === 'EVIDENCE_VERSION') priority = 240;
+        else if (['CALL', 'MISMATCHES', 'RESULT', 'REWARD'].includes(marker)) {
+          priority = 220;
+          perItemLimit = 1_800;
+        } else if (marker === 'SPEC') {
+          priority = 190;
+          perItemLimit = 2_400;
+        } else if (marker === 'ARTIFACT') {
+          priority = 80;
+          perItemLimit = 2_400;
+        }
+        const payloadStart = line.indexOf('{');
+        let evidencePath = '';
+        if (payloadStart >= 0) {
+          try {
+            const payload = JSON.parse(line.slice(payloadStart)) as {
+              path?: unknown;
+              artifact?: unknown;
+            };
+            evidencePath = String(payload.path ?? payload.artifact ?? '').toLowerCase();
+          } catch {
+            // Keep the marker even when its compact payload was truncated.
+          }
+        }
+        if (evidencePath.includes('output')) priority += 50;
+        if (/(?:qc|summary|report|journal|diagnostic|result|reward|log)/.test(evidencePath)) {
+          priority += 60;
+        }
+        if (/(?:manifest|ocr|token|fixture|expected)/.test(evidencePath)) priority -= 80;
+        if (/(?:reconstructed|prediction)/.test(evidencePath)) priority -= 20;
+        return { line, position, priority, perItemLimit };
+      })
+      .filter((item): item is {
+        line: string;
+        position: number;
+        priority: number;
+        perItemLimit: number;
+      } => Boolean(item))
+      .sort((left, right) =>
+        right.priority - left.priority || left.position - right.position
+      );
+    const selected: string[] = [];
+    let remaining = Math.max(1, maxChars);
+    for (const candidate of candidates) {
+      if (remaining <= 0) break;
+      const clipped = candidate.line.length <= candidate.perItemLimit
+        ? candidate.line
+        : `${candidate.line.slice(0, Math.max(0, candidate.perItemLimit - 28))}[diagnostic item compacted]`;
+      if (clipped.length > remaining) continue;
+      selected.push(clipped);
+      remaining -= clipped.length + 1;
+    }
+    if (selected.length > 0) return selected.join('\n');
+    if (output.length <= maxChars) return output;
+    const head = Math.floor(maxChars * 0.4);
+    return `${output.slice(0, head)}\n[runtime_verifier_probe_compacted]\n${output.slice(-(maxChars - head))}`;
+  }
+
   private boundExecutionToolFrontier(
     calls: ExecutionCachedToolCall[],
     maxCalls = 32,
@@ -9558,13 +10103,13 @@ export class Runtime {
     const seen = new Set<string>();
     let serializedChars = 0;
     for (const call of [...calls].reverse()) {
-      const fingerprint = [
-        call.toolName,
-        JSON.stringify(call.params),
-        call.success,
-        call.startedAt ?? '',
-        call.completedAt ?? '',
-      ].join(':');
+      const fingerprint = this.fingerprint({
+        toolName: call.toolName,
+        params: call.params,
+        result: call.result,
+        success: call.success,
+        error: call.error,
+      });
       if (seen.has(fingerprint)) continue;
       seen.add(fingerprint);
       const callChars = JSON.stringify(call).length;
@@ -9690,12 +10235,17 @@ export class Runtime {
     const selectedFeedback = knowledge.feedback.filter(item =>
       item.correlationId === selected.correlationId && selectedStepIds.has(item.stepId)
     );
+    const novelExternalContinuation = externalContinuation
+      && !selected.items.some(item => item.similarity === 1);
     if (openSelectedPaths.length === 0
       && selectedFeedback.every(item => !item.actionable)
-      && !externalContinuation) {
+      && !novelExternalContinuation) {
       return undefined;
     }
-    const anchor = [...openSelectedPaths, ...selectedPaths]
+    const anchorCandidates = openSelectedPaths.length > 0
+      ? openSelectedPaths
+      : selectedPaths;
+    const anchor = anchorCandidates
       .sort((left, right) => right.updatedAt - left.updatedAt)[0];
     if (!anchor) return undefined;
 
@@ -9937,6 +10487,7 @@ export class Runtime {
           existenceReason: plan.existenceReason,
           systemPrompt: plan.systemPrompt,
           budgetTokens: plan.budgetTokens,
+          memoryScope: plan.memoryScope,
           correlationId,
           source: 'root',
           requireRootSynthesis: false,
@@ -10892,6 +11443,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
         ? plan.cognitiveGapIds.filter((item): item is string => typeof item === 'string')
         : undefined,
       existenceReason: typeof plan.existenceReason === 'string' ? plan.existenceReason : undefined,
+      memoryScope: this.agentMemoryScope(plan.memoryScope),
       systemPrompt: typeof plan.systemPrompt === 'string' ? plan.systemPrompt : undefined,
     };
   }
@@ -11294,6 +11846,192 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     };
   }
 
+  private buildVerifierGuidedResumeRecoveryDecision(
+    task: string,
+    resumeState: ExecutionResumeState
+  ): Extract<DelegationDecision, { action: 'spawn_subagents' }> | undefined {
+    if (this.workspaceRuntimeConfig?.teams.enabled === false) return undefined;
+    const priorRecoveryActors = resumeState.knowledge.actors.filter(actor =>
+      actor.name.startsWith('VerifierProbe-')
+      || actor.role === 'verifier-guided recovery executor'
+    );
+    const priorRecoveryRounds = new Set(
+      priorRecoveryActors.map(actor => actor.stepId)
+    ).size;
+    const recoveryRound = priorRecoveryRounds + 1;
+
+    const calls = resumeState.knowledge.paths
+      .flatMap(path => path.toolFrontier ?? [])
+      .sort((left, right) =>
+        (left.completedAt ?? left.startedAt ?? 0)
+        - (right.completedAt ?? right.startedAt ?? 0)
+      );
+    let latestRejectedIndex = -1;
+    for (let index = calls.length - 1; index >= 0; index -= 1) {
+      const call = calls[index]!;
+      const result = call.result as { synthesisRejected?: unknown } | undefined;
+      if (workspaceCandidateRollbackFromCall(call) || result?.synthesisRejected === true) {
+        latestRejectedIndex = index;
+        break;
+      }
+    }
+    const latestRejected = latestRejectedIndex >= 0
+      ? calls[latestRejectedIndex]
+      : undefined;
+    if (!latestRejected) return undefined;
+    let latestDiagnosticIndex = -1;
+    for (let index = calls.length - 1; index >= 0; index -= 1) {
+      const call = calls[index]!;
+      const stdout = String(
+        (call.result as { stdout?: unknown } | undefined)?.stdout ?? ''
+      );
+      if (this.isFocusedVerifierDiagnosticCall(call)
+        && stdout.includes('VERIFIER_PROBE_EVIDENCE_VERSION 2')) {
+        latestDiagnosticIndex = index;
+        break;
+      }
+    }
+    let netMutationAfterDiagnostic = false;
+    if (latestDiagnosticIndex >= 0) {
+      for (const call of calls.slice(latestDiagnosticIndex + 1)) {
+        if (isSuccessfulWorkspaceMutationCall(call)) {
+          netMutationAfterDiagnostic = true;
+        }
+        const laterRollback = workspaceCandidateRollbackFromCall(call);
+        if (laterRollback?.restored === true) {
+          netMutationAfterDiagnostic = false;
+        }
+      }
+    }
+    const cachedDiagnostic = latestDiagnosticIndex >= 0 && !netMutationAfterDiagnostic
+      ? calls[latestDiagnosticIndex]
+      : undefined;
+    const rollback = workspaceCandidateRollbackFromCall(latestRejected);
+    const rejection = latestRejected.result as {
+      path?: unknown;
+      reason?: unknown;
+      generatedPreview?: unknown;
+    } | undefined;
+    const targetPath = this.normalizeCachedPath(String(
+      rollback?.path
+        ?? rejection?.path
+        ?? latestRejected.params.path
+        ?? ''
+    ));
+    const target = targetPath || 'the implementation target named by the task';
+    const latestScorecard = this.latestVerifierScorecardFromCalls(calls);
+    const recoveryCapsule = JSON.stringify({
+      target,
+      sourceCorrelationId: resumeState.sourceCorrelationId,
+      anchorPathId: resumeState.anchorPathId,
+      recoveryRound,
+      latestAcceptedScorecard: latestScorecard,
+      rejectedCandidate: {
+        strategy: latestRejected.params.strategy ?? 'complete',
+        reason: typeof rejection?.reason === 'string'
+          ? rejection.reason.slice(0, 600)
+          : rollback?.reason,
+        baselineReward: rollback?.baselineReward,
+        candidateReward: rollback?.candidateReward,
+        regressedGroups: rollback?.regressedGroups,
+        improvedGroups: rollback?.improvedGroups,
+      },
+      currentWorkspacePolicy: 'Re-observe the current source and run a fresh verifier probe; cached source bytes and rejected payloads are not authoritative.',
+    }, null, 2);
+    const immutableAssignment = this.compactRecoveryAssignment(task);
+    const focusedRecoveryMemory: AgentMemoryScope = {
+      public: false,
+      private: false,
+      parentContext: true,
+      sessionWindowTurns: 0,
+    };
+    const memberOrdinal = (recoveryRound - 1) * 3;
+    const diagnosticAgent: DelegationAgentPlan = {
+      archetype: 'tester',
+      name: `VerifierProbe-${memberOrdinal + 1}`,
+      role: 'verifier-guided diagnostic probe',
+      task: [
+        '[runtime_verifier_diagnostic_probe]',
+        `Diagnose the unresolved official-verifier behavior for ${target}.`,
+        'Read the immutable verifier source and current implementation. Use shell execution to reproduce the failing capability with a disposable diagnostic fixture when possible; do not merely rerun the aggregate score.',
+        'Compare actual and expected outputs, identify the smallest causal mismatch, and report exact source anchors and a bounded repair hypothesis for the next member.',
+        'Do not mutate the implementation or verifier.',
+        `<recovery_capsule>\n${recoveryCapsule}\n</recovery_capsule>`,
+        `Immutable assignment:\n${immutableAssignment}`,
+      ].join('\n\n'),
+      tools: ['fs.read', 'fs.search', 'shell.exec'],
+      skills: ['use_tool_when_needed'],
+      tomLevel: 2,
+      existenceReason: 'A score-only repair was rejected; executable mismatch evidence is required before another mutation.',
+      memoryScope: focusedRecoveryMemory,
+    };
+    const repairAgent: DelegationAgentPlan = {
+      archetype: 'coder',
+      name: `FocusedRepairer-${memberOrdinal + 2}`,
+      role: 'verifier-guided recovery executor',
+      task: [
+        cachedDiagnostic
+          ? `Consume the cached focused verifier diagnostic and repair ${target}.`
+          : `Consume the diagnostic member result and repair ${target}.`,
+        'Inspect the authoritative current snapshot and use the smallest coherent fs.replace or focused fs.synthesize patch supported by the diagnostic evidence.',
+        'Preserve all verifier groups already passing at the accepted baseline. Run the focused reproduction and official verifier after the mutation; consume failures as feedback before reporting.',
+        'Do not perform another broad whole-file rewrite and do not modify immutable verifier evidence.',
+        `<recovery_capsule>\n${recoveryCapsule}\n</recovery_capsule>`,
+        `Immutable assignment:\n${immutableAssignment}`,
+      ].join('\n\n'),
+      tools: ['fs.read', 'fs.search', 'fs.replace', 'fs.write', 'fs.synthesize', 'shell.exec'],
+      skills: ['use_tool_when_needed'],
+      tomLevel: 2,
+      existenceReason: cachedDiagnostic
+        ? 'A fresh cached diagnostic already identifies the unresolved behavior; continue directly with its localized repair.'
+        : 'The diagnostic hypothesis must be turned into a localized, verified workspace mutation.',
+      memoryScope: focusedRecoveryMemory,
+    };
+    const verifierAgent: DelegationAgentPlan = {
+      archetype: 'tester',
+      name: `RecoveryVerifier-${memberOrdinal + 3}`,
+      role: 'independent recovery verifier',
+      task: [
+        'Independently verify the workspace state produced by the recovery executor.',
+        'Run the configured official verifier and inspect its scorecard. Confirm that accepted baseline groups remain passing and report exact remaining mismatches.',
+        'Do not mutate the implementation or verifier and do not claim closure unless the official verifier succeeds.',
+        `<recovery_capsule>\n${recoveryCapsule}\n</recovery_capsule>`,
+        `Immutable assignment:\n${immutableAssignment}`,
+      ].join('\n\n'),
+      tools: ['fs.read', 'fs.search', 'shell.exec'],
+      skills: ['use_tool_when_needed'],
+      tomLevel: 1,
+      existenceReason: 'The localized repair needs independent objective validation before root acceptance.',
+      memoryScope: focusedRecoveryMemory,
+    };
+    return {
+      action: 'spawn_subagents',
+      reason: cachedDiagnostic
+        ? 'The prior recovery stopped after producing a fresh focused diagnostic; resume directly at localized repair and independent verification.'
+        : 'The persisted root repair strategy produced a verifier rollback or an invalid patch; change the causal hypothesis through a bounded diagnostic, localized repair, and independent verification team.',
+      coordination: 'team',
+      continuationPolicy: 'reassess',
+      agents: cachedDiagnostic
+        ? [repairAgent, verifierAgent]
+        : [diagnosticAgent, repairAgent, verifierAgent],
+      team: {
+        name: recoveryRound === 1
+          ? 'VerifierGuidedRecoveryTeam'
+          : `VerifierGuidedRecoveryTeam-${recoveryRound}`,
+        description: 'Changes repair strategy after a rejected candidate by reproducing the mismatch, applying one localized repair, and independently verifying the accepted state.',
+        task,
+        synthesisPolicy: 'Return the reproduced mismatch, exact mutation, official verifier scorecard before and after, preserved passing groups, and any remaining causal blocker.',
+        memberDelegationPolicy: 'deny',
+        executionPolicy: {
+          mode: 'sequential',
+          failureMode: 'best_effort',
+          maxConcurrency: 1,
+          minimumSuccessfulMembers: 1,
+        },
+      },
+    };
+  }
+
   private buildLongHorizonTeamDecision(
     task: string,
     requiresWorkspaceMutation: boolean
@@ -11427,7 +12165,17 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
         ...bootstrapAgents.filter(agent => agent.archetype === 'tester'),
         ...bootstrapAgents.filter(agent => agent.archetype !== 'tester'),
       ];
-    const requiredPhases = requiresWorkspaceMutation ? [1, 2, 0] : [2, 0];
+    const resumesGroundedPath = Boolean(
+      decision.team?.name?.toLowerCase().includes('recovery')
+      || decision.agents.some(agent =>
+        /\b(?:cached-state|cached-path|verifier-guided recovery)\b/i.test(
+          [agent.role, agent.existenceReason].filter(Boolean).join(' ')
+        )
+      )
+    );
+    const requiredPhases = requiresWorkspaceMutation
+      ? resumesGroundedPath ? [1, 2] : [1, 2, 0]
+      : [2, 0];
     for (const requiredPhase of requiredPhases) {
       if (agents.some(agent => this.longHorizonMemberPhase(agent) === requiredPhase)) {
         continue;
@@ -11462,6 +12210,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     for (const addition of additions) {
       if (agents.length >= available) break;
       const phase = this.longHorizonMemberPhase(addition);
+      if (!requiredPhases.includes(phase)) continue;
       if (coveredPhases.has(phase)) continue;
       agents.push(addition);
       coveredPhases.add(phase);
@@ -11531,6 +12280,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
   }
 
   private longHorizonMemberPhase(plan: DelegationAgentPlan): 0 | 1 | 2 {
+    if (plan.role === 'verifier-guided diagnostic probe') return 0;
     if (plan.archetype === 'researcher' || plan.archetype === 'planner') return 0;
     if (plan.archetype === 'coder') return 1;
     if (plan.archetype === 'tester'
@@ -13472,6 +14222,7 @@ Produce the final response to the user as Roy, the root agent.`;
             existenceReason: plan.existenceReason,
             systemPrompt: plan.systemPrompt,
             budgetTokens: plan.budgetTokens,
+            memoryScope: plan.memoryScope,
             correlationId,
             source: agentId,
             requireRootSynthesis: false,
@@ -14677,6 +15428,9 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       && (!Number.isFinite(request.budgetTokens) || request.budgetTokens <= 0)) {
       throw new Error('Agent node budgetTokens must be a positive finite number');
     }
+    if (request.intentTask !== undefined && !request.intentTask.trim()) {
+      throw new Error('Agent node intentTask must be a non-empty string when provided');
+    }
     if (request.outputContract
       && !['markdown', 'json', 'structured_report'].includes(request.outputContract.format)) {
       throw new Error(`Unsupported agent output format "${String(request.outputContract.format)}"`);
@@ -15002,7 +15756,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     const inspectionRoot = this.resolveInspectionRoot(intentTask);
     const groundingRequired = this.agentRestoreSpecs.get(agentId)?.outputContract?.groundingRequired
       ?? this.taskRequiresGrounding(options.archetype ?? 'custom', intentTask);
-    const plans = options.initialPlans
+    let plans = options.initialPlans
       ? [...options.initialPlans]
       : this.toolPlanner.plan({
         task: intentTask,
@@ -15022,6 +15776,9 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       startedAt: call.startedAt,
       completedAt: call.completedAt,
     }));
+    const unresolvedSynthesisRejection = this.hasUnresolvedSynthesisRejection(
+      priorPlannerCalls
+    );
     for (let index = plans.length - 1; index >= 0; index -= 1) {
       const plan = plans[index]!;
       if (options.archetype === 'tester'
@@ -15073,6 +15830,62 @@ For web-grounded work, use only facts present in the subagent report or runtime 
           || binding.name === 'fs.synthesize'
         )
       );
+    const diagnosticProbeRequired =
+      /\[runtime_verifier_diagnostic_probe\]/.test(intentTask);
+    if (diagnosticProbeRequired) {
+      const diagnosticSearch: PlannedToolCall = {
+        toolName: 'fs.search',
+        params: {
+          path: '.roy/official-verifier',
+          filePattern: '*.py',
+          query: '(?:^def |expected|actual|fixture|hidden|layout_qc)',
+          regex: true,
+          maxResults: 40,
+        },
+        reason: 'Locate executable verifier fixture builders and expected-versus-actual assertions before constructing a focused reproduction.',
+        groundingRequired: true,
+      };
+      const diagnosticExecution: PlannedToolCall = {
+        toolName: 'shell.exec',
+        params: {
+          command: this.buildPythonVerifierDiagnosticCommand(),
+          timeoutMs: 120_000,
+          maxOutputBytes: 24_000,
+        },
+        reason: 'Run the Python verifier through a read-only instrumentation harness that preserves generated fixtures and prints compact scorer inputs, expected values, actual values, and results.',
+        groundingRequired: true,
+      };
+      const searchAvailable = bindings.some(binding =>
+        binding.enabled && binding.name === diagnosticSearch.toolName
+      );
+      const shellAvailable = bindings.some(binding =>
+        binding.enabled && binding.name === diagnosticExecution.toolName
+      );
+      for (let index = plans.length - 1; index >= 0; index -= 1) {
+        const plan = plans[index]!;
+        if (plan.toolName !== 'shell.exec') continue;
+        const command = String(plan.params.command ?? '');
+        if (/\bpython(?:3)?\s+\.roy\/official-verifier\/grade\.py(?:\s|$)/i.test(command)
+          || /\bpython(?:3)?\s+-m\s+table_recon\.cli\s+run\b[\s\S]*\bdata\/public\/manifest\.json\b/i.test(
+            command
+          )) {
+          plans.splice(index, 1);
+        }
+      }
+      const diagnosticPlans: PlannedToolCall[] = [];
+      if (searchAvailable
+        && !this.cachedToolPlanDecision(
+          diagnosticSearch,
+          options.priorToolCalls ?? []
+        ).skip
+        && !plans.some(plan =>
+          this.toolPlanFingerprint(plan) === this.toolPlanFingerprint(diagnosticSearch)
+        )) {
+        diagnosticPlans.push(diagnosticSearch);
+      }
+      if (shellAvailable) diagnosticPlans.push(diagnosticExecution);
+      plans.unshift(...diagnosticPlans);
+    }
     if (plans.length === 0 && workspaceExecutionRequired) {
       const transitionPlans = this.toolPlanner.planWorkspaceRepairTransition({
         task: intentTask,
@@ -15118,16 +15931,27 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       || plan.toolName === 'fs.read'
       || plan.toolName === 'fs.search'
     );
+    const hasCausalWorkspaceMutation = plans.some(plan =>
+      isSuccessfulWorkspaceMutationCall({
+        toolName: plan.toolName,
+        params: plan.params,
+        success: true,
+      })
+    );
     if (needsModelPlannedAction
       && loopConfig.enabled
       && loopConfig.llmReplanning
       && !options.skipInitialModelPlanning
       && !hasInitialInspection
+      && !hasCausalWorkspaceMutation
+      && !unresolvedSynthesisRejection
       && remainingGroundingMs() > 1_000
       && actor instanceof UnifiedAgent) {
       const modelPlans = await actor.planNextToolRound({
         task,
         executionRequired: workspaceExecutionRequired,
+        diagnosticProbeRequired,
+        requiredDiagnosticAfterCallIndex: priorPlannerCalls.length - 1,
         round: 0,
         remainingCalls: loopConfig.maxCallsPerRun,
         requestTimeoutMs: planningRequestTimeoutMs(),
@@ -15150,6 +15974,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       const plannedFingerprints = new Set(plans.map(plan => this.toolPlanFingerprint(plan)));
       plans.push(...modelPlans.filter(plan => !plannedFingerprints.has(this.toolPlanFingerprint(plan))));
     }
+    plans = this.keepSingleWorkspaceMutationHypothesis(plans, agentId, options);
     if (plans.length === 0) {
       const warning = groundingRequired
         ? 'Grounding was required, but no authorized tool call could be planned for this task.'
@@ -15287,6 +16112,21 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         });
         if (deterministic.length > 0) return deterministic.slice(0, context.remainingCalls);
         if (this.toolPlanner.hasSufficientWebEvidence(intentTask, context.calls)) return [];
+        const combinedCalls = [...priorPlannerCalls, ...context.calls];
+        if (this.hasUnresolvedSynthesisRejection(combinedCalls)) {
+          this.emit({
+            type: 'agent.tool_loop.rejected_candidate.stopped',
+            agentId,
+            sessionId: this.getContext().sessionId,
+            correlationId: options.correlationId,
+            nodeId: options.nodeId,
+            data: {
+              reason: 'A synthesized candidate was rejected and no newer causal evidence supports another generation.',
+              priorToolCalls: combinedCalls.length,
+            },
+          });
+          return [];
+        }
         if (!loopConfig.enabled || !loopConfig.llmReplanning || !(actor instanceof UnifiedAgent)) return [];
         if (!this.shouldReplanToolLoop(intentTask, context.calls)) return [];
         if (remainingGroundingMs() <= 1_000) {
@@ -15307,6 +16147,8 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         const llmPlans = await actor.planNextToolRound({
           task,
           executionRequired: workspaceExecutionRequired,
+          diagnosticProbeRequired,
+          requiredDiagnosticAfterCallIndex: priorPlannerCalls.length - 1,
           round: context.round,
           remainingCalls: context.remainingCalls,
           requestTimeoutMs: planningRequestTimeoutMs(),
@@ -15577,6 +16419,182 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         || call.toolName === 'fs.synthesize'
       )
       || /\b(?:multi-step|continue|iterate|until|cross-check|multiple sources|independent sources)\b/i.test(task);
+  }
+
+  private isFocusedVerifierDiagnosticCall(
+    call: Pick<ToolCallRecord, 'toolName' | 'params' | 'success'>
+  ): boolean {
+    if (call.toolName !== 'shell.exec' || !call.success) return false;
+    const command = String(call.params.command ?? '').trim();
+    if (!command) return false;
+    if (/\bROY_VERIFIER_PROBE=1\b/.test(command)) return true;
+    if (/\bpython(?:3)?\s+\.roy\/official-verifier\/grade\.py(?:\s|$)/i.test(
+      command
+    )) {
+      return false;
+    }
+    if (/\bpython(?:3)?\s+-m\s+table_recon\.cli\s+run\b[\s\S]*\bdata\/public\/manifest\.json\b/i.test(
+      command
+    )) {
+      return false;
+    }
+    return /\b(?:python3?|pytest|unittest|node|npm|npx)\b/i.test(command)
+      && /\b(?:actual|expected|fixture|hidden|manifest|repro|test|audit|table_recon|verifier)\b/i.test(
+        command
+      );
+  }
+
+  private hasUnresolvedSynthesisRejection(
+    calls: Array<Pick<ToolCallRecord, 'toolName' | 'params' | 'result' | 'success'>>
+  ): boolean {
+    for (let index = calls.length - 1; index >= 0; index -= 1) {
+      const call = calls[index]!;
+      const rejected = (call.result as { synthesisRejected?: unknown } | undefined)
+        ?.synthesisRejected === true;
+      if (!rejected) continue;
+      return !calls.slice(index + 1).some(later =>
+        later.success && (
+          this.isFocusedVerifierDiagnosticCall(later)
+          || later.toolName === 'fs.read'
+          || later.toolName === 'fs.search'
+        )
+      );
+    }
+    return false;
+  }
+
+  private buildPythonVerifierDiagnosticCommand(): string {
+    const script = [
+      'import functools',
+      'import json',
+      'import os',
+      'import runpy',
+      'import tempfile',
+      '',
+      'retained = []',
+      '',
+      'class RetainedTemporaryDirectory:',
+      '    def __init__(self, suffix=None, prefix=None, dir=None, **kwargs):',
+      '        self.name = tempfile.mkdtemp(suffix=suffix, prefix=prefix, dir=dir)',
+      '        retained.append(self.name)',
+      '    def __enter__(self):',
+      '        return self.name',
+      '    def __exit__(self, exc_type, exc_value, traceback):',
+      '        return False',
+      '    def cleanup(self):',
+      '        return None',
+      '',
+      'tempfile.TemporaryDirectory = RetainedTemporaryDirectory',
+      'namespace = runpy.run_path(".roy/official-verifier/grade.py", run_name="roy_verifier_probe")',
+      '',
+      'def compact(value):',
+      '    try:',
+      '        rendered = json.dumps(value, default=str, ensure_ascii=False, sort_keys=True)',
+      '    except Exception:',
+      '        rendered = repr(value)',
+      '    if len(rendered) <= 6000:',
+      '        return rendered',
+      '    return rendered[:3000] + "\\n[verifier_probe_compacted]\\n" + rendered[-3000:]',
+      '',
+      'def mismatch_summary(args):',
+      '    if len(args) < 2 or not isinstance(args[0], dict) or not isinstance(args[1], list):',
+      '        return None',
+      '    actual, expected = args[0], args[1]',
+      '    mismatches = []',
+      '    key_fields = ("document_id", "table_id", "row_index", "col_index")',
+      '    for item in expected:',
+      '        if not isinstance(item, dict) or not all(field in item for field in key_fields):',
+      '            continue',
+      '        key = tuple(item[field] for field in key_fields)',
+      '        expected_value = item.get("text", item.get("value"))',
+      '        actual_value = actual.get(key)',
+      '        if str(actual_value).strip().lower() != str(expected_value).strip().lower():',
+      '            mismatches.append({"key": key, "expected": expected_value, "actual": actual_value})',
+      '    return {',
+      '        "actual_items": len(actual),',
+      '        "expected_items": len(expected),',
+      '        "mismatch_count": len(mismatches),',
+      '        "mismatches": mismatches[:40],',
+      '    }',
+      '',
+      'def instrument(label, function):',
+      '    @functools.wraps(function)',
+      '    def wrapped(*args, **kwargs):',
+      '        result = function(*args, **kwargs)',
+      '        print("VERIFIER_PROBE_CALL", label)',
+      '        summary = mismatch_summary(args)',
+      '        if summary is not None:',
+      '            print("VERIFIER_PROBE_MISMATCHES", compact(summary))',
+      '        else:',
+      '            print("VERIFIER_PROBE_ARGS", compact(args))',
+      '        if kwargs:',
+      '            print("VERIFIER_PROBE_KWARGS", compact(kwargs))',
+      '        print("VERIFIER_PROBE_RESULT", compact(result))',
+      '        return result',
+      '    return wrapped',
+      '',
+      'entrypoint = namespace.get("grade") or namespace.get("main")',
+      'if not callable(entrypoint):',
+      '    raise RuntimeError("No callable grade or main entrypoint found in the Python verifier")',
+      'function_globals = getattr(entrypoint, "__globals__", namespace)',
+      'markers = ("compare", "score", "metric", "fraction", "evaluate", "check")',
+      'for name, value in list(function_globals.items()):',
+      '    if callable(value) and name not in ("grade", "main") and any(marker in name.lower() for marker in markers):',
+      '        function_globals[name] = instrument(name, value)',
+      '',
+      'reward = entrypoint()',
+      'print("VERIFIER_PROBE_REWARD", compact(reward))',
+      'print("VERIFIER_PROBE_EVIDENCE_VERSION", 2)',
+      'artifact_budget = 12000',
+      'artifact_suffixes = {".json", ".csv", ".md", ".txt", ".log", ".yaml", ".yml"}',
+      'artifact_paths = []',
+      'for directory in retained:',
+      '    for root, directories, files in os.walk(directory):',
+      '        directories.sort()',
+      '        files.sort()',
+      '        for filename in files:',
+      '            if artifact_budget <= 0:',
+      '                break',
+      '            path = os.path.join(root, filename)',
+      '            if os.path.splitext(filename)[1].lower() not in artifact_suffixes:',
+      '                continue',
+      '            try:',
+      '                if os.path.getsize(path) > 65536:',
+      '                    continue',
+      '                with open(path, "r", encoding="utf-8", errors="replace") as handle:',
+      '                    content = handle.read(min(4000, artifact_budget))',
+      '            except OSError:',
+      '                continue',
+      '            relative = os.path.relpath(path, directory)',
+      '            print("VERIFIER_PROBE_ARTIFACT", compact({"directory": directory, "path": relative, "content": content}))',
+      '            artifact_paths.append(relative)',
+      '            artifact_budget -= len(content)',
+      '        if artifact_budget <= 0:',
+      '            break',
+      'try:',
+      '    with open(".roy/official-verifier/grade.py", "r", encoding="utf-8") as handle:',
+      '        verifier_lines = handle.read().splitlines()',
+      '    spec_budget = 6000',
+      '    artifact_terms = sorted({os.path.basename(path) for path in artifact_paths if path.startswith("outputs/")})',
+      '    emitted_spec_lines = set()',
+      '    for term in artifact_terms:',
+      '        for index, line in enumerate(verifier_lines):',
+      '            if spec_budget <= 0:',
+      '                break',
+      '            if term not in line or index in emitted_spec_lines:',
+      '                continue',
+      '            start = max(0, index - 2)',
+      '            end = min(len(verifier_lines), index + 7)',
+      '            emitted_spec_lines.update(range(start, end))',
+      '            context = "\\n".join(f"{line_number + 1}: {verifier_lines[line_number]}" for line_number in range(start, end))',
+      '            print("VERIFIER_PROBE_SPEC", compact({"artifact": term, "content": context}))',
+      '            spec_budget -= len(context)',
+      'except OSError:',
+      '    pass',
+      'print("VERIFIER_PROBE_RETAINED_DIRS", compact(retained))',
+    ].join('\n');
+    const encoded = Buffer.from(script, 'utf8').toString('base64');
+    return `ROY_VERIFIER_PROBE=1 python -c "import base64;exec(base64.b64decode('${encoded}'))"`;
   }
 
   private toolPlanFingerprint(
@@ -16103,26 +17121,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
   ): GroundingRunResult | undefined {
     const resumeState = this.resumedExecutionByCorrelation.get(correlationId);
     if (!resumeState) return undefined;
-    const persistedFrontier = resumeState.knowledge.paths
-      .flatMap(path => path.toolFrontier ?? [])
-      .sort((left, right) =>
-        (left.completedAt ?? left.startedAt ?? 0)
-        - (right.completedAt ?? right.startedAt ?? 0)
-      );
-    const toolCalls = this.boundExecutionToolFrontier(
-      persistedFrontier,
-      96,
-      720_000
-    ).map(call => ({
-        toolName: call.toolName,
-        params: call.params,
-        result: call.result,
-        success: call.success,
-        error: call.error,
-        reason: call.reason ?? 'Restored from the persisted causal tool frontier.',
-        startedAt: call.startedAt,
-        completedAt: call.completedAt,
-      }));
+    const toolCalls = this.restoredToolCallsFromResume(correlationId);
     if (toolCalls.length === 0) return undefined;
     const observedPaths = Array.from(new Set(
       resumeState.knowledge.paths.flatMap(path => path.observedPaths)
@@ -16182,6 +17181,35 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         completedAt,
       },
     };
+  }
+
+  private restoredToolCallsFromResume(
+    correlationId: string,
+    maxCalls = 96
+  ): ToolCallRecord[] {
+    const resumeState = this.resumedExecutionByCorrelation.get(correlationId);
+    if (!resumeState) return [];
+    const persistedFrontier = resumeState.knowledge.paths
+      .flatMap(path => path.toolFrontier ?? [])
+      .sort((left, right) =>
+        (left.completedAt ?? left.startedAt ?? 0)
+        - (right.completedAt ?? right.startedAt ?? 0)
+      );
+    const toolCalls = this.boundExecutionToolFrontier(
+      persistedFrontier,
+      maxCalls,
+      720_000
+    ).map(call => ({
+        toolName: call.toolName,
+        params: call.params,
+        result: call.result,
+        success: call.success,
+        error: call.error,
+        reason: call.reason ?? 'Restored from the persisted causal tool frontier.',
+        startedAt: call.startedAt,
+        completedAt: call.completedAt,
+      }));
+    return toolCalls;
   }
 
   private async runRequiredRootExecution(
@@ -16416,6 +17444,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       if (closure.closed) return combined;
       if (current.toolCalls.length === 0) {
         stalledIterations += 1;
+        const stableCausalFrontier = priorExecution ?? delegatedExecution;
         this.emit({
           type: 'root.execution.no_progress.detected',
           agentId: 'root',
@@ -16425,11 +17454,15 @@ For web-grounded work, use only facts present in the subagent report or runtime 
             maxAttempts,
             stalledIterations,
             maxStalledIterations,
-            reason: 'The grounded repair planner exhausted its internal correction attempts without producing a new tool action.',
+            stateUnchanged: Boolean(stableCausalFrontier?.toolCalls.length),
+            reason: stableCausalFrontier?.toolCalls.length
+              ? 'The grounded repair planner produced no action from an unchanged causal frontier; repeating the same evidence would be redundant.'
+              : 'The grounded repair planner exhausted its internal correction attempts without producing a new tool action.',
             latestFailure: priorExecution?.warnings.at(-1),
             ...closure,
           },
         });
+        if (stableCausalFrontier?.toolCalls.length) break;
         if (stalledIterations >= maxStalledIterations) break;
       } else {
         stalledIterations = 0;
@@ -16968,6 +18001,21 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     const seen = new Set<string>();
     return candidates
       .filter(candidate => candidate.toolName && authorized.has(candidate.toolName))
+      .filter(candidate => {
+        const validation = toolRegistry.get(candidate.toolName)?.validate?.(candidate.params);
+        if (validation?.valid !== false) return true;
+        this.emit({
+          type: 'agent.output.tool_intent.invalid',
+          agentId,
+          sessionId: this.getContext().sessionId,
+          data: {
+            toolName: candidate.toolName,
+            params: candidate.params,
+            errors: validation.errors ?? [],
+          },
+        });
+        return false;
+      })
       .map(candidate => ({
         toolName: candidate.toolName,
         params: candidate.params,

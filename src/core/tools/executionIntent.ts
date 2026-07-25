@@ -19,6 +19,10 @@ export interface WorkspaceCandidateRollback {
   candidateReward?: number;
   regressedReward?: number;
   candidateFingerprint?: string;
+  baselineGroups?: Record<string, number>;
+  candidateGroups?: Record<string, number>;
+  regressedGroups?: Array<{ group: string; before?: number; after?: number }>;
+  improvedGroups?: Array<{ group: string; before?: number; after?: number }>;
 }
 
 export function workspaceToolIntentFingerprint(
@@ -205,6 +209,32 @@ export function workspaceCandidateRollbackFromCall(
   if (!value || typeof value !== 'object') return undefined;
   const rollback = value as Record<string, unknown>;
   if (rollback.restored !== true) return undefined;
+  const parseGroups = (
+    groups: unknown
+  ): Array<{ group: string; before?: number; after?: number }> | undefined => {
+    if (!Array.isArray(groups)) return undefined;
+    const parsed = groups.flatMap(item => {
+      if (!item || typeof item !== 'object') return [];
+      const group = item as Record<string, unknown>;
+      if (typeof group.group !== 'string') return [];
+      return [{
+        group: group.group,
+        before: typeof group.before === 'number' ? group.before : undefined,
+        after: typeof group.after === 'number' ? group.after : undefined,
+      }];
+    });
+    return parsed.length > 0 ? parsed : undefined;
+  };
+  const parseGroupScores = (groups: unknown): Record<string, number> | undefined => {
+    if (!groups || typeof groups !== 'object' || Array.isArray(groups)) return undefined;
+    const parsed = Object.fromEntries(
+      Object.entries(groups)
+        .filter((entry): entry is [string, number] =>
+          typeof entry[1] === 'number' && Number.isFinite(entry[1])
+        )
+    );
+    return Object.keys(parsed).length > 0 ? parsed : undefined;
+  };
   return {
     restored: true,
     path: typeof rollback.path === 'string' ? rollback.path : undefined,
@@ -221,6 +251,10 @@ export function workspaceCandidateRollbackFromCall(
     candidateFingerprint: typeof rollback.candidateFingerprint === 'string'
       ? rollback.candidateFingerprint
       : undefined,
+    baselineGroups: parseGroupScores(rollback.baselineGroups),
+    candidateGroups: parseGroupScores(rollback.candidateGroups),
+    regressedGroups: parseGroups(rollback.regressedGroups),
+    improvedGroups: parseGroups(rollback.improvedGroups),
   };
 }
 

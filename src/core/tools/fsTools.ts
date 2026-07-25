@@ -272,11 +272,12 @@ export class FsWriteTool implements Tool {
  */
 export class FsSynthesizeTool implements Tool {
   readonly name = 'fs.synthesize';
-  readonly description = 'Generate the complete contents of one already-inspected workspace file from grounded evidence. Pass only the path and concise implementation instructions; Runtime generates the source outside structured tool JSON and writes it transactionally.';
+  readonly description = 'Generate a complete file or a focused patch for one already-inspected workspace file from grounded evidence. Pass only the path, concise instructions, and optional strategy; Runtime generates the payload outside structured tool JSON and writes it transactionally.';
   readonly version = '0.1.0';
   readonly parameters = {
     path: { type: 'string' as const, required: true, description: 'Relative file path inside the workspace. Inspect it or its parent first.' },
     instructions: { type: 'string' as const, required: true, description: 'Concise implementation or repair requirements. Do not include the file contents.' },
+    strategy: { type: 'string' as const, required: false, enum: ['complete', 'patch'], description: 'Use patch for a focused repair that must preserve an existing implementation; defaults to complete.' },
   };
 
   validate(params: Record<string, unknown>): { valid: boolean; errors?: string[] } {
@@ -289,6 +290,11 @@ export class FsSynthesizeTool implements Tool {
     }
     if (typeof params.instructions === 'string' && params.instructions.length > 4_000) {
       errors.push('instructions must be at most 4000 characters; source content belongs in the runtime synthesis channel');
+    }
+    if (params.strategy !== undefined
+      && params.strategy !== 'complete'
+      && params.strategy !== 'patch') {
+      errors.push('strategy must be complete or patch when provided');
     }
     return { valid: errors.length === 0, errors: errors.length > 0 ? errors : undefined };
   }

@@ -226,6 +226,16 @@ describe('AgentToolPlanner', () => {
           result: {
             path: 'src/table_recon/audit.py',
             content: 'def run_audit(manifest, output):\n    reconstruct_public(manifest, output)\n',
+            truncated: true,
+          },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/table_recon/cli.py', maxBytes: 30_000 },
+          success: true,
+          result: {
+            path: 'src/table_recon/cli.py',
+            content: 'from .audit import run_audit\n',
             truncated: false,
           },
         },
@@ -256,6 +266,143 @@ describe('AgentToolPlanner', () => {
           success: true,
           result: { path: 'src/table_recon/audit.py', synthesized: true },
         },
+      ],
+    })).toEqual([]);
+
+    const rejectedCalls = [
+      ...calls,
+      {
+        toolName: 'fs.synthesize',
+        params: {
+          path: 'src/table_recon/audit.py',
+          instructions: 'Broad preserving repair.',
+        },
+        success: true,
+        result: { path: 'src/table_recon/audit.py', synthesized: true },
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python .roy/official-verifier/grade.py' },
+        success: true,
+        result: {
+          cwd: '/app',
+          stdout: '0.015000000000\n',
+          exitCode: 0,
+          verifierDiagnostics: [{
+            path: '/logs/verifier/scorecard.json',
+            content: '{"groups":{"G_public_reconstruction":1,"G_hidden_end_to_end_stress":0}}',
+          }, {
+            path: '/logs/verifier/grade.log',
+            content: [
+              'Traceback (most recent call last):',
+              '  File "/app/src/table_recon/audit.py", line 478, in run_audit',
+              '    is_cropped = _is_cropped(tokens, all_cells, page_w, page_h)',
+              "UnboundLocalError: cannot access local variable 'all_cells'",
+            ].join('\n'),
+          }],
+          candidateRollback: {
+            restored: true,
+            path: 'src/table_recon/audit.py',
+            reason: 'reward_regression',
+            baselineReward: 0.02,
+            candidateReward: 0.015,
+            regressedGroups: [{
+              group: 'G_public_reconstruction',
+              before: 1,
+              after: 0,
+            }],
+          },
+        },
+      },
+      {
+        toolName: 'shell.exec',
+        params: {
+          command: 'ROY_VERIFIER_PROBE=1 python .roy/runtime/verifier_probe.py',
+        },
+        success: true,
+        result: {
+          command: 'ROY_VERIFIER_PROBE=1 python .roy/runtime/verifier_probe.py',
+          stdout: [
+            'VERIFIER_PROBE_EVIDENCE_VERSION 2',
+            'VERIFIER_PROBE_CALL reconstruction_fraction',
+            'VERIFIER_PROBE_MISMATCHES {"mismatch_count":1,"mismatches":[{"expected":"Q2","actual":null}]}',
+            'VERIFIER_PROBE_SPEC {"artifact":"layout_qc.json","content":"qc.get(\\"cropped_pages_detected\\", 0) >= 1"}',
+            `VERIFIER_PROBE_ARTIFACT ${JSON.stringify({
+              directory: '/tmp/hidden',
+              path: 'hidden_input_manifest.json',
+              content: 'x'.repeat(5_000),
+            })}`,
+            `VERIFIER_PROBE_ARTIFACT ${JSON.stringify({
+              directory: '/tmp/hidden',
+              path: 'outputs/layout_qc.json',
+              content: '{"rotated_or_skewed_pages_detected":["a","b"],"cropped_pages_detected":[]}',
+            })}`,
+          ].join('\n'),
+        },
+      },
+    ];
+    const focused = planner.planWorkspaceRepairTransition({
+      task,
+      workspaceRoot: '/app',
+      bindings,
+      calls: rejectedCalls,
+    });
+    expect(focused).toEqual([expect.objectContaining({
+      toolName: 'fs.synthesize',
+      params: expect.objectContaining({
+        path: 'src/table_recon/audit.py',
+        instructions: expect.stringMatching(
+          /G_hidden_end_to_end_stress[\s\S]*G_public_reconstruction/
+        ),
+      }),
+      reason: expect.stringContaining('repair hypothesis'),
+    })]);
+    expect(String(focused[0]?.params.instructions)).toContain(
+      'VERIFIER_PROBE_MISMATCHES'
+    );
+    expect(String(focused[0]?.params.instructions)).toContain('layout_qc.json');
+    expect(String(focused[0]?.params.instructions).length).toBeLessThanOrEqual(4_000);
+    const focusedPlan = focused[0]!;
+    expect(planner.planWorkspaceRepairTransition({
+      task,
+      workspaceRoot: '/app',
+      bindings,
+      calls: [
+        ...rejectedCalls,
+        {
+          toolName: 'shell.exec',
+          params: { command: 'python .roy/official-verifier/grade.py' },
+          success: true,
+          result: {
+            cwd: '/app',
+            stdout: '0.020000000000\n',
+            exitCode: 0,
+            verifierDiagnostics: [{
+              path: '/logs/verifier/scorecard.json',
+              content: '{"groups":{"G_public_reconstruction":1,"G_hidden_end_to_end_stress":0}}',
+            }],
+          },
+        },
+      ],
+    })).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.synthesize',
+        params: expect.objectContaining({ strategy: 'patch' }),
+      }),
+    ]);
+    expect(planner.planWorkspaceRepairTransition({
+      task,
+      workspaceRoot: '/app',
+      bindings,
+      calls: [
+        ...rejectedCalls,
+        {
+          toolName: focusedPlan.toolName,
+          params: focusedPlan.params,
+          success: true,
+          result: { path: 'src/table_recon/audit.py', synthesized: true },
+        },
+        rejectedCalls.at(-1)!,
       ],
     })).toEqual([]);
   });

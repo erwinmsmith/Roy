@@ -173,7 +173,91 @@ class ToolMarkupSynthesisLLM extends EchoLLM {
   }
 }
 
+class FocusedPatchSynthesisLLM extends EchoLLM {
+  readonly streamedPrompts: string[] = [];
+
+  override async *stream(messages: LLMMessage[]): AsyncGenerator<LLMStreamChunk, void, unknown> {
+    const prompt = messages.map(message => message.content).join('\n');
+    this.streamedPrompts.push(prompt);
+    yield {
+      content: prompt.includes('[runtime_workspace_file_patch_synthesis]')
+        ? [
+          '--- a/app.js',
+          '+++ b/app.js',
+          '@@ -14,1 +14,1 @@',
+          '-export function value() { return 41; }',
+          '+export function value() { return 42; }',
+          ' export function keep() { return "stable"; }',
+        ].join('\n')
+        : 'Focused patch completed.',
+      done: true,
+      usage: { promptTokens: 32, completionTokens: 20, totalTokens: 52 },
+    };
+  }
+}
+
+class RecoveringFocusedPatchSynthesisLLM extends EchoLLM {
+  readonly streamedPrompts: string[] = [];
+
+  override async *stream(messages: LLMMessage[]): AsyncGenerator<LLMStreamChunk, void, unknown> {
+    const prompt = messages.map(message => message.content).join('\n');
+    this.streamedPrompts.push(prompt);
+    yield {
+      content: prompt.includes('[runtime_workspace_file_patch_recovery]')
+        ? [
+          '--- a/app.js',
+          '+++ b/app.js',
+          '@@ -1,2 +1,2 @@',
+          '-export function value() { return 41; }',
+          '+export function value() { return 42; }',
+          ' export function keep() { return "stable"; }',
+        ].join('\n')
+        : [
+          '--- a/app.js',
+          '+++ b/app.js',
+          '@@ -1,1 +1,1 @@',
+          '-export function missing() { return 0; }',
+          '+export function value() { return 42; }',
+        ].join('\n'),
+      done: true,
+      usage: { promptTokens: 32, completionTokens: 20, totalTokens: 52 },
+    };
+  }
+}
+
 describe('Runtime controlled subagent spawning', () => {
+  it('requires new causal evidence before retrying a rejected synthesis', () => {
+    const runtime = new Runtime();
+    const unresolved = (runtime as unknown as {
+      hasUnresolvedSynthesisRejection: (
+        calls: Array<Record<string, unknown>>
+      ) => boolean;
+    }).hasUnresolvedSynthesisRejection.bind(runtime);
+    const rejected = [{
+      toolName: 'fs.synthesize',
+      params: { path: 'src/app.py', strategy: 'patch' },
+      success: false,
+      result: {
+        synthesisRejected: true,
+        path: 'src/app.py',
+        reason: 'source anchor mismatch',
+      },
+    }];
+
+    expect(unresolved(rejected)).toBe(true);
+    expect(unresolved([
+      ...rejected,
+      {
+        toolName: 'shell.exec',
+        params: {
+          command: 'ROY_VERIFIER_PROBE=1 python .roy/runtime/verifier_probe.py',
+        },
+        success: true,
+        result: { stdout: 'VERIFIER_PROBE_MISMATCHES expected=A actual=B' },
+      },
+    ])).toBe(false);
+  });
+
   it('does not route a local repair through web tools because verifier logs contain URLs', () => {
     const runtime = new Runtime();
     const needsWeb = (task: string) => (runtime as unknown as {
@@ -352,6 +436,114 @@ describe('Runtime controlled subagent spawning', () => {
     await runtime.shutdown();
   });
 
+  it('carries resumed causal evidence into an implementation closure continuation', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-closure-frontier-'));
+    await writeFile(path.join(workspaceCwd, 'app.ts'), 'export const value = "stub";\n');
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'closure-frontier-test',
+      llmProvider: new EchoLLM(),
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+    const task = 'Repair app.ts and verify the implementation.';
+    const coder = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'coder',
+      name: 'ClosureFrontierCoder-1',
+      description: task,
+      task,
+      tools: ['fs.read', 'fs.replace', 'shell.exec'],
+    });
+    const resumedDiagnostic = {
+      toolName: 'shell.exec',
+      params: { command: 'ROY_VERIFIER_PROBE=1 python -c "print(1)"' },
+      success: true,
+      result: { exitCode: 0, stdout: 'VERIFIER_PROBE_RESULT 0.5' },
+    };
+    let groundingRuns = 0;
+    let continuationPriorCalls: Array<{ toolName: string; params: Record<string, unknown> }> = [];
+    (
+      runtime as unknown as {
+        runGroundingCheck: (
+          agentId: string,
+          task: string,
+          options: {
+            priorToolCalls?: Array<{
+              toolName: string;
+              params: Record<string, unknown>;
+            }>;
+          }
+        ) => Promise<Record<string, unknown>>;
+      }
+    ).runGroundingCheck = async (_agentId, _task, options) => {
+      groundingRuns += 1;
+      const toolCalls = groundingRuns === 1
+        ? [{
+          toolName: 'fs.read',
+          params: { path: 'app.ts' },
+          success: true,
+          result: { path: 'app.ts', content: 'export const value = "stub";\n' },
+        }]
+        : [{
+          toolName: 'fs.replace',
+          params: { path: 'app.ts', oldText: '"stub"', newText: '"ready"' },
+          success: true,
+          result: { path: 'app.ts', replaced: true },
+        }, {
+          toolName: 'shell.exec',
+          params: { command: 'npm test' },
+          success: true,
+          result: { command: 'npm test', exitCode: 0 },
+        }];
+      if (groundingRuns === 2) {
+        continuationPriorCalls = options.priorToolCalls ?? [];
+      }
+      const now = Date.now();
+      return {
+        toolCalls,
+        grounded: true,
+        warnings: [],
+        context: '',
+        evidence: {
+          toolGrounded: true,
+          outputGrounded: true,
+          observedPaths: ['app.ts'],
+        },
+        toolLoop: {
+          rounds: [],
+          totalCalls: toolCalls.length,
+          successfulCalls: toolCalls.length,
+          failedCalls: 0,
+          stopReason: 'completed',
+          startedAt: now,
+          completedAt: now,
+        },
+      };
+    };
+
+    await runtime.runAgent(coder.identity.id, task, {
+      disableRecursiveDelegation: true,
+      archetype: 'coder',
+      priorToolCalls: [resumedDiagnostic],
+    });
+
+    expect(groundingRuns).toBe(2);
+    expect(continuationPriorCalls).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        toolName: 'shell.exec',
+        params: expect.objectContaining({
+          command: expect.stringContaining('ROY_VERIFIER_PROBE=1'),
+        }),
+      }),
+      expect.objectContaining({
+        toolName: 'fs.read',
+        params: expect.objectContaining({ path: 'app.ts' }),
+      }),
+    ]));
+    await runtime.shutdown();
+  });
+
   it('does not demand a workspace mutation from a read-only evidence member whose task references the parent implementation', async () => {
     const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-read-only-parent-task-'));
     await writeFile(path.join(workspaceCwd, 'app.ts'), 'export const value = "stub";\n');
@@ -501,6 +693,293 @@ describe('Runtime controlled subagent spawning', () => {
       30_000
     );
     expect(verifierEvidence).toContain('UNIQUE_HIDDEN_ASSERTION');
+    await runtime.shutdown();
+  });
+
+  it('applies a focused runtime-generated patch without rewriting working source', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-file-patch-'));
+    await writeFile(
+      path.join(workspaceCwd, 'app.js'),
+      [
+        'export function value() { return 41; }',
+        'export function keep() { return "stable"; }',
+        '',
+      ].join('\n')
+    );
+    await mkdir(path.join(workspaceCwd, '.roy'), { recursive: true });
+    await writeFile(
+      path.join(workspaceCwd, '.roy', 'config.json'),
+      JSON.stringify({
+        tools: {
+          approval: {
+            readOnly: 'auto',
+            write: 'auto',
+          },
+        },
+      })
+    );
+    const llm = new FocusedPatchSynthesisLLM();
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'file-patch-synthesis-test',
+      llmProvider: llm,
+      workspaceCwd,
+    });
+    const observed = await runtime.executeToolForAgent(
+      'root',
+      'fs.read',
+      { path: 'app.js' },
+      { correlationId: 'file-patch-synthesis-correlation' }
+    );
+    const patched = await runtime.executeToolForAgent(
+      'root',
+      'fs.synthesize',
+      {
+        path: 'app.js',
+        instructions: 'Correct value while preserving the stable API.',
+        strategy: 'patch',
+      },
+      {
+        correlationId: 'file-patch-synthesis-correlation',
+        synthesisTask: 'Repair app.js without rewriting working behavior.',
+        groundingCalls: [{
+          toolName: 'fs.read',
+          params: { path: 'app.js' },
+          reason: 'Observe the authoritative current source.',
+          groundingRequired: true,
+          success: observed.success,
+          result: observed.result,
+          error: observed.error,
+        }],
+      }
+    );
+
+    expect(patched).toMatchObject({
+      success: true,
+      result: expect.objectContaining({
+        path: 'app.js',
+        synthesized: true,
+        strategy: 'patch',
+      }),
+    });
+    expect(await readFile(path.join(workspaceCwd, 'app.js'), 'utf8')).toBe([
+      'export function value() { return 42; }',
+      'export function keep() { return "stable"; }',
+      '',
+    ].join('\n'));
+    expect(llm.streamedPrompts).toContainEqual(
+      expect.stringContaining('[runtime_workspace_file_patch_synthesis]')
+    );
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'tool.synthesis.completed',
+      data: expect.objectContaining({
+        strategy: 'patch',
+      }),
+    }));
+    await runtime.shutdown();
+  });
+
+  it('applies exact non-overlapping patch anchors despite stale line numbers and hunk order', async () => {
+    const runtime = new Runtime();
+    const applyPatch = (runtime as unknown as {
+      applyUnifiedPatchToContent: (
+        current: string,
+        patch: string
+      ) => { content?: string; error?: string };
+    }).applyUnifiedPatchToContent.bind(runtime);
+    const current = [
+      'def earlier():',
+      '    value = 1',
+      '    return value',
+      '',
+      'def later():',
+      '    flag = False',
+      '    return flag',
+      '',
+    ].join('\n');
+    const patch = [
+      '--- a/app.py',
+      '+++ b/app.py',
+      '@@ -40,3 +40,3 @@',
+      ' def later():',
+      '-    flag = False',
+      '+    flag = True',
+      '     return flag',
+      '@@ -44,3 +44,3 @@',
+      ' def earlier():',
+      '-    value = 1',
+      '+    value = 2',
+      '     return value',
+    ].join('\n');
+
+    expect(applyPatch(current, patch)).toEqual({
+      content: [
+        'def earlier():',
+        '    value = 2',
+        '    return value',
+        '',
+        'def later():',
+        '    flag = True',
+        '    return flag',
+        '',
+      ].join('\n'),
+    });
+  });
+
+  it('retries a rejected focused patch once with exact anchor feedback', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-file-patch-recovery-'));
+    await writeFile(
+      path.join(workspaceCwd, 'app.js'),
+      [
+        'export function value() { return 41; }',
+        'export function keep() { return "stable"; }',
+        '',
+      ].join('\n')
+    );
+    await mkdir(path.join(workspaceCwd, '.roy'), { recursive: true });
+    await writeFile(
+      path.join(workspaceCwd, '.roy', 'config.json'),
+      JSON.stringify({
+        tools: {
+          approval: {
+            readOnly: 'auto',
+            write: 'auto',
+          },
+        },
+      })
+    );
+    const llm = new RecoveringFocusedPatchSynthesisLLM();
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'file-patch-synthesis-recovery-test',
+      llmProvider: llm,
+      workspaceCwd,
+    });
+    const observed = await runtime.executeToolForAgent(
+      'root',
+      'fs.read',
+      { path: 'app.js' },
+      { correlationId: 'file-patch-synthesis-recovery-correlation' }
+    );
+    const patched = await runtime.executeToolForAgent(
+      'root',
+      'fs.synthesize',
+      {
+        path: 'app.js',
+        instructions: 'Correct only the returned value.',
+        strategy: 'patch',
+      },
+      {
+        correlationId: 'file-patch-synthesis-recovery-correlation',
+        synthesisTask: 'Repair app.js without rewriting working behavior.',
+        groundingCalls: [{
+          toolName: 'fs.read',
+          params: { path: 'app.js' },
+          reason: 'Observe the authoritative current source.',
+          groundingRequired: true,
+          success: observed.success,
+          result: observed.result,
+          error: observed.error,
+        }],
+      }
+    );
+
+    expect(patched).toMatchObject({
+      success: true,
+      result: expect.objectContaining({ strategy: 'patch' }),
+    });
+    expect(await readFile(path.join(workspaceCwd, 'app.js'), 'utf8')).toContain(
+      'return 42'
+    );
+    expect(llm.streamedPrompts).toContainEqual(
+      expect.stringContaining('[runtime_workspace_file_patch_recovery]')
+    );
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'tool.synthesis.retrying',
+      data: expect.objectContaining({
+        strategy: 'patch',
+        reason: expect.stringContaining('anchor'),
+      }),
+    }));
+    await runtime.shutdown();
+  });
+
+  it('keeps one workspace mutation hypothesis in a combined causal frontier', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-single-mutation-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'single-mutation-hypothesis-test',
+      llmProvider: new EchoLLM(),
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+    const prioritize = (runtime as unknown as {
+      keepSingleWorkspaceMutationHypothesis: (
+        plans: Array<{
+          toolName: string;
+          params: Record<string, unknown>;
+          reason: string;
+          groundingRequired: boolean;
+        }>,
+        agentId?: string,
+        options?: { correlationId?: string }
+      ) => Array<{ toolName: string; params: Record<string, unknown> }>;
+    }).keepSingleWorkspaceMutationHypothesis.bind(runtime);
+
+    const selected = prioritize([
+      {
+        toolName: 'fs.read',
+        params: { path: 'src/app.py' },
+        reason: 'Observe the target.',
+        groundingRequired: true,
+      },
+      {
+        toolName: 'fs.synthesize',
+        params: {
+          path: 'src/app.py',
+          strategy: 'patch',
+          instructions: 'Apply the focused verifier repair.',
+        },
+        reason: 'Execute the causal repair hypothesis.',
+        groundingRequired: true,
+      },
+      {
+        toolName: 'fs.synthesize',
+        params: {
+          path: 'src/app.py',
+          instructions: 'Repair the implementation.',
+        },
+        reason: 'Generic model fallback.',
+        groundingRequired: true,
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python .roy/official-verifier/grade.py' },
+        reason: 'Verify the selected repair.',
+        groundingRequired: true,
+      },
+    ], 'root', { correlationId: 'single-mutation-hypothesis-correlation' });
+
+    expect(selected).toEqual([
+      expect.objectContaining({ toolName: 'fs.read' }),
+      expect.objectContaining({
+        toolName: 'fs.synthesize',
+        params: expect.objectContaining({ strategy: 'patch' }),
+      }),
+      expect.objectContaining({ toolName: 'shell.exec' }),
+    ]);
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'tool.plan.mutation_hypothesis.deferred',
+      data: expect.objectContaining({
+        reason: 'verify_current_workspace_hypothesis_before_another_mutation',
+        deferred: [
+          expect.objectContaining({
+            toolName: 'fs.synthesize',
+            params: expect.not.objectContaining({ strategy: 'patch' }),
+          }),
+        ],
+      }),
+    }));
     await runtime.shutdown();
   });
 
@@ -750,6 +1229,40 @@ describe('Runtime controlled subagent spawning', () => {
     await runtime.shutdown();
   });
 
+  it('does not execute recovered tool markup with invalid required parameters', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-invalid-tool-intent-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'invalid-tool-intent-recovery-test',
+      llmProvider: new EchoLLM(),
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+    const extract = (runtime as unknown as {
+      extractUnresolvedToolPlans: (
+        agentId: string,
+        result: string
+      ) => Array<{ toolName: string; params: Record<string, unknown> }>;
+    }).extractUnresolvedToolPlans.bind(runtime);
+
+    expect(extract(
+      'root',
+      '<tool_call><tool_name>fs.read</tool_name></tool_call>'
+    )).toEqual([]);
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'agent.output.tool_intent.invalid',
+      agentId: 'root',
+      data: expect.objectContaining({
+        toolName: 'fs.read',
+        params: {},
+        errors: expect.arrayContaining([
+          expect.stringContaining('path must be a non-empty string'),
+        ]),
+      }),
+    }));
+    await runtime.shutdown();
+  });
+
   it('executes native invoke/parameter XML even after earlier grounding calls', async () => {
     const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-native-tool-intent-'));
     await writeFile(path.join(workspaceCwd, 'package.json'), '{"name":"seed-grounded"}\n', 'utf8');
@@ -891,6 +1404,145 @@ describe('Runtime controlled subagent spawning', () => {
     expect(result.grounded).toBe(false);
     expect(result.warnings).toContainEqual(expect.stringContaining('no authorized tool call'));
 
+    await runtime.shutdown();
+  });
+
+  it('instruments a Python verifier to expose focused scorer inputs without deleting fixtures', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-python-verifier-probe-'));
+    const verifierDirectory = path.join(workspaceCwd, '.roy', 'official-verifier');
+    await mkdir(verifierDirectory, { recursive: true });
+    await writeFile(
+      path.join(verifierDirectory, 'grade.py'),
+      [
+        'import tempfile',
+        'from pathlib import Path',
+        '',
+        'def reconstruction_fraction(actual, expected):',
+        '    return 1.0 if actual == expected else 0.0',
+        '',
+        'def grade():',
+        '    with tempfile.TemporaryDirectory(prefix="fixture_probe_") as directory:',
+        '        Path(directory, "fixture.txt").write_text("retained", encoding="utf-8")',
+        '        output = Path(directory, "outputs")',
+        '        output.mkdir()',
+        '        Path(output, "layout_qc.json").write_text(\'{"cropped_pages_detected": []}\', encoding="utf-8")',
+        '        actual = {("doc", "table", 0, 0): "wrong"}',
+        '        expected = [{"document_id": "doc", "table_id": "table", "row_index": 0, "col_index": 0, "text": "right"}]',
+        '        return reconstruction_fraction(actual, expected)',
+        '',
+      ].join('\n'),
+      'utf8'
+    );
+    await writeFile(
+      path.join(workspaceCwd, '.roy', 'config.json'),
+      JSON.stringify({
+        tools: {
+          shell: {
+            mode: 'unrestricted',
+            shell: '/bin/sh',
+          },
+          approval: {
+            execute: 'auto',
+          },
+        },
+      }),
+      'utf8'
+    );
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'python-verifier-probe-test',
+      llmProvider: new EchoLLM(),
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+    const command = (runtime as unknown as {
+      buildPythonVerifierDiagnosticCommand: () => string;
+    }).buildPythonVerifierDiagnosticCommand();
+    const probe = await runtime.executeToolForAgent(
+      'root',
+      'shell.exec',
+      { command, timeoutMs: 30_000, maxOutputBytes: 24_000 },
+      { correlationId: 'python-verifier-probe-correlation' }
+    );
+    const stdout = String((probe.result as { stdout?: unknown } | undefined)?.stdout ?? '');
+
+    expect(probe.error).toBeUndefined();
+    expect(probe).toMatchObject({ success: true });
+    expect(stdout).toContain('VERIFIER_PROBE_EVIDENCE_VERSION 2');
+    expect(stdout).toContain('VERIFIER_PROBE_CALL reconstruction_fraction');
+    expect(stdout).toContain('"actual": "wrong"');
+    expect(stdout).toContain('"expected": "right"');
+    expect(stdout).toContain('VERIFIER_PROBE_ARTIFACT');
+    expect(stdout).toContain('layout_qc.json');
+    expect(stdout).toContain('cropped_pages_detected');
+    expect(stdout).toContain('VERIFIER_PROBE_SPEC');
+    expect(stdout).toContain('VERIFIER_PROBE_RETAINED_DIRS');
+    const compactProbe = (
+      runtime as unknown as {
+        compactVerifierProbeEvidenceText: (output: string, maxChars: number) => string;
+      }
+    ).compactVerifierProbeEvidenceText([
+      'VERIFIER_PROBE_EVIDENCE_VERSION 2',
+      `VERIFIER_PROBE_ARTIFACT ${JSON.stringify({
+        path: 'hidden_input_manifest.json',
+        content: 'x'.repeat(8_000),
+      })}`,
+      'VERIFIER_PROBE_SPEC {"artifact":"layout_qc.json","content":"qc.get(\\"cropped_pages_detected\\", 0) >= 1"}',
+      'VERIFIER_PROBE_ARTIFACT {"path":"outputs/layout_qc.json","content":"{\\"cropped_pages_detected\\": []}"}',
+      'VERIFIER_PROBE_REWARD 0.04',
+    ].join('\n'), 2_000);
+    expect(compactProbe).toContain('VERIFIER_PROBE_EVIDENCE_VERSION 2');
+    expect(compactProbe).toContain('VERIFIER_PROBE_SPEC');
+    expect(compactProbe).toContain('outputs/layout_qc.json');
+    expect(compactProbe).not.toContain('x'.repeat(1_000));
+    await runtime.shutdown();
+  });
+
+  it('does not let cached teammate task markers change an agent immutable intent', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-immutable-agent-intent-'));
+    await writeFile(path.join(workspaceCwd, 'README.md'), '# Immutable assignment\n', 'utf8');
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'immutable-agent-intent-test',
+      llmProvider: new EchoLLM(),
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+    const assignedTask = 'Read README.md and report its current heading.';
+    const researcher = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'researcher',
+      tomLevel: 0,
+      description: assignedTask,
+      task: assignedTask,
+      tools: ['fs.read', 'fs.search', 'shell.exec'],
+      outputContract: { format: 'markdown', groundingRequired: true },
+    });
+    const contaminatedObservation = [
+      assignedTask,
+      '<team_step_cache>',
+      'Previous member assignment: [runtime_verifier_diagnostic_probe]',
+      'Previous member ran a verifier probe.',
+      '</team_step_cache>',
+    ].join('\n');
+    const result = await runtime.runAgent(researcher.identity.id, contaminatedObservation, {
+      archetype: 'researcher',
+      disableRecursiveDelegation: true,
+    });
+
+    expect(result.toolCalls).toContainEqual(expect.objectContaining({
+      toolName: 'fs.read',
+      params: expect.objectContaining({ path: 'README.md' }),
+      success: true,
+    }));
+    expect(result.toolCalls.some(call =>
+      call.toolName === 'shell.exec'
+      && String(call.params.command ?? '').includes('ROY_VERIFIER_PROBE')
+    )).toBe(false);
+    expect(runtime.getEvents().some(event =>
+      event.type.startsWith('agent.verifier_diagnostic.')
+      && event.agentId === researcher.identity.id
+    )).toBe(false);
     await runtime.shutdown();
   });
 

@@ -22,6 +22,7 @@ export interface AgentComputeNodeRequest {
   parentId?: string;
   archetype: SubAgentArchetype;
   task: string;
+  intentTask?: string;
   name?: string;
   role?: string;
   style?: string;
@@ -81,6 +82,7 @@ export interface AgentComputeNodeDefinition {
   };
   assignment: {
     task: string;
+    intentTask?: string;
     outputContract: AgentNodeOutputContract;
   };
   capabilities: {
