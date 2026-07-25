@@ -8093,7 +8093,24 @@ export class Runtime {
         }
 
         const recoveryPlans = this.extractUnresolvedToolPlans(agentId, result);
-        if (recoveryPlans.length > 0) {
+        const novelRecoveryPlans = recoveryPlans.filter(plan => {
+          const cached = this.cachedToolPlanDecision(plan, grounding.toolCalls);
+          if (!cached.skip) return true;
+          this.emit({
+            type: 'agent.output.tool_intent.recovery.skipped',
+            agentId,
+            sessionId: ctx.sessionId,
+            correlationId: options.correlationId,
+            data: {
+              task,
+              toolName: plan.toolName,
+              params: plan.params,
+              reason: cached.reason,
+            },
+          });
+          return false;
+        });
+        if (novelRecoveryPlans.length > 0) {
           this.emit({
             type: 'agent.output.tool_intent.recovery.started',
             agentId,
@@ -8101,13 +8118,13 @@ export class Runtime {
             correlationId: options.correlationId,
             data: {
               task,
-              tools: recoveryPlans.map(plan => plan.toolName),
+              tools: novelRecoveryPlans.map(plan => plan.toolName),
             },
           });
           const recovered = await this.runGroundingCheck(agentId, task, {
             ...options,
             intentTask: immutableActorTask,
-            initialPlans: recoveryPlans,
+            initialPlans: novelRecoveryPlans,
             priorToolCalls: grounding.toolCalls,
             skipInitialModelPlanning: true,
           });
@@ -16141,6 +16158,21 @@ For web-grounded work, use only facts present in the subagent report or runtime 
           return failureContextPlans.slice(0, context.remainingCalls);
         }
         const combinedCalls = [...priorPlannerCalls, ...context.calls];
+        if (diagnosticProbeRequired
+          && context.calls.some(call => this.isFocusedVerifierDiagnosticCall(call))) {
+          this.emit({
+            type: 'agent.tool_loop.diagnostic_closed',
+            agentId,
+            sessionId: this.getContext().sessionId,
+            correlationId: options.correlationId,
+            nodeId: options.nodeId,
+            data: {
+              round: context.round,
+              reason: 'focused_verifier_probe_completed',
+            },
+          });
+          return [];
+        }
         const workspaceEvidencePlans = this.toolPlanner.planWorkspaceEvidenceFollowUps({
           task: intentTask,
           calls: combinedCalls,
