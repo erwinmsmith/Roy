@@ -47,6 +47,23 @@ class EchoLLM implements LLMProvider {
   }
 }
 
+class OversizedUsageLLM extends EchoLLM {
+  override async *stream(
+    _messages: LLMMessage[],
+    _options?: LLMCompletionOptions
+  ): AsyncGenerator<LLMStreamChunk, void, unknown> {
+    yield {
+      content: 'Completed a productive long-horizon slice beyond the initial accounting estimate.',
+      done: true,
+      usage: {
+        promptTokens: 420,
+        completionTokens: 180,
+        totalTokens: 600,
+      },
+    };
+  }
+}
+
 class SaturatedClosurePlanningLLM extends EchoLLM {
   sawSaturatedEvidence = false;
 
@@ -319,6 +336,52 @@ class RecoveringFocusedPatchSynthesisLLM extends EchoLLM {
 }
 
 describe('Runtime controlled subagent spawning', () => {
+  it('treats unlimited per-agent allocations as renewable accounting leases', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-renewable-lease-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'renewable-lease-test',
+      llmProvider: new OversizedUsageLLM(),
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+    const worker = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'summarizer',
+      name: 'LongHorizonWorker',
+      description: 'Complete one bounded productive slice.',
+      task: 'Return one grounded summary.',
+      budgetTokens: 256,
+    });
+
+    const result = await runtime.runAgent(
+      worker.identity.id,
+      'Return one grounded summary.',
+      {
+        correlationId: 'renewable-lease-correlation',
+        archetype: 'summarizer',
+        disableRecursiveDelegation: true,
+      }
+    );
+
+    expect(result.result).toContain('productive long-horizon slice');
+    expect(result.usage.totalTokens).toBe(600);
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'budget.rebalanced',
+      agentId: worker.identity.id,
+      data: expect.objectContaining({
+        purpose: 'agent_run_settlement',
+        reason: 'unlimited_active_actor_lease_renewal',
+        requiredConsumedTokens: 600,
+      }),
+    }));
+    expect(runtime.getEvents().some(event =>
+      event.type === 'budget.exceeded'
+      && event.agentId === worker.identity.id
+    )).toBe(false);
+    await runtime.shutdown();
+  });
+
   it('uses Python 3 for verifier probes and safely quotes an explicit interpreter path', () => {
     const previous = process.env.ROY_PYTHON_EXECUTABLE;
     const runtime = new Runtime();
@@ -3284,7 +3347,8 @@ describe('Runtime controlled subagent spawning', () => {
       event.type === 'budget.context.truncated'
       && event.agentId === researcher.identity.id
       && event.data?.purpose === 'agent.multi_child_synthesis'
-    )).toBe(true);
+    )).toBe(false);
+    expect(runtime.getBudgetState().mode).toBe('unlimited');
 
     await runtime.shutdown();
   });

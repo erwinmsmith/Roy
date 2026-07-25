@@ -123,7 +123,7 @@ export class BudgetMarket {
     minimumAdditionalTokens = 1
   ): BudgetAllocation | undefined {
     const allocation = this.allocations.get(allocationId);
-    if (!allocation || allocation.status !== 'granted') return undefined;
+    if (!allocation || !['granted', 'exceeded'].includes(allocation.status)) return undefined;
 
     const requested = Math.max(0, Math.floor(requestedAdditionalTokens));
     const minimum = Math.max(1, Math.floor(minimumAdditionalTokens));
@@ -148,6 +148,13 @@ export class BudgetMarket {
     const previousTokens = allocation.allocatedTokens;
     allocation.allocatedTokens += available;
     allocation.grantedTokens += available;
+    if (allocation.allocatedTokens >= allocation.consumedTokens) {
+      allocation.status = 'granted';
+    }
+    allocation.utilization = allocation.allocatedTokens === 0
+      ? 0
+      : allocation.consumedTokens / allocation.allocatedTokens;
+    allocation.efficiency = this.efficiency(allocation);
     allocation.rationale = 'continuation_budget_augmented';
     allocation.reason = allocation.rationale;
     allocation.updatedAt = Date.now();

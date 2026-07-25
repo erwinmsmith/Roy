@@ -2323,6 +2323,30 @@ export class Runtime {
     ].join('\n\n');
   }
 
+  private failedAgentRunProducedWorkspaceMutation(error: unknown): boolean {
+    const inspected = new Set<unknown>();
+    let current: unknown = error;
+    while (current && typeof current === 'object' && !inspected.has(current)) {
+      inspected.add(current);
+      const candidate = current as {
+        runtimeToolCalls?: unknown;
+        cause?: unknown;
+      };
+      if (Array.isArray(candidate.runtimeToolCalls)
+        && candidate.runtimeToolCalls.some(call =>
+          call
+          && typeof call === 'object'
+          && isSuccessfulWorkspaceMutationCall(
+            call as Parameters<typeof isSuccessfulWorkspaceMutationCall>[0]
+          )
+        )) {
+        return true;
+      }
+      current = candidate.cause;
+    }
+    return false;
+  }
+
   async runTeam(
     teamId: string,
     task: string,
@@ -2375,6 +2399,7 @@ export class Runtime {
         await this.transitionTeamFsm(teamId, 'S_member_execute', { count: plans.length });
         let diagnosticPhaseFailed = false;
         let implementationPhaseFailed = false;
+        let implementationPhaseProducedMutation = false;
         executionOutcomes = await executeTeamItems(plans.map((plan, index) => {
           const key = `planned:${index + 1}:${plan.archetype}`;
           const phase = this.longHorizonMemberPhase(plan);
@@ -2396,7 +2421,9 @@ export class Runtime {
                 });
                 throw new Error('dependent_repair_blocked_by_failed_diagnostic');
               }
-              if (phase === 2 && implementationPhaseFailed) {
+              if (phase === 2
+                && implementationPhaseFailed
+                && !implementationPhaseProducedMutation) {
                 this.emit({
                   type: 'team.member.dependency_blocked',
                   agentId: teamId,
@@ -2410,6 +2437,22 @@ export class Runtime {
                   },
                 });
                 throw new Error('dependent_verification_blocked_by_failed_implementation');
+              }
+              if (phase === 2
+                && implementationPhaseFailed
+                && implementationPhaseProducedMutation) {
+                this.emit({
+                  type: 'team.member.partial_handoff.accepted',
+                  agentId: teamId,
+                  sessionId: ctx.sessionId,
+                  correlationId,
+                  data: {
+                    teamId,
+                    memberKey: key,
+                    archetype: plan.archetype,
+                    reason: 'The implementation member failed after producing an effective workspace mutation; continue with independent verification so the mutation receives authoritative feedback.',
+                  },
+                });
               }
               this.teams.markMemberRunning(teamId, key);
               this.emit({
@@ -2435,7 +2478,12 @@ export class Runtime {
                 if (phase === 0 && plan.role === 'verifier-guided diagnostic probe') {
                   diagnosticPhaseFailed = true;
                 }
-                if (phase === 1) implementationPhaseFailed = true;
+                if (phase === 1) {
+                  implementationPhaseFailed = true;
+                  implementationPhaseProducedMutation =
+                    implementationPhaseProducedMutation
+                    || this.failedAgentRunProducedWorkspaceMutation(error);
+                }
                 this.teams.recordMemberFailure(
                   teamId,
                   key,
@@ -3991,6 +4039,65 @@ export class Runtime {
     return this.workspaceRuntimeConfig?.budgetMarket.accountingDimension ?? 'total_tokens';
   }
 
+  private hasUnlimitedBudgetSupply(): boolean {
+    return this.getBudgetState().mode === 'unlimited';
+  }
+
+  private accountedUsageTokens(actual: number | TokenUsage): number {
+    if (typeof actual === 'number') return Math.max(0, Math.floor(actual));
+    if (this.budgetAccountingDimension() === 'output_tokens') {
+      return Math.max(0, Math.floor(actual.outputTokens ?? actual.completionTokens));
+    }
+    if (this.budgetAccountingDimension() === 'thinking_tokens') {
+      return Math.max(0, Math.floor(
+        actual.thinkingAccountingTokens
+          ?? actual.thinkingTokens
+          ?? actual.totalTokens
+      ));
+    }
+    return Math.max(0, Math.floor(actual.totalTokens));
+  }
+
+  private ensureUnlimitedAllocationCoverage(
+    allocationId: string,
+    requiredConsumedTokens: number,
+    agentId: string,
+    purpose: string,
+    correlationId?: string
+  ): BudgetAllocation | undefined {
+    if (!this.budgetMarket) return undefined;
+    const allocation = this.budgetMarket.getAllocation(allocationId);
+    if (!allocation || !this.hasUnlimitedBudgetSupply()) return allocation;
+    const missingTokens = Math.max(
+      0,
+      Math.floor(requiredConsumedTokens) - allocation.allocatedTokens
+    );
+    if (missingTokens === 0) return allocation;
+    const updated = this.budgetMarket.augment(allocationId, missingTokens, 1);
+    const addedTokens = Math.max(
+      0,
+      (updated?.allocatedTokens ?? allocation.allocatedTokens)
+        - allocation.allocatedTokens
+    );
+    if (addedTokens > 0) {
+      this.emit({
+        type: 'budget.rebalanced',
+        agentId,
+        correlationId,
+        data: {
+          allocationId,
+          purpose,
+          previousAllocatedTokens: allocation.allocatedTokens,
+          addedTokens,
+          allocatedTokens: updated?.allocatedTokens,
+          requiredConsumedTokens,
+          reason: 'unlimited_active_actor_lease_renewal',
+        },
+      });
+    }
+    return updated ?? allocation;
+  }
+
   private budgetRequestTokens(inputTokens: number, completionTokens: number): number {
     return this.budgetAccountingDimension() === 'total_tokens'
       ? inputTokens + completionTokens
@@ -4261,6 +4368,12 @@ export class Runtime {
   ): void {
     const allocationId = this.agentBudgetAllocations.get(agentId);
     if (!allocationId || !this.budgetMarket) return;
+    this.ensureUnlimitedAllocationCoverage(
+      allocationId,
+      this.accountedUsageTokens(actual),
+      agentId,
+      'agent_run_settlement'
+    );
     const allocation = this.budgetMarket.settle(allocationId, actual);
     this.agentBudgetAllocations.delete(agentId);
     this.getContext().manager.getAgentById(agentId)?.setCompletionTokenLimit(undefined);
@@ -4305,6 +4418,13 @@ export class Runtime {
 
   private settleDirectBudget(agentId: string, allocation: BudgetAllocation | undefined, usage: TokenUsage, correlationId?: string): void {
     if (!allocation || allocation.status !== 'granted' || !this.budgetMarket) return;
+    this.ensureUnlimitedAllocationCoverage(
+      allocation.id,
+      this.accountedUsageTokens(usage),
+      agentId,
+      'direct_reasoning_settlement',
+      correlationId
+    );
     const settled = this.budgetMarket.settle(allocation.id, usage);
     if (!settled) return;
     this.recordBudgetOutcome(allocation.id, {
@@ -4366,7 +4486,16 @@ export class Runtime {
   ): void {
     const allocationId = this.agentBudgetAllocations.get(agentId);
     if (!allocationId || !this.budgetMarket) return;
-    const before = this.budgetMarket.getAllocation(allocationId);
+    let before = this.budgetMarket.getAllocation(allocationId);
+    if (before) {
+      before = this.ensureUnlimitedAllocationCoverage(
+        allocationId,
+        before.consumedTokens + this.accountedUsageTokens(usage),
+        agentId,
+        purpose ?? 'active_agent_completion',
+        correlationId
+      );
+    }
     const consumed = this.budgetMarket.consume(allocationId, usage);
     if (!consumed) return;
     const consumedDelta = Math.max(0, consumed.consumedTokens - (before?.consumedTokens ?? 0));
@@ -8548,7 +8677,9 @@ export class Runtime {
         parentContext: contextWindow.parentContext,
       });
       const originalRenderedPromptTokens = this.estimateTextTokens(goal);
-      if (budgetAllocation?.status === 'granted' && this.budgetAccountingDimension() === 'total_tokens') {
+      if (budgetAllocation?.status === 'granted'
+        && !this.hasUnlimitedBudgetSupply()
+        && this.budgetAccountingDimension() === 'total_tokens') {
         const outputReserve = Math.min(512, Math.max(128, Math.floor(budgetAllocation.allocatedTokens * 0.2)));
         const executionOverhead = Math.min(512, Math.max(128, Math.floor(budgetAllocation.allocatedTokens * 0.15)));
         const promptBudget = Math.max(64, budgetAllocation.allocatedTokens - outputReserve - executionOverhead);
@@ -8957,7 +9088,12 @@ export class Runtime {
 
     const activeAllocationId = this.agentBudgetAllocations.get(agentId);
     const activeAllocation = activeAllocationId ? this.budgetMarket?.getAllocation(activeAllocationId) : undefined;
-    agent.setCompletionTokenLimit(activeAllocation?.allocatedTokens, this.budgetAccountingDimension());
+    agent.setCompletionTokenLimit(
+      this.hasUnlimitedBudgetSupply()
+        ? undefined
+        : activeAllocation?.allocatedTokens,
+      this.budgetAccountingDimension()
+    );
     const actorWorkspaceExecutionRequired = this.taskRequiresWorkspaceMutation(
       immutableActorTask
     )
@@ -10429,6 +10565,7 @@ export class Runtime {
     }
 
     const allocationRemaining = allocation?.status === 'granted'
+      && !(this.hasUnlimitedBudgetSupply() && !ownsAllocation)
       ? Math.max(0, allocation.allocatedTokens - allocation.consumedTokens)
       : undefined;
     const agentRemaining = parent.getCompletionTokenLimit();
@@ -15135,6 +15272,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     const activeAllocation = activeAllocationId ? this.budgetMarket?.getAllocation(activeAllocationId) : undefined;
     const effectiveAllocation = allocation ?? activeAllocation;
     const allocationRemaining = effectiveAllocation?.status === 'granted'
+      && !(this.hasUnlimitedBudgetSupply() && !ownsAllocation)
       ? Math.max(0, effectiveAllocation.allocatedTokens - effectiveAllocation.consumedTokens)
       : undefined;
     const agentRemaining = agent.getCompletionTokenLimit();
@@ -17462,7 +17600,12 @@ Produce the final response to the user as Roy, the root agent.`;
       return;
     }
 
-    agent.setCompletionTokenLimit(currentRemaining + addedTokens, this.budgetAccountingDimension());
+    agent.setCompletionTokenLimit(
+      this.hasUnlimitedBudgetSupply()
+        ? undefined
+        : currentRemaining + addedTokens,
+      this.budgetAccountingDimension()
+    );
     this.emit({
       type: 'budget.rebalanced',
       agentId: agent.id,

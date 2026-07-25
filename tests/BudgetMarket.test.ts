@@ -200,6 +200,37 @@ describe('Phase 5 budget market', () => {
     ]));
   });
 
+  it('reopens an exceeded allocation when unlimited continuation supply covers the overrun', () => {
+    const market = new BudgetMarket(() => 0, { mode: 'market', minimumGrantTokens: 1 });
+    market.configure(null);
+    const allocation = market.request({
+      requesterId: 'long-horizon-worker',
+      parentId: 'root',
+      requestedTokens: 100,
+      minimumTokens: 1,
+      purpose: 'continue productive execution',
+    });
+    const exceeded = market.consume(allocation.id, 140);
+    expect(exceeded).toMatchObject({ status: 'exceeded', consumedTokens: 140, allocatedTokens: 100 });
+
+    const renewed = market.augment(allocation.id, 80);
+
+    expect(renewed).toMatchObject({
+      status: 'granted',
+      consumedTokens: 140,
+      allocatedTokens: 180,
+      grantedTokens: 180,
+      utilization: 140 / 180,
+    });
+    expect(market.getState().ledger).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'rebalanced',
+        allocationId: allocation.id,
+        tokens: 80,
+      }),
+    ]));
+  });
+
   it('rebalances duplicate requester purposes by allocation order instead of conflating bids', () => {
     const market = new BudgetMarket(() => 0, { mode: 'market', minimumGrantTokens: 100 });
     market.configure(2000);

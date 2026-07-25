@@ -978,6 +978,35 @@ describe('Phase 3 subteam runtime', () => {
     await runtime.shutdown();
   });
 
+  it('distinguishes a failed implementation with a durable mutation from a failure with no handoff', async () => {
+    const runtime = new Runtime();
+    const producedMutation = (runtime as unknown as {
+      failedAgentRunProducedWorkspaceMutation: (error: unknown) => boolean;
+    }).failedAgentRunProducedWorkspaceMutation;
+    const mutationFailure = Object.assign(new Error('completion failed after editing'), {
+      runtimeToolCalls: [{
+        toolName: 'fs.replace',
+        params: {
+          path: 'src/app.ts',
+          oldText: 'return false;',
+          newText: 'return true;',
+        },
+        success: true,
+      }],
+    });
+    const inspectionFailure = Object.assign(new Error('completion failed after reading'), {
+      runtimeToolCalls: [{
+        toolName: 'fs.read',
+        params: { path: 'src/app.ts' },
+        success: true,
+      }],
+    });
+
+    expect(producedMutation.call(runtime, mutationFailure)).toBe(true);
+    expect(producedMutation.call(runtime, { cause: mutationFailure })).toBe(true);
+    expect(producedMutation.call(runtime, inspectionFailure)).toBe(false);
+  });
+
   it('keeps failed automatic team members in the root step actor tree', async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), 'roy-phase3-root-partial-tree-'));
     await mkdir(path.join(cwd, '.roy'), { recursive: true });
