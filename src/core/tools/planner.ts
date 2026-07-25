@@ -1284,15 +1284,24 @@ export class AgentToolPlanner {
   private extractIndependentWebQuestions(task: string): string[] {
     const questions: string[] = [];
     const seen = new Set<string>();
-    for (const line of task.split(/\r?\n/)) {
-      const match = line.match(/^\s*(?:\d{1,2}[.)]|[-*])\s+(.+\?)\s*$/);
-      const question = match?.[1]?.replace(/\s+/g, ' ').trim();
-      if (!question || question.length < 8 || question.length > 300) continue;
+    const addQuestion = (value: string | undefined): void => {
+      const question = value?.replace(/\s+/g, ' ').trim();
+      if (!question || question.length < 8 || question.length > 300) return;
       const fingerprint = question.toLowerCase();
-      if (seen.has(fingerprint)) continue;
+      if (seen.has(fingerprint)) return;
       seen.add(fingerprint);
       questions.push(question);
+    };
+    for (const match of task.matchAll(/(?:^|\s)\d{1,2}[.)]\s+([^\n?]{7,299}\?)/g)) {
+      addQuestion(match[1]);
       if (questions.length >= 10) break;
+    }
+    if (questions.length < 10) {
+      for (const line of task.split(/\r?\n/)) {
+        const match = line.match(/^\s*[-*]\s+(.+\?)\s*$/);
+        addQuestion(match?.[1]);
+        if (questions.length >= 10) break;
+      }
     }
     return questions;
   }

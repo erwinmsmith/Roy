@@ -1299,6 +1299,35 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('extracts independent questions from a compact delegated assignment', () => {
+    const plans = new AgentToolPlanner().plan({
+      task: [
+        'Use web.search and web.fetch to find canonical answers.',
+        '1. Who created the original Chipmunks characters?',
+        '2. Which musical premiered in the United States on December 10, 1993?',
+        '3. Who became British prime minister immediately after Arthur Balfour?',
+        '4. Who had a 1970s number-one hit with Kiss You All Over?',
+        '5. What disease killed Kathleen Ferrier?',
+        'Return answers in a structured format.',
+      ].join(' '),
+      workspacePath: '.',
+      archetype: 'researcher',
+      bindings: [
+        { name: 'web.search', enabled: true },
+        { name: 'web.fetch', enabled: true },
+      ],
+    });
+
+    expect(plans).toHaveLength(5);
+    expect(plans.map(plan => plan.params.query)).toEqual([
+      'Who created the original Chipmunks characters?',
+      'Which musical premiered in the United States on December 10, 1993?',
+      'Who became British prime minister immediately after Arthur Balfour?',
+      'Who had a 1970s number-one hit with Kiss You All Over?',
+      'What disease killed Kathleen Ferrier?',
+    ]);
+  });
+
   it('fetches an explicitly supplied public URL instead of searching again', () => {
     const plans = new AgentToolPlanner().plan({
       task: 'Read https://nodejs.org/api/globals.html and summarize the fetch section.',
