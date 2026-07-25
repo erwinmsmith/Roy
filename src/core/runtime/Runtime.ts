@@ -13367,21 +13367,9 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
         (left.completedAt ?? left.startedAt ?? 0)
         - (right.completedAt ?? right.startedAt ?? 0)
       );
-    const authoritativeVerifierCommand = calls
-      .filter(call => call.toolName === 'shell.exec'
-        && isWorkspaceVerificationCall(call))
-      .map((call, index) => ({
-        command: String(call.params.command ?? '').trim(),
-        index,
-      }))
-      .filter(item => item.command)
-      .map(item => ({
-        ...item,
-        authority: this.verificationCommandAuthority(item.command),
-      }))
-      .sort((left, right) =>
-        right.authority - left.authority || right.index - left.index
-      )[0]?.command;
+    const authoritativeVerifierCommand = String(
+      this.selectAuthoritativePriorVerification(calls, task)?.params.command ?? ''
+    ).trim() || undefined;
     let latestScorecardIndex = -1;
     let latestScorecard: ReturnType<Runtime['latestVerifierScorecardFromCalls']>;
     for (let index = calls.length - 1; index >= 0; index -= 1) {
@@ -13483,8 +13471,13 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
         ?? ''
     ));
     const externalFeedback = this.latestExternalVerificationFeedback(task);
-    const targetPath = externalFeedback?.path ?? cachedTargetPath;
-    const target = targetPath || 'the implementation target named by the task';
+    const targetPath = externalFeedback
+      ? externalFeedback.path ?? ''
+      : cachedTargetPath;
+    const target = targetPath
+      || (externalFeedback
+        ? `the workspace declaration controlling this failure: ${externalFeedback.summary}`
+        : 'the implementation target named by the task');
     const unresolvedGroups = Object.entries(latestScorecard?.groups ?? {})
       .filter(([, score]) => score < 1)
       .map(([group, score]) => `${group}=${score.toFixed(3)}`);
@@ -13501,7 +13494,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
           : 'incomplete_accepted_scorecard_after_progress',
       externalFeedback,
       unresolvedGroups,
-      rejectedCandidate: latestRejected
+      rejectedCandidate: latestRejected && !externalFeedback
         ? {
           strategy: latestRejected.params.strategy ?? 'complete',
           reason: typeof rejection?.reason === 'string'
@@ -13597,22 +13590,33 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
       existenceReason: 'The localized repair needs independent objective validation before root acceptance.',
       memoryScope: focusedRecoveryMemory,
     };
+    const instrumentableGradeVerifier = Boolean(
+      authoritativeVerifierCommand
+      && /\.roy\/official-verifier\/grade\.py(?:\s|$)/i.test(
+        authoritativeVerifierCommand
+      )
+    );
+    const recoveryAgents = externalFeedback
+      ? [repairAgent, verifierAgent]
+      : cachedDiagnostic
+        ? [repairAgent, verifierAgent]
+        : instrumentableGradeVerifier
+          ? [diagnosticAgent, repairAgent, verifierAgent]
+          : [repairAgent, verifierAgent];
     return {
       action: 'spawn_subagents',
       reason: externalFeedback
         ? 'New concrete external verifier feedback supersedes the stale cached recovery frontier; repair its authoritative target directly, then independently verify it.'
         : cachedDiagnostic
         ? 'The prior recovery stopped after producing a fresh focused diagnostic; resume directly at localized repair and independent verification.'
-        : latestRejected
+        : latestRejected && instrumentableGradeVerifier
           ? 'The persisted root repair strategy produced a verifier rollback or an invalid patch; change the causal hypothesis through a bounded diagnostic, localized repair, and independent verification team.'
+          : latestRejected
+            ? 'The persisted repair candidate was rejected, but the authoritative verifier is not compatible with the specialized grade.py probe; re-read the exact verifier and source, apply one localized repair, and independently rerun its declared command.'
           : 'A newer accepted verifier scorecard superseded the old rejection but remains incomplete; diagnose only its unresolved groups, then apply and independently verify one localized repair.',
       coordination: 'team',
       continuationPolicy: 'reassess',
-      agents: externalFeedback
-        ? [repairAgent, verifierAgent]
-        : cachedDiagnostic
-        ? [repairAgent, verifierAgent]
-        : [diagnosticAgent, repairAgent, verifierAgent],
+      agents: recoveryAgents,
       team: {
         name: recoveryRound === 1
           ? 'VerifierGuidedRecoveryTeam'
@@ -13655,8 +13659,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
           )[0]
           : undefined;
         if (capsule.recoveryTrigger === 'new_external_verifier_feedback'
-          && summary
-          && path) {
+          && summary) {
           return { summary, path };
         }
       } catch {
@@ -13679,7 +13682,6 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     if (!summary) return undefined;
     const path = this.extractTaskDiagnosticSourcePaths(feedback)[0]
       ?? this.extractTaskDiagnosticInputPaths(feedback)[0];
-    if (!path) return undefined;
     return {
       summary,
       path,
@@ -19782,7 +19784,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     const cached = candidates[0];
     const taskCommand = this.extractAuthoritativeVerificationCommand(task);
     if (taskCommand
-      && this.verificationCommandAuthority(taskCommand) > (cached?.authority ?? 0)) {
+      && this.verificationCommandAuthority(taskCommand) >= (cached?.authority ?? 0)) {
       return {
         toolName: 'shell.exec',
         params: { command: taskCommand },

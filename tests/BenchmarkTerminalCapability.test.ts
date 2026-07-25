@@ -624,6 +624,65 @@ describe('benchmark terminal capability', () => {
     expect(newerExternalFailure?.agents.some(agent =>
       agent.task?.includes('[runtime_verifier_diagnostic_probe]')
     )).toBe(false);
+    const pathlessExternalFailure = buildRecovery([
+      'Repair the workspace until the official verifier succeeds.',
+      '## VERIFICATION FAILED — CONTINUE WORKING',
+      'Verifier feedback:',
+      'project metadata still targets a legacy dependency runtime',
+      '<official_verifier_feedback>',
+      'The score artifact is unchanged.',
+      '</official_verifier_feedback>',
+      '## Required local repair verification',
+      '```bash',
+      'python -m pytest -q .roy/official-verifier/test_outputs.py',
+      '```',
+    ].join('\n'), state);
+    expect(pathlessExternalFailure).toMatchObject({
+      reason: expect.stringContaining(
+        'supersedes the stale cached recovery frontier'
+      ),
+      agents: [
+        expect.objectContaining({
+          name: 'FocusedRepairer-2',
+          task: expect.stringContaining(
+            'workspace declaration controlling this failure'
+          ),
+        }),
+        expect.objectContaining({ name: 'RecoveryVerifier-3' }),
+      ],
+    });
+    expect(pathlessExternalFailure?.agents.every(agent =>
+      agent.task?.includes(
+        'python -m pytest -q .roy/official-verifier/test_outputs.py'
+      )
+    )).toBe(true);
+    expect(pathlessExternalFailure?.agents.some(agent =>
+      agent.task?.includes('[runtime_verifier_diagnostic_probe]')
+      || agent.task?.includes('"rejectedCandidate"')
+    )).toBe(false);
+
+    const pytestRejectedState = structuredClone(state);
+    pytestRejectedState.knowledge.paths[0]!.toolFrontier[0]!.params.command =
+      'python -m pytest -q .roy/official-verifier/test_outputs.py';
+    const pytestRejectedRecovery = buildRecovery([
+      'Repair implementation.py until the official verifier succeeds.',
+      'Authoritative acceptance:',
+      '```bash',
+      'python -m pytest -q .roy/official-verifier/test_outputs.py',
+      '```',
+    ].join('\n'), pytestRejectedState);
+    expect(pytestRejectedRecovery).toMatchObject({
+      reason: expect.stringContaining(
+        'not compatible with the specialized grade.py probe'
+      ),
+      agents: [
+        expect.objectContaining({ name: 'FocusedRepairer-2' }),
+        expect.objectContaining({ name: 'RecoveryVerifier-3' }),
+      ],
+    });
+    expect(pytestRejectedRecovery?.agents.some(agent =>
+      agent.task?.includes('[runtime_verifier_diagnostic_probe]')
+    )).toBe(false);
     const failedAttempt = structuredClone(state);
     failedAttempt.knowledge.actors.push({
       id: 'actor',
