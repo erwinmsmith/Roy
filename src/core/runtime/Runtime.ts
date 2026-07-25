@@ -4476,7 +4476,11 @@ export class Runtime {
       })();
       const hunkLines = patchLines
         .slice(patchIndex + 1, hunkEnd)
-        .filter(line => line !== '\\ No newline at end of file');
+        .filter(line => line !== '\\ No newline at end of file')
+        // A blank context line in a unified diff should carry an invisible
+        // leading space. Models frequently omit only that prefix. Normalize
+        // the unambiguous case and still validate it against the source below.
+        .map(line => line === '' ? ' ' : line);
       const sourcePatternFor = (lines: string[]): string[] => lines
         .filter(line => line[0] === ' ' || line[0] === '-')
         .map(line => line.slice(1));
@@ -4597,8 +4601,6 @@ export class Runtime {
         } else if (prefix === '+') {
           output.push(text);
           changedLines += 1;
-        } else if (!line.trim()) {
-          return { error: 'focused patch contains an unprefixed blank line inside a hunk' };
         } else {
           return { error: `focused patch contains invalid hunk content: ${line.slice(0, 200)}` };
         }
@@ -10161,10 +10163,35 @@ export class Runtime {
   ): string {
     if (!output.trim()) return output;
     const lines = output.split('\n').map(line => line.trim()).filter(Boolean);
+    const mismatchTerms = new Set<string>();
+    for (const line of lines) {
+      if (!line.startsWith('VERIFIER_PROBE_MISMATCHES ')) continue;
+      const payloadStart = line.indexOf('{');
+      if (payloadStart < 0) continue;
+      try {
+        const payload = JSON.parse(line.slice(payloadStart)) as {
+          mismatch_count?: unknown;
+          mismatches?: Array<{ key?: unknown }>;
+        };
+        if (Number(payload.mismatch_count ?? 0) <= 0) continue;
+        for (const mismatch of payload.mismatches ?? []) {
+          const key = Array.isArray(mismatch.key) ? mismatch.key : [];
+          for (const part of key.slice(0, 2)) {
+            const normalized = String(part ?? '').trim().toLowerCase();
+            if (normalized.length >= 3) mismatchTerms.add(normalized);
+          }
+        }
+      } catch {
+        // A clipped mismatch marker remains useful without relevance terms.
+      }
+    }
+    const seenCandidates = new Set<string>();
     const candidates = lines
       .map((line, position) => {
         const marker = /^VERIFIER_PROBE_([A-Z_]+)\b/.exec(line)?.[1];
         if (!marker) return undefined;
+        if (seenCandidates.has(line)) return undefined;
+        seenCandidates.add(line);
         let priority = 20;
         let perItemLimit = 1_200;
         if (marker === 'EVIDENCE_VERSION') priority = 240;
@@ -10188,10 +10215,26 @@ export class Runtime {
             const payload = JSON.parse(line.slice(payloadStart)) as {
               path?: unknown;
               artifact?: unknown;
+              mismatch_count?: unknown;
             };
             evidencePath = String(payload.path ?? payload.artifact ?? '').toLowerCase();
+            if (marker === 'MISMATCHES'
+              && Number(payload.mismatch_count ?? 0) === 0) {
+              priority -= 100;
+            }
           } catch {
             // Keep the marker even when its compact payload was truncated.
+          }
+        }
+        if (marker === 'TASK_INPUT') {
+          const relevantToMismatch = [...mismatchTerms].some(term =>
+            evidencePath.includes(term)
+          );
+          if (relevantToMismatch) {
+            priority = 235;
+            perItemLimit = 3_200;
+          } else if (/(?:manifest|index|dataset)/.test(evidencePath)) {
+            priority = 225;
           }
         }
         if (evidencePath.includes('output')) priority += 50;
@@ -16986,8 +17029,14 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       '                collect_paths(item)',
       '    collect_paths(payload)',
       '    for discovered_path in discovered[:20]:',
-      '        resolved = discovered_path if os.path.isabs(discovered_path) else os.path.join(os.path.dirname(absolute), discovered_path)',
-      '        task_input_queue.append((resolved, depth + 1))',
+      '        if os.path.isabs(discovered_path):',
+      '            task_input_queue.append((discovered_path, depth + 1))',
+      '            continue',
+      '        # Manifests commonly mix paths relative to the manifest with',
+      '        # paths relative to the workspace root. Queue both; canonical',
+      '        # path deduplication keeps the traversal bounded.',
+      '        task_input_queue.append((os.path.join(os.path.dirname(absolute), discovered_path), depth + 1))',
+      '        task_input_queue.append((os.path.join(workspace_root, discovered_path), depth + 1))',
       '',
       'def mismatch_summary(args):',
       '    if len(args) < 2 or not isinstance(args[0], dict) or not isinstance(args[1], list):',

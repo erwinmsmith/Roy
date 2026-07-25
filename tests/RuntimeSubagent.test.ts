@@ -826,6 +826,43 @@ describe('Runtime controlled subagent spawning', () => {
     });
   });
 
+  it('normalizes an unprefixed blank context line in a focused patch', () => {
+    const runtime = new Runtime();
+    const applyPatch = (runtime as unknown as {
+      applyUnifiedPatchToContent: (
+        current: string,
+        patch: string
+      ) => { content?: string; error?: string };
+    }).applyUnifiedPatchToContent.bind(runtime);
+    const current = [
+      'def value():',
+      '    answer = 41',
+      '',
+      '    return answer',
+      '',
+    ].join('\n');
+    const patch = [
+      '--- a/app.py',
+      '+++ b/app.py',
+      '@@ -1,4 +1,4 @@',
+      ' def value():',
+      '-    answer = 41',
+      '+    answer = 42',
+      '',
+      '     return answer',
+    ].join('\n');
+
+    expect(applyPatch(current, patch)).toEqual({
+      content: [
+        'def value():',
+        '    answer = 42',
+        '',
+        '    return answer',
+        '',
+      ].join('\n'),
+    });
+  });
+
   it('applies a focused patch with stale edge context while preserving deletion anchors', () => {
     const runtime = new Runtime();
     const applyPatch = (runtime as unknown as {
@@ -1522,8 +1559,16 @@ describe('Runtime controlled subagent spawning', () => {
       'utf8'
     );
     await writeFile(
+      path.join(workspaceCwd, 'data', 'metadata.json'),
+      JSON.stringify({ source: 'workspace-root-relative-input' }),
+      'utf8'
+    );
+    await writeFile(
       path.join(workspaceCwd, 'data', 'manifest.json'),
-      JSON.stringify({ token_file: 'tokens.json' }),
+      JSON.stringify({
+        token_file: 'tokens.json',
+        metadata_file: 'data/metadata.json',
+      }),
       'utf8'
     );
     const command = (runtime as unknown as {
@@ -1553,6 +1598,8 @@ describe('Runtime controlled subagent spawning', () => {
     expect(stdout).toContain('data/manifest.json');
     expect(stdout).toContain('data/tokens.json');
     expect(stdout).toContain('causal-input-token');
+    expect(stdout).toContain('data/metadata.json');
+    expect(stdout).toContain('workspace-root-relative-input');
     expect(stdout).toContain('VERIFIER_PROBE_RETAINED_DIRS');
     expect(stdout).toContain('VERIFIER_PROBE_MIRROR');
     const probeDirectories = await readdir(
@@ -1593,6 +1640,25 @@ describe('Runtime controlled subagent spawning', () => {
     expect(compactProbe).toContain('VERIFIER_PROBE_SPEC');
     expect(compactProbe).toContain('outputs/layout_qc.json');
     expect(compactProbe).not.toContain('x'.repeat(1_000));
+    const relevanceCompactProbe = (
+      runtime as unknown as {
+        compactVerifierProbeEvidenceText: (output: string, maxChars: number) => string;
+      }
+    ).compactVerifierProbeEvidenceText([
+      'VERIFIER_PROBE_EVIDENCE_VERSION 2',
+      'VERIFIER_PROBE_MISMATCHES {"mismatch_count":1,"mismatches":[{"key":["public_region_status","status_counts",0,0],"expected":"Region","actual":"31"}]}',
+      `VERIFIER_PROBE_TASK_INPUT ${JSON.stringify({
+        path: 'data/public/public_invoice_alpha_ocr.json',
+        content: `IRRELEVANT_GEOMETRY_${'i'.repeat(900)}`,
+      })}`,
+      `VERIFIER_PROBE_TASK_INPUT ${JSON.stringify({
+        path: 'data/public/public_region_status_ocr.json',
+        content: `RELEVANT_GEOMETRY_${'r'.repeat(900)}`,
+      })}`,
+      'VERIFIER_PROBE_REWARD 0.99',
+    ].join('\n'), 1_600);
+    expect(relevanceCompactProbe).toContain('RELEVANT_GEOMETRY');
+    expect(relevanceCompactProbe).not.toContain('IRRELEVANT_GEOMETRY');
     await runtime.shutdown();
   });
 
