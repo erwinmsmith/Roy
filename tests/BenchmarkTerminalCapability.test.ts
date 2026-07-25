@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Runtime from '../src/core/runtime/Runtime.js';
+import { compactExecutionKnowledgeForPrompt } from '../src/core/runtime/executionCache.js';
 import type {
   LLMCompletionOptions,
   LLMCompletionResult,
@@ -700,6 +701,203 @@ describe('benchmark terminal capability', () => {
         expect.objectContaining({ name: 'RecoveryVerifier-6' }),
       ],
     });
+
+    const obsoleteRejectionAfterAcceptedProgress = structuredClone(failedAttempt);
+    obsoleteRejectionAfterAcceptedProgress.knowledge.paths[0]!.toolFrontier.push(
+      {
+        toolName: 'fs.synthesize',
+        params: { path: 'implementation.py', strategy: 'patch' },
+        success: true,
+        result: { path: 'implementation.py', synthesized: true },
+        startedAt: now + 3,
+        completedAt: now + 4,
+      } as never,
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python .roy/official-verifier/grade.py' },
+        success: true,
+        result: {
+          stdout: '0.8\n',
+          verifierDiagnostics: [{
+            path: '/logs/verifier/scorecard.json',
+            content: JSON.stringify({
+              reward: 0.8,
+              groups: { accepted_capability: 1, unresolved_capability: 0.5 },
+            }),
+          }],
+        },
+        startedAt: now + 5,
+        completedAt: now + 6,
+      } as never
+    );
+    const scorecardRecovery = buildRecovery(
+      'Repair implementation.py until the official verifier succeeds.',
+      obsoleteRejectionAfterAcceptedProgress
+    );
+    expect(scorecardRecovery).toMatchObject({
+      agents: [
+        expect.objectContaining({ name: 'VerifierProbe-4' }),
+        expect.objectContaining({ name: 'FocusedRepairer-5' }),
+        expect.objectContaining({ name: 'RecoveryVerifier-6' }),
+      ],
+    });
+    expect(scorecardRecovery?.agents[0]?.task).toContain(
+      '"recoveryTrigger": "incomplete_accepted_scorecard_after_progress"'
+    );
+    expect(scorecardRecovery?.agents[0]?.task).toContain(
+      '"unresolvedGroups": [\n    "unresolved_capability=0.500"'
+    );
+    expect(scorecardRecovery?.agents[0]?.task).not.toContain('"rejectedCandidate"');
+  });
+
+  it('expires rejected synthesis paths after a newer mutation changes the hypothesis', () => {
+    const runtime = new Runtime();
+    const unresolved = (runtime as unknown as {
+      hasUnresolvedSynthesisRejection: (
+        calls: Array<Record<string, unknown>>
+      ) => boolean;
+    }).hasUnresolvedSynthesisRejection.bind(runtime);
+
+    expect(unresolved([
+      {
+        toolName: 'fs.synthesize',
+        params: { path: 'implementation.py', strategy: 'patch' },
+        success: false,
+        result: { synthesisRejected: true },
+      },
+    ])).toBe(true);
+    expect(unresolved([
+      {
+        toolName: 'fs.synthesize',
+        params: { path: 'implementation.py', strategy: 'patch' },
+        success: false,
+        result: { synthesisRejected: true },
+      },
+      {
+        toolName: 'fs.replace',
+        params: {
+          path: 'implementation.py',
+          oldText: 'VALUE = 1',
+          newText: 'VALUE = 2',
+        },
+        success: true,
+        result: { path: 'implementation.py', replacements: 1 },
+      },
+    ])).toBe(false);
+  });
+
+  it('deduplicates inherited tool frontiers in prompt context', () => {
+    const now = Date.now();
+    const sharedCalls = [{
+      toolName: 'fs.read',
+      params: { path: 'implementation.py' },
+      success: true,
+      result: { path: 'implementation.py', content: 'VALUE = 1\n' },
+      completedAt: now,
+    }, {
+      toolName: 'shell.exec',
+      params: { command: 'python .roy/official-verifier/grade.py' },
+      success: true,
+      result: { stdout: '0.5\n' },
+      completedAt: now + 1,
+    }];
+    const pathRecord = (id: string) => ({
+      id,
+      correlationId: 'correlation',
+      stepId: `${id}.step`,
+      parentPathIds: [],
+      taskFingerprint: 'task',
+      status: 'partial' as const,
+      actorIds: [],
+      teamIds: [],
+      observedPaths: ['implementation.py'],
+      invalidPaths: [],
+      successfulTools: ['fs.read', 'shell.exec'],
+      failedTools: [],
+      mutationObserved: true,
+      verificationObserved: true,
+      toolFrontier: sharedCalls,
+      feedbackIds: [],
+      createdAt: now,
+      updatedAt: now + 1,
+    });
+    const compacted = compactExecutionKnowledgeForPrompt({
+      version: 1,
+      updatedAt: now + 1,
+      steps: [],
+      paths: [pathRecord('path-a'), pathRecord('path-b')],
+      actors: [],
+      feedback: [],
+    }) as {
+      paths: Array<Record<string, unknown>>;
+      causalToolFrontier: Array<Record<string, unknown>>;
+    };
+
+    expect(compacted.paths.every(item => item.toolFrontier === undefined)).toBe(true);
+    expect(compacted.causalToolFrontier).toHaveLength(2);
+  });
+
+  it('retains semantic workspace anchors when bounding a long tool frontier', () => {
+    const runtime = new Runtime();
+    const bound = (runtime as unknown as {
+      boundExecutionToolFrontier: (
+        calls: Array<Record<string, unknown>>,
+        maxCalls: number,
+        maxSerializedChars: number
+      ) => Array<Record<string, unknown>>;
+    }).boundExecutionToolFrontier.bind(runtime);
+    const calls: Array<Record<string, unknown>> = [
+      {
+        toolName: 'fs.read',
+        params: { path: 'implementation.py' },
+        success: true,
+        result: { path: 'implementation.py', content: 'VALUE = 1\n' },
+      },
+      {
+        toolName: 'fs.replace',
+        params: {
+          path: 'implementation.py',
+          oldText: 'VALUE = 1',
+          newText: 'VALUE = 2',
+        },
+        success: true,
+        result: { path: 'implementation.py', replacements: 1 },
+      },
+      ...Array.from({ length: 60 }, (_, index) => ({
+        toolName: 'shell.exec',
+        params: { command: `printf diagnostic-${index}` },
+        success: true,
+        result: { stdout: `diagnostic-${index}` },
+      })),
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python .roy/official-verifier/grade.py' },
+        success: true,
+        result: {
+          stdout: '0.8\n',
+          verifierDiagnostics: [{
+            path: '/logs/verifier/scorecard.json',
+            content: '{"reward":0.8,"groups":{"remaining":0.5}}',
+          }],
+        },
+      },
+    ];
+
+    const selected = bound(calls, 8, 100_000);
+    expect(selected).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        toolName: 'fs.read',
+        params: { path: 'implementation.py' },
+      }),
+      expect.objectContaining({
+        toolName: 'fs.replace',
+        params: expect.objectContaining({ path: 'implementation.py' }),
+      }),
+      expect.objectContaining({
+        toolName: 'shell.exec',
+        params: { command: 'python .roy/official-verifier/grade.py' },
+      }),
+    ]));
   });
 
   it('reuses persisted invalid-path knowledge in a later correlation', async () => {

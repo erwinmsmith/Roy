@@ -10227,10 +10227,10 @@ export class Runtime {
     maxCalls = 32,
     maxSerializedChars = 240_000
   ): ExecutionCachedToolCall[] {
-    const selected: ExecutionCachedToolCall[] = [];
+    const unique: Array<{ call: ExecutionCachedToolCall; index: number }> = [];
     const seen = new Set<string>();
-    let serializedChars = 0;
-    for (const call of [...calls].reverse()) {
+    for (let index = calls.length - 1; index >= 0; index -= 1) {
+      const call = calls[index]!;
       const fingerprint = this.fingerprint({
         toolName: call.toolName,
         params: call.params,
@@ -10240,13 +10240,69 @@ export class Runtime {
       });
       if (seen.has(fingerprint)) continue;
       seen.add(fingerprint);
-      const callChars = JSON.stringify(call).length;
-      if (selected.length > 0 && serializedChars + callChars > maxSerializedChars) continue;
-      selected.push(call);
-      serializedChars += callChars;
-      if (selected.length >= Math.max(1, maxCalls)) break;
+      unique.push({ call, index });
     }
-    return selected.reverse();
+
+    const mutatedPaths = new Set(unique
+      .filter(item => isSuccessfulWorkspaceMutationCall(item.call))
+      .map(item => this.normalizeToolWorkspacePath(String(item.call.params.path ?? '')))
+      .filter(path => path && path !== '.'));
+    const latestReadIndexByPath = new Map<string, number>();
+    for (const item of unique) {
+      if (item.call.toolName !== 'fs.read') continue;
+      const target = this.normalizeToolWorkspacePath(String(
+        (item.call.result as { path?: unknown } | undefined)?.path
+          ?? item.call.params.path
+          ?? ''
+      ));
+      if (target && !latestReadIndexByPath.has(target)) {
+        latestReadIndexByPath.set(target, item.index);
+      }
+    }
+    const recentThreshold = Math.max(0, calls.length - Math.min(12, Math.max(1, maxCalls)));
+    const ranked = unique.map(item => {
+      const call = item.call;
+      const target = this.normalizeToolWorkspacePath(String(
+        (call.result as { path?: unknown } | undefined)?.path
+          ?? call.params.path
+          ?? ''
+      ));
+      let priority = item.index >= recentThreshold ? 600 : 0;
+      if (workspaceCandidateRollbackFromCall(call)?.restored === true) priority += 1_000;
+      if (isWorkspaceVerificationCall(call)) priority += 950;
+      if (this.isFocusedVerifierDiagnosticCall(call)) priority += 925;
+      if (isSuccessfulWorkspaceMutationCall(call)) priority += 900;
+      if (call.toolName === 'fs.read' && mutatedPaths.has(target)) priority += 875;
+      if (call.toolName === 'fs.read' && target.startsWith('.roy/official-verifier/')) {
+        priority += 825;
+      }
+      if (call.toolName === 'fs.read' && latestReadIndexByPath.get(target) === item.index) {
+        priority += 700;
+      }
+      if (!call.success) priority += 650;
+      return {
+        ...item,
+        priority,
+        serializedChars: JSON.stringify(call).length,
+      };
+    }).sort((left, right) =>
+      right.priority - left.priority || right.index - left.index
+    );
+
+    const selected: typeof ranked = [];
+    let serializedChars = 0;
+    for (const item of ranked) {
+      if (selected.length >= Math.max(1, maxCalls)) break;
+      if (selected.length > 0
+        && serializedChars + item.serializedChars > maxSerializedChars) {
+        continue;
+      }
+      selected.push(item);
+      serializedChars += item.serializedChars;
+    }
+    return selected
+      .sort((left, right) => left.index - right.index)
+      .map(item => item.call);
   }
 
   private actorGenerationFromNodes(
@@ -11995,19 +12051,49 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
         (left.completedAt ?? left.startedAt ?? 0)
         - (right.completedAt ?? right.startedAt ?? 0)
       );
-    let latestRejectedIndex = -1;
+    let latestScorecardIndex = -1;
+    let latestScorecard: ReturnType<Runtime['latestVerifierScorecardFromCalls']>;
+    for (let index = calls.length - 1; index >= 0; index -= 1) {
+      const scorecard = this.latestVerifierScorecardFromCalls([calls[index]!]);
+      if (!scorecard) continue;
+      latestScorecardIndex = index;
+      latestScorecard = scorecard;
+      break;
+    }
+    let rejectedCandidateIndex = -1;
     for (let index = calls.length - 1; index >= 0; index -= 1) {
       const call = calls[index]!;
       const result = call.result as { synthesisRejected?: unknown } | undefined;
       if (workspaceCandidateRollbackFromCall(call) || result?.synthesisRejected === true) {
-        latestRejectedIndex = index;
+        rejectedCandidateIndex = index;
         break;
       }
     }
-    const latestRejected = latestRejectedIndex >= 0
-      ? calls[latestRejectedIndex]
+    const rejectedCandidate = rejectedCandidateIndex >= 0
+      ? calls[rejectedCandidateIndex]
       : undefined;
-    if (!latestRejected) return undefined;
+    const rejectedRollback = rejectedCandidate
+      ? workspaceCandidateRollbackFromCall(rejectedCandidate)
+      : undefined;
+    const acceptedProgressAfterRejection = Boolean(
+      rejectedCandidate
+      && latestScorecard
+      && latestScorecardIndex > rejectedCandidateIndex
+      && typeof rejectedRollback?.baselineReward === 'number'
+      && latestScorecard.reward > rejectedRollback.baselineReward + 1e-12
+    );
+    const latestRejected = acceptedProgressAfterRejection
+      ? undefined
+      : rejectedCandidate;
+    const unresolvedAcceptedScorecard = Boolean(
+      latestScorecard
+      && latestScorecard.reward < 1 - 1e-12
+      && Object.values(latestScorecard.groups).some(score => score < 1)
+    );
+    if (!latestRejected && !unresolvedAcceptedScorecard) return undefined;
+    const causalAnchorIndex = latestRejected
+      ? rejectedCandidateIndex
+      : latestScorecardIndex;
     let latestDiagnosticIndex = -1;
     for (let index = calls.length - 1; index >= 0; index -= 1) {
       const call = calls[index]!;
@@ -12032,40 +12118,55 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
         }
       }
     }
-    const cachedDiagnostic = latestDiagnosticIndex > latestRejectedIndex
+    const cachedDiagnostic = latestDiagnosticIndex > causalAnchorIndex
       && netMutationDepthAfterDiagnostic === 0
       ? calls[latestDiagnosticIndex]
       : undefined;
-    const rollback = workspaceCandidateRollbackFromCall(latestRejected);
-    const rejection = latestRejected.result as {
+    const rollback = latestRejected
+      ? workspaceCandidateRollbackFromCall(latestRejected)
+      : undefined;
+    const rejection = latestRejected?.result as {
       path?: unknown;
       reason?: unknown;
       generatedPreview?: unknown;
     } | undefined;
+    const latestMutation = [...calls].reverse().find(call =>
+      isSuccessfulWorkspaceMutationCall(call)
+      && !this.normalizeCachedPath(String(call.params.path ?? '')).startsWith('.roy/')
+    );
     const targetPath = this.normalizeCachedPath(String(
       rollback?.path
         ?? rejection?.path
-        ?? latestRejected.params.path
+        ?? latestMutation?.params.path
+        ?? rejectedCandidate?.params.path
         ?? ''
     ));
     const target = targetPath || 'the implementation target named by the task';
-    const latestScorecard = this.latestVerifierScorecardFromCalls(calls);
+    const unresolvedGroups = Object.entries(latestScorecard?.groups ?? {})
+      .filter(([, score]) => score < 1)
+      .map(([group, score]) => `${group}=${score.toFixed(3)}`);
     const recoveryCapsule = JSON.stringify({
       target,
       sourceCorrelationId: resumeState.sourceCorrelationId,
       anchorPathId: resumeState.anchorPathId,
       recoveryRound,
       latestAcceptedScorecard: latestScorecard,
-      rejectedCandidate: {
-        strategy: latestRejected.params.strategy ?? 'complete',
-        reason: typeof rejection?.reason === 'string'
-          ? rejection.reason.slice(0, 600)
-          : rollback?.reason,
-        baselineReward: rollback?.baselineReward,
-        candidateReward: rollback?.candidateReward,
-        regressedGroups: rollback?.regressedGroups,
-        improvedGroups: rollback?.improvedGroups,
-      },
+      recoveryTrigger: latestRejected
+        ? 'current_rejected_candidate'
+        : 'incomplete_accepted_scorecard_after_progress',
+      unresolvedGroups,
+      rejectedCandidate: latestRejected
+        ? {
+          strategy: latestRejected.params.strategy ?? 'complete',
+          reason: typeof rejection?.reason === 'string'
+            ? rejection.reason.slice(0, 600)
+            : rollback?.reason,
+          baselineReward: rollback?.baselineReward,
+          candidateReward: rollback?.candidateReward,
+          regressedGroups: rollback?.regressedGroups,
+          improvedGroups: rollback?.improvedGroups,
+        }
+        : undefined,
       currentWorkspacePolicy: 'Re-observe the current source and run a fresh verifier probe; cached source bytes and rejected payloads are not authoritative.',
     }, null, 2);
     const immutableAssignment = this.compactRecoveryAssignment(task);
@@ -12092,7 +12193,9 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
       tools: ['fs.read', 'fs.search', 'shell.exec'],
       skills: ['use_tool_when_needed'],
       tomLevel: 2,
-      existenceReason: 'A score-only repair was rejected; executable mismatch evidence is required before another mutation.',
+      existenceReason: latestRejected
+        ? 'A score-only repair was rejected; executable mismatch evidence is required before another mutation.'
+        : 'The accepted scorecard still has unresolved groups after newer progress; fresh causal evidence is required without reviving obsolete failures.',
       memoryScope: focusedRecoveryMemory,
     };
     const repairAgent: DelegationAgentPlan = {
@@ -12114,7 +12217,9 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
       tomLevel: 2,
       existenceReason: cachedDiagnostic
         ? 'A fresh cached diagnostic already identifies the unresolved behavior; continue directly with its localized repair.'
-        : 'The diagnostic hypothesis must be turned into a localized, verified workspace mutation.',
+        : latestRejected
+          ? 'The diagnostic hypothesis must be turned into a localized, verified workspace mutation.'
+          : 'The remaining accepted-scorecard gap must be turned into one localized, verified workspace mutation.',
       memoryScope: focusedRecoveryMemory,
     };
     const verifierAgent: DelegationAgentPlan = {
@@ -12138,7 +12243,9 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
       action: 'spawn_subagents',
       reason: cachedDiagnostic
         ? 'The prior recovery stopped after producing a fresh focused diagnostic; resume directly at localized repair and independent verification.'
-        : 'The persisted root repair strategy produced a verifier rollback or an invalid patch; change the causal hypothesis through a bounded diagnostic, localized repair, and independent verification team.',
+        : latestRejected
+          ? 'The persisted root repair strategy produced a verifier rollback or an invalid patch; change the causal hypothesis through a bounded diagnostic, localized repair, and independent verification team.'
+          : 'A newer accepted verifier scorecard superseded the old rejection but remains incomplete; diagnose only its unresolved groups, then apply and independently verify one localized repair.',
       coordination: 'team',
       continuationPolicy: 'reassess',
       agents: cachedDiagnostic
@@ -16772,6 +16879,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
           this.isFocusedVerifierDiagnosticCall(later)
           || later.toolName === 'fs.read'
           || later.toolName === 'fs.search'
+          || isSuccessfulWorkspaceMutationCall(later)
         )
       );
     }

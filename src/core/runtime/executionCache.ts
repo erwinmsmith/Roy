@@ -133,6 +133,8 @@ export function compactExecutionKnowledgeForPrompt(
     )
     .slice(0, Math.max(1, maxFeedbackItems));
   const feedbackIds = new Set(selectedFeedback.map(item => item.id));
+  const selectedPaths = state.paths.slice(-12);
+  const causalToolFrontier = compactSharedToolFrontier(selectedPaths);
   return {
     updatedAt: state.updatedAt,
     steps: state.steps.slice(-12).map(step => ({
@@ -145,7 +147,7 @@ export function compactExecutionKnowledgeForPrompt(
       resultSummary: step.resultSummary?.slice(0, 1200),
       stateFingerprint: step.stateFingerprint,
     })),
-    paths: state.paths.slice(-12).map(item => ({
+    paths: selectedPaths.map(item => ({
       id: item.id,
       parentPathIds: item.parentPathIds,
       status: item.status,
@@ -155,14 +157,9 @@ export function compactExecutionKnowledgeForPrompt(
       failedTools: item.failedTools,
       mutationObserved: item.mutationObserved,
       verificationObserved: item.verificationObserved,
-      toolFrontier: item.toolFrontier?.slice(-16).map(call => ({
-        toolName: call.toolName,
-        params: call.params,
-        success: call.success,
-        error: call.error?.slice(0, 500),
-      })),
       feedbackIds: item.feedbackIds.filter(id => feedbackIds.has(id)),
     })),
+    causalToolFrontier,
     actors: state.actors.slice(-30).map(item => ({
       id: item.runtimeActorId,
       kind: item.kind,
@@ -186,4 +183,45 @@ export function compactExecutionKnowledgeForPrompt(
       pathId: item.pathId,
     })),
   };
+}
+
+/**
+ * Paths inherit the causal frontier from their parents, so rendering a frontier
+ * inside every path multiplies identical context on long runs. Keep one
+ * chronological, deduplicated frontier for the whole prompt instead. Results
+ * remain in the persisted cache; the prompt only needs intent and outcome
+ * references to direct attention.
+ */
+function compactSharedToolFrontier(
+  paths: ExecutionCachedPath[],
+  maxCalls = 24
+): Array<Record<string, unknown>> {
+  const calls = paths
+    .flatMap(path => (path.toolFrontier ?? []).map(call => ({
+      pathId: path.id,
+      call,
+      timestamp: call.completedAt ?? call.startedAt ?? 0,
+    })))
+    .sort((left, right) => left.timestamp - right.timestamp);
+  const selected: typeof calls = [];
+  const seen = new Set<string>();
+  for (const item of [...calls].reverse()) {
+    const fingerprint = JSON.stringify({
+      toolName: item.call.toolName,
+      params: item.call.params,
+      success: item.call.success,
+      error: item.call.error,
+    });
+    if (seen.has(fingerprint)) continue;
+    seen.add(fingerprint);
+    selected.push(item);
+    if (selected.length >= Math.max(1, maxCalls)) break;
+  }
+  return selected.reverse().map(item => ({
+    pathId: item.pathId,
+    toolName: item.call.toolName,
+    params: item.call.params,
+    success: item.call.success,
+    error: item.call.error?.slice(0, 500),
+  }));
 }
