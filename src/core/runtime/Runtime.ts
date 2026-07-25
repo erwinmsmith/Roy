@@ -3,7 +3,7 @@
 import 'dotenv/config';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { config } from '../../config/index.js';
 import { logger } from '../utils/logger.js';
@@ -3014,6 +3014,11 @@ export class Runtime {
     correlationId?: string
   ): Promise<ToolResult> {
     if (!toolResult.result || typeof toolResult.result !== 'object') return toolResult;
+    const verifierRoots = [
+      '/logs/verifier',
+      path.join(this.workspaceRoot, 'logs', 'verifier'),
+      path.join(this.workspaceRoot, '.roy', 'verifier'),
+    ];
     const candidateFiles = [
       '/logs/verifier/scorecard.json',
       '/logs/verifier/grade.log',
@@ -3024,10 +3029,42 @@ export class Runtime {
       path.join(this.workspaceRoot, '.roy', 'verifier', 'scorecard.json'),
       path.join(this.workspaceRoot, '.roy', 'verifier', 'reward.txt'),
     ];
+    const knownCandidates = new Set(candidateFiles);
+    const discovered: string[] = [];
+    for (const root of verifierRoots) {
+      try {
+        const entries = await readdir(root, { withFileTypes: true });
+        for (const entry of entries) {
+          if (!entry.isFile()
+            || !/(?:scorecard|details|summary|report|grade|reward|failure|error)[^/]*\.(?:json|log|txt)$/i.test(
+              entry.name
+            )) {
+            continue;
+          }
+          const candidate = path.join(root, entry.name);
+          if (!knownCandidates.has(candidate)) discovered.push(candidate);
+        }
+      } catch {
+        // Verifier roots are optional and may live outside the workspace.
+      }
+    }
+    candidateFiles.push(...discovered
+      .sort((left, right) => {
+        const priority = (candidate: string): number =>
+          /scorecard/i.test(candidate) ? 5
+          : /details/i.test(candidate) ? 4
+          : /(?:failure|error)/i.test(candidate) ? 3
+          : /(?:summary|report)/i.test(candidate) ? 2
+          : 1;
+        return priority(right) - priority(left) || left.localeCompare(right);
+      })
+      .slice(0, 8));
     const diagnostics: Array<{ path: string; content: string }> = [];
     for (const candidate of candidateFiles) {
       if (diagnostics.some(item => item.path === candidate)) continue;
       try {
+        const metadata = await stat(candidate);
+        if (!metadata.isFile() || metadata.size > 256_000) continue;
         const content = await readFile(candidate, 'utf8');
         if (!content.trim()) continue;
         diagnostics.push({
@@ -3060,7 +3097,7 @@ export class Runtime {
   }
 
   private shouldAttachVerifierDiagnostics(command: string): boolean {
-    return /(?:^|\/)\.roy\/official-verifier\/|\bgrade\.py\b|\b(?:pytest|vitest|jest|mocha)\b/i.test(
+    return /(?:^|[\s/])\.roy\/official-verifier\/|\bgrade\.py\b|\b(?:pytest|vitest|jest|mocha)\b/i.test(
       command
     );
   }
@@ -3129,6 +3166,7 @@ export class Runtime {
     const diagnostics = resultRecord.verifierDiagnostics;
     if (!Array.isArray(diagnostics)) return undefined;
     let scalarReward: number | undefined;
+    let structuredGroups: Record<string, number> | undefined;
     for (const item of diagnostics) {
       if (!item || typeof item !== 'object') continue;
       const diagnostic = item as { path?: unknown; content?: unknown };
@@ -3143,6 +3181,7 @@ export class Runtime {
         const parsed = JSON.parse(diagnostic.content) as {
           reward?: unknown;
           groups?: unknown;
+          gates?: unknown;
         } | number;
         if (typeof parsed === 'number') {
           if (Number.isFinite(parsed)
@@ -3151,7 +3190,25 @@ export class Runtime {
           }
           continue;
         }
+        if ('gates' in parsed
+          && parsed.gates
+          && typeof parsed.gates === 'object'
+          && !Array.isArray(parsed.gates)) {
+          const gates = Object.fromEntries(
+            Object.entries(parsed.gates)
+              .map(([group, value]): [string, number] | undefined =>
+                typeof value === 'boolean'
+                  ? [group, value ? 1 : 0]
+                  : typeof value === 'number' && Number.isFinite(value)
+                    ? [group, value]
+                    : undefined
+              )
+              .filter((entry): entry is [string, number] => Boolean(entry))
+          );
+          if (Object.keys(gates).length > 0) structuredGroups = gates;
+        }
         if (typeof parsed.reward !== 'number'
+          || !('groups' in parsed)
           || !parsed.groups
           || typeof parsed.groups !== 'object'
           || Array.isArray(parsed.groups)) {
@@ -3188,6 +3245,9 @@ export class Runtime {
       } catch {
         // grade.log and other diagnostic files may not be scorecards.
       }
+    }
+    if (structuredGroups && scalarReward !== undefined) {
+      return { reward: scalarReward, groups: structuredGroups };
     }
     return scalarReward === undefined
       ? undefined

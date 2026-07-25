@@ -1364,6 +1364,81 @@ describe('benchmark terminal capability', () => {
     await runtime.shutdown();
   });
 
+  it('discovers verifier details and maps gate state onto the scalar reward', async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), 'roy-verifier-details-'));
+    await mkdir(path.join(workspace, '.roy', 'official-verifier'), { recursive: true });
+    await mkdir(path.join(workspace, 'logs', 'verifier'), { recursive: true });
+    await writeFile(
+      path.join(workspace, '.roy', 'official-verifier', 'test_outputs.py'),
+      'raise SystemExit(1)\n'
+    );
+    await writeFile(
+      path.join(workspace, '.roy', 'config.json'),
+      JSON.stringify({
+        tools: {
+          approval: { readOnly: 'auto', execute: 'auto' },
+          shell: { mode: 'unrestricted', shell: '/bin/sh' },
+        },
+      })
+    );
+    await writeFile(
+      path.join(workspace, 'logs', 'verifier', 'reward.txt'),
+      '0.3333\n'
+    );
+    await writeFile(
+      path.join(workspace, 'logs', 'verifier', 'migration_details.json'),
+      JSON.stringify({
+        gates: {
+          dependency: true,
+          installed: true,
+          router_structure: false,
+        },
+        failure: 'router structure is incomplete',
+      })
+    );
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'verifier-details-test',
+      workspaceCwd: workspace,
+    });
+
+    const result = await runtime.executeToolForAgent(
+      'root',
+      'shell.exec',
+      { command: 'python3 .roy/official-verifier/test_outputs.py' },
+      { correlationId: 'verifier-details-turn' }
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      result: expect.objectContaining({
+        verifierDiagnostics: expect.arrayContaining([
+          expect.objectContaining({
+            path: path.join(
+              workspace,
+              'logs',
+              'verifier',
+              'migration_details.json'
+            ),
+            content: expect.stringContaining('"router_structure":false'),
+          }),
+        ]),
+      }),
+    });
+    const scorecard = (runtime as unknown as {
+      verifierScorecardFromToolResult: (value: unknown) => unknown;
+    }).verifierScorecardFromToolResult(result.result);
+    expect(scorecard).toEqual({
+      reward: 0.3333,
+      groups: {
+        dependency: 1,
+        installed: 1,
+        router_structure: 0,
+      },
+    });
+    await runtime.shutdown();
+  });
+
   it('protects the first resumed mutation with the persisted verifier baseline', async () => {
     const workspace = await mkdtemp(path.join(tmpdir(), 'roy-resumed-verifier-baseline-'));
     await writeFile(path.join(workspace, 'implementation.py'), 'VALUE = 41\n');
