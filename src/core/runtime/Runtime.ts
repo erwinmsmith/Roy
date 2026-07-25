@@ -18298,6 +18298,32 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     if (plans.length === 0
       && workspaceExecutionRequired
       && !priorRejectedVerifierCandidate) {
+      const environmentRecovery = this.toolPlanner.planEnvironmentRecovery({
+        calls: priorPlannerCalls,
+        bindings,
+        workspaceRoot: this.workspaceRoot,
+      });
+      if (environmentRecovery.length > 0) {
+        plans.push(...environmentRecovery);
+        this.emit({
+          type: 'tool.plan.environment_recovery',
+          agentId,
+          sessionId: this.getContext().sessionId,
+          correlationId: options.correlationId,
+          nodeId: options.nodeId,
+          data: {
+            plans: environmentRecovery.map(plan => ({
+              toolName: plan.toolName,
+              params: plan.params,
+            })),
+            priorToolCalls: priorPlannerCalls.length,
+          },
+        });
+      }
+    }
+    if (plans.length === 0
+      && workspaceExecutionRequired
+      && !priorRejectedVerifierCandidate) {
       const remainingWorkspaceEvidence =
         this.toolPlanner.planWorkspaceEvidenceFollowUps({
           task: intentTask,
@@ -18819,6 +18845,28 @@ For web-grounded work, use only facts present in the subagent report or runtime 
           if (eligible.length > 0) {
             return eligible.slice(0, context.remainingCalls);
           }
+        }
+        const environmentRecovery = this.toolPlanner.planEnvironmentRecovery({
+          calls: combinedCalls,
+          bindings,
+          workspaceRoot: this.workspaceRoot,
+        });
+        if (environmentRecovery.length > 0) {
+          this.emit({
+            type: 'tool.plan.environment_recovery',
+            agentId,
+            sessionId: this.getContext().sessionId,
+            correlationId: options.correlationId,
+            nodeId: options.nodeId,
+            data: {
+              plans: environmentRecovery.map(plan => ({
+                toolName: plan.toolName,
+                params: plan.params,
+              })),
+              priorToolCalls: combinedCalls.length,
+            },
+          });
+          return environmentRecovery.slice(0, context.remainingCalls);
         }
         if (diagnosticProbeRequired
           && context.calls.some(call => this.isFocusedVerifierDiagnosticCall(call))) {

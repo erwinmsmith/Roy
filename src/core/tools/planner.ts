@@ -862,6 +862,98 @@ export class AgentToolPlanner {
       .slice(0, 1);
   }
 
+  planEnvironmentRecovery(input: {
+    calls: ObservedToolCall[];
+    bindings: ToolPlanBinding[];
+    workspaceRoot?: string;
+  }): PlannedToolCall[] {
+    if (!input.bindings.some(binding =>
+      binding.enabled && binding.name === 'shell.exec'
+    )) {
+      return [];
+    }
+    const latestFailureIndex = this.latestShellFailureIndex(input.calls);
+    if (latestFailureIndex < 0) return [];
+    const latestMutationIndex =
+      effectiveWorkspaceMutationCallIndices(input.calls).at(-1) ?? -1;
+    const failureOutput = (call: ObservedToolCall): string => {
+      const result = call.result as {
+        stdout?: unknown;
+        stderr?: unknown;
+        verifierDiagnostics?: unknown;
+      } | undefined;
+      return [
+        String(result?.stdout ?? ''),
+        String(result?.stderr ?? ''),
+        String(call.error ?? ''),
+        ...this.extractVerifierDiagnosticText(result?.verifierDiagnostics),
+      ].filter(Boolean).join('\n');
+    };
+    const actionableSourceFailure = input.calls
+      .slice(latestMutationIndex + 1, latestFailureIndex)
+      .some(call => {
+        if (call.toolName !== 'shell.exec'
+          || (
+            call.success
+            && (!isWorkspaceVerificationCall(call)
+              || isSuccessfulWorkspaceVerificationCall(call))
+          )) {
+          return false;
+        }
+        const result = call.result as { cwd?: unknown } | undefined;
+        return this.extractFailureLocations(
+          failureOutput(call),
+          String(result?.cwd ?? input.workspaceRoot ?? ''),
+          input.workspaceRoot
+        ).some(location => this.isMutableImplementationPath(location.path));
+      });
+    if (actionableSourceFailure) return [];
+
+    const failure = input.calls[latestFailureIndex]!;
+    const result = failure.result as { command?: unknown } | undefined;
+    const command = String(result?.command ?? failure.params.command ?? '').trim();
+    const invokedModule = /^((?:python|python3))\s+-m\s+([A-Za-z0-9_.-]+)\b/.exec(
+      command
+    );
+    if (!invokedModule) return [];
+    const python = invokedModule[1]!;
+    const moduleName = invokedModule[2]!;
+    const installableDevelopmentTools = new Map<string, string>([
+      ['pytest', 'pytest'],
+      ['ruff', 'ruff'],
+      ['mypy', 'mypy'],
+      ['coverage', 'coverage'],
+      ['tox', 'tox'],
+      ['nox', 'nox'],
+      ['hypothesis', 'hypothesis'],
+    ]);
+    const packageName = installableDevelopmentTools.get(moduleName);
+    if (!packageName) return [];
+    const output = failureOutput(failure);
+    const escapedModule = moduleName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (!new RegExp(
+      `(?:No module named ['"]?${escapedModule}['"]?|ModuleNotFoundError:[^\\n]*${escapedModule})`,
+      'i'
+    ).test(output)) {
+      return [];
+    }
+    const installCommand = `${python} -m pip install ${packageName}`;
+    if (input.calls.some((call, index) =>
+      index > latestFailureIndex
+      && call.toolName === 'shell.exec'
+      && String(call.params.command ?? '').trim() === installCommand
+      && call.success
+    )) {
+      return [];
+    }
+    return [{
+      toolName: 'shell.exec',
+      params: { command: installCommand },
+      reason: `The task-declared ${moduleName} command cannot start because its own development-tool module is absent, and no newer source-localized failure remains; install the runner before retrying verification.`,
+      groundingRequired: true,
+    }];
+  }
+
   planWorkspaceRepairTransition(input: {
     task: string;
     calls: ObservedToolCall[];

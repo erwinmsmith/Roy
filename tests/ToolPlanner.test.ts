@@ -794,6 +794,125 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('bootstraps an explicitly invoked missing development tool after source failures clear', () => {
+    const planner = new AgentToolPlanner();
+    const bindings = [{ name: 'shell.exec', enabled: true }];
+    const calls = [
+      {
+        toolName: 'fs.synthesize',
+        params: {
+          path: 'src/support_rag/router.py',
+          instructions: 'Repair the router.',
+          strategy: 'patch',
+        },
+        success: true,
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m support_rag.cli route --ticket invoice' },
+        success: true,
+        result: {
+          command: 'python -m support_rag.cli route --ticket invoice',
+          cwd: '/app',
+          exitCode: 0,
+          stdout: '{"route":"billing"}',
+        },
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m pytest -q' },
+        success: false,
+        result: {
+          command: 'python -m pytest -q',
+          cwd: '/app',
+          exitCode: 1,
+          stderr: '/usr/local/bin/python: No module named pytest',
+        },
+      },
+    ];
+
+    expect(planner.planEnvironmentRecovery({
+      calls,
+      bindings,
+      workspaceRoot: '/app',
+    })).toEqual([
+      expect.objectContaining({
+        toolName: 'shell.exec',
+        params: { command: 'python -m pip install pytest' },
+        reason: expect.stringContaining('development-tool module is absent'),
+      }),
+    ]);
+    expect(planner.planEnvironmentRecovery({
+      calls: [
+        ...calls,
+        {
+          toolName: 'shell.exec',
+          params: { command: 'python -m pip install pytest' },
+          success: true,
+        },
+      ],
+      bindings,
+      workspaceRoot: '/app',
+    })).toEqual([]);
+  });
+
+  it('does not install a development tool while a newer source repair remains', () => {
+    const planner = new AgentToolPlanner();
+    expect(planner.planEnvironmentRecovery({
+      workspaceRoot: '/app',
+      bindings: [{ name: 'shell.exec', enabled: true }],
+      calls: [
+        {
+          toolName: 'fs.synthesize',
+          params: {
+            path: 'src/support_rag/chain.py',
+            instructions: 'Migrate the chain.',
+            strategy: 'patch',
+          },
+          success: true,
+        },
+        {
+          toolName: 'shell.exec',
+          params: { command: 'python -m support_rag.cli answer' },
+          success: false,
+          result: {
+            cwd: '/app',
+            exitCode: 1,
+            stderr: [
+              'Traceback (most recent call last):',
+              '  File "/app/src/support_rag/models.py", line 5, in <module>',
+              "ModuleNotFoundError: No module named 'langchain.llms'",
+            ].join('\n'),
+          },
+        },
+        {
+          toolName: 'shell.exec',
+          params: { command: 'python -m pytest -q' },
+          success: false,
+          result: {
+            command: 'python -m pytest -q',
+            cwd: '/app',
+            exitCode: 1,
+            stderr: '/usr/local/bin/python: No module named pytest',
+          },
+        },
+      ],
+    })).toEqual([]);
+
+    expect(planner.planEnvironmentRecovery({
+      bindings: [{ name: 'shell.exec', enabled: true }],
+      calls: [{
+        toolName: 'shell.exec',
+        params: { command: 'python -m business_package.cli' },
+        success: false,
+        result: {
+          command: 'python -m business_package.cli',
+          stderr: '/usr/bin/python: No module named business_package',
+        },
+      }],
+    })).toEqual([]);
+  });
+
   it('uses a non-perfect official verifier score and nested diagnostic traceback', () => {
     const plans = new AgentToolPlanner().planWorkspaceFailureFollowUps({
       workspaceRoot: '/app',
