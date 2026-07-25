@@ -430,6 +430,10 @@ export class AgentToolPlanner {
     const effectiveMutations = new Set(
       effectiveWorkspaceMutationCallIndices(input.calls)
     );
+    const acceptanceRepairFeedback =
+      /<runtime_acceptance_repair_targets>([\s\S]*?)<\/runtime_acceptance_repair_targets>/i.exec(
+        input.task
+      )?.[1]?.toLowerCase() ?? '';
     const attemptedMutationIndexByPath = new Map<string, number>();
     input.calls.forEach((call, index) => {
       if (!isSuccessfulWorkspaceMutationCall(call)) return;
@@ -485,14 +489,26 @@ export class AgentToolPlanner {
         } | undefined;
         const path = normalizeObservedPath(result?.path ?? call.params.path);
         const content = typeof result?.content === 'string' ? result.content : '';
+        const basename = path.slice(path.lastIndexOf('/') + 1);
+        const basenameStem = basename.replace(/\.[^.]+$/, '');
+        const acceptanceFailureMentioned = Boolean(
+          acceptanceRepairFeedback
+          && (
+            acceptanceRepairFeedback.includes(path.toLowerCase())
+            || acceptanceRepairFeedback.includes(basename.toLowerCase())
+            || new RegExp(
+              `\\b${basenameStem.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`,
+              'i'
+            ).test(acceptanceRepairFeedback)
+          )
+        );
         if (!path
           || !content
           || result?.truncated === true
-          || mutatedPaths.has(path)
+          || mutatedPaths.has(path) && !acceptanceFailureMentioned
           || !this.isMutableImplementationPath(path)) {
           return undefined;
         }
-        const basename = path.slice(path.lastIndexOf('/') + 1);
         const taskPathIndex = taskLower.indexOf(path.toLowerCase());
         const taskBasenameIndex = taskLower.indexOf(basename.toLowerCase());
         const taskExplicit = taskPathIndex >= 0 || taskBasenameIndex >= 0;
@@ -503,13 +519,17 @@ export class AgentToolPlanner {
           || latestFailureText.includes(basename.toLowerCase());
         const previousMutationIndex = attemptedMutationIndexByPath.get(path);
         if (previousMutationIndex !== undefined
+          && !acceptanceFailureMentioned
           && (
             latestFailureIndex <= previousMutationIndex
             || !failureMentioned
           )) {
           return undefined;
         }
-        if (!taskExplicit && matchedTerms.length === 0 && !failureMentioned) {
+        if (!taskExplicit
+          && matchedTerms.length === 0
+          && !failureMentioned
+          && !acceptanceFailureMentioned) {
           return undefined;
         }
         const firstMention = taskPathIndex >= 0
@@ -523,7 +543,9 @@ export class AgentToolPlanner {
           index,
           firstMention,
           matchedTerms,
-          score: (failureMentioned ? 900 : 0)
+          acceptanceFailureMentioned,
+          score: (acceptanceFailureMentioned ? 1_200 : 0)
+            + (failureMentioned ? 900 : 0)
             + (taskPathIndex >= 0 ? 500 : taskBasenameIndex >= 0 ? 360 : 0)
             + Math.min(10, matchedTerms.length) * 45,
         };
@@ -544,6 +566,9 @@ export class AgentToolPlanner {
       relevantContract.length > 0
         ? `The current source still contains these identifiers or contract terms named by the assignment: ${relevantContract.join(', ')}.`
         : 'The assignment explicitly names this file as an implementation target.',
+      candidate.acceptanceFailureMentioned
+        ? `The latest global acceptance audit identifies this component as failed:\n${acceptanceRepairFeedback.slice(0, 2_400)}`
+        : '',
       'Use the current file as the patch base, preserve public interfaces and unrelated working behavior, and replace only the legacy or incomplete behavior required by the immutable assignment.',
       'Do not modify tests, benchmark assets, verifier files, or unrelated source paths.',
     ].join(' ');

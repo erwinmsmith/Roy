@@ -21132,13 +21132,23 @@ For web-grounded work, use only facts present in the subagent report or runtime 
           '- Consume actionable feedback, preserve useful state from prior paths, and append new verification evidence.',
         ].join('\n'),
       ].join('\n\n');
+      const executionIntentTask = priorExecution?.acceptanceAudit
+        ? [
+          userTask,
+          '<runtime_acceptance_repair_targets>',
+          ...priorExecution.acceptanceAudit.items
+            .filter(item => item.status === 'failed')
+            .map(item => `${item.id}: ${item.evidence}`),
+          '</runtime_acceptance_repair_targets>',
+        ].join('\n')
+        : userTask;
       const current = await this.runGroundingCheck(
         'root',
         task,
         {
           correlationId,
           archetype: 'coder',
-          intentTask: userTask,
+          intentTask: executionIntentTask,
           maxWallClockMs: attemptWallClockMs,
           priorToolCalls: priorExecution?.toolCalls ?? delegatedExecution?.toolCalls,
           requireFreshMutation: this.shouldRequireFreshAcceptanceMutation(

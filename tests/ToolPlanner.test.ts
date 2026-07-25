@@ -1057,6 +1057,65 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('routes failed global acceptance feedback back to its observed source component', () => {
+    const planner = new AgentToolPlanner();
+    const task = [
+      'Migrate the application runtime and preserve its CLI/API behavior.',
+      '<runtime_acceptance_repair_targets>',
+      'acceptance_03: Migrated replay always returns account with confidence 0.0.',
+      'acceptance_07: Router ignores markers and confidences from config.',
+      '</runtime_acceptance_repair_targets>',
+    ].join('\n');
+    const calls = [
+      {
+        toolName: 'fs.read',
+        params: { path: 'src/support_rag/router.py' },
+        success: true,
+        result: {
+          path: 'src/support_rag/router.py',
+          content: 'def route_ticket(ticket):\n    return {"route": "account", "confidence": 0.0}\n',
+          truncated: false,
+        },
+      },
+      {
+        toolName: 'fs.synthesize',
+        params: {
+          path: 'src/support_rag/router.py',
+          instructions: 'Migrate the router.',
+          strategy: 'patch',
+        },
+        success: true,
+        result: { path: 'src/support_rag/router.py' },
+      },
+      {
+        toolName: 'fs.read',
+        params: { path: 'src/support_rag/router.py' },
+        success: true,
+        result: {
+          path: 'src/support_rag/router.py',
+          content: 'def route_ticket(ticket):\n    return {"route": "account", "confidence": 0.0}\n',
+          truncated: false,
+        },
+      },
+    ];
+
+    expect(planner.planGroundedImplementationTransition({
+      task,
+      workspaceRoot: '/app',
+      bindings: [{ name: 'fs.synthesize', enabled: true }],
+      calls,
+    })).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.synthesize',
+        params: expect.objectContaining({
+          path: 'src/support_rag/router.py',
+          instructions: expect.stringContaining('confidence 0.0'),
+          strategy: 'patch',
+        }),
+      }),
+    ]);
+  });
+
   it('uses shell error text to inspect an imported workspace module', () => {
     const plans = new AgentToolPlanner().planWorkspaceFailureFollowUps({
       workspaceRoot: '/app',
