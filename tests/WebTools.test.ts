@@ -88,6 +88,40 @@ describe('web tools', () => {
     );
   });
 
+  it('recovers an unavailable keyless provider through Wikipedia search', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response('rate limited', { status: 429 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        query: {
+          search: [{
+            title: 'Moonwalk (book)',
+            snippet: 'Moonwalk is a 1988 <span class="searchmatch">autobiography</span> by Michael Jackson.',
+          }],
+        },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubEnv('BRAVE_SEARCH_API_KEY', '');
+
+    const result = await new WebSearchTool({ searchProvider: 'auto' }).execute({
+      query: 'Michael Jackson autobiography 1988',
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.result).toEqual(expect.objectContaining({
+      provider: 'wikipedia',
+      results: [{
+        title: 'Moonwalk (book)',
+        url: 'https://en.wikipedia.org/wiki/Moonwalk_(book)',
+        snippet: 'Moonwalk is a 1988 autobiography by Michael Jackson.',
+        source: 'en.wikipedia.org',
+      }],
+    }));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it('rejects localhost and cloud metadata URLs before fetching', async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);

@@ -3,7 +3,12 @@ import { isIP } from 'node:net';
 import { load } from 'cheerio';
 import type { Tool, ToolResult } from './types.js';
 
-export type WebSearchProviderName = 'auto' | 'brave' | 'brave_html' | 'bing';
+export type WebSearchProviderName =
+  | 'auto'
+  | 'brave'
+  | 'brave_html'
+  | 'wikipedia'
+  | 'bing';
 
 export interface WebToolConfig {
   enabled: boolean;
@@ -90,25 +95,47 @@ export class WebSearchTool implements Tool {
     const query = domain ? `${rawQuery} site:${domain}` : rawQuery;
     const maxResults = Math.min(Math.max(1, Number(params.maxResults ?? this.config.maxResults)), 10);
     const configuredKey = process.env[this.config.braveApiKeyEnv]?.trim();
-    const provider = this.config.searchProvider === 'auto'
+    const configuredProvider = this.config.searchProvider;
+    const provider = configuredProvider === 'auto'
       ? configuredKey ? 'brave' : 'brave_html'
-      : this.config.searchProvider;
+      : configuredProvider;
 
     try {
-      const results = provider === 'brave'
-        ? await this.searchBrave(query, maxResults, configuredKey)
-        : provider === 'brave_html'
-          ? await this.searchBraveHtml(query, maxResults)
-          : await this.searchBing(query, maxResults);
+      let actualProvider = provider;
+      let results: WebSearchResultItem[];
+      if (provider === 'brave') {
+        results = await this.searchBrave(query, maxResults, configuredKey);
+      } else if (provider === 'brave_html') {
+        try {
+          results = await this.searchBraveHtml(query, maxResults);
+          if (configuredProvider === 'auto' && results.length === 0) {
+            actualProvider = 'wikipedia';
+            results = await this.searchWikipedia(query, maxResults);
+          }
+        } catch (error) {
+          if (configuredProvider !== 'auto') throw error;
+          actualProvider = 'wikipedia';
+          results = await this.searchWikipedia(query, maxResults);
+        }
+      } else if (provider === 'wikipedia') {
+        results = await this.searchWikipedia(query, maxResults);
+      } else {
+        results = await this.searchBing(query, maxResults);
+      }
       return {
         success: true,
         result: {
           query: rawQuery,
-          provider,
+          provider: actualProvider,
           results,
           fetchedAt: new Date().toISOString(),
         } satisfies WebSearchResult,
-        metadata: { provider, resultCount: results.length, domain },
+        metadata: {
+          provider: actualProvider,
+          configuredProvider,
+          resultCount: results.length,
+          domain,
+        },
       };
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : String(error), metadata: { provider } };
@@ -208,6 +235,53 @@ export class WebSearchTool implements Tool {
       .filter((item, index, items) =>
         items.findIndex(candidate => candidate.url === item.url) === index
       )
+      .slice(0, maxResults);
+  }
+
+  private async searchWikipedia(query: string, maxResults: number): Promise<WebSearchResultItem[]> {
+    const url = new URL('https://en.wikipedia.org/w/api.php');
+    url.searchParams.set('action', 'query');
+    url.searchParams.set('list', 'search');
+    url.searchParams.set('srsearch', query);
+    url.searchParams.set('srlimit', String(maxResults));
+    url.searchParams.set('format', 'json');
+    url.searchParams.set('formatversion', '2');
+    url.searchParams.set('origin', '*');
+    const response = await fetchWithTimeout(url, {
+      timeoutMs: this.config.timeoutMs,
+      headers: {
+        Accept: 'application/json',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'User-Agent': this.config.userAgent,
+      },
+    });
+    if (!response.ok) throw new Error(`Wikipedia search returned HTTP ${response.status}`);
+    const payload = await response.json() as {
+      query?: {
+        search?: Array<{
+          title?: unknown;
+          snippet?: unknown;
+        }>;
+      };
+    };
+    return (payload.query?.search ?? [])
+      .map(item => {
+        const title = cleanText(String(item.title ?? ''));
+        if (!title) return undefined;
+        const articleUrl = new URL(
+          `/wiki/${encodeURIComponent(title.replace(/\s+/g, '_'))}`,
+          'https://en.wikipedia.org'
+        ).toString();
+        const snippetHtml = String(item.snippet ?? '');
+        const snippet = cleanText(load(`<div>${snippetHtml}</div>`)('div').text());
+        return {
+          title,
+          url: articleUrl,
+          snippet,
+          source: 'en.wikipedia.org',
+        } satisfies WebSearchResultItem;
+      })
+      .filter((item): item is WebSearchResultItem => Boolean(item))
       .slice(0, maxResults);
   }
 }

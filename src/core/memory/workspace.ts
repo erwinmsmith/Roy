@@ -252,7 +252,7 @@ export interface WorkspaceRuntimeConfig {
     };
     web: {
       enabled: boolean;
-      searchProvider: 'auto' | 'brave' | 'brave_html' | 'bing';
+      searchProvider: 'auto' | 'brave' | 'brave_html' | 'wikipedia' | 'bing';
       braveApiKeyEnv: string;
       timeoutMs: number;
       maxResults: number;

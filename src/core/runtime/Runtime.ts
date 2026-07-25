@@ -19534,7 +19534,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     return [
       '[runtime_grounding_provided]',
       task,
-      '\nGrounding rules:\n- Treat the runtime-provided tool output as authoritative.\n- Mention only files, technologies, commands, test results, compatibility claims, and API semantics supported by that output.\n- A page title, URL, or navigation entry proves only that the page exists; it does not establish the page body, compatibility range, or API behavior.\n- If prior assumptions conflict with the tool output, discard the assumptions.\n- Label anything not established by the tool output as unverified; do not invent a replacement structure.',
+      '\nGrounding rules:\n- Treat the runtime-provided tool output as authoritative.\n- Mention only files, technologies, commands, test results, compatibility claims, and API semantics supported by that output.\n- A page title, URL, or navigation entry proves only that the page exists; it does not establish the page body, compatibility range, or API behavior.\n- If prior assumptions conflict with the tool output, discard the assumptions.\n- When credible sources support multiple plausible interpretations, state the ambiguity and preserve the supported alternatives instead of silently choosing one.\n- Label anything not established by the tool output as unverified; do not invent a replacement structure.',
       grounding.context ? `\nGrounding context:\n${grounding.context}` : '',
       grounding.warnings.length > 0 ? `\nGrounding warnings:\n${grounding.warnings.join('\n')}` : '',
     ].filter(Boolean).join('\n');
