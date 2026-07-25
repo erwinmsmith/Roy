@@ -1007,6 +1007,41 @@ describe('Phase 3 subteam runtime', () => {
     expect(producedMutation.call(runtime, inspectionFailure)).toBe(false);
   });
 
+  it('counts cached failed-member mutations when deciding to hand execution back to root', () => {
+    const runtime = new Runtime();
+    const internals = runtime as unknown as {
+      teamToolEvidenceCache: Map<string, Array<{
+        toolName: string;
+        params: Record<string, unknown>;
+        success: boolean;
+      }>>;
+      delegationRoundHasWorkspaceMutation: (round: {
+        subagents: [];
+        teams: Array<{
+          team: { identity: { id: string } };
+          members: [];
+        }>;
+      }) => boolean;
+    };
+    internals.teamToolEvidenceCache.set('team-with-partial-mutation', [{
+      toolName: 'fs.replace',
+      params: {
+        path: 'src/app.ts',
+        oldText: 'return false;',
+        newText: 'return true;',
+      },
+      success: true,
+    }]);
+
+    expect(internals.delegationRoundHasWorkspaceMutation({
+      subagents: [],
+      teams: [{
+        team: { identity: { id: 'team-with-partial-mutation' } },
+        members: [],
+      }],
+    })).toBe(true);
+  });
+
   it('keeps failed automatic team members in the root step actor tree', async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), 'roy-phase3-root-partial-tree-'));
     await mkdir(path.join(cwd, '.roy'), { recursive: true });

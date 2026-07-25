@@ -12227,6 +12227,9 @@ export class Runtime {
     const calls = [
       ...round.subagents.flatMap(item => item.subagentResult.toolCalls),
       ...round.teams.flatMap(team => team.members.flatMap(member => member.toolCalls)),
+      ...round.teams.flatMap(team =>
+        this.teamToolEvidenceCache.get(team.team.identity.id) ?? []
+      ),
     ];
     return this.hasSuccessfulWorkspaceMutation(calls);
   }
