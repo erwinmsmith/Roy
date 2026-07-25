@@ -1209,6 +1209,88 @@ export class AgentToolPlanner {
     const latestFailureIndex = this.latestShellFailureIndex(input.calls);
     if (latestFailureIndex < 0) return [];
     const latestFailure = input.calls[latestFailureIndex]!;
+    const latestFailureResult = latestFailure.result as {
+      stdout?: unknown;
+      stderr?: unknown;
+    } | undefined;
+    const latestFailureOutput = [
+      String(latestFailureResult?.stdout ?? ''),
+      String(latestFailureResult?.stderr ?? ''),
+      String(latestFailure.error ?? ''),
+    ].filter(Boolean).join('\n');
+    const unavailableDependency = /(?:could not find a version that satisfies the requirement|no matching distribution found for)\s+([A-Za-z0-9_.-]+)/i.exec(
+      latestFailureOutput
+    )?.[1];
+    if (latestFailure.toolName === 'shell.exec'
+      && this.isDependencyInstallCommand(String(latestFailure.params.command ?? ''))
+      && unavailableDependency) {
+      const dependencyToken = unavailableDependency
+        .toLowerCase()
+        .replace(/[-_.]+/g, '[-_.]');
+      const dependencyPattern = new RegExp(`\\b${dependencyToken}\\b`, 'i');
+      const manifestRead = input.calls
+        .map((call, index) => ({ call, index }))
+        .reverse()
+        .find(({ call }) => {
+          if (call.toolName !== 'fs.read' || !call.success) return false;
+          const result = call.result as {
+            path?: unknown;
+            content?: unknown;
+          } | undefined;
+          const path = this.normalizeWorkspacePath(String(
+            result?.path ?? call.params.path ?? ''
+          ));
+          return this.isDependencyManifestPath(path)
+            && typeof result?.content === 'string'
+            && dependencyPattern.test(result.content);
+        });
+      if (manifestRead) {
+        const targetPath = this.normalizeWorkspacePath(String(
+          (manifestRead.call.result as { path?: unknown } | undefined)?.path
+            ?? manifestRead.call.params.path
+            ?? ''
+        ));
+        const staleRead = input.calls
+          .slice(manifestRead.index + 1)
+          .some(call =>
+            isSuccessfulWorkspaceMutationCall(call)
+            && this.normalizeWorkspacePath(String(call.params.path ?? ''))
+              === targetPath
+          );
+        if (!staleRead) {
+          const compactFailure = latestFailureOutput.length <= 2_400
+            ? latestFailureOutput
+            : `${latestFailureOutput.slice(0, 700)}\n[installer output compacted]\n${latestFailureOutput.slice(-1_700)}`;
+          const instructions = [
+            'Repair the dependency manifest so the project can install in the authoritative current environment.',
+            `The installer cannot resolve ${unavailableDependency}. Reconcile only the declaration that causes this failure; do not add guessed replacement packages or weaken unrelated required runtime constraints.`,
+            `Authoritative installer failure:\n${compactFailure}`,
+            'Use the freshly read manifest as the patch base and preserve unrelated metadata.',
+          ].join('\n\n');
+          const duplicate = input.calls
+            .slice(manifestRead.index + 1)
+            .some(call =>
+              call.toolName === 'fs.synthesize'
+              && this.normalizeWorkspacePath(String(call.params.path ?? ''))
+                === targetPath
+              && String(call.params.instructions ?? '') === instructions
+              && call.params.strategy === 'patch'
+            );
+          if (!duplicate) {
+            return [{
+              toolName: 'fs.synthesize',
+              params: {
+                path: targetPath,
+                instructions,
+                strategy: 'patch',
+              },
+              reason: `The current environment rejected ${unavailableDependency}; the freshly read dependency manifest is the causal repair target.`,
+              groundingRequired: true,
+            }];
+          }
+        }
+      }
+    }
     if (!isWorkspaceVerificationCall(latestFailure)
       || isUnavailableWorkspaceVerificationCall(latestFailure)
       || isSuccessfulWorkspaceVerificationCall(latestFailure)) {

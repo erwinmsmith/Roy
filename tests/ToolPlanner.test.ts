@@ -992,6 +992,71 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('repairs a freshly read manifest after the environment rejects a dependency', () => {
+    const planner = new AgentToolPlanner();
+    const calls = [
+      {
+        toolName: 'fs.synthesize',
+        params: {
+          path: 'pyproject.toml',
+          instructions: 'Upgrade the runtime dependencies.',
+          strategy: 'patch',
+        },
+        success: true,
+        result: { path: 'pyproject.toml' },
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m pip install -e .' },
+        success: false,
+        result: {
+          cwd: '/app',
+          exitCode: 1,
+          stderr: [
+            'ERROR: Could not find a version that satisfies the requirement',
+            'langchain-community>=0.3.0 (from support-rag)',
+            'ERROR: No matching distribution found for langchain-community>=0.3.0',
+          ].join(' '),
+        },
+      },
+      {
+        toolName: 'fs.read',
+        params: { path: 'pyproject.toml' },
+        success: true,
+        result: {
+          path: 'pyproject.toml',
+          content: [
+            '[project]',
+            'dependencies = [',
+            '  "langchain>=1.3.0",',
+            '  "langchain-community>=0.3.0",',
+            ']',
+          ].join('\n'),
+          truncated: false,
+        },
+      },
+    ];
+
+    expect(planner.planWorkspaceRepairTransition({
+      task: 'Upgrade the application runtime and verify installation.',
+      workspaceRoot: '/app',
+      bindings: [
+        { name: 'fs.synthesize', enabled: true },
+        { name: 'shell.exec', enabled: true },
+      ],
+      calls,
+    })).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.synthesize',
+        params: expect.objectContaining({
+          path: 'pyproject.toml',
+          instructions: expect.stringContaining('langchain-community'),
+          strategy: 'patch',
+        }),
+      }),
+    ]);
+  });
+
   it('uses shell error text to inspect an imported workspace module', () => {
     const plans = new AgentToolPlanner().planWorkspaceFailureFollowUps({
       workspaceRoot: '/app',
