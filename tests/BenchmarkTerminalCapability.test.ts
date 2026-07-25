@@ -392,6 +392,52 @@ describe('benchmark terminal capability', () => {
       verificationPassed: true,
     });
     expect(analyze([
+      { toolName: 'fs.write', params: { path: 'artifact.txt', content: 'changed' }, success: true },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m app.cli answer' },
+        success: false,
+        result: { exitCode: 1, stderr: 'answer failed' },
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m pip install -e .' },
+        success: true,
+        result: { exitCode: 0 },
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m app.cli route' },
+        success: true,
+        result: { exitCode: 0 },
+      },
+    ])).toMatchObject({
+      closed: false,
+      verificationAttemptedAfterMutation: true,
+      verificationPassed: false,
+      unresolvedVerificationFailures: 1,
+    });
+    expect(analyze([
+      { toolName: 'fs.write', params: { path: 'artifact.txt', content: 'changed' }, success: true },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m app.cli answer' },
+        success: false,
+        result: { exitCode: 1, stderr: 'answer failed' },
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m app.cli answer' },
+        success: true,
+        result: { exitCode: 0 },
+      },
+    ])).toMatchObject({
+      closed: true,
+      verificationAttemptedAfterMutation: true,
+      verificationPassed: true,
+      unresolvedVerificationFailures: 0,
+    });
+    expect(analyze([
       {
         toolName: 'fs.write',
         params: { path: 'artifact.txt', content: 'candidate' },

@@ -389,6 +389,10 @@ export function isWorkspaceVerificationCall(call: ExecutionIntentCall): boolean 
   if (call.toolName !== 'shell.exec') return false;
   const command = String(call.params.command ?? '');
   if (masksShellFailure(command)) return false;
+  if (/\bpython(?:3)?\s+-m\s+(?:pip|ensurepip|venv)(?:\s|$)/i.test(command)
+    || /\b(?:pip|uv\s+pip)\s+install\b/i.test(command)) {
+    return false;
+  }
   return /\b(?:test|pytest|vitest|jest|mocha|cargo\s+test|go\s+test|npm\s+(?:test|run\s+(?:test|check|build|lint|typecheck))|pnpm\s+(?:test|run)|yarn\s+(?:test|run)|ruff|eslint|tsc|mypy|pyright|compileall)\b/i.test(command)
     || /\bpython(?:3)?\s+(?:-m\s+[A-Za-z_][\w.]*|(?:\.\/)?[\w./-]+\.py)(?:\s|$)/i.test(command);
 }

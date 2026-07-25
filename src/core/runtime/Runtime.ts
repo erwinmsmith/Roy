@@ -514,6 +514,7 @@ interface WorkspaceExecutionClosureStatus {
   lastMutationCallIndex: number;
   lastVerificationCallIndex: number;
   failedVerificationCallsAfterMutation: number;
+  unresolvedVerificationFailures: number;
 }
 
 interface ExecutionResumeState {
@@ -20863,8 +20864,19 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     const lastVerification = verificationCalls.at(-1);
     const mutationApplied = lastMutationCallIndex >= 0;
     const verificationAttemptedAfterMutation = mutationApplied && verificationCalls.length > 0;
+    const latestVerificationByIntent = new Map<string, ToolCallRecord>();
+    for (const item of verificationCalls) {
+      latestVerificationByIntent.set(
+        this.toolPlanFingerprint(item.call),
+        item.call
+      );
+    }
+    const unresolvedVerificationFailures = [...latestVerificationByIntent.values()]
+      .filter(call => !isSuccessfulWorkspaceVerificationCall(call)).length;
     const verificationPassed = verificationAttemptedAfterMutation
-      && Boolean(lastVerification && isSuccessfulWorkspaceVerificationCall(lastVerification.call));
+      && unresolvedVerificationFailures === 0
+      && [...latestVerificationByIntent.values()]
+        .some(call => isSuccessfulWorkspaceVerificationCall(call));
     const acceptanceItems = acceptanceAudit?.items.length ?? 0;
     const acceptanceItemsVerified = acceptanceAudit?.items
       .filter(item => item.status === 'verified').length ?? 0;
@@ -20887,6 +20899,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       lastVerificationCallIndex: lastVerification?.index ?? -1,
       failedVerificationCallsAfterMutation: verificationCalls
         .filter(item => !isSuccessfulWorkspaceVerificationCall(item.call)).length,
+      unresolvedVerificationFailures,
     };
   }
 

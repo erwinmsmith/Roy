@@ -6,6 +6,7 @@ import {
   hasEffectiveWorkspaceMutationCall,
   isSuccessfulWorkspaceMutationCall,
   isSuccessfulWorkspaceVerificationCall,
+  isWorkspaceVerificationCall,
   plannedWorkspaceMutationPath,
   taskRequestsWorkspaceMutation,
   workspaceTargetNeedsFreshNoGainEvidence,
@@ -48,6 +49,16 @@ describe('workspace execution intent', () => {
     expect(isSuccessfulWorkspaceMutationCall({
       toolName: 'shell.exec',
       params: { command: 'uv pip install pytest' },
+      success: true,
+    })).toBe(false);
+    expect(isWorkspaceVerificationCall({
+      toolName: 'shell.exec',
+      params: { command: 'python -m pip install -e .' },
+      success: true,
+    })).toBe(false);
+    expect(isWorkspaceVerificationCall({
+      toolName: 'shell.exec',
+      params: { command: 'python3 -m ensurepip --upgrade' },
       success: true,
     })).toBe(false);
   });
