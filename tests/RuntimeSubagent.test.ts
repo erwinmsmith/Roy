@@ -1455,6 +1455,8 @@ describe('Runtime controlled subagent spawning', () => {
     expect(result.result).toBe('Recovered complete visible result.');
     expect(result.agent.error).toBeUndefined();
     expect(llm.streamedPrompts).toHaveLength(2);
+    expect(llm.streamedPrompts.at(-1)).toContain('[runtime_current_assignment]');
+    expect(llm.streamedPrompts.at(-1)).toContain(task);
     expect(runtime.getEvents().map(event => event.type)).toEqual(expect.arrayContaining([
       'agent.output.empty.recovery.started',
       'agent.output.empty.recovery.completed',

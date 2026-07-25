@@ -2295,6 +2295,14 @@ export class Runtime {
     ].join('\n');
   }
 
+  private isolatedAgentTaskObservation(task: string): string {
+    return [
+      '[runtime_current_assignment]',
+      'This completion is isolated from the earlier agent conversation, so the immutable task is repeated below.',
+      this.compactDelegatedTask(task, 12_000),
+    ].join('\n\n');
+  }
+
   async runTeam(
     teamId: string,
     task: string,
@@ -8967,7 +8975,7 @@ export class Runtime {
         }
         if (!result.trim()) {
           const recoveryPrompt = [
-            `Complete this bounded assigned task directly:\n${this.agentTaskObservationReference(agentId, task)}`,
+            `Complete this bounded assigned task directly:\n${this.isolatedAgentTaskObservation(task)}`,
             `Available runtime grounding:\n${(grounding.evidence.toolResultSummary ?? grounding.context).slice(-12_000) || 'No external tool evidence was required.'}`,
             stepError
               ? `The previous attempt produced an invalid runtime action instead of a result:\n${stepError.slice(0, 1_000)}`
@@ -9046,7 +9054,7 @@ export class Runtime {
           result = await this.completeAsAgent(
             agent,
             [
-              `Task reference:\n${this.agentTaskObservationReference(agentId, task)}`,
+              `Task reference:\n${this.isolatedAgentTaskObservation(task)}`,
               `Runtime-provided evidence:\n${(grounding.evidence.toolResultSummary ?? grounding.context).slice(-12_000)}`,
               'The workspace execution path is still open: a mutation and successful post-mutation verification have not both been observed.',
               'Produce the final task result from the evidence above. Do so only if the task is genuinely complete.',
@@ -9120,7 +9128,7 @@ export class Runtime {
             result = await this.completeAsAgent(
               agent,
               [
-                `Task reference:\n${this.agentTaskObservationReference(agentId, task)}`,
+                `Task reference:\n${this.isolatedAgentTaskObservation(task)}`,
                 `Runtime-provided evidence:\n${(grounding.evidence.toolResultSummary ?? grounding.context).slice(-12_000)}`,
                 'Runtime executed the model-authored tool request through the authorized tool layer.',
                 'Produce the final task result from the evidence above. Do so only if the task is genuinely complete.',
@@ -9153,7 +9161,7 @@ export class Runtime {
         result = await this.completeAsAgent(
           agent,
           [
-            `Task reference:\n${this.agentTaskObservationReference(agentId, task)}`,
+            `Task reference:\n${this.isolatedAgentTaskObservation(task)}`,
             `Runtime-provided evidence:\n${grounding.evidence.toolResultSummary ?? grounding.context}`,
             'Produce the final task result from the evidence above.',
             'Do not emit tool-call markup, JSON tool requests, or claim that a tool still needs to run.',
