@@ -1632,6 +1632,84 @@ describe('benchmark terminal capability', () => {
     await resumedRuntime.shutdown();
   });
 
+  it('runs the mirrored official verifier before a second mutation hypothesis', async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), 'roy-mirrored-verifier-barrier-'));
+    await mkdir(path.join(workspace, '.roy', 'official-verifier'), { recursive: true });
+    await mkdir(path.join(workspace, 'logs', 'verifier'), { recursive: true });
+    await writeFile(path.join(workspace, 'implementation.py'), 'VALUE = 0\n');
+    await writeFile(
+      path.join(workspace, '.roy', 'config.json'),
+      JSON.stringify({
+        tools: {
+          approval: { readOnly: 'auto', write: 'auto', execute: 'auto' },
+          shell: { mode: 'unrestricted', shell: '/bin/sh' },
+        },
+      })
+    );
+    await writeFile(
+      path.join(workspace, '.roy', 'official-verifier', 'grade.py'),
+      [
+        'import json',
+        'from pathlib import Path',
+        'value = int(Path("implementation.py").read_text().split("=")[1].strip())',
+        'reward = 1.0 if value == 1 else 0.0',
+        'Path("logs/verifier/scorecard.json").write_text(json.dumps({"groups": {"behavior": reward}, "reward": reward}))',
+        'print(f"{reward:.12f}")',
+      ].join('\n') + '\n'
+    );
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'mirrored-verifier-barrier-test',
+      workspaceCwd: workspace,
+    });
+
+    const grounding = await (runtime as unknown as {
+      runGroundingCheck: (
+        agentId: string,
+        task: string,
+        options: Record<string, unknown>
+      ) => Promise<{ toolCalls: Array<{ toolName: string; params: Record<string, unknown> }> }>;
+    }).runGroundingCheck(
+      'root',
+      'Repair implementation.py in the workspace and verify the completed behavior.',
+      {
+        correlationId: 'mirrored-verifier-barrier-turn',
+        intentTask: 'Repair implementation.py in the workspace and verify the completed behavior.',
+        initialPlans: [{
+          toolName: 'fs.replace',
+          params: {
+            path: 'implementation.py',
+            oldText: 'VALUE = 0',
+            newText: 'VALUE = 1',
+            expectedReplacements: 1,
+          },
+          reason: 'Apply the first grounded mutation hypothesis.',
+          groundingRequired: true,
+        }],
+        skipInitialModelPlanning: true,
+      }
+    );
+
+    expect(grounding.toolCalls.map(call => ({
+      toolName: call.toolName,
+      command: call.params.command,
+    }))).toEqual(expect.arrayContaining([
+      { toolName: 'fs.replace', command: undefined },
+      {
+        toolName: 'shell.exec',
+        command: 'python .roy/official-verifier/grade.py',
+      },
+    ]));
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'tool.plan.mirrored_verifier_barrier',
+      data: expect.objectContaining({
+        phase: 'continuation',
+        reason: 'current_workspace_mutation_requires_objective_feedback',
+      }),
+    }));
+    await runtime.shutdown();
+  });
+
   it('runs an explicitly authorized shell loop and persists its execution tree', async () => {
     const workspace = await mkdtemp(path.join(tmpdir(), 'roy-terminal-task-'));
     await mkdir(path.join(workspace, '.roy'), { recursive: true });

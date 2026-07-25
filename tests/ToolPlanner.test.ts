@@ -78,6 +78,22 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('does not execute explanatory prose found in a shell-styled task block', () => {
+    const plans = new AgentToolPlanner().plan({
+      task: [
+        '## Required verification notes',
+        '```bash',
+        'The verifier independently reruns validation on the cleaned data.',
+        '```',
+      ].join('\n'),
+      workspacePath: '.',
+      archetype: 'tester',
+      bindings: [{ name: 'shell.exec', enabled: true }],
+    });
+
+    expect(plans).toEqual([]);
+  });
+
   it('reruns a task-declared acceptance command after every newer mutation', () => {
     const planner = new AgentToolPlanner();
     const task = [

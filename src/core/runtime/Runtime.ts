@@ -16957,6 +16957,50 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       );
     const diagnosticProbeRequired =
       /\[runtime_verifier_diagnostic_probe\]/.test(intentTask);
+    const mirroredVerifierPath = path.join(
+      this.workspaceRoot,
+      '.roy',
+      'official-verifier',
+      'grade.py'
+    );
+    const mirroredVerifierCommand = await (async (): Promise<string | undefined> => {
+      if (diagnosticProbeRequired
+        || !bindings.some(binding =>
+          binding.enabled && binding.name === 'shell.exec'
+        )) {
+        return undefined;
+      }
+      try {
+        const verifierStat = await stat(mirroredVerifierPath);
+        return verifierStat.isFile()
+          ? 'python .roy/official-verifier/grade.py'
+          : undefined;
+      } catch {
+        return undefined;
+      }
+    })();
+    const pendingMirroredVerifierPlan = (
+      calls: ToolCallRecord[]
+    ): PlannedToolCall | undefined => {
+      if (!mirroredVerifierCommand) return undefined;
+      const latestMutationIndex =
+        effectiveWorkspaceMutationCallIndices(calls).at(-1) ?? -1;
+      if (latestMutationIndex < 0) return undefined;
+      const alreadyVerified = calls.some((call, index) =>
+        index > latestMutationIndex
+        && call.toolName === 'shell.exec'
+        && String(call.params.command ?? '').includes(
+          '.roy/official-verifier/grade.py'
+        )
+      );
+      if (alreadyVerified) return undefined;
+      return {
+        toolName: 'shell.exec',
+        params: { command: mirroredVerifierCommand },
+        reason: 'Run the immutable mirrored official verifier immediately after the current mutation hypothesis before allowing another workspace mutation.',
+        groundingRequired: true,
+      };
+    };
     if (diagnosticProbeRequired) {
       const diagnosticSourcePath = this.extractTaskDiagnosticSourcePaths(
         intentTask
@@ -17188,6 +17232,24 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       plans.push(...modelPlans.filter(plan => !plannedFingerprints.has(this.toolPlanFingerprint(plan))));
     }
     plans = this.keepSingleWorkspaceMutationHypothesis(plans, agentId, options);
+    const pendingInitialMirroredVerifier = pendingMirroredVerifierPlan(
+      priorPlannerCalls
+    );
+    if (pendingInitialMirroredVerifier) {
+      plans = [pendingInitialMirroredVerifier];
+      this.emit({
+        type: 'tool.plan.mirrored_verifier_barrier',
+        agentId,
+        sessionId: this.getContext().sessionId,
+        correlationId: options.correlationId,
+        nodeId: options.nodeId,
+        data: {
+          phase: 'initial',
+          command: mirroredVerifierCommand,
+          reason: 'prior_workspace_mutation_requires_objective_feedback',
+        },
+      });
+    }
     if (plans.length === 0) {
       if (priorRejectedVerifierCandidate) {
         this.emit({
@@ -17309,9 +17371,28 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         return { result: result.result, success: result.success, error: result.error };
       },
       planNext: async context => {
+        const combinedCalls = [...priorPlannerCalls, ...context.calls];
+        const pendingMirroredVerifier = pendingMirroredVerifierPlan(
+          combinedCalls
+        );
+        if (pendingMirroredVerifier) {
+          this.emit({
+            type: 'tool.plan.mirrored_verifier_barrier',
+            agentId,
+            sessionId: this.getContext().sessionId,
+            correlationId: options.correlationId,
+            nodeId: options.nodeId,
+            data: {
+              phase: 'continuation',
+              command: mirroredVerifierCommand,
+              reason: 'current_workspace_mutation_requires_objective_feedback',
+            },
+          });
+          return [pendingMirroredVerifier];
+        }
         const postMutationVerification = this.toolPlanner.planPostMutationVerification({
           task: intentTask,
-          calls: [...priorPlannerCalls, ...context.calls],
+          calls: combinedCalls,
           bindings,
         });
         if (postMutationVerification.length > 0) {
@@ -17410,7 +17491,6 @@ For web-grounded work, use only facts present in the subagent report or runtime 
           });
           return externalFeedbackRepair.slice(0, context.remainingCalls);
         }
-        const combinedCalls = [...priorPlannerCalls, ...context.calls];
         if (diagnosticProbeRequired
           && context.calls.some(call => this.isFocusedVerifierDiagnosticCall(call))) {
           this.emit({

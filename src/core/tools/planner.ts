@@ -1170,7 +1170,10 @@ export class AgentToolPlanner {
         const command = line.replace(/^\$\s+/, '');
         if (command.length > 1_000
           || command.endsWith('\\')
-          || /\b(?:rm\s+-rf|mkfs|shutdown|reboot|halt)\b/i.test(command)) {
+          || /\b(?:rm\s+-rf|mkfs|shutdown|reboot|halt)\b/i.test(command)
+          || /^(?:the|a|an|this|that|these|those|we|you|it)\b/i.test(
+            command.replace(/^(?:[A-Z_][A-Z0-9_]*=\S+\s+)+/, '')
+          )) {
           continue;
         }
         commands.push(command);
