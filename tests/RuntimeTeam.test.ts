@@ -525,6 +525,9 @@ describe('Phase 3 subteam runtime', () => {
       && event.data?.teamId === first.identity.id
     );
     expect(Number(initialCache?.data?.cachedCalls ?? 0)).toBeGreaterThan(0);
+    (runtime as unknown as {
+      teams: { remove: (teamId: string) => unknown };
+    }).teams.remove(first.identity.id);
 
     const recovery = await runtime.spawnTeam({
       parentAgentId: 'root',

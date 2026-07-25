@@ -844,6 +844,7 @@ export class Runtime {
   private readonly teams = new TeamRegistry();
   private teamMemberPlans = new Map<string, TeamMemberSpec[]>();
   private teamToolEvidenceCache = new Map<string, ToolCallRecord[]>();
+  private teamToolEvidenceCorrelations = new Map<string, string>();
   private readonly sharedReadOnlyToolResultCache =
     new Map<string, SharedReadOnlyToolCacheEntry>();
   private readonly sharedReadOnlyToolRequests =
@@ -1158,6 +1159,7 @@ export class Runtime {
     this.teams.clear();
     this.teamMemberPlans.clear();
     this.teamToolEvidenceCache.clear();
+    this.teamToolEvidenceCorrelations.clear();
     this.sharedReadOnlyToolResultCache.clear();
     this.sharedReadOnlyToolRequests.clear();
     this.teamSpawnReservations.clear();
@@ -7821,14 +7823,14 @@ export class Runtime {
         ? this.teamToolEvidenceCache.get(payload.teamId) ?? []
         : [];
       if (payload.teamId && sharedTeamToolCalls.length === 0) {
-        const sourceTeams = this.getTeams().filter(team =>
-          team.identity.id !== payload.teamId
-          && team.correlationId === correlationId
-          && (this.teamToolEvidenceCache.get(team.identity.id)?.length ?? 0) > 0
+        const sourceTeamIds = [...this.teamToolEvidenceCache.keys()].filter(teamId =>
+          teamId !== payload.teamId
+          && this.teamToolEvidenceCorrelations.get(teamId) === correlationId
+          && (this.teamToolEvidenceCache.get(teamId)?.length ?? 0) > 0
         );
         const seenCalls = new Set<ToolCallRecord>();
-        sharedTeamToolCalls = sourceTeams
-          .flatMap(team => this.teamToolEvidenceCache.get(team.identity.id) ?? [])
+        sharedTeamToolCalls = sourceTeamIds
+          .flatMap(teamId => this.teamToolEvidenceCache.get(teamId) ?? [])
           .filter(call => {
             if (seenCalls.has(call)) return false;
             seenCalls.add(call);
@@ -7841,6 +7843,7 @@ export class Runtime {
           .slice(-80);
         if (sharedTeamToolCalls.length > 0) {
           this.teamToolEvidenceCache.set(payload.teamId, sharedTeamToolCalls);
+          this.teamToolEvidenceCorrelations.set(payload.teamId, correlationId);
           this.emit({
             type: 'team.tool_evidence.seeded_from_correlation',
             agentId: agent.identity.id,
@@ -7848,7 +7851,7 @@ export class Runtime {
             correlationId,
             data: {
               teamId: payload.teamId,
-              sourceTeamIds: sourceTeams.map(team => team.identity.id),
+              sourceTeamIds,
               cachedCalls: sharedTeamToolCalls.length,
               successfulCalls: sharedTeamToolCalls.filter(call => call.success).length,
             },
@@ -7859,6 +7862,7 @@ export class Runtime {
         sharedTeamToolCalls = this.restoredToolCallsFromResume(correlationId, 48);
         if (sharedTeamToolCalls.length > 0) {
           this.teamToolEvidenceCache.set(payload.teamId, sharedTeamToolCalls);
+          this.teamToolEvidenceCorrelations.set(payload.teamId, correlationId);
           this.emit({
             type: 'team.tool_evidence.seeded_from_resume',
             agentId: agent.identity.id,
@@ -7901,6 +7905,7 @@ export class Runtime {
           ...subagentResult.toolCalls,
         ].slice(-80);
         this.teamToolEvidenceCache.set(payload.teamId, cachedCalls);
+        this.teamToolEvidenceCorrelations.set(payload.teamId, correlationId);
         this.emit({
           type: 'team.tool_evidence.cached',
           agentId: agent.identity.id,
@@ -7925,6 +7930,7 @@ export class Runtime {
           ...failedToolCalls,
         ].slice(-80);
         this.teamToolEvidenceCache.set(payload.teamId, cachedCalls);
+        this.teamToolEvidenceCorrelations.set(payload.teamId, correlationId);
         this.emit({
           type: 'team.tool_evidence.cached_from_failure',
           agentId: agent.identity.id,

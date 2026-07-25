@@ -1000,6 +1000,63 @@ describe('UnifiedAgent capability execution', () => {
     ]);
   });
 
+  it('prioritizes a grounded dependency manifest for an explicit runtime migration', () => {
+    const llm = new NovelInspectionOnlyPlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'dependency-transition-agent',
+      goal: 'migrate the grounded dependency contract',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.read', 'fs.synthesize'],
+    });
+
+    const plans = agent.planGroundedExecutionTransition({
+      task: [
+        'Upgrade the project to the target runtime.',
+        'Update dependency metadata and remove legacy compatibility pins.',
+        'Preserve the existing application behavior.',
+      ].join('\n'),
+      round: 4,
+      tools: [{ name: 'fs.read' }, { name: 'fs.synthesize' }],
+      calls: [
+        {
+          toolName: 'fs.read',
+          params: { path: 'pyproject.toml' },
+          reason: 'Inspect the current dependency manifest.',
+          groundingRequired: true,
+          success: true,
+          result: {
+            path: 'pyproject.toml',
+            content: '[project]\ndependencies = ["legacy-runtime==0.1", "compat<2"]\n',
+            truncated: false,
+          },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/app.py' },
+          reason: 'Inspect one affected source file.',
+          groundingRequired: true,
+          success: true,
+          result: {
+            path: 'src/app.py',
+            content: 'from legacy_runtime import Client\n',
+            truncated: false,
+          },
+        },
+      ],
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.synthesize',
+        params: expect.objectContaining({
+          path: 'pyproject.toml',
+          strategy: 'patch',
+        }),
+      }),
+    ]);
+  });
+
   it('allows another workspace repair after a mutation when verification failed', async () => {
     const llm = new MutationRepairPlanningLLM();
     const agent = new UnifiedAgent({

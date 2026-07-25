@@ -1800,7 +1800,12 @@ function rankGroundedSynthesisTargets(
           ?? call.params.path
           ?? ''
       ));
-      if (!/\.(?:py|ts|tsx|js|jsx|mjs|cjs|java|go|rs|rb|php|sh)$/i.test(filePath)) {
+      const sourceFile = /\.(?:py|ts|tsx|js|jsx|mjs|cjs|java|go|rs|rb|php|sh)$/i.test(
+        filePath
+      );
+      const dependencyManifestIntent = isDependencyManifestPath(filePath)
+        && taskRequestsDependencyMetadataMutation(taskLower);
+      if (!sourceFile && !dependencyManifestIntent) {
         return undefined;
       }
       if (filePath === '.roy/official-verifier'
@@ -1824,7 +1829,8 @@ function rankGroundedSynthesisTargets(
         filePathLower,
         basename
       );
-      const implementationIntent = explicitImplementationIntent || (
+      const implementationIntent = dependencyManifestIntent
+        || explicitImplementationIntent || (
         requestsWorkspaceMutation(task)
         && (
           taskLower.includes(filePathLower)
@@ -1842,6 +1848,7 @@ function rankGroundedSynthesisTargets(
       if (invalidSourceSignal) score += 30;
       if (implementationIntent) score += 20;
       if (explicitImplementationIntent) score += 18;
+      if (dependencyManifestIntent) score += 28;
       if (contractMatchSignal) {
         score += 12 + Math.min(16, contractMatchCount * 4);
       }
@@ -1880,6 +1887,23 @@ function rankGroundedSynthesisTargets(
       }
     });
   return [...byPath.values()].sort((left, right) => right.score - left.score);
+}
+
+function isDependencyManifestPath(filePath: string): boolean {
+  const basename = filePath.split('/').at(-1)?.toLowerCase() ?? '';
+  return /^(?:pyproject\.toml|requirements(?:[-_.][a-z0-9]+)?\.txt|setup\.cfg|setup\.py|package\.json|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|cargo\.toml|go\.mod|pom\.xml|build\.gradle(?:\.kts)?|gemfile|composer\.json)$/i.test(
+    basename
+  );
+}
+
+function taskRequestsDependencyMetadataMutation(taskLower: string): boolean {
+  return /\b(?:dependency|dependencies|package|packages|runtime|compatibility)\b[\s\S]{0,120}\b(?:metadata|manifest|pin|pins|pinned|version|versions|constraint|constraints|requirement|requirements)\b/i.test(
+    taskLower
+  ) || /\b(?:update|upgrade|migrate|replace|remove|unpin|bump)\b[\s\S]{0,100}\b(?:dependency|dependencies|package|packages|runtime|compatibility)\b/i.test(
+    taskLower
+  ) || /(?:更新|升级|迁移|替换|移除|取消固定)[\s\S]{0,60}(?:依赖|运行时|兼容性|版本|约束|清单)/u.test(
+    taskLower
+  );
 }
 
 function extractTaskContractIdentifiers(task: string): string[] {
