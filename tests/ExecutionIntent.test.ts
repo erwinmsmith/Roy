@@ -315,6 +315,15 @@ describe('workspace execution intent', () => {
     expect(taskRequestsWorkspaceMutation(
       'Do not modify the source files; analyze the failure only.'
     )).toBe(false);
+    expect(taskRequestsWorkspaceMutation(
+      'Produce a structured summary and save the report to migration_report.md.'
+    )).toBe(true);
+    expect(taskRequestsWorkspaceMutation(
+      '生成结构化摘要，并保存报告到 migration_report.md。'
+    )).toBe(true);
+    expect(taskRequestsWorkspaceMutation(
+      'Analyze the project, but do not save or persist a report.'
+    )).toBe(false);
   });
 
   it('rejects a parallel top-level package after observing a src layout', () => {

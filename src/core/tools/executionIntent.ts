@@ -124,13 +124,13 @@ export function taskRequestsWorkspaceMutation(task: string): boolean {
   }
   const mutationScopedTask = task
     .replace(
-      /\b(?:do not|don't|without)\s+(?:modify|modifying|edit|editing|write|writing|change|changing|patch|patching|mutate|mutating)\b[^.;\n]*/gi,
+      /\b(?:do not|don't|without)\s+(?:modify|modifying|edit|editing|write|writing|save|saving|persist|persisting|change|changing|patch|patching|mutate|mutating)\b[^.;\n]*/gi,
       ' '
     )
-    .replace(/(?:不要|无需|仅|只)\s*(?:修改|写入|改动|执行)[^。；;\n]*/g, ' ');
-  return /\b(?:implement|modify|edit|create|write|patch|repair|fix|refactor|migrate|upgrade|downgrade|install|remove|replace|apply|build)\b[\s\S]{0,240}\b(?:file|code|project|repository|repo|workspace|artifact|solution|dependency|dependencies|implementation|migration|application|package|tests?)\b/i.test(mutationScopedTask)
+    .replace(/(?:不要|无需|仅|只)\s*(?:修改|写入|保存|持久化|改动|执行)[^。；;\n]*/g, ' ');
+  return /\b(?:implement|modify|edit|create|write|save|persist|record|export|patch|repair|fix|refactor|migrate|upgrade|downgrade|install|remove|replace|apply|build)\b[\s\S]{0,240}\b(?:file|code|project|repository|repo|workspace|artifact|solution|report|summary|output|dependency|dependencies|implementation|migration|application|package|tests?)\b/i.test(mutationScopedTask)
     || /\b(?:fix|repair|migrate|upgrade|refactor|implement)\b[\s\S]{0,160}\b(?:bug|issue|failure|task|feature|api|cli|runtime|system)\b/i.test(mutationScopedTask)
-    || /(?:实现|修改|编辑|创建|写入|修复|重构|迁移|升级|安装|替换|落盘|改动)[\s\S]{0,120}(?:文件|代码|项目|仓库|工作区|依赖|实现|测试|系统)/.test(mutationScopedTask);
+    || /(?:实现|修改|编辑|创建|写入|保存|持久化|导出|修复|重构|迁移|升级|安装|替换|落盘|改动)[\s\S]{0,120}(?:文件|代码|项目|仓库|工作区|产物|报告|摘要|输出|依赖|实现|测试|系统)/.test(mutationScopedTask);
 }
 
 export function isSuccessfulWorkspaceMutationCall(call: ExecutionIntentCall): boolean {
