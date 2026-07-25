@@ -420,7 +420,22 @@ define the real security boundary.
 
 Model-generated custom agents use the same capability contract. When a concrete task requires file, runtime API, web, test, or build evidence but omits an explicit binding, Runtime derives the minimum registered capability, intersects it with approval policy, and records the resulting binding on the compute node. File planning merges explicit paths with inferred runtime entry points and avoids a broad workspace listing when targeted reads are available.
 
-Provider calls are resilient at both transport and structured-output boundaries. Stream retries discard partial output before retrying and failed root turns restore the session FSM so later turns can continue. JSON control-plane calls reserve model-family reasoning capacity and retry truncated/invalid output in unlimited mode. Configure `.roy/config.json` with `llm.streamMaxAttempts`, `llm.jsonMaxAttempts`, `llm.retryInitialDelayMs`, and `llm.retryMaxDelayMs`.
+Provider calls are resilient at transport, output-window, and structured-output
+boundaries. Stream retries discard partial output after a transport failure. When
+a successful provider stream ends because its output window is full, Runtime
+requests a fresh allocation and continues from the cached suffix instead of
+accepting a partial answer or replaying the whole draft. The continuation count is
+configured with `llm.streamContinuationMaxSegments`; transport and JSON retry
+settings remain available through `llm.streamMaxAttempts`,
+`llm.jsonMaxAttempts`, `llm.retryInitialDelayMs`, and `llm.retryMaxDelayMs`.
+Failed root turns restore the session FSM so later turns can continue.
+
+For non-workspace responses with several explicit obligations, Runtime performs a
+separate final-response acceptance audit. Unmet requirements become trace events
+and cached feedback, then drive one focused repair pass using accumulated
+delegated evidence. The repaired response is audited again before the turn is
+closed. Workspace mutations continue to use tool and verifier evidence as their
+authoritative acceptance boundary.
 
 ## Budget Control
 

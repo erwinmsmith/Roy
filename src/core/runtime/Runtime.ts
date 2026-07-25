@@ -3864,6 +3864,50 @@ export class Runtime {
       : visibleOutputTokens;
   }
 
+  private rootVisibleCompletionTokenBudget(purpose: string): number {
+    if (purpose.includes('synthesis')) return 2_048;
+    if (purpose.includes('repair')) return 1_536;
+    return 512;
+  }
+
+  private isTruncatedFinishReason(finishReason?: string): boolean {
+    return Boolean(
+      finishReason
+      && ['length', 'max_tokens'].includes(finishReason.toLowerCase())
+    );
+  }
+
+  private mergeCompletionContinuation(existing: string, continuation: string): string {
+    if (!existing) return continuation;
+    if (!continuation) return existing;
+    const maximumOverlap = Math.min(existing.length, continuation.length, 4_000);
+    for (let overlap = maximumOverlap; overlap >= 16; overlap -= 1) {
+      if (existing.endsWith(continuation.slice(0, overlap))) {
+        return existing + continuation.slice(overlap);
+      }
+    }
+    if (existing.endsWith(continuation)) return existing;
+    return existing + continuation;
+  }
+
+  private compactRootContinuationContext(prompt: string): string {
+    const maximumCharacters = 12_000;
+    if (prompt.length <= maximumCharacters) return prompt;
+    const userTask = prompt.match(/<user_task>([\s\S]*?)<\/user_task>/i)?.[0];
+    if (userTask && userTask.length <= 8_000) {
+      return [
+        userTask,
+        '[The original request also supplied delegated evidence. Continue the existing draft without inventing facts beyond it.]',
+        prompt.slice(-4_000),
+      ].join('\n\n');
+    }
+    return [
+      prompt.slice(0, 8_000),
+      '...[continuation context compacted]...',
+      prompt.slice(-4_000),
+    ].join('\n');
+  }
+
   private async requestTeamSynthesisBudget(input: {
     team: TeamRuntimeState;
     correlationId: string;
@@ -6919,6 +6963,17 @@ export class Runtime {
       });
     }
 
+    if (!requiresWorkspaceMutation && decision.action !== 'ask_clarification') {
+      finalResponse = await this.enforceRootResponseAcceptance(
+        finalResponse,
+        userInput,
+        correlationId,
+        [
+          ...teamResults.map(result => result.result),
+          ...subagents.map(result => result.subagentResult.result),
+        ]
+      );
+    }
     finalResponse = await this.enforceExplicitRootOutputContract(
       finalResponse,
       userInput,
@@ -10705,6 +10760,29 @@ export class Runtime {
       && event.timestamp >= stepStart
       && event.timestamp <= now
     );
+    for (const event of events.filter(item =>
+      item.type === 'root.response.acceptance.unmet'
+      || item.type === 'root.response.acceptance.repair.unmet'
+    )) {
+      const requirements = Array.isArray(event.data?.unmetRequirements)
+        ? event.data.unmetRequirements
+          .filter((item): item is string => typeof item === 'string')
+          .join('; ')
+        : '';
+      const reason = typeof event.data?.reason === 'string'
+        ? event.data.reason
+        : '';
+      addFeedback(
+        event.type.endsWith('repair.unmet') ? 'unresolved_gap' : 'acceptance_feedback',
+        [
+          event.type.endsWith('repair.unmet')
+            ? 'Final-response repair still has unmet acceptance requirements.'
+            : 'Final-response acceptance feedback was routed into the repair step.',
+          requirements,
+          reason,
+        ].filter(Boolean).join(' ')
+      );
+    }
     const generatedIds = new Set([
       ...input.actorIds,
       ...input.teamIds,
@@ -13620,6 +13698,240 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     });
   }
 
+  private responseSelfDeclaresIncomplete(response: string): boolean {
+    return /\b(?:does not|doesn't|did not|didn't|fails? to|unable to)\s+(?:fully\s+)?(?:satisfy|address|answer|include|incorporate|cover|complete)\b/i.test(response)
+      || /\b(?:omitted?|missing|unmet|unaddressed|incomplete)\s+(?:requirements?|questions?|items?|parts?|details?)\b/i.test(response)
+      || /(?:未能|没有|尚未|无法)(?:完整|全部)?(?:满足|回答|包括|纳入|覆盖|完成)|(?:遗漏|缺少|未满足|未覆盖)(?:的)?(?:要求|问题|项目|部分)/.test(response);
+  }
+
+  private shouldAuditRootResponse(response: string, userTask: string): boolean {
+    if (this.workspaceRuntimeConfig?.delegation.rootSteps.requireAcceptanceAudit === false) {
+      return false;
+    }
+    const threshold = Math.max(
+      2,
+      this.workspaceRuntimeConfig?.delegation.rootSteps.directDecisionAuditMinObligations ?? 4
+    );
+    return this.responseSelfDeclaresIncomplete(response)
+      || this.countIndependentTaskObligations(userTask) >= threshold;
+  }
+
+  private async auditRootResponseAcceptance(
+    response: string,
+    userTask: string,
+    correlationId: string,
+    phase: 'candidate' | 'repaired'
+  ): Promise<{ complete: boolean; unmetRequirements: string[]; reason: string }> {
+    const raw = await this.completeJSONAsAgent<{
+      complete?: unknown;
+      unmetRequirements?: unknown;
+      reason?: unknown;
+    }>(
+      this.getContext().agent,
+      [
+        {
+          role: 'system',
+          content: [
+            'You are Roy\'s final-response acceptance auditor.',
+            'Compare the candidate only against explicit, user-visible requirements in the original task.',
+            'Treat every numbered or bulleted question, deliverable, constraint, and output contract as a separate obligation.',
+            'Judge objective coverage and internal consistency, not subjective writing style or hidden benchmark answers.',
+            'Do not expose chain-of-thought. Return strict JSON with complete, unmetRequirements, and reason.',
+          ].join('\n'),
+        },
+        {
+          role: 'user',
+          content: JSON.stringify({
+            originalTask: userTask,
+            candidateResponse: response,
+            requiredSchema: {
+              complete: 'boolean: true only when every explicit obligation is satisfied',
+              unmetRequirements: ['concise explicit requirements that remain unmet'],
+              reason: 'one concise evidence-based explanation',
+            },
+          }),
+        },
+      ],
+      { temperature: 0, maxTokens: 768 },
+      `root.response_acceptance.${phase}`,
+      correlationId
+    );
+    const unmetRequirements = Array.isArray(raw.unmetRequirements)
+      ? raw.unmetRequirements
+        .filter((item): item is string => typeof item === 'string' && Boolean(item.trim()))
+        .map(item => item.trim().slice(0, 800))
+        .slice(0, 24)
+      : [];
+    const complete = raw.complete === true && unmetRequirements.length === 0;
+    return {
+      complete,
+      unmetRequirements,
+      reason: typeof raw.reason === 'string' && raw.reason.trim()
+        ? raw.reason.trim().slice(0, 1_200)
+        : complete
+          ? 'Every explicit response obligation is covered.'
+          : 'The acceptance auditor found incomplete explicit obligations.',
+    };
+  }
+
+  private async enforceRootResponseAcceptance(
+    response: string,
+    userTask: string,
+    correlationId: string,
+    supportingResults: string[]
+  ): Promise<string> {
+    if (!this.shouldAuditRootResponse(response, userTask)) return response;
+    this.emit({
+      type: 'root.response.acceptance.audit.started',
+      agentId: 'root',
+      correlationId,
+      data: {
+        candidateCharacters: response.length,
+        independentObligations: this.countIndependentTaskObligations(userTask),
+        selfDeclaredIncomplete: this.responseSelfDeclaresIncomplete(response),
+      },
+    });
+    let audit: { complete: boolean; unmetRequirements: string[]; reason: string };
+    try {
+      audit = await this.auditRootResponseAcceptance(
+        response,
+        userTask,
+        correlationId,
+        'candidate'
+      );
+    } catch (error) {
+      this.rethrowRetryableLLMTransportError(error);
+      this.emit({
+        type: 'root.response.acceptance.audit.failed',
+        agentId: 'root',
+        correlationId,
+        data: { error: error instanceof Error ? error.message : String(error) },
+      });
+      return response;
+    }
+    if (audit.complete) {
+      this.emit({
+        type: 'root.response.acceptance.audit.completed',
+        agentId: 'root',
+        correlationId,
+        data: { complete: true, reason: audit.reason },
+      });
+      return response;
+    }
+
+    const tree = this.executionTrees.get(correlationId);
+    const previousStepId = tree?.steps.at(-1)?.id;
+    let repairStep: RootExecutionStep | undefined;
+    try {
+      repairStep = await this.startRootExecutionStep(correlationId, {
+        action: 'finalize',
+        reason: 'Final-response acceptance found unmet explicit requirements; repair only the missing obligations using accumulated evidence.',
+        agentCount: 0,
+      }, previousStepId ? [previousStepId] : []);
+    } catch (error) {
+      this.emit({
+        type: 'root.response.acceptance.repair.untracked',
+        agentId: 'root',
+        correlationId,
+        data: { reason: error instanceof Error ? error.message : String(error) },
+      });
+    }
+    this.emit({
+      type: 'root.response.acceptance.unmet',
+      agentId: 'root',
+      correlationId,
+      data: {
+        stepId: repairStep?.id,
+        unmetRequirements: audit.unmetRequirements,
+        reason: audit.reason,
+      },
+    });
+    this.emit({
+      type: 'root.response.acceptance.repair.started',
+      agentId: 'root',
+      correlationId,
+      data: {
+        stepId: repairStep?.id,
+        unmetRequirements: audit.unmetRequirements,
+      },
+    });
+
+    const supportingEvidence = supportingResults
+      .filter(result => result.trim())
+      .map((result, index) => `<delegated_result index="${index + 1}">\n${result}\n</delegated_result>`)
+      .join('\n\n')
+      .slice(0, 32_000);
+    const usageBefore = this.getContext().agent.getUsage();
+    try {
+      const repaired = await this.completeAsRoot(
+        [
+          'Repair the candidate into one complete final response to the original user task.',
+          'Close every listed unmet requirement. Preserve correct completed content and the requested output format.',
+          'Use delegated results only as supporting evidence. Do not mention this audit or expose chain-of-thought.',
+          `<original_task>\n${userTask}\n</original_task>`,
+          `<acceptance_feedback>\n${JSON.stringify(audit, null, 2)}\n</acceptance_feedback>`,
+          `<candidate_response>\n${response}\n</candidate_response>`,
+          supportingEvidence
+            ? `<supporting_evidence>\n${supportingEvidence}\n</supporting_evidence>`
+            : '',
+        ].filter(Boolean).join('\n\n'),
+        'root.response_acceptance.repair',
+        correlationId
+      );
+      const usageDelta = this.usageDifference(
+        usageBefore,
+        this.getContext().agent.getUsage()
+      );
+      this.recordTurnUsage(usageDelta);
+      this.emit({
+        type: 'budget.updated',
+        agentId: 'root',
+        correlationId,
+        data: { purpose: 'root.response_acceptance.repair', ...usageDelta },
+      });
+      const candidate = repaired.trim() || response;
+      const repairedAudit = await this.auditRootResponseAcceptance(
+        candidate,
+        userTask,
+        correlationId,
+        'repaired'
+      );
+      this.emit({
+        type: repairedAudit.complete
+          ? 'root.response.acceptance.repair.completed'
+          : 'root.response.acceptance.repair.unmet',
+        agentId: 'root',
+        correlationId,
+        data: {
+          stepId: repairStep?.id,
+          complete: repairedAudit.complete,
+          unmetRequirements: repairedAudit.unmetRequirements,
+          reason: repairedAudit.reason,
+          repairedCharacters: candidate.length,
+        },
+      });
+      if (repairStep) {
+        await this.completeRootExecutionStep(correlationId, repairStep, {
+          resultSummary: candidate,
+        });
+      }
+      return candidate;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.emit({
+        type: 'root.response.acceptance.repair.failed',
+        agentId: 'root',
+        correlationId,
+        data: { stepId: repairStep?.id, error: message },
+      });
+      if (repairStep) {
+        await this.failRootExecutionStep(correlationId, repairStep, message, false);
+      }
+      this.rethrowRetryableLLMTransportError(error);
+      return response;
+    }
+  }
+
   private async enforceExplicitRootOutputContract(
     response: string,
     userTask: string,
@@ -13840,41 +14152,103 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
       }
     }
 
-    const messages: LLMMessage[] = [
+    const initialMessages: LLMMessage[] = [
       { role: 'system', content: systemContent },
       { role: 'user', content: effectivePrompt },
     ];
-    const estimatedInputTokens = this.estimateTextTokens(messages.map(message => message.content).join('\n'));
-    const completionTokens = this.reasoningAwareCompletionTokenBudget(512);
-    const allocation = await this.requestAgentBudget({
-      parentId: 'root',
-      requesterId: 'root',
-      archetype: 'custom',
-      correlationId,
-      requestedTokens: Math.max(
-        this.budgetRequestTokens(estimatedInputTokens, completionTokens),
-        this.workspaceRuntimeConfig?.budgetMarket.defaultRequestsByArchetype.root ?? 2400
-      ),
-      minimumTokens: this.budgetMinimumTokens(estimatedInputTokens),
-      priority: purpose.includes('synthesis') ? 'high' : 'medium',
-      expectedUtility: purpose.includes('synthesis') ? 0.9 : 0.78,
-      purpose,
-    });
-    if (allocation?.status === 'denied') throw new Error(`Root completion rejected by budget market: ${allocation.reason}`);
-    const usageBefore = ctx.agent.getUsage();
-    try {
-      const maxTokens = allocation?.status === 'granted'
-        ? Math.max(1, this.completionCapacity(allocation.allocatedTokens, estimatedInputTokens))
-        : undefined;
-      const completion = await this.collectRuntimeLLMStream(
-        ctx.llm,
-        [...messages],
-        { temperature: 0.2, maxTokens },
-        { actorId: 'root', purpose, correlationId }
-      );
-      const content = completion.content;
-      if (completion.finishReason
-        && ['length', 'max_tokens'].includes(completion.finishReason.toLowerCase())) {
+    const continuationLimit = Math.max(
+      1,
+      Math.floor(this.workspaceRuntimeConfig?.llm.streamContinuationMaxSegments ?? 4)
+    );
+    const continuationContext = this.compactRootContinuationContext(effectivePrompt);
+    let content = '';
+
+    for (let segment = 1; segment <= continuationLimit; segment += 1) {
+      const messages: LLMMessage[] = segment === 1
+        ? initialMessages
+        : [
+          { role: 'system', content: systemContent },
+          {
+            role: 'user',
+            content: [
+              'Continue a response that the provider cut off only because its output window ended.',
+              'Continue exactly where the draft stops. Do not restart, summarize, or repeat completed text.',
+              'Finish every requirement from the original request and preserve its output contract.',
+              `<original_context>\n${continuationContext}\n</original_context>`,
+            ].join('\n\n'),
+          },
+          {
+            role: 'assistant',
+            content: content.slice(-16_000),
+          },
+          {
+            role: 'user',
+            content: 'Continue from the final character above and complete the response. Return continuation text only.',
+          },
+        ];
+      const estimatedInputTokens = this.estimateTextTokens(messages.map(message => message.content).join('\n'));
+      const visibleCompletionTokens = this.rootVisibleCompletionTokenBudget(purpose);
+      const completionTokens = this.reasoningAwareCompletionTokenBudget(visibleCompletionTokens);
+      let allocation: BudgetAllocation | undefined;
+      const usageBefore = ctx.agent.getUsage();
+      try {
+        allocation = await this.requestAgentBudget({
+          parentId: 'root',
+          requesterId: 'root',
+          archetype: 'custom',
+          correlationId,
+          requestedTokens: Math.max(
+            this.budgetRequestTokens(estimatedInputTokens, completionTokens),
+            this.workspaceRuntimeConfig?.budgetMarket.defaultRequestsByArchetype.root ?? 2400
+          ),
+          minimumTokens: this.budgetMinimumTokens(estimatedInputTokens),
+          priority: purpose.includes('synthesis') ? 'high' : 'medium',
+          expectedUtility: purpose.includes('synthesis') ? 0.9 : 0.78,
+          purpose: segment === 1 ? purpose : `${purpose}.continuation`,
+        });
+        if (allocation?.status === 'denied') {
+          throw new Error(`Root completion rejected by budget market: ${allocation.reason}`);
+        }
+        const maxTokens = allocation?.status === 'granted'
+          ? Math.max(1, this.completionCapacity(allocation.allocatedTokens, estimatedInputTokens))
+          : completionTokens;
+        const completion = await this.collectRuntimeLLMStream(
+          ctx.llm,
+          messages,
+          { temperature: 0.2, maxTokens },
+          {
+            actorId: 'root',
+            purpose: segment === 1 ? purpose : `${purpose}.continuation`,
+            correlationId,
+          }
+        );
+        content = this.mergeCompletionContinuation(content, completion.content);
+        ctx.agent.recordRuntimeCompletion(completion.content, {
+          content: completion.content,
+          usage: completion.usage ?? this.estimateModelUsage(messages, completion.content),
+        });
+        this.settleDirectBudget(
+          'root',
+          allocation,
+          this.usageDifference(usageBefore, ctx.agent.getUsage()),
+          correlationId
+        );
+        if (!this.isTruncatedFinishReason(completion.finishReason)) {
+          if (segment > 1) {
+            this.emit({
+              type: 'llm.stream.continuation.completed',
+              agentId: 'root',
+              correlationId,
+              data: {
+                purpose,
+                segments: segment,
+                characters: content.length,
+                finishReason: completion.finishReason,
+              },
+            });
+          }
+          return content;
+        }
         this.emit({
           type: 'llm.stream.truncated',
           agentId: 'root',
@@ -13884,19 +14258,48 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
             finishReason: completion.finishReason,
             characters: content.length,
             maxTokens,
+            segment,
+            continuationLimit,
           },
         });
+        if (segment < continuationLimit) {
+          this.emit({
+            type: 'llm.stream.continuation.started',
+            agentId: 'root',
+            correlationId,
+            data: {
+              purpose,
+              completedSegments: segment,
+              characters: content.length,
+            },
+          });
+        }
+      } catch (error) {
+        if (allocation?.status === 'granted') {
+          this.budgetMarket?.release(allocation.id, 'root_completion_failed');
+        }
+        if (segment === 1 || !content) throw error;
+        this.emit({
+          type: 'llm.stream.continuation.failed',
+          agentId: 'root',
+          correlationId,
+          data: {
+            purpose,
+            segment,
+            characters: content.length,
+            error: error instanceof Error ? error.message : String(error),
+          },
+        });
+        return content;
       }
-      ctx.agent.recordRuntimeCompletion(content, {
-        content,
-        usage: completion.usage ?? this.estimateModelUsage(messages, content),
-      });
-      this.settleDirectBudget('root', allocation, this.usageDifference(usageBefore, ctx.agent.getUsage()), correlationId);
-      return content;
-    } catch (error) {
-      if (allocation?.status === 'granted') this.budgetMarket?.release(allocation.id, 'root_completion_failed');
-      throw error;
     }
+    this.emit({
+      type: 'llm.stream.continuation.exhausted',
+      agentId: 'root',
+      correlationId,
+      data: { purpose, segments: continuationLimit, characters: content.length },
+    });
+    return content;
   }
 
   private async completeJSONAsAgent<T>(

@@ -168,6 +168,7 @@ export interface WorkspaceRuntimeConfig {
   memoryUpdates: MemoryMode;
   llm: {
     streamMaxAttempts: number;
+    streamContinuationMaxSegments: number;
     jsonMaxAttempts: number;
     turnMaxAttempts: number;
     retryInitialDelayMs: number;
@@ -531,11 +532,12 @@ Role-specific terms are recorded here.
 };
 
 const DEFAULT_WORKSPACE_CONFIG: WorkspaceRuntimeConfig = {
-  version: 14,
+  version: 15,
   traceEvents: true,
   memoryUpdates: 'suggest',
   llm: {
     streamMaxAttempts: 3,
+    streamContinuationMaxSegments: 4,
     jsonMaxAttempts: 2,
     turnMaxAttempts: 3,
     retryInitialDelayMs: 250,

@@ -4,6 +4,7 @@ export type ExecutionFeedbackKind =
   | 'path_observation'
   | 'workspace_mutation'
   | 'workspace_verification'
+  | 'acceptance_feedback'
   | 'external_feedback'
   | 'unresolved_gap';
 
