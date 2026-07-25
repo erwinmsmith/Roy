@@ -173,7 +173,7 @@ export class AgentToolExecutionLoop {
     for (const plan of plans) {
       const value = fingerprint?.(plan) ?? `${plan.toolName}:${stableStringify(plan.params)}`;
       if (fingerprints.has(value)
-        && !this.shellPlanWasInvalidatedByFileMutation(
+        && !this.shellPlanWasInvalidatedByWorkspaceStateChange(
           plan,
           value,
           calls,
@@ -187,7 +187,7 @@ export class AgentToolExecutionLoop {
     return unique;
   }
 
-  private shellPlanWasInvalidatedByFileMutation(
+  private shellPlanWasInvalidatedByWorkspaceStateChange(
     plan: PlannedToolCall,
     planFingerprint: string,
     calls: ToolLoopCallRecord[],
@@ -205,15 +205,37 @@ export class AgentToolExecutionLoop {
       }
     }
     if (previousIndex < 0) return false;
-    return calls.slice(previousIndex + 1).some(call =>
-      call.success
-      && (
+    return calls.slice(previousIndex + 1).some(call => {
+      if (!call.success) return false;
+      if ((
         call.toolName === 'fs.write'
         || call.toolName === 'fs.replace'
         || call.toolName === 'fs.synthesize'
-      )
-      && isSuccessfulWorkspaceMutationCall(call)
+      ) && isSuccessfulWorkspaceMutationCall(call)) {
+        return true;
+      }
+      if (call.toolName !== 'shell.exec') return false;
+      return this.isEnvironmentRecoveryCommand(
+        String(call.params.command ?? '')
+      );
+    });
+  }
+
+  private isEnvironmentRecoveryCommand(command: string): boolean {
+    const normalized = command.trim().replace(
+      /^(?:(?:cd|pushd)\s+\S+\s*&&\s*)+/i,
+      ''
     );
+    return /^(?:python(?:3)?\s+-m\s+pip|pip(?:3)?|uv)\s+install\b/i.test(
+      normalized
+    )
+      || /^(?:uv\s+sync|poetry\s+install|pdm\s+sync|pipenv\s+sync)\b/i.test(
+        normalized
+      )
+      || /^(?:npm|pnpm|yarn|bun)\s+(?:install|ci)\b/i.test(normalized)
+      || /^(?:bundle\s+install|composer\s+install|cargo\s+fetch|go\s+mod\s+download)\b/i.test(
+        normalized
+      );
   }
 }
 

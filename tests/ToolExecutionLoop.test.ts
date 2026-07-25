@@ -175,4 +175,51 @@ describe('AgentToolExecutionLoop', () => {
     expect(execute).toHaveBeenCalledTimes(2);
     expect(summary.stopReason).toBe('duplicate_plan');
   });
+
+  it('reruns verification after a successful environment recovery command', async () => {
+    const loop = new AgentToolExecutionLoop({
+      maxRounds: 5,
+      maxCalls: 8,
+      maxConsecutiveFailures: 2,
+      maxWallClockMs: 10_000,
+    });
+    const verify = {
+      toolName: 'shell.exec',
+      params: { command: 'python -m pytest -q' },
+      reason: 'Run acceptance tests.',
+      groundingRequired: true,
+    };
+    const recover = {
+      toolName: 'shell.exec',
+      params: { command: 'cd /app && python -m pip install pytest' },
+      reason: 'Install the missing test runner.',
+      groundingRequired: true,
+    };
+    const execute = vi.fn(async plan => ({
+      success: plan === verify
+        ? execute.mock.calls.length > 2
+        : true,
+      result: 'observed',
+    }));
+    const summary = await loop.run({
+      task: 'Install a missing verifier dependency, then rerun verification.',
+      initialPlans: [verify],
+      execute,
+      planNext: async context => context.round === 1
+        ? [recover]
+        : context.round <= 3
+          ? [verify]
+          : [],
+    });
+
+    expect(summary.rounds.map(round =>
+      round.calls.map(call => String(call.params.command))
+    )).toEqual([
+      ['python -m pytest -q'],
+      ['cd /app && python -m pip install pytest'],
+      ['python -m pytest -q'],
+    ]);
+    expect(execute).toHaveBeenCalledTimes(3);
+    expect(summary.stopReason).toBe('duplicate_plan');
+  });
 });

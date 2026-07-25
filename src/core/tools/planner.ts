@@ -1906,11 +1906,21 @@ export class AgentToolPlanner {
       ...task.matchAll(/[`'"]([A-Za-z_][A-Za-z0-9_.]{3,})[`'"]/g),
     ].map(match => String(match[1] ?? match[0] ?? '').replace(/[()]+$/, ''));
     const ignored = new Set([
-      'apply', 'current', 'exact', 'file', 'implementation', 'modify',
-      'preserve', 'replace', 'source', 'task', 'verify', 'workspace',
+      'agent', 'apply', 'config', 'current', 'exact', 'file',
+      'implementation', 'inspect', 'modify', 'none', 'preserve', 'replace',
+      'runtime', 'source', 'task', 'true', 'false', 'verify', 'workspace',
     ]);
     return [...new Set(terms)]
-      .filter(term => term.length >= 4 && !ignored.has(term.toLowerCase()))
+      .filter(term => {
+        const lower = term.toLowerCase();
+        if (term.length < 4 || ignored.has(lower)) return false;
+        if (/\.(?:cfg|csv|ini|json|jsonl|md|py|txt|toml|xml|ya?ml)$/i.test(
+          term
+        )) {
+          return false;
+        }
+        return true;
+      })
       .slice(0, 80);
   }
 

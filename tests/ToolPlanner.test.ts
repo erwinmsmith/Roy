@@ -1828,6 +1828,37 @@ describe('AgentToolPlanner', () => {
     })).toEqual([]);
   });
 
+  it('does not treat config filenames or generic prose terms as implementation evidence', () => {
+    const planner = new AgentToolPlanner();
+    const calls = [{
+      toolName: 'fs.read',
+      params: { path: 'src/app/cli.py' },
+      success: true,
+      result: {
+        path: 'src/app/cli.py',
+        content: [
+          'def main(argv: list[str] | None = None) -> int:',
+          '    runtime = load_runtime("configs/agent.yaml")',
+          '    return runtime.inspect()',
+        ].join('\n'),
+        truncated: false,
+      },
+    }];
+
+    expect(planner.planGroundedImplementationTransition({
+      task: [
+        'Migrate the application Runtime. Inspect the installed package.',
+        'Read routing policy from `configs/agent.yaml` and preserve None defaults.',
+        'Keep the CLI stable.',
+      ].join('\n'),
+      calls,
+      bindings: [
+        { name: 'fs.read', enabled: true },
+        { name: 'fs.synthesize', enabled: true },
+      ],
+    })).toEqual([]);
+  });
+
   it('extracts explicitly quoted natural-language commands from a team task', () => {
     const planner = new AgentToolPlanner();
     const plans = planner.plan({
