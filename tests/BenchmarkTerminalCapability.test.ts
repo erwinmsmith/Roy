@@ -595,10 +595,53 @@ describe('benchmark terminal capability', () => {
       cachedDiagnostic
     )).toMatchObject({
       agents: [
+        expect.objectContaining({ name: 'VerifierProbe-4' }),
         expect.objectContaining({ name: 'FocusedRepairer-5' }),
         expect.objectContaining({ name: 'RecoveryVerifier-6' }),
       ],
       team: expect.objectContaining({ name: 'VerifierGuidedRecoveryTeam-2' }),
+    });
+
+    const freshDiagnostic = structuredClone(failedAttempt);
+    freshDiagnostic.knowledge.paths[0]!.toolFrontier.push(
+      diagnosticFrontier.at(-3)!
+    );
+    expect(buildRecovery(
+      'Repair implementation.py until the official verifier succeeds.',
+      freshDiagnostic
+    )).toMatchObject({
+      agents: [
+        expect.objectContaining({ name: 'FocusedRepairer-5' }),
+        expect.objectContaining({ name: 'RecoveryVerifier-6' }),
+      ],
+      team: expect.objectContaining({ name: 'VerifierGuidedRecoveryTeam-2' }),
+    });
+
+    const completedRepairOnlyRound = structuredClone(failedAttempt);
+    completedRepairOnlyRound.knowledge.actors.push({
+      id: 'repair-actor',
+      runtimeActorId: 'repair-actor',
+      kind: 'agent',
+      correlationId: 'repair-correlation',
+      stepId: 'repair-step',
+      pathId: 'repair-path',
+      name: 'FocusedRepairer-5',
+      role: 'coder',
+      generation: 1,
+      status: 'completed',
+      createdAt: now + 10,
+      updatedAt: now + 20,
+    });
+    expect(buildRecovery(
+      'Repair implementation.py until the official verifier succeeds.',
+      completedRepairOnlyRound
+    )).toMatchObject({
+      agents: [
+        expect.objectContaining({ name: 'VerifierProbe-7' }),
+        expect.objectContaining({ name: 'FocusedRepairer-8' }),
+        expect.objectContaining({ name: 'RecoveryVerifier-9' }),
+      ],
+      team: expect.objectContaining({ name: 'VerifierGuidedRecoveryTeam-3' }),
     });
 
     const staleAfterAcceptedProgress = structuredClone(failedAttempt);

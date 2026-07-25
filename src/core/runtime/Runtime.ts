@@ -11937,6 +11937,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     if (this.workspaceRuntimeConfig?.teams.enabled === false) return undefined;
     const priorRecoveryActors = resumeState.knowledge.actors.filter(actor =>
       actor.name.startsWith('VerifierProbe-')
+      || actor.name.startsWith('FocusedRepairer-')
       || actor.role === 'verifier-guided recovery executor'
     );
     const priorRecoveryRounds = new Set(
@@ -11987,7 +11988,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
         }
       }
     }
-    const cachedDiagnostic = latestDiagnosticIndex >= 0
+    const cachedDiagnostic = latestDiagnosticIndex > latestRejectedIndex
       && netMutationDepthAfterDiagnostic === 0
       ? calls[latestDiagnosticIndex]
       : undefined;
