@@ -231,12 +231,7 @@ describe('AgentToolPlanner', () => {
       expect.objectContaining({
         toolName: 'shell.exec',
         params: { command: 'python -m pip install -e .' },
-      }),
-      expect.objectContaining({
-        toolName: 'shell.exec',
-        params: {
-          command: 'python -m support_rag.cli answer --question "hello"',
-        },
+        reason: expect.stringContaining('Refresh the active environment'),
       }),
     ]);
 
@@ -1459,6 +1454,161 @@ describe('AgentToolPlanner', () => {
     expect(nextPlans).toEqual([expect.objectContaining({
       params: expect.objectContaining({ path: 'src/app/models.py' }),
     })]);
+  });
+
+  it('does not retry a rolled-back generic synthesis without new path-specific failure evidence', () => {
+    const planner = new AgentToolPlanner();
+    const task = [
+      'Migrate src/app/router.py to the current runtime.',
+      'Run `python -m pytest -q` and verify the result.',
+    ].join('\n');
+    const calls = [
+      {
+        toolName: 'fs.read',
+        params: { path: 'src/app/router.py' },
+        success: true,
+        result: {
+          path: 'src/app/router.py',
+          content: 'from legacy.router import Router\n',
+          truncated: false,
+        },
+      },
+      {
+        toolName: 'fs.synthesize',
+        params: {
+          path: 'src/app/router.py',
+          instructions: 'Migrate the router.',
+          strategy: 'patch',
+        },
+        success: true,
+        result: { path: 'src/app/router.py' },
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m pytest -q' },
+        success: false,
+        result: {
+          exitCode: 1,
+          stderr: '/usr/bin/python: No module named pytest',
+          candidateRollback: {
+            restored: true,
+            path: 'src/app/router.py',
+            reason: 'no_verifier_gain',
+          },
+        },
+      },
+    ];
+
+    expect(planner.planGroundedImplementationTransition({
+      task,
+      calls,
+      bindings: [
+        { name: 'fs.read', enabled: true },
+        { name: 'fs.synthesize', enabled: true },
+        { name: 'shell.exec', enabled: true },
+      ],
+    })).toEqual([]);
+  });
+
+  it('reopens a rolled-back source path when a newer verifier failure localizes it', () => {
+    const planner = new AgentToolPlanner();
+    const task = 'Migrate src/app/router.py to the current runtime and verify it.';
+    const calls = [
+      {
+        toolName: 'fs.read',
+        params: { path: 'src/app/router.py' },
+        success: true,
+        result: {
+          path: 'src/app/router.py',
+          content: 'from legacy.router import Router\n',
+          truncated: false,
+        },
+      },
+      {
+        toolName: 'fs.synthesize',
+        params: {
+          path: 'src/app/router.py',
+          instructions: 'Migrate the router.',
+          strategy: 'patch',
+        },
+        success: true,
+        result: { path: 'src/app/router.py' },
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m pytest -q' },
+        success: false,
+        result: {
+          exitCode: 1,
+          stderr: 'src/app/router.py:42: router contract still fails',
+          candidateRollback: {
+            restored: true,
+            path: 'src/app/router.py',
+            reason: 'no_verifier_gain',
+          },
+        },
+      },
+    ];
+
+    expect(planner.planGroundedImplementationTransition({
+      task,
+      calls,
+      bindings: [
+        { name: 'fs.read', enabled: true },
+        { name: 'fs.synthesize', enabled: true },
+        { name: 'shell.exec', enabled: true },
+      ],
+    })).toEqual([
+      expect.objectContaining({
+        params: expect.objectContaining({ path: 'src/app/router.py' }),
+      }),
+    ]);
+  });
+
+  it('verifies the latest previously failing acceptance command before broad closure checks', () => {
+    const planner = new AgentToolPlanner();
+    const task = [
+      '## Helpful Commands',
+      '```bash',
+      'python -m app.cli answer',
+      'python -m app.cli replay',
+      'python -m pytest -q',
+      '```',
+    ].join('\n');
+    const calls = [
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m app.cli answer' },
+        success: true,
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m pytest -q' },
+        success: false,
+        result: { exitCode: 1, stderr: 'src/app/router.py:12: assertion failed' },
+      },
+      {
+        toolName: 'fs.synthesize',
+        params: {
+          path: 'src/app/router.py',
+          instructions: 'Repair the reported failure.',
+          strategy: 'patch',
+        },
+        success: true,
+        result: { path: 'src/app/router.py' },
+      },
+    ];
+
+    expect(planner.planPostMutationVerification({
+      task,
+      calls,
+      bindings: [{ name: 'shell.exec', enabled: true }],
+    })).toEqual([
+      expect.objectContaining({
+        params: { command: 'python -m pytest -q' },
+        reason: expect.stringContaining('focused causal feedback'),
+      }),
+    ]);
   });
 
   it('does not turn unrelated reads or non-mutation tasks into source synthesis', () => {

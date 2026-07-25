@@ -429,6 +429,15 @@ export class AgentToolPlanner {
     const effectiveMutations = new Set(
       effectiveWorkspaceMutationCallIndices(input.calls)
     );
+    const attemptedMutationIndexByPath = new Map<string, number>();
+    input.calls.forEach((call, index) => {
+      if (!isSuccessfulWorkspaceMutationCall(call)) return;
+      const path = normalizeObservedPath(
+        (call.result as { path?: unknown } | undefined)?.path
+          ?? call.params.path
+      );
+      if (path) attemptedMutationIndexByPath.set(path, index);
+    });
     const mutatedPaths = new Set(input.calls
       .map((call, index) => ({ call, index }))
       .filter(item => effectiveMutations.has(item.index))
@@ -438,18 +447,31 @@ export class AgentToolPlanner {
       ))
       .filter(Boolean));
     const contractTerms = this.extractImplementationContractTerms(input.task);
-    const latestFailure = [...input.calls].reverse().find(call =>
+    const latestFailureIndex = input.calls.reduce((latest, call, index) =>
       isWorkspaceVerificationCall(call)
       && !isSuccessfulWorkspaceVerificationCall(call)
-    );
+        ? index
+        : latest
+    , -1);
+    const latestFailure = latestFailureIndex >= 0
+      ? input.calls[latestFailureIndex]
+      : undefined;
+    const latestFailureResult = latestFailure?.result
+      && typeof latestFailure.result === 'object'
+      ? latestFailure.result as {
+        stdout?: unknown;
+        stderr?: unknown;
+        verifierDiagnostics?: unknown;
+      }
+      : undefined;
     const latestFailureText = latestFailure
       ? [
         String(latestFailure.error ?? ''),
         ...this.extractVerifierDiagnosticText(
-          (latestFailure.result as { verifierDiagnostics?: unknown } | undefined)
-            ?.verifierDiagnostics
+          latestFailureResult?.verifierDiagnostics
         ),
-        JSON.stringify(latestFailure.result ?? ''),
+        String(latestFailureResult?.stdout ?? ''),
+        String(latestFailureResult?.stderr ?? ''),
       ].join('\n').toLowerCase()
       : '';
     const candidates = input.calls
@@ -478,6 +500,14 @@ export class AgentToolPlanner {
         );
         const failureMentioned = latestFailureText.includes(path.toLowerCase())
           || latestFailureText.includes(basename.toLowerCase());
+        const previousMutationIndex = attemptedMutationIndexByPath.get(path);
+        if (previousMutationIndex !== undefined
+          && (
+            latestFailureIndex <= previousMutationIndex
+            || !failureMentioned
+          )) {
+          return undefined;
+        }
         if (!taskExplicit && matchedTerms.length === 0 && !failureMentioned) {
           return undefined;
         }
@@ -561,7 +591,7 @@ export class AgentToolPlanner {
       ))
       .at(-1);
     const commands = this.extractExplicitShellCommands(input.task);
-    return commands
+    const pending = commands
       .filter(command => {
         const matchingCalls = input.calls
           .map((call, index) => ({ call, index }))
@@ -588,12 +618,40 @@ export class AgentToolPlanner {
           && call.toolName === 'shell.exec'
           && String(call.params.command ?? '').trim() === command.trim()
         );
-      })
-      .slice(0, 2)
+      });
+    const invalidatedInstall = pending.find(command =>
+      this.isDependencyInstallCommand(command)
+    );
+    const selected = invalidatedInstall
+      ? [invalidatedInstall]
+      : pending
+        .map(command => ({
+          command,
+          latestFailureIndex: input.calls.reduce((latest, call, index) =>
+            index < latestMutationIndex
+            && call.toolName === 'shell.exec'
+            && String(call.params.command ?? '').trim() === command.trim()
+            && !call.success
+              ? index
+              : latest
+          , -1),
+        }))
+        .filter(item => item.latestFailureIndex >= 0)
+        .sort((left, right) => right.latestFailureIndex - left.latestFailureIndex)
+        .slice(0, 1)
+        .map(item => item.command);
+    const verificationFrontier = selected.length > 0
+      ? selected
+      : pending.slice(0, 2);
+    return verificationFrontier
       .map(command => ({
         toolName: 'shell.exec',
         params: { command },
-        reason: 'Run the task-declared acceptance command against the newly mutated workspace before closing execution.',
+        reason: invalidatedInstall === command
+          ? 'Refresh the active environment from the newly mutated dependency manifest before running behavior checks.'
+          : selected.includes(command)
+            ? 'Re-run the most recent failing task-declared acceptance command first so the mutation receives focused causal feedback.'
+            : 'Run the task-declared acceptance command against the newly mutated workspace before closing execution.',
         groundingRequired: true,
       }));
   }
