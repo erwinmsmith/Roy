@@ -5556,6 +5556,7 @@ export class Runtime {
   private async executeUserTurn(userInput: string, correlationId: string): Promise<RootTurnResult> {
     const ctx = this.getContext();
     const rootUsageBefore = ctx.agent.getUsage();
+    const perTurnUsageStartIndex = this.perTurnUsage.length;
     const rootStepConfig = this.workspaceRuntimeConfig?.delegation.rootSteps;
     const externalExecutionFeedback = this.containsExternalExecutionFeedback(userInput);
     const requiresWorkspaceMutation = this.taskRequiresRootWorkspaceMutation(userInput);
@@ -6265,6 +6266,17 @@ export class Runtime {
     const teamSynthesisUsage = Object.fromEntries(
       teamResults.map(result => [result.team.identity.id, { ...result.team.synthesisUsage }])
     );
+    const reportedUsage = this.sumUsage([
+      rootUsage,
+      ...Object.values(subagentUsage),
+      ...Object.values(teamSynthesisUsage),
+      ...(evolution ? [this.sumUsage(evolution.executions.map(item =>
+        this.evolutionUsageToTokenUsage(item.usage)
+      ))] : []),
+    ]);
+    const recordedUsage = this.sumUsage(
+      this.perTurnUsage.slice(perTurnUsageStartIndex)
+    );
 
     return {
       correlationId,
@@ -6280,12 +6292,9 @@ export class Runtime {
         root: rootUsage,
         subagents: subagentUsage,
         teamSynthesis: teamSynthesisUsage,
-        total: this.sumUsage([
-          rootUsage,
-          ...Object.values(subagentUsage),
-          ...Object.values(teamSynthesisUsage),
-          ...(evolution ? [this.sumUsage(evolution.executions.map(item => this.evolutionUsageToTokenUsage(item.usage)))] : []),
-        ]),
+        total: recordedUsage.totalTokens > reportedUsage.totalTokens
+          ? recordedUsage
+          : reportedUsage,
       },
     };
   }
@@ -8314,6 +8323,14 @@ export class Runtime {
       return runResult;
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error));
+      const usageDelta = this.usageDifference(usageBefore, agent.getUsage());
+      this.recordTurnUsage(usageDelta);
+      this.emit({
+        type: 'budget.updated',
+        agentId,
+        correlationId: options.correlationId,
+        data: { failed: true, ...usageDelta },
+      });
       if (activeGrounding) {
         Object.assign(failure, {
           runtimeToolCalls: activeGrounding.toolCalls,
@@ -8333,13 +8350,23 @@ export class Runtime {
         sessionId: ctx.sessionId,
         correlationId: options.correlationId,
         nodeId: options.nodeId,
-        data: { task, error: message, correlationId: options.correlationId },
+        data: {
+          task,
+          error: message,
+          correlationId: options.correlationId,
+          totalTokens: usageDelta.totalTokens,
+        },
       });
-      this.releaseAgentBudget(agentId, 'agent_run_failed');
+      this.settleAgentBudget(agentId, usageDelta, {
+        success: false,
+        error: message,
+        evidenceGain: activeGrounding?.evidence.toolGrounded ? 0.25 : 0,
+        uncertaintyReduction: activeGrounding?.grounded ? 0.2 : 0,
+      });
       await ctx.memory.recordAgentPatternOutcome(options.archetype ?? this.inferAgentArchetype(agent.getInfo()), {
         success: false,
         grounded: false,
-        totalTokens: 0,
+        totalTokens: usageDelta.totalTokens,
       }, options.patternId);
       await this.finalizeActorLifecycle(agentId, 'failure', options.correlationId);
       throw failure;
