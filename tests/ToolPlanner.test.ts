@@ -424,7 +424,7 @@ describe('AgentToolPlanner', () => {
           exitCode: 0,
           verifierDiagnostics: [{
             path: '/logs/verifier/scorecard.json',
-            content: '{"groups":{"G_public_reconstruction":1,"G_hidden_end_to_end_stress":0}}',
+            content: '{"groups":{"G_public_reconstruction":1,"G_hidden_end_to_end_stress":0},"weights":{"G_public_reconstruction":0.005,"G_hidden_end_to_end_stress":0.89}}',
           }, {
             path: '/logs/verifier/grade.log',
             content: [
@@ -493,6 +493,9 @@ describe('AgentToolPlanner', () => {
     })]);
     expect(String(focused[0]?.params.instructions)).toContain(
       'VERIFIER_PROBE_MISMATCHES'
+    );
+    expect(String(focused[0]?.params.instructions)).toContain(
+      'G_hidden_end_to_end_stress (score 0.000, weight 0.890)'
     );
     expect(String(focused[0]?.params.instructions)).toContain('layout_qc.json');
     expect(String(focused[0]?.params.instructions).length).toBeLessThanOrEqual(4_000);

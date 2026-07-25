@@ -559,9 +559,15 @@ export class AgentToolPlanner {
       input.calls,
       targetPath
     );
+    const latestScorecard = [...input.calls].reverse()
+      .map(call => this.verifierScorecardState(call))
+      .find((state): state is {
+        groups: Record<string, number>;
+        weights: Record<string, number>;
+      } => Boolean(state));
     const verifierGroups = {
       ...(targetRejectedCandidate?.baselineGroups
-        ?? this.verifierGroupState(failure)
+        ?? latestScorecard?.groups
         ?? {}),
     };
     for (const group of [
@@ -572,7 +578,14 @@ export class AgentToolPlanner {
     }
     const failedGroups = Object.entries(verifierGroups ?? {})
       .filter(([, score]) => score < 1)
-      .map(([group]) => group);
+      .map(([group, score]) => ({
+        group,
+        score,
+        weight: latestScorecard?.weights[group] ?? 0,
+      }))
+      .sort((left, right) =>
+        right.weight - left.weight || left.group.localeCompare(right.group)
+      );
     const passingGroups = Object.entries(verifierGroups ?? {})
       .filter(([, score]) => score >= 1)
       .map(([group]) => group);
@@ -581,7 +594,9 @@ export class AgentToolPlanner {
       ? [
         'Apply a focused semantics-preserving repair after the prior candidate was transactionally rejected.',
         failedGroups.length > 0
-          ? `Repair only the unresolved verifier capabilities: ${failedGroups.join(', ')}.`
+          ? `Repair only the unresolved verifier capabilities in descending objective weight: ${failedGroups.map(item =>
+            `${item.group} (score ${item.score.toFixed(3)}, weight ${item.weight.toFixed(3)})`
+          ).join(', ')}. Prioritize the highest-weight causal mismatch before low-weight cosmetic groups.`
           : 'Repair only the newest unresolved verifier behavior.',
         passingGroups.length > 0
           ? `Preserve the currently passing capabilities exactly: ${passingGroups.join(', ')}.`
@@ -622,7 +637,10 @@ export class AgentToolPlanner {
     }];
   }
 
-  private verifierGroupState(call: ObservedToolCall): Record<string, number> | undefined {
+  private verifierScorecardState(call: ObservedToolCall): {
+    groups: Record<string, number>;
+    weights: Record<string, number>;
+  } | undefined {
     const diagnostics = (call.result as { verifierDiagnostics?: unknown } | undefined)
       ?.verifierDiagnostics;
     if (!Array.isArray(diagnostics)) return undefined;
@@ -631,7 +649,7 @@ export class AgentToolPlanner {
       const content = (item as { content?: unknown }).content;
       if (typeof content !== 'string') continue;
       try {
-        const parsed = JSON.parse(content) as { groups?: unknown };
+        const parsed = JSON.parse(content) as { groups?: unknown; weights?: unknown };
         if (!parsed.groups
           || typeof parsed.groups !== 'object'
           || Array.isArray(parsed.groups)) {
@@ -643,7 +661,17 @@ export class AgentToolPlanner {
               typeof entry[1] === 'number' && Number.isFinite(entry[1])
             )
         );
-        if (Object.keys(groups).length > 0) return groups;
+        const weights = parsed.weights
+          && typeof parsed.weights === 'object'
+          && !Array.isArray(parsed.weights)
+          ? Object.fromEntries(
+            Object.entries(parsed.weights)
+              .filter((entry): entry is [string, number] =>
+                typeof entry[1] === 'number' && Number.isFinite(entry[1])
+              )
+          )
+          : {};
+        if (Object.keys(groups).length > 0) return { groups, weights };
       } catch {
         // Other verifier diagnostics can be free-form logs.
       }
