@@ -226,6 +226,32 @@ class RecoveringFocusedPatchSynthesisLLM extends EchoLLM {
 }
 
 describe('Runtime controlled subagent spawning', () => {
+  it('uses Python 3 for verifier probes and safely quotes an explicit interpreter path', () => {
+    const previous = process.env.ROY_PYTHON_EXECUTABLE;
+    const runtime = new Runtime();
+    const buildCommand = () => (
+      runtime as unknown as {
+        buildPythonVerifierDiagnosticCommand: () => string;
+      }
+    ).buildPythonVerifierDiagnosticCommand();
+
+    try {
+      delete process.env.ROY_PYTHON_EXECUTABLE;
+      expect(buildCommand()).toMatch(/^ROY_VERIFIER_PROBE=1 python3 -c /);
+
+      process.env.ROY_PYTHON_EXECUTABLE = "/opt/Python 3's/bin/python";
+      expect(buildCommand()).toMatch(
+        /^ROY_VERIFIER_PROBE=1 '\/opt\/Python 3'"'"'s\/bin\/python' -c /
+      );
+    } finally {
+      if (previous === undefined) {
+        delete process.env.ROY_PYTHON_EXECUTABLE;
+      } else {
+        process.env.ROY_PYTHON_EXECUTABLE = previous;
+      }
+    }
+  });
+
   it('requires new causal evidence before retrying a rejected synthesis', () => {
     const runtime = new Runtime();
     const unresolved = (runtime as unknown as {

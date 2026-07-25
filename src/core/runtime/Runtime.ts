@@ -4702,7 +4702,7 @@ export class Runtime {
     }
     const syntaxCheck = extension === '.py'
       ? {
-        executable: process.env.ROY_PYTHON_EXECUTABLE || 'python3',
+        executable: this.pythonExecutable(),
         args: ['-c', 'import ast,sys; ast.parse(sys.stdin.read())'],
         label: 'Python',
       }
@@ -18223,6 +18223,15 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     return undefined;
   }
 
+  private pythonExecutable(): string {
+    return process.env.ROY_PYTHON_EXECUTABLE?.trim() || 'python3';
+  }
+
+  private shellExecutable(executable: string): string {
+    if (/^[A-Za-z0-9_./-]+$/.test(executable)) return executable;
+    return `'${executable.replace(/'/g, `'"'"'`)}'`;
+  }
+
   private buildPythonVerifierDiagnosticCommand(task = ''): string {
     const taskInputPaths = this.extractTaskDiagnosticInputPaths(task);
     const diagnosticScopes = this.extractVerifierDiagnosticScopes(task);
@@ -18490,7 +18499,8 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       'print("VERIFIER_PROBE_RETAINED_DIRS", compact(retained))',
     ].join('\n');
     const encoded = Buffer.from(script, 'utf8').toString('base64');
-    return `ROY_VERIFIER_PROBE=1 python -c "import base64;exec(base64.b64decode('${encoded}'))"`;
+    const python = this.shellExecutable(this.pythonExecutable());
+    return `ROY_VERIFIER_PROBE=1 ${python} -c "import base64;exec(base64.b64decode('${encoded}'))"`;
   }
 
   private extractVerifierDiagnosticScopes(task: string): string[] {
