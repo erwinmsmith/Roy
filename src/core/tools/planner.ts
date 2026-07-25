@@ -1020,7 +1020,7 @@ export class AgentToolPlanner {
     for (const match of task.matchAll(/```(?:bash|sh|shell|zsh|console)\s*\n([\s\S]*?)```/gi)) {
       const index = match.index ?? 0;
       const leadIn = task.slice(Math.max(0, index - 240), index);
-      if (!/(?:required|run|execute|verification|verify|test)[^\n]{0,80}(?:command|with|using)?/i.test(leadIn)) {
+      if (!/(?:required|helpful|run|execute|verification|verify|test)[^\n]{0,80}(?:commands?|with|using)?/i.test(leadIn)) {
         continue;
       }
       const lines = String(match[1] ?? '')
@@ -1037,7 +1037,7 @@ export class AgentToolPlanner {
         commands.push(command);
       }
     }
-    return [...new Set(commands)].slice(0, 3);
+    return [...new Set(commands)].slice(0, 12);
   }
 
   private extractReferencedUrls(task: string): string[] {

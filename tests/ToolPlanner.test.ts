@@ -173,6 +173,58 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('retains acceptance commands beyond the initial planning batch', () => {
+    const planner = new AgentToolPlanner();
+    const task = [
+      '## Helpful Commands',
+      '```bash',
+      'cd /app',
+      'python -m pip install -e .',
+      'python -m support_rag.cli answer --question "hello"',
+      'python -m support_rag.cli route --ticket "invoice"',
+      'python -m support_rag.cli replay --history data/history',
+      'python -m pytest -q',
+      '```',
+    ].join('\n');
+
+    const plans = planner.planPostMutationVerification({
+      task,
+      calls: [
+        {
+          toolName: 'shell.exec',
+          params: { command: 'cd /app' },
+          success: true,
+        },
+        {
+          toolName: 'shell.exec',
+          params: { command: 'python -m pip install -e .' },
+          success: true,
+        },
+        {
+          toolName: 'fs.synthesize',
+          params: { path: 'src/support_rag/chain.py', instructions: 'Migrate it.' },
+          success: true,
+        },
+        {
+          toolName: 'shell.exec',
+          params: { command: 'python -m support_rag.cli answer --question "hello"' },
+          success: true,
+        },
+        {
+          toolName: 'shell.exec',
+          params: { command: 'python -m support_rag.cli route --ticket "invoice"' },
+          success: true,
+        },
+      ],
+      bindings: [{ name: 'shell.exec', enabled: true }],
+    });
+
+    expect(plans.map(plan => plan.params.command)).toEqual([
+      'python -m support_rag.cli replay --history data/history',
+      'python -m pytest -q',
+    ]);
+  });
+
   it('follows explicit files and text dependencies from a grounded manifest without another model plan', () => {
     const planner = new AgentToolPlanner();
     const plans = planner.planWorkspaceEvidenceFollowUps({
