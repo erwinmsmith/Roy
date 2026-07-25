@@ -772,6 +772,7 @@ export class AgentToolPlanner {
       effectiveWorkspaceMutationCallIndices(input.calls).at(-1) ?? -1;
     const describeFailure = (index: number): {
       index: number;
+      output: string;
       locations: Array<{ path: string; line?: number }>;
     } => {
       const failure = input.calls[index]!;
@@ -789,6 +790,7 @@ export class AgentToolPlanner {
       ].filter(Boolean).join('\n');
       return {
         index,
+        output,
         locations: this.extractFailureLocations(
           output,
           String(shell?.cwd ?? input.workspaceRoot ?? ''),
@@ -826,6 +828,75 @@ export class AgentToolPlanner {
     }
     const failureIndex = causalFailure.index;
     const locations = causalFailure.locations;
+    const abstractClass = /can't instantiate abstract class\s+([A-Za-z_][A-Za-z0-9_]*)\s+with abstract methods?\s+([^\n]+)/i.exec(
+      causalFailure.output
+    );
+    if (abstractClass) {
+      const className = abstractClass[1]!;
+      const query = `class\\s+${className}\\b`;
+      const searchAfterFailure = input.calls
+        .slice(failureIndex + 1)
+        .find(call =>
+          call.toolName === 'fs.search'
+          && call.success
+          && String(call.params.query ?? '') === query
+        );
+      if (!searchAfterFailure
+        && input.bindings.some(binding =>
+          binding.enabled && binding.name === 'fs.search'
+        )) {
+        return [{
+          toolName: 'fs.search',
+          params: {
+            path: '.',
+            filePattern: '*.py',
+            query,
+            regex: true,
+            maxResults: 20,
+          },
+          reason: `The traceback fails while instantiating abstract class ${className}; locate its definition instead of patching the caller frame.`,
+          groundingRequired: true,
+        }];
+      }
+      const matches = (searchAfterFailure?.result as {
+        matches?: Array<{ path?: unknown; line?: unknown }>;
+      } | undefined)?.matches;
+      const definition = Array.isArray(matches)
+        ? matches.find(match =>
+          typeof match.path === 'string'
+          && this.isMutableImplementationPath(String(match.path))
+        )
+        : undefined;
+      if (definition) {
+        const path = this.normalizeWorkspacePath(String(definition.path));
+        const alreadyRead = input.calls
+          .slice(failureIndex + 1)
+          .some(call =>
+            call.toolName === 'fs.read'
+            && call.success
+            && this.normalizeWorkspacePath(String(
+              (call.result as { path?: unknown } | undefined)?.path
+                ?? call.params.path
+                ?? ''
+            )) === path
+          );
+        if (!alreadyRead) {
+          const line = Number(definition.line);
+          return [{
+            toolName: 'fs.read',
+            params: Number.isInteger(line) && line > 0
+              ? {
+                path,
+                startLine: Math.max(1, line - 15),
+                endLine: line + 80,
+              }
+              : { path },
+            reason: `Read the definition of abstract class ${className}; its missing methods are the semantic cause, while the traceback caller is only the instantiation site.`,
+            groundingRequired: true,
+          }];
+        }
+      }
+    }
     return locations
       .map(location => ({
         toolName: 'fs.read',
@@ -1046,9 +1117,45 @@ export class AgentToolPlanner {
       }
     }
     const rejectedCandidate = this.latestRollbackForCurrentWorkspace(input.calls);
-    const failureLocation = causalFailure.locations.find(location =>
-      this.isMutableImplementationPath(location.path)
+    const abstractClass = /can't instantiate abstract class\s+([A-Za-z_][A-Za-z0-9_]*)\s+with abstract methods?\s+([^\n]+)/i.exec(
+      causalFailure.output
     );
+    const semanticDefinitionRead = abstractClass
+      ? [...input.calls]
+        .map((call, index) => ({ call, index }))
+        .reverse()
+        .find(({ call, index }) => {
+          if (index <= causalFailure.index
+            || call.toolName !== 'fs.read'
+            || !call.success) {
+            return false;
+          }
+          const result = call.result as {
+            path?: unknown;
+            content?: unknown;
+          } | undefined;
+          const candidatePath = this.normalizeWorkspacePath(String(
+            result?.path ?? call.params.path ?? ''
+          ));
+          return this.isMutableImplementationPath(candidatePath)
+            && typeof result?.content === 'string'
+            && new RegExp(
+              `\\bclass\\s+${abstractClass[1]!.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`
+            ).test(result.content);
+        })
+      : undefined;
+    const semanticDefinitionPath = semanticDefinitionRead
+      ? this.normalizeWorkspacePath(String(
+        (semanticDefinitionRead.call.result as { path?: unknown } | undefined)?.path
+          ?? semanticDefinitionRead.call.params.path
+          ?? ''
+      ))
+      : undefined;
+    const failureLocation = semanticDefinitionPath
+      ? { path: semanticDefinitionPath }
+      : causalFailure.locations.find(location =>
+      this.isMutableImplementationPath(location.path)
+      );
     if (failureLocation && !rejectedCandidate) {
       const targetPath = failureLocation.path;
       let sourceReadIndex = -1;

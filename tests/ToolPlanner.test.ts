@@ -794,6 +794,136 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('follows an abstract-instantiation failure to the class definition', () => {
+    const planner = new AgentToolPlanner();
+    const failure = {
+      toolName: 'shell.exec',
+      params: { command: 'python -m support_rag.cli answer' },
+      success: false,
+      result: {
+        cwd: '/app',
+        exitCode: 1,
+        stderr: [
+          'Traceback (most recent call last):',
+          '  File "/app/src/support_rag/chain.py", line 42, in build_answer_chain',
+          '    llm = LegacyAnswerLLM()',
+          "TypeError: Can't instantiate abstract class LegacyAnswerLLM with abstract methods _generate, _llm_type",
+        ].join('\n'),
+      },
+    };
+    const bindings = [
+      { name: 'fs.read', enabled: true },
+      { name: 'fs.search', enabled: true },
+      { name: 'shell.exec', enabled: true },
+    ];
+    const searchPlan = planner.planWorkspaceFailureFollowUps({
+      workspaceRoot: '/app',
+      bindings,
+      calls: [failure],
+    });
+
+    expect(searchPlan).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.search',
+        params: {
+          path: '.',
+          filePattern: '*.py',
+          query: 'class\\s+LegacyAnswerLLM\\b',
+          regex: true,
+          maxResults: 20,
+        },
+        reason: expect.stringContaining('definition instead of patching the caller'),
+      }),
+    ]);
+
+    const definitionRead = planner.planWorkspaceFailureFollowUps({
+      workspaceRoot: '/app',
+      bindings,
+      calls: [
+        failure,
+        {
+          toolName: 'fs.search',
+          params: searchPlan[0]!.params,
+          success: true,
+          result: {
+            matches: [{
+              path: 'src/support_rag/models.py',
+              line: 24,
+              preview: 'class LegacyAnswerLLM(BaseLLM):',
+            }],
+          },
+        },
+      ],
+    });
+    expect(definitionRead).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.read',
+        params: {
+          path: 'src/support_rag/models.py',
+          startLine: 9,
+          endLine: 104,
+        },
+        reason: expect.stringContaining('semantic cause'),
+      }),
+    ]);
+  });
+
+  it('repairs a grounded abstract class definition rather than its caller frame', () => {
+    const planner = new AgentToolPlanner();
+    const failure = {
+      toolName: 'shell.exec',
+      params: { command: 'python -m support_rag.cli answer' },
+      success: false,
+      result: {
+        cwd: '/app',
+        exitCode: 1,
+        stderr: [
+          'Traceback (most recent call last):',
+          '  File "/app/src/support_rag/chain.py", line 42, in build_answer_chain',
+          '    llm = LegacyAnswerLLM()',
+          "TypeError: Can't instantiate abstract class LegacyAnswerLLM with abstract methods _generate, _llm_type",
+        ].join('\n'),
+      },
+    };
+    const plans = planner.planWorkspaceRepairTransition({
+      task: 'Repair src/support_rag/models.py and preserve the CLI.',
+      workspaceRoot: '/app',
+      bindings: [
+        { name: 'fs.read', enabled: true },
+        { name: 'fs.synthesize', enabled: true },
+        { name: 'shell.exec', enabled: true },
+      ],
+      calls: [
+        failure,
+        {
+          toolName: 'fs.read',
+          params: {
+            path: 'src/support_rag/models.py',
+            startLine: 9,
+            endLine: 104,
+          },
+          success: true,
+          result: {
+            path: 'src/support_rag/models.py',
+            content: 'class LegacyAnswerLLM(BaseLLM):\n    def _call(self, prompt): return prompt\n',
+            truncated: false,
+          },
+        },
+      ],
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.synthesize',
+        params: expect.objectContaining({
+          path: 'src/support_rag/models.py',
+          strategy: 'patch',
+          instructions: expect.stringMatching(/abstract class LegacyAnswerLLM[\s\S]*_generate, _llm_type/i),
+        }),
+      }),
+    ]);
+  });
+
   it('bootstraps an explicitly invoked missing development tool after source failures clear', () => {
     const planner = new AgentToolPlanner();
     const bindings = [{ name: 'shell.exec', enabled: true }];
