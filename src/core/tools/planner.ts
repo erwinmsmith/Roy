@@ -2082,12 +2082,22 @@ export class AgentToolPlanner {
   }
 
   private webCoreEntityTerms(task: string): string[] {
+    const toolSyntaxTerms = new Set([
+      'web.search',
+      'web.fetch',
+      'websearch',
+      'webfetch',
+      'web',
+      'search',
+      'fetch',
+    ]);
     const dotted = [...task.matchAll(/\b[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)+\b/g)]
       .flatMap(match => [match[0], ...match[0].split('.')]);
     const named = (task.match(/\b[A-Za-z][A-Za-z0-9]*\b/g) ?? [])
       .filter(term => /^[A-Z0-9]{2,}$/.test(term) || /[a-z][A-Z]/.test(term));
     return [...new Set([...dotted, ...named]
       .map(term => term.toLowerCase().replace(/[^a-z0-9]+/g, ''))
+      .filter(term => !toolSyntaxTerms.has(term))
       .filter(term => term.length >= 3))];
   }
 

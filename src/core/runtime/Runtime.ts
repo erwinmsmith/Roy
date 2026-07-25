@@ -5467,6 +5467,21 @@ export class Runtime {
       || /\b(?:research|compare|verify)\b[\s\S]*\b(?:external|official|independent)\s+sources?\b/.test(lower);
   }
 
+  private taskRequiresIndependentWebEvidence(
+    task: string,
+    archetype?: SubAgentArchetype,
+    descriptor = ''
+  ): boolean {
+    if (!this.taskNeedsWebAccess(task)) return false;
+    if (task.includes('[runtime_independent_web_evidence]')) return true;
+    const intent = `${descriptor}\n${task}`.toLowerCase();
+    return archetype === 'critic'
+      || archetype === 'tester'
+      || /\b(?:fact[- ]?check(?:er|ing)?|factuality|reviewer|critic|verifier|validator|cross[- ]?check|corroborat|independent(?:ly)?\s+(?:check|verify|research)|precise canonical|supporting sources?|source[- ]grounded|scope[- ]sensitive)\b/.test(
+        intent
+      );
+  }
+
   private stripPassiveReferenceSections(task: string): string {
     return task.replace(
       /(?:^|\n)(?:#{1,6}\s*)?(?:(?:official\s*\/\s*public|official|public)\s+)?references?\s*:?\s*\n[\s\S]*$/i,
@@ -12870,8 +12885,28 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     fallbackTask: string
   ): DelegationAgentPlan {
     const archetype = String(plan.archetype) as SubAgentArchetype;
+    const suppliedTask =
+      typeof plan.task === 'string' && plan.task.trim()
+        ? plan.task.trim()
+        : fallbackTask;
+    const descriptor = [
+      typeof plan.name === 'string' ? plan.name : '',
+      typeof plan.role === 'string' ? plan.role : '',
+      typeof plan.existenceReason === 'string' ? plan.existenceReason : '',
+    ].filter(Boolean).join('\n');
+    const evidenceTask = this.taskRequiresIndependentWebEvidence(
+      suppliedTask,
+      archetype,
+      descriptor
+    ) && !suppliedTask.includes('[runtime_independent_web_evidence]')
+      ? [
+        suppliedTask,
+        '[runtime_independent_web_evidence]',
+        'Treat shared cached web results as a baseline, not as independent corroboration. When cached searches cover a material factual conclusion, use non-equivalent follow-up queries that probe alternate wording, scope, dates, and counterexamples; prefer primary or authoritative sources and report conflicts instead of following the prior majority.',
+      ].join('\n')
+      : suppliedTask;
     const task = this.compactDelegatedTask(
-      typeof plan.task === 'string' && plan.task.trim() ? plan.task.trim() : fallbackTask
+      evidenceTask
     );
     const requestedTools = Array.isArray(plan.tools)
       ? plan.tools.filter((tool): tool is string =>
@@ -13440,13 +13475,15 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
       isSuccessfulWorkspaceMutationCall(call)
       && !this.normalizeCachedPath(String(call.params.path ?? '')).startsWith('.roy/')
     );
-    const targetPath = this.normalizeCachedPath(String(
+    const cachedTargetPath = this.normalizeCachedPath(String(
       rollback?.path
         ?? rejection?.path
         ?? latestMutation?.params.path
         ?? rejectedCandidate?.params.path
         ?? ''
     ));
+    const externalFeedback = this.latestExternalVerificationFeedback(task);
+    const targetPath = externalFeedback?.path ?? cachedTargetPath;
     const target = targetPath || 'the implementation target named by the task';
     const unresolvedGroups = Object.entries(latestScorecard?.groups ?? {})
       .filter(([, score]) => score < 1)
@@ -13457,9 +13494,12 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
       anchorPathId: resumeState.anchorPathId,
       recoveryRound,
       latestAcceptedScorecard: latestScorecard,
-      recoveryTrigger: latestRejected
-        ? 'current_rejected_candidate'
-        : 'incomplete_accepted_scorecard_after_progress',
+      recoveryTrigger: externalFeedback
+        ? 'new_external_verifier_feedback'
+        : latestRejected
+          ? 'current_rejected_candidate'
+          : 'incomplete_accepted_scorecard_after_progress',
+      externalFeedback,
       unresolvedGroups,
       rejectedCandidate: latestRejected
         ? {
@@ -13511,7 +13551,9 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
       name: `FocusedRepairer-${memberOrdinal + 2}`,
       role: 'verifier-guided recovery executor',
       task: [
-        cachedDiagnostic
+        externalFeedback
+          ? `Consume the newest concrete external verifier feedback and repair ${target}: ${externalFeedback.summary}`
+          : cachedDiagnostic
           ? `Consume the cached focused verifier diagnostic and repair ${target}.`
           : `Consume the diagnostic member result and repair ${target}.`,
         'Inspect the authoritative current snapshot and use the smallest coherent fs.replace or focused fs.synthesize patch supported by the diagnostic evidence.',
@@ -13526,7 +13568,9 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
       tools: ['fs.read', 'fs.search', 'fs.replace', 'fs.write', 'fs.synthesize', 'shell.exec'],
       skills: ['use_tool_when_needed'],
       tomLevel: 2,
-      existenceReason: cachedDiagnostic
+      existenceReason: externalFeedback
+        ? 'A newer concrete verifier failure supersedes the stale cached causal target and supports a direct localized repair.'
+        : cachedDiagnostic
         ? 'A fresh cached diagnostic already identifies the unresolved behavior; continue directly with its localized repair.'
         : latestRejected
           ? 'The diagnostic hypothesis must be turned into a localized, verified workspace mutation.'
@@ -13555,14 +13599,18 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     };
     return {
       action: 'spawn_subagents',
-      reason: cachedDiagnostic
+      reason: externalFeedback
+        ? 'New concrete external verifier feedback supersedes the stale cached recovery frontier; repair its authoritative target directly, then independently verify it.'
+        : cachedDiagnostic
         ? 'The prior recovery stopped after producing a fresh focused diagnostic; resume directly at localized repair and independent verification.'
         : latestRejected
           ? 'The persisted root repair strategy produced a verifier rollback or an invalid patch; change the causal hypothesis through a bounded diagnostic, localized repair, and independent verification team.'
           : 'A newer accepted verifier scorecard superseded the old rejection but remains incomplete; diagnose only its unresolved groups, then apply and independently verify one localized repair.',
       coordination: 'team',
       continuationPolicy: 'reassess',
-      agents: cachedDiagnostic
+      agents: externalFeedback
+        ? [repairAgent, verifierAgent]
+        : cachedDiagnostic
         ? [repairAgent, verifierAgent]
         : [diagnosticAgent, repairAgent, verifierAgent],
       team: {
@@ -13580,6 +13628,32 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
           minimumSuccessfulMembers: 1,
         },
       },
+    };
+  }
+
+  private latestExternalVerificationFeedback(
+    task: string
+  ): { summary: string; path?: string } | undefined {
+    const failureMarker = task.toLowerCase().lastIndexOf('## verification failed');
+    if (failureMarker < 0) return undefined;
+    const latestFailure = task.slice(failureMarker);
+    const feedbackMatch = /(?:^|\n)Verifier feedback:\s*\n([\s\S]*?)(?=\n\s*<official_verifier_feedback>|\n\s*##\s+Required local repair verification|\s*$)/i.exec(
+      latestFailure
+    );
+    const feedback = feedbackMatch?.[1]?.trim();
+    if (!feedback) return undefined;
+    const summary = feedback
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .find(line => line && !/^unchanged\b/i.test(line))
+      ?.slice(0, 1_200);
+    if (!summary) return undefined;
+    const path = this.extractTaskDiagnosticSourcePaths(feedback)[0]
+      ?? this.extractTaskDiagnosticInputPaths(feedback)[0];
+    if (!path) return undefined;
+    return {
+      summary,
+      path,
     };
   }
 
@@ -18187,6 +18261,21 @@ For web-grounded work, use only facts present in the subagent report or runtime 
           || binding.name === 'fs.synthesize'
         )
       );
+    const independentWebEvidenceRequired =
+      this.taskRequiresIndependentWebEvidence(
+        intentTask,
+        options.archetype
+      );
+    const sharedWebSearchFingerprints = new Set<string>();
+    const freshWebSearchFingerprints = new Set<string>();
+    const requiredFreshWebSearches = (): number =>
+      independentWebEvidenceRequired
+        ? Math.min(2, sharedWebSearchFingerprints.size)
+        : 0;
+    const hasSharedWebEvidenceDiversityGap = (): boolean =>
+      requiredFreshWebSearches() > freshWebSearchFingerprints.size;
+    let diversityGapEmitted = false;
+    let diversityCompletedEmitted = false;
     const diagnosticProbeRequired =
       /\[runtime_verifier_diagnostic_probe\]/.test(intentTask);
     const mirroredVerifierPath = path.join(
@@ -18758,6 +18847,10 @@ For web-grounded work, use only facts present in the subagent report or runtime 
               ageMs: Math.max(0, Date.now() - cacheSource.cachedAt),
             },
           });
+          if (plan.toolName === 'web.search'
+            && cacheSource.sourceAgentId !== agentId) {
+            sharedWebSearchFingerprints.add(this.toolPlanFingerprint(plan));
+          }
         } else {
           const execute = this.executeToolForAgent(agentId, plan.toolName, plan.params, {
             reason: plan.reason,
@@ -18804,6 +18897,9 @@ For web-grounded work, use only facts present in the subagent report or runtime 
                 entries: this.sharedReadOnlyToolResultCache.size,
               },
             });
+          }
+          if (plan.toolName === 'web.search' && result.success) {
+            freshWebSearchFingerprints.add(this.toolPlanFingerprint(plan));
           }
         }
         liveGroundingCalls.push({
@@ -19024,7 +19120,27 @@ For web-grounded work, use only facts present in the subagent report or runtime 
           maxFetches: loopConfig.maxFetchesAfterSearch,
         });
         if (deterministic.length > 0) return deterministic.slice(0, context.remainingCalls);
-        if (this.toolPlanner.hasSufficientWebEvidence(intentTask, context.calls)) return [];
+        if (diversityGapEmitted
+          && !diversityCompletedEmitted
+          && !hasSharedWebEvidenceDiversityGap()) {
+          diversityCompletedEmitted = true;
+          this.emit({
+            type: 'agent.web_evidence.diversification.completed',
+            agentId,
+            sessionId: this.getContext().sessionId,
+            correlationId: options.correlationId,
+            nodeId: options.nodeId,
+            data: {
+              sharedSearches: sharedWebSearchFingerprints.size,
+              freshSearches: freshWebSearchFingerprints.size,
+              requiredFreshSearches: requiredFreshWebSearches(),
+            },
+          });
+        }
+        if (this.toolPlanner.hasSufficientWebEvidence(intentTask, context.calls)
+          && !hasSharedWebEvidenceDiversityGap()) {
+          return [];
+        }
         if (this.hasClosedReadOnlyWorkspaceEvidence(intentTask, combinedCalls)) {
           this.emit({
             type: 'agent.tool_loop.evidence_closed',
@@ -19073,8 +19189,30 @@ For web-grounded work, use only facts present in the subagent report or runtime 
           });
           return [];
         }
+        const diversityPlanningTask = hasSharedWebEvidenceDiversityGap()
+          ? [
+            task,
+            '[runtime_shared_web_frontier]',
+            `Another actor already executed ${sharedWebSearchFingerprints.size} equivalent web search(es), so their cached results do not constitute an independent check. Request ${requiredFreshWebSearches() - freshWebSearchFingerprints.size} non-equivalent web.search call(s) now. Probe alternate wording, scope, dates, or counterexamples for the most material uncertainties; do not repeat these cached query fingerprints: ${[...sharedWebSearchFingerprints].join(', ')}.`,
+          ].join('\n')
+          : task;
+        if (hasSharedWebEvidenceDiversityGap() && !diversityGapEmitted) {
+          diversityGapEmitted = true;
+          this.emit({
+            type: 'agent.web_evidence.diversification.required',
+            agentId,
+            sessionId: this.getContext().sessionId,
+            correlationId: options.correlationId,
+            nodeId: options.nodeId,
+            data: {
+              sharedSearches: sharedWebSearchFingerprints.size,
+              freshSearches: freshWebSearchFingerprints.size,
+              requiredFreshSearches: requiredFreshWebSearches(),
+            },
+          });
+        }
         const llmPlans = await actor.planNextToolRound({
-          task,
+          task: diversityPlanningTask,
           intentTask,
           executionRequired: workspaceExecutionRequired,
           diagnosticProbeRequired,
@@ -19102,6 +19240,21 @@ For web-grounded work, use only facts present in the subagent report or runtime 
             ? priorPlannerCalls.length - 1
             : undefined,
         });
+        if (hasSharedWebEvidenceDiversityGap()) {
+          this.emit({
+            type: 'agent.web_evidence.diversification.planned',
+            agentId,
+            sessionId: this.getContext().sessionId,
+            correlationId: options.correlationId,
+            nodeId: options.nodeId,
+            data: {
+              plans: llmPlans.map(plan => ({
+                toolName: plan.toolName,
+                params: plan.params,
+              })),
+            },
+          });
+        }
         this.emitToolPlanningFailure(actor, agentId, options, context.round);
         const alignedPlans = llmPlans.filter(plan => {
           const parallelMutation = findParallelSourceMutation(
@@ -19166,6 +19319,23 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         });
       },
     });
+    if (diversityGapEmitted
+      && !diversityCompletedEmitted
+      && !hasSharedWebEvidenceDiversityGap()) {
+      diversityCompletedEmitted = true;
+      this.emit({
+        type: 'agent.web_evidence.diversification.completed',
+        agentId,
+        sessionId: this.getContext().sessionId,
+        correlationId: options.correlationId,
+        nodeId: options.nodeId,
+        data: {
+          sharedSearches: sharedWebSearchFingerprints.size,
+          freshSearches: freshWebSearchFingerprints.size,
+          requiredFreshSearches: requiredFreshWebSearches(),
+        },
+      });
+    }
     this.emit({
       type: 'agent.tool_loop.completed',
       agentId,

@@ -73,6 +73,32 @@ class SaturatedClosurePlanningLLM extends EchoLLM {
   }
 }
 
+class DiversifyingWebLLM extends EchoLLM {
+  sawSharedFrontier = false;
+
+  override async completeJSON<T>(messages: LLMMessage[]): Promise<T> {
+    const prompt = messages.map(message => String(message.content)).join('\n');
+    if (prompt.includes('[runtime_shared_web_frontier]')) {
+      this.sawSharedFrontier = true;
+      return {
+        action: 'call_tools',
+        reason: 'Probe the shared conclusions with independent search formulations.',
+        calls: [
+          {
+            toolName: 'web.search',
+            params: { query: 'Hamlet authorship Shakespeare primary evidence' },
+          },
+          {
+            toolName: 'web.search',
+            params: { query: 'Macbeth authorship Shakespeare primary evidence' },
+          },
+        ],
+      } as T;
+    }
+    return { action: 'finish', reason: 'No additional tool call is needed.', calls: [] } as T;
+  }
+}
+
 class ContradictoryArchitectureLLM extends EchoLLM {
   override async *stream(_messages: LLMMessage[], _options?: LLMCompletionOptions): AsyncGenerator<LLMStreamChunk, void, unknown> {
     yield { content: 'This is a Rust project built around Cargo.toml, Cargo.lock, and src/main.rs.', done: false };
@@ -456,6 +482,25 @@ describe('Runtime controlled subagent spawning', () => {
 
     expect(normalized.tools).toBeUndefined();
     expect(normalized.skills).toBeUndefined();
+  });
+
+  it('marks delegated public-web fact verification as independent of shared cached evidence', () => {
+    const runtime = new Runtime();
+    const normalized = (runtime as unknown as {
+      normalizeDelegationAgentPlan: (
+        plan: Record<string, unknown>,
+        fallbackTask: string
+      ) => { task: string };
+    }).normalizeDelegationAgentPlan({
+      archetype: 'researcher',
+      name: 'IndependentReviewer-1',
+      role: 'factuality reviewer',
+      task: 'Use public web sources to verify the precise canonical answers.',
+      tools: ['web.search', 'web.fetch'],
+    }, 'Verify the supplied claims.');
+
+    expect(normalized.task).toContain('[runtime_independent_web_evidence]');
+    expect(normalized.task).toContain('shared cached web results');
   });
 
   it('allows a semantic researcher to reason without pretending it has an external tool path', async () => {
@@ -1635,6 +1680,126 @@ describe('Runtime controlled subagent spawning', () => {
     expect(runtime.getEvents().filter(event =>
       event.type === 'tool.plan.shared_cache.reused'
     )).toHaveLength(2);
+    await runtime.shutdown();
+  });
+
+  it('requires a verification actor to diversify a shared web-search frontier', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-diversified-web-'));
+    const llm = new DiversifyingWebLLM();
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'diversified-web-test',
+      llmProvider: llm,
+      workspaceCwd,
+    });
+    const internal = runtime as unknown as {
+      runtimeToolOverrides: Map<string, {
+        name: string;
+        description: string;
+        execute: (params: Record<string, unknown>) => Promise<{
+          success: boolean;
+          result: unknown;
+        }>;
+      }>;
+      runGroundingCheck: (
+        agentId: string,
+        task: string,
+        options: Record<string, unknown>
+      ) => Promise<{
+        toolCalls: Array<{
+          toolName: string;
+          success: boolean;
+          params: Record<string, unknown>;
+        }>;
+      }>;
+    };
+    const queries: string[] = [];
+    internal.runtimeToolOverrides.set('web.search', {
+      name: 'web.search',
+      description: 'Deterministic test web search.',
+      execute: async params => {
+        queries.push(String(params.query));
+        return {
+          success: true,
+          result: {
+            query: params.query,
+            provider: 'test',
+            results: [{
+              title: 'Authorship evidence',
+              url: 'https://example.test/authorship',
+              snippet: 'The requested play is attributed to William Shakespeare.',
+            }],
+          },
+        };
+      },
+    });
+    const task = [
+      'Use web.search to fact-check these precise canonical answers.',
+      '1. Who wrote Hamlet?',
+      '2. Who wrote Macbeth?',
+      '[runtime_independent_web_evidence]',
+    ].join('\n');
+    const primary = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'researcher',
+      tomLevel: 0,
+      description: task,
+      task,
+      tools: ['web.search'],
+    });
+    const verifier = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'researcher',
+      tomLevel: 0,
+      description: task,
+      task,
+      tools: ['web.search'],
+    });
+    const initialPlans = [
+      {
+        toolName: 'web.search',
+        params: { query: 'Who wrote Hamlet?' },
+        reason: 'Resolve the first fact.',
+        groundingRequired: true,
+      },
+      {
+        toolName: 'web.search',
+        params: { query: 'Who wrote Macbeth?' },
+        reason: 'Resolve the second fact.',
+        groundingRequired: true,
+      },
+    ];
+    await internal.runGroundingCheck(primary.identity.id, task, {
+      archetype: 'researcher',
+      correlationId: 'diversified-web-primary',
+      initialPlans,
+      skipInitialModelPlanning: true,
+    });
+    const verified = await internal.runGroundingCheck(verifier.identity.id, task, {
+      archetype: 'researcher',
+      correlationId: 'diversified-web-verifier',
+      initialPlans,
+      skipInitialModelPlanning: true,
+    });
+
+    expect(llm.sawSharedFrontier).toBe(true);
+    expect(queries).toEqual(expect.arrayContaining([
+      'Who wrote Hamlet?',
+      'Who wrote Macbeth?',
+      'Hamlet authorship Shakespeare primary evidence',
+      'Macbeth authorship Shakespeare primary evidence',
+    ]));
+    expect(verified.toolCalls.filter(call =>
+      call.toolName === 'web.search'
+    )).toHaveLength(4);
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'agent.web_evidence.diversification.required',
+      agentId: verifier.identity.id,
+    }));
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'agent.web_evidence.diversification.completed',
+      agentId: verifier.identity.id,
+    }));
     await runtime.shutdown();
   });
 

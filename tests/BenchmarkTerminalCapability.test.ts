@@ -473,9 +473,25 @@ describe('benchmark terminal capability', () => {
         state: Record<string, unknown>
       ) => {
         action: string;
-        agents: Array<{ name?: string; role?: string; tools?: string[] }>;
+        reason?: string;
+        agents: Array<{
+          name?: string;
+          role?: string;
+          task?: string;
+          tools?: string[];
+          skills?: string[];
+          memoryScope?: {
+            public?: boolean;
+            private?: boolean;
+            sessionWindowTurns?: number;
+          };
+        }>;
         coordination?: string;
-        team?: { name?: string; executionPolicy?: { mode?: string } };
+        team?: {
+          name?: string;
+          memberDelegationPolicy?: string;
+          executionPolicy?: { mode?: string };
+        };
       } | undefined;
     }).buildVerifierGuidedResumeRecoveryDecision.bind(runtime);
     const state = {
@@ -577,6 +593,37 @@ describe('benchmark terminal capability', () => {
       && agent.memoryScope.sessionWindowTurns === 0
       && !agent.skills?.includes('delegate_to_subagent')
     )).toBe(true);
+    const newerExternalFailure = buildRecovery([
+      'Repair implementation.py until the official verifier succeeds.',
+      '## VERIFICATION FAILED — CONTINUE WORKING',
+      'Verifier feedback:',
+      'source violation: src/current_module.py still defines a forbidden compatibility shim',
+      '<official_verifier_feedback>',
+      'The score artifact is unchanged.',
+      '</official_verifier_feedback>',
+      '## Required local repair verification',
+      'Run the mirrored verifier after the repair.',
+    ].join('\n'), state);
+    expect(newerExternalFailure).toMatchObject({
+      reason: expect.stringContaining('supersedes the stale cached recovery frontier'),
+      agents: [
+        expect.objectContaining({
+          name: 'FocusedRepairer-2',
+          role: 'verifier-guided recovery executor',
+          task: expect.stringContaining('src/current_module.py'),
+        }),
+        expect.objectContaining({
+          name: 'RecoveryVerifier-3',
+          role: 'independent recovery verifier',
+        }),
+      ],
+    });
+    expect(newerExternalFailure?.agents[0]?.task).toContain(
+      'newest concrete external verifier feedback'
+    );
+    expect(newerExternalFailure?.agents.some(agent =>
+      agent.task?.includes('[runtime_verifier_diagnostic_probe]')
+    )).toBe(false);
     const failedAttempt = structuredClone(state);
     failedAttempt.knowledge.actors.push({
       id: 'actor',

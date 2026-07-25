@@ -2310,6 +2310,15 @@ describe('AgentToolPlanner', () => {
     expect(plans[0].params.query).toBe('Node.js AbortSignal.timeout and MDN AbortSignal.timeout');
   });
 
+  it('does not treat web tool syntax as a task entity during follow-up alignment', () => {
+    const planner = new AgentToolPlanner();
+
+    expect(planner.isWebCandidateAligned(
+      'Use web.search and web.fetch to verify the supplied factual claims.',
+      'alternate historical scope and counterexample evidence'
+    )).toBe(true);
+  });
+
   it('searches each numbered factual question instead of the tool-use scaffolding', () => {
     const plans = new AgentToolPlanner().plan({
       task: [
