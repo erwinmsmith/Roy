@@ -16176,6 +16176,27 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         return { result: result.result, success: result.success, error: result.error };
       },
       planNext: async context => {
+        const postMutationVerification = this.toolPlanner.planPostMutationVerification({
+          task: intentTask,
+          calls: [...priorPlannerCalls, ...context.calls],
+          bindings,
+        });
+        if (postMutationVerification.length > 0) {
+          this.emit({
+            type: 'tool.plan.post_mutation_verification',
+            agentId,
+            sessionId: this.getContext().sessionId,
+            correlationId: options.correlationId,
+            nodeId: options.nodeId,
+            data: {
+              plans: postMutationVerification.map(plan => ({
+                toolName: plan.toolName,
+                params: plan.params,
+              })),
+            },
+          });
+          return postMutationVerification.slice(0, context.remainingCalls);
+        }
         const causalTransitionPlans = this.toolPlanner.planWorkspaceRepairTransition({
           task: intentTask,
           calls: [...priorPlannerCalls, ...context.calls],

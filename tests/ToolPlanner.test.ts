@@ -78,6 +78,59 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('reruns a task-declared acceptance command after every newer mutation', () => {
+    const planner = new AgentToolPlanner();
+    const task = [
+      'Implement the workspace pipeline.',
+      '## Required Command',
+      '```bash',
+      'python -m dq_audit.cli run --config configs/public_audit.yml --out-dir outputs',
+      '```',
+    ].join('\n');
+    const calls = [
+      {
+        toolName: 'shell.exec',
+        params: {
+          command: 'python -m dq_audit.cli run --config configs/public_audit.yml --out-dir outputs',
+        },
+        success: false,
+      },
+      {
+        toolName: 'fs.synthesize',
+        params: { path: 'src/dq_audit/audit.py', instructions: 'Implement it.' },
+        success: true,
+      },
+    ];
+
+    expect(planner.planPostMutationVerification({
+      task,
+      calls,
+      bindings: [{ name: 'shell.exec', enabled: true }],
+    })).toEqual([
+      expect.objectContaining({
+        toolName: 'shell.exec',
+        params: {
+          command: 'python -m dq_audit.cli run --config configs/public_audit.yml --out-dir outputs',
+        },
+      }),
+    ]);
+
+    expect(planner.planPostMutationVerification({
+      task,
+      calls: [
+        ...calls,
+        {
+          toolName: 'shell.exec',
+          params: {
+            command: 'python -m dq_audit.cli run --config configs/public_audit.yml --out-dir outputs',
+          },
+          success: true,
+        },
+      ],
+      bindings: [{ name: 'shell.exec', enabled: true }],
+    })).toEqual([]);
+  });
+
   it('follows explicit files and text dependencies from a grounded manifest without another model plan', () => {
     const planner = new AgentToolPlanner();
     const plans = planner.planWorkspaceEvidenceFollowUps({

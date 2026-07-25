@@ -379,6 +379,35 @@ export class AgentToolPlanner {
       }));
   }
 
+  planPostMutationVerification(input: {
+    task: string;
+    calls: ObservedToolCall[];
+    bindings: ToolPlanBinding[];
+  }): PlannedToolCall[] {
+    if (!input.bindings.some(binding =>
+      binding.enabled && binding.name === 'shell.exec'
+    )) {
+      return [];
+    }
+    const mutationIndices = effectiveWorkspaceMutationCallIndices(input.calls);
+    const latestMutationIndex = mutationIndices.at(-1);
+    if (latestMutationIndex === undefined) return [];
+    const commands = this.extractExplicitShellCommands(input.task);
+    return commands
+      .filter(command => !input.calls.some((call, index) =>
+        index > latestMutationIndex
+        && call.toolName === 'shell.exec'
+        && String(call.params.command ?? '').trim() === command.trim()
+      ))
+      .slice(0, 2)
+      .map(command => ({
+        toolName: 'shell.exec',
+        params: { command },
+        reason: 'Run the task-declared acceptance command against the newly mutated workspace before closing execution.',
+        groundingRequired: true,
+      }));
+  }
+
   planWorkspaceFailureFollowUps(input: {
     calls: ObservedToolCall[];
     bindings: ToolPlanBinding[];
