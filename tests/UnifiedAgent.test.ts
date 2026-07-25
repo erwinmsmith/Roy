@@ -422,6 +422,28 @@ class WrongRepairTargetPlanningLLM extends PlanningLLM {
   }
 }
 
+class StaleDependencyRepairPlanningLLM extends PlanningLLM {
+  constructor() {
+    super('none');
+  }
+
+  override async completeJSON<T>(): Promise<T> {
+    this.jsonCalls += 1;
+    return {
+      action: 'call_tools',
+      reason: 'Continue the old dependency repair.',
+      calls: [{
+        toolName: 'fs.synthesize',
+        params: {
+          path: 'requirements.txt',
+          instructions: 'Repair the aggregate verifier failures.',
+          strategy: 'patch',
+        },
+      }],
+    } as T;
+  }
+}
+
 class TruncatedMutationPlanningLLM extends PlanningLLM {
   messagesByAttempt: LLMMessage[][] = [];
   optionsByAttempt: Array<LLMCompletionOptions | undefined> = [];
@@ -2693,6 +2715,81 @@ describe('UnifiedAgent capability execution', () => {
         instructions: 'Repair the latest grounded failure.',
       },
     })]);
+  });
+
+  it('binds a pathless recovery feedback symbol ahead of stale dependency intent', async () => {
+    const llm = new StaleDependencyRepairPlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'focused-recovery-symbol-agent',
+      goal: 'repair the newest verifier feedback',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.read', 'fs.search', 'fs.synthesize', 'shell.exec'],
+    });
+    const task = [
+      'Migrate the application dependencies and runtime.',
+      '<official_verifier_feedback>',
+      'project metadata still targets the legacy runtime dependency version',
+      '</official_verifier_feedback>',
+      '<recovery_capsule>',
+      JSON.stringify({
+        recoveryTrigger: 'new_external_verifier_feedback',
+        externalFeedback: {
+          summary: 'router structure violation: classify_ticket is not registered with @tool',
+        },
+        authoritativeVerifierCommand:
+          'python -m pytest -q .roy/official-verifier/test_outputs.py',
+      }),
+      '</recovery_capsule>',
+    ].join('\n');
+
+    const plans = await agent.planNextToolRound({
+      task,
+      executionRequired: true,
+      round: 1,
+      remainingCalls: 3,
+      tools: [
+        { name: 'fs.read' },
+        { name: 'fs.search' },
+        { name: 'fs.synthesize' },
+        { name: 'shell.exec' },
+      ],
+      calls: [
+        {
+          toolName: 'fs.read',
+          params: { path: 'requirements.txt' },
+          reason: 'Read the earlier dependency target.',
+          groundingRequired: true,
+          success: true,
+          result: {
+            path: 'requirements.txt',
+            content: 'langchain==1.3.4\n',
+          },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/support_rag/router.py' },
+          reason: 'Read the current router implementation.',
+          groundingRequired: true,
+          success: true,
+          result: {
+            path: 'src/support_rag/router.py',
+            content: 'def classify_ticket(ticket: str) -> str:\n    return "billing"\n',
+          },
+        },
+      ],
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.synthesize',
+        params: expect.objectContaining({
+          path: 'src/support_rag/router.py',
+          strategy: 'patch',
+        }),
+        reason: expect.stringContaining('explicit implementation target'),
+      }),
+    ]);
   });
 
   it('reruns the most recent authoritative verification after a repair', async () => {

@@ -620,6 +620,143 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('lets the newest recovery capsule supersede stale dependency feedback', () => {
+    const planner = new AgentToolPlanner();
+    const task = [
+      'Migrate the application dependencies and runtime.',
+      '<official_verifier_feedback>',
+      'project metadata still targets the legacy runtime dependency version',
+      '</official_verifier_feedback>',
+      '<recovery_capsule>',
+      JSON.stringify({
+        recoveryTrigger: 'new_external_verifier_feedback',
+        externalFeedback: {
+          summary: 'router structure violation: classify_ticket is not registered with @tool',
+        },
+        authoritativeVerifierCommand:
+          'python -m pytest -q .roy/official-verifier/test_outputs.py',
+      }),
+      '</recovery_capsule>',
+      'Read `.roy/official-verifier/test_outputs.py` and repair the current source.',
+    ].join('\n');
+    const bindings = [
+      { name: 'fs.list', enabled: true },
+      { name: 'fs.read', enabled: true },
+      { name: 'fs.search', enabled: true },
+      { name: 'fs.synthesize', enabled: true },
+      { name: 'shell.exec', enabled: true },
+    ];
+
+    expect(planner.plan({
+      task,
+      workspacePath: '/app',
+      bindings,
+    })).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.search',
+        params: {
+          path: '.',
+          query: 'classify_ticket',
+          maxResults: 20,
+        },
+      }),
+      expect.objectContaining({
+        toolName: 'fs.read',
+        params: { path: '.roy/official-verifier/test_outputs.py' },
+      }),
+    ]);
+
+    const plans = planner.planExternalFeedbackRepair({
+      task,
+      bindings,
+      workspaceRoot: '/app',
+      calls: [
+        {
+          toolName: 'fs.read',
+          params: { path: 'requirements.txt' },
+          success: true,
+          result: {
+            path: 'requirements.txt',
+            content: 'langchain==1.3.4\n',
+          },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/support_rag/router.py' },
+          success: true,
+          result: {
+            path: 'src/support_rag/router.py',
+            content: 'def classify_ticket(ticket: str) -> str:\n    return "billing"\n',
+          },
+        },
+      ],
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.synthesize',
+        params: expect.objectContaining({
+          path: 'src/support_rag/router.py',
+          strategy: 'patch',
+          instructions: expect.stringContaining(
+            'classify_ticket is not registered with @tool'
+          ),
+        }),
+      }),
+    ]);
+
+    const nextPlans = planner.planExternalFeedbackRepair({
+      task,
+      bindings,
+      workspaceRoot: '/app',
+      calls: [
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/support_rag/router.py' },
+          success: true,
+          result: {
+            path: 'src/support_rag/router.py',
+            content: '@tool\ndef classify_ticket(ticket: str) -> str:\n    return "billing"\n',
+          },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/support_rag/retriever.py' },
+          success: true,
+          result: {
+            path: 'src/support_rag/retriever.py',
+            content: 'class FAQRetriever:\n    def search(self, query: str):\n        return []\n',
+          },
+        },
+        {
+          toolName: 'shell.exec',
+          params: {
+            command: 'python -m pytest -q .roy/official-verifier/test_outputs.py',
+          },
+          success: false,
+          result: {
+            command: 'python -m pytest -q .roy/official-verifier/test_outputs.py',
+            exitCode: 1,
+            stdout:
+              "AttributeError: 'FAQRetriever' object has no attribute '_get_relevant_documents'",
+          },
+        },
+      ],
+    });
+
+    expect(nextPlans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.synthesize',
+        params: expect.objectContaining({
+          path: 'src/support_rag/retriever.py',
+          instructions: expect.stringContaining(
+            "FAQRetriever' object has no attribute '_get_relevant_documents"
+          ),
+        }),
+      }),
+    ]);
+  });
+
   it('repairs implementation code instead of benchmark config named by verifier feedback', () => {
     const planner = new AgentToolPlanner();
     const plans = planner.planExternalFeedbackRepair({

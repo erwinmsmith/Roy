@@ -17,7 +17,10 @@ import {
   actionTemplate,
 } from '../prompts/index.js';
 import { logger } from '../utils/logger.js';
-import type { PlannedToolCall } from '../tools/planner.js';
+import {
+  effectiveRecoveryFeedbackFocus,
+  type PlannedToolCall,
+} from '../tools/planner.js';
 import type { ToolLoopCallRecord } from '../tools/executionLoop.js';
 import {
   completedWorkspaceReadCoversPlan,
@@ -1774,8 +1777,20 @@ function rankGroundedSynthesisTargets(
   contractMatchSignal: boolean;
   contractMatchCount: number;
 }> {
-  const taskLower = task.toLowerCase();
-  const taskContractIdentifiers = extractTaskContractIdentifiers(task);
+  const recoveryFocus = effectiveRecoveryFeedbackFocus(task, calls);
+  const focusedTask = recoveryFocus
+    ? [
+      recoveryFocus.summary,
+      recoveryFocus.path ?? '',
+    ].filter(Boolean).join('\n')
+    : task;
+  const taskLower = focusedTask.toLowerCase();
+  const taskContractIdentifiers = extractTaskContractIdentifiers(focusedTask);
+  const focusedSemanticIdentifiers = recoveryFocus
+    ? focusedTask.match(
+      /\b(?:[A-Za-z_][A-Za-z0-9_]*_[A-Za-z0-9_]+|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+|[A-Z][A-Za-z0-9_]{3,})\b/g
+    ) ?? []
+    : [];
   const latestFailure = [...calls].reverse().find(call =>
     isWorkspaceVerificationCall(call) && !isSuccessfulWorkspaceVerification(call)
   );
@@ -1829,8 +1844,26 @@ function rankGroundedSynthesisTargets(
         filePathLower,
         basename
       );
+      const basenameStem = basename.replace(/\.[^.]+$/, '');
+      const focusedBasenameMatch = Boolean(
+        recoveryFocus
+        && basenameStem.length >= 5
+        && new RegExp(
+          `\\b${basenameStem.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`,
+          'i'
+        ).test(focusedTask)
+      );
+      const focusedSemanticMatchCount = focusedSemanticIdentifiers.filter(identifier =>
+        new RegExp(
+          `\\b${identifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`,
+          'i'
+        ).test(content)
+      ).length;
       const implementationIntent = dependencyManifestIntent
-        || explicitImplementationIntent || (
+        || explicitImplementationIntent
+        || focusedBasenameMatch
+        || focusedSemanticMatchCount > 0
+        || (
         requestsWorkspaceMutation(task)
         && (
           taskLower.includes(filePathLower)
@@ -1849,6 +1882,10 @@ function rankGroundedSynthesisTargets(
       if (implementationIntent) score += 20;
       if (explicitImplementationIntent) score += 18;
       if (dependencyManifestIntent) score += 28;
+      if (focusedSemanticMatchCount > 0) {
+        score += 80 + Math.min(40, focusedSemanticMatchCount * 10);
+      }
+      if (focusedBasenameMatch) score += 70;
       if (contractMatchSignal) {
         score += 12 + Math.min(16, contractMatchCount * 4);
       }

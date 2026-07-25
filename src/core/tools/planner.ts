@@ -35,16 +35,126 @@ export interface ObservedToolCall {
   error?: unknown;
 }
 
+export interface RecoveryFeedbackFocus {
+  summary: string;
+  path?: string;
+  authoritativeVerifierCommand?: string;
+}
+
+export function recoveryFeedbackFocus(task: string): RecoveryFeedbackFocus | undefined {
+  const capsuleMatch = /<recovery_capsule>\s*([\s\S]*?)\s*<\/recovery_capsule>/i.exec(
+    task
+  );
+  if (!capsuleMatch) return undefined;
+  try {
+    const capsule = JSON.parse(capsuleMatch[1]!) as {
+      recoveryTrigger?: unknown;
+      externalFeedback?: {
+        summary?: unknown;
+        path?: unknown;
+      };
+      authoritativeVerifierCommand?: unknown;
+    };
+    if (capsule.recoveryTrigger !== 'new_external_verifier_feedback') {
+      return undefined;
+    }
+    const summary = typeof capsule.externalFeedback?.summary === 'string'
+      ? capsule.externalFeedback.summary.trim().slice(0, 1_200)
+      : '';
+    if (!summary) return undefined;
+    const path = typeof capsule.externalFeedback?.path === 'string'
+      ? capsule.externalFeedback.path.trim()
+      : '';
+    const authoritativeVerifierCommand =
+      typeof capsule.authoritativeVerifierCommand === 'string'
+        ? capsule.authoritativeVerifierCommand.trim()
+        : '';
+    return {
+      summary,
+      ...(path ? { path } : {}),
+      ...(authoritativeVerifierCommand ? { authoritativeVerifierCommand } : {}),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+export function effectiveRecoveryFeedbackFocus(
+  task: string,
+  calls: ObservedToolCall[]
+): RecoveryFeedbackFocus | undefined {
+  const focus = recoveryFeedbackFocus(task);
+  if (!focus) return undefined;
+  const latestFailure = [...calls].reverse().find(call =>
+    isWorkspaceVerificationCall(call)
+    && !isSuccessfulWorkspaceVerificationCall(call)
+  );
+  if (!latestFailure) return focus;
+  const result = latestFailure.result as {
+    stdout?: unknown;
+    stderr?: unknown;
+    verifierDiagnostics?: unknown;
+  } | undefined;
+  const diagnostics = Array.isArray(result?.verifierDiagnostics)
+    ? result.verifierDiagnostics
+      .map(item =>
+        item && typeof item === 'object'
+          ? String((item as { content?: unknown }).content ?? '')
+          : ''
+      )
+      .filter(Boolean)
+    : [];
+  const output = [
+    String(result?.stdout ?? ''),
+    String(result?.stderr ?? ''),
+    String(latestFailure.error ?? ''),
+    ...diagnostics,
+  ].filter(Boolean).join('\n');
+  const failures = [...output.matchAll(
+    /\b(?:AssertionError|AttributeError|ImportError|ModuleNotFoundError|RuntimeError|TypeError|ValueError):\s*([^\n]+)/g
+  )];
+  const summary = failures.at(-1)?.[1]?.trim();
+  return summary
+    ? { ...focus, summary: summary.slice(0, 1_200) }
+    : focus;
+}
+
+function semanticFeedbackIdentifiers(feedback: string): string[] {
+  const identifiers = new Set<string>();
+  for (const match of feedback.matchAll(
+    /\b(?:[A-Za-z_][A-Za-z0-9_]*_[A-Za-z0-9_]+|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+|[A-Z][A-Za-z0-9_]{3,})\b/g
+  )) {
+    const identifier = match[0]!;
+    if (/^(?:AssertionError|ImportError|ModuleNotFoundError|RuntimeError|TypeError)$/i.test(
+      identifier
+    )) {
+      continue;
+    }
+    identifiers.add(identifier);
+  }
+  return [...identifiers];
+}
+
 export class AgentToolPlanner {
   plan(input: ToolPlanningInput): PlannedToolCall[] {
     const enabled = new Set(input.bindings.filter(binding => binding.enabled).map(binding => binding.name));
-    const lower = input.task.toLowerCase();
+    const recoveryFocus = recoveryFeedbackFocus(input.task);
+    const planningTask = recoveryFocus
+      ? `Repair the newest verifier failure: ${recoveryFocus.summary}${
+        recoveryFocus.path ? `\nAuthoritative source path: ${recoveryFocus.path}` : ''
+      }`
+      : input.task;
+    const lower = planningTask.toLowerCase();
     const plans: PlannedToolCall[] = [];
-    const referencedPaths = this.extractReferencedPaths(input.task.replace(/https?:\/\/[^\s`'"<>),]+/gi, ' '));
+    const referencedPaths = this.extractReferencedPaths(
+      planningTask.replace(/https?:\/\/[^\s`'"<>),]+/gi, ' ')
+    );
     const referencedDirectories = referencedPaths.filter(item => item.endsWith('/'));
     const referencedFiles = referencedPaths.filter(item => !item.endsWith('/'));
-    const referencedUrls = this.extractReferencedUrls(input.task);
-    const explicitShellCommands = this.extractExplicitShellCommands(input.task);
+    const referencedUrls = this.extractReferencedUrls(planningTask);
+    const explicitShellCommands = recoveryFocus
+      ? []
+      : this.extractExplicitShellCommands(input.task);
     const runtimeApiInspection = /\bruntime\s+apis?\b[\s\S]{0,80}\b(?:exports?|surface|inspection|declarations?|signatures?|source|symbols?)\b|\bexported runtime apis?\b/.test(lower);
     const mutationTask = /\b(?:implement|modify|edit|create|write|patch|repair|fix|refactor|migrate|upgrade|install|replace|apply)\b/.test(lower);
     const explicitUrlReading = /\b(?:open|read|fetch|visit|consult)\b[\s\S]{0,120}https?:\/\//i.test(input.task);
@@ -80,7 +190,46 @@ export class AgentToolPlanner {
       }
     }
 
-    if (enabled.has('fs.list') && !this.isWebOnlyTask(lower) && (mutationTask || broadWorkspaceInspection)) {
+    if (recoveryFocus) {
+      const focusedPath = recoveryFocus.path
+        ? this.normalizeWorkspacePath(recoveryFocus.path)
+        : '';
+      if (focusedPath && enabled.has('fs.read')) {
+        plans.push({
+          toolName: 'fs.read',
+          params: { path: focusedPath },
+          reason: `The newest verifier feedback identifies ${focusedPath} as its authoritative repair target.`,
+          groundingRequired: true,
+        });
+      } else if (enabled.has('fs.search')) {
+        const identifier = semanticFeedbackIdentifiers(recoveryFocus.summary)[0];
+        if (identifier) {
+          plans.push({
+            toolName: 'fs.search',
+            params: {
+              path: '.',
+              query: identifier,
+              maxResults: 20,
+            },
+            reason: `Locate the current source definition for ${identifier}, the semantic symbol named by the newest verifier feedback.`,
+            groundingRequired: true,
+          });
+        }
+      }
+      if (enabled.has('fs.read')) {
+        const verifierPath = this.extractReferencedPaths(input.task)
+          .map(path => this.normalizeWorkspacePath(path))
+          .find(path => path.startsWith('.roy/official-verifier/'));
+        if (verifierPath) {
+          plans.push({
+            toolName: 'fs.read',
+            params: { path: verifierPath },
+            reason: 'Read the immutable verifier assertion that produced the newest focused failure.',
+            groundingRequired: true,
+          });
+        }
+      }
+    } else if (enabled.has('fs.list') && !this.isWebOnlyTask(lower) && (mutationTask || broadWorkspaceInspection)) {
       plans.push({
         toolName: 'fs.list',
         params: { path: '.', maxDepth: 4 },
@@ -736,11 +885,17 @@ export class AgentToolPlanner {
     )) {
       return [];
     }
+    const recoveryFocus = effectiveRecoveryFeedbackFocus(input.task, input.calls);
     const feedbackMatch = /<official_verifier_feedback>([\s\S]*?)<\/official_verifier_feedback>/i.exec(
       input.task
     );
     const continuationMatch = /##\s+VERIFICATION FAILED\b([\s\S]*)/i.exec(input.task);
-    const feedback = String(feedbackMatch?.[1] ?? continuationMatch?.[1] ?? '').trim();
+    const feedback = String(
+      recoveryFocus?.summary
+        ?? feedbackMatch?.[1]
+        ?? continuationMatch?.[1]
+        ?? ''
+    ).trim();
     if (!feedback) return [];
     const dependencyFeedback = feedback
       .split(/\r?\n/)
@@ -764,9 +919,11 @@ export class AgentToolPlanner {
       input.workspaceRoot
     );
     const explicitFeedbackPaths = new Set([
+      ...(recoveryFocus?.path ? [recoveryFocus.path] : []),
       ...this.extractReferencedPaths(feedback),
       ...feedbackLocations.map(location => location.path),
     ].map(path => this.normalizeWorkspacePath(path)));
+    const semanticIdentifiers = semanticFeedbackIdentifiers(feedback);
     const manifestPriority = (candidatePath: string): number => {
       const lowerPath = candidatePath.toLowerCase();
       if (/(?:^|\/)pyproject\.toml$/.test(lowerPath)) return 420;
@@ -840,6 +997,15 @@ export class AgentToolPlanner {
         const lowerPath = candidate.path.toLowerCase();
         let score = explicitFeedbackPaths.has(candidate.path) ? 500 : 0;
         if (this.isMutableImplementationPath(candidate.path)) score += 40;
+        const matchingIdentifiers = semanticIdentifiers.filter(identifier =>
+          new RegExp(
+            `\\b${identifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`,
+            'i'
+          ).test(candidate.content)
+        );
+        if (matchingIdentifiers.length > 0) {
+          score += 600 + Math.min(200, matchingIdentifiers.length * 40);
+        }
         if (dependencyFeedback) {
           score += manifestPriority(lowerPath);
           if (/\blegacy\b/i.test(feedback)
@@ -851,6 +1017,14 @@ export class AgentToolPlanner {
         }
         const basename = candidate.path.slice(candidate.path.lastIndexOf('/') + 1);
         if (feedback.toLowerCase().includes(basename.toLowerCase())) score += 160;
+        const basenameStem = basename.replace(/\.[^.]+$/, '');
+        if (basenameStem.length >= 5
+          && new RegExp(
+            `\\b${basenameStem.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`,
+            'i'
+          ).test(feedback)) {
+          score += 220;
+        }
         return { ...candidate, score };
       })
       .filter(candidate => candidate.score > 0)
