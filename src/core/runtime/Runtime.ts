@@ -796,6 +796,13 @@ interface PersistentVerifierWorkspaceCheckpoint {
   verifiedAt: number;
 }
 
+interface SharedReadOnlyToolCacheEntry {
+  call: ToolCallRecord;
+  sourceAgentId: string;
+  correlationId?: string;
+  cachedAt: number;
+}
+
 export class Runtime {
   private static instance: Runtime | null = null;
 
@@ -833,6 +840,10 @@ export class Runtime {
   private readonly teams = new TeamRegistry();
   private teamMemberPlans = new Map<string, TeamMemberSpec[]>();
   private teamToolEvidenceCache = new Map<string, ToolCallRecord[]>();
+  private readonly sharedReadOnlyToolResultCache =
+    new Map<string, SharedReadOnlyToolCacheEntry>();
+  private readonly sharedReadOnlyToolRequests =
+    new Map<string, Promise<ToolResult>>();
   private teamSpawnReservations = new Map<string, {
     parentId: string;
     correlationId: string;
@@ -1143,6 +1154,8 @@ export class Runtime {
     this.teams.clear();
     this.teamMemberPlans.clear();
     this.teamToolEvidenceCache.clear();
+    this.sharedReadOnlyToolResultCache.clear();
+    this.sharedReadOnlyToolRequests.clear();
     this.teamSpawnReservations.clear();
     this.turnAgentCounts.clear();
     this.tomAnalyses.clear();
@@ -18181,13 +18194,97 @@ For web-grounded work, use only facts present in the subagent report or runtime 
             });
           }
         }
-        const result = await this.executeToolForAgent(agentId, plan.toolName, plan.params, {
-          reason: plan.reason,
-          correlationId: options.correlationId,
-          nodeId: options.nodeId,
-          synthesisTask: intentTask,
-          groundingCalls: liveGroundingCalls,
-        });
+        const cacheKey = this.sharedReadOnlyToolCacheKey(plan);
+        const authorized = bindings.some(binding =>
+          binding.enabled && binding.name === plan.toolName
+        );
+        let result: ToolResult;
+        let cacheSource: SharedReadOnlyToolCacheEntry | undefined;
+        if (cacheKey && authorized) {
+          cacheSource = this.sharedReadOnlyToolResultCache.get(cacheKey);
+          if (!cacheSource) {
+            const pending = this.sharedReadOnlyToolRequests.get(cacheKey);
+            if (pending) {
+              const pendingResult = await pending;
+              if (pendingResult.success) {
+                cacheSource = this.sharedReadOnlyToolResultCache.get(cacheKey);
+              }
+            }
+          }
+        }
+        if (cacheSource) {
+          result = {
+            success: true,
+            result: cacheSource.call.result,
+            metadata: {
+              sharedReadOnlyToolCache: true,
+              sourceAgentId: cacheSource.sourceAgentId,
+              cachedAt: cacheSource.cachedAt,
+            },
+          };
+          this.emit({
+            type: 'tool.plan.shared_cache.reused',
+            agentId,
+            sessionId: this.getContext().sessionId,
+            correlationId: options.correlationId,
+            nodeId: options.nodeId,
+            data: {
+              toolName: plan.toolName,
+              params: plan.params,
+              cacheKey,
+              sourceAgentId: cacheSource.sourceAgentId,
+              sourceCorrelationId: cacheSource.correlationId,
+              ageMs: Math.max(0, Date.now() - cacheSource.cachedAt),
+            },
+          });
+        } else {
+          const execute = this.executeToolForAgent(agentId, plan.toolName, plan.params, {
+            reason: plan.reason,
+            correlationId: options.correlationId,
+            nodeId: options.nodeId,
+            synthesisTask: intentTask,
+            groundingCalls: liveGroundingCalls,
+          });
+          if (cacheKey && authorized) {
+            this.sharedReadOnlyToolRequests.set(cacheKey, execute);
+          }
+          try {
+            result = await execute;
+          } finally {
+            if (cacheKey
+              && this.sharedReadOnlyToolRequests.get(cacheKey) === execute) {
+              this.sharedReadOnlyToolRequests.delete(cacheKey);
+            }
+          }
+          if (cacheKey && result.success) {
+            this.storeSharedReadOnlyToolResult(cacheKey, {
+              call: {
+                toolName: plan.toolName,
+                params: { ...plan.params },
+                reason: plan.reason,
+                result: result.result,
+                success: true,
+                completedAt: Date.now(),
+              },
+              sourceAgentId: agentId,
+              correlationId: options.correlationId,
+              cachedAt: Date.now(),
+            });
+            this.emit({
+              type: 'tool.result.shared_cache.stored',
+              agentId,
+              sessionId: this.getContext().sessionId,
+              correlationId: options.correlationId,
+              nodeId: options.nodeId,
+              data: {
+                toolName: plan.toolName,
+                params: plan.params,
+                cacheKey,
+                entries: this.sharedReadOnlyToolResultCache.size,
+              },
+            });
+          }
+        }
         liveGroundingCalls.push({
           toolName: plan.toolName,
           params: plan.params,
@@ -19285,13 +19382,41 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       return `${plan.toolName}:${this.canonicalWebDocumentUrl(String(plan.params.url ?? ''))}`;
     }
     if (plan.toolName === 'web.search') {
-      const query = String(plan.params.query ?? '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+      const query = String(plan.params.query ?? '')
+        .toLocaleLowerCase()
+        .replace(/[^\p{L}\p{N}]+/gu, ' ')
+        .trim();
       return `${plan.toolName}:${query}`;
     }
     return workspaceToolIntentFingerprint({
       toolName: plan.toolName,
       params: plan.params,
     });
+  }
+
+  private sharedReadOnlyToolCacheKey(
+    plan: Pick<PlannedToolCall, 'toolName' | 'params'>
+  ): string | undefined {
+    if (plan.toolName !== 'web.search' && plan.toolName !== 'web.fetch') {
+      return undefined;
+    }
+    return this.toolPlanFingerprint(plan);
+  }
+
+  private storeSharedReadOnlyToolResult(
+    key: string,
+    entry: SharedReadOnlyToolCacheEntry
+  ): void {
+    const maxEntries = 256;
+    this.sharedReadOnlyToolResultCache.delete(key);
+    this.sharedReadOnlyToolResultCache.set(key, entry);
+    while (this.sharedReadOnlyToolResultCache.size > maxEntries) {
+      const oldest = this.sharedReadOnlyToolResultCache.keys().next().value as
+        | string
+        | undefined;
+      if (!oldest) break;
+      this.sharedReadOnlyToolResultCache.delete(oldest);
+    }
   }
 
   private cachedToolPlanDecision(

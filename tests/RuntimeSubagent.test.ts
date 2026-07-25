@@ -1355,6 +1355,162 @@ describe('Runtime controlled subagent spawning', () => {
     await disabled.shutdown();
   });
 
+  it('shares successful idempotent web evidence across agents without repeating the request', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-shared-web-cache-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'shared-web-cache-test',
+      llmProvider: new EchoLLM(),
+      workspaceCwd,
+    });
+    const internal = runtime as unknown as {
+      runtimeToolOverrides: Map<string, {
+        name: string;
+        description: string;
+        execute: (params: Record<string, unknown>) => Promise<{
+          success: boolean;
+          result: unknown;
+        }>;
+      }>;
+      workspaceRuntimeConfig: {
+        tools: {
+          executionLoop: {
+            maxRounds: number;
+            llmReplanning: boolean;
+          };
+        };
+      };
+      runGroundingCheck: (
+        agentId: string,
+        task: string,
+        options: Record<string, unknown>
+      ) => Promise<{
+        toolCalls: Array<{
+          toolName: string;
+          success: boolean;
+          result?: unknown;
+        }>;
+        context: string;
+      }>;
+    };
+    internal.workspaceRuntimeConfig.tools.executionLoop.maxRounds = 1;
+    internal.workspaceRuntimeConfig.tools.executionLoop.llmReplanning = false;
+    let executions = 0;
+    internal.runtimeToolOverrides.set('web.search', {
+      name: 'web.search',
+      description: 'Deterministic test web search.',
+      execute: async params => {
+        executions += 1;
+        return {
+          success: true,
+          result: {
+            query: params.query,
+            provider: 'test',
+            results: [{
+              title: 'Hamlet',
+              url: 'https://example.test/hamlet',
+              snippet: 'Hamlet was written by William Shakespeare.',
+            }],
+          },
+        };
+      },
+    });
+    const task = 'Use web.search to answer: Who wrote Hamlet?';
+    const first = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'researcher',
+      tomLevel: 0,
+      description: task,
+      task,
+      tools: ['web.search'],
+    });
+    const second = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'researcher',
+      tomLevel: 0,
+      description: task,
+      task,
+      tools: ['web.search'],
+    });
+    const firstRun = await internal.runGroundingCheck(first.identity.id, task, {
+      archetype: 'researcher',
+      correlationId: 'shared-web-first',
+      initialPlans: [{
+        toolName: 'web.search',
+        params: { query: 'Who Wrote Hamlet?' },
+        reason: 'Resolve the public fact.',
+        groundingRequired: true,
+      }],
+      skipInitialModelPlanning: true,
+    });
+    const secondRun = await internal.runGroundingCheck(second.identity.id, task, {
+      archetype: 'researcher',
+      correlationId: 'shared-web-second',
+      initialPlans: [{
+        toolName: 'web.search',
+        params: { query: ' who wrote hamlet ' },
+        reason: 'Resolve the same public fact independently.',
+        groundingRequired: true,
+      }],
+      skipInitialModelPlanning: true,
+    });
+
+    expect(executions).toBe(1);
+    expect(firstRun.toolCalls).toEqual([
+      expect.objectContaining({ toolName: 'web.search', success: true }),
+    ]);
+    expect(secondRun.toolCalls).toEqual([
+      expect.objectContaining({ toolName: 'web.search', success: true }),
+    ]);
+    expect(secondRun.context).toContain('William Shakespeare');
+    const fingerprint = (
+      runtime as unknown as {
+        toolPlanFingerprint: (
+          plan: { toolName: string; params: Record<string, unknown> }
+        ) => string;
+      }
+    ).toolPlanFingerprint.bind(runtime);
+    expect(fingerprint({
+      toolName: 'web.search',
+      params: { query: '中国首都' },
+    })).not.toBe(fingerprint({
+      toolName: 'web.search',
+      params: { query: '日本首都' },
+    }));
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'tool.plan.shared_cache.reused',
+      agentId: second.identity.id,
+      data: expect.objectContaining({
+        sourceAgentId: first.identity.id,
+      }),
+    }));
+    const concurrentPlan = {
+      archetype: 'researcher',
+      initialPlans: [{
+        toolName: 'web.search',
+        params: { query: 'Who wrote Macbeth?' },
+        reason: 'Resolve another public fact concurrently.',
+        groundingRequired: true,
+      }],
+      skipInitialModelPlanning: true,
+    };
+    await Promise.all([
+      internal.runGroundingCheck(first.identity.id, task, {
+        ...concurrentPlan,
+        correlationId: 'shared-web-concurrent-first',
+      }),
+      internal.runGroundingCheck(second.identity.id, task, {
+        ...concurrentPlan,
+        correlationId: 'shared-web-concurrent-second',
+      }),
+    ]);
+    expect(executions).toBe(2);
+    expect(runtime.getEvents().filter(event =>
+      event.type === 'tool.plan.shared_cache.reused'
+    )).toHaveLength(2);
+    await runtime.shutdown();
+  });
+
   it('does not impose a hidden lifetime cap on filesystem evidence calls', async () => {
     const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-fs-call-cap-'));
     await writeFile(path.join(workspaceCwd, 'evidence.txt'), 'reusable evidence\n', 'utf8');
