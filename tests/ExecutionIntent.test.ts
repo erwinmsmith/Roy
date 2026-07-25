@@ -6,6 +6,7 @@ import {
   hasEffectiveWorkspaceMutationCall,
   isSuccessfulWorkspaceMutationCall,
   isSuccessfulWorkspaceVerificationCall,
+  isUnavailableWorkspaceVerificationCall,
   isWorkspaceVerificationCall,
   plannedWorkspaceMutationPath,
   taskRequestsWorkspaceMutation,
@@ -239,6 +240,21 @@ describe('workspace execution intent', () => {
       success: true,
       result: { exitCode: 0, stdout: 'reward: 1.0\n' },
     })).toBe(true);
+  });
+
+  it('classifies pytest exit five with no collected tests as unavailable rather than failed code', () => {
+    expect(isUnavailableWorkspaceVerificationCall({
+      toolName: 'shell.exec',
+      params: { command: 'python -m pytest -q' },
+      success: false,
+      result: { exitCode: 5, stdout: 'no tests ran in 0.01s' },
+    })).toBe(true);
+    expect(isUnavailableWorkspaceVerificationCall({
+      toolName: 'shell.exec',
+      params: { command: 'python -m pytest -q' },
+      success: false,
+      result: { exitCode: 1, stdout: '1 failed in 0.01s' },
+    })).toBe(false);
   });
 
   it('canonicalizes execution controls without conflating output contracts', () => {

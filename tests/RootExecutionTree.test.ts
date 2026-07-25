@@ -1051,6 +1051,47 @@ describe('Root dynamic execution tree', () => {
     }));
   });
 
+  it('solves self-contained answer contracts instead of asking an unrelated clarification', () => {
+    const runtime = new Runtime();
+    const override = (runtime as unknown as {
+      overrideExecutableTaskClarification: (
+        decision: DelegationDecision,
+        task: string,
+        requiresLongHorizon: boolean,
+        requiresWorkspaceMutation: boolean,
+        correlationId: string
+      ) => DelegationDecision;
+    }).overrideExecutableTaskClarification;
+    const decision = override.call(
+      runtime,
+      {
+        action: 'ask_clarification',
+        reason: 'The request is too broad.',
+        question: 'What part should I improve?',
+      },
+      [
+        'Solve the supplied reasoning problem and select one of the listed choices.',
+        'Question: Which option follows from all of the supplied constraints?',
+        'End with exactly one machine-readable line: FINAL_ANSWER: <choice>',
+      ].join('\n'),
+      false,
+      false,
+      'self-contained-answer-test'
+    );
+
+    expect(decision).toMatchObject({
+      action: 'solve_directly',
+    });
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'delegation.clarification.overridden',
+      correlationId: 'self-contained-answer-test',
+      data: expect.objectContaining({
+        replacementAction: 'solve_directly',
+        rejectedQuestion: 'What part should I improve?',
+      }),
+    }));
+  });
+
   it('hands a long-horizon task back to root as soon as a delegated mutation occurs', () => {
     const runtime = new Runtime();
     const shouldHandoff = (runtime as unknown as {

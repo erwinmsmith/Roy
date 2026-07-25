@@ -385,6 +385,20 @@ export function isSuccessfulWorkspaceVerificationCall(call: ExecutionIntentCall)
   return reportedStatuses.length === 0 || reportedStatuses.every(status => status === 0);
 }
 
+export function isUnavailableWorkspaceVerificationCall(call: ExecutionIntentCall): boolean {
+  if (!isWorkspaceVerificationCall(call)) return false;
+  const command = String(call.params.command ?? '');
+  if (!/\b(?:python(?:3)?\s+-m\s+)?pytest\b/i.test(command)) return false;
+  const shell = call.result as {
+    exitCode?: unknown;
+    stdout?: unknown;
+    stderr?: unknown;
+  } | undefined;
+  const output = `${String(shell?.stdout ?? '')}\n${String(shell?.stderr ?? '')}`;
+  return shell?.exitCode === 5
+    && /\b(?:no tests ran|collected 0 items|no tests collected)\b/i.test(output);
+}
+
 export function isWorkspaceVerificationCall(call: ExecutionIntentCall): boolean {
   if (call.toolName !== 'shell.exec') return false;
   const command = String(call.params.command ?? '');

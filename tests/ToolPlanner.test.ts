@@ -353,6 +353,52 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('does not repair source code from a pytest no-tests-collected exit', () => {
+    const planner = new AgentToolPlanner();
+    const task = [
+      'Implement the requested behavior.',
+      '```bash',
+      'python -m app.cli smoke',
+      'python -m pytest -q',
+      '```',
+    ].join('\n');
+    const calls = [
+      {
+        toolName: 'fs.synthesize',
+        params: {
+          path: 'src/app/cli.py',
+          instructions: 'Implement the behavior.',
+          strategy: 'patch',
+        },
+        success: true,
+        result: { path: 'src/app/cli.py' },
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m app.cli smoke' },
+        success: true,
+        result: { exitCode: 0, stdout: 'ok' },
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m pytest -q' },
+        success: false,
+        result: { exitCode: 5, stdout: 'no tests ran in 0.01s' },
+      },
+    ];
+
+    expect(planner.planPostMutationVerification({
+      task,
+      calls,
+      bindings: [{ name: 'shell.exec', enabled: true }],
+    })).toEqual([]);
+    expect(planner.planWorkspaceRepairTransition({
+      task,
+      calls,
+      bindings: [{ name: 'fs.synthesize', enabled: true }],
+    })).toEqual([]);
+  });
+
   it('stops the post-mutation verification frontier at the first failure', () => {
     const planner = new AgentToolPlanner();
     const task = [

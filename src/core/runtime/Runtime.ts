@@ -57,6 +57,7 @@ import {
   hasEffectiveWorkspaceMutationCall,
   isSuccessfulWorkspaceMutationCall,
   isSuccessfulWorkspaceVerificationCall,
+  isUnavailableWorkspaceVerificationCall,
   isWorkspaceVerificationCall,
   plannedWorkspaceMutationPath,
   ShellExecTool,
@@ -13670,11 +13671,26 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     requiresWorkspaceMutation: boolean,
     correlationId: string
   ): DelegationDecision {
-    if (decision.action !== 'ask_clarification'
-      || !requiresLongHorizon
-      || !requiresWorkspaceMutation) {
+    if (decision.action !== 'ask_clarification') {
       return decision;
     }
+    if (this.isSelfContainedAnswerTask(task)) {
+      this.emit({
+        type: 'delegation.clarification.overridden',
+        agentId: 'root',
+        correlationId,
+        data: {
+          reason: 'The task already supplies a concrete question and explicit answer contract, so no additional user input is needed.',
+          rejectedQuestion: decision.question,
+          replacementAction: 'solve_directly',
+        },
+      });
+      return {
+        action: 'solve_directly',
+        reason: 'The request is self-contained and declares a concrete answer contract; solve it directly instead of requesting unrelated clarification.',
+      };
+    }
+    if (!requiresLongHorizon || !requiresWorkspaceMutation) return decision;
     const replacement = this.buildLongHorizonTeamDecision(task, true);
     this.emit({
       type: 'delegation.clarification.overridden',
@@ -13686,6 +13702,21 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
       },
     });
     return replacement;
+  }
+
+  private isSelfContainedAnswerTask(task: string): boolean {
+    if (!this.inferExplicitRootOutputContract(task) || task.trim().length < 80) {
+      return false;
+    }
+    const hasConcreteAnswerRequest =
+      /(?:\?|？)\s*(?:\n|$)|\b(?:solve|answer|identify|determine|calculate|choose|select|write|compose|produce)\b|(?:求解|回答|识别|确定|计算|选择|写出|生成)/i.test(
+        task
+      );
+    const declaresMissingInput =
+      /\b(?:tbd|todo|placeholder|ask the user to provide|wait for (?:the )?user input)\b|(?:待补充|占位符|请用户提供|等待用户输入)/i.test(
+        task
+      );
+    return hasConcreteAnswerRequest && !declaresMissingInput;
   }
 
   private ensureLongHorizonTeamDecision(
@@ -21052,7 +21083,11 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     const lastMutationCallIndex = effectiveWorkspaceMutationCallIndices(calls).at(-1) ?? -1;
     const verificationCalls = calls
       .map((call, index) => ({ call, index }))
-      .filter(item => item.index >= lastMutationCallIndex && isWorkspaceVerificationCall(item.call));
+      .filter(item =>
+        item.index >= lastMutationCallIndex
+        && isWorkspaceVerificationCall(item.call)
+        && !isUnavailableWorkspaceVerificationCall(item.call)
+      );
     const lastVerification = verificationCalls.at(-1);
     const mutationApplied = lastMutationCallIndex >= 0;
     const verificationAttemptedAfterMutation = mutationApplied && verificationCalls.length > 0;

@@ -2,6 +2,7 @@ import {
   effectiveWorkspaceMutationCallIndices,
   isSuccessfulWorkspaceMutationCall,
   isSuccessfulWorkspaceVerificationCall,
+  isUnavailableWorkspaceVerificationCall,
   isWorkspaceVerificationCall,
   workspaceCandidateRollbackFromCall,
 } from './executionIntent.js';
@@ -586,6 +587,7 @@ export class AgentToolPlanner {
       (latest, call, index) =>
         index > latestMutationIndex
         && isWorkspaceVerificationCall(call)
+        && !isUnavailableWorkspaceVerificationCall(call)
         && !isSuccessfulWorkspaceVerificationCall(call)
           ? index
           : latest,
@@ -1204,6 +1206,7 @@ export class AgentToolPlanner {
     if (latestFailureIndex < 0) return [];
     const latestFailure = input.calls[latestFailureIndex]!;
     if (!isWorkspaceVerificationCall(latestFailure)
+      || isUnavailableWorkspaceVerificationCall(latestFailure)
       || isSuccessfulWorkspaceVerificationCall(latestFailure)) {
       return [];
     }
@@ -1267,6 +1270,7 @@ export class AgentToolPlanner {
       ) {
         const candidate = input.calls[index]!;
         if (!isWorkspaceVerificationCall(candidate)
+          || isUnavailableWorkspaceVerificationCall(candidate)
           || isSuccessfulWorkspaceVerificationCall(candidate)) {
           continue;
         }
@@ -1734,9 +1738,10 @@ export class AgentToolPlanner {
       const call = calls[index]!;
       if (call.toolName === 'shell.exec'
         && (
-          !call.success
+          (!call.success && !isUnavailableWorkspaceVerificationCall(call))
           || (
             isWorkspaceVerificationCall(call)
+            && !isUnavailableWorkspaceVerificationCall(call)
             && !isSuccessfulWorkspaceVerificationCall(call)
           )
         )) {

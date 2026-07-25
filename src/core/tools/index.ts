@@ -31,6 +31,7 @@ export {
   hasEffectiveWorkspaceMutationCall,
   isSuccessfulWorkspaceMutationCall,
   isSuccessfulWorkspaceVerificationCall,
+  isUnavailableWorkspaceVerificationCall,
   isWorkspaceVerificationCall,
   lastEffectiveWorkspaceMutationCallIndex,
   plannedWorkspaceMutationPath,
