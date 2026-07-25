@@ -924,6 +924,140 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('inspects an imported runtime signature before repairing an unexpected keyword', () => {
+    const planner = new AgentToolPlanner();
+    const failure = {
+      toolName: 'shell.exec',
+      params: { command: 'python -m support_rag.cli route --ticket invoice' },
+      success: false,
+      result: {
+        command: 'python -m support_rag.cli route --ticket invoice',
+        cwd: '/app',
+        exitCode: 1,
+        stderr: [
+          'Traceback (most recent call last):',
+          '  File "/app/src/support_rag/router.py", line 88, in build_router_agent',
+          '    agent = create_agent(llm=llm, tools=tools)',
+          "TypeError: create_agent() got an unexpected keyword argument 'llm'",
+        ].join('\n'),
+      },
+    };
+    const bindings = [
+      { name: 'fs.read', enabled: true },
+      { name: 'fs.search', enabled: true },
+      { name: 'fs.synthesize', enabled: true },
+      { name: 'shell.exec', enabled: true },
+    ];
+    const searchPlan = planner.planWorkspaceFailureFollowUps({
+      workspaceRoot: '/app',
+      bindings,
+      calls: [failure],
+    });
+    expect(searchPlan).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.search',
+        params: {
+          path: 'src/support_rag',
+          filePattern: 'router.py',
+          query: 'create_agent',
+          maxResults: 20,
+        },
+      }),
+    ]);
+    const searchCall = {
+      toolName: 'fs.search',
+      params: searchPlan[0]!.params,
+      success: true,
+      result: {
+        matches: [
+          {
+            path: 'src/support_rag/router.py',
+            line: 8,
+            preview: 'from langchain.agents import create_agent',
+          },
+          {
+            path: 'src/support_rag/router.py',
+            line: 88,
+            preview: 'agent = create_agent(llm=llm, tools=tools)',
+          },
+        ],
+      },
+    };
+    const signaturePlan = planner.planWorkspaceFailureFollowUps({
+      workspaceRoot: '/app',
+      bindings,
+      calls: [failure, searchCall],
+    });
+    const signatureCommand =
+      'python -c "import inspect; from langchain.agents import create_agent; print(inspect.signature(create_agent))"';
+    expect(signaturePlan).toEqual([
+      expect.objectContaining({
+        toolName: 'shell.exec',
+        params: {
+          command: signatureCommand,
+          maxOutputBytes: 8_000,
+        },
+        reason: expect.stringContaining('do not guess replacement keyword names'),
+      }),
+    ]);
+    const sourceRead = {
+      toolName: 'fs.read',
+      params: {
+        path: 'src/support_rag/router.py',
+        startLine: 63,
+        endLine: 113,
+      },
+      success: true,
+      result: {
+        path: 'src/support_rag/router.py',
+        content: [
+          'def build_router_agent(path):',
+          '    return create_agent(llm=model, tools=tools)',
+        ].join('\n'),
+        truncated: false,
+      },
+    };
+    expect(planner.planWorkspaceRepairTransition({
+      task: 'Repair src/support_rag/router.py and rerun the CLI.',
+      workspaceRoot: '/app',
+      bindings,
+      calls: [failure, searchCall, sourceRead],
+    })).toEqual([]);
+
+    const plans = planner.planWorkspaceRepairTransition({
+      task: 'Repair src/support_rag/router.py and rerun the CLI.',
+      workspaceRoot: '/app',
+      bindings,
+      calls: [
+        failure,
+        searchCall,
+        {
+          toolName: 'shell.exec',
+          params: signaturePlan[0]!.params,
+          success: true,
+          result: {
+            command: signatureCommand,
+            stdout: '(model, tools=None, *, system_prompt=None, context_schema=None)\n',
+            exitCode: 0,
+          },
+        },
+        sourceRead,
+      ],
+    });
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.synthesize',
+        params: expect.objectContaining({
+          path: 'src/support_rag/router.py',
+          strategy: 'patch',
+          instructions: expect.stringMatching(
+            /unexpected keyword argument 'llm'[\s\S]*system_prompt=None, context_schema=None/
+          ),
+        }),
+      }),
+    ]);
+  });
+
   it('bootstraps an explicitly invoked missing development tool after source failures clear', () => {
     const planner = new AgentToolPlanner();
     const bindings = [{ name: 'shell.exec', enabled: true }];

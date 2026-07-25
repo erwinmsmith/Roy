@@ -897,6 +897,71 @@ export class AgentToolPlanner {
         }
       }
     }
+    const unexpectedKeyword = /(?:typeerror:\s*)?([A-Za-z_][A-Za-z0-9_.]*)\(\)\s+got an unexpected keyword argument\s+['"]([A-Za-z_][A-Za-z0-9_]*)['"]/i.exec(
+      causalFailure.output
+    );
+    if (unexpectedKeyword) {
+      const callableName = unexpectedKeyword[1]!.split('.').at(-1)!;
+      const caller = locations.find(location =>
+        this.isMutableImplementationPath(location.path)
+      );
+      if (caller) {
+        const callerPath = this.normalizeWorkspacePath(caller.path);
+        const slash = callerPath.lastIndexOf('/');
+        const searchParams = {
+          path: slash >= 0 ? callerPath.slice(0, slash) : '.',
+          filePattern: slash >= 0 ? callerPath.slice(slash + 1) : callerPath,
+          query: callableName,
+          maxResults: 20,
+        };
+        const importSearch = input.calls
+          .slice(failureIndex + 1)
+          .find(call =>
+            call.toolName === 'fs.search'
+            && call.success
+            && JSON.stringify(call.params) === JSON.stringify(searchParams)
+          );
+        if (!importSearch
+          && input.bindings.some(binding =>
+            binding.enabled && binding.name === 'fs.search'
+          )) {
+          return [{
+            toolName: 'fs.search',
+            params: searchParams,
+            reason: `The installed callable ${callableName} rejected a keyword; locate its import in the caller before changing arguments.`,
+            groundingRequired: true,
+          }];
+        }
+        const importEvidence = this.importedCallableEvidence(
+          importSearch,
+          callableName
+        );
+        if (importEvidence) {
+          const signatureCommand = this.pythonSignatureInspectionCommand(
+            importEvidence.moduleName,
+            callableName
+          );
+          const signatureObserved = input.calls
+            .slice(failureIndex + 1)
+            .some(call =>
+              call.toolName === 'shell.exec'
+              && call.success
+              && String(call.params.command ?? '') === signatureCommand
+            );
+          if (!signatureObserved) {
+            return [{
+              toolName: 'shell.exec',
+              params: {
+                command: signatureCommand,
+                maxOutputBytes: 8_000,
+              },
+              reason: `Inspect the installed runtime signature for ${importEvidence.moduleName}.${callableName}; do not guess replacement keyword names.`,
+              groundingRequired: true,
+            }];
+          }
+        }
+      }
+    }
     return locations
       .map(location => ({
         toolName: 'fs.read',
@@ -1183,14 +1248,57 @@ export class AgentToolPlanner {
           .some(index => index > sourceReadIndex)) {
         return [];
       }
+      const unexpectedKeyword = /(?:typeerror:\s*)?([A-Za-z_][A-Za-z0-9_.]*)\(\)\s+got an unexpected keyword argument\s+['"]([A-Za-z_][A-Za-z0-9_]*)['"]/i.exec(
+        causalFailure.output
+      );
+      let runtimeSignature = '';
+      if (unexpectedKeyword) {
+        const callableName = unexpectedKeyword[1]!.split('.').at(-1)!;
+        const importSearch = input.calls
+          .slice(causalFailure.index + 1)
+          .find(call =>
+            call.toolName === 'fs.search'
+            && call.success
+            && String(call.params.query ?? '') === callableName
+          );
+        const importEvidence = this.importedCallableEvidence(
+          importSearch,
+          callableName
+        );
+        if (importEvidence) {
+          const signatureCommand = this.pythonSignatureInspectionCommand(
+            importEvidence.moduleName,
+            callableName
+          );
+          const signatureCall = input.calls
+            .slice(causalFailure.index + 1)
+            .find(call =>
+              call.toolName === 'shell.exec'
+              && call.success
+              && String(call.params.command ?? '') === signatureCommand
+            );
+          if (!signatureCall) return [];
+          const signatureResult = signatureCall.result as {
+            stdout?: unknown;
+            stderr?: unknown;
+          } | undefined;
+          runtimeSignature = [
+            String(signatureResult?.stdout ?? ''),
+            String(signatureResult?.stderr ?? ''),
+          ].filter(Boolean).join('\n').trim().slice(0, 4_000);
+        }
+      }
       const localizedFailure = causalFailure.output.length <= 2_400
         ? causalFailure.output
         : `[earlier failure output compacted]\n${causalFailure.output.slice(-2_400)}`;
       const instructions = [
         'Apply the smallest interface-preserving patch that fixes this exact localized execution failure.',
         `Authoritative failure:\n${localizedFailure}`,
+        runtimeSignature
+          ? `Authoritative installed runtime signature:\n${runtimeSignature}`
+          : '',
         'Use the freshly read current source as the only patch base. Initialize values on every control-flow path, preserve already working behavior, and do not broaden the change beyond the causal failure.',
-      ].join('\n\n');
+      ].filter(Boolean).join('\n\n');
       const duplicate = input.calls.slice(sourceReadIndex + 1).some(call =>
         call.toolName === 'fs.synthesize'
         && this.normalizeWorkspacePath(String(call.params.path ?? '')) === targetPath
@@ -1329,6 +1437,35 @@ export class AgentToolPlanner {
         : 'The causal frontier contains a non-perfect aggregate verifier result plus complete verifier and implementation source evidence; transition from inspection to a preserving repair.',
       groundingRequired: true,
     }];
+  }
+
+  private importedCallableEvidence(
+    searchCall: ObservedToolCall | undefined,
+    callableName: string
+  ): { moduleName: string } | undefined {
+    if (!searchCall || searchCall.toolName !== 'fs.search' || !searchCall.success) {
+      return undefined;
+    }
+    const matches = (searchCall.result as {
+      matches?: Array<{ preview?: unknown }>;
+    } | undefined)?.matches;
+    if (!Array.isArray(matches)) return undefined;
+    const escapedCallable = callableName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    for (const match of matches) {
+      const preview = String(match.preview ?? '');
+      const imported = new RegExp(
+        `\\bfrom\\s+([A-Za-z_][A-Za-z0-9_.]*)\\s+import\\s+[^\\n#]*\\b${escapedCallable}\\b`
+      ).exec(preview);
+      if (imported?.[1]) return { moduleName: imported[1] };
+    }
+    return undefined;
+  }
+
+  private pythonSignatureInspectionCommand(
+    moduleName: string,
+    callableName: string
+  ): string {
+    return `python -c "import inspect; from ${moduleName} import ${callableName}; print(inspect.signature(${callableName}))"`;
   }
 
   private verifierScorecardState(call: ObservedToolCall): {
