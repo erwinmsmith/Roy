@@ -7944,6 +7944,66 @@ export class Runtime {
     };
   }
 
+  private completeDelegatedTaskReference(
+    task: string | undefined,
+    parentId: string,
+    correlationId: string
+  ): {
+    task: string;
+    source: 'execution_tree' | 'parent_assignment';
+    originalCharacters: number;
+  } | undefined {
+    if (!task?.trim() || !this.delegatedTaskHasUnresolvedReference(task)) {
+      return undefined;
+    }
+    const treeTask = this.executionTrees.get(correlationId)?.task;
+    const parentTask = this.agentRestoreSpecs.get(parentId)?.task;
+    const source = treeTask?.trim()
+      ? { task: treeTask, kind: 'execution_tree' as const }
+      : parentTask?.trim()
+        ? { task: parentTask, kind: 'parent_assignment' as const }
+        : undefined;
+    if (!source
+      || source.task.trim() === task.trim()
+      || source.task.length <= task.length
+      || this.countIndependentTaskObligations(source.task) < 2) {
+      return undefined;
+    }
+    const boundedSource = source.task.slice(0, 12_000);
+    return {
+      task: [
+        task.trim(),
+        '',
+        '[runtime_referenced_parent_assignment]',
+        'The delegated task referred to omitted objects. Use the following immutable parent assignment only to resolve those references:',
+        boundedSource,
+        '[/runtime_referenced_parent_assignment]',
+      ].join('\n'),
+      source: source.kind,
+      originalCharacters: task.length,
+    };
+  }
+
+  private delegatedTaskHasUnresolvedReference(task: string): boolean {
+    const referencedObjects = task.match(
+      /\b(?:these|those|above|following|all|each\s+of\s+the|the)\s+(?:(?:[a-z]+|\d+)[ -]?){0,4}(questions?|requirements?|criteria|items?|files?|tasks?|answers?)\b/i
+    )?.[1]?.toLowerCase();
+    if (!referencedObjects) return false;
+    const numberedObjects = [...task.matchAll(/(?:^|\n)\s*\d{1,2}[.)]\s+\S/g)].length;
+    if (numberedObjects >= 2) return false;
+    if (referencedObjects.startsWith('question')
+      || referencedObjects.startsWith('answer')) {
+      return (task.match(/\?/g) ?? []).length < 2;
+    }
+    if (referencedObjects.startsWith('file')) {
+      const paths = task.match(
+        /(?:\.{0,2}\/)?(?:[A-Za-z0-9._@-]+\/)*[A-Za-z0-9._@-]+\.[A-Za-z0-9]{1,8}/g
+      ) ?? [];
+      return paths.length < 2;
+    }
+    return true;
+  }
+
   async spawnAgent(spec: SpawnAgentSpec & { tomProfile?: ToMProfile; cacheHits?: string[] }): Promise<AgentInfo> {
     const ctx = this.getContext();
     if (!this.isValidArchetype(spec.archetype)) {
@@ -7960,6 +8020,29 @@ export class Runtime {
 
     const parentIdentity = parent.getIdentity();
     const creationCorrelationId = spec.correlationId ?? this.createCorrelationId();
+    const delegatedTaskCompletion = this.completeDelegatedTaskReference(
+      spec.task,
+      spec.parentId,
+      creationCorrelationId
+    );
+    if (delegatedTaskCompletion) {
+      spec = {
+        ...spec,
+        task: delegatedTaskCompletion.task,
+      };
+      this.emit({
+        type: 'agent.assignment.reference.completed',
+        agentId: spec.parentId,
+        sessionId: ctx.sessionId,
+        correlationId: creationCorrelationId,
+        nodeId: spec.nodeDefinition?.nodeId,
+        data: {
+          source: delegatedTaskCompletion.source,
+          originalCharacters: delegatedTaskCompletion.originalCharacters,
+          completedCharacters: delegatedTaskCompletion.task.length,
+        },
+      });
+    }
     if (spec.parentId !== 'root') {
       await this.prepareParentForDelegation(spec.parentId, creationCorrelationId, spec.task ?? spec.description);
     }

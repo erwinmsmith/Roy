@@ -1511,6 +1511,60 @@ describe('Runtime controlled subagent spawning', () => {
     await runtime.shutdown();
   });
 
+  it('detects delegated references whose concrete parent objects were omitted', () => {
+    const runtime = new Runtime();
+    const internal = runtime as unknown as {
+      delegatedTaskHasUnresolvedReference: (task: string) => boolean;
+      completeDelegatedTaskReference: (
+        task: string,
+        parentId: string,
+        correlationId: string
+      ) => { task: string; source: string } | undefined;
+      executionTrees: {
+        begin: (input: {
+          correlationId: string;
+          sessionId: string;
+          task: string;
+          maxSteps: number;
+        }) => unknown;
+      };
+    };
+    const hasUnresolvedReference =
+      internal.delegatedTaskHasUnresolvedReference.bind(runtime);
+
+    expect(hasUnresolvedReference(
+      'Research the precise canonical answer to each of the five trivia questions.'
+    )).toBe(true);
+    expect(hasUnresolvedReference([
+      'Research these five questions:',
+      '1. Who wrote Hamlet?',
+      '2. Who wrote Macbeth?',
+    ].join('\n'))).toBe(false);
+    expect(hasUnresolvedReference(
+      'Inspect all referenced files: src/a.ts and src/b.ts.'
+    )).toBe(false);
+    internal.executionTrees.begin({
+      correlationId: 'referential-assignment',
+      sessionId: 'test',
+      task: [
+        'Answer every question.',
+        '1. Who wrote Hamlet?',
+        '2. Who wrote Macbeth?',
+      ].join('\n'),
+      maxSteps: 4,
+    });
+    const completed = internal.completeDelegatedTaskReference.call(
+      runtime,
+      'Research each of the two questions.',
+      'root',
+      'referential-assignment'
+    );
+    expect(completed?.source).toBe('execution_tree');
+    expect(completed?.task).toContain('[runtime_referenced_parent_assignment]');
+    expect(completed?.task).toContain('Who wrote Hamlet?');
+    expect(completed?.task).toContain('Who wrote Macbeth?');
+  });
+
   it('does not impose a hidden lifetime cap on filesystem evidence calls', async () => {
     const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-fs-call-cap-'));
     await writeFile(path.join(workspaceCwd, 'evidence.txt'), 'reusable evidence\n', 'utf8');
