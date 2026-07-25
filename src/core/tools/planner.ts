@@ -282,10 +282,22 @@ export class AgentToolPlanner {
     for (const explicitPath of this.extractReferencedPaths(input.task)) {
       const path = resolvePath(explicitPath);
       if (!path || !readablePath(path)) continue;
+      const lower = path.toLowerCase();
+      const priority = /(?:^|\/)(?:src|lib|app|packages)\/.+\.(?:py|ts|tsx|js|jsx|mjs|cjs|java|go|rs|rb|php|sh)$/i.test(
+        path
+      )
+        ? 340
+        : lower.startsWith('.roy/official-verifier/')
+          ? 320
+          : /(?:^|\/)[^/]*manifest[^/]*\.(?:json|ya?ml|toml)$/i.test(path)
+            ? 260
+            : /(?:^|\/)outputs?\//i.test(path)
+              ? 40
+              : 200;
       candidates.push({
         path,
         reason: `Read the still-unobserved file explicitly named by the task: ${path}.`,
-        priority: 200,
+        priority,
       });
     }
 

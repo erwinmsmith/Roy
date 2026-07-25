@@ -138,6 +138,36 @@ describe('AgentToolPlanner', () => {
     expect(JSON.stringify(plans)).not.toContain('invoice.png');
   });
 
+  it('reads repair source before generated outputs in mutation-task evidence follow-ups', () => {
+    const plans = new AgentToolPlanner().planWorkspaceEvidenceFollowUps({
+      task: [
+        'Repair src/table_recon/audit.py using data/public/manifest.json.',
+        'Required outputs: outputs/layout_qc.json and outputs/reconstructed_tables.csv.',
+      ].join(' '),
+      workspaceRoot: '/app',
+      bindings: [{ name: 'fs.read', enabled: true }],
+      calls: [{
+        toolName: 'fs.list',
+        params: { path: '.', maxDepth: 4 },
+        success: true,
+        result: {
+          entries: [
+            'src/table_recon/audit.py',
+            'data/public/manifest.json',
+            'outputs/layout_qc.json',
+            'outputs/reconstructed_tables.csv',
+          ],
+        },
+      }],
+    });
+
+    expect(plans.map(plan => plan.params.path)).toEqual([
+      'src/table_recon/audit.py',
+      'data/public/manifest.json',
+      'outputs/layout_qc.json',
+    ]);
+  });
+
   it('turns a verifier traceback into a bounded source read', () => {
     const plans = new AgentToolPlanner().planWorkspaceFailureFollowUps({
       bindings: [
