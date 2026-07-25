@@ -851,6 +851,146 @@ describe('AgentToolPlanner', () => {
     })]);
   });
 
+  it('transitions cached complete source evidence into the next explicit implementation slice', () => {
+    const planner = new AgentToolPlanner();
+    const task = [
+      'Migrate the current project implementation.',
+      '- src/app/chain.py: Replace LegacyChain.predict with RunnableSequence.invoke.',
+      '- src/app/models.py: Replace LegacyModel with CoreModel.',
+      'Run `python -m app.cli answer` and verify the result.',
+    ].join('\n');
+    const bindings = [
+      { name: 'fs.read', enabled: true },
+      { name: 'fs.synthesize', enabled: true },
+      { name: 'shell.exec', enabled: true },
+    ];
+    const calls = [
+      {
+        toolName: 'fs.synthesize',
+        params: {
+          path: 'pyproject.toml',
+          instructions: 'Update runtime dependencies.',
+          strategy: 'patch',
+        },
+        success: true,
+        result: { path: 'pyproject.toml' },
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m pytest -q' },
+        success: false,
+        result: {
+          cwd: '/app',
+          exitCode: 1,
+          stderr: '/usr/bin/python: No module named pytest',
+        },
+      },
+      {
+        toolName: 'fs.read',
+        params: { path: '/app/src/app/models.py' },
+        success: true,
+        result: {
+          path: '/app/src/app/models.py',
+          content: 'class LegacyModel:\n    pass\n',
+          truncated: false,
+        },
+      },
+      {
+        toolName: 'fs.read',
+        params: { path: 'src/app/chain.py' },
+        success: true,
+        result: {
+          path: 'src/app/chain.py',
+          content: 'class LegacyChain:\n    def predict(self): pass\n',
+          truncated: false,
+        },
+      },
+    ];
+
+    const plans = planner.planGroundedImplementationTransition({
+      task,
+      calls,
+      bindings,
+      workspaceRoot: '/app',
+    });
+
+    expect(plans).toEqual([expect.objectContaining({
+      toolName: 'fs.synthesize',
+      params: expect.objectContaining({
+        path: 'src/app/chain.py',
+        strategy: 'patch',
+        instructions: expect.stringMatching(/LegacyChain[\s\S]*preserve public interfaces/i),
+      }),
+      reason: expect.stringContaining('cached inspection to execution'),
+    })]);
+
+    const nextPlans = planner.planGroundedImplementationTransition({
+      task,
+      calls: [
+        ...calls,
+        {
+          toolName: plans[0]!.toolName,
+          params: plans[0]!.params,
+          success: true,
+          result: { path: 'src/app/chain.py' },
+        },
+      ],
+      bindings,
+      workspaceRoot: '/app',
+    });
+    expect(nextPlans).toEqual([expect.objectContaining({
+      params: expect.objectContaining({ path: 'src/app/models.py' }),
+    })]);
+  });
+
+  it('does not turn unrelated reads or non-mutation tasks into source synthesis', () => {
+    const planner = new AgentToolPlanner();
+    const calls = [{
+      toolName: 'fs.read',
+      params: { path: 'src/app/chain.py' },
+      success: true,
+      result: {
+        path: 'src/app/chain.py',
+        content: 'def answer(): return "ok"\n',
+        truncated: false,
+      },
+    }];
+    const bindings = [
+      { name: 'fs.read', enabled: true },
+      { name: 'fs.synthesize', enabled: true },
+    ];
+
+    expect(planner.planGroundedImplementationTransition({
+      task: 'Summarize the project architecture.',
+      calls,
+      bindings,
+    })).toEqual([]);
+    expect(planner.planGroundedImplementationTransition({
+      task: 'Modify src/app/router.py to implement the new route contract.',
+      calls,
+      bindings,
+    })).toEqual([]);
+  });
+
+  it('extracts explicitly quoted natural-language commands from a team task', () => {
+    const planner = new AgentToolPlanner();
+    const plans = planner.plan({
+      task: [
+        "Run 'cd /app && python -m pip install -e .'.",
+        "Confirm with 'python -c \"import app; print(app.__version__)\"'.",
+        "If the test runner is absent, install it: 'pip install pytest'.",
+      ].join(' '),
+      workspacePath: '.',
+      bindings: [{ name: 'shell.exec', enabled: true }],
+    });
+
+    expect(plans.map(plan => plan.params.command)).toEqual([
+      'cd /app && python -m pip install -e .',
+      'python -c "import app; print(app.__version__)"',
+      'pip install pytest',
+    ]);
+  });
+
   it('does not keep repairing from stale failures after a newer mutation passes its declared command', () => {
     const planner = new AgentToolPlanner();
     const command = 'python -m dq_audit.cli run --config configs/public_audit.yml --out-dir outputs';

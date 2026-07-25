@@ -405,6 +405,139 @@ export class AgentToolPlanner {
       }));
   }
 
+  planGroundedImplementationTransition(input: {
+    task: string;
+    calls: ObservedToolCall[];
+    bindings: ToolPlanBinding[];
+    workspaceRoot?: string;
+  }): PlannedToolCall[] {
+    if (!input.bindings.some(binding =>
+      binding.enabled && binding.name === 'fs.synthesize'
+    ) || !this.taskRequestsWorkspaceMutation(input.task)) {
+      return [];
+    }
+    const taskLower = input.task.toLowerCase().replaceAll('\\', '/');
+    const workspaceRoot = this.normalizeWorkspacePath(String(input.workspaceRoot ?? ''))
+      .replace(/\/+$/, '');
+    const normalizeObservedPath = (value: unknown): string => {
+      let candidate = this.normalizeWorkspacePath(String(value ?? ''));
+      if (workspaceRoot && candidate.startsWith(`${workspaceRoot}/`)) {
+        candidate = candidate.slice(workspaceRoot.length + 1);
+      }
+      return candidate.replace(/^\/+/, '');
+    };
+    const effectiveMutations = new Set(
+      effectiveWorkspaceMutationCallIndices(input.calls)
+    );
+    const mutatedPaths = new Set(input.calls
+      .map((call, index) => ({ call, index }))
+      .filter(item => effectiveMutations.has(item.index))
+      .map(({ call }) => normalizeObservedPath(
+        (call.result as { path?: unknown } | undefined)?.path
+          ?? call.params.path
+      ))
+      .filter(Boolean));
+    const contractTerms = this.extractImplementationContractTerms(input.task);
+    const latestFailure = [...input.calls].reverse().find(call =>
+      isWorkspaceVerificationCall(call)
+      && !isSuccessfulWorkspaceVerificationCall(call)
+    );
+    const latestFailureText = latestFailure
+      ? [
+        String(latestFailure.error ?? ''),
+        ...this.extractVerifierDiagnosticText(
+          (latestFailure.result as { verifierDiagnostics?: unknown } | undefined)
+            ?.verifierDiagnostics
+        ),
+        JSON.stringify(latestFailure.result ?? ''),
+      ].join('\n').toLowerCase()
+      : '';
+    const candidates = input.calls
+      .map((call, index) => {
+        if (call.toolName !== 'fs.read' || !call.success) return undefined;
+        const result = call.result as {
+          path?: unknown;
+          content?: unknown;
+          truncated?: unknown;
+        } | undefined;
+        const path = normalizeObservedPath(result?.path ?? call.params.path);
+        const content = typeof result?.content === 'string' ? result.content : '';
+        if (!path
+          || !content
+          || result?.truncated === true
+          || mutatedPaths.has(path)
+          || !this.isMutableImplementationPath(path)) {
+          return undefined;
+        }
+        const basename = path.slice(path.lastIndexOf('/') + 1);
+        const taskPathIndex = taskLower.indexOf(path.toLowerCase());
+        const taskBasenameIndex = taskLower.indexOf(basename.toLowerCase());
+        const taskExplicit = taskPathIndex >= 0 || taskBasenameIndex >= 0;
+        const matchedTerms = contractTerms.filter(term =>
+          content.toLowerCase().includes(term.toLowerCase())
+        );
+        const failureMentioned = latestFailureText.includes(path.toLowerCase())
+          || latestFailureText.includes(basename.toLowerCase());
+        if (!taskExplicit && matchedTerms.length === 0 && !failureMentioned) {
+          return undefined;
+        }
+        const firstMention = taskPathIndex >= 0
+          ? taskPathIndex
+          : taskBasenameIndex >= 0
+            ? taskBasenameIndex
+            : Number.MAX_SAFE_INTEGER;
+        return {
+          path,
+          content,
+          index,
+          firstMention,
+          matchedTerms,
+          score: (failureMentioned ? 900 : 0)
+            + (taskPathIndex >= 0 ? 500 : taskBasenameIndex >= 0 ? 360 : 0)
+            + Math.min(10, matchedTerms.length) * 45,
+        };
+      })
+      .filter((candidate): candidate is NonNullable<typeof candidate> =>
+        candidate !== undefined
+      )
+      .sort((left, right) =>
+        right.score - left.score
+        || left.firstMention - right.firstMention
+        || right.index - left.index
+      );
+    const candidate = candidates[0];
+    if (!candidate) return [];
+    const relevantContract = candidate.matchedTerms.slice(0, 12);
+    const instructions = [
+      'Apply the next uncompleted task-declared implementation slice to this already observed source file.',
+      relevantContract.length > 0
+        ? `The current source still contains these identifiers or contract terms named by the assignment: ${relevantContract.join(', ')}.`
+        : 'The assignment explicitly names this file as an implementation target.',
+      'Use the current file as the patch base, preserve public interfaces and unrelated working behavior, and replace only the legacy or incomplete behavior required by the immutable assignment.',
+      'Do not modify tests, benchmark assets, verifier files, or unrelated source paths.',
+    ].join(' ');
+    const duplicate = input.calls.some(call =>
+      call.toolName === 'fs.synthesize'
+      && normalizeObservedPath(
+        (call.result as { path?: unknown } | undefined)?.path
+          ?? call.params.path
+      ) === candidate.path
+      && call.params.strategy === 'patch'
+      && String(call.params.instructions ?? '') === instructions
+    );
+    if (duplicate) return [];
+    return [{
+      toolName: 'fs.synthesize',
+      params: {
+        path: candidate.path,
+        instructions,
+        strategy: 'patch',
+      },
+      reason: `All required evidence for ${candidate.path} is grounded, while that explicit implementation slice has no retained successful mutation; transition from cached inspection to execution.`,
+      groundingRequired: true,
+    }];
+  }
+
   planPostMutationVerification(input: {
     task: string;
     calls: ObservedToolCall[];
@@ -1257,6 +1390,29 @@ export class AgentToolPlanner {
       || /(?:^|[;&|]\s*)(?:echo|printf)\b[^\n]*(?:>>?|tee)\s*\S+/i.test(command);
   }
 
+  private taskRequestsWorkspaceMutation(task: string): boolean {
+    return /\b(?:implement|modify|edit|create|write|patch|repair|fix|refactor|migrate|upgrade|replace|apply)\b/i.test(
+      task
+    ) || /(?:实现|修改|编辑|创建|写入|修复|迁移|升级|替换|应用补丁)/.test(task);
+  }
+
+  private extractImplementationContractTerms(task: string): string[] {
+    const terms = [
+      ...task.matchAll(
+        /\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+\b/g
+      ),
+      ...task.matchAll(/\b[A-Z][A-Za-z0-9_]{3,}\b/g),
+      ...task.matchAll(/[`'"]([A-Za-z_][A-Za-z0-9_.]{3,})[`'"]/g),
+    ].map(match => String(match[1] ?? match[0] ?? '').replace(/[()]+$/, ''));
+    const ignored = new Set([
+      'apply', 'current', 'exact', 'file', 'implementation', 'modify',
+      'preserve', 'replace', 'source', 'task', 'verify', 'workspace',
+    ]);
+    return [...new Set(terms)]
+      .filter(term => term.length >= 4 && !ignored.has(term.toLowerCase()))
+      .slice(0, 80);
+  }
+
   private isEnvironmentSetupCommand(command: string): boolean {
     const normalized = command.trim();
     return /^(?:cd|pushd|popd)\b/i.test(normalized)
@@ -1267,6 +1423,19 @@ export class AgentToolPlanner {
 
   private extractExplicitShellCommands(task: string): string[] {
     const commands: string[] = [];
+    const addCommand = (rawCommand: string): void => {
+      const command = rawCommand.trim().replace(/^\$\s+/, '');
+      if (!command
+        || command.length > 1_000
+        || command.endsWith('\\')
+        || /\b(?:rm\s+-rf|mkfs|shutdown|reboot|halt)\b/i.test(command)
+        || /^(?:the|a|an|this|that|these|those|we|you|it)\b/i.test(
+          command.replace(/^(?:[A-Z_][A-Z0-9_]*=\S+\s+)+/, '')
+        )) {
+        return;
+      }
+      commands.push(command);
+    };
     for (const match of task.matchAll(/```(?:bash|sh|shell|zsh|console)\s*\n([\s\S]*?)```/gi)) {
       const index = match.index ?? 0;
       const leadIn = task.slice(Math.max(0, index - 240), index);
@@ -1278,17 +1447,13 @@ export class AgentToolPlanner {
         .map(line => line.trim())
         .filter(line => line && !line.startsWith('#'));
       for (const line of lines) {
-        const command = line.replace(/^\$\s+/, '');
-        if (command.length > 1_000
-          || command.endsWith('\\')
-          || /\b(?:rm\s+-rf|mkfs|shutdown|reboot|halt)\b/i.test(command)
-          || /^(?:the|a|an|this|that|these|those|we|you|it)\b/i.test(
-            command.replace(/^(?:[A-Z_][A-Z0-9_]*=\S+\s+)+/, '')
-          )) {
-          continue;
-        }
-        commands.push(command);
+        addCommand(line);
       }
+    }
+    for (const match of task.matchAll(
+      /\b(?:run|execute|rerun|verify(?:\s+with)?|confirm(?:\s+with)?|command(?:\s+is)?|install(?:\s+it)?\s*:)\s+(?:the\s+command\s+)?(['"])([\s\S]{2,1000}?)\1/gi
+    )) {
+      addCommand(String(match[2] ?? ''));
     }
     return [...new Set(commands)].slice(0, 12);
   }
