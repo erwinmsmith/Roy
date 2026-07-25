@@ -44,6 +44,7 @@ export interface UnifiedAgentConfig extends AgentConfig {
 
 export interface AgentToolRoundPlanningInput {
   task: string;
+  intentTask?: string;
   executionRequired?: boolean;
   diagnosticProbeRequired?: boolean;
   requiredDiagnosticAfterCallIndex?: number;
@@ -106,7 +107,8 @@ export class UnifiedAgent extends BaseAgent {
       .filter(tool => !this.allowedTools || this.allowedTools.has(tool.name))
       .map(tool => tool.name));
     if (authorized.size === 0) return [];
-    const executionRequired = (input.executionRequired ?? requestsWorkspaceMutation(input.task))
+    const intentTask = input.intentTask ?? input.task;
+    const executionRequired = (input.executionRequired ?? requestsWorkspaceMutation(intentTask))
       && (
         authorized.has('fs.write')
         || authorized.has('fs.replace')
@@ -153,12 +155,12 @@ export class UnifiedAgent extends BaseAgent {
     const aggregateVerifierEvidenceReady = latestVerificationFailed
       && aggregateVerifierEvidenceIsReadyForRepair(
         input.calls,
-        input.task,
+        intentTask,
         lastVerificationIndex
       );
     const groundedImplementationTarget = rankGroundedSynthesisTargets(
       input.calls,
-      input.task
+      intentTask
     ).some(candidate => candidate.implementationIntent);
     const workspaceEvidenceSaturated = input.workspaceEvidenceSaturated === true
       && groundedImplementationTarget;
@@ -401,7 +403,7 @@ export class UnifiedAgent extends BaseAgent {
           convertObservedOverwriteToExactReplace(call, input.calls, authorized) ?? call
         );
         plannedCalls = plannedCalls.map(call =>
-          alignSynthesisRepairTargetWithFailure(call, input.calls, input.task)
+          alignSynthesisRepairTargetWithFailure(call, input.calls, intentTask)
         );
         if (executionRequired && latestVerificationFailed) {
           if (inspectedAfterLatestFailure) {
@@ -418,7 +420,7 @@ export class UnifiedAgent extends BaseAgent {
             const novelExplicitReads = plannedCalls.filter(call =>
               (call.toolName === 'fs.read' || call.toolName === 'fs.search')
               && taskExplicitlyNamesWorkspacePath(
-                input.task,
+                intentTask,
                 String(call.params.path ?? '')
               )
             );
@@ -494,7 +496,7 @@ export class UnifiedAgent extends BaseAgent {
         const synthesisFallback = recoverGroundedSynthesisPlan({
           authorized,
           calls: input.calls,
-          task: input.task,
+          task: intentTask,
           mutationRequirementSatisfied,
           latestVerificationFailed,
           workspaceEvidenceSaturated,
@@ -587,7 +589,7 @@ export class UnifiedAgent extends BaseAgent {
           const synthesisFallback = recoverGroundedSynthesisPlan({
             authorized,
             calls: input.calls,
-            task: input.task,
+            task: intentTask,
             mutationRequirementSatisfied,
             latestVerificationFailed,
             workspaceEvidenceSaturated,
@@ -628,7 +630,7 @@ export class UnifiedAgent extends BaseAgent {
       const synthesisFallback = recoverGroundedSynthesisPlan({
         authorized,
         calls: input.calls,
-        task: input.task,
+        task: intentTask,
         mutationRequirementSatisfied,
         latestVerificationFailed,
         workspaceEvidenceSaturated,
@@ -1762,10 +1764,17 @@ function rankGroundedSynthesisTargets(
       const invalidSourceSignal =
         /(?:<\|?\|?DSML\|?\|?|<tool_calls?>|<invoke\s+name=|<parameter\s+name=|assistant\s+to=)/i.test(content)
         || /[<｜]\s*[｜|]{0,2}DSML[｜|]{0,2}\s*[>｜]/i.test(content);
-      const implementationIntent = taskNamesFileAsImplementationTarget(
+      const explicitImplementationIntent = taskNamesFileAsImplementationTarget(
         taskLower,
         filePathLower,
         basename
+      );
+      const implementationIntent = explicitImplementationIntent || (
+        requestsWorkspaceMutation(task)
+        && (
+          taskLower.includes(filePathLower)
+          || Boolean(basename && taskLower.includes(basename))
+        )
       );
       let score = index / Math.max(1, calls.length);
       if (/(?:^|\/)(?:src|lib|app|packages)\//i.test(filePath)) score += 6;
@@ -1773,6 +1782,7 @@ function rankGroundedSynthesisTargets(
       if (stubSignal) score += 18;
       if (invalidSourceSignal) score += 30;
       if (implementationIntent) score += 20;
+      if (explicitImplementationIntent) score += 18;
       if (taskLower.includes(filePathLower)
         || taskLower.includes(basename)) {
         score += 7;

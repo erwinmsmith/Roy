@@ -817,7 +817,12 @@ describe('UnifiedAgent capability execution', () => {
     });
 
     const plans = await agent.planNextToolRound({
-      task: 'src/app.py: Migrate it using configs/runtime.yaml and preserve its interface.',
+      task: [
+        'Migrate the project implementation to the modern runtime.',
+        'Preserve public behavior and use the grounded configuration.',
+        'Detailed architectural constraints follow. '.repeat(8),
+        'Relevant files: src/app.py and configs/runtime.yaml.',
+      ].join('\n'),
       executionRequired: true,
       workspaceEvidenceSaturated: true,
       round: 6,

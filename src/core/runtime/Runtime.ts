@@ -18276,6 +18276,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       && actor instanceof UnifiedAgent) {
       const modelPlans = await actor.planNextToolRound({
         task,
+        intentTask,
         executionRequired: workspaceExecutionRequired,
         diagnosticProbeRequired,
         requiredDiagnosticAfterCallIndex: priorPlannerCalls.length - 1,
@@ -18746,6 +18747,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         }
         const llmPlans = await actor.planNextToolRound({
           task,
+          intentTask,
           executionRequired: workspaceExecutionRequired,
           diagnosticProbeRequired,
           requiredDiagnosticAfterCallIndex: priorPlannerCalls.length - 1,
