@@ -826,6 +826,41 @@ describe('Runtime controlled subagent spawning', () => {
     });
   });
 
+  it('applies a focused patch with stale edge context while preserving deletion anchors', () => {
+    const runtime = new Runtime();
+    const applyPatch = (runtime as unknown as {
+      applyUnifiedPatchToContent: (
+        current: string,
+        patch: string
+      ) => { content?: string; error?: string };
+    }).applyUnifiedPatchToContent.bind(runtime);
+    const current = [
+      'def value():',
+      '    answer = 41',
+      '    return answer',
+      '',
+    ].join('\n');
+    const patch = [
+      '--- a/app.py',
+      '+++ b/app.py',
+      '@@ -80,4 +80,4 @@',
+      ' # stale generated edge context',
+      ' def value():',
+      '-    answer = 41',
+      '+    answer = 42',
+      '     return answer',
+    ].join('\n');
+
+    expect(applyPatch(current, patch)).toEqual({
+      content: [
+        'def value():',
+        '    answer = 42',
+        '    return answer',
+        '',
+      ].join('\n'),
+    });
+  });
+
   it('extracts a unified diff from model prose and a trailing Markdown fence', () => {
     const runtime = new Runtime();
     const extract = (runtime as unknown as {

@@ -4467,23 +4467,60 @@ export class Runtime {
       const hunkLines = patchLines
         .slice(patchIndex + 1, hunkEnd)
         .filter(line => line !== '\\ No newline at end of file');
-      const sourcePattern = hunkLines
+      const sourcePatternFor = (lines: string[]): string[] => lines
         .filter(line => line[0] === ' ' || line[0] === '-')
         .map(line => line.slice(1));
+      let effectiveHunkLines = hunkLines;
+      let sourcePattern = sourcePatternFor(effectiveHunkLines);
       const declaredIndex = Math.max(0, oldStart - 1);
-      const matchesAt = (index: number): boolean =>
+      const matchesAt = (pattern: string[], index: number): boolean =>
         index >= 0
-        && index + sourcePattern.length <= currentLines.length
-        && sourcePattern.every((line, offset) => currentLines[index + offset] === line);
-      let hunkSourceIndex = declaredIndex;
-      if (!matchesAt(hunkSourceIndex) && sourcePattern.length > 0) {
+        && index + pattern.length <= currentLines.length
+        && pattern.every((line, offset) => currentLines[index + offset] === line);
+      const matchingIndices = (pattern: string[]): number[] => {
         const candidates: number[] = [];
         for (
           let index = 0;
-          index + sourcePattern.length <= currentLines.length;
+          index + pattern.length <= currentLines.length;
           index += 1
         ) {
-          if (matchesAt(index)) candidates.push(index);
+          if (matchesAt(pattern, index)) candidates.push(index);
+        }
+        return candidates;
+      };
+      let hunkSourceIndex = declaredIndex;
+      if (!matchesAt(sourcePattern, hunkSourceIndex) && sourcePattern.length > 0) {
+        let candidates = matchingIndices(sourcePattern);
+        // Match the behavior of a conservative patch fuzz factor: a model may
+        // carry one or two stale context lines at a hunk edge even though its
+        // deletion anchor is exact. Only context lines may be discarded;
+        // additions and deletions always remain authoritative.
+        if (candidates.length === 0) {
+          outer: for (let totalTrim = 1; totalTrim <= 4; totalTrim += 1) {
+            for (let leadingTrim = 0; leadingTrim <= totalTrim; leadingTrim += 1) {
+              const trailingTrim = totalTrim - leadingTrim;
+              if (leadingTrim > 2 || trailingTrim > 2) continue;
+              if (!hunkLines.slice(0, leadingTrim).every(line => line[0] === ' ')) {
+                continue;
+              }
+              if (trailingTrim > 0
+                && !hunkLines.slice(-trailingTrim).every(line => line[0] === ' ')) {
+                continue;
+              }
+              const end = trailingTrim > 0
+                ? hunkLines.length - trailingTrim
+                : hunkLines.length;
+              const fuzzyLines = hunkLines.slice(leadingTrim, end);
+              const fuzzyPattern = sourcePatternFor(fuzzyLines);
+              if (fuzzyPattern.length === 0) continue;
+              const fuzzyCandidates = matchingIndices(fuzzyPattern);
+              if (fuzzyCandidates.length === 0) continue;
+              effectiveHunkLines = fuzzyLines;
+              sourcePattern = fuzzyPattern;
+              candidates = fuzzyCandidates;
+              break outer;
+            }
+          }
         }
         if (candidates.length === 0) {
           return {
@@ -4504,7 +4541,7 @@ export class Runtime {
         declaredIndex,
         sourceIndex: hunkSourceIndex,
         sourcePattern,
-        lines: hunkLines,
+        lines: effectiveHunkLines,
       });
       patchIndex = hunkEnd;
     }
