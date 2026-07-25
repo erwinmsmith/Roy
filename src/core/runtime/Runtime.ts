@@ -16230,6 +16230,28 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         if (failureContextPlans.length > 0) {
           return failureContextPlans.slice(0, context.remainingCalls);
         }
+        const externalFeedbackRepair = this.toolPlanner.planExternalFeedbackRepair({
+          task: intentTask,
+          calls: context.calls,
+          bindings,
+          workspaceRoot: this.workspaceRoot,
+        });
+        if (externalFeedbackRepair.length > 0) {
+          this.emit({
+            type: 'tool.plan.external_feedback_repair',
+            agentId,
+            sessionId: this.getContext().sessionId,
+            correlationId: options.correlationId,
+            nodeId: options.nodeId,
+            data: {
+              plans: externalFeedbackRepair.map(plan => ({
+                toolName: plan.toolName,
+                params: plan.params,
+              })),
+            },
+          });
+          return externalFeedbackRepair.slice(0, context.remainingCalls);
+        }
         const combinedCalls = [...priorPlannerCalls, ...context.calls];
         if (diagnosticProbeRequired
           && context.calls.some(call => this.isFocusedVerifierDiagnosticCall(call))) {

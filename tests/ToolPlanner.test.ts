@@ -225,6 +225,80 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('turns external dependency feedback into ordered manifest repairs', () => {
+    const planner = new AgentToolPlanner();
+    const task = [
+      'Continue the workspace migration.',
+      '## VERIFICATION FAILED — CONTINUE WORKING',
+      '<official_verifier_feedback>',
+      'project metadata still targets the legacy runtime dependency version',
+      '</official_verifier_feedback>',
+    ].join('\n');
+    const bindings = [
+      { name: 'fs.read', enabled: true },
+      { name: 'fs.synthesize', enabled: true },
+    ];
+    const calls = [
+      {
+        toolName: 'fs.read',
+        params: { path: 'requirements.txt' },
+        success: true,
+        result: {
+          path: 'requirements.txt',
+          content: 'runtime==0.0.1\ncompat<2\n',
+        },
+      },
+      {
+        toolName: 'fs.read',
+        params: { path: 'pyproject.toml' },
+        success: true,
+        result: {
+          path: 'pyproject.toml',
+          content: '[project]\ndependencies = ["runtime>=0.3"]\n',
+        },
+      },
+    ];
+
+    const first = planner.planExternalFeedbackRepair({
+      task,
+      calls,
+      bindings,
+      workspaceRoot: '/app',
+    });
+    expect(first).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.synthesize',
+        params: expect.objectContaining({
+          path: 'pyproject.toml',
+          strategy: 'patch',
+          instructions: expect.stringContaining(
+            'project metadata still targets the legacy runtime dependency version'
+          ),
+        }),
+      }),
+    ]);
+
+    const second = planner.planExternalFeedbackRepair({
+      task,
+      calls: [
+        ...calls,
+        {
+          toolName: 'fs.synthesize',
+          params: first[0]!.params,
+          success: true,
+        },
+      ],
+      bindings,
+      workspaceRoot: '/app',
+    });
+    expect(second).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.synthesize',
+        params: expect.objectContaining({ path: 'requirements.txt' }),
+      }),
+    ]);
+  });
+
   it('follows explicit files and text dependencies from a grounded manifest without another model plan', () => {
     const planner = new AgentToolPlanner();
     const plans = planner.planWorkspaceEvidenceFollowUps({

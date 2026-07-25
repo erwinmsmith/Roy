@@ -418,6 +418,91 @@ export class AgentToolPlanner {
       }));
   }
 
+  planExternalFeedbackRepair(input: {
+    task: string;
+    calls: ObservedToolCall[];
+    bindings: ToolPlanBinding[];
+    workspaceRoot?: string;
+  }): PlannedToolCall[] {
+    if (!input.bindings.some(binding =>
+      binding.enabled && binding.name === 'fs.synthesize'
+    )) {
+      return [];
+    }
+    const feedbackMatch = /<official_verifier_feedback>([\s\S]*?)<\/official_verifier_feedback>/i.exec(
+      input.task
+    );
+    const continuationMatch = /##\s+VERIFICATION FAILED\b([\s\S]*)/i.exec(input.task);
+    const feedback = String(feedbackMatch?.[1] ?? continuationMatch?.[1] ?? '').trim();
+    if (!feedback) return [];
+    const dependencyFeedback = /\b(?:dependenc(?:y|ies)|metadata|manifest|requirements?|runtime version|version constraint|pin(?:ned|ning)?|package install)\b/i.test(
+      feedback
+    );
+    const feedbackLocations = this.extractFailureLocations(
+      feedback,
+      input.workspaceRoot ?? '',
+      input.workspaceRoot
+    );
+    const explicitFeedbackPaths = new Set([
+      ...this.extractReferencedPaths(feedback),
+      ...feedbackLocations.map(location => location.path),
+    ].map(path => this.normalizeWorkspacePath(path)));
+    const mutatedPaths = new Set(input.calls
+      .filter(call => isSuccessfulWorkspaceMutationCall(call))
+      .map(call => this.normalizeWorkspacePath(String(call.params.path ?? '')))
+      .filter(Boolean));
+    const candidates = input.calls
+      .filter(call => call.toolName === 'fs.read' && call.success)
+      .map(call => {
+        const result = call.result as { path?: unknown; content?: unknown } | undefined;
+        const candidatePath = this.normalizeWorkspacePath(String(
+          result?.path ?? call.params.path ?? ''
+        ));
+        return {
+          path: candidatePath,
+          content: typeof result?.content === 'string' ? result.content : '',
+        };
+      })
+      .filter(candidate => candidate.path && candidate.content && !mutatedPaths.has(candidate.path))
+      .map(candidate => {
+        const lowerPath = candidate.path.toLowerCase();
+        let score = explicitFeedbackPaths.has(candidate.path) ? 500 : 0;
+        if (dependencyFeedback) {
+          if (/(?:^|\/)pyproject\.toml$/.test(lowerPath)) score += 420;
+          else if (/(?:^|\/)requirements[^/]*\.txt$/.test(lowerPath)) score += 400;
+          else if (/(?:^|\/)package\.json$/.test(lowerPath)) score += 380;
+          else if (/(?:^|\/)(?:cargo\.toml|go\.mod|pom\.xml|build\.gradle|gemfile)$/.test(lowerPath)) score += 360;
+          else if (/(?:^|\/)[^/]*(?:lock|manifest|dependencies)[^/]*\.(?:json|toml|ya?ml|txt)$/.test(lowerPath)) score += 320;
+        }
+        const basename = candidate.path.slice(candidate.path.lastIndexOf('/') + 1);
+        if (feedback.toLowerCase().includes(basename.toLowerCase())) score += 160;
+        return { ...candidate, score };
+      })
+      .filter(candidate => candidate.score > 0)
+      .sort((left, right) =>
+        right.score - left.score || left.path.localeCompare(right.path)
+      );
+    const candidate = candidates[0];
+    if (!candidate) return [];
+    const compactFeedback = feedback.length <= 2_800
+      ? feedback
+      : `${feedback.slice(0, 700)}\n[older external feedback compacted]\n${feedback.slice(-2_100)}`;
+    return [{
+      toolName: 'fs.synthesize',
+      params: {
+        path: candidate.path,
+        instructions: [
+          'Apply the smallest coherent, interface-preserving change that resolves the newest external verifier feedback.',
+          `Authoritative external feedback:\n${compactFeedback}`,
+          'Use the already observed current file as the patch base. Preserve unrelated working declarations and do not alter benchmark or verifier files.',
+        ].join('\n\n'),
+        strategy: 'patch',
+      },
+      reason: `The external verifier identifies a concrete failure category and ${candidate.path} is the highest-priority observed file that controls it.`,
+      groundingRequired: true,
+    }];
+  }
+
   planWorkspaceFailureFollowUps(input: {
     calls: ObservedToolCall[];
     bindings: ToolPlanBinding[];
