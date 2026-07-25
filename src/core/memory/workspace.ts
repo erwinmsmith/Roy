@@ -960,12 +960,33 @@ export class WorkspaceMemoryManager {
         .sort((left, right) => left.updatedAt - right.updatedAt)
         .slice(-Math.max(1, maxSteps));
       const stepIds = new Set(boundedSteps.map(step => step.stepId));
+      const boundedPaths = upsert(current.paths ?? [], [snapshot.path])
+        .filter(item => stepIds.has(item.stepId))
+        .sort((left, right) => left.updatedAt - right.updatedAt);
+      const seenToolCalls = new Set<string>();
+      const deltaPaths = boundedPaths.map(item => ({
+        ...item,
+        toolFrontier: (item.toolFrontier ?? []).filter(call => {
+          const fingerprint = JSON.stringify({
+            toolName: call.toolName,
+            params: call.params,
+            startedAt: call.startedAt,
+            completedAt: call.completedAt,
+          });
+          if (seenToolCalls.has(fingerprint)) return false;
+          seenToolCalls.add(fingerprint);
+          return true;
+        }),
+      }));
       const state: ExecutionKnowledgeCacheState = {
         version: 1,
         updatedAt: Date.now(),
         steps: boundedSteps,
-        paths: upsert(current.paths ?? [], [snapshot.path])
-          .filter(item => stepIds.has(item.stepId)),
+        // A path references its parents by ID; copying every inherited tool
+        // payload into every descendant made long runs grow quadratically.
+        // Persist each causal call once and reconstruct the active frontier
+        // from the selected path deltas when resuming.
+        paths: deltaPaths,
         actors: upsert(current.actors ?? [], snapshot.actors)
           .filter(item => stepIds.has(item.stepId)),
         feedback: upsert(current.feedback ?? [], snapshot.feedback)

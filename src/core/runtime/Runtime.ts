@@ -3,7 +3,7 @@
 import 'dotenv/config';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { readFile, stat } from 'node:fs/promises';
+import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { config } from '../../config/index.js';
 import { logger } from '../utils/logger.js';
@@ -750,6 +750,19 @@ interface WorkspaceMutationCheckpoint {
   baseline?: VerifierScorecard;
   candidateFingerprint: string;
   createdAt: number;
+}
+
+interface PersistentVerifierWorkspaceCheckpoint {
+  version: 1;
+  sessionId: string;
+  scorecard: VerifierScorecard;
+  files: Array<{
+    path: string;
+    content: string;
+    sha256: string;
+  }>;
+  correlationId: string;
+  verifiedAt: number;
 }
 
 export class Runtime {
@@ -2777,6 +2790,74 @@ export class Runtime {
         agentId,
         options.correlationId ?? ctx.sessionId
       );
+      const persistentRecovery = (
+        result.result as {
+          persistentCheckpointRecovery?: {
+            restored?: unknown;
+            expectedReward?: unknown;
+          };
+        } | undefined
+      )?.persistentCheckpointRecovery;
+      if (persistentRecovery?.restored === true) {
+        const recoveryResult = result;
+        let reverified = runtimeTool
+          ? await this.executeRuntimeTool(runtimeTool, params)
+          : await toolRegistry.execute(toolName, params);
+        reverified = await this.attachVerifierDiagnostics(
+          reverified,
+          agentId,
+          options.correlationId
+        );
+        const reverifiedScorecard = this.verifierScorecardFromToolResult(
+          reverified.result
+        );
+        const expectedReward = Number(persistentRecovery.expectedReward);
+        const restoreVerified = Boolean(
+          reverified.success
+          && reverifiedScorecard
+          && Number.isFinite(expectedReward)
+          && reverifiedScorecard.reward + 1e-12 >= expectedReward
+        );
+        const recoveryMetadata = {
+          ...persistentRecovery,
+          reverified: restoreVerified,
+          reverifiedReward: reverifiedScorecard?.reward,
+        };
+        this.emit({
+          type: restoreVerified
+            ? 'workspace.verifier_checkpoint.reverified'
+            : 'workspace.verifier_checkpoint.reverification_failed',
+          agentId,
+          correlationId: options.correlationId,
+          data: recoveryMetadata,
+        });
+        result = {
+          ...reverified,
+          ...(!restoreVerified
+            ? {
+              success: false,
+              error: [
+                reverified.error,
+                `Persistent verifier checkpoint restoration did not reproduce reward ${expectedReward}.`,
+              ].filter(Boolean).join('\n'),
+            }
+            : {}),
+          result: {
+            ...(
+              reverified.result && typeof reverified.result === 'object'
+                ? reverified.result as Record<string, unknown>
+                : {}
+            ),
+            persistentCheckpointRecovery: recoveryMetadata,
+            candidateRollback: (
+              recoveryResult.result as { candidateRollback?: unknown } | undefined
+            )?.candidateRollback,
+            regressionRollback: (
+              recoveryResult.result as { regressionRollback?: unknown } | undefined
+            )?.regressionRollback,
+          },
+        };
+      }
     }
     this.recordToolPathOutcome(agentId, toolName, params, result, options.correlationId);
     this.toolCallCounts.set(callKey, calls + 1);
@@ -3037,10 +3118,36 @@ export class Runtime {
     const checkpoint = checkpoints.find(item => item.baseline)
       ?? checkpoints[0];
     const current = this.verifierScorecardFromToolResult(toolResult.result);
-    if (!checkpoint || !checkpoint.baseline || !current) return toolResult;
+    if (!current) return toolResult;
+    if (!checkpoint) {
+      return await this.restorePersistentVerifierWorkspaceCheckpoint(
+        toolResult,
+        current,
+        agentId,
+        correlationId
+      );
+    }
+    if (!checkpoint.baseline) {
+      this.mutationCheckpointsByCorrelation.delete(correlationId);
+      await this.persistAcceptedVerifierWorkspaceCheckpoint(
+        current,
+        checkpoints,
+        agentId,
+        correlationId
+      );
+      return toolResult;
+    }
     this.mutationCheckpointsByCorrelation.delete(correlationId);
     const baseline = checkpoint.baseline;
-    if (current.reward > baseline.reward + 1e-12) return toolResult;
+    if (current.reward > baseline.reward + 1e-12) {
+      await this.persistAcceptedVerifierWorkspaceCheckpoint(
+        current,
+        checkpoints,
+        agentId,
+        correlationId
+      );
+      return toolResult;
+    }
     const regressedGroups = Object.keys(baseline.groups)
       .filter(group => (current.groups[group] ?? 0) + 1e-12 < baseline.groups[group]!)
       .map(group => ({
@@ -3146,6 +3253,196 @@ export class Runtime {
             },
           }
           : {}),
+      },
+    };
+  }
+
+  private persistentVerifierWorkspaceCheckpointPath(): string {
+    return path.join(
+      this.workspaceRoot,
+      '.roy',
+      'cache',
+      'accepted-workspace-checkpoint.json'
+    );
+  }
+
+  private async readPersistentVerifierWorkspaceCheckpoint():
+  Promise<PersistentVerifierWorkspaceCheckpoint | undefined> {
+    try {
+      const parsed = JSON.parse(await readFile(
+        this.persistentVerifierWorkspaceCheckpointPath(),
+        'utf8'
+      )) as PersistentVerifierWorkspaceCheckpoint;
+      if (parsed.version !== 1
+        || parsed.sessionId !== this.getContext().sessionId
+        || !parsed.scorecard
+        || typeof parsed.scorecard.reward !== 'number'
+        || !Array.isArray(parsed.files)
+        || parsed.files.length === 0) {
+        return undefined;
+      }
+      return parsed;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async persistAcceptedVerifierWorkspaceCheckpoint(
+    scorecard: VerifierScorecard,
+    checkpoints: WorkspaceMutationCheckpoint[],
+    agentId: string,
+    correlationId: string
+  ): Promise<void> {
+    const existing = await this.readPersistentVerifierWorkspaceCheckpoint();
+    if (existing && existing.scorecard.reward > scorecard.reward + 1e-12) return;
+    const filesByPath = new Map(
+      existing?.files.map(file => [file.path, file]) ?? []
+    );
+    for (const checkpoint of checkpoints) {
+      const normalizedPath = this.normalizeCachedPath(checkpoint.path);
+      if (!normalizedPath
+        || normalizedPath === '.'
+        || normalizedPath.startsWith('.roy/official-verifier/')) {
+        continue;
+      }
+      const absolutePath = path.resolve(this.workspaceRoot, normalizedPath);
+      const relativePath = path.relative(this.workspaceRoot, absolutePath);
+      if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) continue;
+      try {
+        const content = await readFile(absolutePath, 'utf8');
+        filesByPath.set(normalizedPath, {
+          path: normalizedPath,
+          content,
+          sha256: createHash('sha256').update(content).digest('hex'),
+        });
+      } catch {
+        // A checkpoint remains useful even when one optional generated file is
+        // no longer present. Existing accepted files are retained above.
+      }
+    }
+    if (filesByPath.size === 0) return;
+    const persisted: PersistentVerifierWorkspaceCheckpoint = {
+      version: 1,
+      sessionId: this.getContext().sessionId,
+      scorecard,
+      files: [...filesByPath.values()].sort((left, right) =>
+        left.path.localeCompare(right.path)
+      ),
+      correlationId,
+      verifiedAt: Date.now(),
+    };
+    const destination = this.persistentVerifierWorkspaceCheckpointPath();
+    await mkdir(path.dirname(destination), { recursive: true });
+    const temporary = `${destination}.${process.pid}.${randomUUID()}.tmp`;
+    await writeFile(temporary, `${JSON.stringify(persisted, null, 2)}\n`, 'utf8');
+    await rename(temporary, destination);
+    this.emit({
+      type: 'workspace.verifier_checkpoint.persisted',
+      agentId,
+      correlationId,
+      data: {
+        reward: scorecard.reward,
+        groups: scorecard.groups,
+        paths: persisted.files.map(file => file.path),
+        checkpointPath: path.relative(this.workspaceRoot, destination),
+      },
+    });
+  }
+
+  private async restorePersistentVerifierWorkspaceCheckpoint(
+    toolResult: ToolResult,
+    current: VerifierScorecard,
+    agentId: string,
+    correlationId: string
+  ): Promise<ToolResult> {
+    const accepted = await this.readPersistentVerifierWorkspaceCheckpoint();
+    if (!accepted || current.reward + 1e-12 >= accepted.scorecard.reward) {
+      return toolResult;
+    }
+    const failures: Array<{ path: string; error: string }> = [];
+    const restoredPaths: string[] = [];
+    for (const file of accepted.files) {
+      const normalizedPath = this.normalizeCachedPath(file.path);
+      const expectedHash = createHash('sha256').update(file.content).digest('hex');
+      if (expectedHash !== file.sha256
+        || normalizedPath === '.'
+        || normalizedPath.startsWith('.roy/official-verifier/')) {
+        failures.push({ path: file.path, error: 'checkpoint integrity validation failed' });
+        continue;
+      }
+      const restored = await new FsWriteTool(this.workspaceRoot).execute({
+        path: normalizedPath,
+        content: file.content,
+        mode: 'overwrite',
+        createDirectories: true,
+      });
+      if (!restored.success) {
+        failures.push({
+          path: normalizedPath,
+          error: restored.error ?? 'unknown restore failure',
+        });
+        continue;
+      }
+      restoredPaths.push(normalizedPath);
+    }
+    if (failures.length > 0 || restoredPaths.length === 0) {
+      return {
+        ...toolResult,
+        success: false,
+        error: [
+          toolResult.error,
+          `Persistent accepted workspace restoration failed: ${JSON.stringify(failures)}`,
+        ].filter(Boolean).join('\n'),
+      };
+    }
+    const candidateRollback = {
+      restored: true,
+      path: restoredPaths[0],
+      restoredPaths,
+      reason: 'persisted_accepted_workspace_regression',
+      candidateFingerprint: this.fingerprint({
+        current,
+        acceptedAt: accepted.verifiedAt,
+      }),
+      baselineReward: accepted.scorecard.reward,
+      candidateReward: current.reward,
+      baselineGroups: accepted.scorecard.groups,
+      candidateGroups: current.groups,
+      regressedGroups: Object.keys(accepted.scorecard.groups)
+        .filter(group =>
+          (current.groups[group] ?? 0) + 1e-12 < accepted.scorecard.groups[group]!
+        )
+        .map(group => ({
+          group,
+          before: accepted.scorecard.groups[group],
+          after: current.groups[group] ?? 0,
+        })),
+      improvedGroups: [],
+    };
+    const persistentCheckpointRecovery = {
+      restored: true,
+      restoredPaths,
+      expectedReward: accepted.scorecard.reward,
+      observedReward: current.reward,
+      checkpointVerifiedAt: accepted.verifiedAt,
+      checkpointCorrelationId: accepted.correlationId,
+    };
+    this.emit({
+      type: 'workspace.verifier_checkpoint.restored',
+      agentId,
+      correlationId,
+      data: persistentCheckpointRecovery,
+    });
+    return {
+      ...toolResult,
+      result: {
+        ...(toolResult.result as Record<string, unknown>),
+        persistentCheckpointRecovery,
+        candidateRollback,
+        regressionRollback: {
+          ...candidateRollback,
+          regressedReward: current.reward,
+        },
       },
     };
   }
@@ -4045,7 +4342,7 @@ export class Runtime {
       groundingCalls,
       normalizedPath,
       synthesisStrategy === 'patch'
-        ? focusedInstructions.includes('VERIFIER_PROBE_') ? 12_000 : 20_000
+        ? focusedInstructions.includes('VERIFIER_PROBE_') ? 6_000 : 20_000
         : 30_000,
       focusedInstructions
     );
@@ -8394,11 +8691,31 @@ export class Runtime {
       }
       await this.transitionAgentFsm(agentId, 'S_reasoning', { task, correlationId: options.correlationId });
       let result = '';
+      const freshVerifierDiagnostic = actorDiagnosticProbeRequired
+        && grounding.toolCalls.some(call =>
+          this.isFocusedVerifierDiagnosticCall(call)
+        );
       const freshIndependentVerification = priorIndependentVerification
         && grounding.toolCalls.some(call =>
           isSuccessfulWorkspaceVerificationCall(call)
         );
-      if (freshIndependentVerification) {
+      if (freshVerifierDiagnostic) {
+        result = this.buildDeterministicVerifierDiagnosticResult(grounding);
+        this.emit({
+          type: 'agent.verifier_diagnostic.summary.deterministic',
+          agentId,
+          sessionId: ctx.sessionId,
+          correlationId: options.correlationId,
+          nodeId: options.nodeId,
+          data: {
+            focusedReproductions: grounding.toolCalls.filter(call =>
+              this.isFocusedVerifierDiagnosticCall(call)
+            ).length,
+            reason: 'executable_probe_evidence_flows_directly_to_repair_synthesis',
+            resultChars: result.length,
+          },
+        });
+      } else if (freshIndependentVerification) {
         result = [
           '[runtime_independent_verification_closure]',
           'The runtime reran the authoritative post-mutation verifier for this tester role.',
@@ -10579,6 +10896,45 @@ export class Runtime {
     if (output.length <= maxChars) return output;
     const head = Math.floor(maxChars * 0.4);
     return `${output.slice(0, head)}\n[runtime_verifier_probe_compacted]\n${output.slice(-(maxChars - head))}`;
+  }
+
+  private buildDeterministicVerifierDiagnosticResult(
+    grounding: GroundingRunResult
+  ): string {
+    const diagnosticCalls = grounding.toolCalls.filter(call =>
+      this.isFocusedVerifierDiagnosticCall(call)
+    );
+    const probeEvidence = diagnosticCalls
+      .map(call => {
+        const result = call.result as {
+          stdout?: unknown;
+          stderr?: unknown;
+        } | undefined;
+        return [result?.stdout, result?.stderr]
+          .filter((value): value is string => typeof value === 'string' && value.length > 0)
+          .join('\n');
+      })
+      .filter(Boolean)
+      .map(output => this.compactVerifierProbeEvidenceText(output, 3_200))
+      .join('\n');
+    const observedSources = grounding.toolCalls
+      .filter(call => call.toolName === 'fs.read' && call.success)
+      .map(call => this.normalizeToolWorkspacePath(String(
+        (call.result as { path?: unknown } | undefined)?.path
+          ?? call.params.path
+          ?? ''
+      )))
+      .filter(sourcePath =>
+        sourcePath
+        && sourcePath !== '.'
+        && !sourcePath.startsWith('.roy/official-verifier/')
+      );
+    return [
+      '[runtime_verifier_diagnostic_evidence_closure]',
+      'The runtime executed the focused verifier probe. The next repair member must consume these direct expected-versus-actual observations without another narrative diagnosis pass.',
+      `Authoritative implementation snapshots observed: ${[...new Set(observedSources)].join(', ') || 'none'}`,
+      probeEvidence || 'The focused probe completed without printable mismatch markers.',
+    ].join('\n\n').slice(0, 3_900);
   }
 
   private boundExecutionToolFrontier(

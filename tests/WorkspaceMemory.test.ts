@@ -321,4 +321,89 @@ describe('Workspace memory initialization', () => {
     );
     expect(researcherMemory.match(/For project inspection tasks, call `fs\.list`/g)).toHaveLength(1);
   });
+
+  it('persists inherited causal tool calls once as path deltas', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-execution-delta-cache-'));
+    const memory = new WorkspaceMemoryManager();
+    await memory.initWorkspace(workspaceCwd, 'execution-delta-cache');
+    const now = Date.now();
+    const sharedCall = {
+      toolName: 'fs.read',
+      params: { path: 'src/implementation.py' },
+      result: { path: 'src/implementation.py', content: 'VALUE = 1\n' },
+      success: true,
+      startedAt: now,
+      completedAt: now + 1,
+    };
+    type Snapshot = Parameters<WorkspaceMemoryManager['writeExecutionCacheSnapshot']>[0];
+    const snapshot = (
+      stepId: string,
+      index: number,
+      toolFrontier: Snapshot['path']['toolFrontier']
+    ): Snapshot => ({
+      step: {
+        id: `${stepId}.cache`,
+        correlationId: 'delta-correlation',
+        stepId,
+        index,
+        task: 'Repair the implementation.',
+        taskFingerprint: 'task-fingerprint',
+        pathId: `${stepId}.path`,
+        dependsOn: index === 1 ? [] : ['step_01'],
+        action: 'delegate',
+        status: 'completed',
+        actorIds: [],
+        teamIds: [],
+        feedbackIds: [],
+        createdAt: now + index,
+        updatedAt: now + index,
+      },
+      path: {
+        id: `${stepId}.path`,
+        correlationId: 'delta-correlation',
+        stepId,
+        parentPathIds: index === 1 ? [] : ['step_01.path'],
+        taskFingerprint: 'task-fingerprint',
+        status: 'completed',
+        actorIds: [],
+        teamIds: [],
+        observedPaths: ['src/implementation.py'],
+        invalidPaths: [],
+        successfulTools: ['fs.read'],
+        failedTools: [],
+        mutationObserved: false,
+        verificationObserved: false,
+        toolFrontier,
+        feedbackIds: [],
+        createdAt: now + index,
+        updatedAt: now + index,
+      },
+      actors: [],
+      feedback: [],
+    });
+    await memory.writeExecutionCacheSnapshot(snapshot('step_01', 1, [sharedCall]));
+    await memory.writeExecutionCacheSnapshot(snapshot('step_02', 2, [
+      sharedCall,
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m pytest' },
+        result: { exitCode: 0, stdout: 'passed' },
+        success: true,
+        startedAt: now + 2,
+        completedAt: now + 3,
+      },
+    ]));
+
+    const persisted = JSON.parse(await readFile(
+      path.join(workspaceCwd, '.roy', 'cache', 'execution-knowledge.json'),
+      'utf8'
+    )) as {
+      paths: Array<{ id: string; toolFrontier: Array<{ toolName: string }> }>;
+    };
+    expect(persisted.paths.flatMap(item => item.toolFrontier)).toHaveLength(2);
+    expect(persisted.paths.find(item => item.id === 'step_01.path')?.toolFrontier)
+      .toEqual([expect.objectContaining({ toolName: 'fs.read' })]);
+    expect(persisted.paths.find(item => item.id === 'step_02.path')?.toolFrontier)
+      .toEqual([expect.objectContaining({ toolName: 'shell.exec' })]);
+  });
 });

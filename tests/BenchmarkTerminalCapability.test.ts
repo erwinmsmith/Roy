@@ -1509,6 +1509,129 @@ describe('benchmark terminal capability', () => {
     await runtime.shutdown();
   });
 
+  it('persists an accepted workspace checkpoint and restores it across runtime processes', async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), 'roy-persistent-verifier-checkpoint-'));
+    await mkdir(path.join(workspace, '.roy', 'official-verifier'), { recursive: true });
+    await mkdir(path.join(workspace, 'logs', 'verifier'), { recursive: true });
+    await writeFile(path.join(workspace, 'implementation.py'), 'VALUE = 41\n');
+    await writeFile(
+      path.join(workspace, '.roy', 'config.json'),
+      JSON.stringify({
+        tools: {
+          approval: { readOnly: 'auto', write: 'auto', execute: 'auto' },
+          shell: { mode: 'unrestricted', shell: '/bin/sh' },
+        },
+      })
+    );
+    await writeFile(
+      path.join(workspace, '.roy', 'official-verifier', 'grade.py'),
+      [
+        'import json',
+        'from pathlib import Path',
+        'value = int(Path("implementation.py").read_text().split("=")[1].strip())',
+        'reward = 0.8 if value == 42 else (0.5 if value == 41 else 0.1)',
+        'groups = {"public": 1 if reward >= 0.5 else 0, "hidden": 1 if reward >= 0.8 else 0}',
+        'Path("logs/verifier/scorecard.json").write_text(json.dumps({"groups": groups, "reward": reward}))',
+        'print(f"{reward:.12f}")',
+      ].join('\n') + '\n'
+    );
+
+    const firstRuntime = new Runtime();
+    await firstRuntime.initialize({
+      sessionId: 'persistent-verifier-checkpoint-test',
+      workspaceCwd: workspace,
+    });
+    const baseline = await firstRuntime.executeToolForAgent(
+      'root',
+      'shell.exec',
+      { command: 'python3 .roy/official-verifier/grade.py' },
+      { correlationId: 'accepted-checkpoint-turn' }
+    );
+    const baselineCall = {
+      toolName: 'shell.exec',
+      params: { command: 'python3 .roy/official-verifier/grade.py' },
+      reason: 'Establish baseline.',
+      groundingRequired: true,
+      success: baseline.success,
+      result: baseline.result,
+      error: baseline.error,
+    };
+    await firstRuntime.executeToolForAgent(
+      'root',
+      'fs.replace',
+      {
+        path: 'implementation.py',
+        oldText: 'VALUE = 41',
+        newText: 'VALUE = 42',
+        expectedReplacements: 1,
+      },
+      {
+        correlationId: 'accepted-checkpoint-turn',
+        groundingCalls: [baselineCall],
+      }
+    );
+    const improved = await firstRuntime.executeToolForAgent(
+      'root',
+      'shell.exec',
+      { command: 'python3 .roy/official-verifier/grade.py' },
+      {
+        correlationId: 'accepted-checkpoint-turn',
+        groundingCalls: [baselineCall],
+      }
+    );
+    expect((improved.result as { stdout?: string }).stdout).toContain('0.800000000000');
+    expect(JSON.parse(await readFile(
+      path.join(workspace, '.roy', 'cache', 'accepted-workspace-checkpoint.json'),
+      'utf8'
+    ))).toMatchObject({
+      sessionId: 'persistent-verifier-checkpoint-test',
+      scorecard: { reward: 0.8 },
+      files: [expect.objectContaining({ path: 'implementation.py' })],
+    });
+    await firstRuntime.shutdown();
+
+    await writeFile(path.join(workspace, 'implementation.py'), 'VALUE = -1\n');
+    const resumedRuntime = new Runtime();
+    await resumedRuntime.initialize({
+      sessionId: 'persistent-verifier-checkpoint-test',
+      workspaceCwd: workspace,
+    });
+    const recovered = await resumedRuntime.executeToolForAgent(
+      'root',
+      'shell.exec',
+      { command: 'python3 .roy/official-verifier/grade.py' },
+      { correlationId: 'checkpoint-recovery-turn' }
+    );
+
+    expect(recovered).toMatchObject({
+      success: true,
+      result: expect.objectContaining({
+        stdout: expect.stringContaining('0.800000000000'),
+        persistentCheckpointRecovery: expect.objectContaining({
+          restored: true,
+          reverified: true,
+          expectedReward: 0.8,
+          observedReward: 0.1,
+          reverifiedReward: 0.8,
+        }),
+      }),
+    });
+    expect(await readFile(path.join(workspace, 'implementation.py'), 'utf8'))
+      .toBe('VALUE = 42\n');
+    expect(resumedRuntime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'workspace.verifier_checkpoint.restored',
+      data: expect.objectContaining({
+        expectedReward: 0.8,
+        observedReward: 0.1,
+      }),
+    }));
+    expect(resumedRuntime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'workspace.verifier_checkpoint.reverified',
+      data: expect.objectContaining({ reverifiedReward: 0.8 }),
+    }));
+    await resumedRuntime.shutdown();
+  });
+
   it('runs an explicitly authorized shell loop and persists its execution tree', async () => {
     const workspace = await mkdtemp(path.join(tmpdir(), 'roy-terminal-task-'));
     await mkdir(path.join(workspace, '.roy'), { recursive: true });
