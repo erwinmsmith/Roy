@@ -493,6 +493,45 @@ describe('Autonomous multi-turn actor design', () => {
     await runtime.shutdown();
   });
 
+  it('marks exhausted transient turn recovery as a persisted retryable handoff', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-transient-turn-exhausted-'));
+    await mkdir(path.join(workspaceCwd, '.roy'), { recursive: true });
+    await writeFile(path.join(workspaceCwd, '.roy', 'config.json'), JSON.stringify({
+      llm: {
+        streamMaxAttempts: 1,
+        turnMaxAttempts: 2,
+        retryInitialDelayMs: 0,
+        retryMaxDelayMs: 0,
+      },
+      tom: { autoCompleteGaps: false, minimumCoverage: 0 },
+    }, null, 2));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'transient-turn-exhausted-test',
+      workspaceCwd,
+      llmProvider: new StreamResilienceLLM(),
+    });
+
+    await expect(runtime.handleUserTurnWithRecovery(
+      'FAIL_TURN: preserve the failed execution state after all provider retries.'
+    )).rejects.toThrow('Premature close');
+
+    expect(runtime.listRootExecutionTrees().map(tree => tree.status)).toEqual([
+      'failed',
+      'failed',
+    ]);
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'runtime.transient_turn.failed',
+      data: expect.objectContaining({
+        attempt: 2,
+        maxAttempts: 2,
+        retryable: true,
+        persistedState: true,
+      }),
+    }));
+    await runtime.shutdown();
+  });
+
   it('reserves reasoning tokens and retries an incomplete structured delegation response', async () => {
     const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-json-retry-'));
     await mkdir(path.join(workspaceCwd, '.roy'), { recursive: true });

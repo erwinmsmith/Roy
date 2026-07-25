@@ -145,34 +145,80 @@ async function main(): Promise<void> {
       budget: options.budget,
       wallClockLimitMs: options.wallClockMs,
     });
-    const recovery = await runtime.handleUserTurnWithRecovery(task);
-    const result = recovery.result;
-    const correlationIds = new Set(recovery.correlationIds);
-    const artifact = {
-      schemaVersion: 1,
-      sessionId: options.sessionId,
-      workspace,
-      task,
-      result,
-      recovery: {
-        attempts: recovery.attempts,
-        recovered: recovery.recovered,
-        correlationIds: recovery.correlationIds,
-      },
-      events: runtime.getEvents().filter(event =>
-        (event.correlationId !== undefined && correlationIds.has(event.correlationId))
-        || event.type.startsWith('runtime.transient_turn.')
-        || event.type === 'runtime.wall_clock_limit.applied'
-      ),
-      messages: (await Promise.all(
-        recovery.correlationIds.map(correlationId =>
-          runtime.getMessages({ correlationId, limit: 10_000 })
-        )
-      )).flat().sort((left, right) => left.createdAt - right.createdAt),
-      completedAt: new Date().toISOString(),
-    };
-    if (outputPath) await writeJsonAtomically(outputPath, artifact);
-    process.stdout.write(options.json ? `${JSON.stringify(artifact)}\n` : `${result.finalResponse}\n`);
+    try {
+      const recovery = await runtime.handleUserTurnWithRecovery(task);
+      const result = recovery.result;
+      const correlationIds = new Set(recovery.correlationIds);
+      const artifact = {
+        schemaVersion: 1,
+        status: 'completed',
+        sessionId: options.sessionId,
+        workspace,
+        task,
+        result,
+        recovery: {
+          attempts: recovery.attempts,
+          recovered: recovery.recovered,
+          correlationIds: recovery.correlationIds,
+        },
+        events: runtime.getEvents().filter(event =>
+          (event.correlationId !== undefined && correlationIds.has(event.correlationId))
+          || event.type.startsWith('runtime.transient_turn.')
+          || event.type === 'runtime.wall_clock_limit.applied'
+        ),
+        messages: (await Promise.all(
+          recovery.correlationIds.map(correlationId =>
+            runtime.getMessages({ correlationId, limit: 10_000 })
+          )
+        )).flat().sort((left, right) => left.createdAt - right.createdAt),
+        completedAt: new Date().toISOString(),
+      };
+      if (outputPath) await writeJsonAtomically(outputPath, artifact);
+      process.stdout.write(options.json ? `${JSON.stringify(artifact)}\n` : `${result.finalResponse}\n`);
+    } catch (error) {
+      const allEvents = runtime.getEvents();
+      const transientFailure = [...allEvents].reverse().find(event =>
+        event.type === 'runtime.transient_turn.failed'
+      );
+      const correlationIds = [...new Set(
+        allEvents
+          .filter(event => event.type === 'root.turn.failed' && event.correlationId)
+          .map(event => event.correlationId!)
+      )];
+      const correlationIdSet = new Set(correlationIds);
+      const artifact = {
+        schemaVersion: 1,
+        status: 'failed',
+        sessionId: options.sessionId,
+        workspace,
+        task,
+        error: {
+          name: error instanceof Error ? error.name : 'Error',
+          message: error instanceof Error ? error.message : String(error),
+          retryable: transientFailure?.data?.retryable === true,
+          persistedState: transientFailure?.data?.persistedState === true,
+        },
+        recovery: {
+          attempts: Number(transientFailure?.data?.attempt ?? correlationIds.length),
+          recovered: false,
+          correlationIds,
+        },
+        events: allEvents.filter(event =>
+          (event.correlationId !== undefined && correlationIdSet.has(event.correlationId))
+          || event.type.startsWith('runtime.transient_turn.')
+          || event.type === 'runtime.wall_clock_limit.applied'
+        ),
+        messages: (await Promise.all(
+          correlationIds.map(correlationId =>
+            runtime.getMessages({ correlationId, limit: 10_000 })
+          )
+        )).flat().sort((left, right) => left.createdAt - right.createdAt),
+        failedAt: new Date().toISOString(),
+      };
+      if (outputPath) await writeJsonAtomically(outputPath, artifact);
+      if (options.json) process.stdout.write(`${JSON.stringify(artifact)}\n`);
+      throw error;
+    }
   } finally {
     await runtime.shutdown();
   }
