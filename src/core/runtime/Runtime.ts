@@ -11891,19 +11891,20 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
         break;
       }
     }
-    let netMutationAfterDiagnostic = false;
+    let netMutationDepthAfterDiagnostic = 0;
     if (latestDiagnosticIndex >= 0) {
       for (const call of calls.slice(latestDiagnosticIndex + 1)) {
         if (isSuccessfulWorkspaceMutationCall(call)) {
-          netMutationAfterDiagnostic = true;
+          netMutationDepthAfterDiagnostic += 1;
         }
         const laterRollback = workspaceCandidateRollbackFromCall(call);
-        if (laterRollback?.restored === true) {
-          netMutationAfterDiagnostic = false;
+        if (laterRollback?.restored === true && netMutationDepthAfterDiagnostic > 0) {
+          netMutationDepthAfterDiagnostic -= 1;
         }
       }
     }
-    const cachedDiagnostic = latestDiagnosticIndex >= 0 && !netMutationAfterDiagnostic
+    const cachedDiagnostic = latestDiagnosticIndex >= 0
+      && netMutationDepthAfterDiagnostic === 0
       ? calls[latestDiagnosticIndex]
       : undefined;
     const rollback = workspaceCandidateRollbackFromCall(latestRejected);

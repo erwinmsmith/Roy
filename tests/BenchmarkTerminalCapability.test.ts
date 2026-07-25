@@ -550,6 +550,63 @@ describe('benchmark terminal capability', () => {
       ],
       team: expect.objectContaining({ name: 'VerifierGuidedRecoveryTeam-2' }),
     });
+
+    const staleAfterAcceptedProgress = structuredClone(failedAttempt);
+    const progressedFrontier = staleAfterAcceptedProgress.knowledge.paths[0]!.toolFrontier;
+    progressedFrontier.push(
+      diagnosticFrontier.at(-3)!,
+      {
+        toolName: 'fs.synthesize',
+        params: { path: 'implementation.py', strategy: 'patch' },
+        success: true,
+        result: { path: 'implementation.py', synthesized: true },
+        startedAt: now + 3,
+        completedAt: now + 4,
+      } as never,
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python .roy/official-verifier/grade.py' },
+        success: true,
+        result: { stdout: '0.6\n' },
+        startedAt: now + 5,
+        completedAt: now + 6,
+      } as never,
+      {
+        toolName: 'fs.synthesize',
+        params: { path: 'implementation.py', strategy: 'patch' },
+        success: true,
+        result: { path: 'implementation.py', synthesized: true },
+        startedAt: now + 7,
+        completedAt: now + 8,
+      } as never,
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python .roy/official-verifier/grade.py' },
+        success: true,
+        result: {
+          stdout: '0.5\n',
+          candidateRollback: {
+            restored: true,
+            path: 'implementation.py',
+            reason: 'reward_regression',
+            baselineReward: 0.6,
+            candidateReward: 0.5,
+          },
+        },
+        startedAt: now + 9,
+        completedAt: now + 10,
+      } as never
+    );
+    expect(buildRecovery(
+      'Repair implementation.py until the official verifier succeeds.',
+      staleAfterAcceptedProgress
+    )).toMatchObject({
+      agents: [
+        expect.objectContaining({ name: 'VerifierProbe-4' }),
+        expect.objectContaining({ name: 'FocusedRepairer-5' }),
+        expect.objectContaining({ name: 'RecoveryVerifier-6' }),
+      ],
+    });
   });
 
   it('reuses persisted invalid-path knowledge in a later correlation', async () => {
