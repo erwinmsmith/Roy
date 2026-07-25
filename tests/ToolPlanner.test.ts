@@ -1328,6 +1328,28 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('splits a compact question range into independent public web searches', () => {
+    const plans = new AgentToolPlanner().plan({
+      task: [
+        'Use web.search and web.fetch to find precise canonical answers.',
+        'Questions 1-3: Who sang the title song? Which state ended prohibition? Which actress was Miss Greenwich Village?',
+        'Provide answers with source URLs.',
+      ].join(' '),
+      workspacePath: '.',
+      archetype: 'researcher',
+      bindings: [
+        { name: 'web.search', enabled: true },
+        { name: 'web.fetch', enabled: true },
+      ],
+    });
+
+    expect(plans.map(plan => plan.params.query)).toEqual([
+      'Who sang the title song?',
+      'Which state ended prohibition?',
+      'Which actress was Miss Greenwich Village?',
+    ]);
+  });
+
   it('fetches an explicitly supplied public URL instead of searching again', () => {
     const plans = new AgentToolPlanner().plan({
       task: 'Read https://nodejs.org/api/globals.html and summarize the fetch section.',

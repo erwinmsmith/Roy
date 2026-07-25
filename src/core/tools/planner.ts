@@ -1303,6 +1303,20 @@ export class AgentToolPlanner {
         if (questions.length >= 10) break;
       }
     }
+    if (questions.length < 2
+      && /\bquestions?(?:\s+\d+\s*-\s*\d+)?\s*:/i.test(task)) {
+      const questionRegion = task.slice(
+        task.search(/\bquestions?(?:\s+\d+\s*-\s*\d+)?\s*:/i)
+      );
+      for (const match of questionRegion.matchAll(/([^?\n]{7,299}\?)/g)) {
+        addQuestion(String(match[1] ?? '')
+          .replace(
+            /^.*?\bquestions?(?:\s+\d+\s*-\s*\d+)?\s*:\s*/i,
+            ''
+          ));
+        if (questions.length >= 10) break;
+      }
+    }
     return questions;
   }
 

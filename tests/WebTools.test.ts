@@ -32,6 +32,62 @@ describe('web tools', () => {
     }));
   });
 
+  it('uses keyless Brave HTML search in auto mode and parses relevant evidence', async () => {
+    const html = `
+      <html><body>
+        <div class="snippet" data-type="web">
+          <div class="result-content">
+            <a href="https://history.example/prohibition">
+              <div class="search-snippet-title" title="The Night Prohibition Ended"></div>
+            </a>
+            <div class="generic-snippet">
+              <div class="content">Utah was the final state needed to ratify the 21st Amendment.</div>
+            </div>
+          </div>
+        </div>
+        <div class="snippet" data-type="web">
+          <div class="result-content">
+            <a href="http://127.0.0.1/private">
+              <div class="search-snippet-title" title="Unsafe"></div>
+            </a>
+          </div>
+        </div>
+      </body></html>`;
+    const fetchMock = vi.fn(async () => new Response(html, {
+      status: 200,
+      headers: { 'content-type': 'text/html' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubEnv('BRAVE_SEARCH_API_KEY', '');
+
+    const result = await new WebSearchTool({ searchProvider: 'auto' }).execute({
+      query: 'last state needed to end prohibition',
+      maxResults: 5,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.result).toEqual(expect.objectContaining({
+      provider: 'brave_html',
+      results: [{
+        title: 'The Night Prohibition Ended',
+        url: 'https://history.example/prohibition',
+        snippet: 'Utah was the final state needed to ratify the 21st Amendment.',
+        source: 'history.example',
+      }],
+    }));
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        hostname: 'search.brave.com',
+        search: expect.stringContaining('source=web'),
+      }),
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          'Accept-Language': 'en-US,en;q=0.9',
+        }),
+      })
+    );
+  });
+
   it('rejects localhost and cloud metadata URLs before fetching', async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);

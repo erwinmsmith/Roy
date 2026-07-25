@@ -3,7 +3,7 @@ import { isIP } from 'node:net';
 import { load } from 'cheerio';
 import type { Tool, ToolResult } from './types.js';
 
-export type WebSearchProviderName = 'auto' | 'brave' | 'bing';
+export type WebSearchProviderName = 'auto' | 'brave' | 'brave_html' | 'bing';
 
 export interface WebToolConfig {
   enabled: boolean;
@@ -91,13 +91,15 @@ export class WebSearchTool implements Tool {
     const maxResults = Math.min(Math.max(1, Number(params.maxResults ?? this.config.maxResults)), 10);
     const configuredKey = process.env[this.config.braveApiKeyEnv]?.trim();
     const provider = this.config.searchProvider === 'auto'
-      ? configuredKey ? 'brave' : 'bing'
+      ? configuredKey ? 'brave' : 'brave_html'
       : this.config.searchProvider;
 
     try {
       const results = provider === 'brave'
         ? await this.searchBrave(query, maxResults, configuredKey)
-        : await this.searchBing(query, maxResults);
+        : provider === 'brave_html'
+          ? await this.searchBraveHtml(query, maxResults)
+          : await this.searchBing(query, maxResults);
       return {
         success: true,
         result: {
@@ -162,6 +164,50 @@ export class WebSearchTool implements Tool {
         return { title, url: resultUrl, snippet, source: new URL(resultUrl).hostname } satisfies WebSearchResultItem;
       })
       .filter((item): item is WebSearchResultItem => Boolean(item))
+      .slice(0, maxResults);
+  }
+
+  private async searchBraveHtml(query: string, maxResults: number): Promise<WebSearchResultItem[]> {
+    const url = new URL('https://search.brave.com/search');
+    url.searchParams.set('q', query);
+    url.searchParams.set('source', 'web');
+    const response = await fetchWithTimeout(url, {
+      timeoutMs: this.config.timeoutMs,
+      headers: {
+        Accept: 'text/html',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'User-Agent': this.config.userAgent,
+      },
+    });
+    if (!response.ok) throw new Error(`Brave web search returned HTTP ${response.status}`);
+    const html = await response.text();
+    const $ = load(html);
+    return $('div.snippet[data-type="web"]').toArray()
+      .map(item => {
+        const container = $(item);
+        const anchor = container.find('.result-content > a[href]').first();
+        const resultUrl = anchor.attr('href')?.trim() ?? '';
+        const title = cleanText(
+          container.find('.search-snippet-title').first().attr('title')
+            ?? container.find('.search-snippet-title').first().text()
+        );
+        const snippet = cleanText(container.find('.generic-snippet .content').first().text());
+        if (!resultUrl
+          || !title
+          || !isPublicHttpUrl(resultUrl, this.config.allowHttp)) {
+          return undefined;
+        }
+        return {
+          title,
+          url: resultUrl,
+          snippet,
+          source: new URL(resultUrl).hostname,
+        } satisfies WebSearchResultItem;
+      })
+      .filter((item): item is WebSearchResultItem => Boolean(item))
+      .filter((item, index, items) =>
+        items.findIndex(candidate => candidate.url === item.url) === index
+      )
       .slice(0, maxResults);
   }
 }
