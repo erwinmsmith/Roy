@@ -1867,6 +1867,11 @@ export class AgentToolPlanner {
       }
       locations.push({ path: candidate, line });
     };
+    for (const match of output.matchAll(
+      /(?:^|[\s"'`([{])((?:\.{0,2}\/)?(?:[A-Za-z0-9_.@-]+\/)+[A-Za-z0-9_.@-]+\.(?:py|ts|tsx|js|jsx|mjs|cjs|java|go|rs|rb|php))(?=$|[\s"'`,:;)\]}])/g
+    )) {
+      add(String(match[1]));
+    }
     for (const match of output.matchAll(/\bFile\s+["']([^"']+)["'],\s+line\s+(\d+)/g)) {
       add(String(match[1]), String(match[2]));
     }

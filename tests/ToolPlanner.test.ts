@@ -890,6 +890,72 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('turns a path-only verifier failure into a localized repair frontier', () => {
+    const planner = new AgentToolPlanner();
+    const task = 'Migrate the application and satisfy the official verifier.';
+    const bindings = [
+      { name: 'fs.read', enabled: true },
+      { name: 'fs.synthesize', enabled: true },
+      { name: 'shell.exec', enabled: true },
+    ];
+    const failure = {
+      toolName: 'shell.exec',
+      params: {
+        command: 'python -m pytest -q .roy/official-verifier/test_outputs.py',
+      },
+      success: false,
+      result: {
+        cwd: '/app',
+        exitCode: 1,
+        stderr: [
+          'AssertionError: source violations in calls:',
+          'src/support_rag/retriever.py calls .get_relevant_documents()',
+        ].join(' '),
+      },
+    };
+
+    expect(planner.planWorkspaceFailureFollowUps({
+      workspaceRoot: '/app',
+      bindings,
+      calls: [failure],
+    })).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.read',
+        params: { path: 'src/support_rag/retriever.py' },
+      }),
+    ]);
+
+    const read = {
+      toolName: 'fs.read',
+      params: { path: 'src/support_rag/retriever.py' },
+      success: true,
+      result: {
+        path: 'src/support_rag/retriever.py',
+        content: [
+          'class FAQRetriever:',
+          '    def get_relevant_documents(self, query):',
+          '        return []',
+        ].join('\n'),
+        truncated: false,
+      },
+    };
+    expect(planner.planWorkspaceRepairTransition({
+      task,
+      workspaceRoot: '/app',
+      bindings,
+      calls: [failure, read],
+    })).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.synthesize',
+        params: expect.objectContaining({
+          path: 'src/support_rag/retriever.py',
+          instructions: expect.stringContaining('.get_relevant_documents()'),
+          strategy: 'patch',
+        }),
+      }),
+    ]);
+  });
+
   it('uses shell error text to inspect an imported workspace module', () => {
     const plans = new AgentToolPlanner().planWorkspaceFailureFollowUps({
       workspaceRoot: '/app',
