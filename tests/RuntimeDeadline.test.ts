@@ -239,8 +239,20 @@ describe('Runtime external wall-clock deadline', () => {
           acceptanceAuditPerformed: boolean;
           acceptanceAuditPassed: boolean;
         },
-        invalidated: boolean
+        invalidated: boolean,
+        audit: {
+          items: Array<{ status: 'verified' | 'failed' | 'blocked' | 'unverified' }>;
+        }
       ): boolean;
+      buildRootAcceptanceAuditTask(
+        task: string,
+        prior: {
+          evidence: {
+            observedPaths: string[];
+            toolResultSummary?: string;
+          };
+        }
+      ): string;
     };
     const closure = { mutationApplied: true, verificationPassed: true };
     const failedAudit = { performed: true, passed: false };
@@ -266,11 +278,42 @@ describe('Runtime external wall-clock deadline', () => {
     expect(runtime.shouldRequireFreshAcceptanceMutation({
       acceptanceAuditPerformed: true,
       acceptanceAuditPassed: false,
-    }, false)).toBe(true);
+    }, false, {
+      items: [{ status: 'unverified' }],
+    })).toBe(false);
     expect(runtime.shouldRequireFreshAcceptanceMutation({
       acceptanceAuditPerformed: true,
       acceptanceAuditPassed: false,
-    }, true)).toBe(false);
+    }, false, {
+      items: [{ status: 'failed' }],
+    })).toBe(true);
+    expect(runtime.shouldRequireFreshAcceptanceMutation({
+      acceptanceAuditPerformed: true,
+      acceptanceAuditPassed: false,
+    }, true, {
+      items: [{ status: 'failed' }],
+    })).toBe(false);
+
+    const auditTask = runtime.buildRootAcceptanceAuditTask(
+      'Implement and verify the project.',
+      {
+        evidence: {
+          observedPaths: [
+            'src/app.ts',
+            '.roy/agents/coder/sessions.jsonl',
+            '.roy/official-verifier/test_outputs.py',
+          ],
+          toolResultSummary: [
+            'Read src/app.ts',
+            'Read .roy/agents/coder/sessions.jsonl',
+            'Read .roy/official-verifier/test_outputs.py',
+          ].join('\n'),
+        },
+      }
+    );
+    expect(auditTask).toContain('src/app.ts');
+    expect(auditTask).toContain('.roy/official-verifier/test_outputs.py');
+    expect(auditTask).not.toContain('Read .roy/agents/coder/sessions.jsonl');
   });
 
   it('keeps fenced output contracts attached to acceptance requirements', () => {

@@ -20207,6 +20207,24 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     userTask: string,
     priorExecution: GroundingRunResult
   ): string {
+    const priorEvidence = String(
+      priorExecution.evidence.toolResultSummary ?? ''
+    )
+      .split(/\r?\n/)
+      .filter(line =>
+        !/(?:^|[\s"'`])\.roy\/(?:agents|cache|sessions|teams|traces)(?:\/|\b)/i.test(
+          line
+        )
+      )
+      .join('\n')
+      .slice(-12_000);
+    const observedProjectPaths = priorExecution.evidence.observedPaths
+      .filter(path =>
+        !/^\.roy\/(?!official-verifier(?:\/|$))/i.test(
+          this.normalizeToolWorkspacePath(path)
+        )
+      )
+      .slice(-120);
     return [
       '[runtime_acceptance_audit_phase]',
       'This is a read-only final audit. Do not modify, edit, write, patch, install, or create files during this audit.',
@@ -20220,8 +20238,12 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         '- Choose verification commands from observed project metadata instead of assuming a language or package manager.',
         '- Run the broadest relevant executable checks that fit the remaining time, preserving their real exit status.',
         '- Return concrete evidence for every acceptance item. A narrow passing check does not verify unrelated items.',
+        '- Treat .roy/agents, .roy/cache, .roy/sessions, .roy/teams, and .roy/traces as Runtime control-plane metadata, not project acceptance evidence. Do not inspect them.',
+        '- Do not infer a top-level agents/ path from Runtime actor metadata. Read only project paths established by workspace inventory or the authoritative project-path list below.',
+        '- The only .roy subtree that may contain project acceptance evidence is the read-only .roy/official-verifier mirror.',
       ].join('\n'),
-      `Prior execution evidence:\n${priorExecution.evidence.toolResultSummary?.slice(-12_000) || 'No prior textual evidence.'}`,
+      `Authoritative observed project paths:\n${observedProjectPaths.join('\n') || 'No project paths were retained.'}`,
+      `Prior execution evidence:\n${priorEvidence || 'No prior textual evidence.'}`,
     ].join('\n\n');
   }
 
@@ -20744,6 +20766,26 @@ For web-grounded work, use only facts present in the subagent report or runtime 
             auditRequired
           )
         : undefined;
+      if (priorClosure?.verificationPassed
+        && priorExecution?.acceptanceAudit?.performed
+        && !priorExecution.acceptanceAudit.passed
+        && !this.acceptanceAuditRequiresMutation(priorExecution.acceptanceAudit)) {
+        this.emit({
+          type: 'root.execution.acceptance.non_mutating_frontier',
+          agentId: 'root',
+          correlationId,
+          data: {
+            attempt,
+            reason: 'Acceptance is unverified or blocked, but no audit item contains evidence of a code defect; another mutation would be causally unsupported.',
+            missingItemIds: priorExecution.acceptanceAudit.missingItemIds,
+            statuses: priorExecution.acceptanceAudit.items.map(item => ({
+              id: item.id,
+              status: item.status,
+            })),
+          },
+        });
+        break;
+      }
       let baseTask = priorExecution
         ? this.buildRootExecutionRepairTask(userTask, priorExecution, attempt)
         : this.buildRootExecutionClosureTask(userTask, subagents, teamResults);
@@ -20796,7 +20838,8 @@ For web-grounded work, use only facts present in the subagent report or runtime 
           priorToolCalls: priorExecution?.toolCalls ?? delegatedExecution?.toolCalls,
           requireFreshMutation: this.shouldRequireFreshAcceptanceMutation(
             priorClosure,
-            acceptanceAuditInvalidated
+            acceptanceAuditInvalidated,
+            priorExecution?.acceptanceAudit
           ),
         }
       );
@@ -21144,13 +21187,21 @@ For web-grounded work, use only facts present in the subagent report or runtime 
 
   private shouldRequireFreshAcceptanceMutation(
     priorClosure: WorkspaceExecutionClosureStatus | undefined,
-    acceptanceAuditInvalidated: boolean
+    acceptanceAuditInvalidated: boolean,
+    acceptanceAudit?: WorkspaceAcceptanceAudit
   ): boolean {
     return !acceptanceAuditInvalidated
       && Boolean(
         priorClosure?.acceptanceAuditPerformed
         && !priorClosure.acceptanceAuditPassed
+        && this.acceptanceAuditRequiresMutation(acceptanceAudit)
       );
+  }
+
+  private acceptanceAuditRequiresMutation(
+    acceptanceAudit: WorkspaceAcceptanceAudit | undefined
+  ): boolean {
+    return acceptanceAudit?.items.some(item => item.status === 'failed') === true;
   }
 
   private summarizeRootExecutionClosure(execution: GroundingRunResult): string {
