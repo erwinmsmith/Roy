@@ -1732,7 +1732,25 @@ export class AgentToolPlanner {
       ));
       return this.isMutableImplementationPath(candidate);
     });
-    const implementationRead = implementationReads.find(call => {
+    const rejectedImportConsumerPath = rejectedCandidate
+      ? this.rejectedImportConsumerPath(
+        input.calls,
+        String(rejectedCandidate.path ?? ''),
+        input.workspaceRoot
+      )
+      : undefined;
+    const implementationRead = (
+      rejectedImportConsumerPath
+        ? implementationReads.find(call => {
+          const candidate = this.normalizeWorkspacePath(String(
+            (call.result as { path?: unknown } | undefined)?.path
+              ?? call.params.path
+              ?? ''
+          ));
+          return candidate === rejectedImportConsumerPath;
+        })
+        : undefined
+    ) ?? implementationReads.find(call => {
       const candidate = this.normalizeWorkspacePath(String(
         (call.result as { path?: unknown } | undefined)?.path
           ?? call.params.path
@@ -1755,14 +1773,16 @@ export class AgentToolPlanner {
       input.calls,
       targetPath
     );
+    const effectiveRejectedCandidate = targetRejectedCandidate
+      ?? (rejectedImportConsumerPath ? rejectedCandidate : undefined);
     const verifierGroups = {
-      ...(targetRejectedCandidate?.baselineGroups
+      ...(effectiveRejectedCandidate?.baselineGroups
         ?? latestScorecard?.groups
         ?? {}),
     };
     for (const group of [
-      ...(targetRejectedCandidate?.regressedGroups ?? []),
-      ...(targetRejectedCandidate?.improvedGroups ?? []),
+      ...(effectiveRejectedCandidate?.regressedGroups ?? []),
+      ...(effectiveRejectedCandidate?.improvedGroups ?? []),
     ]) {
       if (typeof group.before === 'number') verifierGroups[group.group] = group.before;
     }
@@ -1780,7 +1800,7 @@ export class AgentToolPlanner {
       .filter(([, score]) => score >= 1)
       .map(([group]) => group);
     const diagnosticSummary = this.verifierDiagnosticSummary(input.calls);
-    const instructions = targetRejectedCandidate
+    const instructions = effectiveRejectedCandidate
       ? [
         'Apply a focused semantics-preserving repair after the prior candidate was transactionally rejected.',
         failedGroups.length > 0
@@ -1791,16 +1811,19 @@ export class AgentToolPlanner {
         passingGroups.length > 0
           ? `Preserve the currently passing capabilities exactly: ${passingGroups.join(', ')}.`
           : 'Preserve all behavior not contradicted by the verifier evidence.',
-        targetRejectedCandidate.regressedGroups?.length
-          ? `Do not repeat the rejected regression in: ${targetRejectedCandidate.regressedGroups.map(item => item.group).join(', ')}.`
+        effectiveRejectedCandidate.regressedGroups?.length
+          ? `Do not repeat the rejected regression in: ${effectiveRejectedCandidate.regressedGroups.map(item => item.group).join(', ')}.`
           : 'Do not repeat the rejected whole-file strategy; make the smallest coherent semantic change supported by the official verifier source.',
+        rejectedImportConsumerPath
+          ? 'The rejected provider-side compatibility patch regressed accepted behavior. Repair the stale importing consumer instead of restoring the removed provider symbol.'
+          : '',
         diagnosticSummary
           ? `Use this newest focused expected-versus-actual verifier reproduction as the causal repair evidence:\n${diagnosticSummary}`
           : '',
         'Treat the grounded official verifier implementation as the executable specification and keep public interfaces stable.',
       ].filter(Boolean).join(' ')
       : 'Structurally repair the implementation to satisfy the grounded aggregate official-verifier failures and immutable assignment, preserving behavior already proven by passing verifier groups.';
-    if (targetRejectedCandidate && input.calls.some(call =>
+    if (effectiveRejectedCandidate && input.calls.some(call =>
       call.toolName === 'fs.synthesize'
       && this.normalizeWorkspacePath(String(call.params.path ?? '')) === targetPath
       && String(call.params.instructions ?? '') === instructions
@@ -1820,8 +1843,10 @@ export class AgentToolPlanner {
         instructions,
         strategy: 'patch',
       },
-      reason: targetRejectedCandidate
-        ? 'The prior candidate was rolled back; change the repair hypothesis to the unresolved verifier capabilities while preserving the accepted baseline.'
+      reason: effectiveRejectedCandidate
+        ? rejectedImportConsumerPath
+          ? 'The provider-side import compatibility candidate regressed accepted verifier groups; repair the grounded stale consumer while preserving the accepted baseline.'
+          : 'The prior candidate was rolled back; change the repair hypothesis to the unresolved verifier capabilities while preserving the accepted baseline.'
         : 'The causal frontier contains a non-perfect aggregate verifier result plus complete verifier and implementation source evidence; transition from inspection to a preserving repair.',
       groundingRequired: true,
     }];
@@ -2184,6 +2209,74 @@ export class AgentToolPlanner {
       seen.add(key);
       return true;
     });
+  }
+
+  private rejectedImportConsumerPath(
+    calls: ObservedToolCall[],
+    rejectedPath: string,
+    workspaceRoot?: string
+  ): string | undefined {
+    const normalizedRejectedPath = this.normalizeWorkspacePath(rejectedPath);
+    if (!normalizedRejectedPath) return undefined;
+    let rollbackIndex = -1;
+    for (let index = calls.length - 1; index >= 0; index -= 1) {
+      const rollback = workspaceCandidateRollbackFromCall(calls[index]!);
+      if (rollback?.restored !== true) continue;
+      if (this.normalizeWorkspacePath(String(rollback.path ?? ''))
+        !== normalizedRejectedPath) {
+        continue;
+      }
+      rollbackIndex = index;
+      break;
+    }
+    if (rollbackIndex < 0) return undefined;
+    for (let index = rollbackIndex; index >= 0; index -= 1) {
+      const call = calls[index]!;
+      if (call.toolName !== 'shell.exec') continue;
+      const shell = call.result as {
+        cwd?: unknown;
+        stdout?: unknown;
+        stderr?: unknown;
+        verifierDiagnostics?: unknown;
+      } | undefined;
+      const output = [
+        String(shell?.stdout ?? ''),
+        String(shell?.stderr ?? ''),
+        String(call.error ?? ''),
+        ...this.extractVerifierDiagnosticText(shell?.verifierDiagnostics),
+      ].filter(Boolean).join('\n');
+      const importFailure = /ImportError:\s+cannot import name\s+['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s+from\s+['"][^'"]+['"]\s+\(([^)\n]+)\)/i.exec(
+        output
+      );
+      if (!importFailure) continue;
+      const providerLocation = this.extractFailureLocations(
+        importFailure[2]!,
+        String(shell?.cwd ?? workspaceRoot ?? ''),
+        workspaceRoot
+      )[0]?.path;
+      if (providerLocation && providerLocation !== normalizedRejectedPath) {
+        continue;
+      }
+      const symbol = importFailure[1]!.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const importingFrame = new RegExp(
+        `File\\s+["']([^"']+\\.py)["'],\\s+line\\s+(\\d+)[^\\n]*\\n\\s*(?:from\\s+[^\\n]+\\s+import\\s+[^\\n]*\\b${symbol}\\b|import\\s+[^\\n]*\\b${symbol}\\b)`,
+        'gi'
+      );
+      const frames = [...output.matchAll(importingFrame)];
+      for (const frame of frames.reverse()) {
+        const consumer = this.extractFailureLocations(
+          `File "${String(frame[1])}", line ${String(frame[2])}`,
+          String(shell?.cwd ?? workspaceRoot ?? ''),
+          workspaceRoot
+        )[0]?.path;
+        if (consumer
+          && consumer !== normalizedRejectedPath
+          && this.isMutableImplementationPath(consumer)) {
+          return consumer;
+        }
+      }
+    }
+    return undefined;
   }
 
   private looksLikeShellMutation(command: string): boolean {

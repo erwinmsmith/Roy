@@ -1302,6 +1302,129 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('repairs a stale importing consumer after a provider compatibility patch regresses verified groups', () => {
+    const planner = new AgentToolPlanner();
+    const calls = [
+      {
+        toolName: 'fs.read',
+        params: { path: '.roy/official-verifier/test_outputs.py' },
+        success: true,
+        result: {
+          path: '.roy/official-verifier/test_outputs.py',
+          content: 'assert source_violations["stubs"] == []',
+        },
+      },
+      {
+        toolName: 'fs.read',
+        params: { path: 'src/support_rag/chain.py' },
+        success: true,
+        result: {
+          path: 'src/support_rag/chain.py',
+          content: 'from support_rag.models import LegacyAnswerLLM\n',
+        },
+      },
+      {
+        toolName: 'fs.read',
+        params: { path: 'src/support_rag/models.py' },
+        success: true,
+        result: {
+          path: 'src/support_rag/models.py',
+          content: 'class AnswerModel:\n    pass\n',
+        },
+      },
+      {
+        toolName: 'fs.synthesize',
+        params: {
+          path: 'src/support_rag/models.py',
+          instructions: 'Restore the missing imported symbol.',
+          strategy: 'patch',
+        },
+        success: true,
+        result: {
+          path: 'src/support_rag/models.py',
+          synthesized: true,
+        },
+      },
+      {
+        toolName: 'shell.exec',
+        params: {
+          command: 'python -m pytest -q .roy/official-verifier/test_outputs.py',
+        },
+        success: false,
+        result: {
+          cwd: '/app',
+          exitCode: 1,
+          stderr: [
+            'Traceback (most recent call last):',
+            '  File "/app/src/support_rag/chain.py", line 7, in <module>',
+            '    from support_rag.models import LegacyAnswerLLM',
+            "ImportError: cannot import name 'LegacyAnswerLLM' from 'support_rag.models' (/app/src/support_rag/models.py)",
+          ].join('\n'),
+          verifierDiagnostics: [{
+            path: '/logs/verifier/scorecard.json',
+            content: JSON.stringify({
+              groups: {
+                imports: 1,
+                router_structure: 1,
+                stubs: 0,
+              },
+              weights: {
+                imports: 0.1,
+                router_structure: 0.2,
+                stubs: 0.1,
+              },
+            }),
+          }],
+          candidateRollback: {
+            restored: true,
+            path: 'src/support_rag/models.py',
+            reason: 'reward_regression',
+            baselineReward: 0.3889,
+            candidateReward: 0.2778,
+            baselineGroups: {
+              imports: 1,
+              router_structure: 1,
+              stubs: 1,
+            },
+            candidateGroups: {
+              imports: 1,
+              router_structure: 1,
+              stubs: 0,
+            },
+            regressedGroups: [{
+              group: 'stubs',
+              before: 1,
+              after: 0,
+            }],
+          },
+        },
+      },
+    ];
+
+    expect(planner.planWorkspaceRepairTransition({
+      task: 'Migrate the application and preserve all passing verifier groups.',
+      workspaceRoot: '/app',
+      bindings: [
+        { name: 'fs.read', enabled: true },
+        { name: 'fs.synthesize', enabled: true },
+        { name: 'shell.exec', enabled: true },
+      ],
+      calls,
+    })).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.synthesize',
+        params: expect.objectContaining({
+          path: 'src/support_rag/chain.py',
+          instructions: expect.stringMatching(
+            /(?=.*Preserve the currently passing capabilities exactly: imports, router_structure, stubs)(?=.*stale importing consumer)/s
+          ),
+          strategy: 'patch',
+        }),
+        reason: expect.stringContaining('stale consumer'),
+      }),
+    ]);
+  });
+
   it('does not let a later missing test runner hide an earlier source traceback', () => {
     const plans = new AgentToolPlanner().planWorkspaceFailureFollowUps({
       workspaceRoot: '/app',
