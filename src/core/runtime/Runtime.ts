@@ -18435,10 +18435,29 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     const cachedRejectedVerifierCandidate = this.latestRejectedVerifierCandidate(
       priorPlannerCalls
     );
-    const priorRejectedVerifierCandidate = concreteExternalFeedback
+    const rejectedCandidateIsSuperseded = (
+      candidate: Record<string, unknown> | undefined
+    ): boolean => {
+      if (!candidate || !concreteExternalFeedback) return false;
+      const rejectedPath = this.normalizeToolWorkspacePath(String(
+        candidate.path ?? ''
+      ));
+      const authoritativePath = this.normalizeToolWorkspacePath(
+        concreteExternalFeedback.path ?? ''
+      );
+      return !rejectedPath
+        || !authoritativePath
+        || rejectedPath !== authoritativePath;
+    };
+    const cachedRejectionSuperseded = rejectedCandidateIsSuperseded(
+      cachedRejectedVerifierCandidate
+    );
+    const priorRejectedVerifierCandidate = cachedRejectionSuperseded
       ? undefined
       : cachedRejectedVerifierCandidate;
-    if (cachedRejectedVerifierCandidate && concreteExternalFeedback) {
+    if (cachedRejectionSuperseded
+      && cachedRejectedVerifierCandidate
+      && concreteExternalFeedback) {
       this.emit({
         type: 'tool.plan.rejected_candidate.superseded',
         agentId,
@@ -19005,7 +19024,11 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         }
         const rejectedCandidate = this.latestRejectedVerifierCandidate(
           context.calls
-        ) ?? (concreteExternalFeedback
+        ) ?? (rejectedCandidateIsSuperseded(
+          this.latestRejectedVerifierCandidate(
+            [...priorPlannerCalls, ...context.calls]
+          )
+        )
           ? undefined
           : this.latestRejectedVerifierCandidate(
             [...priorPlannerCalls, ...context.calls]

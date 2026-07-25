@@ -2064,6 +2064,60 @@ describe('benchmark terminal capability', () => {
         authoritativePath: 'src/app/retriever.py',
       }),
     }));
+
+    const repeated = await (runtime as unknown as {
+      runGroundingCheck: (
+        agentId: string,
+        task: string,
+        options: Record<string, unknown>
+      ) => Promise<{
+        toolCalls: Array<{
+          toolName: string;
+          params: Record<string, unknown>;
+          success: boolean;
+        }>;
+      }>;
+    }).runGroundingCheck(
+      'root',
+      recoveryTask,
+      {
+        correlationId: 'external-feedback-current-rejection-turn',
+        intentTask: recoveryTask,
+        initialPlans: [{
+          toolName: 'fs.replace',
+          params: {
+            path: 'src/app/retriever.py',
+            oldText: 'METHOD = "invoke"',
+            newText: 'METHOD = "retry"',
+            expectedReplacements: 1,
+          },
+          reason: 'Repeat the rejected current-target hypothesis.',
+          groundingRequired: true,
+        }],
+        skipInitialModelPlanning: true,
+        priorToolCalls: [{
+          toolName: 'shell.exec',
+          params: { command: 'python .roy/official-verifier/grade.py' },
+          success: true,
+          result: {
+            candidateRollback: {
+              restored: true,
+              path: 'src/app/retriever.py',
+              reason: 'no_objective_gain',
+              baselineReward: 0.2778,
+              candidateReward: 0.2778,
+            },
+          },
+        }],
+      }
+    );
+    expect(repeated.toolCalls.some(call =>
+      call.toolName === 'fs.replace'
+    )).toBe(false);
+    expect(await readFile(
+      path.join(workspace, 'src', 'app', 'retriever.py'),
+      'utf8'
+    )).not.toContain('METHOD = "retry"');
     await runtime.shutdown();
   });
 
