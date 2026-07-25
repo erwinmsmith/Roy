@@ -25,6 +25,15 @@ export interface WorkspaceCandidateRollback {
   improvedGroups?: Array<{ group: string; before?: number; after?: number }>;
 }
 
+export interface WorkspaceCandidateRetention {
+  retained: true;
+  path?: string;
+  reason?: string;
+  baselineReward?: number;
+  candidateReward?: number;
+  improvedGroups?: Array<{ group: string; before?: number; after?: number }>;
+}
+
 export function workspaceToolIntentFingerprint(
   call: Pick<ExecutionIntentCall, 'toolName' | 'params'>
 ): string {
@@ -256,6 +265,102 @@ export function workspaceCandidateRollbackFromCall(
     regressedGroups: parseGroups(rollback.regressedGroups),
     improvedGroups: parseGroups(rollback.improvedGroups),
   };
+}
+
+export function workspaceCandidateRetentionFromCall(
+  call: ExecutionIntentCall
+): WorkspaceCandidateRetention | undefined {
+  if (!call.result || typeof call.result !== 'object') return undefined;
+  const value = (call.result as { candidateRetention?: unknown }).candidateRetention;
+  if (!value || typeof value !== 'object') return undefined;
+  const retention = value as Record<string, unknown>;
+  if (retention.retained !== true) return undefined;
+  const improvedGroups = Array.isArray(retention.improvedGroups)
+    ? retention.improvedGroups.flatMap(item => {
+      if (!item || typeof item !== 'object') return [];
+      const group = item as Record<string, unknown>;
+      if (typeof group.group !== 'string') return [];
+      return [{
+        group: group.group,
+        before: typeof group.before === 'number' ? group.before : undefined,
+        after: typeof group.after === 'number' ? group.after : undefined,
+      }];
+    })
+    : undefined;
+  return {
+    retained: true,
+    path: typeof retention.path === 'string' ? retention.path : undefined,
+    reason: typeof retention.reason === 'string' ? retention.reason : undefined,
+    baselineReward: typeof retention.baselineReward === 'number'
+      ? retention.baselineReward
+      : undefined,
+    candidateReward: typeof retention.candidateReward === 'number'
+      ? retention.candidateReward
+      : undefined,
+    improvedGroups,
+  };
+}
+
+/**
+ * Defer a path after repeated retained candidates fail to move any verifier
+ * objective. The path becomes eligible again only after both its current
+ * snapshot and immutable verifier evidence are freshly grounded.
+ */
+export function workspaceTargetNeedsFreshNoGainEvidence(
+  calls: ExecutionIntentCall[],
+  targetPath: string,
+  attemptLimit = 2
+): boolean {
+  const normalizedTarget = normalizeWorkspaceRelativePath(targetPath);
+  if (!normalizedTarget || attemptLimit < 1) return false;
+  const retainedIndices: number[] = [];
+  for (let index = 0; index < calls.length; index += 1) {
+    const retention = workspaceCandidateRetentionFromCall(calls[index]!);
+    if (!retention) continue;
+    const retainedPath = normalizeWorkspaceRelativePath(String(retention.path ?? ''));
+    const noRewardGain = typeof retention.baselineReward !== 'number'
+      || typeof retention.candidateReward !== 'number'
+      || retention.candidateReward <= retention.baselineReward + 1e-12;
+    if (retainedPath === normalizedTarget
+      && noRewardGain
+      && (retention.improvedGroups?.length ?? 0) === 0) {
+      retainedIndices.push(index);
+    }
+  }
+  if (retainedIndices.length < attemptLimit) return false;
+  const latestRetentionIndex = retainedIndices.at(-1)!;
+  const newerCalls = calls.slice(latestRetentionIndex + 1);
+  const targetRegrounded = newerCalls.some(call =>
+    call.toolName === 'fs.read'
+    && call.success
+    && normalizeWorkspaceRelativePath(String(
+      (call.result as { path?: unknown } | undefined)?.path
+        ?? call.params.path
+        ?? ''
+    )) === normalizedTarget
+  );
+  const verifierRegrounded = newerCalls.some(call =>
+    call.toolName === 'fs.read'
+    && call.success
+    && normalizeWorkspaceRelativePath(String(
+      (call.result as { path?: unknown } | undefined)?.path
+        ?? call.params.path
+        ?? ''
+    )).startsWith('.roy/official-verifier/')
+  );
+  return !(targetRegrounded && verifierRegrounded);
+}
+
+export function plannedWorkspaceMutationPath(
+  call: Pick<ExecutionIntentCall, 'toolName' | 'params'>
+): string | undefined {
+  if (call.toolName !== 'fs.write'
+    && call.toolName !== 'fs.replace'
+    && call.toolName !== 'fs.synthesize') {
+    return undefined;
+  }
+  const normalized = normalizeWorkspaceRelativePath(String(call.params.path ?? ''));
+  return normalized || undefined;
 }
 
 export function isSuccessfulWorkspaceVerificationCall(call: ExecutionIntentCall): boolean {

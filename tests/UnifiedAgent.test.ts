@@ -123,6 +123,28 @@ class MutationRepairPlanningLLM extends PlanningLLM {
   }
 }
 
+class RepeatedNoGainMetadataPlanningLLM extends PlanningLLM {
+  constructor() {
+    super('none');
+  }
+
+  override async completeJSON<T>(): Promise<T> {
+    this.jsonCalls += 1;
+    return {
+      action: 'call_tools',
+      reason: 'Retry the same dependency metadata hypothesis.',
+      calls: [{
+        toolName: 'fs.synthesize',
+        params: {
+          path: 'pyproject.toml',
+          instructions: 'Retry the dependency migration.',
+          strategy: 'patch',
+        },
+      }],
+    } as T;
+  }
+}
+
 class FinishThenDiagnosticPlanningLLM extends PlanningLLM {
   constructor() {
     super('none');
@@ -1974,6 +1996,102 @@ describe('UnifiedAgent capability execution', () => {
       },
     })]);
     expect(JSON.stringify(plans)).not.toContain('def run');
+  });
+
+  it('advances beyond a repeatedly retained no-gain mutation target', async () => {
+    const llm = new RepeatedNoGainMetadataPlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'no-gain-frontier-agent',
+      goal: 'advance the causal repair frontier instead of oscillating',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.read', 'fs.synthesize', 'shell.exec'],
+    });
+    const retention = {
+      retained: true,
+      path: 'pyproject.toml',
+      reason: 'hard_gate_composition',
+      baselineReward: 0,
+      candidateReward: 0,
+      improvedGroups: [],
+    };
+    const calls = [
+      {
+        toolName: 'fs.read',
+        params: { path: 'src/support_rag/chain.py' },
+        reason: 'Inspect the failing implementation source.',
+        groundingRequired: true,
+        success: true,
+        result: {
+          path: 'src/support_rag/chain.py',
+          content: 'from langchain.chains import LLMChain\n',
+          truncated: false,
+        },
+      },
+      {
+        toolName: 'fs.read',
+        params: { path: '.roy/official-verifier/test_outputs.py' },
+        reason: 'Inspect the immutable acceptance checks.',
+        groundingRequired: true,
+        success: true,
+        result: {
+          path: '.roy/official-verifier/test_outputs.py',
+          content: 'FORBIDDEN_IMPORT_PREFIXES = ("langchain.chains",)\n',
+          truncated: false,
+        },
+      },
+      ...[1, 2].flatMap(attempt => [
+        {
+          toolName: 'fs.synthesize',
+          params: {
+            path: 'pyproject.toml',
+            instructions: `Dependency attempt ${attempt}.`,
+            strategy: 'patch',
+          },
+          reason: 'Try the metadata migration.',
+          groundingRequired: true,
+          success: true,
+          result: { path: 'pyproject.toml', synthesized: true },
+        },
+        {
+          toolName: 'shell.exec',
+          params: {
+            command: 'python -m pytest -q .roy/official-verifier/test_outputs.py',
+          },
+          reason: 'Run the official verifier.',
+          groundingRequired: true,
+          success: false,
+          error: 'project metadata still targets legacy runtime',
+          result: {
+            exitCode: 1,
+            stderr: 'project metadata still targets legacy runtime',
+            candidateRetention: retention,
+          },
+        },
+      ]),
+    ];
+
+    const plans = await agent.planNextToolRound({
+      task: 'Migrate pyproject.toml and src/support_rag/chain.py to the modern runtime.',
+      executionRequired: true,
+      round: 9,
+      remainingCalls: 3,
+      tools: [
+        { name: 'fs.read' },
+        { name: 'fs.synthesize' },
+        { name: 'shell.exec' },
+      ],
+      calls,
+    });
+
+    expect(plans).toEqual([expect.objectContaining({
+      toolName: 'fs.synthesize',
+      params: expect.objectContaining({
+        path: 'src/support_rag/chain.py',
+        strategy: 'patch',
+      }),
+    })]);
+    expect(JSON.stringify(plans)).not.toContain('pyproject.toml');
   });
 
   it('does not recover a destructive whole-file synthesis for an existing non-stub implementation', async () => {

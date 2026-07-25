@@ -33,8 +33,11 @@ export {
   isSuccessfulWorkspaceVerificationCall,
   isWorkspaceVerificationCall,
   lastEffectiveWorkspaceMutationCallIndex,
+  plannedWorkspaceMutationPath,
   taskRequestsWorkspaceMutation,
   workspaceCandidateRollbackFromCall,
+  workspaceCandidateRetentionFromCall,
+  workspaceTargetNeedsFreshNoGainEvidence,
   workspaceToolIntentFingerprint,
 } from './executionIntent.js';
 export { ToolApprovalManager } from './approval.js';
@@ -46,5 +49,6 @@ export type {
   ExecutionIntentCall,
   ParallelSourceMutation,
   WorkspaceCandidateRollback,
+  WorkspaceCandidateRetention,
 } from './executionIntent.js';
 export type { ToolApprovalDecision, ToolApprovalPolicy, ToolApprovalRequest, ToolApprovalResult } from './approval.js';

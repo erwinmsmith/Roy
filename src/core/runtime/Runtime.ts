@@ -58,9 +58,11 @@ import {
   isSuccessfulWorkspaceMutationCall,
   isSuccessfulWorkspaceVerificationCall,
   isWorkspaceVerificationCall,
+  plannedWorkspaceMutationPath,
   ShellExecTool,
   taskRequestsWorkspaceMutation,
   workspaceCandidateRollbackFromCall,
+  workspaceTargetNeedsFreshNoGainEvidence,
   workspaceToolIntentFingerprint,
   WebFetchTool,
   WebSearchTool,
@@ -4421,6 +4423,41 @@ export class Runtime {
           deferred: skipped.map(plan => ({
             toolName: plan.toolName,
             params: plan.params,
+          })),
+        },
+      });
+    }
+    return selected;
+  }
+
+  private deferRepeatedNoGainMutationTargets(
+    plans: PlannedToolCall[],
+    calls: ToolCallRecord[],
+    agentId?: string,
+    options?: { correlationId?: string; nodeId?: string }
+  ): PlannedToolCall[] {
+    const deferred: PlannedToolCall[] = [];
+    const selected = plans.filter(plan => {
+      const mutationPath = plannedWorkspaceMutationPath(plan);
+      if (!mutationPath
+        || !workspaceTargetNeedsFreshNoGainEvidence(calls, mutationPath)) {
+        return true;
+      }
+      deferred.push(plan);
+      return false;
+    });
+    if (deferred.length > 0 && agentId) {
+      this.emit({
+        type: 'tool.plan.no_gain_target.deferred',
+        agentId,
+        sessionId: this.getContext().sessionId,
+        correlationId: options?.correlationId,
+        nodeId: options?.nodeId,
+        data: {
+          reason: 'repeated_retained_candidate_requires_fresh_causal_evidence',
+          deferred: deferred.map(plan => ({
+            toolName: plan.toolName,
+            path: plannedWorkspaceMutationPath(plan),
           })),
         },
       });
@@ -18333,6 +18370,12 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         });
       }
     }
+    plans = this.deferRepeatedNoGainMutationTargets(
+      plans,
+      priorPlannerCalls,
+      agentId,
+      options
+    );
     plans = this.keepSingleWorkspaceMutationHypothesis(plans, agentId, options);
     const pendingInitialMirroredVerifier = pendingMirroredVerifierPlan(
       priorPlannerCalls
@@ -18644,7 +18687,15 @@ For web-grounded work, use only facts present in the subagent report or runtime 
               priorToolCalls: priorPlannerCalls.length + context.calls.length,
             },
           });
-          return causalTransitionPlans.slice(0, context.remainingCalls);
+          const eligible = this.deferRepeatedNoGainMutationTargets(
+            causalTransitionPlans,
+            combinedCalls,
+            agentId,
+            options
+          );
+          if (eligible.length > 0) {
+            return eligible.slice(0, context.remainingCalls);
+          }
         }
         const failureContextPlans = this.toolPlanner.planWorkspaceFailureFollowUps({
           calls: [...priorPlannerCalls, ...context.calls],
@@ -18675,7 +18726,15 @@ For web-grounded work, use only facts present in the subagent report or runtime 
               })),
             },
           });
-          return externalFeedbackRepair.slice(0, context.remainingCalls);
+          const eligible = this.deferRepeatedNoGainMutationTargets(
+            externalFeedbackRepair,
+            combinedCalls,
+            agentId,
+            options
+          );
+          if (eligible.length > 0) {
+            return eligible.slice(0, context.remainingCalls);
+          }
         }
         if (diagnosticProbeRequired
           && context.calls.some(call => this.isFocusedVerifierDiagnosticCall(call))) {
@@ -18805,7 +18864,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
             : undefined,
         });
         this.emitToolPlanningFailure(actor, agentId, options, context.round);
-        return llmPlans.filter(plan => {
+        const alignedPlans = llmPlans.filter(plan => {
           const parallelMutation = findParallelSourceMutation(
             plan,
             [...priorPlannerCalls, ...context.calls]
@@ -18832,6 +18891,12 @@ For web-grounded work, use only facts present in the subagent report or runtime 
           }
           return true;
         });
+        return this.deferRepeatedNoGainMutationTargets(
+          alignedPlans,
+          combinedCalls,
+          agentId,
+          options
+        );
       },
       onRoundStarted: (round, roundPlans) => {
         this.emit({

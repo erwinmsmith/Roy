@@ -6,7 +6,9 @@ import {
   hasEffectiveWorkspaceMutationCall,
   isSuccessfulWorkspaceMutationCall,
   isSuccessfulWorkspaceVerificationCall,
+  plannedWorkspaceMutationPath,
   taskRequestsWorkspaceMutation,
+  workspaceTargetNeedsFreshNoGainEvidence,
   workspaceToolIntentFingerprint,
 } from '../src/core/tools/executionIntent.js';
 
@@ -119,6 +121,65 @@ describe('workspace execution intent', () => {
     });
     expect(effectiveWorkspaceMutationCallIndices(calls)).toEqual([2]);
     expect(hasEffectiveWorkspaceMutationCall(calls)).toBe(true);
+  });
+
+  it('defers a repeatedly retained no-gain path until causal evidence is refreshed', () => {
+    const retention = {
+      retained: true,
+      path: 'pyproject.toml',
+      reason: 'hard_gate_composition',
+      baselineReward: 0,
+      candidateReward: 0,
+      improvedGroups: [],
+    };
+    const calls = [
+      {
+        toolName: 'shell.exec',
+        params: { command: 'pytest -q' },
+        success: false,
+        result: { candidateRetention: retention },
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'pytest -q' },
+        success: false,
+        result: { candidateRetention: retention },
+      },
+    ];
+
+    expect(workspaceTargetNeedsFreshNoGainEvidence(
+      calls,
+      './pyproject.toml'
+    )).toBe(true);
+    expect(plannedWorkspaceMutationPath({
+      toolName: 'fs.synthesize',
+      params: { path: './pyproject.toml' },
+    })).toBe('pyproject.toml');
+
+    calls.push({
+      toolName: 'fs.read',
+      params: { path: 'pyproject.toml' },
+      success: true,
+      result: { path: 'pyproject.toml', content: '[project]' },
+    });
+    expect(workspaceTargetNeedsFreshNoGainEvidence(
+      calls,
+      'pyproject.toml'
+    )).toBe(true);
+
+    calls.push({
+      toolName: 'fs.read',
+      params: { path: '.roy/official-verifier/test_outputs.py' },
+      success: true,
+      result: {
+        path: '.roy/official-verifier/test_outputs.py',
+        content: 'TARGET_VERSION = "1.3.4"',
+      },
+    });
+    expect(workspaceTargetNeedsFreshNoGainEvidence(
+      calls,
+      'pyproject.toml'
+    )).toBe(false);
   });
 
   it('does not accept verification commands that mask a failing exit status', () => {

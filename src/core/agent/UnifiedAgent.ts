@@ -26,8 +26,10 @@ import {
   isSuccessfulWorkspaceVerificationCall as isSuccessfulWorkspaceVerification,
   isWorkspaceVerificationCall,
   lastEffectiveWorkspaceMutationCallIndex,
+  plannedWorkspaceMutationPath,
   taskRequestsWorkspaceMutation as requestsWorkspaceMutation,
   workspaceCandidateRollbackFromCall,
+  workspaceTargetNeedsFreshNoGainEvidence,
   workspaceToolIntentFingerprint,
 } from '../tools/executionIntent.js';
 
@@ -162,6 +164,15 @@ export class UnifiedAgent extends BaseAgent {
       input.calls,
       intentTask
     ).some(candidate => candidate.implementationIntent);
+    const deferredNoGainTargets = Array.from(new Set(input.calls.flatMap(call => {
+      const path = String(
+        ((call.result as { candidateRetention?: { path?: unknown } } | undefined)
+          ?.candidateRetention?.path) ?? ''
+      );
+      return path && workspaceTargetNeedsFreshNoGainEvidence(input.calls, path)
+        ? [path]
+        : [];
+    })));
     const workspaceEvidenceSaturated = input.workspaceEvidenceSaturated === true
       && groundedImplementationTarget;
     const successfulInspection = input.calls.some(call =>
@@ -239,6 +250,9 @@ export class UnifiedAgent extends BaseAgent {
             : '',
           latestCandidateRollback(input.calls)
             ? 'The latest verifier transaction rejected and restored a source candidate because it did not improve the objective. Treat that candidate as a failed path. Do not repeat the same broad synthesis; use the changed group evidence to make a narrower, causally distinct repair.'
+            : '',
+          deferredNoGainTargets.length > 0
+            ? `Repeated retained candidates made no verifier progress on: ${deferredNoGainTargets.join(', ')}. Advance a different causal target. Reopen one of these paths only after freshly reading both its current snapshot and immutable verifier evidence.`
             : '',
           executionRequired && mutationApplied && !verificationPassed && !latestVerificationFailed
             ? 'At least one workspace mutation succeeded, but no verification has passed. Continue any remaining edits or repairs, then request a relevant test, build, lint, typecheck, or targeted assertion.'
@@ -405,6 +419,11 @@ export class UnifiedAgent extends BaseAgent {
         plannedCalls = plannedCalls.map(call =>
           alignSynthesisRepairTargetWithFailure(call, input.calls, intentTask)
         );
+        plannedCalls = plannedCalls.filter(call => {
+          const mutationPath = plannedWorkspaceMutationPath(call);
+          return !mutationPath
+            || !workspaceTargetNeedsFreshNoGainEvidence(input.calls, mutationPath);
+        });
         if (executionRequired && latestVerificationFailed) {
           if (inspectedAfterLatestFailure) {
             const localizedFailure = hasLocalizedVerificationFailureSinceLastMutation(
@@ -1485,7 +1504,10 @@ function recoverGroundedSynthesisPlan(input: {
     || (input.mutationRequirementSatisfied && !input.latestVerificationFailed)) {
     return undefined;
   }
-  const candidate = rankGroundedSynthesisTargets(input.calls, input.task)[0];
+  const candidate = rankGroundedSynthesisTargets(input.calls, input.task)
+    .find(item =>
+      !workspaceTargetNeedsFreshNoGainEvidence(input.calls, item.filePath)
+    );
   if (!candidate) return undefined;
   const rejectedCandidate = latestCandidateRollback(input.calls);
   if (rejectedCandidate
@@ -1708,7 +1730,9 @@ function alignSynthesisRepairTargetWithFailure(
   task: string
 ): PlannedToolCall {
   if (planned.toolName !== 'fs.synthesize') return planned;
-  const candidates = rankGroundedSynthesisTargets(calls, task);
+  const candidates = rankGroundedSynthesisTargets(calls, task).filter(candidate =>
+    !workspaceTargetNeedsFreshNoGainEvidence(calls, candidate.filePath)
+  );
   const best = candidates[0];
   const decisiveFailureTarget = Boolean(best?.failureMentioned && best.stubSignal);
   const explicitImplementationTarget = Boolean(best?.implementationIntent);
