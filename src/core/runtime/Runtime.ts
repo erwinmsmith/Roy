@@ -21647,28 +21647,30 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     acceptanceAuditRequired = false
   ): WorkspaceExecutionClosureStatus {
     const lastMutationCallIndex = effectiveWorkspaceMutationCallIndices(calls).at(-1) ?? -1;
-    const verificationCalls = calls
+    const allVerificationCalls = calls
       .map((call, index) => ({ call, index }))
       .filter(item =>
         item.index >= lastMutationCallIndex
         && isWorkspaceVerificationCall(item.call)
-        && !isUnavailableWorkspaceVerificationCall(item.call)
       );
-    const lastVerification = verificationCalls.at(-1);
+    const lastVerification = allVerificationCalls.at(-1);
     const mutationApplied = lastMutationCallIndex >= 0;
-    const verificationAttemptedAfterMutation = mutationApplied && verificationCalls.length > 0;
+    const verificationAttemptedAfterMutation =
+      mutationApplied && allVerificationCalls.length > 0;
     const latestVerificationByIntent = new Map<string, ToolCallRecord>();
-    for (const item of verificationCalls) {
+    for (const item of allVerificationCalls) {
       latestVerificationByIntent.set(
         this.toolPlanFingerprint(item.call),
         item.call
       );
     }
-    const unresolvedVerificationFailures = [...latestVerificationByIntent.values()]
+    const availableLatestVerifications = [...latestVerificationByIntent.values()]
+      .filter(call => !isUnavailableWorkspaceVerificationCall(call));
+    const unresolvedVerificationFailures = availableLatestVerifications
       .filter(call => !isSuccessfulWorkspaceVerificationCall(call)).length;
     const verificationPassed = verificationAttemptedAfterMutation
       && unresolvedVerificationFailures === 0
-      && [...latestVerificationByIntent.values()]
+      && availableLatestVerifications
         .some(call => isSuccessfulWorkspaceVerificationCall(call));
     const acceptanceItems = acceptanceAudit?.items.length ?? 0;
     const acceptanceItemsVerified = acceptanceAudit?.items
@@ -21690,8 +21692,11 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       closed: mutationApplied && verificationPassed && acceptanceAuditPassed,
       lastMutationCallIndex,
       lastVerificationCallIndex: lastVerification?.index ?? -1,
-      failedVerificationCallsAfterMutation: verificationCalls
-        .filter(item => !isSuccessfulWorkspaceVerificationCall(item.call)).length,
+      failedVerificationCallsAfterMutation: allVerificationCalls
+        .filter(item =>
+          !isUnavailableWorkspaceVerificationCall(item.call)
+          && !isSuccessfulWorkspaceVerificationCall(item.call)
+        ).length,
       unresolvedVerificationFailures,
     };
   }

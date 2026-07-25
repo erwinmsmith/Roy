@@ -438,6 +438,38 @@ describe('benchmark terminal capability', () => {
       unresolvedVerificationFailures: 0,
     });
     expect(analyze([
+      { toolName: 'fs.write', params: { path: 'artifact.txt', content: 'changed' }, success: true },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m app.cli answer' },
+        success: true,
+        result: { exitCode: 0 },
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m pytest -q' },
+        success: false,
+        result: {
+          exitCode: 1,
+          stderr: '/usr/local/bin/python: No module named pytest',
+        },
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m pytest -q' },
+        success: false,
+        result: {
+          exitCode: 5,
+          stdout: 'no tests ran in 0.01s',
+        },
+      },
+    ])).toMatchObject({
+      closed: true,
+      verificationAttemptedAfterMutation: true,
+      verificationPassed: true,
+      unresolvedVerificationFailures: 0,
+    });
+    expect(analyze([
       {
         toolName: 'fs.write',
         params: { path: 'artifact.txt', content: 'candidate' },
