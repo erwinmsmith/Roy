@@ -2084,9 +2084,20 @@ export class AgentToolPlanner {
 
   private extractReferencedPaths(task: string): string[] {
     const matches = task.matchAll(/(?:^|[\s`'"(])((?:\.{1,2}\/)?(?:[A-Za-z0-9._@-]+\/)*[A-Za-z0-9._@-]+(?:\/|\.(?:py|ts|tsx|js|jsx|mjs|cjs|java|go|rs|rb|php|sh|json|jsonl|csv|md|toml|ini|cfg|txt|xml|yaml|yml)))(?=$|[.\s`'"),:;])/g);
+    const fileExtension = /\.(?:py|ts|tsx|js|jsx|mjs|cjs|java|go|rs|rb|php|sh|json|jsonl|csv|md|toml|ini|cfg|txt|xml|yaml|yml)$/i;
     return [...new Set([...matches]
       .map(match => match[1].replace(/^\.\//, ''))
-      .filter(value => value.length > 0))];
+      .filter(value => value.length > 0)
+      .flatMap(value => {
+        const segments = value.split('/');
+        // Natural-language tasks commonly use "setup.py/pyproject.toml" or
+        // "package.json/tsconfig.json" to mean alternatives, not a child path
+        // below a file. Preserve real directory paths and split only this
+        // unambiguous two-file shorthand.
+        return segments.length === 2 && segments.every(segment => fileExtension.test(segment))
+          ? segments
+          : [value];
+      }))];
   }
 
   private taskDeclaredDirectoryPath(task: string, rawPath: string): string | undefined {

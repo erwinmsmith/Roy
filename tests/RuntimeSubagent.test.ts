@@ -134,6 +134,23 @@ class FabricatedPathsLLM extends EchoLLM {
   }
 }
 
+class AbsoluteObservedPathsLLM extends EchoLLM {
+  constructor(private readonly workspaceRoot: string) {
+    super();
+  }
+
+  override async *stream(
+    _messages: LLMMessage[],
+    _options?: LLMCompletionOptions
+  ): AsyncGenerator<LLMStreamChunk, void, unknown> {
+    yield {
+      content: `The grounded project files are \`${this.workspaceRoot}/package.json\` and \`${this.workspaceRoot}/index.ts\`.`,
+      done: true,
+      usage: { promptTokens: 20, completionTokens: 10, totalTokens: 30 },
+    };
+  }
+}
+
 class MarkdownToolIntentLLM extends EchoLLM {
   override async *stream(messages: LLMMessage[], _options?: LLMCompletionOptions): AsyncGenerator<LLMStreamChunk, void, unknown> {
     const prompt = messages.map(message => String(message.content)).join('\n');
@@ -2294,6 +2311,39 @@ describe('Runtime controlled subagent spawning', () => {
     expect(result.grounded).toBe(false);
     expect(result.evidence.outputGrounded).toBe(false);
     expect(result.warnings).toContainEqual(expect.stringContaining('src/fabricated/worker.ts'));
+    await runtime.shutdown();
+  });
+
+  it('accepts absolute workspace paths when tools recorded their relative equivalents', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-grounding-absolute-path-'));
+    await writeFile(path.join(workspaceCwd, 'package.json'), '{"name":"typescript-project"}\n', 'utf8');
+    await writeFile(path.join(workspaceCwd, 'index.ts'), 'export const value = 1;\n', 'utf8');
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'grounding-absolute-path-test',
+      llmProvider: new AbsoluteObservedPathsLLM(workspaceCwd),
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+    const agent = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'researcher',
+      tomLevel: 0,
+      description: 'Inspect repository architecture from filesystem evidence.',
+      task: 'Inspect repository architecture from filesystem evidence.',
+      outputContract: { format: 'markdown', groundingRequired: true },
+    });
+
+    const result = await runtime.runAgent(
+      agent.identity.id,
+      agent.identity.description ?? 'Inspect repository.',
+      { archetype: 'researcher', disableRecursiveDelegation: true }
+    );
+
+    expect(result.evidence.outputGrounded).toBe(true);
+    expect(result.warnings).not.toContainEqual(
+      expect.stringContaining('not present in runtime evidence')
+    );
     await runtime.shutdown();
   });
 

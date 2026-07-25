@@ -890,6 +890,25 @@ describe('AgentToolPlanner', () => {
     expect(JSON.stringify(plans)).not.toContain('invoice.png');
   });
 
+  it('treats slash-separated manifest filenames as alternatives instead of a nested file path', () => {
+    const plans = new AgentToolPlanner().planWorkspaceEvidenceFollowUps({
+      task: 'Inspect setup.py/pyproject.toml and summarize the dependency metadata.',
+      workspaceRoot: '/app',
+      bindings: [{ name: 'fs.read', enabled: true }],
+      calls: [{
+        toolName: 'fs.list',
+        params: { path: '.', maxDepth: 4 },
+        success: true,
+        result: {
+          entries: ['pyproject.toml', 'src/example/__init__.py'],
+        },
+      }],
+    });
+
+    expect(plans.map(plan => plan.params.path)).toContain('pyproject.toml');
+    expect(plans.map(plan => plan.params.path)).not.toContain('setup.py/pyproject.toml');
+  });
+
   it('reads repair source before generated outputs in mutation-task evidence follow-ups', () => {
     const plans = new AgentToolPlanner().planWorkspaceEvidenceFollowUps({
       task: [

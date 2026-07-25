@@ -21881,7 +21881,9 @@ For web-grounded work, use only facts present in the subagent report or runtime 
 
   private detectEvidenceContradictions(result: string, evidence: RunEvidence): string[] {
     if (!result.trim() || evidence.observedPaths.length === 0) return [];
-    const observed = evidence.observedPaths.map(item => item.toLowerCase());
+    const observed = evidence.observedPaths.map(item =>
+      this.normalizeToolWorkspacePath(item).toLowerCase()
+    );
     const normalized = result.toLowerCase();
     const hasNodeEvidence = observed.some(item => item === 'package.json' || /\.(?:ts|tsx|js)$/.test(item));
     const hasRustEvidence = observed.some(item => item === 'cargo.toml' || item.endsWith('.rs'));
@@ -21890,12 +21892,17 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     if (hasNodeEvidence && !hasRustEvidence && claimsRust) {
       contradictions.push('The model report claims a Rust/Cargo project, but runtime filesystem evidence contains Node/TypeScript markers and no Rust project markers.');
     }
-    const evidenceText = `${evidence.observedPaths.join('\n')}\n${evidence.toolResultSummary ?? ''}`.toLowerCase();
+    const evidenceText = [
+      ...evidence.observedPaths,
+      ...observed,
+      evidence.toolResultSummary ?? '',
+    ].join('\n').toLowerCase();
     const unsupportedPaths = Array.from(result.matchAll(/`([^`\n]{1,180})`/g))
       .map(match => match[1].trim().replace(/^["']|["']$/g, '').replace(/^\.\//, '').replace(/[,:;.)]+$/, ''))
       .filter(candidate => this.looksLikeConcreteProjectPath(candidate))
       .filter(candidate => {
-        const normalizedCandidate = candidate.toLowerCase();
+        const normalizedCandidate =
+          this.normalizeToolWorkspacePath(candidate).toLowerCase();
         return !evidenceText.includes(normalizedCandidate)
           && !observed.some(item => item === normalizedCandidate || item.endsWith(`/${normalizedCandidate}`));
       });
