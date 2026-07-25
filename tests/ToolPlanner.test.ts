@@ -1239,6 +1239,50 @@ describe('AgentToolPlanner', () => {
     expect(plans[0].params.query).toBe('Node.js AbortSignal.timeout and MDN AbortSignal.timeout');
   });
 
+  it('searches each numbered factual question instead of the tool-use scaffolding', () => {
+    const plans = new AgentToolPlanner().plan({
+      task: [
+        'Use web.search and web.fetch to verify every answer against public evidence.',
+        '',
+        '1. Who created the original Chipmunks characters?',
+        '2. Which musical premiered in the United States on December 10, 1993?',
+        '3. Who became British prime minister immediately after Arthur Balfour?',
+        '',
+        'Write one coherent story after resolving the facts.',
+      ].join('\n'),
+      workspacePath: '.',
+      archetype: 'researcher',
+      bindings: [
+        { name: 'web.search', enabled: true },
+        { name: 'web.fetch', enabled: true },
+      ],
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'web.search',
+        params: {
+          query: 'Who created the original Chipmunks characters?',
+          maxResults: 5,
+        },
+      }),
+      expect.objectContaining({
+        toolName: 'web.search',
+        params: {
+          query: 'Which musical premiered in the United States on December 10, 1993?',
+          maxResults: 5,
+        },
+      }),
+      expect.objectContaining({
+        toolName: 'web.search',
+        params: {
+          query: 'Who became British prime minister immediately after Arthur Balfour?',
+          maxResults: 5,
+        },
+      }),
+    ]);
+  });
+
   it('fetches an explicitly supplied public URL instead of searching again', () => {
     const plans = new AgentToolPlanner().plan({
       task: 'Read https://nodejs.org/api/globals.html and summarize the fetch section.',

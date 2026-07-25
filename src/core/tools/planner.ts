@@ -61,12 +61,22 @@ export class AgentToolPlanner {
         groundingRequired: true,
       })));
     } else if (enabled.has('web.search') && webEvidenceRequired) {
-      plans.push({
-        toolName: 'web.search',
-        params: { query: this.buildSearchQuery(input.task), maxResults: 5 },
-        reason: 'The task requires current or externally verifiable web evidence.',
-        groundingRequired: true,
-      });
+      const independentQuestions = this.extractIndependentWebQuestions(input.task);
+      if (independentQuestions.length > 1) {
+        plans.push(...independentQuestions.map(query => ({
+          toolName: 'web.search',
+          params: { query, maxResults: 5 },
+          reason: 'This independent question requires externally verifiable web evidence.',
+          groundingRequired: true,
+        })));
+      } else {
+        plans.push({
+          toolName: 'web.search',
+          params: { query: this.buildSearchQuery(input.task), maxResults: 5 },
+          reason: 'The task requires current or externally verifiable web evidence.',
+          groundingRequired: true,
+        });
+      }
     }
 
     if (enabled.has('fs.list') && !this.isWebOnlyTask(lower) && (mutationTask || broadWorkspaceInspection)) {
@@ -1253,6 +1263,22 @@ export class AgentToolPlanner {
       .replace(/\s+/g, ' ')
       .trim()
       .slice(0, 300);
+  }
+
+  private extractIndependentWebQuestions(task: string): string[] {
+    const questions: string[] = [];
+    const seen = new Set<string>();
+    for (const line of task.split(/\r?\n/)) {
+      const match = line.match(/^\s*(?:\d{1,2}[.)]|[-*])\s+(.+\?)\s*$/);
+      const question = match?.[1]?.replace(/\s+/g, ' ').trim();
+      if (!question || question.length < 8 || question.length > 300) continue;
+      const fingerprint = question.toLowerCase();
+      if (seen.has(fingerprint)) continue;
+      seen.add(fingerprint);
+      questions.push(question);
+      if (questions.length >= 10) break;
+    }
+    return questions;
   }
 
   private isWebOnlyTask(task: string): boolean {
