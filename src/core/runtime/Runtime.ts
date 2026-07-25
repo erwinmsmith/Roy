@@ -7897,8 +7897,7 @@ export class Runtime {
     const priorIndependentVerification = actorVerificationEvidenceRequired
       && !actorDiagnosticProbeRequired
       && !actorWorkspaceExecutionRequired
-      ? [...(options.priorToolCalls ?? [])].reverse()
-        .find(call => isSuccessfulWorkspaceVerificationCall(call))
+      ? this.selectAuthoritativePriorVerification(options.priorToolCalls ?? [])
       : undefined;
 
     const session = ctx.manager.getSession(ctx.sessionId);
@@ -17109,6 +17108,31 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       );
   }
 
+  private selectAuthoritativePriorVerification(
+    calls: ToolCallRecord[]
+  ): ToolCallRecord | undefined {
+    const candidates = calls
+      .map((call, index) => ({ call, index }))
+      .filter(item => isSuccessfulWorkspaceVerificationCall(item.call))
+      .map(item => {
+        const command = String(item.call.params.command ?? '').toLowerCase();
+        let authority = 10;
+        if (command.includes('.roy/official-verifier/')
+          && !command.includes('roy_verifier_probe=1')) {
+          authority = 100;
+        } else if (/\b(?:pytest|unittest|npm test|pnpm test|yarn test|cargo test|go test)\b/.test(command)) {
+          authority = 80;
+        } else if (/\b(?:grade|verifier|verify|test|check)\b/.test(command)) {
+          authority = command.includes('roy_verifier_probe=1') ? 30 : 60;
+        }
+        return { ...item, authority };
+      })
+      .sort((left, right) =>
+        right.authority - left.authority || right.index - left.index
+      );
+    return candidates[0]?.call;
+  }
+
   private hasUnresolvedSynthesisRejection(
     calls: Array<Pick<ToolCallRecord, 'toolName' | 'params' | 'result' | 'success'>>
   ): boolean {
@@ -17166,6 +17190,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       '',
       `task_input_candidates = ${JSON.stringify(taskInputPaths)}`,
       'task_input_seen = set()',
+      'task_input_records = []',
       'task_input_queue = [(candidate, 0) for candidate in task_input_candidates]',
       'task_input_files_remaining = 10',
       'task_input_bytes_remaining = 16000',
@@ -17190,7 +17215,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       '    except OSError:',
       '        continue',
       '    relative = os.path.relpath(absolute, workspace_root)',
-      '    print("VERIFIER_PROBE_TASK_INPUT", compact({"path": relative, "size": size, "content": content}))',
+      '    task_input_records.append({"path": relative, "size": size, "content": content})',
       '    task_input_files_remaining -= 1',
       '    task_input_bytes_remaining -= len(content)',
       '    if depth >= 2 or suffix != ".json" or size > 262144:',
@@ -17247,19 +17272,20 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       '        "mismatches": mismatches[:40],',
       '    }',
       '',
+      'probe_observations = []',
+      '',
       'def instrument(label, function):',
       '    @functools.wraps(function)',
       '    def wrapped(*args, **kwargs):',
       '        result = function(*args, **kwargs)',
-      '        print("VERIFIER_PROBE_CALL", label)',
       '        summary = mismatch_summary(args)',
-      '        if summary is not None:',
-      '            print("VERIFIER_PROBE_MISMATCHES", compact(summary))',
-      '        else:',
-      '            print("VERIFIER_PROBE_ARGS", compact(args))',
-      '        if kwargs:',
-      '            print("VERIFIER_PROBE_KWARGS", compact(kwargs))',
-      '        print("VERIFIER_PROBE_RESULT", compact(result))',
+      '        probe_observations.append({',
+      '            "label": label,',
+      '            "summary": summary,',
+      '            "args": None if summary is not None else args,',
+      '            "kwargs": kwargs or None,',
+      '            "result": result,',
+      '        })',
       '        return result',
       '    return wrapped',
       '',
@@ -17273,8 +17299,22 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       '        function_globals[name] = instrument(name, value)',
       '',
       'reward = entrypoint()',
+      '# Emit the causal core before optional retained artifacts. Shell',
+      '# transports are permitted to retain only the output head, so the',
+      '# scorer mismatch, relevant task inputs, and reward come first.',
+      'for observation in probe_observations[-20:]:',
+      '    print("VERIFIER_PROBE_CALL", observation["label"])',
+      '    if observation["summary"] is not None:',
+      '        print("VERIFIER_PROBE_MISMATCHES", compact(observation["summary"]))',
+      '    elif observation["args"] is not None:',
+      '        print("VERIFIER_PROBE_ARGS", compact(observation["args"]))',
+      '    if observation["kwargs"] is not None:',
+      '        print("VERIFIER_PROBE_KWARGS", compact(observation["kwargs"]))',
+      '    print("VERIFIER_PROBE_RESULT", compact(observation["result"]))',
+      'for task_input_record in task_input_records:',
+      '    print("VERIFIER_PROBE_TASK_INPUT", compact(task_input_record))',
       'print("VERIFIER_PROBE_REWARD", compact(reward))',
-      'print("VERIFIER_PROBE_EVIDENCE_VERSION", 2)',
+      'print("VERIFIER_PROBE_EVIDENCE_VERSION", 3)',
       'mirror_root = os.path.join(".roy", "diagnostics", f"verifier-probe-{os.getpid()}")',
       'os.makedirs(mirror_root, exist_ok=True)',
       'mirror_suffixes = {".json", ".jsonl", ".csv", ".md", ".txt", ".log", ".yaml", ".yml", ".png", ".jpg", ".jpeg", ".gz"}',

@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { mkdir, mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import Runtime from '../src/core/runtime/Runtime.js';
+import Runtime, { type RunAgentResult } from '../src/core/runtime/Runtime.js';
 import type { LLMProvider, LLMMessage, LLMCompletionOptions, LLMCompletionResult, LLMJSONCompletionResult, LLMStreamChunk } from '../src/core/llm/types.js';
 
 class EchoLLM implements LLMProvider {
@@ -1597,7 +1597,7 @@ describe('Runtime controlled subagent spawning', () => {
 
     expect(probe.error).toBeUndefined();
     expect(probe).toMatchObject({ success: true });
-    expect(stdout).toContain('VERIFIER_PROBE_EVIDENCE_VERSION 2');
+    expect(stdout).toContain('VERIFIER_PROBE_EVIDENCE_VERSION 3');
     expect(stdout).toContain('VERIFIER_PROBE_CALL reconstruction_fraction');
     expect(stdout).toContain('"actual": "wrong"');
     expect(stdout).toContain('"expected": "right"');
@@ -1801,6 +1801,32 @@ describe('Runtime controlled subagent spawning', () => {
       event.type === 'agent.llm.called'
       && event.agentId === tester.identity.id
     )).toBe(false);
+    const authoritative = (
+      runtime as unknown as {
+        selectAuthoritativePriorVerification: (
+          calls: RunAgentResult['toolCalls']
+        ) => RunAgentResult['toolCalls'][number] | undefined;
+      }
+    ).selectAuthoritativePriorVerification([
+      {
+        toolName: 'shell.exec',
+        params: {
+          command: 'python -m table_recon.cli run --manifest data/public/manifest.json --out-dir outputs',
+        },
+        success: true,
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python .roy/official-verifier/grade.py' },
+        success: true,
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'npm test' },
+        success: true,
+      },
+    ]);
+    expect(authoritative?.params.command).toBe('python .roy/official-verifier/grade.py');
     await runtime.shutdown();
   });
 
