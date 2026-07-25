@@ -310,8 +310,85 @@ describe('AgentToolPlanner', () => {
 
     expect(plans.map(plan => plan.params.command)).toEqual([
       'python -m support_rag.cli replay --history data/history',
+    ]);
+
+    const afterReplay = planner.planPostMutationVerification({
+      task,
+      calls: [
+        {
+          toolName: 'shell.exec',
+          params: { command: 'cd /app' },
+          success: true,
+        },
+        {
+          toolName: 'shell.exec',
+          params: { command: 'python -m pip install -e .' },
+          success: true,
+        },
+        {
+          toolName: 'fs.synthesize',
+          params: { path: 'src/support_rag/chain.py', instructions: 'Migrate it.' },
+          success: true,
+        },
+        {
+          toolName: 'shell.exec',
+          params: { command: 'python -m support_rag.cli answer --question "hello"' },
+          success: true,
+        },
+        {
+          toolName: 'shell.exec',
+          params: { command: 'python -m support_rag.cli route --ticket "invoice"' },
+          success: true,
+        },
+        {
+          toolName: 'shell.exec',
+          params: { command: 'python -m support_rag.cli replay --history data/history' },
+          success: true,
+        },
+      ],
+      bindings: [{ name: 'shell.exec', enabled: true }],
+    });
+    expect(afterReplay.map(plan => plan.params.command)).toEqual([
       'python -m pytest -q',
     ]);
+  });
+
+  it('stops the post-mutation verification frontier at the first failure', () => {
+    const planner = new AgentToolPlanner();
+    const task = [
+      '## Helpful Commands',
+      '```bash',
+      'python -m app.cli answer',
+      'python -m app.cli replay',
+      'python -m pytest -q',
+      '```',
+    ].join('\n');
+
+    expect(planner.planPostMutationVerification({
+      task,
+      calls: [
+        {
+          toolName: 'fs.synthesize',
+          params: {
+            path: 'src/app/chain.py',
+            instructions: 'Migrate the chain.',
+            strategy: 'patch',
+          },
+          success: true,
+          result: { path: 'src/app/chain.py' },
+        },
+        {
+          toolName: 'shell.exec',
+          params: { command: 'python -m app.cli answer' },
+          success: false,
+          result: {
+            exitCode: 1,
+            stderr: 'src/app/chain.py:12: import failed',
+          },
+        },
+      ],
+      bindings: [{ name: 'shell.exec', enabled: true }],
+    })).toEqual([]);
   });
 
   it('turns external dependency feedback into ordered manifest repairs', () => {

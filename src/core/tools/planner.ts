@@ -581,6 +581,13 @@ export class AgentToolPlanner {
     const mutationIndices = effectiveWorkspaceMutationCallIndices(input.calls);
     const latestMutationIndex = mutationIndices.at(-1);
     if (latestMutationIndex === undefined) return [];
+    if (input.calls.some((call, index) =>
+      index > latestMutationIndex
+      && isWorkspaceVerificationCall(call)
+      && !isSuccessfulWorkspaceVerificationCall(call)
+    )) {
+      return [];
+    }
     const latestDependencyMutationIndex = mutationIndices
       .filter(index => this.isDependencyManifestPath(
         this.normalizeWorkspacePath(String(
@@ -593,6 +600,9 @@ export class AgentToolPlanner {
     const commands = this.extractExplicitShellCommands(input.task);
     const pending = commands
       .filter(command => {
+        if (/^(?:cd|pushd|popd)\s+\S+\s*$/i.test(command.trim())) {
+          return false;
+        }
         const matchingCalls = input.calls
           .map((call, index) => ({ call, index }))
           .filter(item =>
@@ -642,7 +652,7 @@ export class AgentToolPlanner {
         .map(item => item.command);
     const verificationFrontier = selected.length > 0
       ? selected
-      : pending.slice(0, 2);
+      : pending.slice(0, 1);
     return verificationFrontier
       .map(command => ({
         toolName: 'shell.exec',
