@@ -933,6 +933,73 @@ describe('UnifiedAgent capability execution', () => {
     ]);
   });
 
+  it('forms a preserving execution slice from grounded task contract identifiers', () => {
+    const llm = new NovelInspectionOnlyPlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'contract-transition-agent',
+      goal: 'migrate a grounded runtime contract',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.read', 'fs.synthesize'],
+    });
+    const task = [
+      'Migrate the legacy runtime while preserving public behavior.',
+      'Replace `legacy.prompt.Prompt`, `legacy.chains.LegacyChain`, and',
+      '`.predict(...)` with the modern runnable contract.',
+      'Do not rewrite unrelated behavior.',
+    ].join('\n');
+
+    const plans = agent.planGroundedExecutionTransition({
+      task,
+      round: 12,
+      tools: [{ name: 'fs.read' }, { name: 'fs.synthesize' }],
+      calls: [
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/models.py' },
+          reason: 'Inspect a related model implementation.',
+          groundingRequired: true,
+          success: true,
+          result: {
+            path: 'src/models.py',
+            content: 'class LegacyChainModel:\n    pass\n',
+            truncated: false,
+          },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/chain.py' },
+          reason: 'Inspect the legacy chain implementation.',
+          groundingRequired: true,
+          success: true,
+          result: {
+            path: 'src/chain.py',
+            content: [
+              'from legacy.prompt import Prompt',
+              'from legacy.chains import LegacyChain',
+              '',
+              'def answer(chain, question):',
+              '    return chain.predict(question=question)',
+            ].join('\n'),
+            truncated: false,
+          },
+        },
+      ],
+    });
+
+    expect(llm.jsonCalls).toBe(0);
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.synthesize',
+        params: expect.objectContaining({
+          path: 'src/chain.py',
+          strategy: 'patch',
+          instructions: expect.stringContaining('legacy contract identifiers'),
+        }),
+      }),
+    ]);
+  });
+
   it('allows another workspace repair after a mutation when verification failed', async () => {
     const llm = new MutationRepairPlanningLLM();
     const agent = new UnifiedAgent({

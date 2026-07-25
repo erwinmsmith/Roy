@@ -163,7 +163,9 @@ export class UnifiedAgent extends BaseAgent {
     const groundedImplementationTarget = rankGroundedSynthesisTargets(
       input.calls,
       intentTask
-    ).some(candidate => candidate.implementationIntent);
+    ).some(candidate =>
+      candidate.implementationIntent || candidate.contractMatchSignal
+    );
     const deferredNoGainTargets = Array.from(new Set(input.calls.flatMap(call => {
       const path = String(
         ((call.result as { candidateRetention?: { path?: unknown } } | undefined)
@@ -1530,7 +1532,7 @@ function recoverGroundedSynthesisPlan(input: {
       )).startsWith('.roy/official-verifier/')
     );
   const groundedInitialRepair = !input.latestVerificationFailed
-    && candidate.implementationIntent
+    && (candidate.implementationIntent || candidate.contractMatchSignal)
     && hasGroundedInitialImplementationEvidence(
       input.calls,
       input.task,
@@ -1538,7 +1540,7 @@ function recoverGroundedSynthesisPlan(input: {
     );
   const saturatedInitialRepair = !input.latestVerificationFailed
     && input.workspaceEvidenceSaturated
-    && candidate.implementationIntent
+    && (candidate.implementationIntent || candidate.contractMatchSignal)
     && hasCompleteGroundedFileRead(input.calls, candidate.filePath);
   // The deterministic fallback is deliberately limited to true scaffolds.
   // Replacing a non-stub implementation after a malformed planner response
@@ -1567,8 +1569,10 @@ function recoverGroundedSynthesisPlan(input: {
         : groundedInitialRepair
           ? 'Apply a focused, interface-preserving implementation patch to satisfy the immutable assignment using the grounded input contract and observed baseline behavior. Preserve working code and do not rewrite unrelated behavior.'
           : saturatedInitialRepair
-            ? 'Apply a focused, interface-preserving implementation patch to the explicit target using the complete task-declared evidence already collected. Preserve working code and do not rewrite unrelated behavior.'
-          : 'Implement the complete assigned workspace behavior in this authoritative source file using the grounded inputs, rules, and project structure.',
+            ? candidate.implementationIntent
+              ? 'Apply a focused, interface-preserving implementation patch to the explicit target using the complete task-declared evidence already collected. Preserve working code and do not rewrite unrelated behavior.'
+              : 'Apply a focused, interface-preserving implementation patch to this grounded source slice. Replace the task-declared legacy contract identifiers observed in this file with the required contract while preserving unrelated behavior.'
+            : 'Implement the complete assigned workspace behavior in this authoritative source file using the grounded inputs, rules, and project structure.',
       ...(groundedInitialRepair || saturatedInitialRepair || aggregateVerifierRepair
         ? { strategy: 'patch' }
         : {}),
@@ -1767,8 +1771,11 @@ function rankGroundedSynthesisTargets(
   stubSignal: boolean;
   invalidSourceSignal: boolean;
   implementationIntent: boolean;
+  contractMatchSignal: boolean;
+  contractMatchCount: number;
 }> {
   const taskLower = task.toLowerCase();
+  const taskContractIdentifiers = extractTaskContractIdentifiers(task);
   const latestFailure = [...calls].reverse().find(call =>
     isWorkspaceVerificationCall(call) && !isSuccessfulWorkspaceVerification(call)
   );
@@ -1782,6 +1789,8 @@ function rankGroundedSynthesisTargets(
     stubSignal: boolean;
     invalidSourceSignal: boolean;
     implementationIntent: boolean;
+    contractMatchSignal: boolean;
+    contractMatchCount: number;
   }>();
   calls
     .map((call, index) => {
@@ -1822,6 +1831,10 @@ function rankGroundedSynthesisTargets(
           || Boolean(basename && taskLower.includes(basename))
         )
       );
+      const contractMatchCount = requestsWorkspaceMutation(task)
+        ? countGroundedContractMatches(content, taskContractIdentifiers)
+        : 0;
+      const contractMatchSignal = contractMatchCount > 0;
       let score = index / Math.max(1, calls.length);
       if (/(?:^|\/)(?:src|lib|app|packages)\//i.test(filePath)) score += 6;
       if (/(?:^|\/)(?:tests?|fixtures?|examples?|data|rules)\//i.test(filePath)) score -= 8;
@@ -1829,6 +1842,9 @@ function rankGroundedSynthesisTargets(
       if (invalidSourceSignal) score += 30;
       if (implementationIntent) score += 20;
       if (explicitImplementationIntent) score += 18;
+      if (contractMatchSignal) {
+        score += 12 + Math.min(16, contractMatchCount * 4);
+      }
       if (taskLower.includes(filePathLower)
         || taskLower.includes(basename)) {
         score += 7;
@@ -1843,6 +1859,8 @@ function rankGroundedSynthesisTargets(
         stubSignal,
         invalidSourceSignal,
         implementationIntent,
+        contractMatchSignal,
+        contractMatchCount,
       };
     })
     .filter((candidate): candidate is {
@@ -1852,6 +1870,8 @@ function rankGroundedSynthesisTargets(
       stubSignal: boolean;
       invalidSourceSignal: boolean;
       implementationIntent: boolean;
+      contractMatchSignal: boolean;
+      contractMatchCount: number;
     } => Boolean(candidate))
     .forEach(candidate => {
       const previous = byPath.get(candidate.filePath);
@@ -1860,6 +1880,67 @@ function rankGroundedSynthesisTargets(
       }
     });
   return [...byPath.values()].sort((left, right) => right.score - left.score);
+}
+
+function extractTaskContractIdentifiers(task: string): string[] {
+  const identifiers = new Set<string>();
+  const addIdentifier = (raw: string): void => {
+    const normalized = raw
+      .trim()
+      .replace(/^\.+/, '')
+      .replace(/\(\s*(?:\.\.\.)?\s*\)$/, '')
+      .replace(/\.\*$/, '')
+      .replace(/[;,.:]+$/, '');
+    if (!normalized
+      || normalized.length < 4
+      || normalized.includes('/')
+      || normalized.includes('\\')
+      || /^(?:https?|python|pytest|pip)$/i.test(normalized)) {
+      return;
+    }
+    if (!/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/u.test(normalized)) {
+      return;
+    }
+    if (!normalized.includes('.') && raw === normalized) return;
+    identifiers.add(normalized.toLowerCase());
+  };
+  for (const match of task.matchAll(
+    /\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+\b/gu
+  )) {
+    addIdentifier(match[0]);
+  }
+  for (const match of task.matchAll(/`([^`\n]{1,120})`/gu)) {
+    addIdentifier(match[1]);
+  }
+  return [...identifiers];
+}
+
+function countGroundedContractMatches(
+  content: string,
+  identifiers: string[]
+): number {
+  const contentLower = content.toLowerCase();
+  let matches = 0;
+  for (const identifier of identifiers) {
+    if (contentLower.includes(identifier)) {
+      matches += 1;
+      continue;
+    }
+    const parts = identifier.split('.');
+    if (parts.length < 2) continue;
+    const leaf = parts.at(-1)!;
+    const namespace = parts.slice(0, -1).join('.');
+    const leafPattern = new RegExp(
+      `\\b${leaf.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`,
+      'i'
+    );
+    if (namespace.length >= 4
+      && contentLower.includes(namespace)
+      && leafPattern.test(content)) {
+      matches += 1;
+    }
+  }
+  return matches;
 }
 
 function taskNamesFileAsImplementationTarget(
