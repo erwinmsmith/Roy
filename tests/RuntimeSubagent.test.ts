@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Runtime from '../src/core/runtime/Runtime.js';
@@ -1502,6 +1502,25 @@ describe('Runtime controlled subagent spawning', () => {
     expect(stdout).toContain('cropped_pages_detected');
     expect(stdout).toContain('VERIFIER_PROBE_SPEC');
     expect(stdout).toContain('VERIFIER_PROBE_RETAINED_DIRS');
+    expect(stdout).toContain('VERIFIER_PROBE_MIRROR');
+    const probeDirectories = await readdir(
+      path.join(workspaceCwd, '.roy', 'diagnostics')
+    );
+    const mirror = probeDirectories.find(directory =>
+      directory.startsWith('verifier-probe-')
+    );
+    expect(mirror).toBeDefined();
+    expect(await readFile(
+      path.join(
+        workspaceCwd,
+        '.roy',
+        'diagnostics',
+        mirror!,
+        'retained-1',
+        'fixture.txt'
+      ),
+      'utf8'
+    )).toBe('retained');
     const compactProbe = (
       runtime as unknown as {
         compactVerifierProbeEvidenceText: (output: string, maxChars: number) => string;
