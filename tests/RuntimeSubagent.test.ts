@@ -1641,9 +1641,13 @@ describe('Runtime controlled subagent spawning', () => {
         '        output = Path(directory, "outputs")',
         '        output.mkdir()',
         '        Path(output, "layout_qc.json").write_text(\'{"cropped_pages_detected": []}\', encoding="utf-8")',
-        '        actual = {("doc", "table", 0, 0): "wrong"}',
-        '        expected = [{"document_id": "doc", "table_id": "table", "row_index": 0, "col_index": 0, "text": "right"}]',
-        '        return reconstruction_fraction(actual, expected)',
+        '        actual = {("public_doc", "table", 0, 0): "wrong"}',
+        '        expected = [{"document_id": "public_doc", "table_id": "table", "row_index": 0, "col_index": 0, "text": "right"}]',
+        '        public_result = reconstruction_fraction(actual, expected)',
+        '        hidden_actual = {("hidden_doc", "table", 0, 0): "hidden_wrong"}',
+        '        hidden_expected = [{"document_id": "hidden_doc", "table_id": "table", "row_index": 0, "col_index": 0, "text": "hidden_right"}]',
+        '        reconstruction_fraction(hidden_actual, hidden_expected)',
+        '        return public_result',
         '',
       ].join('\n'),
       'utf8'
@@ -1703,6 +1707,9 @@ describe('Runtime controlled subagent spawning', () => {
       [
         'Repair the implementation using data/manifest.json as the authoritative input.',
         'Expected artifacts: outputs/a.json outputs/b.json outputs/c.json outputs/d.json.',
+        '<recovery_capsule>',
+        JSON.stringify({ unresolvedGroups: ['G_public_reconstruction=0.500'] }),
+        '</recovery_capsule>',
       ].join('\n')
     );
     const diagnosticSources = (
@@ -1713,6 +1720,20 @@ describe('Runtime controlled subagent spawning', () => {
       'Diagnose src/table_recon/audit.py against .roy/official-verifier/grade.py.'
     );
     expect(diagnosticSources).toEqual(['src/table_recon/audit.py']);
+    const diagnosticScopes = (
+      runtime as unknown as {
+        extractVerifierDiagnosticScopes: (task: string) => string[];
+      }
+    ).extractVerifierDiagnosticScopes([
+      '<recovery_capsule>',
+      JSON.stringify({
+        unresolvedGroups: [
+          'G_public_reconstruction=0.625',
+        ],
+      }),
+      '</recovery_capsule>',
+    ].join('\n'));
+    expect(diagnosticScopes).toEqual(['public']);
     const probe = await runtime.executeToolForAgent(
       'root',
       'shell.exec',
@@ -1727,6 +1748,11 @@ describe('Runtime controlled subagent spawning', () => {
     expect(stdout).toContain('VERIFIER_PROBE_CALL reconstruction_fraction');
     expect(stdout).toContain('"actual": "wrong"');
     expect(stdout).toContain('"expected": "right"');
+    expect(stdout).toContain('"requested": ["public"]');
+    expect(stdout
+      .split('\n')
+      .filter(line => line.startsWith('VERIFIER_PROBE_MISMATCHES '))
+      .join('\n')).not.toContain('hidden_wrong');
     expect(stdout).toContain('VERIFIER_PROBE_ARTIFACT');
     expect(stdout).toContain('layout_qc.json');
     expect(stdout).toContain('cropped_pages_detected');
@@ -2058,6 +2084,8 @@ describe('Runtime controlled subagent spawning', () => {
     const diagnosis = [
       'The first grid boundary is a page-border decoy.',
       'Repair _assign_tokens_to_grid at its sufficient-lines branch.',
+      'diagnostic-detail-'.repeat(220),
+      'diagnostic-tail-anchor',
     ].join(' ');
     const task = [
       'Repair app.py.',
@@ -2074,17 +2102,20 @@ describe('Runtime controlled subagent spawning', () => {
       toolName: 'fs.synthesize',
       params: {
         path: 'app.py',
-        instructions: 'Apply the smallest grounded repair.',
+        instructions: `Apply the smallest grounded repair. ${'baseline-contract-'.repeat(220)}`,
         strategy: 'patch',
       },
       reason: 'repair',
       groundingRequired: true,
     }], task);
 
-    expect(String(plan?.params.instructions)).toContain(diagnosis);
-    expect(String(plan?.params.instructions)).toContain(
+    const instructions = String(plan?.params.instructions);
+    expect(instructions).toContain('The first grid boundary is a page-border decoy.');
+    expect(instructions).toContain('diagnostic-tail-anchor');
+    expect(instructions).toContain(
       'immediately preceding sequential team member'
     );
+    expect(instructions.length).toBeLessThanOrEqual(4_000);
   });
 
   it('spawns, registers, runs, and tracks a subagent', async () => {

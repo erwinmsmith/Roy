@@ -2169,22 +2169,51 @@ export class Runtime {
       return plans;
     }
     if (!latestResult) return plans;
-    const causalResult = latestResult.length <= 4_000
-      ? latestResult
-      : `${latestResult.slice(0, 2_400)}\n[preceding member report compacted]\n${latestResult.slice(-1_600)}`;
     return plans.map(plan => {
       if (plan.toolName !== 'fs.synthesize') return plan;
       const instructions = String(plan.params.instructions ?? '').trim();
-      if (!instructions || instructions.includes(causalResult)) return plan;
+      if (!instructions || instructions.includes(latestResult)) return plan;
+      const preface = 'Grounded diagnosis from the immediately preceding sequential team member:';
+      const suffix = 'Use this diagnosis only where it agrees with the authoritative current source and executable verifier evidence.';
+      const structuralChars = preface.length + suffix.length + 6;
+      const contentBudget = Math.max(1, 4_000 - structuralChars);
+      const baseBudget = Math.min(
+        instructions.length,
+        Math.max(1_200, Math.floor(contentBudget * 0.48))
+      );
+      const resultBudget = Math.max(1, contentBudget - baseBudget);
+      const compact = (
+        value: string,
+        maxChars: number,
+        marker: string,
+        headRatio: number
+      ): string => {
+        if (value.length <= maxChars) return value;
+        const available = Math.max(2, maxChars - marker.length - 2);
+        const head = Math.floor(available * headRatio);
+        return `${value.slice(0, head)}\n${marker}\n${value.slice(-(available - head))}`;
+      };
+      const causalInstructions = compact(
+        instructions,
+        baseBudget,
+        '[repair contract compacted]',
+        0.8
+      );
+      const causalResult = compact(
+        latestResult,
+        resultBudget,
+        '[preceding member report compacted]',
+        0.62
+      );
       return {
         ...plan,
         params: {
           ...plan.params,
           instructions: [
-            instructions,
-            'Grounded diagnosis from the immediately preceding sequential team member:',
+            causalInstructions,
+            preface,
             causalResult,
-            'Use this diagnosis only where it agrees with the authoritative current source and executable verifier evidence.',
+            suffix,
           ].join('\n\n'),
         },
       };
@@ -10437,7 +10466,7 @@ export class Runtime {
         seenCandidates.add(line);
         let priority = 20;
         let perItemLimit = 1_200;
-        if (marker === 'EVIDENCE_VERSION') priority = 240;
+        if (marker === 'EVIDENCE_VERSION' || marker === 'SCOPE') priority = 240;
         else if (['CALL', 'MISMATCHES', 'RESULT', 'REWARD'].includes(marker)) {
           priority = 220;
           perItemLimit = 1_800;
@@ -12507,6 +12536,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
         `Diagnose the unresolved official-verifier behavior for ${target}.`,
         'Read the immutable verifier source and current implementation. Use shell execution to reproduce the failing capability with a disposable diagnostic fixture when possible; do not merely rerun the aggregate score.',
         'Compare actual and expected outputs, identify the smallest causal mismatch, and report exact source anchors and a bounded repair hypothesis for the next member.',
+        'Diagnose only groups listed as unresolved in the recovery capsule. Treat baseline score 1 groups as protected and ignore their probe observations unless the newest official scorecard proves a current regression.',
         'Do not mutate the implementation or verifier.',
         `<recovery_capsule>\n${recoveryCapsule}\n</recovery_capsule>`,
         `Immutable assignment:\n${immutableAssignment}`,
@@ -17593,6 +17623,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
 
   private buildPythonVerifierDiagnosticCommand(task = ''): string {
     const taskInputPaths = this.extractTaskDiagnosticInputPaths(task);
+    const diagnosticScopes = this.extractVerifierDiagnosticScopes(task);
     const script = [
       'import functools',
       'import json',
@@ -17711,6 +17742,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       '    }',
       '',
       'probe_observations = []',
+      `diagnostic_scopes = ${JSON.stringify(diagnosticScopes)}`,
       '',
       'def instrument(label, function):',
       '    @functools.wraps(function)',
@@ -17740,7 +17772,21 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       '# Emit the causal core before optional retained artifacts. Shell',
       '# transports are permitted to retain only the output head, so the',
       '# scorer mismatch, relevant task inputs, and reward come first.',
-      'for observation in probe_observations[-20:]:',
+      'scoped_observations = []',
+      'for observation in probe_observations:',
+      '    summary = observation.get("summary")',
+      '    mismatches = summary.get("mismatches", []) if isinstance(summary, dict) else []',
+      '    keys = [item.get("key", []) for item in mismatches if isinstance(item, dict)]',
+      '    if any(',
+      '        scope in str(key[0]).lower()',
+      '        for scope in diagnostic_scopes',
+      '        for key in keys',
+      '        if isinstance(key, (list, tuple)) and key',
+      '    ):',
+      '        scoped_observations.append(observation)',
+      'selected_observations = scoped_observations if scoped_observations else probe_observations',
+      'print("VERIFIER_PROBE_SCOPE", compact({"requested": diagnostic_scopes, "matched_observations": len(scoped_observations), "total_observations": len(probe_observations)}))',
+      'for observation in selected_observations[-20:]:',
       '    print("VERIFIER_PROBE_CALL", observation["label"])',
       '    if observation["summary"] is not None:',
       '        print("VERIFIER_PROBE_MISMATCHES", compact(observation["summary"]))',
@@ -17839,6 +17885,27 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     ].join('\n');
     const encoded = Buffer.from(script, 'utf8').toString('base64');
     return `ROY_VERIFIER_PROBE=1 python -c "import base64;exec(base64.b64decode('${encoded}'))"`;
+  }
+
+  private extractVerifierDiagnosticScopes(task: string): string[] {
+    const capsuleMatch = /<recovery_capsule>\s*([\s\S]*?)\s*<\/recovery_capsule>/i.exec(
+      task
+    );
+    if (!capsuleMatch) return [];
+    try {
+      const capsule = JSON.parse(capsuleMatch[1]!) as {
+        unresolvedGroups?: unknown;
+      };
+      const groups = Array.isArray(capsule.unresolvedGroups)
+        ? capsule.unresolvedGroups.map(item => String(item).toLowerCase())
+        : [];
+      const scopes: string[] = [];
+      if (groups.some(group => /\bg_public/.test(group))) scopes.push('public');
+      if (groups.some(group => /\bg_hidden/.test(group))) scopes.push('hidden');
+      return scopes;
+    } catch {
+      return [];
+    }
   }
 
   private extractTaskDiagnosticInputPaths(task: string): string[] {
