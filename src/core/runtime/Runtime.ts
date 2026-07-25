@@ -624,6 +624,18 @@ interface RootDelegationRoundResult {
   evolution?: EvolutionRunResult;
 }
 
+interface RootResponseAcceptanceAudit {
+  complete: boolean;
+  unmetRequirements: string[];
+  reason: string;
+  obligations: Array<{
+    requirement: string;
+    satisfied: boolean;
+    candidateEvidence: string;
+    factualConcern?: string;
+  }>;
+}
+
 export interface RootMediatedSpawnResult {
   correlationId: string;
   node: AgentComputeNodeDefinition;
@@ -8925,11 +8937,91 @@ export class Runtime {
         await agent.step(observation);
         const stepError = agent.getInfo().error;
         if (stepError) {
-          throw new Error(stepError.replace(/^Error:\s*/, ''));
+          if (/^Action error:\s*Validation failed:/i.test(stepError)) {
+            this.emit({
+              type: 'agent.output.action_validation.recovery.started',
+              agentId,
+              sessionId: ctx.sessionId,
+              correlationId: options.correlationId,
+              nodeId: options.nodeId,
+              data: {
+                task,
+                error: stepError.slice(0, 1_000),
+                recovery: 'complete_bounded_task_without_invalid_action',
+              },
+            });
+            result = '';
+          } else {
+            throw new Error(stepError.replace(/^Error:\s*/, ''));
+          }
+        } else {
+          result = session
+            ? await this.drainAgentOutput(session.messageQueue, agent.name)
+            : agent.getInfo().lastResult ?? '';
         }
-        result = session
-          ? await this.drainAgentOutput(session.messageQueue, agent.name)
-          : agent.getInfo().lastResult ?? '';
+        if (!result.trim()) {
+          const recoveryPrompt = [
+            `Complete this bounded assigned task directly:\n${this.agentTaskObservationReference(agentId, task)}`,
+            `Available runtime grounding:\n${(grounding.evidence.toolResultSummary ?? grounding.context).slice(-12_000) || 'No external tool evidence was required.'}`,
+            stepError
+              ? `The previous attempt produced an invalid runtime action instead of a result:\n${stepError.slice(0, 1_000)}`
+              : 'The previous provider completion produced no visible result.',
+            'Return a complete visible task result now.',
+            'Do not return an empty response. Do not request a child agent or tool unless the task explicitly requires one and the runtime has authorized it.',
+          ].join('\n\n');
+          this.ensureAgentSynthesisBudget(
+            agent,
+            recoveryPrompt,
+            'agent.empty_output_recovery',
+            options.correlationId ?? this.createCorrelationId(),
+            1_536
+          );
+          this.emit({
+            type: 'agent.output.empty.recovery.started',
+            agentId,
+            sessionId: ctx.sessionId,
+            correlationId: options.correlationId,
+            nodeId: options.nodeId,
+            data: {
+              task,
+              reason: stepError ? 'invalid_action_without_result' : 'model_returned_empty_visible_output',
+            },
+          });
+          result = await this.completeAsAgent(
+            agent,
+            recoveryPrompt,
+            'agent.empty_output_recovery',
+            options.correlationId ?? this.createCorrelationId(),
+            {
+              isolatedContext: true,
+              temperature: 0,
+              maxOutputTokens: this.reasoningAwareCompletionTokenBudget(1_536),
+            }
+          );
+          if (!result.trim()) {
+            this.emit({
+              type: 'agent.output.empty.recovery.failed',
+              agentId,
+              sessionId: ctx.sessionId,
+              correlationId: options.correlationId,
+              nodeId: options.nodeId,
+              data: { task, reason: 'recovery_returned_empty_visible_output' },
+            });
+            throw new Error('Agent returned no visible result after an isolated completion recovery');
+          }
+          this.emit({
+            type: 'agent.output.empty.recovery.completed',
+            agentId,
+            sessionId: ctx.sessionId,
+            correlationId: options.correlationId,
+            nodeId: options.nodeId,
+            data: {
+              task,
+              recoveredCharacters: result.length,
+              recoveredFromInvalidAction: Boolean(stepError),
+            },
+          });
+        }
       }
       let forcedExecutionContinuationAttempted = false;
       while (true) {
@@ -13712,8 +13804,14 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
       2,
       this.workspaceRuntimeConfig?.delegation.rootSteps.directDecisionAuditMinObligations ?? 4
     );
+    const requiresEveryExplicitItem =
+      /\b(?:every|each|all)\b[\s\S]{0,100}\b(?:question|requirement|item|answer|deliverable|constraint)s?\b/i.test(userTask)
+      || /(?:每个|每一|所有|全部)[\s\S]{0,60}(?:问题|要求|项目|答案|交付物|约束)/.test(userTask);
     return this.responseSelfDeclaresIncomplete(response)
-      || this.countIndependentTaskObligations(userTask) >= threshold;
+      || (
+        requiresEveryExplicitItem
+        && this.countIndependentTaskObligations(userTask) >= threshold
+      );
   }
 
   private async auditRootResponseAcceptance(
@@ -13721,11 +13819,12 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     userTask: string,
     correlationId: string,
     phase: 'candidate' | 'repaired'
-  ): Promise<{ complete: boolean; unmetRequirements: string[]; reason: string }> {
+  ): Promise<RootResponseAcceptanceAudit> {
     const raw = await this.completeJSONAsAgent<{
       complete?: unknown;
       unmetRequirements?: unknown;
       reason?: unknown;
+      obligations?: unknown;
     }>(
       this.getContext().agent,
       [
@@ -13735,8 +13834,10 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
             'You are Roy\'s final-response acceptance auditor.',
             'Compare the candidate only against explicit, user-visible requirements in the original task.',
             'Treat every numbered or bulleted question, deliverable, constraint, and output contract as a separate obligation.',
-            'Judge objective coverage and internal consistency, not subjective writing style or hidden benchmark answers.',
-            'Do not expose chain-of-thought. Return strict JSON with complete, unmetRequirements, and reason.',
+            'For every obligation, quote the exact candidate text that satisfies it. Missing quoted evidence means the obligation is unmet.',
+            'When an obligation asks for a factual answer, independently check whether the quoted answer actually answers the question; flag contradictions or uncertain substitutions instead of checking only keyword presence.',
+            'Judge objective coverage and factual consistency, not subjective writing style or any hidden evaluator.',
+            'Do not expose chain-of-thought. Return concise strict JSON only.',
           ].join('\n'),
         },
         {
@@ -13748,29 +13849,78 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
               complete: 'boolean: true only when every explicit obligation is satisfied',
               unmetRequirements: ['concise explicit requirements that remain unmet'],
               reason: 'one concise evidence-based explanation',
+              obligations: [{
+                requirement: 'the explicit numbered or bulleted obligation',
+                satisfied: 'boolean',
+                candidateEvidence: 'an exact concise quote from the candidate, or an empty string',
+                factualConcern: 'a concise contradiction or uncertainty, omitted when none',
+              }],
             },
           }),
         },
       ],
-      { temperature: 0, maxTokens: 768 },
+      { temperature: 0, maxTokens: 1_400 },
       `root.response_acceptance.${phase}`,
       correlationId
     );
+    const obligations = Array.isArray(raw.obligations)
+      ? raw.obligations
+        .filter((item): item is Record<string, unknown> =>
+          Boolean(item) && typeof item === 'object'
+        )
+        .map(item => ({
+          requirement: typeof item.requirement === 'string'
+            ? item.requirement.trim().slice(0, 800)
+            : '',
+          satisfied: item.satisfied === true,
+          candidateEvidence: typeof item.candidateEvidence === 'string'
+            ? item.candidateEvidence.trim().slice(0, 1_200)
+            : '',
+          factualConcern: typeof item.factualConcern === 'string'
+            && item.factualConcern.trim()
+            ? item.factualConcern.trim().slice(0, 800)
+            : undefined,
+        }))
+        .filter(item => item.requirement)
+        .slice(0, 24)
+      : [];
+    const expectedObligations = this.countIndependentTaskObligations(userTask);
+    const structuredUnmet = obligations
+      .filter(item =>
+        !item.satisfied
+        || !item.candidateEvidence
+        || Boolean(item.factualConcern)
+      )
+      .map(item => [
+        item.requirement,
+        item.factualConcern,
+        !item.candidateEvidence ? 'No exact candidate evidence was supplied.' : '',
+      ].filter(Boolean).join(' — '));
     const unmetRequirements = Array.isArray(raw.unmetRequirements)
       ? raw.unmetRequirements
         .filter((item): item is string => typeof item === 'string' && Boolean(item.trim()))
         .map(item => item.trim().slice(0, 800))
         .slice(0, 24)
       : [];
-    const complete = raw.complete === true && unmetRequirements.length === 0;
+    unmetRequirements.push(...structuredUnmet);
+    if (expectedObligations >= 2 && obligations.length < expectedObligations) {
+      unmetRequirements.push(
+        `Acceptance evidence covered ${obligations.length} of ${expectedObligations} explicit obligations.`
+      );
+    }
+    const normalizedUnmet = [...new Set(unmetRequirements)].slice(0, 24);
+    const complete = raw.complete === true
+      && normalizedUnmet.length === 0
+      && (expectedObligations < 2 || obligations.length >= expectedObligations);
     return {
       complete,
-      unmetRequirements,
+      unmetRequirements: normalizedUnmet,
       reason: typeof raw.reason === 'string' && raw.reason.trim()
         ? raw.reason.trim().slice(0, 1_200)
         : complete
           ? 'Every explicit response obligation is covered.'
           : 'The acceptance auditor found incomplete explicit obligations.',
+      obligations,
     };
   }
 
@@ -13791,7 +13941,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
         selfDeclaredIncomplete: this.responseSelfDeclaresIncomplete(response),
       },
     });
-    let audit: { complete: boolean; unmetRequirements: string[]; reason: string };
+    let audit: RootResponseAcceptanceAudit;
     try {
       audit = await this.auditRootResponseAcceptance(
         response,
@@ -13814,7 +13964,11 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
         type: 'root.response.acceptance.audit.completed',
         agentId: 'root',
         correlationId,
-        data: { complete: true, reason: audit.reason },
+        data: {
+          complete: true,
+          reason: audit.reason,
+          evaluatedObligations: audit.obligations.length,
+        },
       });
       return response;
     }
@@ -16555,7 +16709,8 @@ Produce the final response to the user as Roy, the root agent.`;
     agent: BaseAgent,
     prompt: string,
     purpose: string,
-    correlationId: string
+    correlationId: string,
+    visibleOutputTokens = 512
   ): void {
     const allocationId = this.agentBudgetAllocations.get(agent.id);
     if (!allocationId || !this.budgetMarket) return;
@@ -16568,7 +16723,9 @@ Produce the final response to the user as Roy, the root agent.`;
       communicationContext,
       `user:${prompt}`,
     ].filter(Boolean).join('\n'));
-    const requestedCompletionTokens = this.reasoningAwareCompletionTokenBudget(512);
+    const requestedCompletionTokens = this.reasoningAwareCompletionTokenBudget(
+      visibleOutputTokens
+    );
     const requiredTokens = this.budgetRequestTokens(estimatedInputTokens, requestedCompletionTokens);
     const marketRemaining = Math.max(0, allocation.allocatedTokens - allocation.consumedTokens);
     const agentRemaining = agent.getCompletionTokenLimit();

@@ -126,11 +126,23 @@ class AcceptanceRepairLLM implements LLMProvider {
           complete: false,
           unmetRequirements: ['Include gamma', 'Include delta'],
           reason: 'Two explicit numbered obligations are missing.',
+          obligations: [
+            { requirement: 'Include alpha', satisfied: true, candidateEvidence: 'Alpha' },
+            { requirement: 'Include beta', satisfied: true, candidateEvidence: 'beta' },
+            { requirement: 'Include gamma', satisfied: false, candidateEvidence: '' },
+            { requirement: 'Include delta', satisfied: false, candidateEvidence: '' },
+          ],
         }
         : {
           complete: true,
           unmetRequirements: [],
           reason: 'All four explicit obligations are present.',
+          obligations: [
+            { requirement: 'Include alpha', satisfied: true, candidateEvidence: 'Alpha' },
+            { requirement: 'Include beta', satisfied: true, candidateEvidence: 'beta' },
+            { requirement: 'Include gamma', satisfied: true, candidateEvidence: 'gamma' },
+            { requirement: 'Include delta', satisfied: true, candidateEvidence: 'delta' },
+          ],
         }) as T;
     }
     return {

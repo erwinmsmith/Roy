@@ -114,6 +114,29 @@ class CapturingStreamLLM extends EchoLLM {
   }
 }
 
+class EmptyThenRecoveredLLM extends EchoLLM {
+  readonly streamedPrompts: string[] = [];
+
+  override async *stream(
+    messages: LLMMessage[],
+    _options?: LLMCompletionOptions
+  ): AsyncGenerator<LLMStreamChunk, void, unknown> {
+    const prompt = messages.map(message => message.content).join('\n');
+    this.streamedPrompts.push(prompt);
+    const recovered = prompt.includes('Return a complete visible task result now.');
+    yield {
+      content: recovered ? 'Recovered complete visible result.' : '',
+      done: true,
+      finishReason: 'stop',
+      usage: {
+        promptTokens: 20,
+        completionTokens: recovered ? 6 : 0,
+        totalTokens: recovered ? 26 : 20,
+      },
+    };
+  }
+}
+
 class FileSynthesisLLM extends EchoLLM {
   readonly streamedPrompts: string[] = [];
 
@@ -1399,6 +1422,44 @@ describe('Runtime controlled subagent spawning', () => {
     expect(rendered.match(/distinctive zephyr ledger scenario/g)).toHaveLength(1);
     expect(messages.at(-1)?.content).toContain('[runtime_current_assignment]');
     expect(messages.at(-1)?.content).not.toContain('distinctive zephyr ledger scenario');
+    await runtime.shutdown();
+  });
+
+  it('recovers an empty leaf-agent completion before marking the actor successful', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-empty-agent-output-'));
+    const llm = new EmptyThenRecoveredLLM();
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'empty-agent-output-test',
+      llmProvider: llm,
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+    const task = 'Produce one complete bounded semantic analysis.';
+    const agent = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'custom',
+      tomLevel: 0,
+      description: task,
+      task,
+      tools: [],
+      skills: [],
+      outputContract: { format: 'markdown', groundingRequired: false },
+    });
+
+    const result = await runtime.runAgent(agent.identity.id, task, {
+      archetype: 'custom',
+      disableRecursiveDelegation: true,
+    });
+
+    expect(result.result).toBe('Recovered complete visible result.');
+    expect(result.agent.error).toBeUndefined();
+    expect(llm.streamedPrompts).toHaveLength(2);
+    expect(runtime.getEvents().map(event => event.type)).toEqual(expect.arrayContaining([
+      'agent.output.empty.recovery.started',
+      'agent.output.empty.recovery.completed',
+      'agent.run.completed',
+    ]));
     await runtime.shutdown();
   });
 

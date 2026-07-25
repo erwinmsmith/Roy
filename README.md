@@ -434,8 +434,16 @@ For non-workspace responses with several explicit obligations, Runtime performs 
 separate final-response acceptance audit. Unmet requirements become trace events
 and cached feedback, then drive one focused repair pass using accumulated
 delegated evidence. The repaired response is audited again before the turn is
-closed. Workspace mutations continue to use tool and verifier evidence as their
-authoritative acceptance boundary.
+closed. The audit must enumerate each obligation and quote its exact candidate
+evidence; factual obligations also record contradictions or uncertainty instead
+of treating keyword presence as proof. Workspace mutations continue to use tool
+and verifier evidence as their authoritative acceptance boundary.
+
+A leaf actor cannot complete successfully with an empty visible result. Runtime
+performs one isolated, budget-aware result recovery; a second empty response marks
+the actor failed. If a leaf returns an invalid action schema instead of its bounded
+result, the same path captures the validation error as feedback and asks the actor
+to complete its assigned task directly.
 
 ## Budget Control
 
