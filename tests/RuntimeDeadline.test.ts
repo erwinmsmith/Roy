@@ -91,6 +91,65 @@ describe('Runtime external wall-clock deadline', () => {
     ])).toEqual({ skip: false });
   });
 
+  it('invalidates a cached dependency install after its manifest changes', () => {
+    const runtime = new Runtime() as unknown as {
+      cachedToolPlanDecision(
+        plan: PlannedToolCall,
+        priorCalls: ToolCallRecord[]
+      ): { skip: boolean; reason?: string };
+    };
+    const install: PlannedToolCall = {
+      toolName: 'shell.exec',
+      params: { command: 'python -m pip install -e .' },
+      reason: 'Install current dependencies.',
+      groundingRequired: true,
+    };
+    const successfulInstall: ToolCallRecord = {
+      ...install,
+      success: true,
+    };
+
+    expect(runtime.cachedToolPlanDecision(
+      install,
+      [successfulInstall]
+    )).toMatchObject({
+      skip: true,
+      reason: 'equivalent_successful_call_already_completed',
+    });
+    expect(runtime.cachedToolPlanDecision(install, [
+      successfulInstall,
+      {
+        toolName: 'fs.synthesize',
+        params: {
+          path: 'pyproject.toml',
+          instructions: 'Upgrade dependencies.',
+          strategy: 'patch',
+        },
+        success: true,
+        result: { path: 'pyproject.toml' },
+      },
+    ])).toMatchObject({
+      skip: false,
+      reason: 'dependency_manifest_changed_after_cached_install',
+    });
+    expect(runtime.cachedToolPlanDecision(install, [
+      successfulInstall,
+      {
+        toolName: 'fs.synthesize',
+        params: {
+          path: 'src/app/chain.py',
+          instructions: 'Repair source.',
+          strategy: 'patch',
+        },
+        success: true,
+        result: { path: 'src/app/chain.py' },
+      },
+    ])).toMatchObject({
+      skip: true,
+      reason: 'equivalent_successful_call_already_completed',
+    });
+  });
+
   it('invalidates cached inspection only when a relevant workspace path changes', () => {
     const runtime = new Runtime() as unknown as {
       cachedToolPlanDecision(

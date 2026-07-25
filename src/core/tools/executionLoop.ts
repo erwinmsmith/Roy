@@ -1,4 +1,5 @@
 import type { PlannedToolCall } from './planner.js';
+import { isSuccessfulWorkspaceMutationCall } from './executionIntent.js';
 
 export type ToolLoopStopReason = 'completed' | 'max_rounds' | 'max_calls' | 'max_wall_clock' | 'consecutive_failures' | 'duplicate_plan';
 
@@ -138,7 +139,12 @@ export class AgentToolExecutionLoop {
         rounds,
         remainingCalls: this.options.maxCalls - callCount,
       });
-      pending = this.uniquePlans(next, fingerprints, input.fingerprint);
+      pending = this.uniquePlans(
+        next,
+        fingerprints,
+        input.fingerprint,
+        rounds.flatMap(item => item.calls)
+      );
       if (next.length > 0 && pending.length === 0) {
         stopReason = 'duplicate_plan';
         break;
@@ -160,16 +166,54 @@ export class AgentToolExecutionLoop {
   private uniquePlans(
     plans: PlannedToolCall[],
     fingerprints: Set<string>,
-    fingerprint?: (plan: PlannedToolCall) => string
+    fingerprint?: (plan: PlannedToolCall) => string,
+    calls: ToolLoopCallRecord[] = []
   ): PlannedToolCall[] {
     const unique: PlannedToolCall[] = [];
     for (const plan of plans) {
       const value = fingerprint?.(plan) ?? `${plan.toolName}:${stableStringify(plan.params)}`;
-      if (fingerprints.has(value)) continue;
+      if (fingerprints.has(value)
+        && !this.shellPlanWasInvalidatedByFileMutation(
+          plan,
+          value,
+          calls,
+          fingerprint
+        )) {
+        continue;
+      }
       fingerprints.add(value);
       unique.push(plan);
     }
     return unique;
+  }
+
+  private shellPlanWasInvalidatedByFileMutation(
+    plan: PlannedToolCall,
+    planFingerprint: string,
+    calls: ToolLoopCallRecord[],
+    fingerprint?: (plan: PlannedToolCall) => string
+  ): boolean {
+    if (plan.toolName !== 'shell.exec') return false;
+    let previousIndex = -1;
+    for (let index = calls.length - 1; index >= 0; index -= 1) {
+      const call = calls[index]!;
+      const value = fingerprint?.(call)
+        ?? `${call.toolName}:${stableStringify(call.params)}`;
+      if (value === planFingerprint) {
+        previousIndex = index;
+        break;
+      }
+    }
+    if (previousIndex < 0) return false;
+    return calls.slice(previousIndex + 1).some(call =>
+      call.success
+      && (
+        call.toolName === 'fs.write'
+        || call.toolName === 'fs.replace'
+        || call.toolName === 'fs.synthesize'
+      )
+      && isSuccessfulWorkspaceMutationCall(call)
+    );
   }
 }
 

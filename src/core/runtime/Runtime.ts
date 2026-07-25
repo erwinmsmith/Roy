@@ -19897,6 +19897,25 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         ? { skip: false }
         : { skip: true, reason: 'cached_workspace_search_still_current' };
     }
+    if (plan.toolName === 'shell.exec'
+      && this.isDependencyInstallCommand(String(plan.params.command ?? ''))) {
+      const dependencyManifestInvalidated = effectiveLaterMutations.some(call =>
+        (call.toolName === 'fs.write'
+          || call.toolName === 'fs.replace'
+          || call.toolName === 'fs.synthesize')
+        && this.isDependencyManifestPath(String(
+          (call.result as { path?: unknown } | undefined)?.path
+            ?? call.params.path
+            ?? ''
+        ))
+      );
+      if (dependencyManifestInvalidated) {
+        return {
+          skip: false,
+          reason: 'dependency_manifest_changed_after_cached_install',
+        };
+      }
+    }
     if (isWorkspaceVerificationCall({ ...plan, success: true })) {
       const timedOut = Boolean(
         (previous.result as { timedOut?: unknown } | undefined)?.timedOut
@@ -19932,6 +19951,19 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         target === '.'
         || mutated.startsWith(`${target.replace(/\/+$/, '')}/`)
       ));
+  }
+
+  private isDependencyInstallCommand(command: string): boolean {
+    const normalized = command.trim().replace(/^(?:cd\s+\S+\s*&&\s*)+/i, '');
+    return /^(?:python(?:3)?\s+-m\s+pip|pip(?:3)?|uv)\s+install\b/i.test(normalized)
+      || /^(?:npm|pnpm|yarn|bun)\s+(?:install|ci)\b/i.test(normalized);
+  }
+
+  private isDependencyManifestPath(candidatePath: string): boolean {
+    const path = this.normalizeToolWorkspacePath(candidatePath).toLowerCase();
+    return /(?:^|\/)(?:pyproject\.toml|setup\.cfg|setup\.py|requirements[^/]*\.txt|package\.json|package-lock\.json|pnpm-lock\.ya?ml|yarn\.lock|bun\.lockb?|cargo\.toml|cargo\.lock|go\.mod|go\.sum|pom\.xml|build\.gradle|gemfile|gemfile\.lock)$/.test(
+      path
+    );
   }
 
   private normalizeToolWorkspacePath(value: string): string {

@@ -101,4 +101,78 @@ describe('AgentToolExecutionLoop', () => {
     expect(execute).toHaveBeenCalledTimes(1);
     expect(summary.stopReason).toBe('duplicate_plan');
   });
+
+  it('reruns a state-sensitive shell command once after a file mutation', async () => {
+    const loop = new AgentToolExecutionLoop({
+      maxRounds: 5,
+      maxCalls: 8,
+      maxConsecutiveFailures: 2,
+      maxWallClockMs: 10_000,
+    });
+    const install = {
+      toolName: 'shell.exec',
+      params: { command: 'python -m pip install -e .' },
+      reason: 'Install the current manifest.',
+      groundingRequired: true,
+    };
+    const mutation = {
+      toolName: 'fs.synthesize',
+      params: {
+        path: 'pyproject.toml',
+        instructions: 'Upgrade dependencies.',
+        strategy: 'patch',
+      },
+      reason: 'Update the manifest.',
+      groundingRequired: true,
+    };
+    const execute = vi.fn(async () => ({ success: true, result: 'ok' }));
+    const summary = await loop.run({
+      task: 'Update dependencies and install them.',
+      initialPlans: [install, mutation],
+      execute,
+      planNext: async context => context.round <= 2 ? [install] : [],
+    });
+
+    expect(summary.rounds.map(round =>
+      round.calls.map(call => call.toolName)
+    )).toEqual([
+      ['shell.exec', 'fs.synthesize'],
+      ['shell.exec'],
+    ]);
+    expect(execute).toHaveBeenCalledTimes(3);
+    expect(summary.stopReason).toBe('duplicate_plan');
+  });
+
+  it('does not rerun a shell command when only another shell call followed it', async () => {
+    const loop = new AgentToolExecutionLoop({
+      maxRounds: 4,
+      maxCalls: 6,
+      maxConsecutiveFailures: 2,
+      maxWallClockMs: 10_000,
+    });
+    const install = {
+      toolName: 'shell.exec',
+      params: { command: 'python -m pip install -e .' },
+      reason: 'Install dependencies.',
+      groundingRequired: true,
+    };
+    const execute = vi.fn(async () => ({ success: true, result: 'ok' }));
+    const summary = await loop.run({
+      task: 'Install and verify.',
+      initialPlans: [
+        install,
+        {
+          toolName: 'shell.exec',
+          params: { command: 'python -m app.cli --help' },
+          reason: 'Verify.',
+          groundingRequired: true,
+        },
+      ],
+      execute,
+      planNext: async () => [install],
+    });
+
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(summary.stopReason).toBe('duplicate_plan');
+  });
 });
