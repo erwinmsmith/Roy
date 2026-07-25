@@ -17712,7 +17712,11 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         },
       });
       if (closure.closed) return combined;
-      if (current.toolCalls.length === 0) {
+      const attemptAdvanced = this.rootExecutionAttemptAdvanced(
+        current,
+        priorExecution ?? delegatedExecution
+      );
+      if (!attemptAdvanced) {
         stalledIterations += 1;
         const stableCausalFrontier = priorExecution ?? delegatedExecution;
         this.emit({
@@ -17725,8 +17729,9 @@ For web-grounded work, use only facts present in the subagent report or runtime 
             stalledIterations,
             maxStalledIterations,
             stateUnchanged: Boolean(stableCausalFrontier?.toolCalls.length),
+            toolCallsProduced: current.toolCalls.length,
             reason: stableCausalFrontier?.toolCalls.length
-              ? 'The grounded repair planner produced no action from an unchanged causal frontier; repeating the same evidence would be redundant.'
+              ? 'The grounded repair planner produced no new successful action or failure evidence from an unchanged causal frontier; repeating it would be redundant.'
               : 'The grounded repair planner exhausted its internal correction attempts without producing a new tool action.',
             latestFailure: priorExecution?.warnings.at(-1),
             ...closure,
@@ -17739,6 +17744,33 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       }
     }
     return combineWithDelegatedExecution();
+  }
+
+  private rootExecutionAttemptAdvanced(
+    current: GroundingRunResult,
+    prior?: GroundingRunResult
+  ): boolean {
+    if (current.toolCalls.some(call => call.success)) return true;
+    if (current.toolCalls.length === 0) return false;
+    const priorFailures = new Set(
+      (prior?.toolCalls ?? [])
+        .filter(call => !call.success)
+        .map(call => this.failedToolCallEvidenceFingerprint(call))
+    );
+    return current.toolCalls.some(call =>
+      !call.success && !priorFailures.has(this.failedToolCallEvidenceFingerprint(call))
+    );
+  }
+
+  private failedToolCallEvidenceFingerprint(
+    call: Pick<ToolCallRecord, 'toolName' | 'params' | 'result' | 'error'>
+  ): string {
+    return createHash('sha256').update(JSON.stringify({
+      toolName: call.toolName,
+      params: call.params,
+      error: call.error ?? null,
+      result: call.result ?? null,
+    })).digest('hex');
   }
 
   private buildRootExecutionRepairTask(

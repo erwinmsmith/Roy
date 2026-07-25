@@ -298,6 +298,56 @@ class NoProgressDirectExecutionLLM extends TerminalTaskLLM {
 }
 
 describe('benchmark terminal capability', () => {
+  it('treats an identical failed closure action as stalled rather than progress', () => {
+    const runtime = new Runtime();
+    const advanced = (runtime as unknown as {
+      rootExecutionAttemptAdvanced: (
+        current: {
+          toolCalls: Array<{
+            toolName: string;
+            params: Record<string, unknown>;
+            success: boolean;
+            error?: string;
+            result?: unknown;
+          }>;
+        },
+        prior?: {
+          toolCalls: Array<{
+            toolName: string;
+            params: Record<string, unknown>;
+            success: boolean;
+            error?: string;
+            result?: unknown;
+          }>;
+        }
+      ) => boolean;
+    }).rootExecutionAttemptAdvanced.bind(runtime);
+    const rejected = {
+      toolName: 'fs.synthesize',
+      params: { path: '.roy/official-verifier/test_outputs.py' },
+      success: false,
+      error: '.roy/official-verifier is immutable runtime evidence',
+    };
+
+    expect(advanced(
+      { toolCalls: [rejected] },
+      { toolCalls: [rejected] }
+    )).toBe(false);
+    expect(advanced(
+      {
+        toolCalls: [{
+          ...rejected,
+          error: 'requirements.txt still contains langchain==0.0.1',
+        }],
+      },
+      { toolCalls: [rejected] }
+    )).toBe(true);
+    expect(advanced(
+      { toolCalls: [{ ...rejected, success: true, error: undefined }] },
+      { toolCalls: [rejected] }
+    )).toBe(true);
+  });
+
   it('requires verification at or after the latest successful mutation', () => {
     const runtime = new Runtime();
     const analyze = (runtime as unknown as {
