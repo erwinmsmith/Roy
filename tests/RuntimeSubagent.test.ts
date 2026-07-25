@@ -2943,6 +2943,46 @@ describe('Runtime controlled subagent spawning', () => {
     await runtime.shutdown();
   });
 
+  it('does not treat inherited parent delegation guidance as a child assignment', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-inherited-delegation-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'inherited-delegation-test',
+      llmProvider: new EchoLLM(),
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+
+    const researcher = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'researcher',
+      name: 'Bounded Researcher',
+      tomLevel: 0,
+      description: 'Collect evidence for two facts.',
+      task: 'Collect evidence for two facts.',
+    });
+    await runtime.runAgent(
+      researcher.identity.id,
+      [
+        'Collect evidence for two facts and return a bounded report.',
+        'Parent task: Use normal delegation judgment and delegate factual research when useful.',
+      ].join('\n'),
+      { correlationId: 'del_inherited_guidance', archetype: 'researcher' }
+    );
+
+    expect(runtime.getAgentTree().children[0].children).toHaveLength(0);
+    expect(runtime.getEvents().some(event =>
+      event.type === 'agent.delegation.assessment.skipped'
+      && event.agentId === researcher.identity.id
+    )).toBe(true);
+    expect(runtime.getEvents().some(event =>
+      event.type === 'delegation.assess.started'
+      && event.agentId === researcher.identity.id
+    )).toBe(false);
+
+    await runtime.shutdown();
+  });
+
   it('lets a non-root parent aggregate multiple direct children', async () => {
     const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-multi-child-'));
     const runtime = new Runtime();

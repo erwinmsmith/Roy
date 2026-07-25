@@ -12913,9 +12913,14 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     agent: AgentInfo,
     task: string
   ): { assess: boolean; reason: string } {
+    const inheritedParentMarker = /\bParent task\s*:/i.exec(task);
+    const assignedResponsibility = inheritedParentMarker
+      ? task.slice(0, inheritedParentMarker.index)
+      : task;
     const explicitRecursiveResponsibility =
-      /\b(?:delegate|delegation|spawn|subagent|sub-agent|subteam|sub-team|direct child|form a team|create a team)\b/i.test(task)
-      || /(?:派生|委派|子代理|子团队|组建团队)/.test(task);
+      /\b(?:delegate|delegation|spawn|subagent|sub-agent|subteam|sub-team|direct child|form a team|create a team)\b/i.test(assignedResponsibility)
+      || /(?:派生|委派|子代理|子团队|组建团队)/.test(assignedResponsibility);
+    const stagedAssignedResponsibility = this.requiresStagedDelegation(assignedResponsibility);
     const teamId = agent.identity.teamId;
     if (teamId) {
       const team = this.teams.get(teamId);
@@ -12925,7 +12930,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
           reason: 'This bounded team-member task should execute directly; recursive structure is coordinated by the team lead.',
         };
       }
-      if (explicitRecursiveResponsibility || this.requiresStagedDelegation(task)) {
+      if (explicitRecursiveResponsibility || stagedAssignedResponsibility) {
         return {
           assess: true,
           reason: 'The team lead owns an explicit or staged recursive coordination responsibility.',
@@ -12936,7 +12941,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
         reason: 'The team lead has a bounded executable task and no concrete recursive coordination gap.',
       };
     }
-    if (explicitRecursiveResponsibility || this.requiresStagedDelegation(task)) {
+    if (explicitRecursiveResponsibility || stagedAssignedResponsibility) {
       return {
         assess: true,
         reason: 'The standalone agent task explicitly requires delegation or depends on a later staged result.',
