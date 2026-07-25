@@ -577,6 +577,54 @@ describe('Autonomous multi-turn actor design', () => {
     await runtime.shutdown();
   });
 
+  it('retries transport failures inside a JSON decision even when reasoning budget is limited', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-limited-json-transport-retry-'));
+    await mkdir(path.join(workspaceCwd, '.roy'), { recursive: true });
+    await writeFile(path.join(workspaceCwd, '.roy', 'config.json'), JSON.stringify({
+      llm: {
+        jsonMaxAttempts: 2,
+        turnMaxAttempts: 1,
+        retryInitialDelayMs: 0,
+        retryMaxDelayMs: 0,
+      },
+      tom: { autoCompleteGaps: false, minimumCoverage: 0 },
+    }, null, 2));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'limited-json-transport-retry-test',
+      workspaceCwd,
+      budget: 30_000,
+      llmProvider: new StreamResilienceLLM(),
+    });
+
+    const recovery = await runtime.handleUserTurnWithRecovery(
+      'DECISION_CONNECTION_RETRY: answer this concrete bounded task directly.'
+    );
+
+    expect(recovery.recovered).toBe(false);
+    expect(recovery.attempts).toBe(1);
+    expect(recovery.result.finalResponse).toBe('The retried turn completed once.');
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'llm.json.retrying',
+      data: expect.objectContaining({
+        purpose: 'root.delegation_decision',
+        attempt: 1,
+        retryable: true,
+      }),
+    }));
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'llm.json.recovered',
+      data: expect.objectContaining({
+        purpose: 'root.delegation_decision',
+        attempt: 2,
+      }),
+    }));
+    expect(runtime.getEvents()).not.toContainEqual(expect.objectContaining({
+      type: 'runtime.transient_turn.retrying',
+    }));
+    await runtime.shutdown();
+  });
+
   it('reserves reasoning tokens and retries an incomplete structured delegation response', async () => {
     const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-json-retry-'));
     await mkdir(path.join(workspaceCwd, '.roy'), { recursive: true });

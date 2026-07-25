@@ -13965,8 +13965,11 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     };
 
     try {
-      const configuredAttempts = Math.max(1, Math.floor(this.workspaceRuntimeConfig?.llm.jsonMaxAttempts ?? 2));
-      const maxAttempts = this.getBudgetState().mode === 'limited' ? 1 : configuredAttempts;
+      const maxAttempts = Math.max(
+        1,
+        Math.floor(this.workspaceRuntimeConfig?.llm.jsonMaxAttempts ?? 2)
+      );
+      const allowStructuredContentRetry = this.getBudgetState().mode !== 'limited';
       let value: T | undefined;
       for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
         const attemptMessages = attempt === 1 ? messages : [
@@ -13999,7 +14002,11 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
           }
           break;
         } catch (error) {
-          const retryable = this.isRetryableJSONCompletionError(error);
+          const retryable = this.isRetryableLLMStreamError(error)
+            || (
+              allowStructuredContentRetry
+              && this.isRetryableJSONCompletionError(error)
+            );
           const willRetry = retryable && attempt < maxAttempts;
           this.emit({
             type: willRetry ? 'llm.json.retrying' : 'llm.json.failed',
