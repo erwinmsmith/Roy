@@ -17,6 +17,8 @@ export type {
   DelegationAgentPlan,
   DelegationTeamPlan,
   RootTurnResult,
+  RootTurnRecoveryOptions,
+  RootTurnRecoveryResult,
   MultiTurnExperimentInput,
   MultiTurnExperimentTurn,
   MultiTurnExperimentResult,

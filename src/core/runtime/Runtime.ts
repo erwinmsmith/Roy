@@ -652,6 +652,19 @@ export interface RootTurnResult {
   };
 }
 
+export interface RootTurnRecoveryOptions {
+  maxAttempts?: number;
+  retryInitialDelayMs?: number;
+  retryMaxDelayMs?: number;
+}
+
+export interface RootTurnRecoveryResult {
+  result: RootTurnResult;
+  attempts: number;
+  recovered: boolean;
+  correlationIds: string[];
+}
+
 export interface MultiTurnExperimentInput {
   turns: string[];
   stopOnError?: boolean;
@@ -6175,6 +6188,90 @@ export class Runtime {
       this.changedPathsByCorrelation.delete(correlationId);
       this.resumedExecutionByCorrelation.delete(correlationId);
     }
+  }
+
+  /**
+   * Run a non-interactive turn through transient provider failures without
+   * discarding the persisted workspace, execution cache, tree, or trace.
+   *
+   * Stream-level retries handle brief transport faults first. This boundary is
+   * deliberately separate from handleUserTurn so interactive callers keep
+   * explicit failure semantics, while batch runners can resume the same task
+   * from Roy's persisted execution ledger after a fully exhausted stream.
+   */
+  async handleUserTurnWithRecovery(
+    userInput: string,
+    options: RootTurnRecoveryOptions = {}
+  ): Promise<RootTurnRecoveryResult> {
+    const retryConfig = this.workspaceRuntimeConfig?.llm;
+    const maxAttempts = Math.max(
+      1,
+      Math.floor(options.maxAttempts ?? retryConfig?.turnMaxAttempts ?? 3)
+    );
+    const initialDelayMs = Math.max(
+      0,
+      Math.floor(options.retryInitialDelayMs ?? retryConfig?.retryInitialDelayMs ?? 250)
+    );
+    const maxDelayMs = Math.max(
+      initialDelayMs,
+      Math.floor(options.retryMaxDelayMs ?? retryConfig?.retryMaxDelayMs ?? 2_000)
+    );
+    const correlationIds: string[] = [];
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      const eventStart = this.events.length;
+      try {
+        const result = await this.handleUserTurn(userInput);
+        correlationIds.push(result.correlationId);
+        if (attempt > 1) {
+          this.emit({
+            type: 'runtime.transient_turn.recovered',
+            agentId: 'root',
+            correlationId: result.correlationId,
+            data: {
+              attempt,
+              maxAttempts,
+              failedCorrelationIds: correlationIds.slice(0, -1),
+            },
+          });
+        }
+        return {
+          result,
+          attempts: attempt,
+          recovered: attempt > 1,
+          correlationIds,
+        };
+      } catch (error) {
+        const failedCorrelationId = this.events
+          .slice(eventStart)
+          .reverse()
+          .find(event => event.type === 'root.turn.failed')
+          ?.correlationId;
+        if (failedCorrelationId && !correlationIds.includes(failedCorrelationId)) {
+          correlationIds.push(failedCorrelationId);
+        }
+        const retryable = this.isRetryableLLMStreamError(error);
+        const willRetry = retryable && attempt < maxAttempts;
+        this.emit({
+          type: willRetry
+            ? 'runtime.transient_turn.retrying'
+            : 'runtime.transient_turn.failed',
+          agentId: 'root',
+          correlationId: failedCorrelationId,
+          data: {
+            attempt,
+            maxAttempts,
+            retryable,
+            error: error instanceof Error ? error.message : String(error),
+            persistedState: true,
+          },
+        });
+        if (!willRetry) throw error;
+        const delayMs = Math.min(maxDelayMs, initialDelayMs * (2 ** (attempt - 1)));
+        if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs));
+      }
+    }
+    throw new Error('Transient turn recovery exhausted without a result');
   }
 
   private async executeUserTurn(userInput: string, correlationId: string): Promise<RootTurnResult> {
@@ -13690,7 +13787,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
       return true;
     }
     if (status !== undefined && [408, 409, 425, 429, 500, 502, 503, 504].includes(status)) return true;
-    return /premature close|socket hang up|connection (?:was )?(?:closed|reset)|stream (?:was )?(?:closed|terminated)|fetch failed|network error|timed? ?out|temporarily unavailable|service unavailable/.test(message);
+    return /premature close|socket hang up|connection (?:error|(?:was )?(?:closed|reset))|stream (?:was )?(?:closed|terminated)|fetch failed|network error|timed? ?out|temporarily unavailable|service unavailable/.test(message);
   }
 
   private async completeAsRoot(prompt: string, purpose: string, correlationId: string): Promise<string> {

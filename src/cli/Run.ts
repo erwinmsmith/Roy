@@ -145,18 +145,30 @@ async function main(): Promise<void> {
       budget: options.budget,
       wallClockLimitMs: options.wallClockMs,
     });
-    const result = await runtime.handleUserTurn(task);
+    const recovery = await runtime.handleUserTurnWithRecovery(task);
+    const result = recovery.result;
+    const correlationIds = new Set(recovery.correlationIds);
     const artifact = {
       schemaVersion: 1,
       sessionId: options.sessionId,
       workspace,
       task,
       result,
+      recovery: {
+        attempts: recovery.attempts,
+        recovered: recovery.recovered,
+        correlationIds: recovery.correlationIds,
+      },
       events: runtime.getEvents().filter(event =>
-        event.correlationId === result.correlationId
+        (event.correlationId !== undefined && correlationIds.has(event.correlationId))
+        || event.type.startsWith('runtime.transient_turn.')
         || event.type === 'runtime.wall_clock_limit.applied'
       ),
-      messages: await runtime.getMessages({ correlationId: result.correlationId, limit: 10_000 }),
+      messages: (await Promise.all(
+        recovery.correlationIds.map(correlationId =>
+          runtime.getMessages({ correlationId, limit: 10_000 })
+        )
+      )).flat().sort((left, right) => left.createdAt - right.createdAt),
       completedAt: new Date().toISOString(),
     };
     if (outputPath) await writeJsonAtomically(outputPath, artifact);

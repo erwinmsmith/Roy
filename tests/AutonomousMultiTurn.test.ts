@@ -156,6 +156,8 @@ class StreamResilienceLLM implements LLMProvider {
   readonly name = 'deepseek-stream-resilience-test';
   readonly defaultModel = 'test-model';
   private retryTurnAttempts = 0;
+  private connectionRetryAttempts = 0;
+  private recoveredTurnAttempts = 0;
   private jsonRetryAttempts = 0;
   lastJSONMaxTokens?: number;
 
@@ -166,6 +168,14 @@ class StreamResilienceLLM implements LLMProvider {
   async *stream(messages: LLMMessage[]): AsyncGenerator<LLMStreamChunk, void, unknown> {
     const text = messages.map(message => message.content).join('\n');
     if (text.includes('FAIL_TURN')) throw new Error('Premature close');
+    if (text.includes('CONNECTION_RETRY')) {
+      this.connectionRetryAttempts += 1;
+      if (this.connectionRetryAttempts === 1) throw new Error('Premature close');
+      if (this.connectionRetryAttempts === 2) throw new Error('Connection error.');
+    }
+    if (text.includes('TURN_LEVEL_RETRY') && this.recoveredTurnAttempts++ === 0) {
+      throw new Error('Connection error.');
+    }
     if (text.includes('RETRY_TURN') && this.retryTurnAttempts++ === 0) {
       yield { content: 'discard this partial response', done: false };
       throw new Error('Premature close');
@@ -399,6 +409,87 @@ describe('Autonomous multi-turn actor design', () => {
       'llm.stream.recovered',
     ]));
     expect(runtime.getContext().fsm.getState()).toBe('S_solo');
+    await runtime.shutdown();
+  });
+
+  it('treats a provider Connection error as retryable after a prematurely closed stream', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-connection-retry-'));
+    await mkdir(path.join(workspaceCwd, '.roy'), { recursive: true });
+    await writeFile(path.join(workspaceCwd, '.roy', 'config.json'), JSON.stringify({
+      llm: { streamMaxAttempts: 3, retryInitialDelayMs: 0, retryMaxDelayMs: 0 },
+      tom: { autoCompleteGaps: false, minimumCoverage: 0 },
+    }, null, 2));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'connection-retry-test',
+      workspaceCwd,
+      llmProvider: new StreamResilienceLLM(),
+    });
+
+    const result = await runtime.handleUserTurn(
+      'CONNECTION_RETRY: complete this bounded task after transient provider failures.'
+    );
+
+    expect(result.finalResponse).toBe('The retried turn completed once.');
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'llm.stream.retrying',
+      data: expect.objectContaining({
+        attempt: 2,
+        error: 'Connection error.',
+        retryable: true,
+      }),
+    }));
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'llm.stream.recovered',
+      data: expect.objectContaining({ attempt: 3 }),
+    }));
+    await runtime.shutdown();
+  });
+
+  it('resumes the same persisted task after stream retries are exhausted', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-transient-turn-recovery-'));
+    await mkdir(path.join(workspaceCwd, '.roy'), { recursive: true });
+    await writeFile(path.join(workspaceCwd, '.roy', 'config.json'), JSON.stringify({
+      llm: {
+        streamMaxAttempts: 1,
+        turnMaxAttempts: 2,
+        retryInitialDelayMs: 0,
+        retryMaxDelayMs: 0,
+      },
+      tom: { autoCompleteGaps: false, minimumCoverage: 0 },
+    }, null, 2));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'transient-turn-recovery-test',
+      workspaceCwd,
+      llmProvider: new StreamResilienceLLM(),
+    });
+
+    const recovery = await runtime.handleUserTurnWithRecovery(
+      'TURN_LEVEL_RETRY: resume this exact task after the provider recovers.'
+    );
+
+    expect(recovery.result.finalResponse).toBe('The retried turn completed once.');
+    expect(recovery.attempts).toBe(2);
+    expect(recovery.recovered).toBe(true);
+    expect(recovery.correlationIds).toHaveLength(2);
+    expect(runtime.listRootExecutionTrees().map(tree => tree.status).sort()).toEqual([
+      'completed',
+      'failed',
+    ]);
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'runtime.transient_turn.retrying',
+      data: expect.objectContaining({
+        attempt: 1,
+        retryable: true,
+        persistedState: true,
+      }),
+    }));
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'runtime.transient_turn.recovered',
+      correlationId: recovery.result.correlationId,
+      data: expect.objectContaining({ attempt: 2 }),
+    }));
     await runtime.shutdown();
   });
 
