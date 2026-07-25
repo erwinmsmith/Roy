@@ -1892,6 +1892,80 @@ describe('UnifiedAgent capability execution', () => {
     expect(plans).toEqual([]);
   });
 
+  it('transitions a successful baseline into a preserving patch when the task names the target and input contract', async () => {
+    const llm = new CapturingToolPlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'grounded-baseline-repair-agent',
+      goal: 'turn grounded baseline evidence into implementation progress',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.read', 'fs.replace', 'fs.synthesize', 'shell.exec'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: [
+        'Repair src/table_recon/audit.py so it reconstructs geometric table cells.',
+        'Use data/public/manifest.json and run:',
+        'python -m table_recon.cli run --manifest data/public/manifest.json --out-dir outputs',
+      ].join('\n'),
+      executionRequired: true,
+      round: 3,
+      remainingCalls: 3,
+      tools: [
+        { name: 'fs.read' },
+        { name: 'fs.replace' },
+        { name: 'fs.synthesize' },
+        { name: 'shell.exec' },
+      ],
+      calls: [
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/table_recon/audit.py' },
+          reason: 'Inspect the assigned implementation.',
+          groundingRequired: true,
+          success: true,
+          result: {
+            path: 'src/table_recon/audit.py',
+            content: 'def run_audit(config):\n    return token_order_baseline(config)\n',
+            truncated: false,
+          },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'data/public/manifest.json' },
+          reason: 'Inspect the explicit input contract.',
+          groundingRequired: true,
+          success: true,
+          result: {
+            path: 'data/public/manifest.json',
+            content: '{"documents":[]}',
+            truncated: false,
+          },
+        },
+        {
+          toolName: 'shell.exec',
+          params: {
+            command: 'python -m table_recon.cli run --manifest data/public/manifest.json --out-dir outputs',
+          },
+          reason: 'Capture the baseline behavior.',
+          groundingRequired: true,
+          success: true,
+          result: { exitCode: 0, stdout: '' },
+        },
+      ],
+    });
+
+    expect(plans).toEqual([expect.objectContaining({
+      toolName: 'fs.synthesize',
+      params: {
+        path: 'src/table_recon/audit.py',
+        instructions: expect.stringContaining('interface-preserving'),
+        strategy: 'patch',
+      },
+      reason: expect.stringContaining('zero-exit baseline'),
+    })]);
+  });
+
   it('recovers a corrupted source file containing model tool-protocol markup', async () => {
     const llm = new CapturingToolPlanningLLM();
     const agent = new UnifiedAgent({

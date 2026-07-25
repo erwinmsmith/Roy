@@ -229,6 +229,140 @@ export class AgentToolPlanner {
       }));
   }
 
+  planWorkspaceEvidenceFollowUps(input: {
+    task: string;
+    calls: ObservedToolCall[];
+    bindings: ToolPlanBinding[];
+    workspaceRoot?: string;
+  }): PlannedToolCall[] {
+    if (!input.bindings.some(binding =>
+      binding.enabled && binding.name === 'fs.read'
+    )) {
+      return [];
+    }
+    const observed = new Set(input.calls
+      .filter(call => call.toolName === 'fs.read')
+      .map(call => this.normalizeWorkspacePath(String(
+        (call.result as { path?: unknown } | undefined)?.path
+          ?? call.params.path
+          ?? ''
+      )))
+      .filter(Boolean));
+    const listedPaths = input.calls
+      .filter(call => call.toolName === 'fs.list' && call.success)
+      .flatMap(call => {
+        const entries = (call.result as { entries?: unknown } | undefined)?.entries;
+        return Array.isArray(entries)
+          ? entries.filter((entry): entry is string => typeof entry === 'string')
+          : [];
+      })
+      .map(path => this.normalizeWorkspacePath(path));
+    const resolvePath = (rawPath: string, relativeTo?: string): string | undefined => {
+      let candidate = this.normalizeWorkspacePath(rawPath);
+      const workspaceRoot = this.normalizeWorkspacePath(String(input.workspaceRoot ?? ''));
+      if (workspaceRoot && candidate.startsWith(`${workspaceRoot}/`)) {
+        candidate = candidate.slice(workspaceRoot.length + 1);
+      }
+      if (candidate.startsWith('/') || candidate.startsWith('../')) return undefined;
+      if (relativeTo
+        && !candidate.includes('/')
+        && relativeTo.includes('/')) {
+        candidate = `${relativeTo.slice(0, relativeTo.lastIndexOf('/') + 1)}${candidate}`;
+      }
+      const listedMatch = listedPaths.find(path =>
+        path === candidate || path.endsWith(`/${candidate}`)
+      );
+      return listedMatch ?? candidate;
+    };
+    const readablePath = (path: string): boolean =>
+      /\.(?:py|ts|tsx|js|jsx|mjs|cjs|java|go|rs|rb|php|sh|json|jsonl|csv|ya?ml|toml|ini|cfg|md|txt|xml)$/i.test(
+        path
+      );
+    const candidates: Array<{ path: string; reason: string; priority: number }> = [];
+    for (const explicitPath of this.extractReferencedPaths(input.task)) {
+      const path = resolvePath(explicitPath);
+      if (!path || !readablePath(path)) continue;
+      candidates.push({
+        path,
+        reason: `Read the still-unobserved file explicitly named by the task: ${path}.`,
+        priority: 200,
+      });
+    }
+
+    for (const call of input.calls) {
+      if (call.toolName !== 'fs.read' || !call.success) continue;
+      const result = call.result as { path?: unknown; content?: unknown } | undefined;
+      const sourcePath = this.normalizeWorkspacePath(String(
+        result?.path ?? call.params.path ?? ''
+      ));
+      if (!/(?:^|\/)[^/]*manifest[^/]*\.json$/i.test(sourcePath)
+        || typeof result?.content !== 'string') {
+        continue;
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(result.content);
+      } catch {
+        continue;
+      }
+      const referenced = new Set<string>();
+      const visit = (value: unknown, depth: number): void => {
+        if (depth > 8 || value === null || value === undefined) return;
+        if (typeof value === 'string') {
+          if (/[./\\][A-Za-z0-9_.@/-]+\.[A-Za-z0-9]{1,8}$/.test(value)
+            || /^[A-Za-z0-9_.@-]+\.[A-Za-z0-9]{1,8}$/.test(value)) {
+            referenced.add(value);
+          }
+          return;
+        }
+        if (Array.isArray(value)) {
+          value.slice(0, 200).forEach(item => visit(item, depth + 1));
+          return;
+        }
+        if (typeof value === 'object') {
+          Object.values(value as Record<string, unknown>)
+            .slice(0, 200)
+            .forEach(item => visit(item, depth + 1));
+        }
+      };
+      visit(parsed, 0);
+      for (const rawPath of referenced) {
+        const path = resolvePath(rawPath, sourcePath);
+        if (!path || !readablePath(path)) continue;
+        const lower = path.toLowerCase();
+        candidates.push({
+          path,
+          reason: `Follow the task input dependency referenced by ${sourcePath}: ${path}.`,
+          priority: /(?:ocr|tokens?)/.test(lower)
+            ? 150
+            : /(?:metadata|schema|expected|rules?)/.test(lower)
+              ? 120
+              : 80,
+        });
+      }
+    }
+
+    const seen = new Set<string>();
+    return candidates
+      .filter(candidate => {
+        if (!candidate.path || observed.has(candidate.path) || seen.has(candidate.path)) {
+          return false;
+        }
+        seen.add(candidate.path);
+        return true;
+      })
+      .sort((left, right) =>
+        right.priority - left.priority || left.path.localeCompare(right.path)
+      )
+      .slice(0, 3)
+      .map(candidate => ({
+        toolName: 'fs.read',
+        params: { path: candidate.path },
+        reason: candidate.reason,
+        groundingRequired: true,
+      }));
+  }
+
   planWorkspaceFailureFollowUps(input: {
     calls: ObservedToolCall[];
     bindings: ToolPlanBinding[];
@@ -638,7 +772,7 @@ export class AgentToolPlanner {
   }
 
   private extractReferencedPaths(task: string): string[] {
-    const matches = task.matchAll(/(?:^|[\s`'"(])((?:\.{1,2}\/)?(?:[A-Za-z0-9._@-]+\/)*[A-Za-z0-9._@-]+(?:\/|\.(?:ts|tsx|js|mjs|cjs|json|md|yaml|yml)))(?=$|[.\s`'"),:;])/g);
+    const matches = task.matchAll(/(?:^|[\s`'"(])((?:\.{1,2}\/)?(?:[A-Za-z0-9._@-]+\/)*[A-Za-z0-9._@-]+(?:\/|\.(?:py|ts|tsx|js|jsx|mjs|cjs|java|go|rs|rb|php|sh|json|jsonl|csv|md|toml|ini|cfg|txt|xml|yaml|yml)))(?=$|[.\s`'"),:;])/g);
     return [...new Set([...matches]
       .map(match => match[1].replace(/^\.\//, ''))
       .filter(value => value.length > 0))];

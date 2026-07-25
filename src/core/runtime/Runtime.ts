@@ -14776,6 +14776,8 @@ Produce the final response to the user as Roy, the root agent.`;
     } = {}
   ): Promise<string> {
     const ctx = this.getContext();
+    const usageBefore = agent.getUsage();
+    const completionStartedAt = Date.now();
     if (!ctx.llm) {
       const message = 'Error: LLM not configured';
       agent.recordRuntimeCompletion(message, {
@@ -14888,6 +14890,24 @@ Produce the final response to the user as Roy, the root agent.`;
     agent.recordRuntimeCompletion(content, {
       content,
       usage: completion.usage ?? this.estimateModelUsage(messages, content),
+    });
+    const usage = this.usageDifference(usageBefore, agent.getUsage());
+    this.emit({
+      type: 'llm.completion.usage',
+      agentId: agent.id,
+      correlationId,
+      data: {
+        purpose,
+        isolatedContext: options.isolatedContext === true,
+        promptCharacters: effectivePrompt.length,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        thinkingTokens: usage.thinkingTokens,
+        cachedInputTokens: usage.cachedInputTokens,
+        totalTokens: usage.totalTokens,
+        wallClockMs: Date.now() - completionStartedAt,
+        source: completion.usage?.source ?? 'estimated',
+      },
     });
     return content;
   }
@@ -16104,6 +16124,16 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         if (failureContextPlans.length > 0) {
           return failureContextPlans.slice(0, context.remainingCalls);
         }
+        const combinedCalls = [...priorPlannerCalls, ...context.calls];
+        const workspaceEvidencePlans = this.toolPlanner.planWorkspaceEvidenceFollowUps({
+          task: intentTask,
+          calls: combinedCalls,
+          bindings,
+          workspaceRoot: this.workspaceRoot,
+        });
+        if (workspaceEvidencePlans.length > 0) {
+          return workspaceEvidencePlans.slice(0, context.remainingCalls);
+        }
         const deterministic = this.toolPlanner.planWebFollowUps({
           task: intentTask,
           calls: context.calls,
@@ -16112,7 +16142,23 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         });
         if (deterministic.length > 0) return deterministic.slice(0, context.remainingCalls);
         if (this.toolPlanner.hasSufficientWebEvidence(intentTask, context.calls)) return [];
-        const combinedCalls = [...priorPlannerCalls, ...context.calls];
+        if (this.hasClosedReadOnlyWorkspaceEvidence(intentTask, combinedCalls)) {
+          this.emit({
+            type: 'agent.tool_loop.evidence_closed',
+            agentId,
+            sessionId: this.getContext().sessionId,
+            correlationId: options.correlationId,
+            nodeId: options.nodeId,
+            data: {
+              round: context.round,
+              successfulReads: combinedCalls.filter(call =>
+                call.toolName === 'fs.read' && call.success
+              ).length,
+              reason: 'explicit_workspace_evidence_covered',
+            },
+          });
+          return [];
+        }
         if (this.hasUnresolvedSynthesisRejection(combinedCalls)) {
           this.emit({
             type: 'agent.tool_loop.rejected_candidate.stopped',
@@ -16419,6 +16465,59 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         || call.toolName === 'fs.synthesize'
       )
       || /\b(?:multi-step|continue|iterate|until|cross-check|multiple sources|independent sources)\b/i.test(task);
+  }
+
+  private hasClosedReadOnlyWorkspaceEvidence(
+    task: string,
+    calls: Array<Pick<ToolCallRecord, 'toolName' | 'params' | 'result' | 'success'>>
+  ): boolean {
+    if (this.taskRequiresWorkspaceMutation(task)
+      || !/\b(?:inspect|read|review|audit|summari[sz]e|report|identify|analy[sz]e)\b/i.test(
+        task
+      )) {
+      return false;
+    }
+    const successfulReads = calls.filter(call =>
+      call.toolName === 'fs.read' && call.success
+    );
+    if (successfulReads.length === 0
+      || !calls.some(call => call.toolName === 'fs.list' && call.success)) {
+      return false;
+    }
+    const readPaths = successfulReads.map(call =>
+      this.normalizeToolWorkspacePath(String(
+        (call.result as { path?: unknown } | undefined)?.path
+          ?? call.params.path
+          ?? ''
+      )).toLowerCase()
+    );
+    const namedFiles = [...task.matchAll(
+      /(?:^|[\s`'"(])((?:\.{1,2}\/)?(?:[A-Za-z0-9._@-]+\/)*[A-Za-z0-9._@-]+\.(?:py|ts|tsx|js|jsx|mjs|cjs|java|go|rs|rb|php|sh|json|jsonl|csv|ya?ml|toml|ini|cfg|md|txt|xml))(?=$|[.\s`'"),:;])/gi
+    )].map(match => this.normalizeToolWorkspacePath(String(match[1])).toLowerCase());
+    if (namedFiles.some(named =>
+      !readPaths.some(observed =>
+        observed === named || observed.endsWith(`/${named}`)
+      )
+    )) {
+      return false;
+    }
+    if (/\b(?:source|code|implementation|codebase)\b/i.test(task)
+      && !readPaths.some(path =>
+        /\.(?:py|ts|tsx|js|jsx|mjs|cjs|java|go|rs|rb|php|sh)$/i.test(path)
+      )) {
+      return false;
+    }
+    if (/\b(?:manifest|dataset|inputs?|data)\b/i.test(task)
+      && !readPaths.some(path =>
+        /(?:^|\/)data\/|manifest|dataset|input/i.test(path)
+      )) {
+      return false;
+    }
+    if (/\b(?:ocr|tokens?)\b/i.test(task)
+      && !readPaths.some(path => /ocr|tokens?/.test(path))) {
+      return false;
+    }
+    return true;
   }
 
   private isFocusedVerifierDiagnosticCall(

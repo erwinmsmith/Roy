@@ -78,6 +78,66 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('follows explicit files and text dependencies from a grounded manifest without another model plan', () => {
+    const planner = new AgentToolPlanner();
+    const plans = planner.planWorkspaceEvidenceFollowUps({
+      task: [
+        'Inspect src/table_recon/audit.py and data/public/manifest.json.',
+        'Summarize the OCR inputs and src/table_recon/cli.py.',
+      ].join(' '),
+      workspaceRoot: '/app',
+      bindings: [{ name: 'fs.read', enabled: true }],
+      calls: [
+        {
+          toolName: 'fs.list',
+          params: { path: '.', maxDepth: 4 },
+          success: true,
+          result: {
+            entries: [
+              'src/table_recon/audit.py',
+              'src/table_recon/cli.py',
+              'data/public/manifest.json',
+              'data/public/invoice_ocr.json',
+              'data/public/invoice.png',
+            ],
+          },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/table_recon/audit.py' },
+          success: true,
+          result: { path: 'src/table_recon/audit.py', content: 'def run(): pass' },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'data/public/manifest.json' },
+          success: true,
+          result: {
+            path: 'data/public/manifest.json',
+            content: JSON.stringify({
+              documents: [{
+                image_path: 'data/public/invoice.png',
+                tokens_path: 'data/public/invoice_ocr.json',
+              }],
+            }),
+          },
+        },
+      ],
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.read',
+        params: { path: 'src/table_recon/cli.py' },
+      }),
+      expect.objectContaining({
+        toolName: 'fs.read',
+        params: { path: 'data/public/invoice_ocr.json' },
+      }),
+    ]);
+    expect(JSON.stringify(plans)).not.toContain('invoice.png');
+  });
+
   it('turns a verifier traceback into a bounded source read', () => {
     const plans = new AgentToolPlanner().planWorkspaceFailureFollowUps({
       bindings: [

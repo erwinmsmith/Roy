@@ -1458,12 +1458,24 @@ function recoverGroundedSynthesisPlan(input: {
           ?? ''
       )).startsWith('.roy/official-verifier/')
     );
+  const groundedInitialRepair = !input.latestVerificationFailed
+    && candidate.implementationIntent
+    && hasGroundedInitialImplementationEvidence(
+      input.calls,
+      input.task,
+      candidate.filePath
+    );
   // The deterministic fallback is deliberately limited to true scaffolds.
   // Replacing a non-stub implementation after a malformed planner response
   // discards working behavior and turns a local repair into another expensive
-  // whole-file generation. A broad official-verifier score is the exception:
-  // after its source has been read, one structural repair may be necessary.
-  if (!candidate.stubSignal && !candidate.invalidSourceSignal && !aggregateVerifierRepair) {
+  // whole-file generation. A broad official-verifier score is one exception.
+  // The other is a task that explicitly names the implementation target after
+  // both its input contract and a successful baseline execution were observed;
+  // that transition is always emitted as a preserving patch.
+  if (!candidate.stubSignal
+    && !candidate.invalidSourceSignal
+    && !aggregateVerifierRepair
+    && !groundedInitialRepair) {
     return undefined;
   }
   return {
@@ -1476,11 +1488,62 @@ function recoverGroundedSynthesisPlan(input: {
           : aggregateVerifierRepair
           ? 'Structurally repair the implementation to satisfy the grounded aggregate official-verifier failures and immutable assignment, preserving behavior already proven by passing verifier groups.'
           : 'Repair the implementation to satisfy the latest grounded verifier failure and the immutable assignment while preserving working behavior.'
-        : 'Implement the complete assigned workspace behavior in this authoritative source file using the grounded inputs, rules, and project structure.',
+        : groundedInitialRepair
+          ? 'Apply a focused, interface-preserving implementation patch to satisfy the immutable assignment using the grounded input contract and observed baseline behavior. Preserve working code and do not rewrite unrelated behavior.'
+          : 'Implement the complete assigned workspace behavior in this authoritative source file using the grounded inputs, rules, and project structure.',
+      ...(groundedInitialRepair ? { strategy: 'patch' } : {}),
     },
-    reason: `Runtime recovered a grounded file-synthesis action after structured planning did not advance execution in round ${input.round}.`,
+    reason: groundedInitialRepair
+      ? `Runtime transitioned from completed baseline inspection to a grounded preserving implementation patch in round ${input.round}; a zero-exit baseline does not satisfy a mutation-required assignment.`
+      : `Runtime recovered a grounded file-synthesis action after structured planning did not advance execution in round ${input.round}.`,
     groundingRequired: true,
   };
+}
+
+function hasGroundedInitialImplementationEvidence(
+  calls: ToolLoopCallRecord[],
+  task: string,
+  targetPath: string
+): boolean {
+  const normalizedTarget = normalizePlannedWorkspacePath(targetPath);
+  const completeTargetRead = calls.some(call => {
+    if (call.toolName !== 'fs.read' || !call.success) return false;
+    const result = call.result as {
+      path?: unknown;
+      content?: unknown;
+      truncated?: unknown;
+    } | undefined;
+    const path = normalizePlannedWorkspacePath(String(
+      result?.path ?? call.params.path ?? ''
+    ));
+    return path === normalizedTarget
+      && typeof result?.content === 'string'
+      && result.truncated !== true;
+  });
+  if (!completeTargetRead) return false;
+
+  const explicitContractRead = calls.some(call => {
+    if (call.toolName !== 'fs.read' || !call.success) return false;
+    const result = call.result as {
+      path?: unknown;
+      content?: unknown;
+      truncated?: unknown;
+    } | undefined;
+    const path = normalizePlannedWorkspacePath(String(
+      result?.path ?? call.params.path ?? ''
+    ));
+    return path !== normalizedTarget
+      && typeof result?.content === 'string'
+      && result.truncated !== true
+      && taskExplicitlyNamesWorkspacePath(task, path)
+      && /\.(?:csv|json|jsonl|ya?ml|toml|ini|cfg|md|txt|xml)$/i.test(path);
+  });
+  if (!explicitContractRead) return false;
+
+  return calls.some(call =>
+    isWorkspaceVerificationCall(call)
+    && isSuccessfulWorkspaceVerification(call)
+  );
 }
 
 function verificationFailureIsLocalized(latestFailure: ToolLoopCallRecord): boolean {
