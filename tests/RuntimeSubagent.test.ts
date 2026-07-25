@@ -47,6 +47,32 @@ class EchoLLM implements LLMProvider {
   }
 }
 
+class SaturatedClosurePlanningLLM extends EchoLLM {
+  sawSaturatedEvidence = false;
+
+  override async completeJSON<T>(messages: LLMMessage[]): Promise<T> {
+    const prompt = messages.map(message => String(message.content)).join('\n');
+    if (prompt.includes('You plan authorized tool calls')
+      && prompt.includes('"workspaceEvidenceSaturated":true')) {
+      this.sawSaturatedEvidence = true;
+      return {
+        action: 'call_tools',
+        reason: 'Apply the explicit implementation repair from the closed evidence phase.',
+        calls: [{
+          toolName: 'fs.replace',
+          params: {
+            path: 'app.ts',
+            oldText: 'export const value = "stub";',
+            newText: 'export const value = "implemented";',
+            expectedReplacements: 1,
+          },
+        }],
+      } as T;
+    }
+    return { action: 'finish', reason: 'No action selected.', calls: [] } as T;
+  }
+}
+
 class ContradictoryArchitectureLLM extends EchoLLM {
   override async *stream(_messages: LLMMessage[], _options?: LLMCompletionOptions): AsyncGenerator<LLMStreamChunk, void, unknown> {
     yield { content: 'This is a Rust project built around Cargo.toml, Cargo.lock, and src/main.rs.', done: false };
@@ -482,6 +508,80 @@ describe('Runtime controlled subagent spawning', () => {
       type: 'agent.run.completed',
       agentId: coder.identity.id,
     }));
+    await runtime.shutdown();
+  });
+
+  it('carries saturated evidence into a closure run that starts at model planning', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-saturated-closure-'));
+    await mkdir(path.join(workspaceCwd, '.roy'), { recursive: true });
+    await writeFile(
+      path.join(workspaceCwd, '.roy', 'config.json'),
+      JSON.stringify({
+        tools: {
+          approval: { readOnly: 'auto', write: 'auto', execute: 'auto' },
+        },
+      })
+    );
+    await writeFile(path.join(workspaceCwd, 'app.ts'), 'export const value = "stub";\n');
+    const llm = new SaturatedClosurePlanningLLM();
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'saturated-closure-test',
+      llmProvider: llm,
+      workspaceCwd,
+    });
+    const task = 'app.ts: Fix the implementation while preserving its exported interface.';
+    const coder = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'coder',
+      name: 'SaturatedClosureCoder-1',
+      description: task,
+      task,
+      tools: ['fs.list', 'fs.read', 'fs.replace'],
+    });
+    const priorToolCalls = [
+      {
+        toolName: 'fs.list',
+        params: { path: '.', maxDepth: 4 },
+        success: true,
+        result: { root: '.', maxDepth: 4, entries: ['app.ts'] },
+      },
+      {
+        toolName: 'fs.read',
+        params: { path: 'app.ts' },
+        success: true,
+        result: {
+          path: 'app.ts',
+          content: 'export const value = "stub";\n',
+          truncated: false,
+        },
+      },
+    ];
+
+    const grounding = await (runtime as unknown as {
+      runGroundingCheck: (
+        agentId: string,
+        assignedTask: string,
+        options: {
+          archetype: 'coder';
+          intentTask: string;
+          priorToolCalls: typeof priorToolCalls;
+        }
+      ) => Promise<RunAgentResult>;
+    }).runGroundingCheck(coder.identity.id, task, {
+      archetype: 'coder',
+      intentTask: task,
+      priorToolCalls,
+    });
+
+    expect(llm.sawSaturatedEvidence).toBe(true);
+    expect(grounding.toolCalls).toContainEqual(expect.objectContaining({
+      toolName: 'fs.replace',
+      success: true,
+    }));
+    expect(await readFile(path.join(workspaceCwd, 'app.ts'), 'utf8')).toBe(
+      'export const value = "implemented";\n'
+    );
     await runtime.shutdown();
   });
 

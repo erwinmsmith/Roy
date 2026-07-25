@@ -18227,6 +18227,16 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         success: true,
       })
     );
+    const initialWorkspaceEvidenceSaturated = workspaceExecutionRequired
+      && priorPlannerCalls.some(call =>
+        call.toolName === 'fs.read' && call.success
+      )
+      && this.toolPlanner.planWorkspaceEvidenceFollowUps({
+        task: intentTask,
+        calls: priorPlannerCalls,
+        bindings,
+        workspaceRoot: this.workspaceRoot,
+      }).length === 0;
     if (needsModelPlannedAction
       && loopConfig.enabled
       && loopConfig.llmReplanning
@@ -18241,6 +18251,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         executionRequired: workspaceExecutionRequired,
         diagnosticProbeRequired,
         requiredDiagnosticAfterCallIndex: priorPlannerCalls.length - 1,
+        workspaceEvidenceSaturated: initialWorkspaceEvidenceSaturated,
         round: 0,
         remainingCalls: loopConfig.maxCallsPerRun,
         requestTimeoutMs: planningRequestTimeoutMs(),
