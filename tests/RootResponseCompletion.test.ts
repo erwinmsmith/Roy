@@ -88,6 +88,7 @@ class AcceptanceRepairLLM implements LLMProvider {
   readonly name = 'acceptance-repair-test';
   readonly defaultModel = 'test-model';
   acceptanceAudits = 0;
+  referenceResolutions = 0;
   repairCalls = 0;
 
   async complete(): Promise<LLMCompletionResult> {
@@ -119,6 +120,17 @@ class AcceptanceRepairLLM implements LLMProvider {
 
   async completeJSON<T>(messages: LLMMessage[]): Promise<T> {
     const text = messages.map(message => message.content).join('\n');
+    if (text.includes('independent factual requirement resolver')) {
+      this.referenceResolutions += 1;
+      return {
+        references: [
+          { requirement: 'Include alpha', acceptedAnswers: ['alpha'], confidence: 1 },
+          { requirement: 'Include beta', acceptedAnswers: ['beta'], confidence: 1 },
+          { requirement: 'Include gamma', acceptedAnswers: ['gamma'], confidence: 1 },
+          { requirement: 'Include delta', acceptedAnswers: ['delta'], confidence: 1 },
+        ],
+      } as T;
+    }
     if (text.includes('final-response acceptance auditor')) {
       this.acceptanceAudits += 1;
       return (this.acceptanceAudits === 1
@@ -206,7 +218,7 @@ describe('root response completion', () => {
     });
 
     const result = await runtime.handleUserTurn([
-      'Produce one report covering every numbered requirement.',
+      'Answer every question by producing one report covering every numbered requirement.',
       '1. Include alpha.',
       '2. Include beta.',
       '3. Include gamma.',
@@ -217,6 +229,7 @@ describe('root response completion', () => {
     expect(result.finalResponse).toContain('Alpha, beta, gamma, and delta');
     expect(result.finalResponse).toContain('FINAL_REPORT: complete');
     expect(llm.acceptanceAudits).toBe(2);
+    expect(llm.referenceResolutions).toBe(1);
     expect(llm.repairCalls).toBe(1);
     expect(result.executionTree.steps.at(-1)).toMatchObject({
       status: 'completed',
@@ -224,6 +237,7 @@ describe('root response completion', () => {
     });
     expect(runtime.getEvents().map(event => event.type)).toEqual(expect.arrayContaining([
       'root.response.acceptance.audit.started',
+      'root.response.acceptance.references.completed',
       'root.response.acceptance.unmet',
       'root.response.acceptance.repair.started',
       'root.response.acceptance.repair.completed',

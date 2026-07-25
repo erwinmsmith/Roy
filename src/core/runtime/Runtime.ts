@@ -636,6 +636,12 @@ interface RootResponseAcceptanceAudit {
   }>;
 }
 
+interface RootResponseAcceptanceReference {
+  requirement: string;
+  acceptedAnswers: string[];
+  confidence: number;
+}
+
 export interface RootMediatedSpawnResult {
   correlationId: string;
   node: AgentComputeNodeDefinition;
@@ -13814,11 +13820,115 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
       );
   }
 
+  private taskHasMultipleFactualQuestions(userTask: string): boolean {
+    const threshold = Math.max(
+      2,
+      this.workspaceRuntimeConfig?.delegation.rootSteps.directDecisionAuditMinObligations ?? 4
+    );
+    return this.countIndependentTaskObligations(userTask) >= threshold
+      && /\b(?:questions?|who|what|which|when|where|how many|in which)\b/i.test(userTask);
+  }
+
+  private async resolveRootResponseAcceptanceReferences(
+    userTask: string,
+    correlationId: string
+  ): Promise<RootResponseAcceptanceReference[]> {
+    if (!this.taskHasMultipleFactualQuestions(userTask)) return [];
+    this.emit({
+      type: 'root.response.acceptance.references.started',
+      agentId: 'root',
+      correlationId,
+      data: {
+        independentObligations: this.countIndependentTaskObligations(userTask),
+        candidateVisible: false,
+      },
+    });
+    try {
+      const raw = await this.completeJSONAsAgent<{ references?: unknown }>(
+        this.getContext().agent,
+        [
+          {
+            role: 'system',
+            content: [
+              'You are an independent factual requirement resolver.',
+              'You cannot see any candidate response. Resolve each numbered factual question in the original task independently to avoid confirmation bias.',
+              'Return the precise canonical answer plus common aliases, alternate titles, stage names, or equivalent forms that would unambiguously answer that exact question.',
+              'Do not substitute a related entity. If uncertain, lower confidence rather than inventing certainty.',
+              'Return concise strict JSON only with a references array.',
+            ].join('\n'),
+          },
+          {
+            role: 'user',
+            content: JSON.stringify({
+              originalTask: userTask,
+              requiredSchema: {
+                references: [{
+                  requirement: 'the exact numbered factual question',
+                  acceptedAnswers: ['canonical answer', 'unambiguous common alias'],
+                  confidence: 'number from 0 to 1',
+                }],
+              },
+            }),
+          },
+        ],
+        { temperature: 0, maxTokens: 1_600 },
+        'root.response_acceptance.reference_resolution',
+        correlationId
+      );
+      const references = Array.isArray(raw.references)
+        ? raw.references
+          .filter((item): item is Record<string, unknown> =>
+            Boolean(item) && typeof item === 'object'
+          )
+          .map(item => ({
+            requirement: typeof item.requirement === 'string'
+              ? item.requirement.trim().slice(0, 800)
+              : '',
+            acceptedAnswers: Array.isArray(item.acceptedAnswers)
+              ? item.acceptedAnswers
+                .filter((answer): answer is string =>
+                  typeof answer === 'string' && answer.trim().length >= 2
+                )
+                .map(answer => answer.trim().slice(0, 200))
+                .slice(0, 12)
+              : [],
+            confidence: typeof item.confidence === 'number'
+              && Number.isFinite(item.confidence)
+              ? Math.max(0, Math.min(1, item.confidence))
+              : 0,
+          }))
+          .filter(item => item.requirement && item.acceptedAnswers.length > 0)
+          .slice(0, 24)
+        : [];
+      this.emit({
+        type: 'root.response.acceptance.references.completed',
+        agentId: 'root',
+        correlationId,
+        data: {
+          references: references.length,
+          highConfidenceReferences: references.filter(item => item.confidence >= 0.65).length,
+          candidateVisible: false,
+        },
+      });
+      return references;
+    } catch (error) {
+      this.rethrowRetryableLLMTransportError(error);
+      this.emit({
+        type: 'root.response.acceptance.references.failed',
+        agentId: 'root',
+        correlationId,
+        data: { error: error instanceof Error ? error.message : String(error) },
+      });
+      return [];
+    }
+  }
+
   private async auditRootResponseAcceptance(
     response: string,
     userTask: string,
     correlationId: string,
-    phase: 'candidate' | 'repaired'
+    phase: 'candidate' | 'repaired',
+    references: RootResponseAcceptanceReference[]
   ): Promise<RootResponseAcceptanceAudit> {
     const raw = await this.completeJSONAsAgent<{
       complete?: unknown;
@@ -13836,6 +13946,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
             'Treat every numbered or bulleted question, deliverable, constraint, and output contract as a separate obligation.',
             'For every obligation, quote the exact candidate text that satisfies it. Missing quoted evidence means the obligation is unmet.',
             'When an obligation asks for a factual answer, independently check whether the quoted answer actually answers the question; flag contradictions or uncertain substitutions instead of checking only keyword presence.',
+            'A blind reference resolver ran without seeing the candidate. Treat its high-confidence acceptedAnswers as the comparison baseline and explicitly flag candidate conflicts.',
             'Judge objective coverage and factual consistency, not subjective writing style or any hidden evaluator.',
             'Do not expose chain-of-thought. Return concise strict JSON only.',
           ].join('\n'),
@@ -13845,6 +13956,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
           content: JSON.stringify({
             originalTask: userTask,
             candidateResponse: response,
+            blindFactualReferences: references,
             requiredSchema: {
               complete: 'boolean: true only when every explicit obligation is satisfied',
               unmetRequirements: ['concise explicit requirements that remain unmet'],
@@ -13908,6 +14020,17 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
         `Acceptance evidence covered ${obligations.length} of ${expectedObligations} explicit obligations.`
       );
     }
+    const normalizedResponse = response.toLocaleLowerCase();
+    for (const reference of references.filter(item => item.confidence >= 0.65)) {
+      const matched = reference.acceptedAnswers.some(answer =>
+        normalizedResponse.includes(answer.toLocaleLowerCase())
+      );
+      if (!matched) {
+        unmetRequirements.push(
+          `${reference.requirement} — candidate contains none of the blind reference answers: ${reference.acceptedAnswers.join(' / ')}`
+        );
+      }
+    }
     const normalizedUnmet = [...new Set(unmetRequirements)].slice(0, 24);
     const complete = raw.complete === true
       && normalizedUnmet.length === 0
@@ -13941,13 +14064,18 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
         selfDeclaredIncomplete: this.responseSelfDeclaresIncomplete(response),
       },
     });
+    const references = await this.resolveRootResponseAcceptanceReferences(
+      userTask,
+      correlationId
+    );
     let audit: RootResponseAcceptanceAudit;
     try {
       audit = await this.auditRootResponseAcceptance(
         response,
         userTask,
         correlationId,
-        'candidate'
+        'candidate',
+        references
       );
     } catch (error) {
       this.rethrowRetryableLLMTransportError(error);
@@ -14048,7 +14176,8 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
         candidate,
         userTask,
         correlationId,
-        'repaired'
+        'repaired',
+        references
       );
       this.emit({
         type: repairedAudit.complete

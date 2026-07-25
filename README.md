@@ -436,8 +436,11 @@ and cached feedback, then drive one focused repair pass using accumulated
 delegated evidence. The repaired response is audited again before the turn is
 closed. The audit must enumerate each obligation and quote its exact candidate
 evidence; factual obligations also record contradictions or uncertainty instead
-of treating keyword presence as proof. Workspace mutations continue to use tool
-and verifier evidence as their authoritative acceptance boundary.
+of treating keyword presence as proof. Multi-question factual tasks first run a
+blind reference-resolution call that cannot see the candidate; high-confidence
+canonical answers and aliases are then checked deterministically against the
+candidate to reduce self-confirmation bias. Workspace mutations continue to use
+tool and verifier evidence as their authoritative acceptance boundary.
 
 A leaf actor cannot complete successfully with an empty visible result. Runtime
 performs one isolated, budget-aware result recovery; a second empty response marks
