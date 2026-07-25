@@ -681,9 +681,9 @@ export class AgentToolPlanner {
     }
     const latestFailureIndex = this.latestShellFailureIndex(input.calls);
     if (latestFailureIndex < 0) return [];
-    const failure = input.calls[latestFailureIndex]!;
-    if (!isWorkspaceVerificationCall(failure)
-      || isSuccessfulWorkspaceVerificationCall(failure)) {
+    const latestFailure = input.calls[latestFailureIndex]!;
+    if (!isWorkspaceVerificationCall(latestFailure)
+      || isSuccessfulWorkspaceVerificationCall(latestFailure)) {
       return [];
     }
     let latestScorecard: {
@@ -704,30 +704,73 @@ export class AgentToolPlanner {
     if (latestFailureIndex < latestMutationIndex && !freshUnresolvedScorecard) {
       return [];
     }
-    const shell = failure.result as {
+    type ShellFailureResult = {
       cwd?: unknown;
       stdout?: unknown;
       stderr?: unknown;
       verifierDiagnostics?: unknown;
-    } | undefined;
+    };
+    const describeFailure = (index: number): {
+      index: number;
+      call: ObservedToolCall;
+      output: string;
+      locations: Array<{ path: string; line?: number }>;
+    } => {
+      const call = input.calls[index]!;
+      const shell = call.result as ShellFailureResult | undefined;
+      const output = [
+        String(shell?.stdout ?? ''),
+        String(shell?.stderr ?? ''),
+        String(call.error ?? ''),
+        ...this.extractVerifierDiagnosticText(shell?.verifierDiagnostics),
+      ].filter(Boolean).join('\n');
+      return {
+        index,
+        call,
+        output,
+        locations: this.extractFailureLocations(
+          output,
+          String(shell?.cwd ?? input.workspaceRoot ?? ''),
+          input.workspaceRoot
+        ),
+      };
+    };
+    let causalFailure = describeFailure(latestFailureIndex);
+    if (!causalFailure.locations.some(location =>
+      this.isMutableImplementationPath(location.path)
+    )) {
+      for (
+        let index = latestFailureIndex - 1;
+        index > latestMutationIndex;
+        index -= 1
+      ) {
+        const candidate = input.calls[index]!;
+        if (!isWorkspaceVerificationCall(candidate)
+          || isSuccessfulWorkspaceVerificationCall(candidate)) {
+          continue;
+        }
+        const described = describeFailure(index);
+        if (!described.locations.some(location =>
+          this.isMutableImplementationPath(location.path)
+        )) {
+          continue;
+        }
+        causalFailure = described;
+        break;
+      }
+    }
     const rejectedCandidate = this.latestRollbackForCurrentWorkspace(input.calls);
-    const failureOutput = [
-      String(shell?.stdout ?? ''),
-      String(shell?.stderr ?? ''),
-      String(failure.error ?? ''),
-      ...this.extractVerifierDiagnosticText(shell?.verifierDiagnostics),
-    ].filter(Boolean).join('\n');
-    const failureLocations = this.extractFailureLocations(
-      failureOutput,
-      String(shell?.cwd ?? input.workspaceRoot ?? ''),
-      input.workspaceRoot
+    const failureLocation = causalFailure.locations.find(location =>
+      this.isMutableImplementationPath(location.path)
     );
-    if (failureLocations.length > 0
-      && !rejectedCandidate
-      && this.isMutableImplementationPath(failureLocations[0]!.path)) {
-      const targetPath = failureLocations[0]!.path;
+    if (failureLocation && !rejectedCandidate) {
+      const targetPath = failureLocation.path;
       let sourceReadIndex = -1;
-      for (let index = input.calls.length - 1; index > latestFailureIndex; index -= 1) {
+      for (
+        let index = input.calls.length - 1;
+        index > causalFailure.index;
+        index -= 1
+      ) {
         const call = input.calls[index]!;
         const readPath = this.normalizeWorkspacePath(String(
           (call.result as { path?: unknown } | undefined)?.path
@@ -747,9 +790,9 @@ export class AgentToolPlanner {
           .some(index => index > sourceReadIndex)) {
         return [];
       }
-      const localizedFailure = failureOutput.length <= 2_400
-        ? failureOutput
-        : `[earlier failure output compacted]\n${failureOutput.slice(-2_400)}`;
+      const localizedFailure = causalFailure.output.length <= 2_400
+        ? causalFailure.output
+        : `[earlier failure output compacted]\n${causalFailure.output.slice(-2_400)}`;
       const instructions = [
         'Apply the smallest interface-preserving patch that fixes this exact localized execution failure.',
         `Authoritative failure:\n${localizedFailure}`,
@@ -769,7 +812,9 @@ export class AgentToolPlanner {
           instructions,
           strategy: 'patch',
         },
-        reason: 'A fresh source read now grounds the exact traceback location; transition directly from diagnosis to a minimal local repair.',
+        reason: causalFailure.index === latestFailureIndex
+          ? 'A fresh source read now grounds the exact traceback location; transition directly from diagnosis to a minimal local repair.'
+          : 'The newest failure is environment-only, while an earlier post-mutation traceback and fresh source read still identify the actionable code frontier; transition directly to that minimal local repair.',
         groundingRequired: true,
       }];
     }

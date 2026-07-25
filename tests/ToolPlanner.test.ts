@@ -776,6 +776,81 @@ describe('AgentToolPlanner', () => {
     })).toEqual([]);
   });
 
+  it('does not let a newer environment-only failure mask a grounded source repair', () => {
+    const planner = new AgentToolPlanner();
+    const calls = [
+      {
+        toolName: 'fs.synthesize',
+        params: {
+          path: 'src/app/chain.py',
+          instructions: 'Migrate the first source slice.',
+          strategy: 'patch',
+        },
+        success: true,
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m app.cli replay' },
+        success: false,
+        result: {
+          cwd: '/app',
+          exitCode: 1,
+          stderr: [
+            'Traceback (most recent call last):',
+            '  File "/app/src/app/models.py", line 5, in <module>',
+            '    from legacy.models import LegacyModel',
+            "ModuleNotFoundError: No module named 'legacy.models'",
+          ].join('\n'),
+        },
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m pytest -q' },
+        success: false,
+        result: {
+          cwd: '/app',
+          exitCode: 1,
+          stderr: '/usr/local/bin/python: No module named pytest',
+        },
+      },
+      {
+        toolName: 'fs.read',
+        params: {
+          path: 'src/app/models.py',
+          startLine: 1,
+          endLine: 40,
+        },
+        success: true,
+        result: {
+          path: 'src/app/models.py',
+          content: 'from legacy.models import LegacyModel\n',
+          truncated: false,
+        },
+      },
+    ];
+
+    const plans = planner.planWorkspaceRepairTransition({
+      task: 'Migrate the application and run its acceptance commands.',
+      workspaceRoot: '/app',
+      bindings: [
+        { name: 'fs.read', enabled: true },
+        { name: 'fs.synthesize', enabled: true },
+        { name: 'shell.exec', enabled: true },
+      ],
+      calls,
+    });
+
+    expect(plans).toEqual([expect.objectContaining({
+      toolName: 'fs.synthesize',
+      params: expect.objectContaining({
+        path: 'src/app/models.py',
+        strategy: 'patch',
+        instructions: expect.stringContaining('legacy.models'),
+      }),
+      reason: expect.stringContaining('environment-only'),
+    })]);
+  });
+
   it('does not keep repairing from stale failures after a newer mutation passes its declared command', () => {
     const planner = new AgentToolPlanner();
     const command = 'python -m dq_audit.cli run --config configs/public_audit.yml --out-dir outputs';

@@ -132,10 +132,22 @@ export class TeamRegistry {
     return this.clone(team);
   }
 
-  recordMemberFailure(teamId: string, memberKey: string, error: string): TeamRuntimeState {
+  recordMemberFailure(
+    teamId: string,
+    memberKey: string,
+    error: string,
+    usage?: TokenUsage
+  ): TeamRuntimeState {
     const team = this.require(teamId);
     team.memberStatuses[memberKey] = 'failed';
     team.memberErrors[memberKey] = error;
+    if (usage && usage.totalTokens > 0) {
+      team.memberUsage[memberKey] = this.addUsage(
+        team.memberUsage[memberKey] ?? ZERO_USAGE,
+        usage
+      );
+      team.tokenUsage = this.addUsage(team.tokenUsage, usage);
+    }
     team.updatedAt = Date.now();
     return this.clone(team);
   }

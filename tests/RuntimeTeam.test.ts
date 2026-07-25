@@ -51,6 +51,11 @@ class PartialFailureTeamLLM extends TeamTestLLM {
   override async *stream(messages: LLMMessage[]): AsyncGenerator<LLMStreamChunk, void, unknown> {
     const systemPrompt = messages.find(message => message.role === 'system')?.content ?? '';
     if (systemPrompt.includes('Name: Critic-1') || systemPrompt.includes('You are Critic-1')) {
+      yield {
+        content: 'Critic consumed context before its execution failed.',
+        done: false,
+        usage: { promptTokens: 17, completionTokens: 3, totalTokens: 20 },
+      };
       throw new Error('critic execution failed');
     }
     yield* super.stream(messages);
@@ -488,6 +493,76 @@ describe('Phase 3 subteam runtime', () => {
     await runtime.shutdown();
   });
 
+  it('reuses grounded tool evidence across recovery teams in one root task', async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), 'roy-cross-team-evidence-'));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'cross-team-evidence-runtime',
+      workspaceCwd: cwd,
+      fsmEnabled: true,
+      llmProvider: new TeamTestLLM(),
+    });
+    const correlationId = 'cross-team-evidence-correlation';
+    const first = await runtime.spawnTeam({
+      parentAgentId: 'root',
+      name: 'InitialEvidenceTeam',
+      description: 'Collect the initial bounded workspace evidence.',
+      task: 'Inspect the project structure.',
+      executionPolicy: {
+        mode: 'sequential',
+        maxConcurrency: 1,
+        minimumSuccessfulMembers: 1,
+      },
+      members: [{
+        archetype: 'researcher',
+        name: 'InitialResearcher',
+        task: 'Inspect the project structure using authorized filesystem tools.',
+      }],
+    });
+    await runtime.runTeam(first.identity.id, 'Inspect the project.', { correlationId });
+    const initialCache = runtime.getEvents().find(event =>
+      event.type === 'team.tool_evidence.cached'
+      && event.data?.teamId === first.identity.id
+    );
+    expect(Number(initialCache?.data?.cachedCalls ?? 0)).toBeGreaterThan(0);
+
+    const recovery = await runtime.spawnTeam({
+      parentAgentId: 'root',
+      name: 'RecoveryEvidenceTeam',
+      description: 'Continue from the same root-task evidence frontier.',
+      task: 'Continue the grounded project inspection.',
+      executionPolicy: {
+        mode: 'sequential',
+        maxConcurrency: 1,
+        minimumSuccessfulMembers: 1,
+      },
+      members: [{
+        archetype: 'researcher',
+        name: 'RecoveryResearcher',
+        task: 'Continue from the evidence already collected for this root task.',
+      }],
+    });
+    await runtime.runTeam(recovery.identity.id, 'Continue the project.', { correlationId });
+
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'team.tool_evidence.seeded_from_correlation',
+      correlationId,
+      data: expect.objectContaining({
+        teamId: recovery.identity.id,
+        sourceTeamIds: [first.identity.id],
+        cachedCalls: initialCache?.data?.cachedCalls,
+      }),
+    }));
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'team.tool_evidence.reused',
+      correlationId,
+      data: expect.objectContaining({
+        teamId: recovery.identity.id,
+      }),
+    }));
+    await runtime.shutdown();
+  });
+
   it('reserves every planned member slot before a limited-budget team starts', async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), 'roy-team-capacity-reservation-'));
     const runtime = new Runtime();
@@ -820,6 +895,9 @@ describe('Phase 3 subteam runtime', () => {
       id: failed?.agentId,
       status: 'failed',
     }));
+    expect(result.usage.subagents[failed!.agentId!].totalTokens).toBeGreaterThan(0);
+    expect(result.teams[0].team.memberUsage[failed!.agentId!].totalTokens)
+      .toBe(result.usage.subagents[failed!.agentId!].totalTokens);
     await runtime.shutdown();
   });
 

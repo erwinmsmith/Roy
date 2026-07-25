@@ -2498,7 +2498,15 @@ export class Runtime {
             : undefined;
           const memberKey = failedAgentId ?? outcome.key;
           if (memberKey !== outcome.key) this.teams.clearMemberTracking(teamId, outcome.key);
-          this.teams.recordMemberFailure(teamId, memberKey, outcome.error ?? 'unknown member execution failure');
+          const failedUsage = outcome.cause instanceof Error
+            ? (outcome.cause as Error & { runtimeUsage?: TokenUsage }).runtimeUsage
+            : undefined;
+          this.teams.recordMemberFailure(
+            teamId,
+            memberKey,
+            outcome.error ?? 'unknown member execution failure',
+            failedUsage
+          );
           this.emit({
             type: 'team.member.failed',
             agentId: failedAgentId ?? outcome.value?.agentId ?? teamId,
@@ -7166,6 +7174,11 @@ export class Runtime {
     for (const item of subagents) {
       subagentUsage[item.agent.identity.id] = item.subagentResult.usage;
     }
+    for (const teamResult of teamResults) {
+      for (const [agentId, usage] of Object.entries(teamResult.team.memberUsage)) {
+        subagentUsage[agentId] = { ...usage };
+      }
+    }
     const teamSynthesisUsage = Object.fromEntries(
       teamResults.map(result => [result.team.identity.id, { ...result.team.synthesisUsage }])
     );
@@ -7806,6 +7819,41 @@ export class Runtime {
       let sharedTeamToolCalls = payload.teamId
         ? this.teamToolEvidenceCache.get(payload.teamId) ?? []
         : [];
+      if (payload.teamId && sharedTeamToolCalls.length === 0) {
+        const sourceTeams = this.getTeams().filter(team =>
+          team.identity.id !== payload.teamId
+          && team.correlationId === correlationId
+          && (this.teamToolEvidenceCache.get(team.identity.id)?.length ?? 0) > 0
+        );
+        const seenCalls = new Set<ToolCallRecord>();
+        sharedTeamToolCalls = sourceTeams
+          .flatMap(team => this.teamToolEvidenceCache.get(team.identity.id) ?? [])
+          .filter(call => {
+            if (seenCalls.has(call)) return false;
+            seenCalls.add(call);
+            return true;
+          })
+          .sort((left, right) =>
+            (left.completedAt ?? left.startedAt ?? 0)
+            - (right.completedAt ?? right.startedAt ?? 0)
+          )
+          .slice(-80);
+        if (sharedTeamToolCalls.length > 0) {
+          this.teamToolEvidenceCache.set(payload.teamId, sharedTeamToolCalls);
+          this.emit({
+            type: 'team.tool_evidence.seeded_from_correlation',
+            agentId: agent.identity.id,
+            sessionId: ctx.sessionId,
+            correlationId,
+            data: {
+              teamId: payload.teamId,
+              sourceTeamIds: sourceTeams.map(team => team.identity.id),
+              cachedCalls: sharedTeamToolCalls.length,
+              successfulCalls: sharedTeamToolCalls.filter(call => call.success).length,
+            },
+          });
+        }
+      }
       if (payload.teamId && sharedTeamToolCalls.length === 0) {
         sharedTeamToolCalls = this.restoredToolCallsFromResume(correlationId, 48);
         if (sharedTeamToolCalls.length > 0) {
@@ -9470,6 +9518,7 @@ export class Runtime {
           runtimeGrounding: activeGrounding,
         });
       }
+      Object.assign(failure, { runtimeUsage: usageDelta });
       const message = failure.message;
       agent.addToMemory('result', `Error: ${message}`);
       agent.setRuntimeState('failed');
