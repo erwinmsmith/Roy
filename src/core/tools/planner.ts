@@ -551,15 +551,36 @@ export class AgentToolPlanner {
     const mutationIndices = effectiveWorkspaceMutationCallIndices(input.calls);
     const latestMutationIndex = mutationIndices.at(-1);
     if (latestMutationIndex === undefined) return [];
+    const latestDependencyMutationIndex = mutationIndices
+      .filter(index => this.isDependencyManifestPath(
+        this.normalizeWorkspacePath(String(
+          (input.calls[index]!.result as { path?: unknown } | undefined)?.path
+            ?? input.calls[index]!.params.path
+            ?? ''
+        ))
+      ))
+      .at(-1);
     const commands = this.extractExplicitShellCommands(input.task);
     return commands
       .filter(command => {
-        const matchingCalls = input.calls.filter(call =>
-          call.toolName === 'shell.exec'
-          && String(call.params.command ?? '').trim() === command.trim()
-        );
-        if (this.isEnvironmentSetupCommand(command)
-          && matchingCalls.some(call => call.success)) {
+        const matchingCalls = input.calls
+          .map((call, index) => ({ call, index }))
+          .filter(item =>
+            item.call.toolName === 'shell.exec'
+            && String(item.call.params.command ?? '').trim() === command.trim()
+          );
+        if (this.isDependencyInstallCommand(command)) {
+          const latestSuccessfulInstall = matchingCalls
+            .filter(item => item.call.success)
+            .map(item => item.index)
+            .at(-1) ?? -1;
+          if (latestDependencyMutationIndex === undefined
+            ? latestSuccessfulInstall >= 0
+            : latestSuccessfulInstall > latestDependencyMutationIndex) {
+            return false;
+          }
+        } else if (this.isEnvironmentSetupCommand(command)
+          && matchingCalls.some(item => item.call.success)) {
           return false;
         }
         return !input.calls.some((call, index) =>
@@ -747,24 +768,64 @@ export class AgentToolPlanner {
     if (!input.bindings.some(binding => binding.enabled && binding.name === 'fs.read')) return [];
     const latestFailureIndex = this.latestShellFailureIndex(input.calls);
     if (latestFailureIndex < 0) return [];
-    const failure = input.calls[latestFailureIndex]!;
-    const shell = failure.result as {
-      cwd?: unknown;
-      stdout?: unknown;
-      stderr?: unknown;
-      verifierDiagnostics?: unknown;
-    } | undefined;
-    const output = [
-      String(shell?.stdout ?? ''),
-      String(shell?.stderr ?? ''),
-      String(failure.error ?? ''),
-      ...this.extractVerifierDiagnosticText(shell?.verifierDiagnostics),
-    ].filter(Boolean).join('\n');
-    const locations = this.extractFailureLocations(
-      output,
-      String(shell?.cwd ?? input.workspaceRoot ?? ''),
-      input.workspaceRoot
-    );
+    const latestMutationIndex =
+      effectiveWorkspaceMutationCallIndices(input.calls).at(-1) ?? -1;
+    const describeFailure = (index: number): {
+      index: number;
+      locations: Array<{ path: string; line?: number }>;
+    } => {
+      const failure = input.calls[index]!;
+      const shell = failure.result as {
+        cwd?: unknown;
+        stdout?: unknown;
+        stderr?: unknown;
+        verifierDiagnostics?: unknown;
+      } | undefined;
+      const output = [
+        String(shell?.stdout ?? ''),
+        String(shell?.stderr ?? ''),
+        String(failure.error ?? ''),
+        ...this.extractVerifierDiagnosticText(shell?.verifierDiagnostics),
+      ].filter(Boolean).join('\n');
+      return {
+        index,
+        locations: this.extractFailureLocations(
+          output,
+          String(shell?.cwd ?? input.workspaceRoot ?? ''),
+          input.workspaceRoot
+        ),
+      };
+    };
+    let causalFailure = describeFailure(latestFailureIndex);
+    if (!causalFailure.locations.some(location =>
+      this.isMutableImplementationPath(location.path)
+    )) {
+      for (
+        let index = latestFailureIndex - 1;
+        index > latestMutationIndex;
+        index -= 1
+      ) {
+        const call = input.calls[index]!;
+        if (call.toolName !== 'shell.exec'
+          || (
+            call.success
+            && (!isWorkspaceVerificationCall(call)
+              || isSuccessfulWorkspaceVerificationCall(call))
+          )) {
+          continue;
+        }
+        const candidate = describeFailure(index);
+        if (!candidate.locations.some(location =>
+          this.isMutableImplementationPath(location.path)
+        )) {
+          continue;
+        }
+        causalFailure = candidate;
+        break;
+      }
+    }
+    const failureIndex = causalFailure.index;
+    const locations = causalFailure.locations;
     return locations
       .map(location => ({
         toolName: 'fs.read',
@@ -782,7 +843,7 @@ export class AgentToolPlanner {
       } satisfies PlannedToolCall))
       .filter(plan => {
         let latestReadIndex = -1;
-        for (let index = input.calls.length - 1; index > latestFailureIndex; index -= 1) {
+        for (let index = input.calls.length - 1; index > failureIndex; index -= 1) {
           const call = input.calls[index]!;
           if (call.toolName === plan.toolName
             && JSON.stringify(call.params) === JSON.stringify(plan.params)) {
@@ -1419,6 +1480,19 @@ export class AgentToolPlanner {
       || /^(?:python(?:3)?\s+-m\s+pip|pip(?:3)?|uv)\s+install\b/i.test(normalized)
       || /^(?:npm|pnpm|yarn|bun)\s+(?:install|ci)\b/i.test(normalized)
       || /^(?:apt-get|apt|apk|brew)\s+install\b/i.test(normalized);
+  }
+
+  private isDependencyInstallCommand(command: string): boolean {
+    const normalized = command.trim().replace(/^(?:cd\s+\S+\s*&&\s*)+/i, '');
+    return /^(?:python(?:3)?\s+-m\s+pip|pip(?:3)?|uv)\s+install\b/i.test(normalized)
+      || /^(?:npm|pnpm|yarn|bun)\s+(?:install|ci)\b/i.test(normalized);
+  }
+
+  private isDependencyManifestPath(candidatePath: string): boolean {
+    const path = this.normalizeWorkspacePath(candidatePath).toLowerCase();
+    return /(?:^|\/)(?:pyproject\.toml|setup\.cfg|setup\.py|requirements[^/]*\.txt|package\.json|package-lock\.json|pnpm-lock\.ya?ml|yarn\.lock|bun\.lockb?|cargo\.toml|cargo\.lock|go\.mod|go\.sum|pom\.xml|build\.gradle|gemfile|gemfile\.lock)$/.test(
+      path
+    );
   }
 
   private extractExplicitShellCommands(task: string): string[] {

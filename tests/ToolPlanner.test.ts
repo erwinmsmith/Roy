@@ -189,6 +189,84 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('invalidates a successful dependency install when its manifest changes afterward', () => {
+    const planner = new AgentToolPlanner();
+    const task = [
+      '## Required Commands',
+      '```bash',
+      'cd /app',
+      'python -m pip install -e .',
+      'python -m support_rag.cli answer --question "hello"',
+      '```',
+    ].join('\n');
+
+    const plans = planner.planPostMutationVerification({
+      task,
+      calls: [
+        {
+          toolName: 'shell.exec',
+          params: { command: 'cd /app' },
+          success: true,
+        },
+        {
+          toolName: 'shell.exec',
+          params: { command: 'python -m pip install -e .' },
+          success: true,
+        },
+        {
+          toolName: 'fs.synthesize',
+          params: {
+            path: 'pyproject.toml',
+            instructions: 'Upgrade dependencies.',
+            strategy: 'patch',
+          },
+          success: true,
+          result: { path: 'pyproject.toml' },
+        },
+      ],
+      bindings: [{ name: 'shell.exec', enabled: true }],
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'shell.exec',
+        params: { command: 'python -m pip install -e .' },
+      }),
+      expect.objectContaining({
+        toolName: 'shell.exec',
+        params: {
+          command: 'python -m support_rag.cli answer --question "hello"',
+        },
+      }),
+    ]);
+
+    const afterInstall = planner.planPostMutationVerification({
+      task,
+      calls: [
+        {
+          toolName: 'fs.synthesize',
+          params: {
+            path: 'pyproject.toml',
+            instructions: 'Upgrade dependencies.',
+            strategy: 'patch',
+          },
+          success: true,
+          result: { path: 'pyproject.toml' },
+        },
+        {
+          toolName: 'shell.exec',
+          params: { command: 'python -m pip install -e .' },
+          success: true,
+        },
+      ],
+      bindings: [{ name: 'shell.exec', enabled: true }],
+    }).map(plan => plan.params.command);
+    expect(afterInstall).not.toContain('python -m pip install -e .');
+    expect(afterInstall).toContain(
+      'python -m support_rag.cli answer --question "hello"'
+    );
+  });
+
   it('retains acceptance commands beyond the initial planning batch', () => {
     const planner = new AgentToolPlanner();
     const task = [
@@ -655,6 +733,63 @@ describe('AgentToolPlanner', () => {
       expect.objectContaining({
         toolName: 'fs.read',
         params: { path: 'src/dq_audit/audit.py' },
+      }),
+    ]);
+  });
+
+  it('does not let a later missing test runner hide an earlier source traceback', () => {
+    const plans = new AgentToolPlanner().planWorkspaceFailureFollowUps({
+      workspaceRoot: '/app',
+      bindings: [
+        { name: 'fs.read', enabled: true },
+        { name: 'shell.exec', enabled: true },
+      ],
+      calls: [
+        {
+          toolName: 'fs.synthesize',
+          params: {
+            path: 'src/support_rag/router.py',
+            instructions: 'Migrate the router.',
+            strategy: 'patch',
+          },
+          success: true,
+        },
+        {
+          toolName: 'shell.exec',
+          params: { command: 'python -m support_rag.cli route --ticket invoice' },
+          success: false,
+          result: {
+            cwd: '/app',
+            exitCode: 1,
+            stderr: [
+              'Traceback (most recent call last):',
+              '  File "/app/src/support_rag/models.py", line 7, in <module>',
+              '    from langchain.llms.base import LLM',
+              "ModuleNotFoundError: No module named 'langchain.llms'",
+            ].join('\n'),
+          },
+        },
+        {
+          toolName: 'shell.exec',
+          params: { command: 'python -m pytest -q' },
+          success: false,
+          result: {
+            cwd: '/app',
+            exitCode: 1,
+            stderr: '/usr/local/bin/python: No module named pytest',
+          },
+        },
+      ],
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.read',
+        params: {
+          path: 'src/support_rag/models.py',
+          startLine: 1,
+          endLine: 32,
+        },
       }),
     ]);
   });
