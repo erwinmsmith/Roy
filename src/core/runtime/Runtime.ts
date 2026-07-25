@@ -18236,8 +18236,12 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       startedAt: call.startedAt,
       completedAt: call.completedAt,
     }));
-    const unresolvedSynthesisRejection = this.hasUnresolvedSynthesisRejection(
-      priorPlannerCalls
+    const unresolvedSynthesisRejectionState =
+      this.latestUnresolvedSynthesisRejection(
+        priorPlannerCalls
+      );
+    const unresolvedSynthesisRejection = Boolean(
+      unresolvedSynthesisRejectionState
     );
     for (let index = plans.length - 1; index >= 0; index -= 1) {
       const plan = plans[index]!;
@@ -18262,6 +18266,40 @@ For web-grounded work, use only facts present in the subagent report or runtime 
           reason: cached.reason,
         },
       });
+    }
+    if (unresolvedSynthesisRejectionState) {
+      const rejectedPath = this.normalizeToolWorkspacePath(String(
+        unresolvedSynthesisRejectionState.path ?? ''
+      ));
+      const readAvailable = bindings.some(binding =>
+        binding.enabled && binding.name === 'fs.read'
+      );
+      plans = plans.filter(plan =>
+        !isSuccessfulWorkspaceMutationCall({
+          toolName: plan.toolName,
+          params: plan.params,
+          success: true,
+        })
+      );
+      if (rejectedPath && readAvailable) {
+        plans = [{
+          toolName: 'fs.read',
+          params: { path: rejectedPath },
+          reason: 'Re-read the authoritative current source after a rejected synthesis invalidated the previous patch anchors.',
+          groundingRequired: true,
+        }];
+        this.emit({
+          type: 'tool.plan.synthesis_rejection.regrounded',
+          agentId,
+          sessionId: this.getContext().sessionId,
+          correlationId: options.correlationId,
+          nodeId: options.nodeId,
+          data: {
+            path: rejectedPath,
+            reason: unresolvedSynthesisRejectionState.reason,
+          },
+        });
+      }
     }
     const loopConfig = this.workspaceRuntimeConfig?.tools.executionLoop ?? {
       enabled: true,
@@ -18755,7 +18793,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     const pendingInitialMirroredVerifier = pendingMirroredVerifierPlan(
       priorPlannerCalls
     );
-    if (pendingInitialMirroredVerifier) {
+    if (pendingInitialMirroredVerifier && !unresolvedSynthesisRejection) {
       plans = [pendingInitialMirroredVerifier];
       this.emit({
         type: 'tool.plan.mirrored_verifier_barrier',
@@ -19796,24 +19834,44 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     return commands[0]?.command;
   }
 
-  private hasUnresolvedSynthesisRejection(
+  private latestUnresolvedSynthesisRejection(
     calls: Array<Pick<ToolCallRecord, 'toolName' | 'params' | 'result' | 'success'>>
-  ): boolean {
+  ): { path?: string; reason?: string } | undefined {
     for (let index = calls.length - 1; index >= 0; index -= 1) {
       const call = calls[index]!;
-      const rejected = (call.result as { synthesisRejected?: unknown } | undefined)
-        ?.synthesisRejected === true;
+      const result = call.result as {
+        synthesisRejected?: unknown;
+        path?: unknown;
+        reason?: unknown;
+      } | undefined;
+      const rejected = result?.synthesisRejected === true;
       if (!rejected) continue;
-      return !calls.slice(index + 1).some(later =>
+      if (calls.slice(index + 1).some(later =>
         later.success && (
           this.isFocusedVerifierDiagnosticCall(later)
           || later.toolName === 'fs.read'
           || later.toolName === 'fs.search'
           || isSuccessfulWorkspaceMutationCall(later)
         )
-      );
+      )) {
+        return undefined;
+      }
+      return {
+        path: typeof result.path === 'string'
+          ? result.path
+          : typeof call.params.path === 'string'
+            ? call.params.path
+            : undefined,
+        reason: typeof result.reason === 'string' ? result.reason : undefined,
+      };
     }
-    return false;
+    return undefined;
+  }
+
+  private hasUnresolvedSynthesisRejection(
+    calls: Array<Pick<ToolCallRecord, 'toolName' | 'params' | 'result' | 'success'>>
+  ): boolean {
+    return Boolean(this.latestUnresolvedSynthesisRejection(calls));
   }
 
   private latestRejectedVerifierCandidate(

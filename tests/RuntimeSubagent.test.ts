@@ -364,6 +364,15 @@ describe('Runtime controlled subagent spawning', () => {
     }];
 
     expect(unresolved(rejected)).toBe(true);
+    const rejectionState = (runtime as unknown as {
+      latestUnresolvedSynthesisRejection: (
+        calls: Array<Record<string, unknown>>
+      ) => { path?: string; reason?: string } | undefined;
+    }).latestUnresolvedSynthesisRejection(rejected);
+    expect(rejectionState).toEqual({
+      path: 'src/app.py',
+      reason: 'source anchor mismatch',
+    });
     expect(unresolved([
       ...rejected,
       {
