@@ -581,11 +581,43 @@ export class AgentToolPlanner {
     const mutationIndices = effectiveWorkspaceMutationCallIndices(input.calls);
     const latestMutationIndex = mutationIndices.at(-1);
     if (latestMutationIndex === undefined) return [];
-    if (input.calls.some((call, index) =>
-      index > latestMutationIndex
-      && isWorkspaceVerificationCall(call)
-      && !isSuccessfulWorkspaceVerificationCall(call)
-    )) {
+    const commands = this.extractExplicitShellCommands(input.task);
+    const latestFailedVerificationIndex = input.calls.reduce(
+      (latest, call, index) =>
+        index > latestMutationIndex
+        && isWorkspaceVerificationCall(call)
+        && !isSuccessfulWorkspaceVerificationCall(call)
+          ? index
+          : latest,
+      -1
+    );
+    if (latestFailedVerificationIndex >= 0) {
+      const failedVerification = input.calls[latestFailedVerificationIndex]!;
+      const failedCommand = String(failedVerification.params.command ?? '').trim();
+      const recoveryIndex = input.calls.reduce((latest, call, index) =>
+        index > latestFailedVerificationIndex
+        && call.toolName === 'shell.exec'
+        && call.success
+        && this.isDependencyInstallCommand(String(call.params.command ?? ''))
+          ? index
+          : latest
+      , -1);
+      const retriedAfterRecovery = recoveryIndex >= 0
+        && input.calls.some((call, index) =>
+          index > recoveryIndex
+          && call.toolName === 'shell.exec'
+          && String(call.params.command ?? '').trim() === failedCommand
+        );
+      if (recoveryIndex >= 0
+        && !retriedAfterRecovery
+        && commands.some(command => command.trim() === failedCommand)) {
+        return [{
+          toolName: 'shell.exec',
+          params: { command: failedCommand },
+          reason: 'Re-run the task-declared acceptance command whose missing runtime tool was just installed successfully before considering any source repair.',
+          groundingRequired: true,
+        }];
+      }
       return [];
     }
     const latestDependencyMutationIndex = mutationIndices
@@ -597,7 +629,6 @@ export class AgentToolPlanner {
         ))
       ))
       .at(-1);
-    const commands = this.extractExplicitShellCommands(input.task);
     const pending = commands
       .filter(command => {
         if (/^(?:cd|pushd|popd)\s+\S+\s*$/i.test(command.trim())) {

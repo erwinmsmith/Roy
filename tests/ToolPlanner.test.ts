@@ -391,6 +391,71 @@ describe('AgentToolPlanner', () => {
     })).toEqual([]);
   });
 
+  it('retries a failed acceptance command after its missing runtime tool is installed', () => {
+    const planner = new AgentToolPlanner();
+    const task = [
+      'Modify src/app/chain.py and verify it.',
+      '```bash',
+      'python -m pytest -q',
+      '```',
+    ].join('\n');
+    const calls = [
+      {
+        toolName: 'fs.synthesize',
+        params: {
+          path: 'src/app/chain.py',
+          instructions: 'Migrate the chain.',
+          strategy: 'patch',
+        },
+        success: true,
+        result: { path: 'src/app/chain.py' },
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m pytest -q' },
+        success: false,
+        result: {
+          exitCode: 1,
+          stderr: '/usr/local/bin/python: No module named pytest',
+        },
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m pip install pytest' },
+        success: true,
+        result: { exitCode: 0 },
+      },
+    ];
+
+    expect(planner.planPostMutationVerification({
+      task,
+      calls,
+      bindings: [{ name: 'shell.exec', enabled: true }],
+    })).toEqual([
+      expect.objectContaining({
+        params: { command: 'python -m pytest -q' },
+        reason: expect.stringContaining('missing runtime tool was just installed'),
+      }),
+    ]);
+
+    expect(planner.planPostMutationVerification({
+      task,
+      calls: [
+        ...calls,
+        {
+          toolName: 'shell.exec',
+          params: { command: 'python -m pytest -q' },
+          success: false,
+          result: {
+            exitCode: 1,
+            stderr: 'src/app/chain.py:12: assertion failed',
+          },
+        },
+      ],
+      bindings: [{ name: 'shell.exec', enabled: true }],
+    })).toEqual([]);
+  });
+
   it('turns external dependency feedback into ordered manifest repairs', () => {
     const planner = new AgentToolPlanner();
     const task = [
