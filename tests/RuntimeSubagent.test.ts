@@ -511,7 +511,7 @@ describe('Runtime controlled subagent spawning', () => {
     await runtime.shutdown();
   });
 
-  it('carries saturated evidence into a closure run that starts at model planning', async () => {
+  it('resumes remaining evidence and carries saturation into closure model planning', async () => {
     const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-saturated-closure-'));
     await mkdir(path.join(workspaceCwd, '.roy'), { recursive: true });
     await writeFile(
@@ -523,6 +523,7 @@ describe('Runtime controlled subagent spawning', () => {
       })
     );
     await writeFile(path.join(workspaceCwd, 'app.ts'), 'export const value = "stub";\n');
+    await writeFile(path.join(workspaceCwd, 'runtime.json'), '{"mode":"modern"}\n');
     const llm = new SaturatedClosurePlanningLLM();
     const runtime = new Runtime();
     await runtime.initialize({
@@ -530,7 +531,10 @@ describe('Runtime controlled subagent spawning', () => {
       llmProvider: llm,
       workspaceCwd,
     });
-    const task = 'app.ts: Fix the implementation while preserving its exported interface.';
+    const task = [
+      'app.ts: Fix the implementation using runtime.json while preserving its exported interface.',
+      'Inspect the named runtime contract before editing.',
+    ].join(' ');
     const coder = await runtime.spawnAgent({
       parentId: 'root',
       archetype: 'coder',
@@ -575,6 +579,11 @@ describe('Runtime controlled subagent spawning', () => {
     });
 
     expect(llm.sawSaturatedEvidence).toBe(true);
+    expect(grounding.toolCalls).toContainEqual(expect.objectContaining({
+      toolName: 'fs.read',
+      params: { path: 'runtime.json' },
+      success: true,
+    }));
     expect(grounding.toolCalls).toContainEqual(expect.objectContaining({
       toolName: 'fs.replace',
       success: true,

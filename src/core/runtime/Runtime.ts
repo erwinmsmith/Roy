@@ -18202,6 +18202,34 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         });
       }
     }
+    if (plans.length === 0
+      && workspaceExecutionRequired
+      && !priorRejectedVerifierCandidate) {
+      const remainingWorkspaceEvidence =
+        this.toolPlanner.planWorkspaceEvidenceFollowUps({
+          task: intentTask,
+          calls: priorPlannerCalls,
+          bindings,
+          workspaceRoot: this.workspaceRoot,
+        });
+      if (remainingWorkspaceEvidence.length > 0) {
+        plans.push(...remainingWorkspaceEvidence);
+        this.emit({
+          type: 'tool.plan.workspace_evidence_resumed',
+          agentId,
+          sessionId: this.getContext().sessionId,
+          correlationId: options.correlationId,
+          nodeId: options.nodeId,
+          data: {
+            plans: remainingWorkspaceEvidence.map(plan => ({
+              toolName: plan.toolName,
+              params: plan.params,
+            })),
+            priorToolCalls: priorPlannerCalls.length,
+          },
+        });
+      }
+    }
     const needsModelPlannedAction = bindings.some(binding =>
       binding.enabled && (
         binding.name === 'shell.exec'
