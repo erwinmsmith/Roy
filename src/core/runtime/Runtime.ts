@@ -16018,6 +16018,32 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         });
       }
     }
+    if (plans.length === 0 && workspaceExecutionRequired) {
+      const externalFeedbackRepair = this.toolPlanner.planExternalFeedbackRepair({
+        task: intentTask,
+        calls: priorPlannerCalls,
+        bindings,
+        workspaceRoot: this.workspaceRoot,
+      });
+      if (externalFeedbackRepair.length > 0) {
+        plans.push(...externalFeedbackRepair);
+        this.emit({
+          type: 'tool.plan.external_feedback_repair',
+          agentId,
+          sessionId: this.getContext().sessionId,
+          correlationId: options.correlationId,
+          nodeId: options.nodeId,
+          data: {
+            source: 'persisted_tool_frontier',
+            plans: externalFeedbackRepair.map(plan => ({
+              toolName: plan.toolName,
+              params: plan.params,
+            })),
+            priorToolCalls: priorPlannerCalls.length,
+          },
+        });
+      }
+    }
     const needsModelPlannedAction = bindings.some(binding =>
       binding.enabled && (
         binding.name === 'shell.exec'
