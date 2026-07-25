@@ -21075,11 +21075,12 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     if (!result.trim()) return false;
     return /<tool_call>[\s\S]*?<\/tool_call>/i.test(result)
       || /<tool_calls>[\s\S]*?<\/tool_calls>/i.test(result)
+      || /<function>\s*<name>\s*(?:web\.(?:search|fetch)|fs\.(?:list|read|search|replace|write|synthesize)|shell\.exec)\s*<\/name>[\s\S]*?<\/function>/i.test(result)
       || /<tool_name>[\s\S]*?<\/tool_name>/i.test(result)
       || /<function_calls>[\s\S]*?<\/function_calls>/i.test(result)
-      || /<invocation\s+name=["'](?:web\.(?:search|fetch)|fs\.(?:list|read|search|replace|write)|shell\.exec)["'][\s\S]*?<\/invocation>/i.test(result)
-      || /<invoke\s+name=["'](?:web\.(?:search|fetch)|fs\.(?:list|read|search|replace|write)|shell\.exec)["'][\s\S]*?<\/invoke>/i.test(result)
-      || /```(?:tool|json)?\s*\n\s*(?:web\.(?:search|fetch)|fs\.(?:list|read|search|replace|write)|shell\.exec)\b[\s\S]*?```/i.test(result)
+      || /<invocation\s+name=["'](?:web\.(?:search|fetch)|fs\.(?:list|read|search|replace|write|synthesize)|shell\.exec)["'][\s\S]*?<\/invocation>/i.test(result)
+      || /<invoke\s+name=["'](?:web\.(?:search|fetch)|fs\.(?:list|read|search|replace|write|synthesize)|shell\.exec)["'][\s\S]*?<\/invoke>/i.test(result)
+      || /```(?:tool|json)?\s*\n\s*(?:web\.(?:search|fetch)|fs\.(?:list|read|search|replace|write|synthesize)|shell\.exec)\b[\s\S]*?```/i.test(result)
       || /\{\s*"(?:tool_name|tool|function)"\s*:\s*"[^"\n]+"[\s\S]*?\}/i.test(result);
   }
 
@@ -21141,13 +21142,18 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       const toolName = body.match(/<tool_name>\s*([^<]+?)\s*<\/tool_name>/i)?.[1]?.trim();
       if (toolName) candidates.push({ toolName, params: parseParams(body) });
     }
+    for (const match of result.matchAll(/<function>([\s\S]*?)<\/function>/gi)) {
+      const body = match[1] ?? '';
+      const toolName = body.match(/<name>\s*([^<]+?)\s*<\/name>/i)?.[1]?.trim();
+      if (toolName) candidates.push({ toolName, params: parseParams(body) });
+    }
     for (const match of result.matchAll(/<(?:invocation|invoke)\s+name=["']([^"']+)["'][^>]*>([\s\S]*?)<\/(?:invocation|invoke)>/gi)) {
       candidates.push({
         toolName: String(match[1] ?? '').trim(),
         params: parseParams(match[2] ?? ''),
       });
     }
-    for (const match of result.matchAll(/```(?:tool|json)?\s*\n\s*((?:web\.(?:search|fetch)|fs\.(?:list|read|search|replace|write)|shell\.exec))\s*\n([\s\S]*?)```/gi)) {
+    for (const match of result.matchAll(/```(?:tool|json)?\s*\n\s*((?:web\.(?:search|fetch)|fs\.(?:list|read|search|replace|write|synthesize)|shell\.exec))\s*\n([\s\S]*?)```/gi)) {
       try {
         const parsed = JSON.parse((match[2] ?? '').trim());
         candidates.push({

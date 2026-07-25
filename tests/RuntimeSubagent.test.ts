@@ -111,6 +111,24 @@ class XmlToolIntentRecoveryLLM extends EchoLLM {
   }
 }
 
+class FunctionXmlToolIntentRecoveryLLM extends EchoLLM {
+  override async *stream(messages: LLMMessage[], _options?: LLMCompletionOptions): AsyncGenerator<LLMStreamChunk, void, unknown> {
+    const prompt = messages.map(message => String(message.content)).join('\n');
+    const content = prompt.includes('Produce the final task result from the evidence above.')
+      ? 'The runtime executed the function-style request and grounded evidence.txt.'
+      : [
+        'I need one more source observation.',
+        '<function>',
+        '<name>fs.read</name>',
+        '<params>',
+        '<path>evidence.txt</path>',
+        '</params>',
+        '</function>',
+      ].join('\n');
+    yield { content, done: true, usage: { promptTokens: 20, completionTokens: 10, totalTokens: 30 } };
+  }
+}
+
 class NativeXmlToolIntentRecoveryLLM extends EchoLLM {
   override async *stream(messages: LLMMessage[], _options?: LLMCompletionOptions): AsyncGenerator<LLMStreamChunk, void, unknown> {
     const prompt = messages.map(message => String(message.content)).join('\n');
@@ -1849,6 +1867,51 @@ describe('Runtime controlled subagent spawning', () => {
       'agent.output.tool_intent.recovery.completed',
     ]));
     expect(runtime.getEvents().map(event => event.type)).not.toContain('agent.output.repair.completed');
+    await runtime.shutdown();
+  });
+
+  it('executes function/name/params tool markup before caching a member result', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-function-tool-intent-'));
+    await writeFile(path.join(workspaceCwd, 'evidence.txt'), 'runtime-grounded\n', 'utf8');
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'function-tool-intent-recovery-test',
+      llmProvider: new FunctionXmlToolIntentRecoveryLLM(),
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+    const agent = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'researcher',
+      name: 'FunctionIntentRecovery-1',
+      tomLevel: 0,
+      description: 'Inspect the remaining evidence and report it.',
+      task: 'Inspect the remaining evidence and report it.',
+      tools: ['fs.read'],
+      skills: ['use_tool_when_needed'],
+      outputContract: { format: 'markdown', groundingRequired: true },
+    });
+
+    const result = await runtime.runAgent(
+      agent.identity.id,
+      'Inspect the remaining evidence and report it.',
+      { archetype: 'researcher', disableRecursiveDelegation: true }
+    );
+
+    expect(result.toolCalls).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.read',
+        success: true,
+        params: { path: 'evidence.txt' },
+      }),
+    ]);
+    expect(result.result).not.toContain('<function>');
+    expect(result.result).toContain('evidence.txt');
+    expect(runtime.getEvents().map(event => event.type)).toEqual(expect.arrayContaining([
+      'agent.output.tool_intent.recovery.started',
+      'agent.output.tool_intent.recovery.completed',
+      'agent.run.completed',
+    ]));
     await runtime.shutdown();
   });
 
