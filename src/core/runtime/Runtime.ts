@@ -2951,7 +2951,9 @@ export class Runtime {
       '/logs/verifier/reward.txt',
       path.join(this.workspaceRoot, 'logs', 'verifier', 'scorecard.json'),
       path.join(this.workspaceRoot, 'logs', 'verifier', 'grade.log'),
+      path.join(this.workspaceRoot, 'logs', 'verifier', 'reward.txt'),
       path.join(this.workspaceRoot, '.roy', 'verifier', 'scorecard.json'),
+      path.join(this.workspaceRoot, '.roy', 'verifier', 'reward.txt'),
     ];
     const diagnostics: Array<{ path: string; content: string }> = [];
     for (const candidate of candidateFiles) {
@@ -3057,15 +3059,29 @@ export class Runtime {
     };
     const diagnostics = resultRecord.verifierDiagnostics;
     if (!Array.isArray(diagnostics)) return undefined;
+    let scalarReward: number | undefined;
     for (const item of diagnostics) {
       if (!item || typeof item !== 'object') continue;
       const diagnostic = item as { path?: unknown; content?: unknown };
       if (typeof diagnostic.content !== 'string') continue;
+      const diagnosticPath = String(diagnostic.path ?? '').replaceAll('\\', '/');
+      const scalar = Number(diagnostic.content.trim());
+      if (/(?:^|\/)reward\.txt$/i.test(diagnosticPath)
+        && Number.isFinite(scalar)) {
+        scalarReward = scalar;
+      }
       try {
         const parsed = JSON.parse(diagnostic.content) as {
           reward?: unknown;
           groups?: unknown;
-        };
+        } | number;
+        if (typeof parsed === 'number') {
+          if (Number.isFinite(parsed)
+            && /(?:^|\/)reward\.txt$/i.test(diagnosticPath)) {
+            scalarReward = parsed;
+          }
+          continue;
+        }
         if (typeof parsed.reward !== 'number'
           || !parsed.groups
           || typeof parsed.groups !== 'object'
@@ -3104,7 +3120,9 @@ export class Runtime {
         // grade.log and other diagnostic files may not be scorecards.
       }
     }
-    return undefined;
+    return scalarReward === undefined
+      ? undefined
+      : { reward: scalarReward, groups: { __reward__: scalarReward } };
   }
 
   private async rollbackVerifierRegression(

@@ -1530,8 +1530,7 @@ describe('benchmark terminal capability', () => {
         'from pathlib import Path',
         'value = int(Path("implementation.py").read_text().split("=")[1].strip())',
         'reward = 0.8 if value == 42 else (0.5 if value == 41 else 0.1)',
-        'groups = {"public": 1 if reward >= 0.5 else 0, "hidden": 1 if reward >= 0.8 else 0}',
-        'Path("logs/verifier/scorecard.json").write_text(json.dumps({"groups": groups, "reward": reward}))',
+        'Path("logs/verifier/reward.txt").write_text(str(reward))',
         'print(f"{reward:.12f}")',
       ].join('\n') + '\n'
     );
