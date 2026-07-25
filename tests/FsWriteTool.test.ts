@@ -119,6 +119,25 @@ describe('workspace search and replace tools', () => {
     expect(await readFile(target, 'utf8')).toBe('new\nnew\n');
   });
 
+  it('writes replacement text literally when it contains JavaScript substitution tokens', async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), 'roy-fs-replace-literal-'));
+    const target = path.join(workspace, 'app.py');
+    await writeFile(target, 'PLACEHOLDER\nPLACEHOLDER\n', 'utf8');
+    const tool = new FsReplaceTool(workspace);
+    const literal = "value = raw.replace('$', '').replace(',', '')  # $& $` $' $$";
+
+    const replaced = await tool.execute({
+      path: 'app.py',
+      oldText: 'PLACEHOLDER',
+      newText: literal,
+      expectedReplacements: 2,
+      replaceAll: true,
+    });
+
+    expect(replaced.success).toBe(true);
+    expect(await readFile(target, 'utf8')).toBe(`${literal}\n${literal}\n`);
+  });
+
   it('replaces an inclusive line range when malformed text is unsafe to quote', async () => {
     const workspace = await mkdtemp(path.join(tmpdir(), 'roy-fs-replace-lines-'));
     const target = path.join(workspace, 'app.py');

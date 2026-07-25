@@ -561,9 +561,10 @@ export class FsReplaceTool implements Tool {
         };
       }
       const replacements = params.replaceAll === true ? occurrences : 1;
+      const literalReplacement = String(params.newText);
       const updated = params.replaceAll === true
-        ? content.replaceAll(oldText, String(params.newText))
-        : content.replace(oldText, String(params.newText));
+        ? content.replaceAll(oldText, () => literalReplacement)
+        : content.replace(oldText, () => literalReplacement);
       await writeFile(target, updated, 'utf8');
       return {
         success: true,
