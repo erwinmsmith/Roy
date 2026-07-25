@@ -77,33 +77,19 @@ class ReadOnlyThenMutationPlanningLLM extends PlanningLLM {
   }
 }
 
-class NovelInspectionThenMutationPlanningLLM extends PlanningLLM {
+class NovelInspectionOnlyPlanningLLM extends PlanningLLM {
   constructor() {
     super('none');
   }
 
   override async completeJSON<T>(): Promise<T> {
     this.jsonCalls += 1;
-    if (this.jsonCalls === 1) {
-      return {
-        action: 'call_tools',
-        reason: 'Continue broad discovery in another directory.',
-        calls: [{
-          toolName: 'fs.list',
-          params: { path: 'configs', maxDepth: 4 },
-        }],
-      } as T;
-    }
     return {
       action: 'call_tools',
-      reason: 'Apply a preserving implementation patch from the grounded contract.',
+      reason: 'Continue broad discovery in another directory.',
       calls: [{
-        toolName: 'fs.synthesize',
-        params: {
-          path: 'src/app.py',
-          instructions: 'Migrate the implementation using the grounded runtime config.',
-          strategy: 'patch',
-        },
+        toolName: 'fs.list',
+        params: { path: 'configs', maxDepth: 4 },
       }],
     } as T;
   }
@@ -821,7 +807,7 @@ describe('UnifiedAgent capability execution', () => {
   });
 
   it('closes saturated research and requires a mutation instead of a novel broad listing', async () => {
-    const llm = new NovelInspectionThenMutationPlanningLLM();
+    const llm = new NovelInspectionOnlyPlanningLLM();
     const agent = new UnifiedAgent({
       name: 'saturated-research-agent',
       goal: 'transition grounded research into implementation',
@@ -831,7 +817,7 @@ describe('UnifiedAgent capability execution', () => {
     });
 
     const plans = await agent.planNextToolRound({
-      task: 'Migrate src/app.py using configs/runtime.yaml and preserve its interface.',
+      task: 'src/app.py: Migrate it using configs/runtime.yaml and preserve its interface.',
       executionRequired: true,
       workspaceEvidenceSaturated: true,
       round: 6,
@@ -863,7 +849,7 @@ describe('UnifiedAgent capability execution', () => {
       ],
     });
 
-    expect(llm.jsonCalls).toBe(2);
+    expect(llm.jsonCalls).toBe(1);
     expect(plans).toEqual([
       expect.objectContaining({
         toolName: 'fs.synthesize',

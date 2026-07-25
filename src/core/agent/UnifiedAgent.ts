@@ -497,6 +497,7 @@ export class UnifiedAgent extends BaseAgent {
           task: input.task,
           mutationRequirementSatisfied,
           latestVerificationFailed,
+          workspaceEvidenceSaturated,
           round: input.round,
         });
         if (synthesisFallback) {
@@ -589,6 +590,7 @@ export class UnifiedAgent extends BaseAgent {
             task: input.task,
             mutationRequirementSatisfied,
             latestVerificationFailed,
+            workspaceEvidenceSaturated,
             round: input.round,
           });
           return synthesisFallback ? [synthesisFallback] : [];
@@ -629,6 +631,7 @@ export class UnifiedAgent extends BaseAgent {
         task: input.task,
         mutationRequirementSatisfied,
         latestVerificationFailed,
+        workspaceEvidenceSaturated,
         round: input.round,
       });
       if (synthesisFallback) return [synthesisFallback];
@@ -1451,6 +1454,7 @@ function recoverGroundedSynthesisPlan(input: {
   task: string;
   mutationRequirementSatisfied: boolean;
   latestVerificationFailed: boolean;
+  workspaceEvidenceSaturated: boolean;
   round: number;
 }): PlannedToolCall | undefined {
   if (!input.authorized.has('fs.synthesize')
@@ -1486,6 +1490,10 @@ function recoverGroundedSynthesisPlan(input: {
       input.task,
       candidate.filePath
     );
+  const saturatedInitialRepair = !input.latestVerificationFailed
+    && input.workspaceEvidenceSaturated
+    && candidate.implementationIntent
+    && hasCompleteGroundedFileRead(input.calls, candidate.filePath);
   // The deterministic fallback is deliberately limited to true scaffolds.
   // Replacing a non-stub implementation after a malformed planner response
   // discards working behavior and turns a local repair into another expensive
@@ -1496,7 +1504,8 @@ function recoverGroundedSynthesisPlan(input: {
   if (!candidate.stubSignal
     && !candidate.invalidSourceSignal
     && !aggregateVerifierRepair
-    && !groundedInitialRepair) {
+    && !groundedInitialRepair
+    && !saturatedInitialRepair) {
     return undefined;
   }
   return {
@@ -1511,25 +1520,28 @@ function recoverGroundedSynthesisPlan(input: {
           : 'Repair the implementation to satisfy the latest grounded verifier failure and the immutable assignment while preserving working behavior.'
         : groundedInitialRepair
           ? 'Apply a focused, interface-preserving implementation patch to satisfy the immutable assignment using the grounded input contract and observed baseline behavior. Preserve working code and do not rewrite unrelated behavior.'
+          : saturatedInitialRepair
+            ? 'Apply a focused, interface-preserving implementation patch to the explicit target using the complete task-declared evidence already collected. Preserve working code and do not rewrite unrelated behavior.'
           : 'Implement the complete assigned workspace behavior in this authoritative source file using the grounded inputs, rules, and project structure.',
-      ...(groundedInitialRepair || aggregateVerifierRepair
+      ...(groundedInitialRepair || saturatedInitialRepair || aggregateVerifierRepair
         ? { strategy: 'patch' }
         : {}),
     },
     reason: groundedInitialRepair
       ? `Runtime transitioned from completed baseline inspection to a grounded preserving implementation patch in round ${input.round}; a zero-exit baseline does not satisfy a mutation-required assignment.`
+      : saturatedInitialRepair
+        ? `Runtime closed the fully grounded task-declared research phase and selected a preserving implementation patch in round ${input.round}.`
       : `Runtime recovered a grounded file-synthesis action after structured planning did not advance execution in round ${input.round}.`,
     groundingRequired: true,
   };
 }
 
-function hasGroundedInitialImplementationEvidence(
+function hasCompleteGroundedFileRead(
   calls: ToolLoopCallRecord[],
-  task: string,
   targetPath: string
 ): boolean {
   const normalizedTarget = normalizePlannedWorkspacePath(targetPath);
-  const completeTargetRead = calls.some(call => {
+  return calls.some(call => {
     if (call.toolName !== 'fs.read' || !call.success) return false;
     const result = call.result as {
       path?: unknown;
@@ -1543,7 +1555,15 @@ function hasGroundedInitialImplementationEvidence(
       && typeof result?.content === 'string'
       && result.truncated !== true;
   });
-  if (!completeTargetRead) return false;
+}
+
+function hasGroundedInitialImplementationEvidence(
+  calls: ToolLoopCallRecord[],
+  task: string,
+  targetPath: string
+): boolean {
+  const normalizedTarget = normalizePlannedWorkspacePath(targetPath);
+  if (!hasCompleteGroundedFileRead(calls, normalizedTarget)) return false;
 
   const explicitContractRead = calls.some(call => {
     if (call.toolName !== 'fs.read' || !call.success) return false;
@@ -1796,8 +1816,10 @@ function taskNamesFileAsImplementationTarget(
     .map(value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
   if (targets.length === 0) return false;
   const target = `(?:${targets.join('|')})`;
+  const verbs =
+    '(?:implement|repair|fix|rewrite|complete|move|extract|build|create|write|update|migrate|upgrade|replace|modify|edit|refactor|apply)';
   return new RegExp(
-    `\\b(?:implement|repair|fix|rewrite|complete|move|extract|build|create|write|update|migrate|upgrade|replace|modify|edit|refactor|apply)\\b[^.\\n;]{0,180}${target}`,
+    `(?:\\b${verbs}\\b[^.\\n;]{0,180}${target}|${target}[^\\n;]{0,120}\\b${verbs}\\b)`,
     'i'
   ).test(taskLower);
 }
