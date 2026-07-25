@@ -368,6 +368,7 @@ describe('AgentToolPlanner', () => {
         '<official_verifier_feedback>',
         'configs/public_audit.yml exposes an invalid row-count result from the audit pipeline',
         'Requirement already satisfied: jsonschema>=4.18 (from great-expectations)',
+        'Installing build dependencies: finished with status done',
         'Successfully installed dq-audit-0.1.0',
         '</official_verifier_feedback>',
       ].join('\n'),
@@ -401,6 +402,34 @@ describe('AgentToolPlanner', () => {
         params: expect.objectContaining({ path: 'src/dq_audit/audit.py' }),
       }),
     ]);
+    expect(planner.planExternalFeedbackRepair({
+      task: [
+        'Continue repairing the implementation.',
+        '## VERIFICATION FAILED — CONTINUE WORKING',
+        '<official_verifier_feedback>',
+        'configs/public_audit.yml exposes an invalid row-count result from the audit pipeline',
+        'Requirement already satisfied: jsonschema>=4.18 (from great-expectations)',
+        'Installing build dependencies: finished with status done',
+        'Successfully installed dq-audit-0.1.0',
+        '</official_verifier_feedback>',
+      ].join('\n'),
+      calls: [{
+        toolName: plans[0]!.toolName,
+        params: plans[0]!.params,
+        success: false,
+        error: 'Focused patch returned no diff.',
+      }, {
+        toolName: 'fs.read',
+        params: { path: 'src/dq_audit/audit.py' },
+        success: true,
+        result: {
+          path: 'src/dq_audit/audit.py',
+          content: 'def run_audit():\n    return None\n',
+        },
+      }],
+      bindings: [{ name: 'fs.synthesize', enabled: true }],
+      workspaceRoot: '/app',
+    })).toEqual([]);
   });
 
   it('follows explicit files and text dependencies from a grounded manifest without another model plan', () => {

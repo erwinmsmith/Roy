@@ -448,6 +448,9 @@ export class AgentToolPlanner {
       .some(line =>
         /\b(?:dependenc(?:y|ies)|requirements?|manifest|runtime version|version constraint|pin(?:ned|ning)?|package install)\b/i.test(
           line
+        )
+        && /\b(?:fail(?:ed|ure)?|error|invalid|incorrect|wrong|legacy|outdated|incompatible|unsupported|mismatch|must|should|expect(?:ed)?|require[sd]?|target(?:s|ed)?|pin(?:ned|ning)?|upgrade|downgrade|missing|not found|cannot|can't)\b/i.test(
+          line
         ));
     const feedbackLocations = this.extractFailureLocations(
       feedback,
@@ -553,15 +556,23 @@ export class AgentToolPlanner {
     const compactFeedback = feedback.length <= 2_800
       ? feedback
       : `${feedback.slice(0, 700)}\n[older external feedback compacted]\n${feedback.slice(-2_100)}`;
+    const instructions = [
+      'Apply the smallest coherent, interface-preserving change that resolves the newest external verifier feedback.',
+      `Authoritative external feedback:\n${compactFeedback}`,
+      'Use the already observed current file as the patch base. Preserve unrelated working declarations and do not alter benchmark or verifier files.',
+    ].join('\n\n');
+    const duplicateAttempt = (input.currentCalls ?? input.calls).some(call =>
+      call.toolName === 'fs.synthesize'
+      && this.normalizeWorkspacePath(String(call.params.path ?? '')) === candidate.path
+      && String(call.params.instructions ?? '') === instructions
+      && call.params.strategy === 'patch'
+    );
+    if (duplicateAttempt) return [];
     return [{
       toolName: 'fs.synthesize',
       params: {
         path: candidate.path,
-        instructions: [
-          'Apply the smallest coherent, interface-preserving change that resolves the newest external verifier feedback.',
-          `Authoritative external feedback:\n${compactFeedback}`,
-          'Use the already observed current file as the patch base. Preserve unrelated working declarations and do not alter benchmark or verifier files.',
-        ].join('\n\n'),
+        instructions,
         strategy: 'patch',
       },
       reason: `The external verifier identifies a concrete failure category and ${candidate.path} is the highest-priority observed file that controls it.`,
