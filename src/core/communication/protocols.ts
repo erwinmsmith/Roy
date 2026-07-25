@@ -5,12 +5,53 @@ import type {
   MultiPartyTrace,
 } from './types.js';
 
+function compactString(value: string, maxCharacters = 1_200): string {
+  if (value.length <= maxCharacters) return value;
+  const tailCharacters = Math.floor(maxCharacters * 0.65);
+  const headCharacters = maxCharacters - tailCharacters;
+  return `${value.slice(0, headCharacters)}\n...[communication artifact compacted; authoritative content remains in the execution ledger]...\n${value.slice(-tailCharacters)}`;
+}
+
+function compactPayload(value: unknown, depth = 0): unknown {
+  if (typeof value === 'string') return compactString(value);
+  if (!value || typeof value !== 'object') return value;
+  if (depth >= 4) return '[nested communication data omitted]';
+  if (Array.isArray(value)) {
+    if (value.length <= 8) return value.map(item => compactPayload(item, depth + 1));
+    return [
+      ...value.slice(0, 4).map(item => compactPayload(item, depth + 1)),
+      `[${value.length - 8} intermediate items omitted]`,
+      ...value.slice(-4).map(item => compactPayload(item, depth + 1)),
+    ];
+  }
+  const entries = Object.entries(value as Record<string, unknown>);
+  const selected = entries.length <= 20
+    ? entries
+    : [
+      ...entries.filter(([key]) =>
+        /^(?:toolName|success|error|task|path|command|cwd|exitCode|timedOut|result|status|reason)$/i.test(
+          key
+        )).slice(0, 12),
+      ...entries.filter(([key]) =>
+        !/^(?:toolName|success|error|task|path|command|cwd|exitCode|timedOut|result|status|reason)$/i.test(
+          key
+        )).slice(0, 8),
+    ];
+  const compacted = Object.fromEntries(
+    selected.map(([key, item]) => [key, compactPayload(item, depth + 1)])
+  );
+  if (entries.length > selected.length) {
+    compacted._communicationOmittedFields = entries.length - selected.length;
+  }
+  return compacted;
+}
+
 function payloadText(payload: unknown): string {
-  if (typeof payload === 'string') return payload;
+  if (typeof payload === 'string') return compactString(payload);
   try {
-    return JSON.stringify(payload, null, 2);
+    return JSON.stringify(compactPayload(payload), null, 2);
   } catch {
-    return String(payload);
+    return compactString(String(payload));
   }
 }
 

@@ -402,7 +402,11 @@ export abstract class BaseAgent implements AgentTraceReceiver {
 
   /** Receive an observable runtime trace from any participant in the current system flow. */
   receiveSystemTrace(trace: MultiPartyTrace): void {
-    const existingIndex = this.systemTraces.findIndex(item => item.id === trace.id);
+    const messageId = String(trace.metadata?.messageId ?? '');
+    const existingIndex = this.systemTraces.findIndex(item =>
+      item.id === trace.id
+      || Boolean(messageId && item.metadata?.messageId === messageId)
+    );
     if (existingIndex >= 0) this.systemTraces[existingIndex] = trace;
     else this.systemTraces.push(trace);
     if (this.systemTraces.length > 200) this.systemTraces = this.systemTraces.slice(-200);

@@ -78,18 +78,68 @@ describe('agent communication protocols', () => {
     expect(rendered.rendered).not.toContain('<recipient_model>');
   });
 
-  it('uses ToM by default and derives traces from message transitions', () => {
+  it('uses ToM by default and retains only terminal semantic message traces', () => {
     const manager = new AgentCommunicationManager();
-    const trace = manager.recordTransition({ type: 'message.processing', message: message() });
+    expect(manager.recordTransition({
+      type: 'message.processing',
+      message: message(),
+    })).toBeUndefined();
+    const completedMessage = { ...message(), status: 'completed' as const, updatedAt: 3 };
+    const trace = manager.recordTransition({
+      type: 'message.completed',
+      message: completedMessage,
+    });
 
     expect(manager.getDefaultProtocolId()).toBe('tom');
     expect(trace).toMatchObject({
       protocolId: 'tom',
       kind: 'agent.task',
-      phase: 'processing',
+      phase: 'completed',
       correlationId: 'communication-correlation',
     });
     expect(manager.getState().tracesByProtocol.tom).toBe(1);
+  });
+
+  it('keeps large tool artifacts in the execution ledger instead of duplicating them in communication prompts', () => {
+    const protocol = new StructuredCommunicationProtocol();
+    const rendered = protocol.render({
+      message: {
+        ...message('structured'),
+        kind: 'tool.result',
+        payload: {
+          toolName: 'shell.exec',
+          success: false,
+          result: {
+            command: 'python -m pytest -q',
+            stdout: 'x'.repeat(20_000),
+            stderr: 'failure at src/example.py:10',
+          },
+        },
+      },
+      recipient: { actor: { id: 'root', type: 'agent' } },
+      participants: [],
+      traces: [],
+    });
+
+    expect(rendered.rendered).toContain('communication artifact compacted');
+    expect(rendered.rendered).toContain('failure at src/example.py:10');
+    expect(rendered.rendered.length).toBeLessThan(4_000);
+  });
+
+  it('does not retain budget, approval, or successful tool-call plumbing as reasoning traces', () => {
+    const manager = new AgentCommunicationManager();
+    for (const kind of [
+      'budget.request',
+      'tool.approval.request',
+      'tool.approval.resolved',
+      'tool.call',
+    ] as const) {
+      manager.recordTransition({
+        type: 'message.completed',
+        message: { ...message(), kind, status: 'completed' },
+      });
+    }
+    expect(manager.getState().traces).toBe(0);
   });
 
   it('supports custom protocol registration and selection', () => {

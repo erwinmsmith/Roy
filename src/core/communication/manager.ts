@@ -46,7 +46,12 @@ export class MultiPartyTraceStore {
   constructor(private readonly maxEntries = 200) {}
 
   append(trace: MultiPartyTrace): void {
-    this.traces.push(trace);
+    const messageId = String(trace.metadata?.messageId ?? '');
+    const existingIndex = messageId
+      ? this.traces.findIndex(item => item.metadata?.messageId === messageId)
+      : -1;
+    if (existingIndex >= 0) this.traces[existingIndex] = trace;
+    else this.traces.push(trace);
     if (this.traces.length > this.maxEntries) this.traces = this.traces.slice(-this.maxEntries);
   }
 
@@ -136,10 +141,13 @@ export class AgentCommunicationManager {
   }
 
   recordTransition(transition: QueueTransition): MultiPartyTrace | undefined {
-    if (!this.config.includeCompletedMessages && transition.type === 'message.completed') return undefined;
     const message = transition.message;
     const phase = transition.type.replace('message.', '') as MultiPartyTrace['phase'];
     if (!['enqueued', 'processing', 'completed', 'failed', 'cancelled'].includes(phase)) return undefined;
+    if (phase === 'enqueued' || phase === 'processing') return undefined;
+    if (!this.config.includeCompletedMessages && phase === 'completed') return undefined;
+    if (/^(?:budget\.|tool\.approval\.|memory\.)/.test(message.kind)) return undefined;
+    if (message.kind === 'tool.call' && phase === 'completed') return undefined;
     const protocolId = this.resolveProtocol(message).id;
     const trace: MultiPartyTrace = {
       id: `${message.id}:${phase}:${message.updatedAt}`,

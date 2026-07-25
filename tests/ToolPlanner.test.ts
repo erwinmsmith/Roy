@@ -359,6 +359,50 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('repairs implementation code instead of benchmark config named by verifier feedback', () => {
+    const planner = new AgentToolPlanner();
+    const plans = planner.planExternalFeedbackRepair({
+      task: [
+        'Continue repairing the implementation.',
+        '## VERIFICATION FAILED — CONTINUE WORKING',
+        '<official_verifier_feedback>',
+        'configs/public_audit.yml exposes an invalid row-count result from the audit pipeline',
+        'Requirement already satisfied: jsonschema>=4.18 (from great-expectations)',
+        'Successfully installed dq-audit-0.1.0',
+        '</official_verifier_feedback>',
+      ].join('\n'),
+      calls: [
+        {
+          toolName: 'fs.read',
+          params: { path: 'configs/public_audit.yml' },
+          success: true,
+          result: {
+            path: 'configs/public_audit.yml',
+            content: 'input: data/public.csv\n',
+          },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/dq_audit/audit.py' },
+          success: true,
+          result: {
+            path: 'src/dq_audit/audit.py',
+            content: 'def run_audit():\n    return None\n',
+          },
+        },
+      ],
+      bindings: [{ name: 'fs.synthesize', enabled: true }],
+      workspaceRoot: '/app',
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.synthesize',
+        params: expect.objectContaining({ path: 'src/dq_audit/audit.py' }),
+      }),
+    ]);
+  });
+
   it('follows explicit files and text dependencies from a grounded manifest without another model plan', () => {
     const planner = new AgentToolPlanner();
     const plans = planner.planWorkspaceEvidenceFollowUps({
@@ -989,6 +1033,60 @@ describe('AgentToolPlanner', () => {
         rejectedCalls.at(-1)!,
       ],
     })).toEqual([]);
+  });
+
+  it('never turns a verifier traceback into a verifier mutation', () => {
+    const planner = new AgentToolPlanner();
+    const calls = [
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python .roy/official-verifier/grade.py' },
+        success: false,
+        result: {
+          cwd: '/app',
+          exitCode: 1,
+          stderr: [
+            'Traceback (most recent call last):',
+            '  File "/app/.roy/official-verifier/grade.py", line 40, in grade',
+            '    raise AssertionError("unexpected output")',
+          ].join('\n'),
+          verifierDiagnostics: [{
+            path: '/logs/verifier/scorecard.json',
+            content: '{"groups":{"correctness":0},"weights":{"correctness":1}}',
+          }],
+        },
+      },
+      {
+        toolName: 'fs.read',
+        params: { path: '.roy/official-verifier/grade.py' },
+        success: true,
+        result: {
+          path: '.roy/official-verifier/grade.py',
+          content: 'def grade(): raise AssertionError("unexpected output")',
+        },
+      },
+      {
+        toolName: 'fs.read',
+        params: { path: 'src/dq_audit/audit.py' },
+        success: true,
+        result: {
+          path: 'src/dq_audit/audit.py',
+          content: 'def run_audit(): return None',
+        },
+      },
+    ];
+
+    expect(planner.planWorkspaceRepairTransition({
+      task: 'Repair src/dq_audit/audit.py until the official verifier passes.',
+      workspaceRoot: '/app',
+      bindings: [{ name: 'fs.synthesize', enabled: true }],
+      calls,
+    })).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.synthesize',
+        params: expect.objectContaining({ path: 'src/dq_audit/audit.py' }),
+      }),
+    ]);
   });
 
   it('reads the package manifest for an architecture critic', () => {

@@ -436,9 +436,19 @@ export class AgentToolPlanner {
     const continuationMatch = /##\s+VERIFICATION FAILED\b([\s\S]*)/i.exec(input.task);
     const feedback = String(feedbackMatch?.[1] ?? continuationMatch?.[1] ?? '').trim();
     if (!feedback) return [];
-    const dependencyFeedback = /\b(?:dependenc(?:y|ies)|metadata|manifest|requirements?|runtime version|version constraint|pin(?:ned|ning)?|package install)\b/i.test(
-      feedback
-    );
+    const dependencyFeedback = feedback
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(line =>
+        line.length > 0
+        && line.length <= 600
+        && !/^(?:requirement already satisfied|collecting|downloading|installing collected packages|successfully (?:built|installed)|building (?:wheel|editable)|created wheel|stored in directory|warning: running pip)\b/i.test(
+          line
+        ))
+      .some(line =>
+        /\b(?:dependenc(?:y|ies)|requirements?|manifest|runtime version|version constraint|pin(?:ned|ning)?|package install)\b/i.test(
+          line
+        ));
     const feedbackLocations = this.extractFailureLocations(
       feedback,
       input.workspaceRoot ?? '',
@@ -511,12 +521,16 @@ export class AgentToolPlanner {
       .filter(candidate =>
         candidate.path
         && candidate.content
-        && !candidate.path.startsWith('.roy/official-verifier/')
+        && (
+          this.isMutableImplementationPath(candidate.path)
+          || dependencyFeedback && manifestPriority(candidate.path) > 0
+        )
         && !mutatedPaths.has(candidate.path)
       )
       .map(candidate => {
         const lowerPath = candidate.path.toLowerCase();
         let score = explicitFeedbackPaths.has(candidate.path) ? 500 : 0;
+        if (this.isMutableImplementationPath(candidate.path)) score += 40;
         if (dependencyFeedback) {
           score += manifestPriority(lowerPath);
           if (/\blegacy\b/i.test(feedback)
@@ -671,7 +685,9 @@ export class AgentToolPlanner {
       String(shell?.cwd ?? input.workspaceRoot ?? ''),
       input.workspaceRoot
     );
-    if (failureLocations.length > 0 && !rejectedCandidate) {
+    if (failureLocations.length > 0
+      && !rejectedCandidate
+      && this.isMutableImplementationPath(failureLocations[0]!.path)) {
       const targetPath = failureLocations[0]!.path;
       let sourceReadIndex = -1;
       for (let index = input.calls.length - 1; index > latestFailureIndex; index -= 1) {
@@ -743,8 +759,7 @@ export class AgentToolPlanner {
           ?? call.params.path
           ?? ''
       ));
-      return /(?:^|\/)(?:src|lib|app|packages)\/.+\.(?:py|ts|tsx|js|jsx|mjs|cjs|java|go|rs|rb|php)$/i.test(candidate)
-        && !/(?:^|\/)(?:tests?|fixtures?|examples?)\//i.test(candidate);
+      return this.isMutableImplementationPath(candidate);
     });
     const implementationRead = implementationReads.find(call => {
       const candidate = this.normalizeWorkspacePath(String(
@@ -881,6 +896,20 @@ export class AgentToolPlanner {
       }
     }
     return undefined;
+  }
+
+  private isMutableImplementationPath(candidatePath: string): boolean {
+    const candidate = this.normalizeWorkspacePath(candidatePath);
+    if (!candidate
+      || /(?:^|\/)\.roy(?:\/|$)/i.test(candidate)
+      || /(?:^|\/)(?:tests?|fixtures?|examples?|benchmarks?|configs?|data|datasets?|inputs?|outputs?|artifacts?|logs?|verifier)(?:\/|$)/i.test(
+        candidate
+      )) {
+      return false;
+    }
+    return /(?:^|\/)(?:src|lib|app|packages)\/.+\.(?:py|ts|tsx|js|jsx|mjs|cjs|java|go|rs|rb|php)$/i.test(
+      candidate
+    );
   }
 
   private latestRollbackForCurrentWorkspace(
