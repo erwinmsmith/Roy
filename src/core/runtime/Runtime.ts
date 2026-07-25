@@ -8357,12 +8357,16 @@ export class Runtime {
           totalTokens: usageDelta.totalTokens,
         },
       });
-      this.settleAgentBudget(agentId, usageDelta, {
-        success: false,
-        error: message,
-        evidenceGain: activeGrounding?.evidence.toolGrounded ? 0.25 : 0,
-        uncertaintyReduction: activeGrounding?.grounded ? 0.2 : 0,
-      });
+      if (usageDelta.totalTokens > 0) {
+        this.settleAgentBudget(agentId, usageDelta, {
+          success: false,
+          error: message,
+          evidenceGain: activeGrounding?.evidence.toolGrounded ? 0.25 : 0,
+          uncertaintyReduction: activeGrounding?.grounded ? 0.2 : 0,
+        });
+      } else {
+        this.releaseAgentBudget(agentId, 'agent_run_failed_before_usage');
+      }
       await ctx.memory.recordAgentPatternOutcome(options.archetype ?? this.inferAgentArchetype(agent.getInfo()), {
         success: false,
         grounded: false,
