@@ -1247,6 +1247,8 @@ describe('AgentToolPlanner', () => {
         '1. Who created the original Chipmunks characters?',
         '2. Which musical premiered in the United States on December 10, 1993?',
         '3. Who became British prime minister immediately after Arthur Balfour?',
+        '4. Who had a 1970s number-one hit with Kiss You All Over?',
+        '5. What disease killed Kathleen Ferrier?',
         '',
         'Write one coherent story after resolving the facts.',
       ].join('\n'),
@@ -1277,6 +1279,20 @@ describe('AgentToolPlanner', () => {
         toolName: 'web.search',
         params: {
           query: 'Who became British prime minister immediately after Arthur Balfour?',
+          maxResults: 5,
+        },
+      }),
+      expect.objectContaining({
+        toolName: 'web.search',
+        params: {
+          query: 'Who had a 1970s number-one hit with Kiss You All Over?',
+          maxResults: 5,
+        },
+      }),
+      expect.objectContaining({
+        toolName: 'web.search',
+        params: {
+          query: 'What disease killed Kathleen Ferrier?',
           maxResults: 5,
         },
       }),
@@ -1435,6 +1451,45 @@ describe('AgentToolPlanner', () => {
 
     expect(plans).toEqual([
       expect.objectContaining({ params: { url: 'https://nodejs.org/docs/latest/api/globals.html#fetch' } }),
+    ]);
+  });
+
+  it('scores multi-question follow-ups against the latest independent question', () => {
+    const plans = new AgentToolPlanner().planWebFollowUps({
+      task: [
+        'Verify each answer using public web sources.',
+        '1. Who created the original Chipmunks characters?',
+        '2. Who became British prime minister immediately after Arthur Balfour?',
+      ].join('\n'),
+      bindings: [{ name: 'web.fetch', enabled: true }],
+      maxFetches: 2,
+      calls: [{
+        toolName: 'web.search',
+        params: { query: 'Who became British prime minister immediately after Arthur Balfour?' },
+        success: true,
+        result: {
+          results: [
+            {
+              title: 'NEXT Official Site',
+              url: 'https://www.next.co.uk/',
+              snippet: 'British multinational clothing and homeware retailer.',
+            },
+            {
+              title: 'Arthur Balfour – past Prime Ministers',
+              url: 'https://www.gov.uk/government/history/past-prime-ministers/arthur-james-balfour',
+              snippet: 'Balfour was succeeded as prime minister by Henry Campbell-Bannerman.',
+            },
+          ],
+        },
+      }],
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({
+        params: {
+          url: 'https://www.gov.uk/government/history/past-prime-ministers/arthur-james-balfour',
+        },
+      }),
     ]);
   });
 

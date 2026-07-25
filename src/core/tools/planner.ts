@@ -158,12 +158,17 @@ export class AgentToolPlanner {
     }
 
     const seen = new Set<string>();
-    return plans.filter(plan => {
+    const uniquePlans = plans.filter(plan => {
       const fingerprint = `${plan.toolName}:${JSON.stringify(plan.params)}`;
       if (seen.has(fingerprint)) return false;
       seen.add(fingerprint);
       return true;
-    }).slice(0, 3);
+    });
+    const initialPlanLimit = uniquePlans.length > 0
+      && uniquePlans.every(plan => plan.toolName === 'web.search')
+      ? 10
+      : 3;
+    return uniquePlans.slice(0, initialPlanLimit);
   }
 
   planWebFollowUps(input: {
@@ -174,9 +179,12 @@ export class AgentToolPlanner {
   }): PlannedToolCall[] {
     if (!input.bindings.some(binding => binding.enabled && binding.name === 'web.fetch')) return [];
     const requiredSources = this.requiredWebSourceCount(input.task);
+    const relevanceTasks = this.webEvidenceTasks(input.task);
     const relevantDocuments = this.relevantWebDocuments(input.task, input.calls);
     const focusedSections = input.calls.filter(call => {
-      if (call.toolName !== 'web.fetch' || !call.success || this.webEvidenceScore(input.task, call) < 6) return false;
+      if (call.toolName !== 'web.fetch'
+        || !call.success
+        || !relevanceTasks.some(task => this.webEvidenceScore(task, call) >= 6)) return false;
       const value = String((call.result as { finalUrl?: unknown } | undefined)?.finalUrl ?? call.params.url ?? '');
       try {
         return Boolean(new URL(value).hash);
@@ -200,6 +208,9 @@ export class AgentToolPlanner {
       results?: Array<{ url?: unknown; title?: unknown; snippet?: unknown }>;
     } | undefined)?.results;
     if (Array.isArray(results)) {
+      const latestQuery = String(latestSearch?.params.query ?? input.task);
+      const relevanceTask = relevanceTasks.length > 1 ? latestQuery : input.task;
+      const relevanceThreshold = relevanceTasks.length > 1 ? 6 : 4;
       const resultUrls = new Set(results
         .filter(item => typeof item.url === 'string')
         .map(item => this.canonicalWebDocumentUrl(String(item.url))));
@@ -207,8 +218,8 @@ export class AgentToolPlanner {
       const remaining = Math.max(0, input.maxFetches - alreadyFetched);
       const searchPlans = results
         .filter(item => typeof item.url === 'string' && !fetched.has(this.canonicalWebDocumentUrl(item.url)))
-        .map(item => ({ item, score: this.webRelevanceScore(input.task, `${String(item.title ?? '')} ${String(item.snippet ?? '')} ${String(item.url)}`) }))
-        .filter(candidate => candidate.score >= 4)
+        .map(item => ({ item, score: this.webRelevanceScore(relevanceTask, `${String(item.title ?? '')} ${String(item.snippet ?? '')} ${String(item.url)}`) }))
+        .filter(candidate => candidate.score >= relevanceThreshold)
         .sort((left, right) => right.score - left.score)
         .slice(0, remaining)
         .map(({ item }) => ({
@@ -228,7 +239,12 @@ export class AgentToolPlanner {
       });
     return pageLinks
       .filter(link => typeof link.url === 'string' && !fetched.has(this.canonicalWebDocumentUrl(link.url)))
-      .map(link => ({ link, score: this.webRelevanceScore(input.task, `${String(link.text ?? '')} ${String(link.url)}`) }))
+      .map(link => ({
+        link,
+        score: Math.max(...relevanceTasks.map(task =>
+          this.webRelevanceScore(task, `${String(link.text ?? '')} ${String(link.url)}`)
+        )),
+      }))
       .filter(candidate => candidate.score >= 4)
       .sort((left, right) => right.score - left.score)
       .slice(0, Math.max(0, input.maxFetches))
@@ -1290,9 +1306,10 @@ export class AgentToolPlanner {
     if (!this.isWebCandidateAligned(task, candidate)) return 0;
     const stopWords = new Set([
       'about', 'after', 'also', 'and', 'at', 'before', 'clearly', 'compare', 'concrete', 'current',
-      'distinguish', 'establish', 'evidence', 'for', 'from', 'include', 'latest',
-      'open', 'public', 'relevant', 'search', 'source', 'sources', 'the', 'their', 'uncertainty',
-      'urls', 'use', 'using', 'verified', 'web', 'what', 'with',
+      'did', 'distinguish', 'does', 'establish', 'evidence', 'for', 'from', 'had', 'include', 'latest',
+      'name', 'number', 'one', 'open', 'over', 'public', 'relevant', 'search', 'source', 'sources',
+      'the', 'their', 'uncertainty', 'urls', 'use', 'using', 'verified', 'was', 'web', 'were', 'what',
+      'when', 'where', 'which', 'who', 'with',
     ]);
     const terms = [...new Set(task.toLowerCase().split(/[^a-z0-9._-]+/)
       .map(term => term.replace(/^[._-]+|[._-]+$/g, ''))
@@ -1371,11 +1388,19 @@ export class AgentToolPlanner {
   }
 
   private relevantWebDocuments(task: string, calls: ObservedToolCall[]): Set<string> {
+    const relevanceTasks = this.webEvidenceTasks(task);
     return new Set(calls
-      .filter(call => call.toolName === 'web.fetch' && call.success && this.webEvidenceScore(task, call) >= 6)
+      .filter(call => call.toolName === 'web.fetch'
+        && call.success
+        && relevanceTasks.some(candidate => this.webEvidenceScore(candidate, call) >= 6))
       .map(call => this.canonicalWebDocumentUrl(String(
         (call.result as { finalUrl?: unknown } | undefined)?.finalUrl ?? call.params.url ?? ''
       )))
       .filter(Boolean));
+  }
+
+  private webEvidenceTasks(task: string): string[] {
+    const questions = this.extractIndependentWebQuestions(task);
+    return questions.length > 1 ? questions : [task];
   }
 }
