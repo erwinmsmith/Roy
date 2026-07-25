@@ -13634,6 +13634,35 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
   private latestExternalVerificationFeedback(
     task: string
   ): { summary: string; path?: string } | undefined {
+    const capsuleMatch = /<recovery_capsule>\s*([\s\S]*?)\s*<\/recovery_capsule>/i.exec(
+      task
+    );
+    if (capsuleMatch) {
+      try {
+        const capsule = JSON.parse(capsuleMatch[1]!) as {
+          recoveryTrigger?: unknown;
+          externalFeedback?: {
+            summary?: unknown;
+            path?: unknown;
+          };
+        };
+        const summary = typeof capsule.externalFeedback?.summary === 'string'
+          ? capsule.externalFeedback.summary.trim().slice(0, 1_200)
+          : '';
+        const path = typeof capsule.externalFeedback?.path === 'string'
+          ? this.extractTaskDiagnosticSourcePaths(
+            capsule.externalFeedback.path
+          )[0]
+          : undefined;
+        if (capsule.recoveryTrigger === 'new_external_verifier_feedback'
+          && summary
+          && path) {
+          return { summary, path };
+        }
+      } catch {
+        // Fall through to the full external-verifier feedback parser.
+      }
+    }
     const failureMarker = task.toLowerCase().lastIndexOf('## verification failed');
     if (failureMarker < 0) return undefined;
     const latestFailure = task.slice(failureMarker);
@@ -18400,9 +18429,30 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       if (shellAvailable) diagnosticPlans.push(diagnosticExecution);
       plans.unshift(...diagnosticPlans);
     }
-    const priorRejectedVerifierCandidate = this.latestRejectedVerifierCandidate(
+    const concreteExternalFeedback = this.latestExternalVerificationFeedback(
+      intentTask
+    );
+    const cachedRejectedVerifierCandidate = this.latestRejectedVerifierCandidate(
       priorPlannerCalls
     );
+    const priorRejectedVerifierCandidate = concreteExternalFeedback
+      ? undefined
+      : cachedRejectedVerifierCandidate;
+    if (cachedRejectedVerifierCandidate && concreteExternalFeedback) {
+      this.emit({
+        type: 'tool.plan.rejected_candidate.superseded',
+        agentId,
+        sessionId: this.getContext().sessionId,
+        correlationId: options.correlationId,
+        nodeId: options.nodeId,
+        data: {
+          reason: 'new_concrete_external_feedback_invalidates_cached_rejection',
+          rejectedPath: cachedRejectedVerifierCandidate.path,
+          authoritativePath: concreteExternalFeedback.path,
+          summary: concreteExternalFeedback.summary,
+        },
+      });
+    }
     if (priorRejectedVerifierCandidate) {
       const deferredMutations = plans.filter(plan =>
         isSuccessfulWorkspaceMutationCall({
@@ -18954,8 +19004,12 @@ For web-grounded work, use only facts present in the subagent report or runtime 
           return postMutationVerification.slice(0, context.remainingCalls);
         }
         const rejectedCandidate = this.latestRejectedVerifierCandidate(
-          [...priorPlannerCalls, ...context.calls]
-        );
+          context.calls
+        ) ?? (concreteExternalFeedback
+          ? undefined
+          : this.latestRejectedVerifierCandidate(
+            [...priorPlannerCalls, ...context.calls]
+          ));
         if (rejectedCandidate) {
           this.emit({
             type: 'agent.tool_loop.rejected_candidate.closed',

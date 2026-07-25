@@ -1968,6 +1968,105 @@ describe('benchmark terminal capability', () => {
     await runtime.shutdown();
   });
 
+  it('lets concrete recovery feedback supersede a cached rejected target', async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), 'roy-external-feedback-frontier-'));
+    await mkdir(path.join(workspace, '.roy'), { recursive: true });
+    await mkdir(path.join(workspace, 'src', 'app'), { recursive: true });
+    await writeFile(
+      path.join(workspace, '.roy', 'config.json'),
+      JSON.stringify({
+        tools: {
+          approval: { readOnly: 'auto', write: 'auto', execute: 'auto' },
+        },
+      })
+    );
+    await writeFile(
+      path.join(workspace, 'src', 'app', 'retriever.py'),
+      'METHOD = "legacy"\n'
+    );
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'external-feedback-frontier-test',
+      workspaceCwd: workspace,
+    });
+    const recoveryTask = [
+      'Repair src/app/retriever.py from the newest verifier failure.',
+      '<recovery_capsule>',
+      JSON.stringify({
+        recoveryTrigger: 'new_external_verifier_feedback',
+        externalFeedback: {
+          summary: 'src/app/retriever.py still calls the removed legacy method',
+          path: 'src/app/retriever.py',
+        },
+      }),
+      '</recovery_capsule>',
+    ].join('\n');
+    const grounding = await (runtime as unknown as {
+      runGroundingCheck: (
+        agentId: string,
+        task: string,
+        options: Record<string, unknown>
+      ) => Promise<{
+        toolCalls: Array<{
+          toolName: string;
+          params: Record<string, unknown>;
+          success: boolean;
+        }>;
+      }>;
+    }).runGroundingCheck(
+      'root',
+      recoveryTask,
+      {
+        correlationId: 'external-feedback-frontier-turn',
+        intentTask: recoveryTask,
+        initialPlans: [{
+          toolName: 'fs.replace',
+          params: {
+            path: 'src/app/retriever.py',
+            oldText: 'METHOD = "legacy"',
+            newText: 'METHOD = "invoke"',
+            expectedReplacements: 1,
+          },
+          reason: 'Apply the newly localized verifier repair.',
+          groundingRequired: true,
+        }],
+        skipInitialModelPlanning: true,
+        priorToolCalls: [{
+          toolName: 'shell.exec',
+          params: { command: 'python .roy/official-verifier/grade.py' },
+          success: true,
+          result: {
+            candidateRollback: {
+              restored: true,
+              path: 'pyproject.toml',
+              reason: 'no_objective_gain',
+              baselineReward: 0.1667,
+              candidateReward: 0.1667,
+            },
+          },
+        }],
+      }
+    );
+
+    expect(grounding.toolCalls).toContainEqual(expect.objectContaining({
+      toolName: 'fs.replace',
+      params: expect.objectContaining({ path: 'src/app/retriever.py' }),
+      success: true,
+    }));
+    expect(await readFile(
+      path.join(workspace, 'src', 'app', 'retriever.py'),
+      'utf8'
+    )).toContain('METHOD = "invoke"');
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'tool.plan.rejected_candidate.superseded',
+      data: expect.objectContaining({
+        rejectedPath: 'pyproject.toml',
+        authoritativePath: 'src/app/retriever.py',
+      }),
+    }));
+    await runtime.shutdown();
+  });
+
   it('runs an explicitly authorized shell loop and persists its execution tree', async () => {
     const workspace = await mkdtemp(path.join(tmpdir(), 'roy-terminal-task-'));
     await mkdir(path.join(workspace, '.roy'), { recursive: true });
