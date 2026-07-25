@@ -900,6 +900,21 @@ describe('benchmark terminal capability', () => {
     ]));
   });
 
+  it('omits opaque runtime-generated verifier commands from model evidence', () => {
+    const runtime = new Runtime();
+    const compact = (runtime as unknown as {
+      compactShellCommandForEvidence: (command: string) => string;
+    }).compactShellCommandForEvidence.bind(runtime);
+    const opaquePayload = 'A'.repeat(20_000);
+    const command = `ROY_VERIFIER_PROBE=1 python -c "import base64;exec(base64.b64decode('${opaquePayload}'))"`;
+    const result = compact(command);
+
+    expect(result).toContain('runtime-generated verifier probe omitted');
+    expect(result).toContain(`chars=${command.length}`);
+    expect(result).not.toContain(opaquePayload.slice(0, 200));
+    expect(result.length).toBeLessThan(120);
+  });
+
   it('reuses persisted invalid-path knowledge in a later correlation', async () => {
     const workspace = await mkdtemp(path.join(tmpdir(), 'roy-persisted-path-cache-'));
     const cacheDirectory = path.join(workspace, '.roy', 'cache');

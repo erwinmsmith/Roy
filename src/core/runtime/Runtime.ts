@@ -4366,8 +4366,11 @@ export class Runtime {
           String(call.error ?? ''),
         ].filter(Boolean).join('\n');
         if (output) {
+          const command = this.compactShellCommandForEvidence(
+            String(shell?.command ?? call.params.command ?? '')
+          );
           section = [
-            `Command ${String(shell?.command ?? call.params.command ?? '')} (exit ${String(shell?.exitCode ?? 'unknown')}):`,
+            `Command ${command} (exit ${String(shell?.exitCode ?? 'unknown')}):`,
             output.length <= 8_000
               ? output
               : `${output.slice(0, 3_000)}\n[runtime_compacted_command_middle]\n${output.slice(-5_000)}`,
@@ -16689,8 +16692,11 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       } else if (call.toolName === 'shell.exec') {
         const shell = call.result as { command?: unknown; stdout?: unknown; stderr?: unknown } | undefined;
         const output = [shell?.stdout, shell?.stderr].filter(value => typeof value === 'string' && value).join('\n');
-        summaries.push(`${String(shell?.command ?? 'command')}: ${output.slice(0, 1600)}`);
-        contexts.push(`Command result for ${String(shell?.command ?? 'command')}:\n${output.slice(0, 8000)}`);
+        const command = this.compactShellCommandForEvidence(
+          String(shell?.command ?? call.params.command ?? 'command')
+        );
+        summaries.push(`${command}: ${output.slice(0, 1600)}`);
+        contexts.push(`Command result for ${command}:\n${output.slice(0, 8000)}`);
       } else if (call.toolName === 'web.search') {
         const search = call.result as {
           query?: unknown;
@@ -17574,6 +17580,22 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         completedAt,
       },
     };
+  }
+
+  private compactShellCommandForEvidence(command: string): string {
+    const normalized = command.trim();
+    if (!normalized) return 'command';
+    if (normalized.includes('ROY_VERIFIER_PROBE=1')
+      || normalized.includes('VERIFIER_PROBE_EVIDENCE_VERSION')) {
+      return `ROY_VERIFIER_PROBE=1 [runtime-generated verifier probe omitted; chars=${normalized.length}]`;
+    }
+    if (normalized.length <= 600) return normalized;
+    const fingerprint = this.fingerprint(normalized).slice(0, 16);
+    return [
+      normalized.slice(0, 360),
+      `[runtime_compacted_shell_command chars=${normalized.length} fingerprint=${fingerprint}]`,
+      normalized.slice(-120),
+    ].join('\n');
   }
 
   private collectResumedToolGrounding(
