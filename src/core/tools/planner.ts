@@ -41,6 +41,24 @@ export interface RecoveryFeedbackFocus {
   authoritativeVerifierCommand?: string;
 }
 
+function latestDiagnosticSourcePath(output: string): string | undefined {
+  const paths = [
+    ...[...output.matchAll(
+      /\bFile\s+["']([^"']+\.(?:py|js|mjs|cjs|ts|tsx|jsx|java|go|rs|rb|php|sh))["'](?:,\s*line\s+\d+)?/gi
+    )].map(match => match[1]!),
+    ...[...output.matchAll(
+      /(?:^|[\s(])((?:\/app\/|\.\/|src\/)[A-Za-z0-9_./-]+\.(?:py|js|mjs|cjs|ts|tsx|jsx|java|go|rs|rb|php|sh)):\d+(?::\d+)?/g
+    )].map(match => match[1]!),
+  ]
+    .map(value => value.replace(/^\/app\//, '').replace(/^\.\//, ''))
+    .filter(value =>
+      value
+      && !value.startsWith('.roy/official-verifier/')
+      && !/(?:^|\/)(?:tests?|site-packages)\//i.test(value)
+    );
+  return paths.at(-1);
+}
+
 export function recoveryFeedbackFocus(task: string): RecoveryFeedbackFocus | undefined {
   const capsuleMatch = /<recovery_capsule>\s*([\s\S]*?)\s*<\/recovery_capsule>/i.exec(
     task
@@ -142,8 +160,10 @@ export function effectiveRecoveryFeedbackFocus(
       }
     }
     if (!summary) continue;
+    const path = latestDiagnosticSourcePath(output);
     return {
       summary: summary.slice(0, 1_200),
+      ...(path ? { path } : {}),
       ...(focus?.authoritativeVerifierCommand
         ? { authoritativeVerifierCommand: focus.authoritativeVerifierCommand }
         : {}),
@@ -1049,7 +1069,8 @@ export class AgentToolPlanner {
       )
       .map(candidate => {
         const lowerPath = candidate.path.toLowerCase();
-        let score = explicitFeedbackPaths.has(candidate.path) ? 500 : 0;
+        let grounded = explicitFeedbackPaths.has(candidate.path);
+        let score = grounded ? 500 : 0;
         if (this.isMutableImplementationPath(candidate.path)) score += 40;
         const matchingIdentifiers = semanticIdentifiers.filter(identifier =>
           new RegExp(
@@ -1058,10 +1079,12 @@ export class AgentToolPlanner {
           ).test(candidate.content)
         );
         if (matchingIdentifiers.length > 0) {
+          grounded = true;
           score += 600 + Math.min(200, matchingIdentifiers.length * 40);
         }
         if (dependencyFeedback) {
           const dependencyManifestPriority = manifestPriority(lowerPath);
+          if (dependencyManifestPriority > 0) grounded = true;
           score += dependencyManifestPriority;
           if (dependencyManifestPriority > 0
             && /\b(?:legacy|outdated|incompatible|unsupported|upgrade|migration)\b/i.test(
@@ -1085,18 +1108,22 @@ export class AgentToolPlanner {
           }
         }
         const basename = candidate.path.slice(candidate.path.lastIndexOf('/') + 1);
-        if (feedback.toLowerCase().includes(basename.toLowerCase())) score += 160;
+        if (feedback.toLowerCase().includes(basename.toLowerCase())) {
+          grounded = true;
+          score += 160;
+        }
         const basenameStem = basename.replace(/\.[^.]+$/, '');
         if (basenameStem.length >= 5
           && new RegExp(
             `\\b${basenameStem.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`,
             'i'
           ).test(feedback)) {
+          grounded = true;
           score += 220;
         }
-        return { ...candidate, score };
+        return { ...candidate, score, grounded };
       })
-      .filter(candidate => candidate.score > 0)
+      .filter(candidate => candidate.grounded && candidate.score > 0)
       .sort((left, right) =>
         right.score - left.score || left.path.localeCompare(right.path)
       );

@@ -84,6 +84,55 @@ describe('AgentToolPlanner', () => {
     });
   });
 
+  it('retains the application source path from the newest local traceback', () => {
+    const focus = effectiveRecoveryFeedbackFocus(
+      '<official_verifier_feedback>outer failure</official_verifier_feedback>',
+      [{
+        toolName: 'shell.exec',
+        params: { command: 'python -m support_rag.cli answer' },
+        success: false,
+        result: {
+          exitCode: 1,
+          stderr: [
+            'Traceback (most recent call last):',
+            '  File "/app/src/support_rag/cli.py", line 7, in <module>',
+            '  File "/app/src/support_rag/chain.py", line 7, in <module>',
+            "ModuleNotFoundError: No module named 'langchain.prompts'",
+          ].join('\n'),
+        },
+      }]
+    );
+
+    expect(focus).toEqual({
+      summary: "No module named 'langchain.prompts'",
+      path: 'src/support_rag/chain.py',
+    });
+  });
+
+  it('declines an ungrounded source guess for generic external feedback', () => {
+    const plans = new AgentToolPlanner().planExternalFeedbackRepair({
+      task: [
+        '<official_verifier_feedback>',
+        'The generated behavior is still incorrect.',
+        '</official_verifier_feedback>',
+      ].join('\n'),
+      calls: [{
+        toolName: 'fs.read',
+        params: { path: 'src/app/__init__.py' },
+        success: true,
+        result: {
+          path: 'src/app/__init__.py',
+          content: '__version__ = "0.1.0"\n',
+        },
+      }],
+      currentCalls: [],
+      bindings: [{ name: 'fs.synthesize', enabled: true }],
+      workspaceRoot: '/app',
+    });
+
+    expect(plans).toEqual([]);
+  });
+
   it('keeps new official feedback ahead of failures persisted from the previous phase', () => {
     const task = [
       'Continue the runtime migration.',
