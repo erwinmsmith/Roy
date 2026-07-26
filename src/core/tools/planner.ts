@@ -85,38 +85,57 @@ export function effectiveRecoveryFeedbackFocus(
 ): RecoveryFeedbackFocus | undefined {
   const focus = recoveryFeedbackFocus(task);
   if (!focus) return undefined;
-  const latestFailure = [...calls].reverse().find(call =>
-    isWorkspaceVerificationCall(call)
-    && !isSuccessfulWorkspaceVerificationCall(call)
-  );
-  if (!latestFailure) return focus;
-  const result = latestFailure.result as {
-    stdout?: unknown;
-    stderr?: unknown;
-    verifierDiagnostics?: unknown;
-  } | undefined;
-  const diagnostics = Array.isArray(result?.verifierDiagnostics)
-    ? result.verifierDiagnostics
-      .map(item =>
-        item && typeof item === 'object'
-          ? String((item as { content?: unknown }).content ?? '')
-          : ''
-      )
-      .filter(Boolean)
-    : [];
-  const output = [
-    String(result?.stdout ?? ''),
-    String(result?.stderr ?? ''),
-    String(latestFailure.error ?? ''),
-    ...diagnostics,
-  ].filter(Boolean).join('\n');
-  const failures = [...output.matchAll(
-    /\b(?:AssertionError|AttributeError|ImportError|ModuleNotFoundError|RuntimeError|TypeError|ValueError):\s*([^\n]+)/g
-  )];
-  const summary = failures.at(-1)?.[1]?.trim();
-  return summary
-    ? { ...focus, summary: summary.slice(0, 1_200) }
-    : focus;
+  for (const latestFailure of [...calls].reverse()) {
+    if (!isWorkspaceVerificationCall(latestFailure)
+      || isSuccessfulWorkspaceVerificationCall(latestFailure)) {
+      continue;
+    }
+    const result = latestFailure.result as {
+      stdout?: unknown;
+      stderr?: unknown;
+      verifierDiagnostics?: unknown;
+    } | undefined;
+    const diagnostics = Array.isArray(result?.verifierDiagnostics)
+      ? result.verifierDiagnostics
+        .map(item =>
+          item && typeof item === 'object'
+            ? String((item as { content?: unknown }).content ?? '')
+            : ''
+        )
+        .filter(Boolean)
+      : [];
+    const output = [
+      String(result?.stdout ?? ''),
+      String(result?.stderr ?? ''),
+      String(latestFailure.error ?? ''),
+      ...diagnostics,
+    ].filter(Boolean).join('\n');
+    const failures = [...output.matchAll(
+      /\b(?:AssertionError|AttributeError|ImportError|ModuleNotFoundError|RuntimeError|TypeError|ValueError):\s*([^\n]+)/g
+    )];
+    let summary = failures.at(-1)?.[1]?.trim();
+    if (!summary) {
+      for (const diagnostic of [...diagnostics].reverse()) {
+        try {
+          const parsed = JSON.parse(diagnostic) as { failure?: unknown };
+          if (typeof parsed.failure === 'string' && parsed.failure.trim()) {
+            summary = parsed.failure.trim();
+            break;
+          }
+        } catch {
+          // Non-JSON verifier artifacts are covered by the traceback matcher.
+        }
+      }
+    }
+    if (!summary) continue;
+    return {
+      summary: summary.slice(0, 1_200),
+      ...(focus.authoritativeVerifierCommand
+        ? { authoritativeVerifierCommand: focus.authoritativeVerifierCommand }
+        : {}),
+    };
+  }
+  return focus;
 }
 
 function semanticFeedbackIdentifiers(feedback: string): string[] {

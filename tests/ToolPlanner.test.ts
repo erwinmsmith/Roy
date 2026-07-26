@@ -1,7 +1,59 @@
 import { describe, expect, it } from 'vitest';
-import { AgentToolPlanner } from '../src/core/tools/planner.js';
+import {
+  AgentToolPlanner,
+  effectiveRecoveryFeedbackFocus,
+} from '../src/core/tools/planner.js';
 
 describe('AgentToolPlanner', () => {
+  it('keeps the newest concrete verifier failure ahead of a later uninformative failure', () => {
+    const task = [
+      '<recovery_capsule>',
+      JSON.stringify({
+        recoveryTrigger: 'new_external_verifier_feedback',
+        externalFeedback: {
+          summary: 'project dependency metadata still targets a legacy runtime',
+          path: 'pyproject.toml',
+        },
+        authoritativeVerifierCommand:
+          'python -m pytest -q .roy/official-verifier/test_outputs.py',
+      }),
+      '</recovery_capsule>',
+    ].join('\n');
+    const focus = effectiveRecoveryFeedbackFocus(task, [
+      {
+        toolName: 'shell.exec',
+        params: {
+          command: 'python -m pytest -q .roy/official-verifier/test_outputs.py',
+        },
+        success: false,
+        result: {
+          exitCode: 1,
+          verifierDiagnostics: [{
+            path: '/logs/verifier/details.json',
+            content: JSON.stringify({
+              failure: 'router structure violations remain in src/app/router.py',
+            }),
+          }],
+        },
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m pytest -q' },
+        success: false,
+        result: {
+          exitCode: 5,
+          stdout: 'no tests ran in 0.01s',
+        },
+      },
+    ]);
+
+    expect(focus).toEqual({
+      summary: 'router structure violations remain in src/app/router.py',
+      authoritativeVerifierCommand:
+        'python -m pytest -q .roy/official-verifier/test_outputs.py',
+    });
+  });
+
   it('reads package.json when a package export inspection needs manifest evidence', () => {
     const plans = new AgentToolPlanner().plan({
       task: 'Inspect this package exports and identify one concrete architecture risk.',
