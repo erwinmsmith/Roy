@@ -84,6 +84,66 @@ describe('AgentToolPlanner', () => {
     });
   });
 
+  it('keeps new official feedback ahead of failures persisted from the previous phase', () => {
+    const task = [
+      'Continue the runtime migration.',
+      '## VERIFICATION FAILED — CONTINUE WORKING',
+      'Verifier feedback:',
+      'project metadata still targets legacy LangChain runtime',
+      '<official_verifier_feedback>',
+      'AssertionError: project metadata still targets legacy LangChain runtime',
+      '</official_verifier_feedback>',
+    ].join('\n');
+    const staleFailure = {
+      toolName: 'shell.exec',
+      params: { command: 'python -m pytest -q' },
+      success: false,
+      result: {
+        exitCode: 1,
+        stdout: "AttributeError: 'HumanMessage' object has no attribute 'get'",
+      },
+    };
+    const calls = [
+      staleFailure,
+      {
+        toolName: 'fs.read',
+        params: { path: 'requirements.txt' },
+        success: true,
+        result: {
+          path: 'requirements.txt',
+          content: 'pydantic<2\nlangchain==0.0.1\n',
+        },
+      },
+    ];
+    const plans = new AgentToolPlanner().planExternalFeedbackRepair({
+      task,
+      calls,
+      currentCalls: [],
+      bindings: [
+        { name: 'fs.read', enabled: true },
+        { name: 'fs.synthesize', enabled: true },
+      ],
+      workspaceRoot: '/app',
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.synthesize',
+        params: expect.objectContaining({
+          path: 'requirements.txt',
+          instructions: expect.stringContaining(
+            'project metadata still targets legacy LangChain runtime'
+          ),
+        }),
+      }),
+    ]);
+    expect(String(plans[0]?.params.instructions)).not.toContain('HumanMessage');
+
+    expect(effectiveRecoveryFeedbackFocus(task, calls, [staleFailure])).toEqual({
+      summary: "'HumanMessage' object has no attribute 'get'",
+    });
+  });
+
   it('reads package.json when a package export inspection needs manifest evidence', () => {
     const plans = new AgentToolPlanner().plan({
       task: 'Inspect this package exports and identify one concrete architecture risk.',

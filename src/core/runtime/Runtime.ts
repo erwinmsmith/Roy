@@ -2237,14 +2237,24 @@ export class Runtime {
     return plans.map(plan => {
       if (plan.toolName !== 'fs.synthesize') return plan;
       const instructions = String(plan.params.instructions ?? '').trim();
-      if (!instructions || instructions.includes(latestResult)) return plan;
+      if (!instructions) return plan;
+      const targetPath = this.normalizeToolWorkspacePath(String(
+        plan.params.path ?? ''
+      ));
+      const causalEvidence = this.compactTeamStepEvidenceForRepair(
+        latestResult,
+        targetPath,
+        instructions,
+        1_200
+      );
+      if (!causalEvidence || instructions.includes(causalEvidence)) return plan;
       const preface = 'Grounded diagnosis from the immediately preceding sequential team member:';
       const suffix = 'Use this diagnosis only where it agrees with the authoritative current source and executable verifier evidence.';
       const structuralChars = preface.length + suffix.length + 6;
-      const contentBudget = Math.max(1, 4_000 - structuralChars);
+      const contentBudget = Math.max(1, 2_400 - structuralChars);
       const baseBudget = Math.min(
         instructions.length,
-        Math.max(1_200, Math.floor(contentBudget * 0.48))
+        Math.max(900, Math.floor(contentBudget * 0.5))
       );
       const resultBudget = Math.max(1, contentBudget - baseBudget);
       const compact = (
@@ -2265,10 +2275,10 @@ export class Runtime {
         0.8
       );
       const causalResult = compact(
-        latestResult,
+        causalEvidence,
         resultBudget,
-        '[preceding member report compacted]',
-        0.62
+        '[semantically selected team evidence compacted]',
+        0.78
       );
       return {
         ...plan,
@@ -2283,6 +2293,66 @@ export class Runtime {
         },
       };
     });
+  }
+
+  private compactTeamStepEvidenceForRepair(
+    report: string,
+    targetPath: string,
+    instructions: string,
+    maxChars: number
+  ): string {
+    const targetBase = targetPath.slice(targetPath.lastIndexOf('/') + 1)
+      .toLowerCase();
+    const targetStem = targetBase.replace(/\.[^.]+$/, '');
+    const ignored = new Set([
+      'apply', 'smallest', 'coherent', 'interface', 'preserving', 'change',
+      'resolves', 'newest', 'external', 'verifier', 'feedback',
+      'authoritative', 'current', 'source', 'already', 'observed', 'patch',
+      'base', 'preserve', 'unrelated', 'working', 'declarations', 'alter',
+      'benchmark', 'files', 'reported', 'failure', 'repair', 'implementation',
+    ]);
+    const terms = new Set<string>();
+    if (targetBase) terms.add(targetBase);
+    if (targetStem.length >= 3) terms.add(targetStem);
+    for (const match of instructions.matchAll(
+      /\b[A-Za-z_][A-Za-z0-9_.-]{3,}\b/g
+    )) {
+      const value = match[0]!.toLowerCase();
+      if (!ignored.has(value)) terms.add(value);
+      if (terms.size >= 32) break;
+    }
+    const chunks = report
+      .replace(/\r\n/g, '\n')
+      .split('\n')
+      .flatMap(line => {
+        if (line.length <= 480) return [line];
+        const parts: string[] = [];
+        for (let offset = 0; offset < line.length; offset += 420) {
+          parts.push(line.slice(offset, offset + 480));
+        }
+        return parts;
+      })
+      .map((text, index) => {
+        const lower = text.toLowerCase();
+        let score = /\b(?:error|failed|failure|assert|traceback|mismatch|expected|actual)\b/i.test(
+          text
+        ) ? 2 : 0;
+        for (const term of terms) {
+          if (lower.includes(term)) score += term === targetBase ? 12 : 4;
+        }
+        return { text: text.trim(), index, score };
+      })
+      .filter(item => item.text);
+    const selected = chunks
+      .filter(item => item.score > 0)
+      .sort((left, right) => right.score - left.score || left.index - right.index)
+      .slice(0, 8)
+      .sort((left, right) => left.index - right.index);
+    const evidence = (selected.length > 0 ? selected : chunks.slice(0, 2))
+      .map(item => item.text)
+      .join('\n');
+    if (evidence.length <= maxChars) return evidence;
+    return `${evidence.slice(0, Math.max(1, maxChars - 42))}\n[semantic team evidence compacted]`;
   }
 
   private compactDelegatedTask(task: string, maxChars = 12_000): string {
@@ -4833,7 +4903,7 @@ export class Runtime {
       groundingCalls,
       normalizedPath,
       synthesisStrategy === 'patch'
-        ? focusedInstructions.includes('VERIFIER_PROBE_') ? 6_000 : 20_000
+        ? focusedInstructions.includes('VERIFIER_PROBE_') ? 6_000 : 10_000
         : 30_000,
       focusedInstructions
     );
@@ -5213,10 +5283,79 @@ export class Runtime {
     maxChars: number,
     focusText = ''
   ): string {
-    const sections: string[] = [];
+    const candidates: Array<{
+      section: string;
+      score: number;
+      index: number;
+    }> = [];
     const seen = new Set<string>();
-    let remaining = maxChars;
-    for (const call of [...calls].reverse()) {
+    const targetBase = targetPath.slice(targetPath.lastIndexOf('/') + 1)
+      .toLowerCase();
+    const targetStem = targetBase.replace(/\.[^.]+$/, '');
+    const focusLower = focusText.toLowerCase();
+    const ignoredTerms = new Set([
+      'apply', 'smallest', 'coherent', 'interface', 'preserving', 'change',
+      'newest', 'external', 'verifier', 'feedback', 'authoritative', 'current',
+      'source', 'already', 'observed', 'patch', 'preserve', 'unrelated',
+      'working', 'benchmark', 'files', 'grounded', 'diagnosis', 'preceding',
+      'sequential', 'member', 'runtime', 'compacted',
+    ]);
+    const semanticTerms = Array.from(new Set(
+      [...focusText.matchAll(/\b[A-Za-z_][A-Za-z0-9_.-]{3,}\b/g)]
+        .map(match => match[0]!.toLowerCase())
+        .filter(term => !ignoredTerms.has(term))
+    )).slice(0, 40);
+    const semanticHits = (value: string): number => {
+      const lower = value.toLowerCase();
+      return semanticTerms.reduce(
+        (count, term) => count + (lower.includes(term) ? 1 : 0),
+        0
+      );
+    };
+    const compactRelevantFile = (
+      content: string,
+      perFileLimit: number
+    ): string => {
+      if (content.length <= perFileLimit) return content;
+      const lines = content.replace(/\r\n/g, '\n').split('\n');
+      const matching = lines
+        .map((line, index) => ({
+          index,
+          hits: semanticHits(line)
+            + (targetStem && line.toLowerCase().includes(targetStem) ? 3 : 0)
+            + (/(?:assert|raise|expected|actual|fail(?:ed|ure)?)/i.test(
+              line
+            ) ? 2 : 0),
+        }))
+        .filter(item => item.hits > 0)
+        .sort((left, right) => right.hits - left.hits)
+        .slice(0, 8)
+        .map(item => item.index)
+        .sort((left, right) => left - right);
+      if (matching.length === 0) {
+        const head = Math.floor(perFileLimit * 0.6);
+        return `${content.slice(0, head)}\n[runtime_compacted_file_middle]\n${content.slice(-(perFileLimit - head))}`;
+      }
+      const selected = new Set<number>();
+      for (const center of matching) {
+        for (
+          let index = Math.max(0, center - 6);
+          index <= Math.min(lines.length - 1, center + 6);
+          index += 1
+        ) {
+          selected.add(index);
+        }
+      }
+      let excerpt = [...selected]
+        .sort((left, right) => left - right)
+        .map(index => `${index + 1}: ${lines[index]}`)
+        .join('\n');
+      if (excerpt.length > perFileLimit) {
+        excerpt = `${excerpt.slice(0, perFileLimit - 38)}\n[relevant file excerpts compacted]`;
+      }
+      return excerpt;
+    };
+    for (const [reverseIndex, call] of [...calls].reverse().entries()) {
       const callPath = this.normalizeToolWorkspacePath(String(call.params.path ?? ''));
       const key = call.toolName === 'shell.exec'
         ? `shell:${String(call.params.command ?? '')}`
@@ -5224,27 +5363,37 @@ export class Runtime {
       if (seen.has(key)) continue;
       seen.add(key);
       let section = '';
+      let score = Math.max(0, 80 - reverseIndex);
       if (call.toolName === 'fs.read' && call.success && callPath !== targetPath) {
         const read = call.result as { content?: unknown; truncated?: unknown } | undefined;
         const content = typeof read?.content === 'string' ? read.content : '';
         if (content) {
           const perFileLimit = callPath.startsWith('.roy/official-verifier/')
-            ? 18_000
-            : 6_000;
-          const compact = content.length <= perFileLimit
-            ? content
-            : `${content.slice(0, Math.floor(perFileLimit * 0.67))}\n[runtime_compacted_file_middle]\n${content.slice(-Math.ceil(perFileLimit * 0.33))}`;
+            ? 8_000
+            : 4_000;
+          const compact = compactRelevantFile(content, perFileLimit);
           section = `File ${callPath}${read?.truncated ? ' (observed prefix)' : ''}:\n${compact}`;
+          const pathLower = callPath.toLowerCase();
+          const hits = semanticHits(`${callPath}\n${content}`);
+          score += hits * 90;
+          if (callPath.startsWith('.roy/official-verifier/')) score += 1_000;
+          if (targetStem && pathLower.includes(targetStem)) score += 500;
+          if (focusLower.includes(pathLower)
+            || focusLower.includes(pathLower.slice(pathLower.lastIndexOf('/') + 1))) {
+            score += 650;
+          }
         }
       } else if (call.toolName === 'fs.list' && call.success) {
         const entries = (call.result as { entries?: unknown } | undefined)?.entries;
         if (Array.isArray(entries)) {
           section = `Workspace listing:\n${entries.filter(item => typeof item === 'string').slice(0, 160).join('\n')}`;
+          score += 20 + semanticHits(section) * 40;
         }
       } else if (call.toolName === 'fs.search' && call.success) {
         const result = call.result as { matches?: unknown } | undefined;
         if (Array.isArray(result?.matches)) {
           section = `Workspace search evidence:\n${JSON.stringify(result.matches.slice(0, 60))}`;
+          score += 300 + semanticHits(section) * 80;
         }
       } else if (call.toolName === 'shell.exec') {
         const shell = call.result as {
@@ -5291,15 +5440,30 @@ export class Runtime {
               ? output
               : `${output.slice(0, 3_000)}\n[runtime_compacted_command_middle]\n${output.slice(-5_000)}`,
           ].join('\n');
+          const exitCode = Number(shell?.exitCode);
+          score += exitCode !== 0 || !call.success ? 900 : 180;
+          if (/\b(?:pytest|test|verify|check|lint|build)\b/i.test(command)) {
+            score += 350;
+          }
+          score += semanticHits(`${command}\n${output}`) * 100;
         }
       }
       if (!section) continue;
-      const bounded = section.slice(0, remaining);
-      sections.push(bounded);
-      remaining -= bounded.length;
-      if (remaining <= 0) break;
+      candidates.push({ section, score, index: calls.length - reverseIndex - 1 });
     }
-    return sections.reverse().join('\n\n');
+    const ranked = candidates
+      .sort((left, right) => right.score - left.score || right.index - left.index)
+      .slice(0, 8)
+      .sort((left, right) => left.index - right.index);
+    const sections: string[] = [];
+    let remaining = maxChars;
+    for (const candidate of ranked) {
+      if (remaining <= 0) break;
+      const bounded = candidate.section.slice(0, remaining);
+      sections.push(bounded);
+      remaining -= bounded.length + 2;
+    }
+    return sections.join('\n\n');
   }
 
   private compactFileSynthesisAssignment(task: string): string {
@@ -5308,7 +5472,7 @@ export class Runtime {
       .replace(/<system_communication_context\b[\s\S]*?<\/system_communication_context>/gi, '')
       .replace(/\n{3,}/g, '\n\n')
       .trim();
-    return this.compactDelegatedTask(withoutDerivedCaches, 6_000);
+    return this.compactDelegatedTask(withoutDerivedCaches, 4_000);
   }
 
   private focusedPatchRecoverySnapshot(

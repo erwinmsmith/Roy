@@ -2853,9 +2853,9 @@ describe('Runtime controlled subagent spawning', () => {
     }).enrichRepairPlansWithTeamStepEvidence.bind(runtime);
     const diagnosis = [
       'The first grid boundary is a page-border decoy.',
-      'Repair _assign_tokens_to_grid at its sufficient-lines branch.',
-      'diagnostic-detail-'.repeat(220),
-      'diagnostic-tail-anchor',
+      'Repair app.py in _assign_tokens_to_grid at its sufficient-lines branch.',
+      'unrelated-diagnostic-detail-'.repeat(220),
+      'The authoritative app.py failure is grid_assignment_mismatch.',
     ].join(' ');
     const task = [
       'Repair app.py.',
@@ -2881,11 +2881,13 @@ describe('Runtime controlled subagent spawning', () => {
 
     const instructions = String(plan?.params.instructions);
     expect(instructions).toContain('The first grid boundary is a page-border decoy.');
-    expect(instructions).toContain('diagnostic-tail-anchor');
+    expect(instructions).toContain('_assign_tokens_to_grid');
+    expect(instructions).toContain('grid_assignment_mismatch');
     expect(instructions).toContain(
       'immediately preceding sequential team member'
     );
-    expect(instructions.length).toBeLessThanOrEqual(4_000);
+    expect(instructions.length).toBeLessThanOrEqual(2_400);
+    expect(instructions).not.toContain('unrelated-diagnostic-detail-'.repeat(40));
   });
 
   it('spawns, registers, runs, and tracks a subagent', async () => {

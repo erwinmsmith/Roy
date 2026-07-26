@@ -81,10 +81,25 @@ export function recoveryFeedbackFocus(task: string): RecoveryFeedbackFocus | und
 
 export function effectiveRecoveryFeedbackFocus(
   task: string,
-  calls: ObservedToolCall[]
+  calls: ObservedToolCall[],
+  currentCalls?: ObservedToolCall[]
 ): RecoveryFeedbackFocus | undefined {
   const focus = recoveryFeedbackFocus(task);
-  for (const latestFailure of [...calls].reverse()) {
+  const taskCarriesAuthoritativeFeedback = Boolean(
+    focus
+    || /<official_verifier_feedback>[\s\S]*?<\/official_verifier_feedback>/i.test(
+      task
+    )
+  );
+  // A continuation may carry a large persisted call ledger. Failures in that
+  // ledger happened before the newest outer verifier result and must not
+  // supersede it. Once this phase executes a fresh verifier, however, that
+  // newer local failure becomes the authoritative frontier.
+  const eligibleCalls = taskCarriesAuthoritativeFeedback
+    && currentCalls !== undefined
+    ? currentCalls
+    : calls;
+  for (const latestFailure of [...eligibleCalls].reverse()) {
     if (!isWorkspaceVerificationCall(latestFailure)
       || isSuccessfulWorkspaceVerificationCall(latestFailure)) {
       continue;
@@ -920,7 +935,11 @@ export class AgentToolPlanner {
     )) {
       return [];
     }
-    const recoveryFocus = effectiveRecoveryFeedbackFocus(input.task, input.calls);
+    const recoveryFocus = effectiveRecoveryFeedbackFocus(
+      input.task,
+      input.calls,
+      input.currentCalls
+    );
     const feedbackMatch = /<official_verifier_feedback>([\s\S]*?)<\/official_verifier_feedback>/i.exec(
       input.task
     );
