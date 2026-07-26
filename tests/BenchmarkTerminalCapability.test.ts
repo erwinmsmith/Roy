@@ -1768,6 +1768,134 @@ describe('benchmark terminal capability', () => {
     await runtime.shutdown();
   });
 
+  it('retains equal-reward candidates that reduce a structured verifier failure frontier', async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), 'roy-failure-frontier-'));
+    await mkdir(path.join(workspace, '.roy', 'official-verifier'), { recursive: true });
+    await mkdir(path.join(workspace, 'logs', 'verifier'), { recursive: true });
+    await writeFile(path.join(workspace, 'models.py'), 'VALUE = 0\n');
+    await writeFile(
+      path.join(workspace, '.roy', 'config.json'),
+      JSON.stringify({
+        tools: {
+          approval: { readOnly: 'auto', write: 'auto', execute: 'auto' },
+          shell: { mode: 'unrestricted', shell: '/bin/sh' },
+        },
+      })
+    );
+    const gradePath = path.join(workspace, '.roy', 'official-verifier', 'grade.py');
+    const detailsPath = path.join(workspace, 'logs', 'verifier', 'details.json');
+    await writeFile(gradePath, 'print("0.277800000000")\n');
+    await writeFile(
+      path.join(workspace, 'logs', 'verifier', 'reward.txt'),
+      '0.2778\n'
+    );
+    await writeFile(
+      detailsPath,
+      JSON.stringify({
+        gates: { dependency: true, stubs: false },
+        source_violations: {
+          imports: [],
+          stubs: ['models:a', 'models:b', 'models:c', 'router:d'],
+        },
+      })
+    );
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'failure-frontier-test',
+      workspaceCwd: workspace,
+    });
+
+    const baseline = await runtime.executeToolForAgent(
+      'root',
+      'shell.exec',
+      { command: 'python3 .roy/official-verifier/grade.py' },
+      { correlationId: 'failure-frontier-turn' }
+    );
+    const baselineCall = {
+      toolName: 'shell.exec',
+      params: { command: 'python3 .roy/official-verifier/grade.py' },
+      reason: 'Establish the current hard-gate failure frontier.',
+      groundingRequired: true,
+      success: baseline.success,
+      result: baseline.result,
+      error: baseline.error,
+    };
+    const mutation = await runtime.executeToolForAgent(
+      'root',
+      'fs.replace',
+      {
+        path: 'models.py',
+        oldText: 'VALUE = 0',
+        newText: 'VALUE = 1',
+        expectedReplacements: 1,
+      },
+      {
+        correlationId: 'failure-frontier-turn',
+        groundingCalls: [baselineCall],
+      }
+    );
+    await writeFile(
+      detailsPath,
+      JSON.stringify({
+        gates: { dependency: true, stubs: false },
+        source_violations: {
+          imports: [],
+          stubs: ['router:d'],
+        },
+      })
+    );
+    const candidate = await runtime.executeToolForAgent(
+      'root',
+      'shell.exec',
+      { command: 'python3 .roy/official-verifier/grade.py' },
+      {
+        correlationId: 'failure-frontier-turn',
+        groundingCalls: [
+          baselineCall,
+          {
+            toolName: 'fs.replace',
+            params: { path: 'models.py' },
+            reason: 'Remove three of four violations within one hard gate.',
+            groundingRequired: true,
+            success: mutation.success,
+            result: mutation.result,
+            error: mutation.error,
+          },
+        ],
+      }
+    );
+
+    expect(candidate).toMatchObject({
+      success: true,
+      result: expect.objectContaining({
+        candidateRetention: expect.objectContaining({
+          retained: true,
+          path: 'models.py',
+          reason: 'failure_frontier_reduced',
+          baselineReward: 0.2778,
+          candidateReward: 0.2778,
+          improvedFailureFrontiers: [
+            {
+              frontier: 'source_violations.stubs',
+              before: 4,
+              after: 1,
+            },
+          ],
+        }),
+      }),
+    });
+    expect((candidate.result as { candidateRollback?: unknown }).candidateRollback)
+      .toBeUndefined();
+    expect(await readFile(path.join(workspace, 'models.py'), 'utf8')).toBe('VALUE = 1\n');
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'workspace.mutation.candidate_retained',
+      data: expect.objectContaining({
+        reason: 'failure_frontier_reduced',
+      }),
+    }));
+    await runtime.shutdown();
+  });
+
   it('retains zero-reward hard-gate candidates so coordinated file changes can compose', async () => {
     const workspace = await mkdtemp(path.join(tmpdir(), 'roy-hard-gate-composition-'));
     await mkdir(path.join(workspace, '.roy', 'official-verifier'), { recursive: true });

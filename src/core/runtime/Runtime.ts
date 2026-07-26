@@ -778,6 +778,7 @@ export interface AgentArchetypeProfile {
 interface VerifierScorecard {
   reward: number;
   groups: Record<string, number>;
+  failureFrontiers?: Record<string, number>;
 }
 
 interface WorkspaceMutationCheckpoint {
@@ -3215,6 +3216,7 @@ export class Runtime {
     if (!Array.isArray(diagnostics)) return undefined;
     let scalarReward: number | undefined;
     let structuredGroups: Record<string, number> | undefined;
+    const failureFrontiers: Record<string, number> = {};
     for (const item of diagnostics) {
       if (!item || typeof item !== 'object') continue;
       const diagnostic = item as { path?: unknown; content?: unknown };
@@ -3238,6 +3240,10 @@ export class Runtime {
           }
           continue;
         }
+        Object.assign(
+          failureFrontiers,
+          this.verifierFailureFrontierCounts(parsed)
+        );
         if ('gates' in parsed
           && parsed.gates
           && typeof parsed.gates === 'object'
@@ -3275,7 +3281,13 @@ export class Runtime {
           success: true,
         });
         if (!rollback || typeof rollback.baselineReward !== 'number') {
-          return { reward: parsed.reward, groups };
+          return {
+            reward: parsed.reward,
+            groups,
+            ...(Object.keys(failureFrontiers).length > 0
+              ? { failureFrontiers }
+              : {}),
+          };
         }
         const baselineGroups = {
           ...(rollback.baselineGroups ?? groups),
@@ -3289,17 +3301,62 @@ export class Runtime {
         return {
           reward: rollback.baselineReward,
           groups: baselineGroups,
+          ...(rollback.baselineFailureFrontiers
+            ? { failureFrontiers: rollback.baselineFailureFrontiers }
+            : Object.keys(failureFrontiers).length > 0
+              ? { failureFrontiers }
+              : {}),
         };
       } catch {
         // grade.log and other diagnostic files may not be scorecards.
       }
     }
     if (structuredGroups && scalarReward !== undefined) {
-      return { reward: scalarReward, groups: structuredGroups };
+      return {
+        reward: scalarReward,
+        groups: structuredGroups,
+        ...(Object.keys(failureFrontiers).length > 0
+          ? { failureFrontiers }
+          : {}),
+      };
     }
     return scalarReward === undefined
       ? undefined
       : { reward: scalarReward, groups: { __reward__: scalarReward } };
+  }
+
+  private verifierFailureFrontierCounts(
+    value: unknown
+  ): Record<string, number> {
+    const counts: Record<string, number> = {};
+    const visit = (
+      current: unknown,
+      pathParts: string[],
+      insideFailureFrontier: boolean,
+      depth: number
+    ): void => {
+      if (depth > 6 || !current || typeof current !== 'object') return;
+      if (Array.isArray(current)) {
+        if (insideFailureFrontier && pathParts.length > 0) {
+          counts[pathParts.join('.')] = current.length;
+        }
+        return;
+      }
+      for (const [key, child] of Object.entries(current)) {
+        if (['gates', 'groups', 'reward'].includes(key.toLowerCase())) continue;
+        const failureKey = /\b(?:violations?|failures?|errors?|failed|missing|mismatches?|issues?)\b/i.test(
+          key.replaceAll('_', ' ')
+        );
+        visit(
+          child,
+          [...pathParts, key],
+          insideFailureFrontier || failureKey,
+          depth + 1
+        );
+      }
+    };
+    visit(value, [], false, 0);
+    return counts;
   }
 
   private async rollbackVerifierRegression(
@@ -3357,10 +3414,37 @@ export class Runtime {
         before: baseline.groups[group] ?? 0,
         after: current.groups[group],
       }));
+    const baselineFailureFrontiers = baseline.failureFrontiers ?? {};
+    const candidateFailureFrontiers = current.failureFrontiers ?? {};
+    const improvedFailureFrontiers = Object.keys(baselineFailureFrontiers)
+      .filter(frontier =>
+        (candidateFailureFrontiers[frontier] ?? 0)
+          < baselineFailureFrontiers[frontier]!
+      )
+      .map(frontier => ({
+        frontier,
+        before: baselineFailureFrontiers[frontier],
+        after: candidateFailureFrontiers[frontier] ?? 0,
+      }));
+    const regressedFailureFrontiers = Object.keys(baselineFailureFrontiers)
+      .filter(frontier =>
+        frontier in candidateFailureFrontiers
+        && candidateFailureFrontiers[frontier]!
+          > baselineFailureFrontiers[frontier]!
+      )
+      .map(frontier => ({
+        frontier,
+        before: baselineFailureFrontiers[frontier],
+        after: candidateFailureFrontiers[frontier],
+      }));
     const hardGateComposition = baseline.reward <= 1e-12
       && current.reward <= 1e-12
       && regressedGroups.length === 0;
-    if (hardGateComposition) {
+    const failureFrontierReduced = current.reward + 1e-12 >= baseline.reward
+      && regressedGroups.length === 0
+      && regressedFailureFrontiers.length === 0
+      && improvedFailureFrontiers.length > 0;
+    if (hardGateComposition || failureFrontierReduced) {
       await this.persistAcceptedVerifierWorkspaceCheckpoint(
         current,
         checkpoints,
@@ -3372,7 +3456,9 @@ export class Runtime {
         retained: true,
         path: checkpoint.path,
         retainedPaths,
-        reason: 'hard_gate_composition',
+        reason: failureFrontierReduced
+          ? 'failure_frontier_reduced'
+          : 'hard_gate_composition',
         candidateFingerprint: checkpoint.candidateFingerprint,
         baselineReward: baseline.reward,
         candidateReward: current.reward,
@@ -3380,6 +3466,10 @@ export class Runtime {
         candidateGroups: current.groups,
         regressedGroups,
         improvedGroups,
+        baselineFailureFrontiers,
+        candidateFailureFrontiers,
+        regressedFailureFrontiers,
+        improvedFailureFrontiers,
       };
       this.emit({
         type: 'workspace.mutation.candidate_retained',
@@ -3442,6 +3532,10 @@ export class Runtime {
         candidateReward: current.reward,
         regressedGroups,
         improvedGroups,
+        baselineFailureFrontiers,
+        candidateFailureFrontiers,
+        regressedFailureFrontiers,
+        improvedFailureFrontiers,
         checkpointAgeMs,
       },
     });
@@ -3472,6 +3566,10 @@ export class Runtime {
       candidateGroups: current.groups,
       regressedGroups,
       improvedGroups,
+      baselineFailureFrontiers,
+      candidateFailureFrontiers,
+      regressedFailureFrontiers,
+      improvedFailureFrontiers,
     };
     return {
       ...toolResult,

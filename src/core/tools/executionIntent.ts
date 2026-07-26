@@ -23,6 +23,8 @@ export interface WorkspaceCandidateRollback {
   candidateGroups?: Record<string, number>;
   regressedGroups?: Array<{ group: string; before?: number; after?: number }>;
   improvedGroups?: Array<{ group: string; before?: number; after?: number }>;
+  baselineFailureFrontiers?: Record<string, number>;
+  candidateFailureFrontiers?: Record<string, number>;
 }
 
 export interface WorkspaceCandidateRetention {
@@ -32,6 +34,11 @@ export interface WorkspaceCandidateRetention {
   baselineReward?: number;
   candidateReward?: number;
   improvedGroups?: Array<{ group: string; before?: number; after?: number }>;
+  improvedFailureFrontiers?: Array<{
+    frontier: string;
+    before?: number;
+    after?: number;
+  }>;
 }
 
 export function workspaceToolIntentFingerprint(
@@ -264,6 +271,8 @@ export function workspaceCandidateRollbackFromCall(
     candidateGroups: parseGroupScores(rollback.candidateGroups),
     regressedGroups: parseGroups(rollback.regressedGroups),
     improvedGroups: parseGroups(rollback.improvedGroups),
+    baselineFailureFrontiers: parseGroupScores(rollback.baselineFailureFrontiers),
+    candidateFailureFrontiers: parseGroupScores(rollback.candidateFailureFrontiers),
   };
 }
 
@@ -287,6 +296,18 @@ export function workspaceCandidateRetentionFromCall(
       }];
     })
     : undefined;
+  const improvedFailureFrontiers = Array.isArray(retention.improvedFailureFrontiers)
+    ? retention.improvedFailureFrontiers.flatMap(item => {
+      if (!item || typeof item !== 'object') return [];
+      const frontier = item as Record<string, unknown>;
+      if (typeof frontier.frontier !== 'string') return [];
+      return [{
+        frontier: frontier.frontier,
+        before: typeof frontier.before === 'number' ? frontier.before : undefined,
+        after: typeof frontier.after === 'number' ? frontier.after : undefined,
+      }];
+    })
+    : undefined;
   return {
     retained: true,
     path: typeof retention.path === 'string' ? retention.path : undefined,
@@ -298,6 +319,7 @@ export function workspaceCandidateRetentionFromCall(
       ? retention.candidateReward
       : undefined,
     improvedGroups,
+    improvedFailureFrontiers,
   };
 }
 
@@ -323,7 +345,8 @@ export function workspaceTargetNeedsFreshNoGainEvidence(
       || retention.candidateReward <= retention.baselineReward + 1e-12;
     if (retainedPath === normalizedTarget
       && noRewardGain
-      && (retention.improvedGroups?.length ?? 0) === 0) {
+      && (retention.improvedGroups?.length ?? 0) === 0
+      && (retention.improvedFailureFrontiers?.length ?? 0) === 0) {
       retainedIndices.push(index);
     }
   }
