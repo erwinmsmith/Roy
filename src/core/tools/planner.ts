@@ -942,7 +942,7 @@ export class AgentToolPlanner {
           line
         ))
       .some(line =>
-        /\b(?:dependenc(?:y|ies)|requirements?|manifest|runtime version|version constraint|pin(?:ned|ning)?|package install)\b/i.test(
+        /\b(?:dependenc(?:y|ies)|requirements?|manifest|metadata|runtime(?:\s+version)?|version constraint|pin(?:ned|ning)?|package install)\b/i.test(
           line
         )
         && /\b(?:fail(?:ed|ure)?|error|invalid|incorrect|wrong|legacy|outdated|incompatible|unsupported|mismatch|must|should|expect(?:ed)?|require[sd]?|target(?:s|ed)?|pin(?:ned|ning)?|upgrade|downgrade|missing|not found|cannot|can't)\b/i.test(

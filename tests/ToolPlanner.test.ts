@@ -800,6 +800,66 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('treats legacy runtime metadata feedback as a dependency repair', () => {
+    const planner = new AgentToolPlanner();
+    const plans = planner.planExternalFeedbackRepair({
+      task: [
+        'Continue the runtime migration.',
+        '<official_verifier_feedback>',
+        'project metadata still targets legacy LangChain runtime',
+        '</official_verifier_feedback>',
+      ].join('\n'),
+      workspaceRoot: '/app',
+      bindings: [
+        { name: 'fs.read', enabled: true },
+        { name: 'fs.synthesize', enabled: true },
+      ],
+      calls: [
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/support_rag/chain.py' },
+          success: true,
+          result: {
+            path: 'src/support_rag/chain.py',
+            content: 'def build_answer_chain():\n    return None\n',
+          },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'pyproject.toml' },
+          success: true,
+          result: {
+            path: 'pyproject.toml',
+            content: [
+              '[project]',
+              'dependencies = ["langchain==1.3.4", "pydantic>=2"]',
+              '',
+            ].join('\n'),
+          },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'requirements.txt' },
+          success: true,
+          result: {
+            path: 'requirements.txt',
+            content: 'pydantic<2\nlangchain==0.0.1\npyyaml==6.0.2\n',
+          },
+        },
+      ],
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.synthesize',
+        params: expect.objectContaining({
+          path: 'requirements.txt',
+          strategy: 'patch',
+        }),
+      }),
+    ]);
+  });
+
   it('lets the newest recovery capsule supersede stale dependency feedback', () => {
     const planner = new AgentToolPlanner();
     const task = [
