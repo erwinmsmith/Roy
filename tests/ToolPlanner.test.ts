@@ -1311,6 +1311,62 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('regrounds a changed manifest before repairing an installer rejection', () => {
+    const planner = new AgentToolPlanner();
+    const calls = [
+      {
+        toolName: 'fs.read',
+        params: { path: 'pyproject.toml' },
+        success: true,
+        result: {
+          path: 'pyproject.toml',
+          content: 'dependencies = ["langchain-core>=0.3,<1"]\n',
+        },
+      },
+      {
+        toolName: 'fs.synthesize',
+        params: {
+          path: 'pyproject.toml',
+          instructions: 'Upgrade the runtime dependencies.',
+          strategy: 'patch',
+        },
+        success: true,
+        result: { path: 'pyproject.toml' },
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m pip install -e .' },
+        success: false,
+        result: {
+          cwd: '/app',
+          exitCode: 1,
+          stderr: [
+            'ERROR: Could not find a version that satisfies the requirement',
+            'langchain-core<1,>=0.3 (from support-rag)',
+            'ERROR: No matching distribution found for langchain-core<1,>=0.3',
+          ].join(' '),
+        },
+      },
+    ];
+
+    expect(planner.planWorkspaceRepairTransition({
+      task: 'Upgrade the application runtime and verify installation.',
+      workspaceRoot: '/app',
+      bindings: [
+        { name: 'fs.read', enabled: true },
+        { name: 'fs.synthesize', enabled: true },
+        { name: 'shell.exec', enabled: true },
+      ],
+      calls,
+    })).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.read',
+        params: { path: 'pyproject.toml' },
+        reason: expect.stringContaining('refresh the manifest snapshot'),
+      }),
+    ]);
+  });
+
   it('routes failed global acceptance feedback back to its observed source component', () => {
     const planner = new AgentToolPlanner();
     const task = [

@@ -1488,6 +1488,16 @@ export class AgentToolPlanner {
             && this.normalizeWorkspacePath(String(call.params.path ?? ''))
               === targetPath
           );
+        if (staleRead && input.bindings.some(binding =>
+          binding.enabled && binding.name === 'fs.read'
+        )) {
+          return [{
+            toolName: 'fs.read',
+            params: { path: targetPath },
+            reason: `The installer rejected ${unavailableDependency} after ${targetPath} changed; refresh the manifest snapshot before repairing the unresolved constraint.`,
+            groundingRequired: true,
+          }];
+        }
         if (!staleRead) {
           const compactFailure = latestFailureOutput.length <= 2_400
             ? latestFailureOutput
