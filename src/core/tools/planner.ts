@@ -63,38 +63,59 @@ export function recoveryFeedbackFocus(task: string): RecoveryFeedbackFocus | und
   const capsuleMatch = /<recovery_capsule>\s*([\s\S]*?)\s*<\/recovery_capsule>/i.exec(
     task
   );
-  if (!capsuleMatch) return undefined;
-  try {
-    const capsule = JSON.parse(capsuleMatch[1]!) as {
-      recoveryTrigger?: unknown;
-      externalFeedback?: {
-        summary?: unknown;
-        path?: unknown;
+  if (capsuleMatch) {
+    try {
+      const capsule = JSON.parse(capsuleMatch[1]!) as {
+        recoveryTrigger?: unknown;
+        externalFeedback?: {
+          summary?: unknown;
+          path?: unknown;
+        };
+        authoritativeVerifierCommand?: unknown;
       };
-      authoritativeVerifierCommand?: unknown;
-    };
-    if (capsule.recoveryTrigger !== 'new_external_verifier_feedback') {
-      return undefined;
+      if (capsule.recoveryTrigger === 'new_external_verifier_feedback') {
+        const summary = typeof capsule.externalFeedback?.summary === 'string'
+          ? capsule.externalFeedback.summary.trim().slice(0, 1_200)
+          : '';
+        const path = typeof capsule.externalFeedback?.path === 'string'
+          ? capsule.externalFeedback.path.trim()
+          : '';
+        const authoritativeVerifierCommand =
+          typeof capsule.authoritativeVerifierCommand === 'string'
+            ? capsule.authoritativeVerifierCommand.trim()
+            : '';
+        if (summary) {
+          return {
+            summary,
+            ...(path ? { path } : {}),
+            ...(authoritativeVerifierCommand
+              ? { authoritativeVerifierCommand }
+              : {}),
+          };
+        }
+      }
+    } catch {
+      // Fall through to the human-readable continuation feedback.
     }
-    const summary = typeof capsule.externalFeedback?.summary === 'string'
-      ? capsule.externalFeedback.summary.trim().slice(0, 1_200)
-      : '';
-    if (!summary) return undefined;
-    const path = typeof capsule.externalFeedback?.path === 'string'
-      ? capsule.externalFeedback.path.trim()
-      : '';
-    const authoritativeVerifierCommand =
-      typeof capsule.authoritativeVerifierCommand === 'string'
-        ? capsule.authoritativeVerifierCommand.trim()
-        : '';
-    return {
-      summary,
-      ...(path ? { path } : {}),
-      ...(authoritativeVerifierCommand ? { authoritativeVerifierCommand } : {}),
-    };
-  } catch {
-    return undefined;
   }
+  const failureMarker = task.toLowerCase().lastIndexOf('## verification failed');
+  if (failureMarker < 0) return undefined;
+  const latestFailure = task.slice(failureMarker);
+  const directMatch = /(?:^|\n)Verifier feedback:\s*\n([\s\S]*?)(?=\n\s*<official_verifier_feedback>|\n\s*##\s+Required local repair verification|\s*$)/i.exec(
+    latestFailure
+  );
+  const directFeedback = directMatch?.[1]?.trim() ?? '';
+  const summary = directFeedback
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .find(line => line && !/^unchanged\b/i.test(line))
+    ?.slice(0, 1_200);
+  if (!summary) return undefined;
+  const path = latestDiagnosticSourcePath(directFeedback);
+  return {
+    summary,
+    ...(path ? { path } : {}),
+  };
 }
 
 export function effectiveRecoveryFeedbackFocus(
@@ -230,9 +251,10 @@ function focusedVerifierContractEvidence(
       for (const term of terms) {
         if (lower.includes(term)) score += 2;
       }
-      if (/^\s*(?:TARGET|EXPECTED|REQUIRED|MINIMUM|MAXIMUM)[A-Z0-9_]*\s*=/i.test(
-        line
-      )) {
+      if (score > 0
+        && /^\s*(?:TARGET|EXPECTED|REQUIRED|MINIMUM|MAXIMUM)[A-Z0-9_]*\s*=/i.test(
+          line
+        )) {
         score += 10;
       }
       if (/\b(?:assert|_fail\s*\(|raise\s+AssertionError)\b/i.test(line)) {

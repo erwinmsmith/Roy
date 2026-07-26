@@ -2854,6 +2854,7 @@ describe('Runtime controlled subagent spawning', () => {
     const diagnosis = [
       'The first grid boundary is a page-border decoy.',
       'Repair app.py in _assign_tokens_to_grid at its sufficient-lines branch.',
+      '<function_call>multi_tool_use</function_call>',
       'unrelated-diagnostic-detail-'.repeat(220),
       'The authoritative app.py failure is grid_assignment_mismatch.',
     ].join(' ');
@@ -2883,6 +2884,7 @@ describe('Runtime controlled subagent spawning', () => {
     expect(instructions).toContain('The first grid boundary is a page-border decoy.');
     expect(instructions).toContain('_assign_tokens_to_grid');
     expect(instructions).toContain('grid_assignment_mismatch');
+    expect(instructions).not.toContain('function_call');
     expect(instructions).toContain(
       'immediately preceding sequential team member'
     );

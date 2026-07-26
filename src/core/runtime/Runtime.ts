@@ -2322,6 +2322,8 @@ export class Runtime {
       if (terms.size >= 32) break;
     }
     const chunks = report
+      .replace(/<function_call>[\s\S]*?<\/function_call>/gi, '')
+      .replace(/<\/?(?:tool_call|tool_calls|invoke|parameter)\b[^>]*>/gi, '')
       .replace(/\r\n/g, '\n')
       .split('\n')
       .flatMap(line => {
