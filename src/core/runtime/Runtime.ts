@@ -19396,14 +19396,16 @@ For web-grounded work, use only facts present in the subagent report or runtime 
           });
           return [];
         }
-        const externalFeedbackRepair = this.toolPlanner.planExternalFeedbackRepair({
-          task: intentTask,
-          calls: [...priorPlannerCalls, ...context.calls],
-          currentCalls: context.calls,
-          bindings,
-          workspaceRoot: this.workspaceRoot,
-        });
-        if (externalFeedbackRepair.length > 0) {
+        const authoritativeExternalFeedbackRepair = concreteExternalFeedback
+          ? this.toolPlanner.planExternalFeedbackRepair({
+            task: intentTask,
+            calls: [...priorPlannerCalls, ...context.calls],
+            currentCalls: context.calls,
+            bindings,
+            workspaceRoot: this.workspaceRoot,
+          })
+          : [];
+        if (authoritativeExternalFeedbackRepair.length > 0) {
           // A new external verifier result is the authoritative frontier for
           // this continuation. Resolve it before mining older tool failures;
           // those failures may already have been superseded by later passing
@@ -19415,14 +19417,14 @@ For web-grounded work, use only facts present in the subagent report or runtime 
             correlationId: options.correlationId,
             nodeId: options.nodeId,
             data: {
-              plans: externalFeedbackRepair.map(plan => ({
+              plans: authoritativeExternalFeedbackRepair.map(plan => ({
                 toolName: plan.toolName,
                 params: plan.params,
               })),
             },
           });
           const eligible = this.deferRepeatedNoGainMutationTargets(
-            externalFeedbackRepair,
+            authoritativeExternalFeedbackRepair,
             combinedCalls,
             agentId,
             options
@@ -19500,6 +19502,37 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         });
         if (failureContextPlans.length > 0) {
           return failureContextPlans.slice(0, context.remainingCalls);
+        }
+        const externalFeedbackRepair = this.toolPlanner.planExternalFeedbackRepair({
+          task: intentTask,
+          calls: [...priorPlannerCalls, ...context.calls],
+          currentCalls: context.calls,
+          bindings,
+          workspaceRoot: this.workspaceRoot,
+        });
+        if (externalFeedbackRepair.length > 0) {
+          this.emit({
+            type: 'tool.plan.external_feedback_repair',
+            agentId,
+            sessionId: this.getContext().sessionId,
+            correlationId: options.correlationId,
+            nodeId: options.nodeId,
+            data: {
+              plans: externalFeedbackRepair.map(plan => ({
+                toolName: plan.toolName,
+                params: plan.params,
+              })),
+            },
+          });
+          const eligible = this.deferRepeatedNoGainMutationTargets(
+            externalFeedbackRepair,
+            combinedCalls,
+            agentId,
+            options
+          );
+          if (eligible.length > 0) {
+            return eligible.slice(0, context.remainingCalls);
+          }
         }
         if (diagnosticProbeRequired
           && context.calls.some(call => this.isFocusedVerifierDiagnosticCall(call))) {
