@@ -675,6 +675,12 @@ export class AgentToolPlanner {
           )) {
           return undefined;
         }
+        if (effectiveMutations.size > 0
+          && !taskExplicit
+          && !failureMentioned
+          && !acceptanceFailureMentioned) {
+          return undefined;
+        }
         if (!taskExplicit
           && matchedTerms.length === 0
           && !failureMentioned

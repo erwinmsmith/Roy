@@ -2399,6 +2399,55 @@ describe('AgentToolPlanner', () => {
     })).toEqual([]);
   });
 
+  it('does not sweep semantic-term-only files after a grounded mutation', () => {
+    const planner = new AgentToolPlanner();
+    expect(planner.planGroundedImplementationTransition({
+      task: [
+        'Migrate the application while preserving answer_question and route_ticket.',
+        'Run `python -m app.cli answer` to verify the result.',
+      ].join('\n'),
+      calls: [
+        {
+          toolName: 'fs.synthesize',
+          params: {
+            path: 'src/app/chain.py',
+            instructions: 'Replace the legacy chain.',
+            strategy: 'patch',
+          },
+          success: true,
+          result: {
+            path: 'src/app/chain.py',
+            synthesized: true,
+          },
+        },
+        {
+          toolName: 'shell.exec',
+          params: { command: 'python -m app.cli answer' },
+          success: true,
+          result: { exitCode: 0, stdout: 'ok\n' },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'src/app/api.py' },
+          success: true,
+          result: {
+            path: 'src/app/api.py',
+            content: [
+              'from .chain import answer_question',
+              'from .router import route_ticket',
+            ].join('\n'),
+            truncated: false,
+          },
+        },
+      ],
+      bindings: [
+        { name: 'fs.read', enabled: true },
+        { name: 'fs.synthesize', enabled: true },
+        { name: 'shell.exec', enabled: true },
+      ],
+    })).toEqual([]);
+  });
+
   it('extracts explicitly quoted natural-language commands from a team task', () => {
     const planner = new AgentToolPlanner();
     const plans = planner.plan({
