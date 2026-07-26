@@ -2104,6 +2104,79 @@ describe('AgentToolPlanner', () => {
     })).toEqual([]);
   });
 
+  it('bootstraps a missing development tool after an older source failure is superseded', () => {
+    const planner = new AgentToolPlanner();
+    const bindings = [{ name: 'shell.exec', enabled: true }];
+    const calls = [
+      {
+        toolName: 'fs.synthesize',
+        params: {
+          path: 'src/support_rag/router.py',
+          instructions: 'Migrate the router.',
+          strategy: 'patch',
+        },
+        success: true,
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m support_rag.cli route --ticket invoice' },
+        success: false,
+        result: {
+          command: 'python -m support_rag.cli route --ticket invoice',
+          cwd: '/app',
+          exitCode: 1,
+          stderr: [
+            'Traceback (most recent call last):',
+            '  File "/app/src/support_rag/router.py", line 42, in route_ticket',
+            "TypeError: 'LegacyRouterLLM' object is not callable",
+          ].join('\n'),
+        },
+      },
+      {
+        toolName: 'fs.synthesize',
+        params: {
+          path: 'src/support_rag/models.py',
+          instructions: 'Repair the callable model adapter.',
+          strategy: 'patch',
+        },
+        success: true,
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m support_rag.cli route --ticket invoice' },
+        success: true,
+        result: {
+          command: 'python -m support_rag.cli route --ticket invoice',
+          cwd: '/app',
+          exitCode: 0,
+          stdout: '{"route":"billing"}',
+        },
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m pytest -q' },
+        success: false,
+        result: {
+          command: 'python -m pytest -q',
+          cwd: '/app',
+          exitCode: 1,
+          stderr: '/usr/local/bin/python: No module named pytest',
+        },
+      },
+    ];
+
+    expect(planner.planEnvironmentRecovery({
+      calls,
+      bindings,
+      workspaceRoot: '/app',
+    })).toEqual([
+      expect.objectContaining({
+        toolName: 'shell.exec',
+        params: { command: 'python -m pip install pytest' },
+      }),
+    ]);
+  });
+
   it('does not install a development tool while a newer source repair remains', () => {
     const planner = new AgentToolPlanner();
     expect(planner.planEnvironmentRecovery({

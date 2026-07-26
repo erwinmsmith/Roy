@@ -19431,6 +19431,32 @@ For web-grounded work, use only facts present in the subagent report or runtime 
             return eligible.slice(0, context.remainingCalls);
           }
         }
+        const environmentRecovery = this.toolPlanner.planEnvironmentRecovery({
+          calls: combinedCalls,
+          bindings,
+          workspaceRoot: this.workspaceRoot,
+        });
+        if (environmentRecovery.length > 0) {
+          // Environment recovery already declines to act while a newer,
+          // source-localized failure remains. Give it priority over historical
+          // failure follow-ups so a cleared traceback cannot hide a missing
+          // test runner and trigger unrelated source mutations.
+          this.emit({
+            type: 'tool.plan.environment_recovery',
+            agentId,
+            sessionId: this.getContext().sessionId,
+            correlationId: options.correlationId,
+            nodeId: options.nodeId,
+            data: {
+              plans: environmentRecovery.map(plan => ({
+                toolName: plan.toolName,
+                params: plan.params,
+              })),
+              priorToolCalls: combinedCalls.length,
+            },
+          });
+          return environmentRecovery.slice(0, context.remainingCalls);
+        }
         const failureContextPlans = this.toolPlanner.planWorkspaceFailureFollowUps({
           calls: [...priorPlannerCalls, ...context.calls],
           bindings,
@@ -19469,28 +19495,6 @@ For web-grounded work, use only facts present in the subagent report or runtime 
           if (eligible.length > 0) {
             return eligible.slice(0, context.remainingCalls);
           }
-        }
-        const environmentRecovery = this.toolPlanner.planEnvironmentRecovery({
-          calls: combinedCalls,
-          bindings,
-          workspaceRoot: this.workspaceRoot,
-        });
-        if (environmentRecovery.length > 0) {
-          this.emit({
-            type: 'tool.plan.environment_recovery',
-            agentId,
-            sessionId: this.getContext().sessionId,
-            correlationId: options.correlationId,
-            nodeId: options.nodeId,
-            data: {
-              plans: environmentRecovery.map(plan => ({
-                toolName: plan.toolName,
-                params: plan.params,
-              })),
-              priorToolCalls: combinedCalls.length,
-            },
-          });
-          return environmentRecovery.slice(0, context.remainingCalls);
         }
         if (diagnosticProbeRequired
           && context.calls.some(call => this.isFocusedVerifierDiagnosticCall(call))) {
