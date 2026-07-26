@@ -1027,11 +1027,24 @@ export class AgentToolPlanner {
           const dependencyManifestPriority = manifestPriority(lowerPath);
           score += dependencyManifestPriority;
           if (dependencyManifestPriority > 0
-            && /\blegacy\b/i.test(feedback)
-            && /(?:\blegacy\b|(?:={2,3}|~=)\s*0\.\d|pydantic\s*<\s*2)/im.test(
-              candidate.content
+            && /\b(?:legacy|outdated|incompatible|unsupported|upgrade|migration)\b/i.test(
+              feedback
             )) {
-            score += 300;
+            const declarationLines = candidate.content
+              .split(/\r?\n/)
+              .filter(line =>
+                !/^\s*(?:#|description\s*=)/i.test(line)
+              )
+              .join('\n');
+            if (/(?:={2,3}|~=)\s*0\.\d|pydantic\s*<\s*2/im.test(
+              declarationLines
+            )) {
+              // A concrete obsolete constraint is stronger causal evidence
+              // than a manifest merely named by a verifier traceback. This
+              // matters when parallel manifests disagree and the modern
+              // primary manifest still describes the project as "legacy".
+              score += 1_200;
+            }
           }
         }
         const basename = candidate.path.slice(candidate.path.lastIndexOf('/') + 1);

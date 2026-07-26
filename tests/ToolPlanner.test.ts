@@ -664,6 +664,60 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('repairs an obsolete parallel manifest before a modern manifest named by feedback', () => {
+    const planner = new AgentToolPlanner();
+    const task = [
+      'Continue the runtime migration.',
+      '<official_verifier_feedback>',
+      'project dependency metadata still targets legacy LangChain runtime',
+      'File "/app/pyproject.toml" was inspected by the verifier.',
+      '</official_verifier_feedback>',
+    ].join('\n');
+    const plans = planner.planExternalFeedbackRepair({
+      task,
+      workspaceRoot: '/app',
+      bindings: [
+        { name: 'fs.read', enabled: true },
+        { name: 'fs.synthesize', enabled: true },
+      ],
+      calls: [
+        {
+          toolName: 'fs.read',
+          params: { path: 'pyproject.toml' },
+          success: true,
+          result: {
+            path: 'pyproject.toml',
+            content: [
+              '[project]',
+              'description = "Legacy support app undergoing migration"',
+              'dependencies = ["langchain==1.3.4", "langchain-core>=1.0"]',
+              '',
+            ].join('\n'),
+          },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'requirements.txt' },
+          success: true,
+          result: {
+            path: 'requirements.txt',
+            content: 'pydantic<2\nlangchain==0.0.1\npyyaml==6.0.2\n',
+          },
+        },
+      ],
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.synthesize',
+        params: expect.objectContaining({
+          path: 'requirements.txt',
+          strategy: 'patch',
+        }),
+      }),
+    ]);
+  });
+
   it('lets the newest recovery capsule supersede stale dependency feedback', () => {
     const planner = new AgentToolPlanner();
     const task = [
