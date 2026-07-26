@@ -2777,7 +2777,7 @@ describe('benchmark terminal capability', () => {
     await runtime.shutdown();
   });
 
-  it('reuses a delegated mutation and fresh verification without making root repeat the work', async () => {
+  it('hands a closed delegated mutation to an initial external verifier without speculative acceptance work', async () => {
     const workspace = await mkdtemp(path.join(tmpdir(), 'roy-delegated-closed-reuse-'));
     await writeFile(path.join(workspace, 'delegated-global.txt'), 'delegated', 'utf8');
     const runtime = new Runtime();
@@ -2842,7 +2842,15 @@ describe('benchmark terminal capability', () => {
     }).runRequiredRootExecution.bind(runtime);
 
     const execution = await execute(
-      'Implement and verify delegated-global.txt in the workspace.',
+      [
+        'Implement and verify delegated-global.txt in the workspace.',
+        'Requirements:',
+        '- The file must exist.',
+        '- Its exact content must be delegated.',
+        '- The public path must remain stable.',
+        '- A fresh command must verify the final content.',
+        'This task uses continue-until-timeout mode: after the agent phase, an external harness runs the authoritative verifier and returns concrete failures for continuation.',
+      ].join('\n'),
       delegatedResults,
       [],
       'delegated-closed-reuse-correlation'
@@ -2854,7 +2862,15 @@ describe('benchmark terminal capability', () => {
       data: expect.objectContaining({
         mutationApplied: true,
         verificationPassed: true,
-        auditRequired: false,
+        auditRequired: true,
+        deferInitialAcceptanceToExternalVerifier: true,
+      }),
+    }));
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'root.execution.external_verifier.handoff',
+      data: expect.objectContaining({
+        mutationApplied: true,
+        verificationPassed: true,
       }),
     }));
     expect(runtime.getEvents()).not.toContainEqual(expect.objectContaining({

@@ -21206,6 +21206,8 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     let stalledIterations = 0;
     let acceptanceAuditInvalidated = false;
     const auditRequired = this.taskRequiresAcceptanceAudit(userTask);
+    const deferInitialAcceptanceToExternalVerifier =
+      this.shouldDeferInitialAcceptanceToExternalVerifier(userTask);
     if (delegatedExecution) {
       const delegatedClosure = this.analyzeWorkspaceExecutionClosure(
         delegatedExecution.toolCalls
@@ -21218,10 +21220,26 @@ For web-grounded work, use only facts present in the subagent report or runtime 
           data: {
             ...delegatedClosure,
             auditRequired,
+            deferInitialAcceptanceToExternalVerifier,
             toolCalls: delegatedExecution.toolCalls.length,
           },
         });
-        if (!auditRequired) return delegatedExecution;
+        if (!auditRequired || deferInitialAcceptanceToExternalVerifier) {
+          if (deferInitialAcceptanceToExternalVerifier) {
+            this.emit({
+              type: 'root.execution.external_verifier.handoff',
+              agentId: 'root',
+              correlationId,
+              data: {
+                reason: 'The external continue-until-timeout protocol has not supplied verifier feedback yet; hand off the closed delegated mutation instead of speculating across unverified acceptance items.',
+                mutationApplied: delegatedClosure.mutationApplied,
+                verificationPassed: delegatedClosure.verificationPassed,
+                toolCalls: delegatedExecution.toolCalls.length,
+              },
+            });
+          }
+          return delegatedExecution;
+        }
         const auditRemainingMs = this.remainingRootExecutionTimeMs(correlationId);
         if (auditRemainingMs > 5_000) {
           const audit = await this.runRootAcceptanceAudit(
@@ -21468,6 +21486,15 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       }
     }
     return combineWithDelegatedExecution();
+  }
+
+  private shouldDeferInitialAcceptanceToExternalVerifier(task: string): boolean {
+    const externalLoopDeclared =
+      /\bcontinue(?:[-_ ]+)until(?:[-_ ]+)timeout\b/i.test(task);
+    if (!externalLoopDeclared) return false;
+    return !/<official_verifier_feedback>|<recovery_capsule>|\bVERIFICATION FAILED\b/i.test(
+      task
+    );
   }
 
   private rootExecutionAttemptAdvanced(
