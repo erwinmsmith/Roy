@@ -54,6 +54,36 @@ describe('AgentToolPlanner', () => {
     });
   });
 
+  it('derives concrete verifier focus from calls when a recovery capsule is absent', () => {
+    const focus = effectiveRecoveryFeedbackFocus(
+      [
+        '<official_verifier_feedback>',
+        'project dependency metadata still targets a legacy runtime',
+        '</official_verifier_feedback>',
+      ].join('\n'),
+      [{
+        toolName: 'shell.exec',
+        params: {
+          command: 'python -m pytest -q .roy/official-verifier/test_outputs.py',
+        },
+        success: false,
+        result: {
+          exitCode: 1,
+          verifierDiagnostics: [{
+            path: '/logs/verifier/details.json',
+            content: JSON.stringify({
+              failure: 'router structure violation: create_agent is missing',
+            }),
+          }],
+        },
+      }]
+    );
+
+    expect(focus).toEqual({
+      summary: 'router structure violation: create_agent is missing',
+    });
+  });
+
   it('reads package.json when a package export inspection needs manifest evidence', () => {
     const plans = new AgentToolPlanner().plan({
       task: 'Inspect this package exports and identify one concrete architecture risk.',

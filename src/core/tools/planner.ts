@@ -84,7 +84,6 @@ export function effectiveRecoveryFeedbackFocus(
   calls: ObservedToolCall[]
 ): RecoveryFeedbackFocus | undefined {
   const focus = recoveryFeedbackFocus(task);
-  if (!focus) return undefined;
   for (const latestFailure of [...calls].reverse()) {
     if (!isWorkspaceVerificationCall(latestFailure)
       || isSuccessfulWorkspaceVerificationCall(latestFailure)) {
@@ -130,7 +129,7 @@ export function effectiveRecoveryFeedbackFocus(
     if (!summary) continue;
     return {
       summary: summary.slice(0, 1_200),
-      ...(focus.authoritativeVerifierCommand
+      ...(focus?.authoritativeVerifierCommand
         ? { authoritativeVerifierCommand: focus.authoritativeVerifierCommand }
         : {}),
     };
