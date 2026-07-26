@@ -188,6 +188,85 @@ function semanticFeedbackIdentifiers(feedback: string): string[] {
   return [...identifiers];
 }
 
+function focusedVerifierContractEvidence(
+  calls: ObservedToolCall[],
+  feedback: string,
+  maxChars = 3_600
+): string {
+  const verifierRead = [...calls].reverse().find(call => {
+    if (call.toolName !== 'fs.read' || !call.success) return false;
+    const resultPath = String(
+      (call.result as { path?: unknown } | undefined)?.path
+        ?? call.params.path
+        ?? ''
+    ).replace(/^\/app\//, '').replace(/^\.\//, '');
+    return resultPath.startsWith('.roy/official-verifier/');
+  });
+  const result = verifierRead?.result as {
+    path?: unknown;
+    content?: unknown;
+  } | undefined;
+  const content = typeof result?.content === 'string' ? result.content : '';
+  if (!content) return '';
+  const ignored = new Set([
+    'about', 'after', 'already', 'artifact', 'before', 'changed', 'continue',
+    'external', 'failure', 'feedback', 'newest', 'official', 'previous',
+    'repair', 'reported', 'result', 'runtime', 'source', 'still', 'their',
+    'these', 'verifier', 'working',
+  ]);
+  const terms = new Set(
+    [
+      ...semanticFeedbackIdentifiers(feedback),
+      ...(feedback.match(/\b[A-Za-z][A-Za-z0-9_-]{4,}\b/g) ?? []),
+    ]
+      .map(term => term.toLowerCase())
+      .filter(term => !ignored.has(term))
+  );
+  const lines = content.replace(/\r\n/g, '\n').split('\n');
+  const ranked = lines
+    .map((line, index) => {
+      const lower = line.toLowerCase();
+      let score = 0;
+      for (const term of terms) {
+        if (lower.includes(term)) score += 2;
+      }
+      if (/^\s*(?:TARGET|EXPECTED|REQUIRED|MINIMUM|MAXIMUM)[A-Z0-9_]*\s*=/i.test(
+        line
+      )) {
+        score += 10;
+      }
+      if (/\b(?:assert|_fail\s*\(|raise\s+AssertionError)\b/i.test(line)) {
+        score += 6;
+      }
+      if (/^\s*(?:async\s+)?def\s+/i.test(line) && score > 0) score += 5;
+      return { index, score };
+    })
+    .filter(item => item.score > 0)
+    .sort((left, right) => right.score - left.score || left.index - right.index)
+    .slice(0, 14);
+  if (ranked.length === 0) return '';
+  const selected = new Set<number>();
+  for (const item of ranked) {
+    for (
+      let index = Math.max(0, item.index - 5);
+      index <= Math.min(lines.length - 1, item.index + 5);
+      index += 1
+    ) {
+      selected.add(index);
+    }
+  }
+  const verifierPath = String(result?.path ?? verifierRead?.params.path ?? '')
+    .replace(/^\/app\//, '')
+    .replace(/^\.\//, '');
+  const excerpts = [...selected]
+    .sort((left, right) => left - right)
+    .map(index => `${index + 1}: ${lines[index]}`)
+    .join('\n');
+  const headed = `Verifier contract excerpts from ${verifierPath}:\n${excerpts}`;
+  if (headed.length <= maxChars) return headed;
+  return `${headed.slice(0, Math.max(1, maxChars - 39))}\n[verifier contract excerpts compacted]`;
+}
+
 export class AgentToolPlanner {
   plan(input: ToolPlanningInput): PlannedToolCall[] {
     const enabled = new Set(input.bindings.filter(binding => binding.enabled).map(binding => binding.name));
@@ -1015,6 +1094,21 @@ export class AgentToolPlanner {
           ?? ''
       )))
       .filter(Boolean));
+    const authoritativeVerifierPath = this.extractReferencedPaths(input.task)
+      .map(path => this.normalizeWorkspacePath(path))
+      .find(path => path.startsWith('.roy/official-verifier/'));
+    if (authoritativeVerifierPath
+      && input.bindings.some(binding =>
+        binding.enabled && binding.name === 'fs.read'
+      )
+      && !observedReads.has(authoritativeVerifierPath)) {
+      return [{
+        toolName: 'fs.read',
+        params: { path: authoritativeVerifierPath },
+        reason: 'Read the immutable verifier contract referenced by the continuation before inferring an exact repair from its summarized failure.',
+        groundingRequired: true,
+      }];
+    }
     if (dependencyFeedback
       && input.bindings.some(binding => binding.enabled && binding.name === 'fs.read')) {
       const unreadManifest = input.calls
@@ -1132,11 +1226,18 @@ export class AgentToolPlanner {
     const compactFeedback = feedback.length <= 2_800
       ? feedback
       : `${feedback.slice(0, 700)}\n[older external feedback compacted]\n${feedback.slice(-2_100)}`;
+    const verifierContract = focusedVerifierContractEvidence(
+      input.calls,
+      feedback
+    );
     const instructions = [
       'Apply the smallest coherent, interface-preserving change that resolves the newest external verifier feedback.',
       `Authoritative external feedback:\n${compactFeedback}`,
+      verifierContract
+        ? `${verifierContract}\nTreat these executable assertions and constants as the exact acceptance contract; do not replace an exact constraint with a looser guess.`
+        : '',
       'Use the already observed current file as the patch base. Preserve unrelated working declarations and do not alter benchmark or verifier files.',
-    ].join('\n\n');
+    ].filter(Boolean).join('\n\n');
     const duplicateAttempt = (input.currentCalls ?? input.calls).some(call =>
       call.toolName === 'fs.synthesize'
       && this.normalizeWorkspacePath(String(call.params.path ?? '')) === candidate.path

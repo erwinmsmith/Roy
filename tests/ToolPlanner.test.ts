@@ -193,6 +193,89 @@ describe('AgentToolPlanner', () => {
     });
   });
 
+  it('reads and promotes an immutable verifier contract before an exact repair', () => {
+    const task = [
+      'Continue the runtime migration.',
+      '<official_verifier_feedback>',
+      'project metadata still targets legacy LangChain runtime',
+      '</official_verifier_feedback>',
+      'Read `.roy/official-verifier/test_outputs.py` before repairing.',
+    ].join('\n');
+    const manifestCall = {
+      toolName: 'fs.read',
+      params: { path: 'requirements.txt' },
+      success: true,
+      result: {
+        path: 'requirements.txt',
+        content: 'langchain>=0.3.0\n',
+      },
+    };
+    const planner = new AgentToolPlanner();
+    const bindings = [
+      { name: 'fs.read', enabled: true },
+      { name: 'fs.synthesize', enabled: true },
+    ];
+
+    expect(planner.planExternalFeedbackRepair({
+      task,
+      calls: [manifestCall],
+      currentCalls: [],
+      bindings,
+      workspaceRoot: '/app',
+    })).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.read',
+        params: { path: '.roy/official-verifier/test_outputs.py' },
+      }),
+    ]);
+
+    const plans = planner.planExternalFeedbackRepair({
+      task,
+      calls: [
+        manifestCall,
+        {
+          toolName: 'fs.read',
+          params: { path: '.roy/official-verifier/test_outputs.py' },
+          success: true,
+          result: {
+            path: '.roy/official-verifier/test_outputs.py',
+            content: [
+              'TARGET_LANGCHAIN_VERSION = "1.3.4"',
+              '',
+              'def _dependency_targets_modern_runtime():',
+              '    text = _metadata_text()',
+              '    langchain_exact = re.search(',
+              '        rf"langchain\\\\s*==\\\\s*{TARGET_LANGCHAIN_VERSION}\\\\b", text',
+              '    )',
+              '    return bool(langchain_exact)',
+              '',
+              'if not _dependency_targets_modern_runtime():',
+              '    _fail(details, "project metadata still targets legacy LangChain runtime")',
+            ].join('\n'),
+          },
+        },
+      ],
+      currentCalls: [],
+      bindings,
+      workspaceRoot: '/app',
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.synthesize',
+        params: expect.objectContaining({
+          path: 'requirements.txt',
+          instructions: expect.stringContaining(
+            'TARGET_LANGCHAIN_VERSION = "1.3.4"'
+          ),
+        }),
+      }),
+    ]);
+    expect(String(plans[0]?.params.instructions)).toContain(
+      'exact acceptance contract'
+    );
+  });
+
   it('reads package.json when a package export inspection needs manifest evidence', () => {
     const plans = new AgentToolPlanner().plan({
       task: 'Inspect this package exports and identify one concrete architecture risk.',
@@ -995,6 +1078,19 @@ describe('AgentToolPlanner', () => {
       { name: 'fs.synthesize', enabled: true },
       { name: 'shell.exec', enabled: true },
     ];
+    const verifierRead = {
+      toolName: 'fs.read',
+      params: { path: '.roy/official-verifier/test_outputs.py' },
+      success: true,
+      result: {
+        path: '.roy/official-verifier/test_outputs.py',
+        content: [
+          'def test_router_structure():',
+          '    assert classify_ticket_is_tool',
+          '    assert retriever_has_get_relevant_documents',
+        ].join('\n'),
+      },
+    };
 
     expect(planner.plan({
       task,
@@ -1020,6 +1116,7 @@ describe('AgentToolPlanner', () => {
       bindings,
       workspaceRoot: '/app',
       calls: [
+        verifierRead,
         {
           toolName: 'fs.read',
           params: { path: 'requirements.txt' },
@@ -1059,6 +1156,7 @@ describe('AgentToolPlanner', () => {
       bindings,
       workspaceRoot: '/app',
       calls: [
+        verifierRead,
         {
           toolName: 'fs.read',
           params: { path: 'src/support_rag/router.py' },
