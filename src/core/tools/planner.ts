@@ -194,6 +194,10 @@ export class AgentToolPlanner {
       const focusedPath = recoveryFocus.path
         ? this.normalizeWorkspacePath(recoveryFocus.path)
         : '';
+      const dependencyManifestPaths = this.recoveryDependencyManifestPaths(
+        recoveryFocus.summary,
+        input.task
+      );
       if (focusedPath && enabled.has('fs.read')) {
         plans.push({
           toolName: 'fs.read',
@@ -201,6 +205,13 @@ export class AgentToolPlanner {
           reason: `The newest verifier feedback identifies ${focusedPath} as its authoritative repair target.`,
           groundingRequired: true,
         });
+      } else if (dependencyManifestPaths.length > 0 && enabled.has('fs.read')) {
+        plans.push(...dependencyManifestPaths.map(path => ({
+          toolName: 'fs.read',
+          params: { path },
+          reason: `The newest dependency or runtime-version feedback requires grounding the authoritative ${path} declaration before considering source changes.`,
+          groundingRequired: true,
+        })));
       } else if (enabled.has('fs.search')) {
         const identifier = semanticFeedbackIdentifiers(recoveryFocus.summary)[0];
         if (identifier) {
@@ -2326,6 +2337,33 @@ export class AgentToolPlanner {
         return true;
       })
       .slice(0, 80);
+  }
+
+  private recoveryDependencyManifestPaths(
+    summary: string,
+    task: string
+  ): string[] {
+    if (!/\b(?:dependenc(?:y|ies)|manifest|metadata|runtime(?:\s+version)?|version constraint|package install|pin(?:ned|ning)?)\b/i.test(
+      summary
+    ) || !/\b(?:fail(?:ed|ure)?|error|legacy|outdated|incorrect|wrong|incompatible|unsupported|mismatch|must|should|expect(?:ed)?|target(?:s|ed)?|upgrade|downgrade|missing|cannot|can't|not)\b/i.test(
+      summary
+    )) {
+      return [];
+    }
+    const context = `${summary}\n${task}`.toLowerCase();
+    if (/\b(?:python|pip|pytest|pydantic|langchain|setuptools)\b/.test(context)) {
+      return ['pyproject.toml', 'requirements.txt'];
+    }
+    if (/\b(?:node|npm|pnpm|yarn|bun|typescript|javascript)\b/.test(context)) {
+      return ['package.json'];
+    }
+    if (/\b(?:rust|cargo)\b/.test(context)) return ['Cargo.toml'];
+    if (/\b(?:golang|go\.mod|go module)\b/.test(context)) return ['go.mod'];
+    if (/\b(?:maven|gradle|java|kotlin)\b/.test(context)) {
+      return ['pom.xml', 'build.gradle'];
+    }
+    if (/\b(?:ruby|bundler|gem)\b/.test(context)) return ['Gemfile'];
+    return ['pyproject.toml', 'package.json', 'requirements.txt'];
   }
 
   private isEnvironmentSetupCommand(command: string): boolean {

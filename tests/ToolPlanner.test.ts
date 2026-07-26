@@ -17,6 +17,41 @@ describe('AgentToolPlanner', () => {
     expect(plans.every(plan => plan.groundingRequired)).toBe(true);
   });
 
+  it('grounds ecosystem manifests before source files for dependency recovery', () => {
+    const plans = new AgentToolPlanner().plan({
+      task: [
+        'Repair the Python workspace and run pytest.',
+        '<recovery_capsule>',
+        JSON.stringify({
+          recoveryTrigger: 'new_external_verifier_feedback',
+          externalFeedback: {
+            summary: 'project metadata still targets legacy runtime dependency',
+          },
+        }),
+        '</recovery_capsule>',
+      ].join('\n'),
+      workspacePath: '/workspace',
+      archetype: 'coder',
+      bindings: [
+        { name: 'fs.read', enabled: true },
+        { name: 'fs.search', enabled: true },
+      ],
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.read',
+        params: { path: 'pyproject.toml' },
+        reason: expect.stringContaining('authoritative pyproject.toml'),
+      }),
+      expect.objectContaining({
+        toolName: 'fs.read',
+        params: { path: 'requirements.txt' },
+        reason: expect.stringContaining('authoritative requirements.txt'),
+      }),
+    ]);
+  });
+
   it('does not guess an npm verification command without observed project metadata', () => {
     const plans = new AgentToolPlanner().plan({
       task: 'Verify the claims against tests and failure cases.',
