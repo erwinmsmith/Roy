@@ -388,7 +388,12 @@ export function plannedWorkspaceMutationPath(
 
 export function isSuccessfulWorkspaceVerificationCall(call: ExecutionIntentCall): boolean {
   if (!call.success || !isWorkspaceVerificationCall(call)) return false;
-  const shell = call.result as { exitCode?: unknown; stdout?: unknown; stderr?: unknown } | undefined;
+  const shell = call.result as {
+    exitCode?: unknown;
+    stdout?: unknown;
+    stderr?: unknown;
+    verifierDiagnostics?: unknown;
+  } | undefined;
   if (typeof shell?.exitCode === 'number' && shell.exitCode !== 0) return false;
   const output = `${String(shell?.stdout ?? '')}\n${String(shell?.stderr ?? '')}`;
   const command = String(call.params.command ?? '');
@@ -402,10 +407,41 @@ export function isSuccessfulWorkspaceVerificationCall(call: ExecutionIntentCall)
     )].map(match => Number(match[1])).at(-1);
     const verifierScore = labeledScore ?? numericScore;
     if (verifierScore !== undefined && verifierScore < 1) return false;
+    const diagnosticScores = verifierDiagnosticScores(shell?.verifierDiagnostics);
+    if (diagnosticScores.some(score => score < 1)) return false;
   }
   const reportedStatuses = [...output.matchAll(/(?:^|\n)\s*(?:exit(?:_code)?|status)\s*[:=]\s*(-?\d+)\s*(?:\n|$)/gi)]
     .map(match => Number(match[1]));
   return reportedStatuses.length === 0 || reportedStatuses.every(status => status === 0);
+}
+
+function verifierDiagnosticScores(diagnostics: unknown): number[] {
+  if (!Array.isArray(diagnostics)) return [];
+  const scores: number[] = [];
+  for (const item of diagnostics) {
+    if (!item || typeof item !== 'object') continue;
+    const record = item as { path?: unknown; content?: unknown };
+    if (typeof record.content !== 'string') continue;
+    const diagnosticPath = String(record.path ?? '').replaceAll('\\', '/');
+    const numeric = Number(record.content.trim());
+    if (/(?:^|\/)reward\.txt$/i.test(diagnosticPath)
+      && Number.isFinite(numeric)) {
+      scores.push(numeric);
+    }
+    try {
+      const parsed = JSON.parse(record.content) as unknown;
+      if (parsed
+        && typeof parsed === 'object'
+        && !Array.isArray(parsed)
+        && typeof (parsed as { reward?: unknown }).reward === 'number'
+        && Number.isFinite((parsed as { reward: number }).reward)) {
+        scores.push((parsed as { reward: number }).reward);
+      }
+    } catch {
+      // Non-JSON verifier logs remain useful output evidence but carry no score.
+    }
+  }
+  return scores;
 }
 
 export function isUnavailableWorkspaceVerificationCall(call: ExecutionIntentCall): boolean {

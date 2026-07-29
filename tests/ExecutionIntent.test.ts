@@ -240,6 +240,44 @@ describe('workspace execution intent', () => {
       success: true,
       result: { exitCode: 0, stdout: 'reward: 1.0\n' },
     })).toBe(true);
+    expect(isSuccessfulWorkspaceVerificationCall({
+      toolName: 'shell.exec',
+      params: { command: 'bash .roy/official-verifier/test.sh' },
+      success: true,
+      result: {
+        exitCode: 0,
+        stdout: 'Verifier completed.\n',
+        verifierDiagnostics: [
+          {
+            path: '/logs/verifier/scorecard.json',
+            content: '{"reward":0.25,"groups":{"public":1,"hidden":0}}',
+          },
+          {
+            path: '/logs/verifier/reward.txt',
+            content: '0.25\n',
+          },
+        ],
+      },
+    })).toBe(false);
+    expect(isSuccessfulWorkspaceVerificationCall({
+      toolName: 'shell.exec',
+      params: { command: 'bash .roy/official-verifier/test.sh' },
+      success: true,
+      result: {
+        exitCode: 0,
+        stdout: 'Verifier completed.\n',
+        verifierDiagnostics: [
+          {
+            path: '/logs/verifier/scorecard.json',
+            content: '{"reward":1,"groups":{"public":1,"hidden":1}}',
+          },
+          {
+            path: '/logs/verifier/reward.txt',
+            content: '1.0\n',
+          },
+        ],
+      },
+    })).toBe(true);
   });
 
   it('classifies pytest exit five with no collected tests as unavailable rather than failed code', () => {
