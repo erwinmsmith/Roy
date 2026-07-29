@@ -2332,6 +2332,101 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('inspects installed package-family modules before repairing a missing external import', () => {
+    const planner = new AgentToolPlanner();
+    const failure = {
+      toolName: 'shell.exec',
+      params: { command: 'python -m support_rag.cli answer' },
+      success: false,
+      result: {
+        command: 'python -m support_rag.cli answer',
+        cwd: '/app',
+        exitCode: 1,
+        stderr: [
+          'Traceback (most recent call last):',
+          '  File "/app/src/support_rag/chain.py", line 7, in <module>',
+          '    from langchain.chains import LLMChain',
+          "ModuleNotFoundError: No module named 'langchain.chains'",
+        ].join('\n'),
+      },
+    };
+    const sourceRead = {
+      toolName: 'fs.read',
+      params: {
+        path: 'src/support_rag/chain.py',
+        startLine: 1,
+        endLine: 32,
+      },
+      success: true,
+      result: {
+        path: 'src/support_rag/chain.py',
+        content: 'from langchain.chains import LLMChain\n',
+        truncated: false,
+      },
+    };
+    const bindings = [
+      { name: 'fs.read', enabled: true },
+      { name: 'fs.synthesize', enabled: true },
+      { name: 'shell.exec', enabled: true },
+    ];
+
+    const diagnostic = planner.planWorkspaceRepairTransition({
+      task: 'Migrate the application to the installed runtime.',
+      workspaceRoot: '/app',
+      bindings,
+      calls: [failure, sourceRead],
+    });
+    expect(diagnostic).toEqual([
+      expect.objectContaining({
+        toolName: 'shell.exec',
+        params: expect.objectContaining({
+          command: expect.stringMatching(
+            /requested=.*related_distributions=.*related_import_roots=.*root_submodules/
+          ),
+          maxOutputBytes: 12_000,
+        }),
+        reason: expect.stringContaining('do not guess a legacy module path'),
+      }),
+    ]);
+
+    const plans = planner.planWorkspaceRepairTransition({
+      task: 'Migrate the application to the installed runtime.',
+      workspaceRoot: '/app',
+      bindings,
+      calls: [
+        failure,
+        sourceRead,
+        {
+          toolName: 'shell.exec',
+          params: diagnostic[0]!.params,
+          success: true,
+          result: {
+            command: diagnostic[0]!.params.command,
+            exitCode: 0,
+            stdout: [
+              'requested= langchain.chains',
+              "related_distributions= [('langchain', '1.3.4'), ('langchain-classic', '1.0.1'), ('langchain-core', '1.2.11')]",
+              "related_import_roots= ['langchain', 'langchain_classic', 'langchain_core']",
+              "root_submodules= ['agents', 'chat_models', 'messages', 'tools']",
+            ].join('\n'),
+          },
+        },
+      ],
+    });
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.synthesize',
+        params: expect.objectContaining({
+          path: 'src/support_rag/chain.py',
+          strategy: 'patch',
+          instructions: expect.stringMatching(
+            /No module named 'langchain\.chains'[\s\S]*Authoritative installed module layout:[\s\S]*langchain_classic/
+          ),
+        }),
+      }),
+    ]);
+  });
+
   it('bootstraps an explicitly invoked missing development tool after source failures clear', () => {
     const planner = new AgentToolPlanner();
     const bindings = [{ name: 'shell.exec', enabled: true }];

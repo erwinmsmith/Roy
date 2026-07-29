@@ -1905,6 +1905,50 @@ export class AgentToolPlanner {
           ].filter(Boolean).join('\n').trim().slice(0, 4_000);
         }
       }
+      const missingModule = /(?:modulenotfounderror:\s*)?no module named\s+['"]([A-Za-z_][A-Za-z0-9_.]*)['"]/i.exec(
+        causalFailure.output
+      )?.[1];
+      let runtimeModuleLayout = '';
+      if (missingModule && causalFailure.index === latestFailureIndex) {
+        const packageRoot = missingModule.split('.')[0]!;
+        const targetSegments = targetPath.split('/');
+        const missingWorkspaceModule = targetSegments.includes(packageRoot);
+        if (!missingWorkspaceModule) {
+          const layoutCommand = this.pythonModuleLayoutInspectionCommand(
+            missingModule
+          );
+          const layoutCall = input.calls
+            .slice(causalFailure.index + 1)
+            .find(call =>
+              call.toolName === 'shell.exec'
+              && call.success
+              && String(call.params.command ?? '') === layoutCommand
+            );
+          if (!layoutCall && input.bindings.some(binding =>
+            binding.enabled && binding.name === 'shell.exec'
+          )) {
+            return [{
+              toolName: 'shell.exec',
+              params: {
+                command: layoutCommand,
+                maxOutputBytes: 12_000,
+              },
+              reason: `Inspect the installed ${packageRoot} package family and import roots before replacing the missing ${missingModule} import; do not guess a legacy module path.`,
+              groundingRequired: true,
+            }];
+          }
+          if (layoutCall) {
+            const layoutResult = layoutCall.result as {
+              stdout?: unknown;
+              stderr?: unknown;
+            } | undefined;
+            runtimeModuleLayout = [
+              String(layoutResult?.stdout ?? ''),
+              String(layoutResult?.stderr ?? ''),
+            ].filter(Boolean).join('\n').trim().slice(0, 8_000);
+          }
+        }
+      }
       const localizedFailure = causalFailure.output.length <= 2_400
         ? causalFailure.output
         : `[earlier failure output compacted]\n${causalFailure.output.slice(-2_400)}`;
@@ -1913,6 +1957,9 @@ export class AgentToolPlanner {
         `Authoritative failure:\n${localizedFailure}`,
         runtimeSignature
           ? `Authoritative installed runtime signature:\n${runtimeSignature}`
+          : '',
+        runtimeModuleLayout
+          ? `Authoritative installed module layout:\n${runtimeModuleLayout}`
           : '',
         'Use the freshly read current source as the only patch base. Initialize values on every control-flow path, preserve already working behavior, and do not broaden the change beyond the causal failure.',
       ].filter(Boolean).join('\n\n');
@@ -2108,6 +2155,10 @@ export class AgentToolPlanner {
     callableName: string
   ): string {
     return `python -c "import inspect; from ${moduleName} import ${callableName}; print(inspect.signature(${callableName}))"`;
+  }
+
+  private pythonModuleLayoutInspectionCommand(moduleName: string): string {
+    return `python -c "import importlib.metadata as m, importlib.util as u, pkgutil; missing='${moduleName}'; root=missing.split('.')[0]; spec=u.find_spec(root); dists=[d for d in m.distributions() if root.replace('_','-') in str(d.metadata.get('Name','')).lower().replace('_','-')]; print('requested=',missing); print('root_spec=',spec); print('related_distributions=',sorted((str(d.metadata.get('Name','')),d.version) for d in dists)); print('related_import_roots=',sorted({str(f).split('/')[0] for d in dists for f in (d.files or []) if str(f).split('/')[0].isidentifier()})); print('root_submodules=',sorted(x.name for x in pkgutil.iter_modules(spec.submodule_search_locations or [])) if spec else [])"`;
   }
 
   private verifierScorecardState(call: ObservedToolCall): {
