@@ -684,4 +684,4 @@ The test suite covers autonomous task-specific agent/team design, multi-turn str
 
 ## Contact
 
-Use [GitHub Issues](https://github.com/erwinmsmith/Roy/issues) for bug reports and engineering discussions.
+Use [GitHub Issues](https://github.com/erwinmsmith/Roy/issues) for bug reports and engineering discussions or email at duanzhenke@code-soul.com.
