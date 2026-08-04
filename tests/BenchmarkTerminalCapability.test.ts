@@ -3093,6 +3093,115 @@ describe('benchmark terminal capability', () => {
     await runtime.shutdown();
   });
 
+  it('invalidates a locally closed delegated execution when new external verifier feedback arrives', async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), 'roy-delegated-feedback-invalidation-'));
+    await mkdir(path.join(workspace, '.roy'), { recursive: true });
+    await writeFile(path.join(workspace, '.roy', 'config.json'), JSON.stringify({
+      tools: {
+        approval: {
+          readOnly: 'auto',
+          write: 'auto',
+          execute: 'auto',
+          overrides: {},
+        },
+        shell: {
+          unrestricted: true,
+        },
+      },
+    }), 'utf8');
+    await writeFile(path.join(workspace, 'delegated-global.txt'), 'delegated', 'utf8');
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'delegated-feedback-invalidation-test',
+      workspaceCwd: workspace,
+      llmProvider: new TerminalTaskLLM(),
+    });
+    const now = Date.now();
+    const delegatedResults = [{
+      node: { identity: { archetype: 'coder' } },
+      agent: { identity: { name: 'DelegatedWriter' } },
+      subagentResult: {
+        toolCalls: [
+          {
+            toolName: 'shell.exec',
+            params: { command: "printf 'delegated' > delegated-global.txt" },
+            result: { exitCode: 0, stdout: '', stderr: '' },
+            success: true,
+            startedAt: now - 40,
+            completedAt: now - 30,
+          },
+          {
+            toolName: 'shell.exec',
+            params: { command: 'test "$(cat delegated-global.txt)" = delegated' },
+            result: { exitCode: 0, stdout: '', stderr: '' },
+            success: true,
+            startedAt: now - 20,
+            completedAt: now - 10,
+          },
+        ],
+        grounded: true,
+        warnings: [],
+        context: '',
+        evidence: {
+          toolGrounded: true,
+          outputGrounded: true,
+          observedPaths: ['delegated-global.txt'],
+          toolResultSummary: 'DelegatedWriter created and freshly verified delegated-global.txt.',
+        },
+        toolLoop: {
+          rounds: [],
+          totalCalls: 2,
+          successfulCalls: 2,
+          failedCalls: 0,
+          stopReason: 'completed',
+          startedAt: now - 40,
+          completedAt: now - 10,
+        },
+        result: 'Created and verified delegated-global.txt.',
+        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        agent: { identity: { name: 'DelegatedWriter' } },
+      },
+    }];
+    const execute = (runtime as unknown as {
+      runRequiredRootExecution: (
+        task: string,
+        subagents: unknown[],
+        teams: unknown[],
+        correlationId: string
+      ) => Promise<{ toolCalls: Array<{ toolName: string; success: boolean }> }>;
+    }).runRequiredRootExecution.bind(runtime);
+
+    const execution = await execute(
+      [
+        'Repair and verify the workspace after the external verifier rejected the prior result.',
+        '<official_verifier_feedback>',
+        'The project metadata still targets a legacy runtime and must be repaired before verification passes.',
+        '</official_verifier_feedback>',
+      ].join('\n'),
+      delegatedResults,
+      [],
+      'delegated-feedback-invalidation-correlation'
+    );
+
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'root.execution.delegated.closure.invalidated',
+      data: expect.objectContaining({
+        mutationApplied: true,
+        verificationPassed: true,
+        reason: expect.stringContaining('external verifier feedback'),
+      }),
+    }));
+    expect(runtime.getEvents()).not.toContainEqual(expect.objectContaining({
+      type: 'root.execution.delegated.closure.reused',
+    }));
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'tool.call',
+      agentId: 'root',
+    }));
+    expect(execution.toolCalls.length).toBeGreaterThan(2);
+    await runtime.shutdown();
+  });
+
   it('re-enters root execution when the first direct attempt is not verified', async () => {
     const workspace = await mkdtemp(path.join(tmpdir(), 'roy-direct-execution-retry-'));
     await mkdir(path.join(workspace, '.roy'), { recursive: true });

@@ -21669,11 +21669,23 @@ For web-grounded work, use only facts present in the subagent report or runtime 
     const auditRequired = this.taskRequiresAcceptanceAudit(userTask);
     const deferInitialAcceptanceToExternalVerifier =
       this.shouldDeferInitialAcceptanceToExternalVerifier(userTask);
+    const externalExecutionFeedback = this.containsExternalExecutionFeedback(userTask);
     if (delegatedExecution) {
       const delegatedClosure = this.analyzeWorkspaceExecutionClosure(
         delegatedExecution.toolCalls
       );
-      if (delegatedClosure.closed) {
+      if (delegatedClosure.closed && externalExecutionFeedback) {
+        this.emit({
+          type: 'root.execution.delegated.closure.invalidated',
+          agentId: 'root',
+          correlationId,
+          data: {
+            ...delegatedClosure,
+            reason: 'New external verifier feedback invalidates the prior local closure and requires a fresh repair-and-verification cycle.',
+            toolCalls: delegatedExecution.toolCalls.length,
+          },
+        });
+      } else if (delegatedClosure.closed) {
         this.emit({
           type: 'root.execution.delegated.closure.reused',
           agentId: 'root',
