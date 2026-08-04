@@ -18961,6 +18961,39 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         groundingRequired: true,
       };
     };
+    const pendingAuthoritativeVerifierPlan = (
+      calls: ToolCallRecord[]
+    ): PlannedToolCall | undefined => {
+      const mirrored = pendingMirroredVerifierPlan(calls);
+      if (mirrored) return mirrored;
+      const taskDeclared = this.toolPlanner.planPostMutationVerification({
+        task: intentTask,
+        calls,
+        bindings,
+      })[0];
+      if (taskDeclared) return taskDeclared;
+      const latestMutationIndex =
+        effectiveWorkspaceMutationCallIndices(calls).at(-1) ?? -1;
+      if (latestMutationIndex < 0) return undefined;
+      const priorVerification = this.selectAuthoritativePriorVerification(
+        calls,
+        intentTask
+      );
+      const command = String(priorVerification?.params.command ?? '').trim();
+      if (!command || calls.some((call, index) =>
+        index > latestMutationIndex
+        && call.toolName === 'shell.exec'
+        && String(call.params.command ?? '').trim() === command
+      )) {
+        return undefined;
+      }
+      return {
+        toolName: 'shell.exec',
+        params: { command },
+        reason: 'Re-run the highest-authority observed verifier after the retained workspace mutation before allowing another agent to start a new mutation hypothesis.',
+        groundingRequired: true,
+      };
+    };
     if (diagnosticProbeRequired) {
       const diagnosticSourcePath = this.extractTaskDiagnosticSourcePaths(
         intentTask
@@ -19365,21 +19398,26 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       options
     );
     plans = this.keepSingleWorkspaceMutationHypothesis(plans, agentId, options);
-    const pendingInitialMirroredVerifier = pendingMirroredVerifierPlan(
+    const pendingInitialVerifier = pendingAuthoritativeVerifierPlan(
       priorPlannerCalls
     );
-    if (pendingInitialMirroredVerifier && !unresolvedSynthesisRejection) {
-      plans = [pendingInitialMirroredVerifier];
+    if (pendingInitialVerifier && !unresolvedSynthesisRejection) {
+      plans = [pendingInitialVerifier];
+      const mirrored = String(
+        pendingInitialVerifier.params.command ?? ''
+      ).includes('.roy/official-verifier/grade.py');
       this.emit({
-        type: 'tool.plan.mirrored_verifier_barrier',
+        type: mirrored
+          ? 'tool.plan.mirrored_verifier_barrier'
+          : 'tool.plan.post_mutation_verification',
         agentId,
         sessionId: this.getContext().sessionId,
         correlationId: options.correlationId,
         nodeId: options.nodeId,
         data: {
           phase: 'initial',
-          command: mirroredVerifierCommand,
-          reason: 'prior_workspace_mutation_requires_objective_feedback',
+          command: pendingInitialVerifier.params.command,
+          reason: 'prior_workspace_mutation_requires_objective_feedback_before_next_agent',
         },
       });
     }

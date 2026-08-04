@@ -2262,6 +2262,91 @@ describe('benchmark terminal capability', () => {
     await runtime.shutdown();
   });
 
+  it('verifies a retained mutation before a different agent can mutate again', async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), 'roy-cross-agent-verifier-barrier-'));
+    await mkdir(path.join(workspace, '.roy'), { recursive: true });
+    await writeFile(
+      path.join(workspace, '.roy', 'config.json'),
+      JSON.stringify({
+        tools: {
+          approval: { readOnly: 'auto', write: 'auto', execute: 'auto' },
+          shell: { mode: 'unrestricted', shell: '/bin/sh' },
+        },
+      })
+    );
+    await writeFile(path.join(workspace, 'implementation.py'), 'VALUE = 1\n');
+    await writeFile(
+      path.join(workspace, 'check.py'),
+      'from pathlib import Path\nassert "VALUE = 1" in Path("implementation.py").read_text()\n'
+    );
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'cross-agent-verifier-barrier-test',
+      workspaceCwd: workspace,
+    });
+    const task = [
+      'Repair implementation.py and preserve verified behavior.',
+      'Run this verification command:',
+      '```bash',
+      'python check.py',
+      '```',
+    ].join('\n');
+    const grounding = await (runtime as unknown as {
+      runGroundingCheck: (
+        agentId: string,
+        task: string,
+        options: Record<string, unknown>
+      ) => Promise<{ toolCalls: Array<{ toolName: string; params: Record<string, unknown> }> }>;
+    }).runGroundingCheck(
+      'root',
+      task,
+      {
+        correlationId: 'cross-agent-verifier-barrier-turn',
+        intentTask: task,
+        priorToolCalls: [{
+          toolName: 'fs.replace',
+          params: {
+            path: 'implementation.py',
+            oldText: 'VALUE = 0',
+            newText: 'VALUE = 1',
+            expectedReplacements: 1,
+          },
+          result: { path: 'implementation.py', replacements: 1 },
+          success: true,
+        }],
+        initialPlans: [{
+          toolName: 'fs.replace',
+          params: {
+            path: 'implementation.py',
+            oldText: 'VALUE = 1',
+            newText: 'VALUE = 2',
+            expectedReplacements: 1,
+          },
+          reason: 'A second agent proposes another mutation.',
+          groundingRequired: true,
+        }],
+        skipInitialModelPlanning: true,
+      }
+    );
+
+    expect(grounding.toolCalls[0]).toEqual(expect.objectContaining({
+      toolName: 'shell.exec',
+      params: expect.objectContaining({ command: 'python check.py' }),
+    }));
+    expect(grounding.toolCalls).not.toContainEqual(expect.objectContaining({
+      toolName: 'fs.replace',
+      params: expect.objectContaining({ newText: 'VALUE = 2' }),
+    }));
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'tool.plan.post_mutation_verification',
+      data: expect.objectContaining({
+        phase: 'initial',
+        reason: 'prior_workspace_mutation_requires_objective_feedback_before_next_agent',
+      }),
+    }));
+    await runtime.shutdown();
+  });
+
   it('lets concrete recovery feedback supersede a cached rejected target', async () => {
     const workspace = await mkdtemp(path.join(tmpdir(), 'roy-external-feedback-frontier-'));
     await mkdir(path.join(workspace, '.roy'), { recursive: true });
