@@ -50,6 +50,7 @@ describe('AgentToolPlanner', () => {
 
     expect(focus).toEqual({
       summary: 'router structure violations remain in src/app/router.py',
+      path: 'src/app/router.py',
       authoritativeVerifierCommand:
         'python -m pytest -q .roy/official-verifier/test_outputs.py',
     });
@@ -91,6 +92,27 @@ describe('AgentToolPlanner', () => {
       currentPhaseCalls
     )).toEqual({
       summary: 'source violations in calls: src/app/retriever.py uses removed_api()',
+      path: 'src/app/retriever.py',
+    });
+  });
+
+  it('extracts a bare workspace source path from verifier prose', () => {
+    const focus = effectiveRecoveryFeedbackFocus(
+      '<official_verifier_feedback>outer failure</official_verifier_feedback>',
+      [{
+        toolName: 'shell.exec',
+        params: { command: 'python -m pytest -q' },
+        success: false,
+        result: {
+          exitCode: 1,
+          stderr: 'AssertionError: source violations in calls: src/pkg/retriever.py calls removed_api()',
+        },
+      }]
+    );
+
+    expect(focus).toEqual({
+      summary: 'source violations in calls: src/pkg/retriever.py calls removed_api()',
+      path: 'src/pkg/retriever.py',
     });
   });
 

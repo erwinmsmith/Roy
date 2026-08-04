@@ -49,6 +49,9 @@ function latestDiagnosticSourcePath(output: string): string | undefined {
     ...[...output.matchAll(
       /(?:^|[\s(])((?:\/app\/|\.\/|src\/)[A-Za-z0-9_./-]+\.(?:py|js|mjs|cjs|ts|tsx|jsx|java|go|rs|rb|php|sh)):\d+(?::\d+)?/g
     )].map(match => match[1]!),
+    ...[...output.matchAll(
+      /(?:^|[\s("'`])((?:\/app\/|\.\/|src\/)[A-Za-z0-9_./-]+\.(?:py|js|mjs|cjs|ts|tsx|jsx|java|go|rs|rb|php|sh))(?=$|[\s,"'`:;)\]}])/g
+    )].map(match => match[1]!),
   ]
     .map(value => value.replace(/^\/app\//, '').replace(/^\.\//, ''))
     .filter(value =>
