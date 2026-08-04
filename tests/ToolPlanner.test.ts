@@ -55,6 +55,45 @@ describe('AgentToolPlanner', () => {
     });
   });
 
+  it('keeps a fresh local verifier frontier authoritative across root attempts', () => {
+    const task = [
+      'Continue repairing the workspace.',
+      '## VERIFICATION FAILED — CONTINUE WORKING',
+      'Verifier feedback:',
+      'project metadata still targets a legacy dependency runtime',
+      '<official_verifier_feedback>',
+      'The previous outer verifier failed the dependency gate.',
+      '</official_verifier_feedback>',
+    ].join('\n');
+    const priorCalls = [{
+      toolName: 'fs.read',
+      params: { path: 'pyproject.toml' },
+      success: true,
+      result: {
+        path: 'pyproject.toml',
+        content: 'dependencies = ["runtime==2.0"]\n',
+      },
+    }];
+    const currentPhaseCalls = [{
+      toolName: 'shell.exec',
+      params: { command: 'python -m pytest -q' },
+      success: false,
+      result: {
+        cwd: '/app',
+        exitCode: 1,
+        stderr: 'AssertionError: source violations in calls: src/app/retriever.py uses removed_api()',
+      },
+    }];
+
+    expect(effectiveRecoveryFeedbackFocus(
+      task,
+      priorCalls,
+      currentPhaseCalls
+    )).toEqual({
+      summary: 'source violations in calls: src/app/retriever.py uses removed_api()',
+    });
+  });
+
   it('derives concrete verifier focus from calls when a recovery capsule is absent', () => {
     const focus = effectiveRecoveryFeedbackFocus(
       [

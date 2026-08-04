@@ -146,7 +146,11 @@ import {
 } from '../team/index.js';
 import { ToolApprovalManager, type ToolApprovalRequest } from '../tools/approval.js';
 import type { ToolResult } from '../tools/types.js';
-import { AgentToolPlanner, type PlannedToolCall } from '../tools/planner.js';
+import {
+  AgentToolPlanner,
+  effectiveRecoveryFeedbackFocus,
+  type PlannedToolCall,
+} from '../tools/planner.js';
 import {
   InMemoryMessageQueue,
   MessageScheduler,
@@ -18753,6 +18757,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       skipInitialModelPlanning?: boolean;
       toolAllowlist?: string[];
       priorToolCalls?: ToolCallRecord[];
+      currentPhaseToolCalls?: ToolCallRecord[];
       requireFreshMutation?: boolean;
       onBeforeExecution?: (plans: PlannedToolCall[]) => Promise<void>;
     }
@@ -18781,6 +18786,21 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       toolName: call.toolName,
       params: call.params,
       reason: call.reason ?? 'Completed by a prior actor or execution attempt.',
+      groundingRequired: true,
+      result: call.result,
+      success: call.success,
+      error: call.error,
+      startedAt: call.startedAt,
+      completedAt: call.completedAt,
+    }));
+    // Calls from earlier root-closure attempts in this same outer verifier
+    // phase are newer than the feedback embedded in the task. Keep that
+    // causal frontier separate from persisted calls restored from an older
+    // phase so fresh local verification can supersede stale outer feedback.
+    const currentPhasePlannerCalls = (options.currentPhaseToolCalls ?? []).map(call => ({
+      toolName: call.toolName,
+      params: call.params,
+      reason: call.reason ?? 'Completed by an earlier root attempt in the current verifier phase.',
       groundingRequired: true,
       result: call.result,
       success: call.success,
@@ -19019,9 +19039,11 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       if (shellAvailable) diagnosticPlans.push(diagnosticExecution);
       plans.unshift(...diagnosticPlans);
     }
-    const concreteExternalFeedback = this.latestExternalVerificationFeedback(
-      intentTask
-    );
+    const concreteExternalFeedback = effectiveRecoveryFeedbackFocus(
+      intentTask,
+      priorPlannerCalls,
+      currentPhasePlannerCalls
+    ) ?? this.latestExternalVerificationFeedback(intentTask);
     const cachedRejectedVerifierCandidate = this.latestRejectedVerifierCandidate(
       priorPlannerCalls
     );
@@ -19128,7 +19150,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       const externalFeedbackRepair = this.toolPlanner.planExternalFeedbackRepair({
         task: intentTask,
         calls: priorPlannerCalls,
-        currentCalls: [],
+        currentCalls: currentPhasePlannerCalls,
         bindings,
         workspaceRoot: this.workspaceRoot,
       });
@@ -19646,7 +19668,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
           ? this.toolPlanner.planExternalFeedbackRepair({
             task: intentTask,
             calls: [...priorPlannerCalls, ...context.calls],
-            currentCalls: context.calls,
+            currentCalls: [...currentPhasePlannerCalls, ...context.calls],
             bindings,
             workspaceRoot: this.workspaceRoot,
           })
@@ -19752,7 +19774,7 @@ For web-grounded work, use only facts present in the subagent report or runtime 
         const externalFeedbackRepair = this.toolPlanner.planExternalFeedbackRepair({
           task: intentTask,
           calls: [...priorPlannerCalls, ...context.calls],
-          currentCalls: context.calls,
+          currentCalls: [...currentPhasePlannerCalls, ...context.calls],
           bindings,
           workspaceRoot: this.workspaceRoot,
         });
@@ -21778,6 +21800,9 @@ For web-grounded work, use only facts present in the subagent report or runtime 
           intentTask: executionIntentTask,
           maxWallClockMs: attemptWallClockMs,
           priorToolCalls: priorExecution?.toolCalls ?? delegatedExecution?.toolCalls,
+          currentPhaseToolCalls: attempts
+            .flatMap(item => item.toolCalls)
+            .slice(-96),
           requireFreshMutation: this.shouldRequireFreshAcceptanceMutation(
             priorClosure,
             acceptanceAuditInvalidated,
