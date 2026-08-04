@@ -1168,6 +1168,16 @@ export class AgentToolPlanner {
       ...feedbackLocations.map(location => location.path),
     ].map(path => this.normalizeWorkspacePath(path)));
     const semanticIdentifiers = semanticFeedbackIdentifiers(feedback);
+    const missingImport = /(?:ImportError:\s*)?cannot import name\s+['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s+from\s+['"][^'"]+['"]\s+\(([^)\n]+)\)/i.exec(
+      feedback
+    );
+    const missingImportProviderPath = missingImport
+      ? this.extractFailureLocations(
+        missingImport[2]!,
+        input.workspaceRoot ?? '',
+        input.workspaceRoot
+      )[0]?.path
+      : undefined;
     const manifestPriority = (candidatePath: string): number => {
       const lowerPath = candidatePath.toLowerCase();
       if (/(?:^|\/)pyproject\.toml$/.test(lowerPath)) return 420;
@@ -1230,23 +1240,52 @@ export class AgentToolPlanner {
         }];
       }
     }
-    const mutatedPaths = new Set((input.currentCalls ?? input.calls)
-      .filter(call => isSuccessfulWorkspaceMutationCall(call))
-      .map(call => this.normalizeWorkspacePath(String(call.params.path ?? '')))
-      .filter(Boolean));
-    const latestReadsByPath = new Map<string, ObservedToolCall>();
-    for (const call of [...input.calls].reverse()) {
+    const activeCalls = input.currentCalls ?? input.calls;
+    const latestMutationIndexByPath = new Map<string, number>();
+    activeCalls.forEach((call, index) => {
+      if (!isSuccessfulWorkspaceMutationCall(call)) return;
+      const path = this.normalizeWorkspacePath(String(call.params.path ?? ''));
+      if (path) latestMutationIndexByPath.set(path, index);
+    });
+    const latestReadsByPath = new Map<string, {
+      call: ObservedToolCall;
+      activeIndex: number;
+    }>();
+    for (let index = input.calls.length - 1; index >= 0; index -= 1) {
+      const call = input.calls[index]!;
       if (call.toolName !== 'fs.read' || !call.success) continue;
       const result = call.result as { path?: unknown } | undefined;
       const path = this.normalizeWorkspacePath(String(
         result?.path ?? call.params.path ?? ''
       ));
       if (path && !latestReadsByPath.has(path)) {
-        latestReadsByPath.set(path, call);
+        latestReadsByPath.set(path, {
+          call,
+          activeIndex: activeCalls === input.calls
+            ? index
+            : activeCalls.lastIndexOf(call),
+        });
+      }
+    }
+    if (missingImportProviderPath
+      && input.bindings.some(binding => binding.enabled && binding.name === 'fs.read')) {
+      const providerMutationIndex = latestMutationIndexByPath.get(
+        missingImportProviderPath
+      ) ?? -1;
+      const providerReadIndex = latestReadsByPath.get(
+        missingImportProviderPath
+      )?.activeIndex ?? -1;
+      if (providerMutationIndex >= 0 && providerReadIndex < providerMutationIndex) {
+        return [{
+          toolName: 'fs.read',
+          params: { path: missingImportProviderPath },
+          reason: `The failed import names ${missingImportProviderPath} as the symbol provider, and that file changed after its last snapshot; refresh the provider before repairing the interface boundary.`,
+          groundingRequired: true,
+        }];
       }
     }
     const candidates = [...latestReadsByPath.values()]
-      .map(call => {
+      .map(({ call, activeIndex }) => {
         const result = call.result as { path?: unknown; content?: unknown } | undefined;
         const candidatePath = this.normalizeWorkspacePath(String(
           result?.path ?? call.params.path ?? ''
@@ -1254,6 +1293,7 @@ export class AgentToolPlanner {
         return {
           path: candidatePath,
           content: typeof result?.content === 'string' ? result.content : '',
+          activeReadIndex: activeIndex,
         };
       })
       .filter(candidate =>
@@ -1263,13 +1303,22 @@ export class AgentToolPlanner {
           this.isMutableImplementationPath(candidate.path)
           || dependencyFeedback && manifestPriority(candidate.path) > 0
         )
-        && !mutatedPaths.has(candidate.path)
+        && candidate.activeReadIndex >= (
+          latestMutationIndexByPath.get(candidate.path) ?? -1
+        )
       )
       .map(candidate => {
         const lowerPath = candidate.path.toLowerCase();
         let grounded = explicitFeedbackPaths.has(candidate.path);
         let score = grounded ? 500 : 0;
         if (this.isMutableImplementationPath(candidate.path)) score += 40;
+        if (candidate.path === missingImportProviderPath) {
+          grounded = true;
+          // A provider changed during this repair phase and then failed to
+          // export its advertised symbol. Prefer the freshly grounded
+          // provider over incidental importer frames elsewhere in the stack.
+          score += 1_800;
+        }
         const matchingIdentifiers = semanticIdentifiers.filter(identifier =>
           new RegExp(
             `\\b${identifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`,
@@ -1340,6 +1389,9 @@ export class AgentToolPlanner {
       `Authoritative external feedback:\n${compactFeedback}`,
       verifierContract
         ? `${verifierContract}\nTreat these executable assertions and constants as the exact acceptance contract; do not replace an exact constraint with a looser guess.`
+        : '',
+      missingImportProviderPath && missingImport?.[1]
+        ? `The traceback identifies ${missingImportProviderPath} as the provider of missing symbol ${missingImport[1]}. Repair that interface coherently; do not change an unrelated entry point merely because it appears earlier in the call stack.`
         : '',
       'Use the already observed current file as the patch base. Preserve unrelated working declarations and do not alter benchmark or verifier files.',
     ].filter(Boolean).join('\n\n');

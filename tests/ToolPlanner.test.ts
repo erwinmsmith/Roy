@@ -1321,6 +1321,139 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('regrounds a mutated import provider before repairing a new interface failure', () => {
+    const planner = new AgentToolPlanner();
+    const task = [
+      'Continue the application migration.',
+      '<official_verifier_feedback>',
+      'project metadata still targets a legacy runtime',
+      '</official_verifier_feedback>',
+    ].join('\n');
+    const currentCalls = [
+      {
+        toolName: 'fs.read',
+        params: { path: 'src/app/models.py' },
+        success: true,
+        result: {
+          path: 'src/app/models.py',
+          content: 'class LegacyModel:\n    pass\n',
+        },
+      },
+      {
+        toolName: 'fs.synthesize',
+        params: {
+          path: 'src/app/models.py',
+          instructions: 'Migrate the model provider.',
+          strategy: 'patch',
+        },
+        success: true,
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m app.cli' },
+        success: false,
+        result: {
+          cwd: '/app',
+          exitCode: 1,
+          stderr: [
+            'Traceback (most recent call last):',
+            '  File "/app/src/app/cli.py", line 4, in <module>',
+            '    from app.models import LegacyModel',
+            "ImportError: cannot import name 'LegacyModel' from 'app.models' (/app/src/app/models.py)",
+          ].join('\n'),
+        },
+      },
+    ];
+
+    expect(planner.planExternalFeedbackRepair({
+      task,
+      calls: currentCalls,
+      currentCalls,
+      bindings: [
+        { name: 'fs.read', enabled: true },
+        { name: 'fs.synthesize', enabled: true },
+      ],
+      workspaceRoot: '/app',
+    })).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.read',
+        params: { path: 'src/app/models.py' },
+        reason: expect.stringContaining('symbol provider'),
+      }),
+    ]);
+  });
+
+  it('repairs a freshly regrounded import provider instead of an incidental entry point', () => {
+    const planner = new AgentToolPlanner();
+    const task = '<official_verifier_feedback>outer failure</official_verifier_feedback>';
+    const currentCalls = [
+      {
+        toolName: 'fs.read',
+        params: { path: 'src/app/cli.py' },
+        success: true,
+        result: {
+          path: 'src/app/cli.py',
+          content: 'from app.models import LegacyModel\n',
+        },
+      },
+      {
+        toolName: 'fs.synthesize',
+        params: {
+          path: 'src/app/models.py',
+          instructions: 'Migrate the model provider.',
+          strategy: 'patch',
+        },
+        success: true,
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m app.cli' },
+        success: false,
+        result: {
+          cwd: '/app',
+          exitCode: 1,
+          stderr: [
+            'Traceback (most recent call last):',
+            '  File "/app/src/app/cli.py", line 4, in <module>',
+            '    from app.models import LegacyModel',
+            "ImportError: cannot import name 'LegacyModel' from 'app.models' (/app/src/app/models.py)",
+          ].join('\n'),
+        },
+      },
+      {
+        toolName: 'fs.read',
+        params: { path: 'src/app/models.py' },
+        success: true,
+        result: {
+          path: 'src/app/models.py',
+          content: 'class ModernModel:\n    pass\n',
+        },
+      },
+    ];
+
+    expect(planner.planExternalFeedbackRepair({
+      task,
+      calls: currentCalls,
+      currentCalls,
+      bindings: [
+        { name: 'fs.read', enabled: true },
+        { name: 'fs.synthesize', enabled: true },
+      ],
+      workspaceRoot: '/app',
+    })).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.synthesize',
+        params: expect.objectContaining({
+          path: 'src/app/models.py',
+          instructions: expect.stringMatching(
+            /provider of missing symbol LegacyModel[\s\S]*do not change an unrelated entry point/i
+          ),
+          strategy: 'patch',
+        }),
+      }),
+    ]);
+  });
+
   it('lets the newest recovery capsule supersede stale dependency feedback', () => {
     const planner = new AgentToolPlanner();
     const task = [
