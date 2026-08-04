@@ -19813,6 +19813,21 @@ For web-grounded work, use only facts present in the subagent report or runtime 
           });
           return [];
         }
+        if (concreteExternalFeedback) {
+          this.emit({
+            type: 'agent.tool_loop.external_feedback_barrier',
+            agentId,
+            sessionId: this.getContext().sessionId,
+            correlationId: options.correlationId,
+            nodeId: options.nodeId,
+            data: {
+              round: context.round,
+              summary: concreteExternalFeedback.summary,
+              reason: 'authoritative_external_feedback_has_no_new_causal_plan',
+            },
+          });
+          return [];
+        }
         const workspaceEvidencePlans = this.toolPlanner.planWorkspaceEvidenceFollowUps({
           task: intentTask,
           calls: combinedCalls,
