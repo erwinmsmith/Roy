@@ -272,12 +272,18 @@ function readNonNegativeInteger(value: string | undefined, fallback: number): nu
 function requestOptions(
   options: LLMCompletionOptions | undefined,
   configuredTimeoutMs: number | undefined
-): { timeout: number } {
+): { timeout: number; signal: AbortSignal } {
   const configured = configuredTimeoutMs ?? 120_000;
   const requested = options?.timeoutMs;
+  const timeout = Number.isFinite(requested) && Number(requested) > 0
+    ? Math.max(1, Math.min(configured, Math.floor(Number(requested))))
+    : configured;
   return {
-    timeout: Number.isFinite(requested) && Number(requested) > 0
-      ? Math.max(1, Math.min(configured, Math.floor(Number(requested))))
-      : configured,
+    timeout,
+    // The SDK timeout alone does not reliably close OpenAI-compatible responses
+    // that send headers or keepalive bytes but never finish their JSON body.
+    // A request-scoped abort signal enforces an end-to-end attempt deadline while
+    // leaving Runtime responsible for task-level retry and recovery policy.
+    signal: AbortSignal.timeout(timeout),
   };
 }

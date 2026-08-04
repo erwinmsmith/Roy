@@ -15348,11 +15348,11 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
     const code = typeof value?.code === 'string' ? value.code.toUpperCase() : '';
     const status = typeof value?.status === 'number' ? value.status : undefined;
     const message = String(value?.message ?? error ?? '').toLowerCase();
-    if (['ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ETIMEDOUT', 'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT'].includes(code)) {
+    if (['ABORT_ERR', 'ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ETIMEDOUT', 'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT'].includes(code)) {
       return true;
     }
     if (status !== undefined && [408, 409, 425, 429, 500, 502, 503, 504].includes(status)) return true;
-    return /premature close|socket hang up|connection (?:error|(?:was )?(?:closed|reset))|stream (?:was )?(?:closed|terminated)|fetch failed|network error|timed? ?out|temporarily unavailable|service unavailable/.test(message);
+    return /premature close|request (?:was )?aborted|abort(?:ed|error)|socket hang up|connection (?:error|(?:was )?(?:closed|reset))|stream (?:was )?(?:closed|terminated)|fetch failed|network error|timed? ?out|temporarily unavailable|service unavailable/.test(message);
   }
 
   private rethrowRetryableLLMTransportError(error: unknown): void {

@@ -159,6 +159,7 @@ class StreamResilienceLLM implements LLMProvider {
   private connectionRetryAttempts = 0;
   private recoveredTurnAttempts = 0;
   private decisionConnectionAttempts = 0;
+  private decisionAbortAttempts = 0;
   private jsonRetryAttempts = 0;
   lastJSONMaxTokens?: number;
 
@@ -193,6 +194,10 @@ class StreamResilienceLLM implements LLMProvider {
     if (text.includes('DECISION_CONNECTION_RETRY')
       && this.decisionConnectionAttempts++ === 0) {
       throw new Error('Connection error.');
+    }
+    if (text.includes('DECISION_ABORT_RETRY')
+      && this.decisionAbortAttempts++ === 0) {
+      throw new Error('Request was aborted.');
     }
     if (text.includes('JSON_RETRY') && this.jsonRetryAttempts++ === 0) {
       throw new Error('Failed to parse JSON response: {"action":"solve_directly"');
@@ -641,6 +646,46 @@ describe('Autonomous multi-turn actor design', () => {
     }));
     expect(runtime.getEvents()).not.toContainEqual(expect.objectContaining({
       type: 'runtime.transient_turn.retrying',
+    }));
+    await runtime.shutdown();
+  });
+
+  it('retries a request-deadline abort as a transient JSON transport failure', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-json-abort-retry-'));
+    await mkdir(path.join(workspaceCwd, '.roy'), { recursive: true });
+    await writeFile(path.join(workspaceCwd, '.roy', 'config.json'), JSON.stringify({
+      llm: {
+        jsonMaxAttempts: 2,
+        turnMaxAttempts: 1,
+        retryInitialDelayMs: 0,
+        retryMaxDelayMs: 0,
+      },
+      tom: { autoCompleteGaps: false, minimumCoverage: 0 },
+    }, null, 2));
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'json-abort-retry-test',
+      workspaceCwd,
+      llmProvider: new StreamResilienceLLM(),
+    });
+
+    const recovery = await runtime.handleUserTurnWithRecovery(
+      'DECISION_ABORT_RETRY: answer this concrete bounded task directly.'
+    );
+
+    expect(recovery.result.finalResponse).toBe('The retried turn completed once.');
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'llm.json.retrying',
+      data: expect.objectContaining({
+        purpose: 'root.delegation_decision',
+        attempt: 1,
+        retryable: true,
+        error: 'Request was aborted.',
+      }),
+    }));
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'llm.json.recovered',
+      data: expect.objectContaining({ attempt: 2 }),
     }));
     await runtime.shutdown();
   });
