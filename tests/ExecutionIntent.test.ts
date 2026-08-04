@@ -194,6 +194,75 @@ describe('workspace execution intent', () => {
     )).toBe(false);
   });
 
+  it('shares rolled-back no-gain hypotheses until another objective advances', () => {
+    const rollback = {
+      restored: true,
+      path: 'src/app.py',
+      reason: 'no_objective_gain',
+      baselineReward: 0.4,
+      candidateReward: 0.4,
+      improvedGroups: [],
+    };
+    const calls = [
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python verifier.py' },
+        success: true,
+        result: { candidateRollback: rollback },
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python verifier.py' },
+        success: true,
+        result: { candidateRollback: rollback },
+      },
+    ];
+
+    expect(workspaceTargetNeedsFreshNoGainEvidence(
+      calls,
+      'src/app.py'
+    )).toBe(true);
+
+    calls.push(
+      {
+        toolName: 'fs.read',
+        params: { path: 'src/app.py' },
+        success: true,
+        result: { path: 'src/app.py', content: 'unchanged source' },
+      },
+      {
+        toolName: 'fs.read',
+        params: { path: '.roy/official-verifier/grade.py' },
+        success: true,
+        result: { path: '.roy/official-verifier/grade.py', content: 'unchanged verifier' },
+      }
+    );
+    expect(workspaceTargetNeedsFreshNoGainEvidence(
+      calls,
+      'src/app.py'
+    )).toBe(true);
+
+    calls.push({
+      toolName: 'shell.exec',
+      params: { command: 'python verifier.py' },
+      success: true,
+      result: {
+        candidateRetention: {
+          retained: true,
+          path: 'src/dependency.py',
+          reason: 'objective_progress',
+          baselineReward: 0.4,
+          candidateReward: 0.5,
+          improvedGroups: [{ group: 'imports', before: 0, after: 1 }],
+        },
+      },
+    });
+    expect(workspaceTargetNeedsFreshNoGainEvidence(
+      calls,
+      'src/app.py'
+    )).toBe(false);
+  });
+
   it('does not accept verification commands that mask a failing exit status', () => {
     expect(isSuccessfulWorkspaceVerificationCall({
       toolName: 'shell.exec',

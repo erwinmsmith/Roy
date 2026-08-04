@@ -336,19 +336,58 @@ export function workspaceTargetNeedsFreshNoGainEvidence(
   const normalizedTarget = normalizeWorkspaceRelativePath(targetPath);
   if (!normalizedTarget || attemptLimit < 1) return false;
   const retainedIndices: number[] = [];
+  const rolledBackIndices: number[] = [];
   for (let index = 0; index < calls.length; index += 1) {
     const retention = workspaceCandidateRetentionFromCall(calls[index]!);
-    if (!retention) continue;
-    const retainedPath = normalizeWorkspaceRelativePath(String(retention.path ?? ''));
-    const noRewardGain = typeof retention.baselineReward !== 'number'
-      || typeof retention.candidateReward !== 'number'
-      || retention.candidateReward <= retention.baselineReward + 1e-12;
-    if (retainedPath === normalizedTarget
-      && noRewardGain
-      && (retention.improvedGroups?.length ?? 0) === 0
-      && (retention.improvedFailureFrontiers?.length ?? 0) === 0) {
-      retainedIndices.push(index);
+    if (retention) {
+      const retainedPath = normalizeWorkspaceRelativePath(String(retention.path ?? ''));
+      const noRewardGain = typeof retention.baselineReward !== 'number'
+        || typeof retention.candidateReward !== 'number'
+        || retention.candidateReward <= retention.baselineReward + 1e-12;
+      if (retainedPath === normalizedTarget
+        && noRewardGain
+        && (retention.improvedGroups?.length ?? 0) === 0
+        && (retention.improvedFailureFrontiers?.length ?? 0) === 0) {
+        retainedIndices.push(index);
+      }
     }
+    const rollback = workspaceCandidateRollbackFromCall(calls[index]!);
+    if (rollback) {
+      const rollbackPath = normalizeWorkspaceRelativePath(String(rollback.path ?? ''));
+      const noRewardGain = typeof rollback.baselineReward !== 'number'
+        || typeof rollback.candidateReward !== 'number'
+        || rollback.candidateReward <= rollback.baselineReward + 1e-12;
+      if (rollbackPath === normalizedTarget
+        && noRewardGain
+        && (rollback.improvedGroups?.length ?? 0) === 0) {
+        rolledBackIndices.push(index);
+      }
+    }
+  }
+  if (rolledBackIndices.length >= attemptLimit) {
+    const latestRollbackIndex = rolledBackIndices.at(-1)!;
+    // A rollback restores the same source snapshot, so merely rereading that
+    // snapshot and the same verifier does not create a new repair hypothesis.
+    // Reopen the path only after another accepted candidate advances an
+    // objective frontier; the new workspace state can then make this target
+    // causally different from the rejected attempts.
+    const objectiveAdvancedElsewhere = calls
+      .slice(latestRollbackIndex + 1)
+      .some(call => {
+        const retention = workspaceCandidateRetentionFromCall(call);
+        if (!retention) return false;
+        const retainedPath = normalizeWorkspaceRelativePath(String(
+          retention.path ?? ''
+        ));
+        const rewardImproved = typeof retention.baselineReward === 'number'
+          && typeof retention.candidateReward === 'number'
+          && retention.candidateReward > retention.baselineReward + 1e-12;
+        return retainedPath !== normalizedTarget
+          && (rewardImproved
+            || (retention.improvedGroups?.length ?? 0) > 0
+            || (retention.improvedFailureFrontiers?.length ?? 0) > 0);
+      });
+    return !objectiveAdvancedElsewhere;
   }
   if (retainedIndices.length < attemptLimit) return false;
   const latestRetentionIndex = retainedIndices.at(-1)!;
