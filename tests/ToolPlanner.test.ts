@@ -1515,6 +1515,87 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('updates a stale importer when the authoritative contract removed its symbol', () => {
+    const planner = new AgentToolPlanner();
+    const task = [
+      '<recovery_capsule>',
+      JSON.stringify({
+        recoveryTrigger: 'new_external_verifier_feedback',
+        externalFeedback: {
+          summary: 'source violations in stubs: src/app/models.py defines LegacyModel',
+          path: 'src/app/models.py',
+        },
+      }),
+      '</recovery_capsule>',
+    ].join('\n');
+    const currentCalls = [
+      {
+        toolName: 'fs.read',
+        params: { path: 'src/app/models.py' },
+        success: true,
+        result: {
+          path: 'src/app/models.py',
+          content: 'class LegacyModel:\n    pass\n',
+        },
+      },
+      {
+        toolName: 'fs.read',
+        params: { path: 'src/app/chain.py' },
+        success: true,
+        result: {
+          path: 'src/app/chain.py',
+          content: 'from app.models import LegacyModel\n',
+        },
+      },
+      {
+        toolName: 'fs.synthesize',
+        params: {
+          path: 'src/app/models.py',
+          instructions: 'Remove the forbidden legacy model.',
+          strategy: 'patch',
+        },
+        success: true,
+      },
+      {
+        toolName: 'shell.exec',
+        params: { command: 'python -m app.cli' },
+        success: false,
+        result: {
+          cwd: '/app',
+          exitCode: 1,
+          stderr: [
+            'Traceback (most recent call last):',
+            '  File "/app/src/app/chain.py", line 1, in <module>',
+            '    from app.models import LegacyModel',
+            "ImportError: cannot import name 'LegacyModel' from 'app.models' (/app/src/app/models.py)",
+          ].join('\n'),
+        },
+      },
+    ];
+
+    expect(planner.planExternalFeedbackRepair({
+      task,
+      calls: currentCalls,
+      currentCalls,
+      bindings: [
+        { name: 'fs.read', enabled: true },
+        { name: 'fs.synthesize', enabled: true },
+      ],
+      workspaceRoot: '/app',
+    })).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.synthesize',
+        params: expect.objectContaining({
+          path: 'src/app/chain.py',
+          instructions: expect.stringMatching(
+            /requires LegacyModel to remain absent[\s\S]*update the stale consumer src\/app\/chain\.py/i
+          ),
+          strategy: 'patch',
+        }),
+      }),
+    ]);
+  });
+
   it('lets the newest recovery capsule supersede stale dependency feedback', () => {
     const planner = new AgentToolPlanner();
     const task = [

@@ -1181,6 +1181,24 @@ export class AgentToolPlanner {
         input.workspaceRoot
       )[0]?.path
       : undefined;
+    const taskFeedback = recoveryFeedbackFocus(input.task)?.summary ?? '';
+    const missingImportSymbolRejected = missingImport
+      ? new RegExp(
+        `(?:forbidden|obsolete|deprecated|removed?|must\\s+not|violations?|defines|contains)[^\\n]{0,180}\\b${missingImport[1]!.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`,
+        'i'
+      ).test(taskFeedback)
+      : false;
+    const missingImportConsumerPath = missingImport && missingImportProviderPath
+      && missingImportSymbolRejected
+      ? this.importFailureConsumerPath(
+        input.currentCalls ?? input.calls,
+        missingImport[1]!,
+        missingImportProviderPath,
+        input.workspaceRoot
+      )
+      : undefined;
+    const missingImportCausalPath = missingImportConsumerPath
+      ?? missingImportProviderPath;
     const manifestPriority = (candidatePath: string): number => {
       const lowerPath = candidatePath.toLowerCase();
       if (/(?:^|\/)pyproject\.toml$/.test(lowerPath)) return 420;
@@ -1270,19 +1288,21 @@ export class AgentToolPlanner {
         });
       }
     }
-    if (missingImportProviderPath
+    if (missingImportCausalPath
       && input.bindings.some(binding => binding.enabled && binding.name === 'fs.read')) {
       const providerMutationIndex = latestMutationIndexByPath.get(
-        missingImportProviderPath
+        missingImportCausalPath
       ) ?? -1;
       const providerReadIndex = latestReadsByPath.get(
-        missingImportProviderPath
+        missingImportCausalPath
       )?.activeIndex ?? -1;
       if (providerMutationIndex >= 0 && providerReadIndex < providerMutationIndex) {
         return [{
           toolName: 'fs.read',
-          params: { path: missingImportProviderPath },
-          reason: `The failed import names ${missingImportProviderPath} as the symbol provider, and that file changed after its last snapshot; refresh the provider before repairing the interface boundary.`,
+          params: { path: missingImportCausalPath },
+          reason: missingImportConsumerPath
+            ? `The authoritative contract removed the imported symbol, and ${missingImportConsumerPath} changed after its last snapshot; refresh the stale consumer before repairing the interface boundary.`
+            : `The failed import names ${missingImportCausalPath} as the symbol provider, and that file changed after its last snapshot; refresh the provider before repairing the interface boundary.`,
           groundingRequired: true,
         }];
       }
@@ -1315,11 +1335,11 @@ export class AgentToolPlanner {
         let grounded = explicitFeedbackPaths.has(candidate.path);
         let score = grounded ? 500 : 0;
         if (this.isMutableImplementationPath(candidate.path)) score += 40;
-        if (candidate.path === missingImportProviderPath) {
+        if (candidate.path === missingImportCausalPath) {
           grounded = true;
-          // A provider changed during this repair phase and then failed to
-          // export its advertised symbol. Prefer the freshly grounded
-          // provider over incidental importer frames elsewhere in the stack.
+          // Prefer the causal side of the import boundary: normally the
+          // provider, but the stale consumer when the authoritative contract
+          // explicitly removed or forbade that symbol.
           score += 1_800;
         }
         const matchingIdentifiers = semanticIdentifiers.filter(identifier =>
@@ -1393,8 +1413,10 @@ export class AgentToolPlanner {
       verifierContract
         ? `${verifierContract}\nTreat these executable assertions and constants as the exact acceptance contract; do not replace an exact constraint with a looser guess.`
         : '',
-      missingImportProviderPath && missingImport?.[1]
-        ? `The traceback identifies ${missingImportProviderPath} as the provider of missing symbol ${missingImport[1]}. Repair that interface coherently; do not change an unrelated entry point merely because it appears earlier in the call stack.`
+      missingImportConsumerPath && missingImport?.[1]
+        ? `The authoritative feedback requires ${missingImport[1]} to remain absent from ${missingImportProviderPath}; update the stale consumer ${missingImportConsumerPath} to the supported interface and do not restore the forbidden provider symbol.`
+        : missingImportProviderPath && missingImport?.[1]
+          ? `The traceback identifies ${missingImportProviderPath} as the provider of missing symbol ${missingImport[1]}. Repair that interface coherently; do not change an unrelated entry point merely because it appears earlier in the call stack.`
         : '',
       'Use the already observed current file as the patch base. Preserve unrelated working declarations and do not alter benchmark or verifier files.',
     ].filter(Boolean).join('\n\n');
@@ -2689,6 +2711,45 @@ export class AgentToolPlanner {
         )[0]?.path;
         if (consumer
           && consumer !== normalizedRejectedPath
+          && this.isMutableImplementationPath(consumer)) {
+          return consumer;
+        }
+      }
+    }
+    return undefined;
+  }
+
+  private importFailureConsumerPath(
+    calls: ObservedToolCall[],
+    symbolName: string,
+    providerPath: string,
+    workspaceRoot?: string
+  ): string | undefined {
+    const escapedSymbol = symbolName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const importingFrame = new RegExp(
+      `File\\s+["']([^"']+\\.py)["'],\\s+line\\s+(\\d+)[^\\n]*\\n\\s*(?:from\\s+[^\\n]+\\s+import\\s+[^\\n]*\\b${escapedSymbol}\\b|import\\s+[^\\n]*\\b${escapedSymbol}\\b)`,
+      'gi'
+    );
+    for (const call of [...calls].reverse()) {
+      const shell = call.result as {
+        cwd?: unknown;
+        stdout?: unknown;
+        stderr?: unknown;
+      } | undefined;
+      const output = [
+        String(shell?.stdout ?? ''),
+        String(shell?.stderr ?? ''),
+        String(call.error ?? ''),
+      ].filter(Boolean).join('\n');
+      const frames = [...output.matchAll(importingFrame)];
+      for (const frame of frames.reverse()) {
+        const consumer = this.extractFailureLocations(
+          `File "${String(frame[1])}", line ${String(frame[2])}`,
+          String(shell?.cwd ?? workspaceRoot ?? ''),
+          workspaceRoot
+        )[0]?.path;
+        if (consumer
+          && consumer !== providerPath
           && this.isMutableImplementationPath(consumer)) {
           return consumer;
         }
