@@ -59,6 +59,51 @@ function latestDiagnosticSourcePath(output: string): string | undefined {
   return paths.at(-1);
 }
 
+function latestMirroredVerifierSourcePath(
+  calls: ObservedToolCall[]
+): string | undefined {
+  for (const call of [...calls].reverse()) {
+    if (!isWorkspaceVerificationCall(call)
+      || isSuccessfulWorkspaceVerificationCall(call)) {
+      continue;
+    }
+    const result = call.result as {
+      stdout?: unknown;
+      stderr?: unknown;
+      verifierDiagnostics?: unknown;
+    } | undefined;
+    const diagnostics = Array.isArray(result?.verifierDiagnostics)
+      ? result.verifierDiagnostics
+        .map(item =>
+          item && typeof item === 'object'
+            ? String((item as { content?: unknown }).content ?? '')
+            : ''
+        )
+      : [];
+    const output = [
+      String(result?.stdout ?? ''),
+      String(result?.stderr ?? ''),
+      String(call.error ?? ''),
+      ...diagnostics,
+    ].filter(Boolean).join('\n');
+    const candidates = [
+      ...[...output.matchAll(
+        /(?:^|[\s("'])\.roy\/official-verifier\/([A-Za-z0-9_./-]+\.(?:py|js|mjs|cjs|ts|tsx|jsx|sh))/g
+      )].map(match => match[1]!),
+      ...[...output.matchAll(
+        /(?:^|[\s("'])\/tests\/([A-Za-z0-9_./-]+\.(?:py|js|mjs|cjs|ts|tsx|jsx|sh))/g
+      )].map(match => match[1]!),
+    ].filter(relative =>
+      relative
+      && !relative.split('/').includes('..')
+      && !relative.startsWith('/')
+    );
+    const candidate = candidates.at(-1);
+    if (candidate) return `.roy/official-verifier/${candidate}`;
+  }
+  return undefined;
+}
+
 export function recoveryFeedbackFocus(task: string): RecoveryFeedbackFocus | undefined {
   const capsuleMatch = /<recovery_capsule>\s*([\s\S]*?)\s*<\/recovery_capsule>/i.exec(
     task
@@ -1118,7 +1163,10 @@ export class AgentToolPlanner {
       .filter(Boolean));
     const authoritativeVerifierPath = this.extractReferencedPaths(input.task)
       .map(path => this.normalizeWorkspacePath(path))
-      .find(path => path.startsWith('.roy/official-verifier/'));
+      .find(path => path.startsWith('.roy/official-verifier/'))
+      ?? latestMirroredVerifierSourcePath(
+        input.currentCalls ?? input.calls
+      );
     if (authoritativeVerifierPath
       && input.bindings.some(binding =>
         binding.enabled && binding.name === 'fs.read'

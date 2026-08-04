@@ -277,6 +277,56 @@ describe('AgentToolPlanner', () => {
     );
   });
 
+  it('maps an external verifier traceback to the immutable workspace mirror', () => {
+    const task = [
+      'Continue the runtime migration.',
+      '<official_verifier_feedback>',
+      'project metadata still targets legacy LangChain runtime',
+      '</official_verifier_feedback>',
+    ].join('\n');
+    const planner = new AgentToolPlanner();
+    const plans = planner.planExternalFeedbackRepair({
+      task,
+      calls: [{
+        toolName: 'fs.read',
+        params: { path: 'pyproject.toml' },
+        success: true,
+        result: {
+          path: 'pyproject.toml',
+          content: '[project]\ndependencies = ["langchain>=1.0"]\n',
+        },
+      }],
+      currentCalls: [{
+        toolName: 'shell.exec',
+        params: { command: 'bash .roy/official-verifier/test.sh' },
+        success: true,
+        result: {
+          exitCode: 0,
+          stdout: [
+            '/tests/test_outputs.py:241: in test_langchain_runtime_migration',
+            'E AssertionError: project metadata still targets legacy LangChain runtime',
+          ].join('\n'),
+          verifierDiagnostics: [{
+            path: '/logs/verifier/reward.txt',
+            content: '0.0',
+          }],
+        },
+      }],
+      bindings: [
+        { name: 'fs.read', enabled: true },
+        { name: 'fs.synthesize', enabled: true },
+      ],
+      workspaceRoot: '/app',
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.read',
+        params: { path: '.roy/official-verifier/test_outputs.py' },
+      }),
+    ]);
+  });
+
   it('prefers direct newest feedback over unchanged persisted artifacts', () => {
     const task = [
       '## VERIFICATION FAILED — CONTINUE WORKING',
