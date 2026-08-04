@@ -2273,6 +2273,7 @@ function recoverProseToolPlanningResponse(
     ) ?? [])
       .map(match => match.trim().replace(/^[`'"(]+|[`'"),:;]+$/g, ''))
       .map(normalizePlannedWorkspacePath)
+      .map(filePath => resolveRecoveredWorkspacePath(filePath, completed))
       .filter(Boolean)
   ));
   const groupName = raw.match(/\bG_[A-Za-z0-9_]+\b/)?.[0];
@@ -2323,6 +2324,72 @@ function recoverProseToolPlanningResponse(
     }
   }
   return undefined;
+}
+
+function resolveRecoveredWorkspacePath(
+  requestedPath: string,
+  completed: ToolLoopCallRecord[]
+): string {
+  if (!requestedPath || requestedPath.startsWith('.roy/official-verifier/')) {
+    return requestedPath;
+  }
+  const observedFiles = new Set<string>();
+  const observedDirectories = new Set<string>();
+  for (const call of completed) {
+    if (!call.success) continue;
+    if (call.toolName === 'fs.list') {
+      const result = call.result as {
+        root?: unknown;
+        entries?: unknown;
+      } | undefined;
+      const root = normalizePlannedWorkspacePath(String(result?.root ?? '.'));
+      if (!Array.isArray(result?.entries)) continue;
+      for (const rawEntry of result.entries) {
+        if (typeof rawEntry !== 'string' || !rawEntry) continue;
+        const directory = rawEntry.endsWith('/');
+        const entry = normalizePlannedWorkspacePath(rawEntry.replace(/\/+$/, ''));
+        const resolved = normalizePlannedWorkspacePath(
+          root && root !== '.' ? `${root}/${entry}` : entry
+        );
+        if (!resolved) continue;
+        (directory ? observedDirectories : observedFiles).add(resolved);
+      }
+      continue;
+    }
+    if (call.toolName === 'fs.read') {
+      const resolved = normalizePlannedWorkspacePath(String(
+        (call.result as { path?: unknown } | undefined)?.path
+          ?? call.params.path
+          ?? ''
+      ));
+      if (resolved) observedFiles.add(resolved);
+      continue;
+    }
+    if (call.toolName === 'fs.search') {
+      const matches = (call.result as {
+        matches?: Array<{ path?: unknown }>;
+      } | undefined)?.matches;
+      for (const match of matches ?? []) {
+        const resolved = normalizePlannedWorkspacePath(String(match.path ?? ''));
+        if (resolved) observedFiles.add(resolved);
+      }
+    }
+  }
+  if (observedFiles.size === 0 && observedDirectories.size === 0) {
+    return requestedPath;
+  }
+  if (observedFiles.has(requestedPath)) return requestedPath;
+  const basename = requestedPath.split('/').at(-1);
+  const basenameMatches = [...observedFiles].filter(candidate =>
+    candidate.split('/').at(-1) === basename
+  );
+  if (basenameMatches.length === 1) return basenameMatches[0]!;
+  if ([...observedDirectories].some(directory =>
+    requestedPath.startsWith(`${directory}/`)
+  )) {
+    return requestedPath;
+  }
+  return '';
 }
 
 function extractBalancedJsonObject(input: string, start: number): string | undefined {

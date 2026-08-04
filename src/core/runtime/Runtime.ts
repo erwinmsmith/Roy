@@ -9622,7 +9622,27 @@ export class Runtime {
         && grounding.toolCalls.some(call =>
           isSuccessfulWorkspaceVerificationCall(call)
         );
-      if (freshVerifierDiagnostic) {
+      const deterministicGroundedCheckpoint = actorArchetype === 'researcher'
+        && /\[runtime_grounded_checkpoint\]/.test(immutableActorTask)
+        && grounding.evidence.toolGrounded;
+      if (deterministicGroundedCheckpoint) {
+        result = this.buildDeterministicGroundedCheckpointResult(grounding);
+        this.emit({
+          type: 'agent.grounded_checkpoint.summary.deterministic',
+          agentId,
+          sessionId: ctx.sessionId,
+          correlationId: options.correlationId,
+          nodeId: options.nodeId,
+          data: {
+            observedPaths: grounding.evidence.observedPaths.length,
+            invalidPaths: grounding.toolCalls.filter(call =>
+              !call.success && typeof call.params.path === 'string'
+            ).length,
+            reason: 'structured_read_only_evidence_requires_no_additional_narrative_completion',
+            resultChars: result.length,
+          },
+        });
+      } else if (freshVerifierDiagnostic) {
         result = this.buildDeterministicVerifierDiagnosticResult(grounding);
         this.emit({
           type: 'agent.verifier_diagnostic.summary.deterministic',
@@ -11965,6 +11985,29 @@ export class Runtime {
     ].join('\n\n').slice(0, 3_900);
   }
 
+  private buildDeterministicGroundedCheckpointResult(
+    grounding: GroundingRunResult
+  ): string {
+    const invalidPaths = grounding.toolCalls
+      .filter(call => !call.success && typeof call.params.path === 'string')
+      .map(call => this.normalizeToolWorkspacePath(String(call.params.path)))
+      .filter(Boolean);
+    const failedTools = grounding.toolCalls
+      .filter(call => !call.success)
+      .map(call => `${call.toolName}: ${String(call.error ?? 'unknown failure').slice(0, 500)}`);
+    return [
+      '[runtime_grounded_checkpoint]',
+      `observed_paths: ${JSON.stringify([...new Set(grounding.evidence.observedPaths)].slice(0, 120))}`,
+      `invalid_paths: ${JSON.stringify([...new Set(invalidPaths)].slice(0, 40))}`,
+      `grounding_warnings: ${JSON.stringify(grounding.warnings.slice(0, 40))}`,
+      `failed_tools: ${JSON.stringify(failedTools.slice(0, 40))}`,
+      'tool_result_summary:',
+      ((grounding.evidence.toolResultSummary ?? grounding.context)
+        || 'No structured tool evidence was produced.').slice(0, 12_000),
+      'next_step_contract: Reuse the observed paths as authoritative cached state. Avoid invalid paths unless a mutation changes the hypothesis. Route unresolved implementation work to an actor with write and execution tools, then verify the resulting workspace.',
+    ].join('\n').slice(0, 16_000);
+  }
+
   private boundExecutionToolFrontier(
     calls: ExecutionCachedToolCall[],
     maxCalls = 32,
@@ -14162,7 +14205,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
           archetype: 'researcher',
           name: 'PathSteward-1',
           role: 'execution state and path steward',
-          task: `Establish the first grounded checkpoint for this long-horizon task. Inspect authoritative workspace paths, identify cached invalid paths and actionable feedback, and pass a bounded execution map to the team: ${task}`,
+          task: `[runtime_grounded_checkpoint]\nEstablish the first grounded checkpoint for this long-horizon task. Inspect authoritative workspace paths, identify cached invalid paths and actionable feedback, and pass a bounded execution map to the team: ${task}`,
           tools: ['fs.list', 'fs.read', 'fs.search'],
           skills: ['use_tool_when_needed'],
           tomLevel: 1,
@@ -14194,7 +14237,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
           archetype: 'researcher',
           name: 'EvidenceSteward-1',
           role: 'grounded evidence and path steward',
-          task: `Establish the first grounded checkpoint, authoritative evidence paths, cached failures to avoid, and unresolved gaps for: ${task}`,
+          task: `[runtime_grounded_checkpoint]\nEstablish the first grounded checkpoint, authoritative evidence paths, cached failures to avoid, and unresolved gaps for: ${task}`,
           tools: ['fs.list', 'fs.read', 'fs.search'],
           skills: ['use_tool_when_needed'],
           tomLevel: 1,

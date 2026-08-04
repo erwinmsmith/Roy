@@ -491,6 +491,20 @@ class ProseVerifierInspectionPlanningLLM extends PlanningLLM {
   }
 }
 
+class ProseWorkspaceInspectionPlanningLLM extends PlanningLLM {
+  constructor() {
+    super('none');
+  }
+
+  override async completeJSON<T>(): Promise<T> {
+    this.jsonCalls += 1;
+    throw new Error([
+      'Failed to parse JSON response: I need to inspect agent.yaml, chain.yaml,',
+      'memory.yaml, checkpoint.json, and pyproject.toml/setup.py before continuing.',
+    ].join('\n'));
+  }
+}
+
 class RecoverableTruncatedWritePlanningLLM extends PlanningLLM {
   constructor(private readonly content = 'first line\\nsecond line\\nthird partial') {
     super('none');
@@ -1872,6 +1886,66 @@ describe('UnifiedAgent capability execution', () => {
         }),
       }),
     ]);
+  });
+
+  it('grounds prose-recovered reads in the observed workspace tree', async () => {
+    const llm = new ProseWorkspaceInspectionPlanningLLM();
+    const agent = new UnifiedAgent({
+      name: 'prose-workspace-inspection-planner',
+      goal: 'inspect grounded project configuration',
+      llm,
+      mode: 'hybrid',
+      allowedTools: ['fs.list', 'fs.read'],
+    });
+
+    const plans = await agent.planNextToolRound({
+      task: 'Inspect the project configuration and report the current contract.',
+      round: 2,
+      remainingCalls: 6,
+      tools: [{ name: 'fs.list' }, { name: 'fs.read' }],
+      calls: [{
+        toolName: 'fs.list',
+        params: { path: '.', maxDepth: 4 },
+        reason: 'Ground the workspace tree.',
+        groundingRequired: true,
+        success: true,
+        result: {
+          root: '.',
+          maxDepth: 4,
+          entries: [
+            'configs/',
+            'configs/agent.yaml',
+            'configs/chain.yaml',
+            'configs/memory.yaml',
+            'data/',
+            'data/history/',
+            'data/history/one/checkpoint.json',
+            'data/history/two/checkpoint.json',
+            'pyproject.toml',
+          ],
+        },
+      }],
+    });
+
+    expect(llm.jsonCalls).toBe(1);
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.read',
+        params: { path: 'configs/agent.yaml' },
+      }),
+      expect.objectContaining({
+        toolName: 'fs.read',
+        params: { path: 'configs/chain.yaml' },
+      }),
+      expect.objectContaining({
+        toolName: 'fs.read',
+        params: { path: 'configs/memory.yaml' },
+      }),
+    ]);
+    expect(plans.some(plan =>
+      plan.params.path === 'checkpoint.json'
+      || plan.params.path === 'pyproject.toml/setup.py'
+    )).toBe(false);
   });
 
   it('executes a bounded prefix recovered from a truncated fs.write response', async () => {

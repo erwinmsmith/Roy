@@ -64,6 +64,34 @@ class OversizedUsageLLM extends EchoLLM {
   }
 }
 
+class GroundedCheckpointLLM extends EchoLLM {
+  toolPlanningCalls = 0;
+  streamCalls = 0;
+
+  override async completeJSON<T>(messages: LLMMessage[]): Promise<T> {
+    const prompt = messages.map(message => message.content).join('\n');
+    if (prompt.includes('You plan authorized tool calls')) {
+      this.toolPlanningCalls += 1;
+      return this.toolPlanningCalls === 1
+        ? {
+          action: 'call_tools',
+          reason: 'Read the explicitly named manifest.',
+          calls: [{ toolName: 'fs.read', params: { path: 'package.json' } }],
+        } as T
+        : { action: 'finish', reason: 'The checkpoint evidence is grounded.', calls: [] } as T;
+    }
+    return { action: 'none', params: {} } as T;
+  }
+
+  override async *stream(
+    messages: LLMMessage[],
+    options?: LLMCompletionOptions
+  ): AsyncGenerator<LLMStreamChunk, void, unknown> {
+    this.streamCalls += 1;
+    yield* super.stream(messages, options);
+  }
+}
+
 class SaturatedClosurePlanningLLM extends EchoLLM {
   sawSaturatedEvidence = false;
 
@@ -2640,6 +2668,56 @@ describe('Runtime controlled subagent spawning', () => {
       event.type.startsWith('agent.verifier_diagnostic.')
       && event.agentId === researcher.identity.id
     )).toBe(false);
+    await runtime.shutdown();
+  });
+
+  it('closes a runtime grounded checkpoint from tool evidence without narrative streaming', async () => {
+    const workspaceCwd = await mkdtemp(path.join(tmpdir(), 'roy-runtime-grounded-checkpoint-'));
+    await writeFile(
+      path.join(workspaceCwd, 'package.json'),
+      JSON.stringify({ name: 'grounded-checkpoint-test', scripts: { test: 'node --test' } }),
+      'utf8'
+    );
+    const llm = new GroundedCheckpointLLM();
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'grounded-checkpoint-test',
+      llmProvider: llm,
+      fsmEnabled: false,
+      workspaceCwd,
+    });
+    const task = [
+      '[runtime_grounded_checkpoint]',
+      'Establish the first grounded checkpoint. Inspect package.json and authoritative workspace paths.',
+    ].join('\n');
+    const researcher = await runtime.spawnAgent({
+      parentId: 'root',
+      archetype: 'researcher',
+      tomLevel: 0,
+      description: task,
+      task,
+      tools: ['fs.list', 'fs.read', 'fs.search'],
+      outputContract: { format: 'markdown', groundingRequired: true },
+    });
+
+    const result = await runtime.runAgent(researcher.identity.id, task, {
+      archetype: 'researcher',
+      disableRecursiveDelegation: true,
+    });
+
+    expect(result.result).toContain('[runtime_grounded_checkpoint]');
+    expect(result.result).toContain('package.json');
+    expect(result.result).toContain('next_step_contract');
+    expect(result.evidence.toolGrounded).toBe(true);
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'agent.grounded_checkpoint.summary.deterministic',
+      agentId: researcher.identity.id,
+    }));
+    expect(runtime.getEvents().some(event =>
+      event.type === 'agent.llm.called'
+      && event.agentId === researcher.identity.id
+    )).toBe(false);
+    expect(llm.streamCalls).toBe(0);
     await runtime.shutdown();
   });
 
