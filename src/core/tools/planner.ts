@@ -259,21 +259,6 @@ function focusedVerifierContractEvidence(
   feedback: string,
   maxChars = 3_600
 ): string {
-  const verifierRead = [...calls].reverse().find(call => {
-    if (call.toolName !== 'fs.read' || !call.success) return false;
-    const resultPath = String(
-      (call.result as { path?: unknown } | undefined)?.path
-        ?? call.params.path
-        ?? ''
-    ).replace(/^\/app\//, '').replace(/^\.\//, '');
-    return resultPath.startsWith('.roy/official-verifier/');
-  });
-  const result = verifierRead?.result as {
-    path?: unknown;
-    content?: unknown;
-  } | undefined;
-  const content = typeof result?.content === 'string' ? result.content : '';
-  if (!content) return '';
   const ignored = new Set([
     'about', 'after', 'already', 'artifact', 'before', 'changed', 'continue',
     'external', 'failure', 'feedback', 'newest', 'official', 'previous',
@@ -288,6 +273,45 @@ function focusedVerifierContractEvidence(
       .map(term => term.toLowerCase())
       .filter(term => !ignored.has(term))
   );
+  const verifierReads = calls.flatMap(call => {
+    if (call.toolName !== 'fs.read' || !call.success) return [];
+    const result = call.result as {
+      path?: unknown;
+      content?: unknown;
+    } | undefined;
+    const path = String(result?.path ?? call.params.path ?? '')
+      .replace(/^\/app\//, '')
+      .replace(/^\.\//, '');
+    const content = typeof result?.content === 'string' ? result.content : '';
+    if (!path.startsWith('.roy/official-verifier/') || !content) return [];
+    const lower = content.toLowerCase();
+    const semanticMatches = [...terms].reduce(
+      (total, term) => total + (lower.includes(term) ? 1 : 0),
+      0
+    );
+    const assertionSignals = (content.match(
+      /\b(?:assert|_fail\s*\(|raise\s+AssertionError)\b/gi
+    ) ?? []).length;
+    const constantSignals = (content.match(
+      /^\s*(?:TARGET|EXPECTED|REQUIRED|MINIMUM|MAXIMUM)[A-Z0-9_]*\s*=/gim
+    ) ?? []).length;
+    return [{
+      call,
+      result,
+      path,
+      content,
+      score: semanticMatches * 20
+        + Math.min(120, assertionSignals * 8)
+        + Math.min(80, constantSignals * 12),
+    }];
+  });
+  const selectedRead = verifierReads.sort((left, right) =>
+    right.score - left.score
+  )[0];
+  if (!selectedRead) return '';
+  const verifierRead = selectedRead.call;
+  const result = selectedRead.result;
+  const content = selectedRead.content;
   const lines = content.replace(/\r\n/g, '\n').split('\n');
   const ranked = lines
     .map((line, index) => {

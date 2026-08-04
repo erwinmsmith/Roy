@@ -327,6 +327,74 @@ describe('AgentToolPlanner', () => {
     ]);
   });
 
+  it('keeps the semantically relevant assertion source over a later wrapper read', () => {
+    const task = [
+      'Continue the runtime migration.',
+      '<official_verifier_feedback>',
+      'project metadata still targets legacy LangChain runtime',
+      '</official_verifier_feedback>',
+    ].join('\n');
+    const plans = new AgentToolPlanner().planExternalFeedbackRepair({
+      task,
+      calls: [
+        {
+          toolName: 'fs.read',
+          params: { path: 'pyproject.toml' },
+          success: true,
+          result: {
+            path: 'pyproject.toml',
+            content: '[project]\ndependencies = ["langchain>=1.0"]\n',
+          },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: '.roy/official-verifier/test_outputs.py' },
+          success: true,
+          result: {
+            path: '.roy/official-verifier/test_outputs.py',
+            content: [
+              'TARGET_LANGCHAIN_VERSION = "1.3.4"',
+              'def _dependency_targets_modern_runtime():',
+              '    langchain_exact = TARGET_LANGCHAIN_VERSION',
+              '    if not langchain_exact:',
+              '        _fail(details, "project metadata still targets legacy LangChain runtime")',
+            ].join('\n'),
+          },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: '.roy/official-verifier/test.sh' },
+          success: true,
+          result: {
+            path: '.roy/official-verifier/test.sh',
+            content: 'python -m pip uninstall -y langchain\npython -m pytest /tests/test_outputs.py\n',
+          },
+        },
+      ],
+      currentCalls: [],
+      bindings: [
+        { name: 'fs.read', enabled: true },
+        { name: 'fs.synthesize', enabled: true },
+      ],
+      workspaceRoot: '/app',
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.synthesize',
+        params: expect.objectContaining({
+          path: 'pyproject.toml',
+          instructions: expect.stringContaining(
+            'Verifier contract excerpts from .roy/official-verifier/test_outputs.py'
+          ),
+        }),
+      }),
+    ]);
+    expect(String(plans[0]?.params.instructions)).toContain(
+      'TARGET_LANGCHAIN_VERSION = "1.3.4"'
+    );
+  });
+
   it('prefers direct newest feedback over unchanged persisted artifacts', () => {
     const task = [
       '## VERIFICATION FAILED — CONTINUE WORKING',
