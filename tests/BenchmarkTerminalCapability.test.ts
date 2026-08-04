@@ -2347,6 +2347,129 @@ describe('benchmark terminal capability', () => {
     await runtime.shutdown();
   });
 
+  it('does not roll back a mutation from stale scorecard files before fresh authoritative verification', async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), 'roy-fresh-verifier-scorecard-'));
+    await mkdir(path.join(workspace, '.roy', 'official-verifier'), { recursive: true });
+    await mkdir(path.join(workspace, '.roy', 'verifier'), { recursive: true });
+    await writeFile(
+      path.join(workspace, '.roy', 'config.json'),
+      JSON.stringify({
+        tools: {
+          approval: { readOnly: 'auto', write: 'auto', execute: 'auto' },
+          shell: { mode: 'unrestricted', shell: '/bin/sh' },
+        },
+      })
+    );
+    await writeFile(path.join(workspace, 'implementation.py'), 'VALUE = 0\n');
+    await writeFile(
+      path.join(workspace, 'pytest'),
+      '#!/bin/sh\ngrep -q "VALUE = 1" implementation.py\n'
+    );
+    await writeFile(
+      path.join(workspace, '.roy', 'official-verifier', 'test.sh'),
+      [
+        '#!/bin/sh',
+        'set -eu',
+        'if grep -q "VALUE = 1" implementation.py; then reward=1; else reward=0; fi',
+        'printf "%s\\n" "$reward" > .roy/verifier/reward.txt',
+        'printf \'{"reward":%s,"groups":{"behavior":%s}}\\n\' "$reward" "$reward" > .roy/verifier/scorecard.json',
+        'test "$reward" = 1',
+      ].join('\n') + '\n'
+    );
+    await writeFile(path.join(workspace, '.roy', 'verifier', 'reward.txt'), '0\n');
+    await writeFile(
+      path.join(workspace, '.roy', 'verifier', 'scorecard.json'),
+      '{"reward":0,"groups":{"behavior":0}}\n'
+    );
+    const runtime = new Runtime();
+    await runtime.initialize({
+      sessionId: 'fresh-verifier-scorecard-test',
+      workspaceCwd: workspace,
+    });
+    const task = [
+      'Repair implementation.py and verify the completed behavior.',
+      'Run the authoritative verifier:',
+      '```bash',
+      'bash .roy/official-verifier/test.sh',
+      '```',
+    ].join('\n');
+    const grounding = await (runtime as unknown as {
+      runGroundingCheck: (
+        agentId: string,
+        task: string,
+        options: Record<string, unknown>
+      ) => Promise<{ toolCalls: Array<{
+        toolName: string;
+        params: Record<string, unknown>;
+        result?: unknown;
+      }> }>;
+    }).runGroundingCheck(
+      'root',
+      task,
+      {
+        correlationId: 'fresh-verifier-scorecard-turn',
+        intentTask: task,
+        priorToolCalls: [{
+          toolName: 'shell.exec',
+          params: { command: 'bash .roy/official-verifier/test.sh' },
+          success: true,
+          result: {
+            verifierDiagnostics: [
+              { path: '.roy/verifier/reward.txt', content: '0\n' },
+              {
+                path: '.roy/verifier/scorecard.json',
+                content: '{"reward":0,"groups":{"behavior":0}}\n',
+              },
+            ],
+          },
+        }],
+        initialPlans: [
+          {
+            toolName: 'fs.replace',
+            params: {
+              path: 'implementation.py',
+              oldText: 'VALUE = 0',
+              newText: 'VALUE = 1',
+              expectedReplacements: 1,
+            },
+            reason: 'Apply the grounded mutation hypothesis.',
+            groundingRequired: true,
+          },
+          {
+            toolName: 'shell.exec',
+            params: { command: 'sh ./pytest' },
+            reason: 'Run a focused local check before authoritative verification.',
+            groundingRequired: true,
+          },
+        ],
+        skipInitialModelPlanning: true,
+      }
+    );
+
+    expect(grounding.toolCalls).toContainEqual(expect.objectContaining({
+      toolName: 'shell.exec',
+      params: expect.objectContaining({
+        command: 'bash .roy/official-verifier/test.sh',
+      }),
+    }));
+    expect(await readFile(path.join(workspace, 'implementation.py'), 'utf8'))
+      .toBe('VALUE = 1\n');
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'tool.verifier_diagnostics.stale_ignored',
+      data: expect.objectContaining({
+        reason: expect.stringContaining('cached verifier output cannot score'),
+      }),
+    }));
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'workspace.verifier_checkpoint.persisted',
+      data: expect.objectContaining({ reward: 1 }),
+    }));
+    expect(runtime.getEvents()).not.toContainEqual(expect.objectContaining({
+      type: 'workspace.mutation.candidate_rolled_back',
+    }));
+    await runtime.shutdown();
+  });
+
   it('lets concrete recovery feedback supersede a cached rejected target', async () => {
     const workspace = await mkdtemp(path.join(tmpdir(), 'roy-external-feedback-frontier-'));
     await mkdir(path.join(workspace, '.roy'), { recursive: true });

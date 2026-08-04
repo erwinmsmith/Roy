@@ -2933,6 +2933,12 @@ export class Runtime {
       options.groundingCalls ?? [],
       options.correlationId ?? ctx.sessionId
     );
+    const shellCommand = String(params.command ?? '');
+    const verifierDiagnosticSnapshot = toolName === 'shell.exec'
+      && this.shouldAttachVerifierDiagnostics(shellCommand)
+      && this.verificationCommandAuthority(shellCommand) < 100
+      ? await this.captureVerifierDiagnosticSnapshot()
+      : undefined;
     let result = toolName === 'fs.synthesize'
       ? await this.executeSynthesizedFileForAgent(
         agent,
@@ -2975,7 +2981,8 @@ export class Runtime {
       result = await this.attachVerifierDiagnostics(
         result,
         agentId,
-        options.correlationId
+        options.correlationId,
+        verifierDiagnosticSnapshot
       );
       result = await this.rollbackVerifierRegression(
         result,
@@ -2992,13 +2999,15 @@ export class Runtime {
       )?.persistentCheckpointRecovery;
       if (persistentRecovery?.restored === true) {
         const recoveryResult = result;
+        const reverificationSnapshot = await this.captureVerifierDiagnosticSnapshot();
         let reverified = runtimeTool
           ? await this.executeRuntimeTool(runtimeTool, params)
           : await toolRegistry.execute(toolName, params);
         reverified = await this.attachVerifierDiagnostics(
           reverified,
           agentId,
-          options.correlationId
+          options.correlationId,
+          reverificationSnapshot
         );
         const reverifiedScorecard = this.verifierScorecardFromToolResult(
           reverified.result
@@ -3136,9 +3145,67 @@ export class Runtime {
   private async attachVerifierDiagnostics(
     toolResult: ToolResult,
     agentId: string,
-    correlationId?: string
+    correlationId?: string,
+    previousSnapshot?: Map<string, string>
   ): Promise<ToolResult> {
     if (!toolResult.result || typeof toolResult.result !== 'object') return toolResult;
+    const candidateFiles = await this.verifierDiagnosticCandidateFiles();
+    const currentSnapshot = await this.captureVerifierDiagnosticSnapshot(candidateFiles);
+    const freshCandidateFiles = previousSnapshot
+      ? candidateFiles.filter(candidate =>
+          currentSnapshot.get(candidate) !== previousSnapshot.get(candidate)
+        )
+      : candidateFiles;
+    if (previousSnapshot && freshCandidateFiles.length === 0) {
+      this.emit({
+        type: 'tool.verifier_diagnostics.stale_ignored',
+        agentId,
+        correlationId,
+        data: {
+          reason: 'The verification command did not refresh any scorecard artifact; cached verifier output cannot score the current mutation candidate.',
+          files: candidateFiles,
+        },
+      });
+      return toolResult;
+    }
+    const diagnostics: Array<{ path: string; content: string }> = [];
+    for (const candidate of freshCandidateFiles) {
+      try {
+        const metadata = await stat(candidate);
+        if (!metadata.isFile() || metadata.size > 256_000) continue;
+        const content = await readFile(candidate, 'utf8');
+        if (!content.trim()) continue;
+        diagnostics.push({
+          path: candidate,
+          content: content.length <= 12_000
+            ? content
+            : `${content.slice(0, 7_000)}\n[${content.length - 12_000} middle chars compacted]\n${content.slice(-5_000)}`,
+        });
+      } catch {
+        // Verifier artifacts are optional and environment-dependent.
+      }
+    }
+    if (diagnostics.length === 0) return toolResult;
+    this.emit({
+      type: 'tool.verifier_diagnostics.attached',
+      agentId,
+      correlationId,
+      data: {
+        files: diagnostics.map(item => item.path),
+        totalChars: diagnostics.reduce((sum, item) => sum + item.content.length, 0),
+        fresh: Boolean(previousSnapshot),
+      },
+    });
+    return {
+      ...toolResult,
+      result: {
+        ...(toolResult.result as Record<string, unknown>),
+        verifierDiagnostics: diagnostics,
+      },
+    };
+  }
+
+  private async verifierDiagnosticCandidateFiles(): Promise<string[]> {
     const verifierRoots = [
       '/logs/verifier',
       path.join(this.workspaceRoot, 'logs', 'verifier'),
@@ -3184,41 +3251,27 @@ export class Runtime {
         return priority(right) - priority(left) || left.localeCompare(right);
       })
       .slice(0, 8));
-    const diagnostics: Array<{ path: string; content: string }> = [];
-    for (const candidate of candidateFiles) {
-      if (diagnostics.some(item => item.path === candidate)) continue;
+    return [...new Set(candidateFiles)];
+  }
+
+  private async captureVerifierDiagnosticSnapshot(
+    candidateFiles?: string[]
+  ): Promise<Map<string, string>> {
+    const files = candidateFiles ?? await this.verifierDiagnosticCandidateFiles();
+    const snapshot = new Map<string, string>();
+    for (const candidate of files) {
       try {
         const metadata = await stat(candidate);
-        if (!metadata.isFile() || metadata.size > 256_000) continue;
-        const content = await readFile(candidate, 'utf8');
-        if (!content.trim()) continue;
-        diagnostics.push({
-          path: candidate,
-          content: content.length <= 12_000
-            ? content
-            : `${content.slice(0, 7_000)}\n[${content.length - 12_000} middle chars compacted]\n${content.slice(-5_000)}`,
-        });
+        if (!metadata.isFile()) continue;
+        snapshot.set(
+          candidate,
+          `${metadata.dev}:${metadata.ino}:${metadata.size}:${metadata.mtimeMs}:${metadata.ctimeMs}`
+        );
       } catch {
         // Verifier artifacts are optional and environment-dependent.
       }
     }
-    if (diagnostics.length === 0) return toolResult;
-    this.emit({
-      type: 'tool.verifier_diagnostics.attached',
-      agentId,
-      correlationId,
-      data: {
-        files: diagnostics.map(item => item.path),
-        totalChars: diagnostics.reduce((sum, item) => sum + item.content.length, 0),
-      },
-    });
-    return {
-      ...toolResult,
-      result: {
-        ...(toolResult.result as Record<string, unknown>),
-        verifierDiagnostics: diagnostics,
-      },
-    };
+    return snapshot;
   }
 
   private shouldAttachVerifierDiagnostics(command: string): boolean {
@@ -19634,23 +19687,28 @@ For web-grounded work, use only facts present in the subagent report or runtime 
       },
       planNext: async context => {
         const combinedCalls = [...priorPlannerCalls, ...context.calls];
-        const pendingMirroredVerifier = pendingMirroredVerifierPlan(
+        const pendingVerifier = pendingAuthoritativeVerifierPlan(
           combinedCalls
         );
-        if (pendingMirroredVerifier) {
+        if (pendingVerifier) {
+          const mirrored = String(
+            pendingVerifier.params.command ?? ''
+          ).includes('.roy/official-verifier/grade.py');
           this.emit({
-            type: 'tool.plan.mirrored_verifier_barrier',
+            type: mirrored
+              ? 'tool.plan.mirrored_verifier_barrier'
+              : 'tool.plan.post_mutation_verification',
             agentId,
             sessionId: this.getContext().sessionId,
             correlationId: options.correlationId,
             nodeId: options.nodeId,
             data: {
               phase: 'continuation',
-              command: mirroredVerifierCommand,
+              command: pendingVerifier.params.command,
               reason: 'current_workspace_mutation_requires_objective_feedback',
             },
           });
-          return [pendingMirroredVerifier];
+          return [pendingVerifier];
         }
         const postMutationVerification = this.toolPlanner.planPostMutationVerification({
           task: intentTask,
