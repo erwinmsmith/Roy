@@ -222,4 +222,59 @@ describe('AgentToolExecutionLoop', () => {
     expect(execute).toHaveBeenCalledTimes(3);
     expect(summary.stopReason).toBe('duplicate_plan');
   });
+
+  it('replans immediately when environment setup fails before dependent checks', async () => {
+    const loop = new AgentToolExecutionLoop({
+      maxRounds: 3,
+      maxCalls: 6,
+      maxConsecutiveFailures: 2,
+      maxWallClockMs: 10_000,
+    });
+    const install = {
+      toolName: 'shell.exec',
+      params: { command: 'python -m pip install -e .' },
+      reason: 'Install the mutated dependency manifest.',
+      groundingRequired: true,
+    };
+    const dependentCheck = {
+      toolName: 'shell.exec',
+      params: { command: 'python -m app.cli --help' },
+      reason: 'Check the installed application.',
+      groundingRequired: true,
+    };
+    const repair = {
+      toolName: 'fs.synthesize',
+      params: {
+        path: 'pyproject.toml',
+        instructions: 'Repair the dependency constraint reported by installation.',
+        strategy: 'patch',
+      },
+      reason: 'Repair the authoritative setup failure.',
+      groundingRequired: true,
+    };
+    const execute = vi.fn(async plan => ({
+      success: plan === repair,
+      result: plan === install ? 'No matching distribution found' : 'observed',
+    }));
+    const planNext = vi.fn(async context =>
+      context.round === 1 ? [repair] : []
+    );
+
+    const summary = await loop.run({
+      task: 'Install the project and verify its CLI.',
+      initialPlans: [install, dependentCheck],
+      execute,
+      planNext,
+    });
+
+    expect(summary.rounds.map(round =>
+      round.calls.map(call => String(call.params.command ?? call.params.path))
+    )).toEqual([
+      ['python -m pip install -e .'],
+      ['pyproject.toml'],
+    ]);
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(planNext.mock.calls[0]?.[0].calls).toHaveLength(1);
+    expect(planNext.mock.calls[0]?.[0].calls[0]?.error).toBeUndefined();
+  });
 });

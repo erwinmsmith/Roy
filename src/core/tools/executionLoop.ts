@@ -107,6 +107,18 @@ export class AgentToolExecutionLoop {
           wallClockExceeded = true;
           break;
         }
+        // Environment setup establishes the runtime state that later commands
+        // in the same batch observe. If it fails, those commands can only
+        // report derivative symptoms (for example missing imports after an
+        // unsuccessful install). Re-plan from the setup failure before running
+        // any dependent checks so the causal frontier stays authoritative.
+        if (!outcome.success
+          && plan.toolName === 'shell.exec'
+          && this.isEnvironmentRecoveryCommand(
+            String(plan.params.command ?? '')
+          )) {
+          break;
+        }
         if (consecutiveFailures >= this.options.maxConsecutiveFailures) break;
       }
       const round: ToolLoopRound = {
