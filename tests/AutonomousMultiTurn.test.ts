@@ -610,6 +610,26 @@ describe('Autonomous multi-turn actor design', () => {
         purpose: 'root.delegation_decision',
         attempt: 1,
         retryable: true,
+        wallClockMs: expect.any(Number),
+      }),
+    }));
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'llm.json.attempt.started',
+      data: expect.objectContaining({
+        purpose: 'root.delegation_decision',
+        attempt: 1,
+        maxAttempts: 2,
+        estimatedInputTokens: expect.any(Number),
+        maxOutputTokens: expect.any(Number),
+      }),
+    }));
+    expect(runtime.getEvents()).toContainEqual(expect.objectContaining({
+      type: 'llm.json.attempt.completed',
+      data: expect.objectContaining({
+        purpose: 'root.delegation_decision',
+        attempt: 2,
+        maxAttempts: 2,
+        wallClockMs: expect.any(Number),
       }),
     }));
     expect(runtime.getEvents()).toContainEqual(expect.objectContaining({

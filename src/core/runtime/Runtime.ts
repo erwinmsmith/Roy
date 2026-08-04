@@ -15631,6 +15631,21 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
             content: 'The previous response was incomplete or invalid. Return one complete, concise JSON object only. Do not include analysis, markdown, or prose outside the JSON object.',
           },
         ];
+        const attemptStartedAt = Date.now();
+        this.emit({
+          type: 'llm.json.attempt.started',
+          agentId: agent.id,
+          correlationId,
+          data: {
+            purpose,
+            attempt,
+            maxAttempts,
+            estimatedInputTokens: this.estimateTextTokens(
+              attemptMessages.map(message => `${message.role}:${message.content}`).join('\n')
+            ),
+            maxOutputTokens: boundedOptions.maxTokens,
+          },
+        });
         try {
           if (ctx.llm.completeJSONWithUsage) {
             const result = await ctx.llm.completeJSONWithUsage<T>(attemptMessages, boundedOptions);
@@ -15644,6 +15659,17 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
               usage: this.estimateModelUsage(attemptMessages, output),
             });
           }
+          this.emit({
+            type: 'llm.json.attempt.completed',
+            agentId: agent.id,
+            correlationId,
+            data: {
+              purpose,
+              attempt,
+              maxAttempts,
+              wallClockMs: Date.now() - attemptStartedAt,
+            },
+          });
           if (attempt > 1) {
             this.emit({
               type: 'llm.json.recovered',
@@ -15669,6 +15695,7 @@ Return strict JSON as either {"action":"solve_directly","reason":"..."} or {"act
               attempt,
               maxAttempts,
               retryable,
+              wallClockMs: Date.now() - attemptStartedAt,
               error: (error instanceof Error ? error.message : String(error)).slice(0, 1000),
             },
           });
