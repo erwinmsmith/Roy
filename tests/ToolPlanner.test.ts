@@ -393,6 +393,7 @@ describe('AgentToolPlanner', () => {
     expect(String(plans[0]?.params.instructions)).toContain(
       'TARGET_LANGCHAIN_VERSION = "1.3.4"'
     );
+    expect(String(plans[0]?.params.instructions).length).toBeLessThanOrEqual(4_000);
   });
 
   it('prefers direct newest feedback over unchanged persisted artifacts', () => {

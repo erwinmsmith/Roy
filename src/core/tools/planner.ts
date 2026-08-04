@@ -1322,7 +1322,8 @@ export class AgentToolPlanner {
       : `${feedback.slice(0, 700)}\n[older external feedback compacted]\n${feedback.slice(-2_100)}`;
     const verifierContract = focusedVerifierContractEvidence(
       input.calls,
-      feedback
+      feedback,
+      Math.max(800, 3_400 - compactFeedback.length)
     );
     const instructions = [
       'Apply the smallest coherent, interface-preserving change that resolves the newest external verifier feedback.',
