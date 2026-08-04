@@ -60,6 +60,7 @@ export class OpenAIProvider implements LLMProvider {
       max_tokens: options?.maxTokens ?? this.config.maxTokens ?? 4096,
       top_p: options?.topP,
       stop: options?.stop,
+      ...compatibleReasoningOptions(options),
     }, requestOptions(options, this.config.timeoutMs));
 
     const choice = response.choices[0];
@@ -98,6 +99,7 @@ export class OpenAIProvider implements LLMProvider {
       stop: options?.stop,
       stream: true,
       stream_options: { include_usage: true },
+      ...compatibleReasoningOptions(options),
     }, requestOptions(options, this.config.timeoutMs));
 
     let rawUsage: unknown;
@@ -175,6 +177,7 @@ export class OpenAIProvider implements LLMProvider {
       temperature: options?.temperature ?? this.config.temperature ?? 0.5,
       max_tokens: options?.maxTokens ?? this.config.maxTokens ?? 4096,
       response_format: { type: 'json_object' },
+      ...compatibleReasoningOptions(options),
     }, requestOptions(options, this.config.timeoutMs));
 
     const message = response.choices[0].message as unknown as {
@@ -313,5 +316,14 @@ function requestOptions(
     // A request-scoped abort signal enforces an end-to-end attempt deadline while
     // leaving Runtime responsible for task-level retry and recovery policy.
     signal: AbortSignal.timeout(timeout),
+  };
+}
+
+function compatibleReasoningOptions(
+  options: LLMCompletionOptions | undefined
+): Record<string, unknown> {
+  return {
+    ...(options?.thinking ? { thinking: options.thinking } : {}),
+    ...(options?.reasoningEffort ? { reasoning_effort: options.reasoningEffort } : {}),
   };
 }

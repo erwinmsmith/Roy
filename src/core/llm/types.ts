@@ -14,6 +14,10 @@ export interface LLMCompletionOptions {
   stream?: boolean;
   /** Per-call request deadline. Providers clamp this against their configured default. */
   timeoutMs?: number;
+  /** Optional provider-compatible thinking mode for strict execution channels. */
+  thinking?: { type: 'enabled' | 'disabled' };
+  /** Optional reasoning effort when the compatible provider supports it. */
+  reasoningEffort?: 'low' | 'high' | 'max';
 }
 
 export type TokenMetricAvailability = 'reported' | 'estimated' | 'unavailable';

@@ -271,6 +271,7 @@ class EmptyThenRecoveredLLM extends EchoLLM {
 
 class FileSynthesisLLM extends EchoLLM {
   readonly streamedPrompts: string[] = [];
+  readonly streamedOptions: Array<LLMCompletionOptions | undefined> = [];
 
   override async completeJSON<T>(messages: LLMMessage[]): Promise<T> {
     const prompt = messages.map(message => message.content).join('\n');
@@ -295,9 +296,13 @@ class FileSynthesisLLM extends EchoLLM {
     } as T;
   }
 
-  override async *stream(messages: LLMMessage[]): AsyncGenerator<LLMStreamChunk, void, unknown> {
+  override async *stream(
+    messages: LLMMessage[],
+    options?: LLMCompletionOptions
+  ): AsyncGenerator<LLMStreamChunk, void, unknown> {
     const prompt = messages.map(message => message.content).join('\n');
     this.streamedPrompts.push(prompt);
+    this.streamedOptions.push(options);
     yield {
       content: prompt.includes('[runtime_workspace_file_synthesis]')
         ? 'export function value() { return 42; }\n'
@@ -987,6 +992,9 @@ describe('Runtime controlled subagent spawning', () => {
     expect(synthesisPrompt).toContain('Current target snapshot');
     expect(synthesisPrompt).toContain('throw new Error("stub")');
     expect(synthesisPrompt.length).toBeLessThan(70_000);
+    expect(llm.streamedOptions).toContainEqual(expect.objectContaining({
+      thinking: { type: 'disabled' },
+    }));
     expect(runtime.getEvents().map(event => event.type)).toEqual(expect.arrayContaining([
       'tool.synthesis.started',
       'tool.synthesis.completed',

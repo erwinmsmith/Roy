@@ -4968,6 +4968,7 @@ export class Runtime {
         isolatedContext: true,
         temperature: 0,
         maxOutputTokens: 32_000,
+        thinking: { type: 'disabled' },
       }
     );
     generatedPayload = this.stripSingleMarkdownCodeFence(generatedPayload);
@@ -5036,6 +5037,7 @@ export class Runtime {
           isolatedContext: true,
           temperature: 0,
           maxOutputTokens: 12_000,
+          thinking: { type: 'disabled' },
         }
       );
       generatedPayload = this.stripSingleMarkdownCodeFence(generatedPayload);
@@ -5095,6 +5097,7 @@ export class Runtime {
           isolatedContext: true,
           temperature: 0,
           maxOutputTokens: 32_000,
+          thinking: { type: 'disabled' },
         }
       );
       generatedPayload = this.stripSingleMarkdownCodeFence(generatedPayload);
@@ -17747,6 +17750,8 @@ Produce the final response to the user as Roy, the root agent.`;
       isolatedContext?: boolean;
       temperature?: number;
       maxOutputTokens?: number;
+      thinking?: { type: 'enabled' | 'disabled' };
+      reasoningEffort?: 'low' | 'high' | 'max';
     } = {}
   ): Promise<string> {
     const ctx = this.getContext();
@@ -17857,7 +17862,12 @@ Produce the final response to the user as Roy, the root agent.`;
     const completion = await this.collectRuntimeLLMStream(
       ctx.llm,
       messages,
-      { temperature: options.temperature ?? 0.2, maxTokens },
+      {
+        temperature: options.temperature ?? 0.2,
+        maxTokens,
+        thinking: options.thinking,
+        reasoningEffort: options.reasoningEffort,
+      },
       { actorId: agent.id, purpose, correlationId }
     );
     const content = completion.content;

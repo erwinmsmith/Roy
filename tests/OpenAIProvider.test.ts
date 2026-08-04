@@ -128,4 +128,45 @@ describe('OpenAI-compatible provider request lifecycle', () => {
     expect(chunks.at(-1)?.done).toBe(true);
     expect(chunks.at(-1)?.usage?.totalTokens).toBe(8);
   });
+
+  it('passes an explicit thinking toggle through the compatible request body', async () => {
+    let requestBody: Record<string, unknown> | undefined;
+    const server = createServer((request, response) => {
+      const chunks: Buffer[] = [];
+      request.on('data', chunk => chunks.push(Buffer.from(chunk)));
+      request.on('end', () => {
+        requestBody = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>;
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({
+          id: 'thinking-toggle-completion',
+          object: 'chat.completion',
+          created: 1,
+          model: 'test-model',
+          choices: [{
+            index: 0,
+            message: { role: 'assistant', content: 'bounded output' },
+            finish_reason: 'stop',
+          }],
+          usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+        }));
+      });
+    });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address() as AddressInfo;
+    const provider = new OpenAIProvider({
+      apiKey: 'test-key',
+      baseUrl: `http://127.0.0.1:${port}`,
+      model: 'test-model',
+      timeoutMs: 1_000,
+      maxRetries: 0,
+    });
+
+    await provider.complete(
+      [{ role: 'user', content: 'Return one strict payload.' }],
+      { thinking: { type: 'disabled' } }
+    );
+
+    expect(requestBody?.thinking).toEqual({ type: 'disabled' });
+  });
 });
