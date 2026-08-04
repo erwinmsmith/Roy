@@ -63,9 +63,14 @@ export class OpenAIProvider implements LLMProvider {
     }, requestOptions(options, this.config.timeoutMs));
 
     const choice = response.choices[0];
+    const message = choice.message as unknown as {
+      content?: string | null;
+      reasoning_content?: string | null;
+    };
+    const content = message.content || message.reasoning_content || '';
     return {
-      content: choice.message.content || '',
-      usage: tokenUsageRegistry.normalize({ provider: this.name, model, usage: response.usage, messages, output: choice.message.content || '' }),
+      content,
+      usage: tokenUsageRegistry.normalize({ provider: this.name, model, usage: response.usage, messages, output: content }),
       model,
       finishReason: choice.finish_reason ?? undefined,
     };
@@ -97,15 +102,24 @@ export class OpenAIProvider implements LLMProvider {
 
     let rawUsage: unknown;
     let finishReason: string | undefined;
+    const reasoningChunks: string[] = [];
+    let visibleContentSeen = false;
 
     for await (const chunk of stream) {
-      const content = chunk.choices[0]?.delta?.content || '';
+      const delta = chunk.choices[0]?.delta as unknown as {
+        content?: string | null;
+        reasoning_content?: string | null;
+      } | undefined;
+      const content = delta?.content || '';
+      const reasoningContent = delta?.reasoning_content || '';
       const chunkFinishReason = chunk.choices[0]?.finish_reason;
 
       if (chunk.usage) rawUsage = chunk.usage;
       if (chunkFinishReason) finishReason = chunkFinishReason;
+      if (reasoningContent) reasoningChunks.push(reasoningContent);
 
       if (content) {
+        visibleContentSeen = true;
         yield {
           content,
           done: false,
@@ -113,10 +127,24 @@ export class OpenAIProvider implements LLMProvider {
       }
     }
 
+    const reasoningFallback = visibleContentSeen ? '' : reasoningChunks.join('');
+    if (reasoningFallback) {
+      yield {
+        content: reasoningFallback,
+        done: false,
+      };
+    }
+
     yield {
       content: '',
       done: true,
-      usage: tokenUsageRegistry.normalize({ provider: this.name, model, usage: rawUsage, messages }),
+      usage: tokenUsageRegistry.normalize({
+        provider: this.name,
+        model,
+        usage: rawUsage,
+        messages,
+        output: reasoningFallback || undefined,
+      }),
       finishReason,
     };
   }
