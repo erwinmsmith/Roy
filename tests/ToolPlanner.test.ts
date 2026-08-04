@@ -396,6 +396,73 @@ describe('AgentToolPlanner', () => {
     expect(String(plans[0]?.params.instructions).length).toBeLessThanOrEqual(4_000);
   });
 
+  it('repairs the stale parallel manifest using only each path latest snapshot', () => {
+    const task = [
+      'Continue the runtime migration.',
+      '<official_verifier_feedback>',
+      'project metadata still targets legacy LangChain runtime',
+      '</official_verifier_feedback>',
+    ].join('\n');
+    const plans = new AgentToolPlanner().planExternalFeedbackRepair({
+      task,
+      calls: [
+        {
+          toolName: 'fs.read',
+          params: { path: 'pyproject.toml' },
+          success: true,
+          result: {
+            path: 'pyproject.toml',
+            content: 'dependencies = ["pydantic<2", "langchain==0.0.1"]',
+          },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'requirements.txt' },
+          success: true,
+          result: {
+            path: 'requirements.txt',
+            content: 'pydantic<2\nlangchain==0.0.1\n',
+          },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: '.roy/official-verifier/test_outputs.py' },
+          success: true,
+          result: {
+            path: '.roy/official-verifier/test_outputs.py',
+            content: [
+              'TARGET_LANGCHAIN_VERSION = "1.3.4"',
+              'legacy_pydantic = re.search(r"pydantic\\s*<\\s*2", text)',
+              '_fail(details, "project metadata still targets legacy LangChain runtime")',
+            ].join('\n'),
+          },
+        },
+        {
+          toolName: 'fs.read',
+          params: { path: 'pyproject.toml' },
+          success: true,
+          result: {
+            path: 'pyproject.toml',
+            content: 'dependencies = ["pydantic>=2", "langchain==1.3.4"]',
+          },
+        },
+      ],
+      currentCalls: [],
+      bindings: [
+        { name: 'fs.read', enabled: true },
+        { name: 'fs.synthesize', enabled: true },
+      ],
+      workspaceRoot: '/app',
+    });
+
+    expect(plans).toEqual([
+      expect.objectContaining({
+        toolName: 'fs.synthesize',
+        params: expect.objectContaining({ path: 'requirements.txt' }),
+      }),
+    ]);
+  });
+
   it('prefers direct newest feedback over unchanged persisted artifacts', () => {
     const task = [
       '## VERIFICATION FAILED — CONTINUE WORKING',

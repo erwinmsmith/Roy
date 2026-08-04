@@ -1234,8 +1234,18 @@ export class AgentToolPlanner {
       .filter(call => isSuccessfulWorkspaceMutationCall(call))
       .map(call => this.normalizeWorkspacePath(String(call.params.path ?? '')))
       .filter(Boolean));
-    const candidates = input.calls
-      .filter(call => call.toolName === 'fs.read' && call.success)
+    const latestReadsByPath = new Map<string, ObservedToolCall>();
+    for (const call of [...input.calls].reverse()) {
+      if (call.toolName !== 'fs.read' || !call.success) continue;
+      const result = call.result as { path?: unknown } | undefined;
+      const path = this.normalizeWorkspacePath(String(
+        result?.path ?? call.params.path ?? ''
+      ));
+      if (path && !latestReadsByPath.has(path)) {
+        latestReadsByPath.set(path, call);
+      }
+    }
+    const candidates = [...latestReadsByPath.values()]
       .map(call => {
         const result = call.result as { path?: unknown; content?: unknown } | undefined;
         const candidatePath = this.normalizeWorkspacePath(String(
