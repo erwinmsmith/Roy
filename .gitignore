@@ -36,5 +36,17 @@ coverage/
 # Cache
 .cache/
 
+# Research runtimes and generated artifacts
+research/.venv/
+research/**/__pycache__/
+research/**/*.pyc
+research/output/
+research/artifacts/
+research/models/
+research/data/
+research/external/
+research/remote/work/
+research/remote/results/
+
 # editor
 CLAUDE.md

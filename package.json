@@ -80,6 +80,8 @@
     "lint:fix": "eslint src --ext .ts --fix",
     "format": "prettier --write \"src/**/*.ts\"",
     "check": "tsc --noEmit && eslint src --ext .ts",
+    "research:smoke": "PYTHONPATH=research python3 -m roy_research smoke --output research/output/smoke",
+    "research:test": "PYTHONPATH=research python3 -m unittest discover -s research/tests -v",
     "prepack": "npm run build"
   },
   "dependencies": {

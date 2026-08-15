@@ -5,6 +5,7 @@ export {
   runtime,
   type RuntimeConfig,
   type RuntimeContext,
+  type CaptureStructuralCheckpointInput,
   type ToMRuntimeState,
   type RunEvolutionInput,
   type EvolutionBenchmarkResult,

@@ -185,6 +185,22 @@ import {
   type ActorLifecycleRecord,
   type PersistedActorSnapshot,
 } from '../lifecycle/index.js';
+import {
+  LegacyStructuralPolicyAdapter,
+  StructuralCheckpointStore,
+  projectParentLocalEventGraph,
+  validateStructuralDecision,
+  type ChildSpecification,
+  type CommunicationGraph,
+  type DependencyGraph,
+  type DerivationTree,
+  type ResourceEnvelope,
+  type StructuralCheckpoint,
+  type StructuralDecision,
+  type StructuralEventEdge,
+  type StructuralEventNode,
+  type StructuralPolicy,
+} from '../structural/index.js';
 
 export interface RuntimeConfig {
   agentName?: string;
@@ -200,6 +216,26 @@ export interface RuntimeConfig {
   communicationProtocols?: AgentCommunicationProtocol[];
   tomPlanner?: ToMDelegationEngine;
   reasoningInvestmentModel?: ReasoningInvestmentModel;
+  structuralLearning?: {
+    enabled?: boolean;
+    policy?: StructuralPolicy;
+    environmentRevision?: string;
+  };
+}
+
+export interface CaptureStructuralCheckpointInput {
+  parentId: string;
+  task: string;
+  taskId?: string;
+  correlationId?: string;
+  environmentRevision?: string;
+  randomness?: {
+    environmentSeed?: number;
+    repeat?: number;
+    providerSeed?: number;
+    deterministicProvider?: boolean;
+  };
+  outputContractSatisfied?: boolean;
 }
 
 export interface RuntimeContext {
@@ -884,6 +920,10 @@ export class Runtime {
   private readonly evolutionBudgetBypassCorrelations = new Set<string>();
   private readonly executionTrees = new RootExecutionTreeRegistry();
   private readonly executionActivityProjector = new RootExecutionActivityProjector();
+  private readonly structuralCheckpoints = new StructuralCheckpointStore();
+  private structuralPolicy: StructuralPolicy = new LegacyStructuralPolicyAdapter();
+  private structuralLearningEnabled = false;
+  private structuralEnvironmentRevision = 'roy-runtime-v1';
 
   static getInstance(): Runtime {
     if (!Runtime.instance) {
@@ -898,6 +938,9 @@ export class Runtime {
     }
 
     const startTime = Date.now();
+    this.structuralLearningEnabled = options.structuralLearning?.enabled === true;
+    this.structuralPolicy = options.structuralLearning?.policy ?? new LegacyStructuralPolicyAdapter();
+    this.structuralEnvironmentRevision = options.structuralLearning?.environmentRevision ?? 'roy-runtime-v1';
 
     // Initialize logger
     const logLevel = config.logger?.level ?? 'info';
@@ -1140,6 +1183,8 @@ export class Runtime {
 
     logger.info('Runtime shutting down...');
 
+    await this.structuralPolicy.close?.();
+
     for (const sessionId of this.ctx.manager.listSessions()) {
       await this.ctx.manager.closeSession(sessionId);
     }
@@ -1182,6 +1227,9 @@ export class Runtime {
     this.teamRestoreSpecs.clear();
     this.evolutionBudgetBypassCorrelations.clear();
     this.executionTrees.clear();
+    this.structuralPolicy = new LegacyStructuralPolicyAdapter();
+    this.structuralLearningEnabled = false;
+    this.structuralEnvironmentRevision = 'roy-runtime-v1';
     this.evolutionSequence = 0;
     this.initialized = false;
     logger.info('Runtime shutdown complete');
@@ -1322,6 +1370,280 @@ export class Runtime {
 
   getEvents(): RuntimeEvent[] {
     return [...this.events];
+  }
+
+  isStructuralLearningEnabled(): boolean {
+    return this.structuralLearningEnabled;
+  }
+
+  listStructuralCheckpoints(): StructuralCheckpoint[] {
+    return this.structuralCheckpoints.list();
+  }
+
+  async captureStructuralCheckpoint(
+    input: CaptureStructuralCheckpointInput
+  ): Promise<StructuralCheckpoint> {
+    const ctx = this.getContext();
+    const correlationId = input.correlationId ?? `structural_${randomUUID()}`;
+    const allAgents = ctx.manager.listAgentInfo();
+    const parent = allAgents.find(agent => agent.identity.id === input.parentId)
+      ?? this.archivedAgentInfo.get(input.parentId);
+    if (!parent) throw new Error(`Structural checkpoint parent ${input.parentId} not found`);
+    const visibleAgents = this.localStructuralAgents(allAgents, input.parentId);
+    const visibleActorIds = visibleAgents.map(agent => agent.identity.id);
+    const messages = (await this.getMessages({ correlationId })).filter(message =>
+      message.from === input.parentId || message.to === input.parentId);
+    const runtimeEvents = this.getEvents().filter(event =>
+      (event.correlationId === correlationId || event.data?.correlationId === correlationId)
+      && (!event.agentId || event.agentId === input.parentId));
+    const graphNodes: StructuralEventNode[] = [
+      ...visibleAgents.map(agent => ({
+        id: `agent:${agent.identity.id}`,
+        kind: 'agent' as const,
+        timestamp: agent.createdAt,
+        actorId: agent.identity.id,
+        text: `${agent.identity.name}: ${agent.identity.description ?? agent.lastTask ?? agent.role}`,
+        status: agent.state,
+        attributes: {
+          generation: agent.identity.generation,
+          parentId: agent.identity.parentId ?? '',
+          teamId: agent.identity.teamId ?? '',
+          outputContractSatisfied: Boolean(agent.lastResult),
+        },
+      })),
+      ...runtimeEvents.map((event, index) => ({
+        id: `event:${event.timestamp}:${index}:${event.type}`,
+        kind: this.structuralNodeKindForEvent(event.type),
+        timestamp: event.timestamp,
+        actorId: event.agentId,
+        text: `${event.type} ${this.compactStructuralText(event.data)}`.trim(),
+        status: /failed|error|rejected/.test(event.type) ? 'failed' : 'completed',
+        attributes: { eventType: event.type },
+      })),
+      ...messages.map(message => ({
+        id: `message:${message.id}`,
+        kind: (message.kind === 'tool.call'
+          ? 'tool_call'
+          : message.kind === 'tool.result' ? 'tool_result' : message.kind === 'agent.result' ? 'child_result' : 'message') as StructuralEventNode['kind'],
+        timestamp: message.createdAt,
+        actorId: message.from,
+        text: `${message.kind} ${this.compactStructuralText(message.payload)}`.trim(),
+        status: message.status,
+        attributes: { from: message.from, to: message.to },
+      })),
+    ];
+    const graphEdges: StructuralEventEdge[] = [];
+    for (const agent of visibleAgents) {
+      if (agent.identity.parentId) {
+        graphEdges.push({
+          id: `derive:${agent.identity.parentId}:${agent.identity.id}`,
+          kind: 'derivation',
+          from: `agent:${agent.identity.parentId}`,
+          to: `agent:${agent.identity.id}`,
+          required: true,
+          active: agent.state !== 'done' && agent.state !== 'stopped',
+        });
+      }
+    }
+    for (const message of messages) {
+      const nodeId = `message:${message.id}`;
+      if (graphNodes.some(node => node.id === `agent:${message.from}`)) {
+        graphEdges.push({ id: `message-from:${message.id}`, kind: 'communication', from: `agent:${message.from}`, to: nodeId });
+      }
+      if (graphNodes.some(node => node.id === `agent:${message.to}`)) {
+        graphEdges.push({ id: `message-to:${message.id}`, kind: 'communication', from: nodeId, to: `agent:${message.to}` });
+      }
+    }
+    const visibleGraph = projectParentLocalEventGraph({
+      parentId: input.parentId,
+      nodes: graphNodes,
+      edges: graphEdges,
+      visibleActorIds,
+    });
+    const derivationTree = this.runtimeDerivationTree(visibleAgents, input.parentId);
+    const dependencyGraph = this.runtimeDependencyGraph(correlationId);
+    const communicationGraph = this.runtimeCommunicationGraph(visibleAgents, messages);
+    const resources = this.runtimeStructuralResources(input.parentId, communicationGraph);
+    const llmConfig = ctx.config.llm;
+    return this.structuralCheckpoints.create({
+      id: `checkpoint_${randomUUID()}`,
+      taskId: input.taskId ?? createHash('sha256').update(input.task).digest('hex').slice(0, 16),
+      correlationId,
+      parentId: input.parentId,
+      task: input.task,
+      eventGraph: visibleGraph,
+      derivationTree,
+      dependencyGraph,
+      communicationGraph,
+      resources,
+      environmentRevision: input.environmentRevision ?? this.structuralEnvironmentRevision,
+      model: {
+        provider: ctx.llm?.name ?? 'none',
+        name: ctx.llm?.defaultModel ?? 'none',
+        temperature: llmConfig?.temperature,
+        maxTokens: llmConfig?.maxTokens,
+      },
+      randomness: {
+        environmentSeed: input.randomness?.environmentSeed ?? 0,
+        repeat: input.randomness?.repeat ?? 0,
+        providerSeed: input.randomness?.providerSeed,
+        deterministicProvider: input.randomness?.deterministicProvider ?? false,
+      },
+      outputContractSatisfied: input.outputContractSatisfied,
+    });
+  }
+
+  async decideStructuralAction(input: CaptureStructuralCheckpointInput): Promise<{
+    checkpoint: StructuralCheckpoint;
+    decision: StructuralDecision;
+  }> {
+    const checkpoint = await this.captureStructuralCheckpoint(input);
+    const decision = validateStructuralDecision(checkpoint, await this.structuralPolicy.decide(checkpoint));
+    this.emit({
+      type: 'structural.decision',
+      agentId: input.parentId,
+      correlationId: checkpoint.correlationId,
+      data: {
+        checkpointId: checkpoint.id,
+        fingerprint: checkpoint.fingerprint,
+        action: decision.action,
+        policy: this.structuralPolicy.name,
+        policyVersion: decision.policyVersion ?? this.structuralPolicy.version,
+      },
+    });
+    return { checkpoint, decision };
+  }
+
+  private structuralNodeKindForEvent(type: string): StructuralEventNode['kind'] {
+    if (type.startsWith('tool.') && type.includes('result')) return 'tool_result';
+    if (type.startsWith('tool.')) return 'tool_call';
+    if (type.startsWith('budget.')) return 'resource';
+    if (type.includes('dependency')) return 'dependency';
+    if (type.includes('result')) return 'child_result';
+    if (type.includes('spawn') || type.includes('delegation')) return 'subtask';
+    return 'message';
+  }
+
+  private compactStructuralText(value: unknown): string {
+    if (value === undefined || value === null) return '';
+    const text = typeof value === 'string' ? value : JSON.stringify(value);
+    return text.replace(/\s+/g, ' ').slice(0, 1_200);
+  }
+
+  private localStructuralAgents(agents: AgentInfo[], parentId: string): AgentInfo[] {
+    const candidates = [...new Map([
+      ...this.archivedAgentInfo.entries(),
+      ...agents.map(agent => [agent.identity.id, agent] as const),
+    ]).values()];
+    const byParent = new Map<string, AgentInfo[]>();
+    for (const agent of candidates) {
+      const parent = agent.identity.parentId;
+      if (!parent) continue;
+      const children = byParent.get(parent) ?? [];
+      children.push(agent);
+      byParent.set(parent, children);
+    }
+    const result: AgentInfo[] = [];
+    const pending = [parentId];
+    const visited = new Set<string>();
+    while (pending.length > 0) {
+      const id = pending.shift()!;
+      if (visited.has(id)) continue;
+      visited.add(id);
+      const agent = candidates.find(item => item.identity.id === id);
+      if (agent) result.push(agent);
+      for (const child of byParent.get(id) ?? []) pending.push(child.identity.id);
+    }
+    return result;
+  }
+
+  private runtimeDerivationTree(agents: AgentInfo[], rootId: string): DerivationTree {
+    const combined = agents;
+    return {
+      rootId,
+      nodes: combined.map(agent => ({
+        id: agent.identity.id,
+        parentId: agent.identity.parentId,
+        status: this.structuralDerivationStatus(agent.state),
+        createdAt: agent.createdAt,
+        closedAt: ['done', 'failed', 'stopped'].includes(agent.state) ? agent.updatedAt : undefined,
+      })),
+      edges: combined
+        .filter(agent => Boolean(agent.identity.parentId))
+        .map(agent => ({
+          parentId: agent.identity.parentId!,
+          childId: agent.identity.id,
+          createdAt: agent.createdAt,
+        })),
+    };
+  }
+
+  private structuralDerivationStatus(state: AgentInfo['state']): DerivationTree['nodes'][number]['status'] {
+    if (state === 'idle') return 'ready';
+    if (state === 'waiting') return 'waiting';
+    if (state === 'done') return 'completed';
+    if (state === 'failed') return 'failed';
+    if (state === 'stopped') return 'closed';
+    return 'running';
+  }
+
+  private runtimeDependencyGraph(correlationId: string): DependencyGraph {
+    const tree = this.executionTrees.get(correlationId);
+    if (!tree) return { nodes: [], edges: [] };
+    return {
+      nodes: tree.steps.map(step => ({
+        id: step.id,
+        kind: 'subgoal',
+        producerId: tree.rootAgentId,
+        resolved: step.status === 'completed',
+        valueRef: step.resultSummary,
+      })),
+      edges: tree.steps.flatMap(step => step.dependsOn.map(dependency => ({
+        producerId: dependency,
+        consumerId: step.id,
+        required: true,
+      }))),
+    };
+  }
+
+  private runtimeCommunicationGraph(agents: AgentInfo[], messages: RuntimeMessage[]): CommunicationGraph {
+    const nodes = new Set<string>(['root']);
+    for (const agent of agents) nodes.add(agent.identity.id);
+    for (const message of messages) {
+      nodes.add(message.from);
+      nodes.add(message.to);
+    }
+    const edges: CommunicationGraph['edges'] = [];
+    const add = (from: string, to: string, required: boolean, createdAt: number): void => {
+      if (edges.some(edge => edge.from === from && edge.to === to && edge.active)) return;
+      edges.push({ from, to, required, active: true, createdAt });
+    };
+    for (const agent of agents) {
+      if (!agent.identity.parentId) continue;
+      add(agent.identity.parentId, agent.identity.id, true, agent.createdAt);
+      add(agent.identity.id, agent.identity.parentId, true, agent.createdAt);
+    }
+    for (const message of messages) add(message.from, message.to, false, message.createdAt);
+    return { nodes: [...nodes], edges };
+  }
+
+  private runtimeStructuralResources(parentId: string, communication: CommunicationGraph): ResourceEnvelope {
+    const budget = this.getBudgetState();
+    const policy = this.getAgentPolicy(parentId);
+    const tree = this.executionTrees.latest();
+    const elapsedMs = tree ? Math.max(0, Date.now() - tree.createdAt) : 0;
+    const wallClockLimit = tree?.loop.maxWallClockMs
+      ?? this.workspaceRuntimeConfig?.delegation.rootSteps.maxWallClockMs;
+    const toolCalls = [...this.toolCallCounts.entries()]
+      .filter(([key]) => key.startsWith(`${parentId}:`))
+      .reduce((sum, [, count]) => sum + count, 0);
+    return {
+      computeTokens: budget.remainingTokens,
+      wallClockMs: wallClockLimit === undefined ? undefined : Math.max(0, wallClockLimit - elapsedMs),
+      parallelSlots: policy ? Math.max(0, policy.allowedChildren - policy.currentChildren) : 0,
+      communicationEdges: Math.max(0, 64 - communication.edges.filter(edge => edge.active).length),
+      toolCalls: Math.max(0, 100 - toolCalls),
+    };
   }
 
   getRootExecutionTree(correlationId?: string): RootExecutionTreeState | undefined {
@@ -12926,9 +13248,61 @@ Do not repeat an existing agent task, cached failed path, or equivalent failed t
     return [...teamSummary, ...agentSummary].join('\n') || 'Delegation round completed without a visible result.';
   }
 
+  private async structuralDelegationGate(
+    parentId: string,
+    task: string,
+    correlationId: string
+  ): Promise<DelegationDecision | undefined> {
+    if (!this.structuralLearningEnabled) return undefined;
+    const outputContractSatisfied = this.getEvents().some(event =>
+      (event.correlationId === correlationId || event.data?.correlationId === correlationId)
+      && event.agentId === parentId
+      && /(?:run|synthesis|result)\.completed$/.test(event.type));
+    const { decision } = await this.decideStructuralAction({
+      parentId,
+      task,
+      correlationId,
+      outputContractSatisfied,
+    });
+    if (decision.action === 'BRANCH') {
+      if (!decision.childSpecification) return undefined;
+      return this.delegationDecisionFromChildSpecification(decision.childSpecification, decision.rationale);
+    }
+    return {
+      action: 'solve_directly',
+      reason: decision.action === 'RETURN'
+        ? `Structural policy selected RETURN: ${decision.rationale ?? 'the current result is terminal.'}`
+        : `Structural policy selected CONTINUE: ${decision.rationale ?? 'continue parent-local computation.'}`,
+    };
+  }
+
+  private delegationDecisionFromChildSpecification(
+    specification: ChildSpecification,
+    rationale?: string
+  ): DelegationDecision {
+    return {
+      action: 'spawn_subagents',
+      reason: rationale ?? `Parent-local structural policy derived child ${specification.id}.`,
+      coordination: 'independent',
+      continuationPolicy: 'reassess',
+      agents: [{
+        archetype: 'custom',
+        name: specification.id,
+        role: 'parent-derived computation branch',
+        description: `Open child specification ${specification.id}`,
+        task: specification.task,
+        tools: [...specification.tools],
+        budgetTokens: specification.resources.computeTokens,
+        existenceReason: rationale ?? 'Created by the parent-local structural policy.',
+      }],
+    };
+  }
+
   private async decideDelegation(userInput: string, correlationId: string): Promise<DelegationDecision> {
     const ctx = this.getContext();
     const fallback = this.fallbackDelegationDecision(userInput);
+    const structuralDecision = await this.structuralDelegationGate('root', userInput, correlationId);
+    if (structuralDecision) return structuralDecision;
 
     if (!ctx.llm) {
       this.emit({
@@ -13072,6 +13446,9 @@ Allowed archetypes: researcher, critic, planner, coder, summarizer, tester, cust
     if (this.getRemainingTotalAgentsForTurn(agent.identity.id, correlationId) <= 0) {
       return { action: 'solve_directly', reason: 'No agent slots remain for this turn.' };
     }
+
+    const structuralDecision = await this.structuralDelegationGate(agent.identity.id, task, correlationId);
+    if (structuralDecision) return structuralDecision;
 
     const fallback = this.fallbackAgentDelegationDecision(agent, task);
     const ctx = this.getContext();

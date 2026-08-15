@@ -10,6 +10,7 @@ export {
 export type {
   RuntimeConfig,
   RuntimeContext,
+  CaptureStructuralCheckpointInput,
   ToMRuntimeState,
   RunEvolutionInput,
   EvolutionBenchmarkResult,
@@ -48,6 +49,7 @@ export * from './core/team/index.js';
 export * from './core/tom/index.js';
 export * from './core/communication/index.js';
 export * from './core/delegation/index.js';
+export * from './core/structural/index.js';
 export {
   InMemoryMessageQueue,
   MessageScheduler,

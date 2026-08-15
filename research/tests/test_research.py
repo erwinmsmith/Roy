@@ -1,0 +1,146 @@
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import torch
+
+from roy_research.analysis import paired_bootstrap_interval
+from roy_research.baselines import evaluate_controlled_arms
+from roy_research.controlled import collect_group, generate_tasks, mechanism_diagnostics, task_event_graph
+from roy_research.grpo import clipped_policy_loss, hierarchical_advantages, masked_log_softmax
+from roy_research.model import FrozenTextEncoder, StructuralPolicyNetwork, TEXT_DIMENSION
+from roy_research.policy_server import PolicyServer
+from roy_research.schema import require_schema
+from roy_research.token_ledger import PersistentTokenLedger
+from roy_research.training import train_groups
+from roy_research.io import write_jsonl
+
+
+class GRPOTests(unittest.TestCase):
+    def test_masked_policy_and_clipped_objective(self) -> None:
+        logits = torch.tensor([[1.0, 100.0, 2.0]])
+        mask = torch.tensor([[True, False, True]])
+        values = masked_log_softmax(logits, mask)
+        self.assertLess(values[0, 1].item(), -1e20)
+        loss = clipped_policy_loss(torch.log(torch.tensor([1.5])), torch.tensor([0.0]), torch.tensor([1.0]))
+        self.assertAlmostEqual(loss.item(), -1.2, places=5)
+
+    def test_zero_variance_and_hierarchical_branch_aggregation(self) -> None:
+        result = hierarchical_advantages(
+            {"CONTINUE": iter([0.5, 0.5]), "RETURN": iter([0.5, 0.5])},
+            {"a": iter([0.2, 0.4]), "b": iter([0.8, 1.0])},
+        )
+        self.assertAlmostEqual(result.action_values["BRANCH"], 0.6)
+        self.assertGreater(result.branch_advantages["b"], result.branch_advantages["a"])
+
+
+class ControlledTests(unittest.TestCase):
+    def test_dataset_splits_ood_and_mechanism_reconstruction(self) -> None:
+        tasks = generate_tasks()
+        self.assertEqual(len(tasks), 180)
+        self.assertEqual(sum(task.split == "train" for task in tasks), 90)
+        self.assertEqual(sum(task.split == "validation" for task in tasks), 30)
+        self.assertEqual(sum(task.split == "test" for task in tasks), 60)
+        self.assertEqual(sum(task.ood for task in tasks), 30)
+        self.assertEqual(len({task.seed for task in tasks}), 180)
+        mixed_ood = next(task for task in tasks if task.family == "mixed" and task.ood)
+        self.assertNotEqual(list(mixed_ood.branch_values), sorted(mixed_ood.branch_values))
+        self.assertLessEqual(max(mechanism_diagnostics(task)["reconstruction_error"] for task in tasks), 1e-6)
+        self.assertEqual(mechanism_diagnostics(tasks[0])["remaining_budget_after_evidence"], 7.0)
+
+    def test_unresolved_dependency_masks_return_and_traces_validate(self) -> None:
+        task = next(task for task in generate_tasks() if task.family == "acquisition")
+        group = collect_group(task)
+        self.assertNotIn("RETURN", group["checkpoint"]["legal_actions"])
+        self.assertTrue(any(node["kind"] == "dependency" for node in task_event_graph(task)["nodes"]))
+        result = group["results"][0]
+        trace = {
+            "schema_version": 1, "action": result["action"], "utility": result["utility"],
+        }
+        require_schema(trace)
+
+    def test_mixed_tasks_include_communication_and_artifact_events(self) -> None:
+        task = next(task for task in generate_tasks() if task.family == "mixed")
+        graph = task_event_graph(task)
+        self.assertTrue(any(edge["kind"] == "communication" for edge in graph["edges"]))
+        self.assertTrue(any(node["kind"] == "artifact" for node in graph["nodes"]))
+
+    def test_baselines_report_paired_intervals(self) -> None:
+        groups = [collect_group(task) for task in generate_tasks()[:6]]
+        result = evaluate_controlled_arms(groups)
+        self.assertEqual(result["arms"]["no_derivation"]["episodes"], 6)
+        self.assertIn("conclusion", result["arms"]["roy_heuristic"]["paired_vs_no_derivation"])
+        self.assertEqual(paired_bootstrap_interval([1, 1], [0, 0])["conclusion"], "positive")
+
+
+class ModelTests(unittest.TestCase):
+    def test_pinned_encoder_output_dimension(self) -> None:
+        encoder = FrozenTextEncoder(device="cpu", local_only=True)
+        encoded = encoder.encode(["structural decision", "dependency evidence"])
+        self.assertEqual(tuple(encoded.shape), (2, 384))
+
+    def test_relational_policy_shapes_and_checkpoint_restore(self) -> None:
+        model = StructuralPolicyNetwork()
+        embeddings = torch.randn(3, TEXT_DIMENSION)
+        node_types = torch.tensor([0, 1, 2])
+        scalars = torch.zeros(3, 3)
+        edges = torch.tensor([[0, 1], [1, 2]])
+        edge_types = torch.tensor([0, 1])
+        resources = torch.zeros(5)
+        mask = torch.tensor([True, True, False])
+        logits = model(embeddings, node_types, scalars, edges, edge_types, resources, mask)
+        self.assertEqual(tuple(logits.shape), (3,))
+        self.assertLess(logits[2].item(), -1e20)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model.pt"
+            model.save_checkpoint(path, {"epoch": 1})
+            restored, metadata = StructuralPolicyNetwork.load_checkpoint(path)
+            self.assertEqual(metadata["epoch"], 1)
+            for left, right in zip(model.parameters(), restored.parameters()):
+                self.assertTrue(torch.equal(left, right))
+
+    def test_training_checkpoint_resume(self) -> None:
+        task = next(task for task in generate_tasks() if task.split == "train")
+        group = collect_group(task)
+        with tempfile.TemporaryDirectory() as directory:
+            groups_path = Path(directory) / "groups.jsonl"
+            model_path = Path(directory) / "model.pt"
+            write_jsonl(groups_path, [group])
+            first = train_groups(groups_path, model_path, epochs=1, device_name="cpu")
+            resumed = train_groups(groups_path, model_path, epochs=2, device_name="cpu", resume=True)
+            self.assertEqual(first["completed_epochs"], 1)
+            self.assertEqual(resumed["resumed_from_epoch"], 1)
+            self.assertEqual(resumed["completed_epochs"], 2)
+
+
+class RuntimeBoundaryTests(unittest.TestCase):
+    def test_persistent_ledger_hard_cap_and_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.json"
+            ledger = PersistentTokenLedger(path, limit=10)
+            ledger.reserve(8)
+            conservative_restart = PersistentTokenLedger(path, limit=10)
+            self.assertEqual(conservative_restart.snapshot()["remaining"], 2)
+            with self.assertRaises(RuntimeError):
+                ledger.reserve(3)
+            ledger.settle(8, 6)
+            resumed = PersistentTokenLedger(path, limit=10)
+            self.assertEqual(resumed.snapshot()["remaining"], 4)
+
+    def test_policy_server_has_deterministic_legacy_fallback(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            server = PolicyServer()
+        decision = server.decide({
+            "legalActions": ["CONTINUE", "BRANCH"],
+            "eventGraph": {"nodes": [{"kind": "dependency", "status": "unresolved"}]},
+        })
+        self.assertEqual(decision["action"], "BRANCH")
+
+
+if __name__ == "__main__":
+    unittest.main()

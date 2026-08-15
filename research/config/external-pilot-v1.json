@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "provider": "deepseek",
+  "model": "deepseek-v4-flash",
+  "hard_token_limit": 10000000,
+  "benchmarks": {
+    "tau-knowledge": {
+      "revision": "c3398666e6559e3a063da3fc04b5acf7f941464e",
+      "domain": "banking_knowledge",
+      "tasks": 5,
+      "repeats": 3,
+      "mode": "text"
+    },
+    "tua-bench": {
+      "revision": "3497fd320abcafaf4797424192c891a593fd7964",
+      "tasks": 5,
+      "repeats": 3
+    }
+  },
+  "arms": ["no_derivation", "roy_heuristic", "node_only", "full_v0_v4"],
+  "episodes": 120
+}

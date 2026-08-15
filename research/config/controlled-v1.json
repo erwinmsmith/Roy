@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "benchmark": "controlled-derivation-v1",
+  "generator_seed": 20260815,
+  "instances": {
+    "train": 90,
+    "validation": 30,
+    "test": 60,
+    "total": 180
+  },
+  "counterfactuals": {
+    "branch_specifications": 3,
+    "repeats": 2,
+    "branch_aggregate": "mean",
+    "common_random_numbers": true
+  },
+  "encoder": {
+    "model": "sentence-transformers/all-MiniLM-L6-v2",
+    "revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
+    "dimension": 384,
+    "frozen": true,
+    "local_only": true
+  },
+  "arms": [
+    "no_derivation",
+    "random_derivation",
+    "fixed_branch_count",
+    "roy_heuristic",
+    "full_trajectory_grpo",
+    "cs_grpo_no_event_graph",
+    "node_only_cs_grpo",
+    "full_v0_v4"
+  ],
+  "statistics": {
+    "paired_bootstrap_samples": 2000,
+    "confidence": 0.95,
+    "inconclusive_when_interval_crosses_zero": true
+  }
+}
