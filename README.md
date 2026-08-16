@@ -200,7 +200,7 @@ PYTHONPATH=research python3 -m roy_research experiment \
 
 In the controlled benchmark, `utility` is a deterministic terminal task score in `[0, 1]`; it is not an LLM accuracy score. The current pilot reached `0.8266` test utility for the full hierarchical policy, compared with `0.8086` for Node-only CS-GRPO, `0.6396` without the event graph, and `0.5939` without derivation. These are controlled-fixture results, not claims about real-world Agent performance. The real LLM rollout path is separately budgeted and has not yet completed the external tau Knowledge/TUA-Bench pilot.
 
-See the [research README](research/README.md), [canonical theory](research/theory/Agent_Derivation_Theory_CS_GRPO_Revised.md), and [controlled pilot report](research/reports/controlled-pilot.md) for experiment details, limitations, and reproducibility information.
+See the [research README](https://github.com/erwinmsmith/Roy/blob/exp/research/README.md), [canonical theory](https://github.com/erwinmsmith/Roy/blob/exp/research/theory/Agent_Derivation_Theory_CS_GRPO_Revised.md), and [controlled pilot report](https://github.com/erwinmsmith/Roy/blob/exp/research/reports/controlled-pilot.md) on the `exp` branch for experiment details, limitations, and reproducibility information.
 
 ## ToM-Aware Delegation
 
