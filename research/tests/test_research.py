@@ -11,6 +11,7 @@ import torch
 
 from roy_research.analysis import paired_bootstrap_interval
 from roy_research.baselines import evaluate_controlled_arms
+from roy_research.cli import _compare_live_arms
 from roy_research.controlled import (
     TERMINAL_SUCCESS_THRESHOLD,
     collect_group,
@@ -142,6 +143,42 @@ class ModelTests(unittest.TestCase):
 
 
 class RuntimeBoundaryTests(unittest.TestCase):
+    def test_live_arm_comparison_uses_matched_repeat_means(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            groups = root / "groups.jsonl"
+            evaluation = root / "evaluation.json"
+            mas = root / "mas.jsonl"
+            write_jsonl(groups, [{
+                "task": {"id": "task-1"},
+                "action_values": {"CONTINUE": 0.6},
+                "results": [
+                    {"action": "CONTINUE", "repeat": 0, "utility": 0.2, "token_usage": 10, "duration_ms": 20},
+                    {"action": "CONTINUE", "repeat": 1, "utility": 1.0, "token_usage": 30, "duration_ms": 40},
+                ],
+            }])
+            evaluation.write_text(json.dumps({
+                "split": "test",
+                "task_results": [{
+                    "task_id": "task-1", "selected_action": "CONTINUE",
+                    "selected_child_specification": None, "utility": 0.6, "success": False,
+                }],
+            }), encoding="utf-8")
+            write_jsonl(mas, [{
+                "task_id": "task-1", "utility": 1.0, "success": True,
+                "total_tokens": 100, "parallel_span_ms": 50,
+                "work_latency_ms": 80, "child_agent_count": 3,
+            }])
+
+            result = _compare_live_arms(groups, evaluation, mas)
+            direct = result["arms"]["single_agent_direct"]
+            learned = result["arms"]["learned_full_policy"]
+            self.assertEqual(direct["mean_utility"], 0.6)
+            self.assertEqual(direct["success_rate"], 0.0)
+            self.assertEqual(direct["mean_tokens"], 20)
+            self.assertEqual(learned["mean_utility"], direct["mean_utility"])
+            self.assertEqual(learned["success_rate"], direct["success_rate"])
+
     def test_persistent_ledger_hard_cap_and_resume(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "ledger.json"

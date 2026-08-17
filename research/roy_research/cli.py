@@ -410,16 +410,17 @@ def _compare_live_arms(groups_path: Path, evaluation_path: Path, mas_path: Path)
     }
     for task_id in sorted(expected):
         group = groups[task_id]
-        direct_result = next(
-            result for result in group["results"]
-            if result["action"] == "CONTINUE" and int(result.get("repeat", 0)) == 0
-        )
+        direct_results = [
+            result for result in group["results"] if result["action"] == "CONTINUE"
+        ]
+        direct_utility = float(group["action_values"]["CONTINUE"])
         arm_rows["single_agent_direct"].append({
             "task_id": task_id,
-            "utility": float(direct_result["utility"]),
-            "success": float(direct_result["utility"]) >= TERMINAL_SUCCESS_THRESHOLD,
-            "tokens": int(direct_result.get("token_usage", 0)),
-            "latency_ms": int(direct_result.get("duration_ms", 0)),
+            "utility": direct_utility,
+            "success": direct_utility >= TERMINAL_SUCCESS_THRESHOLD,
+            "tokens": round(sum(int(row.get("token_usage", 0)) for row in direct_results) / len(direct_results)),
+            "latency_ms": round(sum(int(row.get("duration_ms", 0)) for row in direct_results) / len(direct_results)),
+            "rollout_repeats": len(direct_results),
         })
 
         mas_result = mas[task_id]
@@ -442,17 +443,15 @@ def _compare_live_arms(groups_path: Path, evaluation_path: Path, mas_path: Path)
                 result for result in candidates
                 if (result.get("child_specification") or {}).get("id") == selected_child
             ]
-        selected_rollout = next(
-            result for result in candidates if int(result.get("repeat", 0)) == 0
-        )
         arm_rows["learned_full_policy"].append({
             "task_id": task_id,
             "selected_action": selected_action,
             "selected_child_specification": selected_child,
             "utility": float(learned_result["utility"]),
             "success": bool(learned_result["success"]),
-            "tokens": int(selected_rollout.get("token_usage", 0)),
-            "latency_ms": int(selected_rollout.get("duration_ms", 0)),
+            "tokens": round(sum(int(row.get("token_usage", 0)) for row in candidates) / len(candidates)),
+            "latency_ms": round(sum(int(row.get("duration_ms", 0)) for row in candidates) / len(candidates)),
+            "rollout_repeats": len(candidates),
         })
 
     direct_rows = arm_rows["single_agent_direct"]
@@ -488,9 +487,9 @@ def _compare_live_arms(groups_path: Path, evaluation_path: Path, mas_path: Path)
         "success_threshold": TERMINAL_SUCCESS_THRESHOLD,
         "task_ids": sorted(expected),
         "arm_definitions": {
-            "single_agent_direct": "One parent CONTINUE completion; no child agents.",
+            "single_agent_direct": "Parent CONTINUE; task utility and cost are estimated over matched rollout repeats.",
             "forced_full_mas": "All three child agents execute, then one parent aggregates all proposals.",
-            "learned_full_policy": "Trained structural policy chooses CONTINUE, RETURN, or one BRANCH specification.",
+            "learned_full_policy": "Trained structural policy chooses CONTINUE, RETURN, or one BRANCH specification; task utility and cost use the same matched-repeat estimator as direct.",
         },
         "arms": arms,
     }
