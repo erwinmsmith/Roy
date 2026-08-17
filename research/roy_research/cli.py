@@ -43,10 +43,12 @@ def parser() -> argparse.ArgumentParser:
     collect_live.add_argument("--events", type=Path, required=True, help="Append-only request/response event log")
     collect_live.add_argument("--traces", type=Path, help="Optional flat trajectory JSONL output")
     collect_live.add_argument("--task-ids", nargs="*")
+    collect_live.add_argument("--split", choices=("train", "validation", "test"))
     collect_live.add_argument("--limit", type=int)
     collect_live.add_argument("--repeats", type=int, default=2)
     collect_live.add_argument("--max-tokens", type=int, default=384)
     collect_live.add_argument("--temperature", type=float, default=0.0)
+    collect_live.add_argument("--problem-version", choices=("v1", "v2"), default="v1")
     collect_live.add_argument("--token-limit", type=int, default=10_000_000)
     collect_live.add_argument("--timeout", type=float, default=90.0)
     collect_live.add_argument("--resume", action="store_true")
@@ -160,6 +162,8 @@ def main(argv: List[str] | None = None) -> None:
             missing = selected_ids - {str(task["id"]) for task in tasks}
             if missing:
                 raise ValueError(f"unknown task ids: {sorted(missing)}")
+        if args.split:
+            tasks = [task for task in tasks if str(task.get("split")) == args.split]
         if args.limit is not None:
             tasks = tasks[: args.limit]
         completed = set()
@@ -177,6 +181,7 @@ def main(argv: List[str] | None = None) -> None:
             group = collect_live_group(
                 task, client, repeats=args.repeats,
                 max_tokens=args.max_tokens, temperature=args.temperature,
+                problem_version=args.problem_version,
             )
             append_group = args.output.exists() and (args.resume or collected > 0)
             write_jsonl(args.output, [group], append=append_group)

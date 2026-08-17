@@ -58,11 +58,22 @@ PYTHONPATH=research python3 -m roy_research collect-live \
   --ledger research/output/live/token-ledger.json \
   --repeats 1 --max-tokens 384 --resume
 
+# Full versioned training collection: exactly the 90 train tasks, K=3 and M=2.
+PYTHONPATH=research python3 -m roy_research collect-live \
+  --tasks research/output/tasks.jsonl --split train --problem-version v2 \
+  --output research/output/live-v2/train/groups.jsonl \
+  --traces research/output/live-v2/train/traces.jsonl \
+  --events research/output/live-v2/train/events.jsonl \
+  --ledger research/output/token-ledger.json \
+  --repeats 2 --max-tokens 384 --resume
+
 PYTHONPATH=research python3 -m roy_research train \
   --groups research/output/live/groups.jsonl \
   --output research/output/live/cs-grpo.pt \
   --epochs 3 --device cpu
 ```
+
+The v2 live suite replaces the ceiling-prone arithmetic fixture with modular recurrences, hidden-coefficient polynomial evaluation and evidence-updated shortest paths. Keep train, validation and test in separate output directories; the `--split` filter is applied before collection, training reads only `train`, and evaluation never updates model weights.
 
 Transport failures are fail-closed: because a timed-out provider request may still have consumed tokens, its full reservation is charged to the ledger. Resume skips only complete groups; it never fills a missing counterfactual with fixture utility.
 

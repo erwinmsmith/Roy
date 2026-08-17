@@ -26,6 +26,7 @@ from roy_research.token_ledger import PersistentTokenLedger
 from roy_research.training import evaluate_groups, train_groups
 from roy_research.io import write_jsonl
 from roy_research.live_controlled import (
+    ENVIRONMENT_REVISION_V2,
     build_live_problem,
     collect_forced_full_mas,
     collect_live_group,
@@ -209,6 +210,33 @@ class LiveRolloutTests(unittest.TestCase):
         self.assertTrue(all(result["utility"] == 1.0 for result in group["results"]))
         self.assertEqual(group["provider"], "deepseek")
         self.assertEqual(group["checkpoint"]["environment_revision"], "live-controlled-arithmetic-v1")
+
+    def test_v2_problems_are_deterministic_diverse_and_versioned(self) -> None:
+        problems = {}
+        for family in ("activation", "acquisition", "mixed"):
+            task = next(task for task in generate_tasks() if task.family == family and task.ood)
+            first = build_live_problem(task, version="v2")
+            second = build_live_problem(task, version="v2")
+            self.assertEqual(first, second)
+            self.assertEqual(first.environment_revision, ENVIRONMENT_REVISION_V2)
+            problems[family] = first
+        self.assertEqual(problems["activation"].kind, "modular_recurrence")
+        self.assertFalse(problems["activation"].evidence_required)
+        self.assertEqual(problems["acquisition"].kind, "evidence_polynomial")
+        self.assertTrue(problems["acquisition"].evidence_required)
+        self.assertEqual(problems["mixed"].kind, "evidence_shortest_path")
+        self.assertTrue(problems["mixed"].evidence_required)
+
+    def test_v2_group_records_problem_revision(self) -> None:
+        task = next(task for task in generate_tasks() if task.family == "acquisition" and task.ood)
+        problem = build_live_problem(task, version="v2")
+        group = collect_live_group(
+            task, self.FakeClient(problem.gold_answer, True),
+            repeats=1, max_tokens=128, problem_version="v2",
+        )
+        self.assertEqual(group["checkpoint"]["environment_revision"], ENVIRONMENT_REVISION_V2)
+        self.assertEqual(group["task"]["live_problem"]["kind"], "evidence_polynomial")
+        self.assertTrue(all(result["utility"] == 1.0 for result in group["results"]))
 
     def test_activation_checkpoint_draft_and_json_scoring(self) -> None:
         task = next(task for task in generate_tasks() if task.family == "activation")

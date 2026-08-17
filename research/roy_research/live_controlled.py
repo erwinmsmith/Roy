@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import random
 import re
@@ -13,6 +14,7 @@ from .providers import Completion
 
 
 ENVIRONMENT_REVISION = "live-controlled-arithmetic-v1"
+ENVIRONMENT_REVISION_V2 = "live-controlled-reasoning-v2"
 
 
 class CompletionClient(Protocol):
@@ -34,12 +36,22 @@ class LiveProblem:
     evidence: str
     gold_answer: int
     evidence_required: bool
+    kind: str = "arithmetic"
+    environment_revision: str = ENVIRONMENT_REVISION
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
 
-def build_live_problem(task: ControlledTask) -> LiveProblem:
+def build_live_problem(task: ControlledTask, version: str = "v1") -> LiveProblem:
+    if version == "v1":
+        return _build_v1_problem(task)
+    if version == "v2":
+        return _build_v2_problem(task)
+    raise ValueError(f"unknown live problem version: {version}")
+
+
+def _build_v1_problem(task: ControlledTask) -> LiveProblem:
     randomizer = random.Random(task.seed ^ 0x5A17C0DE)
     units_a = randomizer.randint(17, 49)
     price_a = randomizer.randint(11, 37)
@@ -59,6 +71,117 @@ def build_live_problem(task: ControlledTask) -> LiveProblem:
     )
     evidence = f"The deterministic audit tool returned EVIDENCE_VALUE={adjustment}."
     return LiveProblem(task.id, prompt, evidence, gold, evidence_required)
+
+
+def _build_v2_problem(task: ControlledTask) -> LiveProblem:
+    randomizer = random.Random(task.seed ^ 0x29B7A4D3)
+    if task.family == "activation":
+        rounds = 13 if task.ood else 9
+        modulus = randomizer.choice((10007, 10009, 10037, 10039))
+        start = randomizer.randint(127, 911)
+        operations: List[Tuple[int, int]] = []
+        value = start
+        for _ in range(rounds):
+            multiplier = randomizer.randint(3, 17)
+            offset = randomizer.randint(41, 389)
+            operations.append((multiplier, offset))
+            value = (value * multiplier + offset) % modulus
+        operation_text = "; ".join(
+            f"step {index}: x=({multiplier}*x+{offset}) mod {modulus}"
+            for index, (multiplier, offset) in enumerate(operations, start=1)
+        )
+        prompt = (
+            f"Start with x={start}. Apply these operations in order, carrying the exact integer residue "
+            f"from each step into the next: {operation_text}. Return the final x after step {rounds}."
+        )
+        return LiveProblem(
+            task.id, prompt, "", value, False,
+            kind="modular_recurrence", environment_revision=ENVIRONMENT_REVISION_V2,
+        )
+
+    if task.family == "acquisition":
+        degree = 8 if task.ood else 5
+        x = randomizer.randint(11, 23)
+        coefficients = [randomizer.randint(-19, 31) for _ in range(degree + 1)]
+        if coefficients[0] == 0:
+            coefficients[0] = randomizer.randint(2, 11)
+        hidden_indices = {1, 3, 5, 7} & set(range(len(coefficients)))
+        labels = [f"C{index}" for index in range(len(coefficients))]
+        visible = [label if index in hidden_indices else str(coefficients[index]) for index, label in enumerate(labels)]
+        value = coefficients[0]
+        for coefficient in coefficients[1:]:
+            value = value * x + coefficient
+        scale = randomizer.randint(3, 9)
+        deduction = randomizer.randint(101, 701)
+        gold = value * scale - deduction
+        prompt = (
+            f"Evaluate a degree-{degree} polynomial at x={x} using Horner's rule. Coefficients are listed "
+            f"from highest degree to constant term: [{', '.join(visible)}]. After evaluating the polynomial, "
+            f"multiply by {scale} and subtract {deduction}. Hidden coefficient labels must be resolved from "
+            "the deterministic evidence tool. Return the final signed integer."
+        )
+        evidence = "The deterministic coefficient tool returned: " + ", ".join(
+            f"{labels[index]}={coefficients[index]}" for index in sorted(hidden_indices)
+        ) + "."
+        return LiveProblem(
+            task.id, prompt, evidence, gold, True,
+            kind="evidence_polynomial", environment_revision=ENVIRONMENT_REVISION_V2,
+        )
+
+    node_count = 11 if task.ood else 8
+    nodes = [chr(ord("A") + index) for index in range(node_count)]
+    edges: Dict[Tuple[int, int], int] = {}
+    for index in range(node_count - 1):
+        edges[(index, index + 1)] = randomizer.randint(4, 19)
+    target_edges = node_count * 2 + 3
+    while len(edges) < target_edges:
+        left, right = sorted(randomizer.sample(range(node_count), 2))
+        if right - left > 1:
+            edges.setdefault((left, right), randomizer.randint(5, 31))
+    extra_edges = [edge for edge in edges if edge[1] - edge[0] > 1]
+    closed = set(randomizer.sample(extra_edges, 3 if task.ood else 2))
+    toll_edge = randomizer.choice([(index, index + 1) for index in range(node_count - 1)])
+    toll = randomizer.randint(7, 23)
+    adjusted = {
+        edge: weight + (toll if edge == toll_edge else 0)
+        for edge, weight in edges.items() if edge not in closed
+    }
+    adjacency: Dict[int, List[Tuple[int, int]]] = {index: [] for index in range(node_count)}
+    for (left, right), weight in adjusted.items():
+        adjacency[left].append((right, weight))
+        adjacency[right].append((left, weight))
+    distances = [10**18] * node_count
+    distances[0] = 0
+    queue: List[Tuple[int, int]] = [(0, 0)]
+    while queue:
+        distance, node = heapq.heappop(queue)
+        if distance != distances[node]:
+            continue
+        for neighbor, weight in adjacency[node]:
+            candidate = distance + weight
+            if candidate < distances[neighbor]:
+                distances[neighbor] = candidate
+                heapq.heappush(queue, (candidate, neighbor))
+    factor = randomizer.randint(3, 7)
+    checksum = randomizer.randint(29, 97)
+    gold = int(distances[-1]) * factor + checksum
+    edge_text = ", ".join(
+        f"{nodes[left]}-{nodes[right]}:{weight}" for (left, right), weight in sorted(edges.items())
+    )
+    prompt = (
+        f"The following undirected weighted graph has edges edge:cost: {edge_text}. Apply the deterministic "
+        f"routing evidence, then find the minimum cost from A to {nodes[-1]}. Return "
+        f"minimum_cost*{factor}+{checksum} as the final integer."
+    )
+    evidence = (
+        "The deterministic routing tool returned: close edges "
+        + ", ".join(f"{nodes[left]}-{nodes[right]}" for left, right in sorted(closed))
+        + f"; add toll {toll} to edge {nodes[toll_edge[0]]}-{nodes[toll_edge[1]]}."
+    )
+    return LiveProblem(
+        task.id, prompt, evidence, gold, True,
+        kind="evidence_shortest_path", environment_revision=ENVIRONMENT_REVISION_V2,
+    )
 
 
 def live_event_graph(task: ControlledTask, problem: LiveProblem, draft: str | None) -> Dict[str, Any]:
@@ -95,16 +218,20 @@ def live_event_graph(task: ControlledTask, problem: LiveProblem, draft: str | No
     return {"parentId": "root", "nodes": nodes, "edges": edges, "observedAt": 0}
 
 
-def live_child_specifications(task: ControlledTask, max_tokens: int = 384) -> List[Dict[str, Any]]:
+def live_child_specifications(
+    task: ControlledTask,
+    max_tokens: int = 384,
+    environment_revision: str = ENVIRONMENT_REVISION,
+) -> List[Dict[str, Any]]:
     roles = (
-        "Solve the arithmetic independently and show both batch products.",
-        "Act as a verifier: recompute in reverse and identify any arithmetic inconsistency.",
-        "Audit evidence use and produce a clean candidate answer with at least two checks.",
+        "Solve independently and expose the key intermediate values needed to audit the final integer.",
+        "Act as a verifier: use a different method or reverse checks and identify any inconsistency.",
+        "Audit evidence and constraints, then produce a clean candidate answer with at least two checks.",
     )
     return [{
         "id": f"{task.id}-live-branch-{index}",
         "task": role,
-        "context": [task.family, ENVIRONMENT_REVISION],
+        "context": [task.family, environment_revision],
         "tools": ["fixture.audit.lookup"] if task.family != "activation" else [],
         "resources": {"computeTokens": max_tokens, "parallelSlots": 1, "toolCalls": 1 if task.family != "activation" else 0},
         "outputContract": {"format": "json", "requiredFields": ["answer", "checks", "evidence_used"]},
@@ -118,12 +245,13 @@ def collect_live_group(
     repeats: int = 1,
     max_tokens: int = 384,
     temperature: float = 0.0,
+    problem_version: str = "v1",
 ) -> Dict[str, Any]:
     if repeats < 1:
         raise ValueError("repeats must be positive")
     if max_tokens < 64:
         raise ValueError("max_tokens must be at least 64")
-    problem = build_live_problem(task)
+    problem = build_live_problem(task, version=problem_version)
     draft_completion: Completion | None = None
     if not problem.evidence_required:
         draft_completion = _ask(
@@ -135,7 +263,7 @@ def collect_live_group(
     legal_actions = ["CONTINUE", "BRANCH"]
     if not problem.evidence_required:
         legal_actions.append("RETURN")
-    branches = live_child_specifications(task, max_tokens)
+    branches = live_child_specifications(task, max_tokens, problem.environment_revision)
     results: List[Dict[str, Any]] = []
     non_branch: Dict[str, List[float]] = {"CONTINUE": []}
     if "RETURN" in legal_actions:
@@ -203,7 +331,7 @@ def collect_live_group(
         "legal_actions": legal_actions,
         "resources": checkpoint_resources,
         "randomness": randomness,
-        "environment_revision": ENVIRONMENT_REVISION,
+        "environment_revision": problem.environment_revision,
     }, sort_keys=True).encode("utf-8")
     fingerprint = hashlib.sha256(checkpoint_material).hexdigest()
     action_values = dict(advantages.action_values)
@@ -229,7 +357,7 @@ def collect_live_group(
             "event_graph": event_graph,
             "resources": checkpoint_resources,
             "legal_actions": legal_actions,
-            "environment_revision": ENVIRONMENT_REVISION,
+            "environment_revision": problem.environment_revision,
             "environment_seed": task.seed,
             "randomness": randomness,
             "checkpoint_generation": _completion_summary(draft_completion) if draft_completion else None,
@@ -302,6 +430,8 @@ def collect_forced_full_mas(
         evidence=str(problem_value["evidence"]),
         gold_answer=int(problem_value["gold_answer"]),
         evidence_required=bool(problem_value["evidence_required"]),
+        kind=str(problem_value.get("kind", "arithmetic")),
+        environment_revision=str(problem_value.get("environment_revision", ENVIRONMENT_REVISION)),
     )
     evidence = f"\n{problem.evidence}" if problem.evidence_required else ""
     completion = client.complete([
