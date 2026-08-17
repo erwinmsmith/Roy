@@ -382,15 +382,31 @@ def _write_report(
             evaluation.get("task_results", []), key=lambda item: item["regret"], reverse=True
         ) if item["regret"] > 0][:5]
         lines.extend(["", "## Failure cases", ""])
-        for failure in failures:
-            child_suffix = (
-                f" / `{failure['selected_child_specification']}`"
-                if failure.get("selected_child_specification") else ""
-            )
-            lines.append(
-                f"- `{failure['task_id']}`: selected `{failure['selected_action']}`{child_suffix}, "
-                f"oracle under fixed rollout policy `{failure['oracle_action']}`, regret `{failure['regret']:.4f}`."
-            )
+        if not failures:
+            lines.append("- None on this evaluation split.")
+        else:
+            for failure in failures:
+                child_suffix = (
+                    f" / `{failure['selected_child_specification']}`"
+                    if failure.get("selected_child_specification") else ""
+                )
+                lines.append(
+                    f"- `{failure['task_id']}`: selected `{failure['selected_action']}`{child_suffix}, "
+                    f"oracle under fixed rollout policy `{failure['oracle_action']}`, regret `{failure['regret']:.4f}`."
+                )
+    if experiment:
+        reproduction = (
+            "PYTHONPATH=research python3 -m roy_research experiment "
+            f"--groups {groups_path} --output research/output/experiment "
+            f"--epochs {experiment['learned_arms']['full']['metadata']['epochs']} --device cpu"
+        )
+    elif evaluation_path:
+        reproduction = (
+            "PYTHONPATH=research python3 -m roy_research report "
+            f"--groups {groups_path} --evaluation {evaluation_path} --output {output}"
+        )
+    else:
+        reproduction = f"PYTHONPATH=research python3 -m roy_research smoke --output {output.parent}"
     lines.extend([
         "",
         "## Interpretation contract",
@@ -403,7 +419,7 @@ def _write_report(
         "",
         "```bash",
         "npm run research:test",
-        f"PYTHONPATH=research python3 -m roy_research experiment --groups research/output/full/groups.jsonl --output research/output/full/experiment --epochs {experiment['learned_arms']['full']['metadata']['epochs'] if experiment else 1} --device cpu",
+        reproduction,
         "```",
         "",
     ])
