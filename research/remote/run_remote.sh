@@ -44,6 +44,7 @@ clone_pinned() {
 }
 
 prepare() {
+  audit_tua_images
   clone_pinned 0 tau2-bench
   clone_pinned 1 TUA-Bench
   (cd "${work_dir}/tau2-bench" && uv sync --extra knowledge)
@@ -61,6 +62,42 @@ pathlib.Path(sys.argv[2]).write_text(json.dumps({
     "revisions": {b["id"]: b["revision"] for b in manifest["benchmarks"]},
 }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
+}
+
+audit_tua_images() {
+  command -v docker >/dev/null || { echo "missing required command: docker" >&2; exit 2; }
+  command -v curl >/dev/null || { echo "missing required command: curl" >&2; exit 2; }
+  if ! command -v docker-credential-desktop >/dev/null && \
+     [[ -x /Applications/Docker.app/Contents/Resources/bin/docker-credential-desktop ]]; then
+    export PATH="/Applications/Docker.app/Contents/Resources/bin:${PATH}"
+  fi
+  docker buildx version >/dev/null || { echo "docker buildx is required for manifest audit" >&2; exit 2; }
+  local lock_path="${results_dir}/tua-image-audit.lock"
+  local image digest status name url
+  : > "${lock_path}"
+  for image in \
+    debian:bookworm \
+    ubuntu:24.04 \
+    ubuntu:20.04 \
+    docker.io/cellprofiler/cellprofiler:4.2.8 \
+    docker.io/openfoam/openfoam11-paraview510; do
+    digest="$(docker buildx imagetools inspect --raw "${image}" | python3 -c 'import hashlib, sys; print("sha256:" + hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"
+    [[ "${digest}" == sha256:* ]] || { echo "missing TUA base image: ${image}" >&2; exit 5; }
+    echo "image ${image} ${digest}" >> "${lock_path}"
+  done
+  while read -r name url; do
+    status="$(curl -sSIL --max-time 30 -o /dev/null -w '%{http_code}' "${url}")"
+    [[ "${status}" == "200" ]] || { echo "missing TUA setup asset: ${name} status=${status}" >&2; exit 5; }
+    echo "asset ${name} ${status}" >> "${lock_path}"
+  done <<'URLS'
+drawio https://raw.githubusercontent.com/jgraph/drawio-diagrams/dev/blog/waypoint-shape.drawio
+mri https://drive.google.com/uc?export=download&id=1Ff7c21UksxyT4JfETjaarmuKEjdqe1-a
+video https://huggingface.co/datasets/facebook/PE-Video/resolve/main/test/000000.tar?download=true
+floorplan https://huggingface.co/buckets/bebeberr/floor-plans/resolve/floorplan.png?download=true
+comstock https://oedi-data-lake.s3.amazonaws.com/nrel-pds-building-stock/end-use-load-profiles-for-us-building-stock/2025/comstock_amy2018_release_3/timeseries_individual_buildings/by_state/upgrade=0/state=WA/100094-0.parquet
+cellprofiler https://huggingface.co/buckets/bebeberr/cell-profiler/resolve/1-162hrh2ax2.tif?download=true
+URLS
+  echo "TUA image and setup-asset audit passed; lock: ${lock_path}"
 }
 
 print_matrix() {
@@ -109,7 +146,8 @@ run_pilot() {
 
 case "${mode}" in
   dry-run) print_matrix ;;
+  audit-images) audit_tua_images ;;
   prepare) prepare ;;
   run) run_pilot ;;
-  *) echo "usage: $0 [dry-run|prepare|run]" >&2; exit 2 ;;
+  *) echo "usage: $0 [dry-run|audit-images|prepare|run]" >&2; exit 2 ;;
 esac

@@ -39,7 +39,7 @@ The five largest fixed-rollout regrets all selected `BRANCH` when the joint orac
 
 ## Live and external status
 
-One opt-in `deepseek-v4-flash` API smoke completed successfully with 175 total tokens (111 prompt, 64 completion) in 2.329 seconds. The persistent 10,000,000-token ledger recorded 175 used, zero reserved and 9,999,825 remaining. No raw response, credential or API artifact is committed.
+The initial 175-token `deepseek-v4-flash` connectivity smoke has now been followed by a nine-checkpoint real-rollout pilot. The final slice used 66 provider requests and 25,880 tokens; its generated data trained all four learned variants end to end. Results were tied with no derivation on three held-out tasks and are inconclusive. See [the live pilot report](live-deepseek-pilot.md). No raw response, credential or API artifact is committed.
 
 The tau Knowledge/TUA-Bench 120-episode matrix was packaged and dry-run locally. Full benchmark assets and episodes were not executed because no separate high-capacity remote host was supplied. The runner pins both repository revisions, records container image digests during preparation, forwards arm configuration, and places all DeepSeek calls behind the persistent hard-budget proxy. It fails closed until the host confirms that both framework-specific agents consume the Roy arm hooks, preventing mislabeled identical-arm runs.
 

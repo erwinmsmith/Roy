@@ -11,6 +11,7 @@ from .baselines import evaluate_controlled_arms
 from .benchmarks import build_remote_manifest
 from .controlled import collect_group, generate_tasks, mechanism_diagnostics
 from .io import atomic_json, read_jsonl, write_jsonl
+from .live_controlled import collect_live_group
 from .providers import DeepSeekClient
 from .reporting import write_utility_svg
 from .schema import TraceRecord
@@ -33,6 +34,21 @@ def parser() -> argparse.ArgumentParser:
     collect.add_argument("--limit", type=int)
     collect.add_argument("--resume", action="store_true")
     collect.add_argument("--traces", type=Path, help="Optional flat trajectory JSONL output")
+
+    collect_live = commands.add_parser("collect-live", help="Collect real DeepSeek counterfactual rollout groups")
+    collect_live.add_argument("--tasks", type=Path, required=True)
+    collect_live.add_argument("--output", type=Path, required=True)
+    collect_live.add_argument("--ledger", type=Path, required=True)
+    collect_live.add_argument("--events", type=Path, required=True, help="Append-only request/response event log")
+    collect_live.add_argument("--traces", type=Path, help="Optional flat trajectory JSONL output")
+    collect_live.add_argument("--task-ids", nargs="*")
+    collect_live.add_argument("--limit", type=int)
+    collect_live.add_argument("--repeats", type=int, default=2)
+    collect_live.add_argument("--max-tokens", type=int, default=384)
+    collect_live.add_argument("--temperature", type=float, default=0.0)
+    collect_live.add_argument("--token-limit", type=int, default=10_000_000)
+    collect_live.add_argument("--timeout", type=float, default=90.0)
+    collect_live.add_argument("--resume", action="store_true")
 
     train = commands.add_parser("train", help="Train Node CS-GRPO and derivation heads")
     train.add_argument("--groups", type=Path, required=True)
@@ -113,6 +129,52 @@ def main(argv: List[str] | None = None) -> None:
         if args.traces:
             write_jsonl(args.traces, traces, append=args.resume and args.traces.exists())
         print(json.dumps({"collected": count, "traces": len(traces), "output": str(args.output)}))
+    elif args.command == "collect-live":
+        tasks = list(read_jsonl(args.tasks))
+        if args.task_ids:
+            selected_ids = set(args.task_ids)
+            tasks = [task for task in tasks if str(task["id"]) in selected_ids]
+            missing = selected_ids - {str(task["id"]) for task in tasks}
+            if missing:
+                raise ValueError(f"unknown task ids: {sorted(missing)}")
+        if args.limit is not None:
+            tasks = tasks[: args.limit]
+        completed = set()
+        if args.resume and args.output.exists():
+            completed = {record["task"]["id"] for record in read_jsonl(args.output)}
+        ledger = PersistentTokenLedger(args.ledger, args.token_limit)
+        client = DeepSeekClient(ledger, timeout=args.timeout, event_log=args.events)
+        collected = 0
+        trace_count = 0
+        trace_batch = 0
+        for task_value in tasks:
+            task = _task_from_dict(task_value)
+            if task.id in completed:
+                continue
+            group = collect_live_group(
+                task, client, repeats=args.repeats,
+                max_tokens=args.max_tokens, temperature=args.temperature,
+            )
+            append_group = args.output.exists() and (args.resume or collected > 0)
+            write_jsonl(args.output, [group], append=append_group)
+            if args.traces:
+                traces = _group_traces(group)
+                write_jsonl(
+                    args.traces, traces,
+                    append=(args.resume and args.traces.exists()) or trace_batch > 0,
+                )
+                trace_count += len(traces)
+                trace_batch += 1
+            collected += 1
+            print(json.dumps({
+                "task_id": task.id,
+                "collected": collected,
+                "ledger": ledger.snapshot(),
+            }), flush=True)
+        print(json.dumps({
+            "collected": collected, "traces": trace_count,
+            "output": str(args.output), "ledger": ledger.snapshot(),
+        }))
     elif args.command == "train":
         result = train_groups(
             args.groups, args.output, epochs=args.epochs,
@@ -332,9 +394,9 @@ def _group_traces(group: Dict[str, Any]) -> List[Dict[str, Any]]:
         resources_before=dict(result["resources_before"]),
         resources_after=dict(result["resources_after"]),
         utility=float(result["utility"]),
-        provider="controlled",
-        model="deterministic-fixture-v1",
-        token_usage=0,
+        provider=str(result.get("provider", group.get("provider", "controlled"))),
+        model=str(group.get("model", "deterministic-fixture-v1")),
+        token_usage=int(result.get("token_usage", 0)),
         latency_ms=int(result["duration_ms"]),
         repeat=int(result["repeat"]),
         environment_revision=str(checkpoint["environment_revision"]),

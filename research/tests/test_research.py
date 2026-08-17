@@ -19,6 +19,8 @@ from roy_research.schema import require_schema
 from roy_research.token_ledger import PersistentTokenLedger
 from roy_research.training import train_groups
 from roy_research.io import write_jsonl
+from roy_research.live_controlled import build_live_problem, collect_live_group, parse_answer, score_output
+from roy_research.providers import Completion, DeepSeekClient
 
 
 class GRPOTests(unittest.TestCase):
@@ -140,6 +142,66 @@ class RuntimeBoundaryTests(unittest.TestCase):
             "eventGraph": {"nodes": [{"kind": "dependency", "status": "unresolved"}]},
         })
         self.assertEqual(decision["action"], "BRANCH")
+
+    def test_ambiguous_provider_failure_charges_full_reservation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = PersistentTokenLedger(Path(directory) / "ledger.json", limit=10_000)
+            events = Path(directory) / "events.jsonl"
+            with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key"}, clear=True):
+                client = DeepSeekClient(ledger, event_log=events)
+            with patch("roy_research.providers.urllib.request.urlopen", side_effect=TimeoutError("ambiguous timeout")):
+                with self.assertRaises(TimeoutError):
+                    client.complete([{"role": "user", "content": "bounded"}], max_tokens=64)
+            snapshot = ledger.snapshot()
+            self.assertEqual(snapshot["reserved"], 0)
+            self.assertGreater(snapshot["used"], 64)
+            event = json.loads(events.read_text(encoding="utf-8").strip())
+            self.assertEqual(event["status"], "failed")
+            self.assertEqual(event["reservation"], snapshot["used"])
+
+
+class LiveRolloutTests(unittest.TestCase):
+    class FakeClient:
+        model = "fake-deepseek"
+
+        def __init__(self, answer: int, evidence_used: bool) -> None:
+            self.answer = answer
+            self.evidence_used = evidence_used
+            self.calls = 0
+
+        def complete(self, messages, max_tokens=1024, temperature=0.7, metadata=None):
+            self.calls += 1
+            content = json.dumps({
+                "answer": self.answer,
+                "checks": ["forward", "reverse"],
+                "evidence_used": self.evidence_used,
+            })
+            return Completion(content, 10, 10, 20, 1, {"choices": []})
+
+    def test_live_group_uses_real_completion_scores_and_masks_return(self) -> None:
+        task = next(task for task in generate_tasks() if task.family == "acquisition")
+        problem = build_live_problem(task)
+        client = self.FakeClient(problem.gold_answer, True)
+        group = collect_live_group(task, client, repeats=1, max_tokens=128)
+        self.assertNotIn("RETURN", group["checkpoint"]["legal_actions"])
+        self.assertEqual(client.calls, 7)
+        self.assertEqual(len(group["results"]), 4)
+        self.assertTrue(all(result["utility"] == 1.0 for result in group["results"]))
+        self.assertEqual(group["provider"], "deepseek")
+        self.assertEqual(group["checkpoint"]["environment_revision"], "live-controlled-arithmetic-v1")
+
+    def test_activation_checkpoint_draft_and_json_scoring(self) -> None:
+        task = next(task for task in generate_tasks() if task.family == "activation")
+        problem = build_live_problem(task)
+        client = self.FakeClient(problem.gold_answer, False)
+        group = collect_live_group(task, client, repeats=1, max_tokens=128)
+        self.assertIn("RETURN", group["checkpoint"]["legal_actions"])
+        self.assertEqual(client.calls, 8)
+        self.assertIsNotNone(group["checkpoint"]["checkpoint_generation"])
+        answer, parsed = parse_answer(f"```json\n{{\"answer\": {problem.gold_answer}, \"checks\": [\"a\", \"b\"], \"evidence_used\": false}}\n```")
+        self.assertEqual(answer, problem.gold_answer)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(score_output("not json", problem), 0.0)
 
 
 if __name__ == "__main__":

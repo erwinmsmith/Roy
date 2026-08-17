@@ -165,7 +165,12 @@ def evaluate_groups(
             oracle_values = dict(values)
             if branch_values:
                 oracle_values["BRANCH"] = max(branch_values.values())
-            oracle = max(oracle_values, key=oracle_values.get)
+            oracle_utility = max(oracle_values.values())
+            oracle_actions = [
+                action for action in ACTION_INDEX
+                if action in oracle_values and math.isclose(oracle_values[action], oracle_utility, abs_tol=1e-9)
+            ]
+            oracle = oracle_actions[0]
             selected_child = None
             selected_utility = values[selected]
             if selected == "BRANCH" and branch_values and variant == "full":
@@ -176,18 +181,20 @@ def evaluate_groups(
                 selected_child = candidates[int(torch.argmax(scores).item())]["id"]
                 selected_utility = branch_values[selected_child]
             count += 1
-            correct += int(selected == oracle)
-            confusion[oracle][selected] += 1
+            selected_is_optimal = math.isclose(selected_utility, oracle_utility, abs_tol=1e-9)
+            correct += int(selected_is_optimal)
+            confusion[selected if selected_is_optimal else oracle][selected] += 1
             utilities.append(selected_utility)
-            regrets.append(oracle_values[oracle] - selected_utility)
+            regrets.append(oracle_utility - selected_utility)
             task_results.append({
                 "task_id": group["task"]["id"],
                 "selected_action": selected,
                 "selected_child_specification": selected_child,
                 "oracle_action": oracle,
+                "oracle_actions": oracle_actions,
                 "utility": selected_utility,
-                "oracle_utility": oracle_values[oracle],
-                "regret": oracle_values[oracle] - selected_utility,
+                "oracle_utility": oracle_utility,
+                "regret": oracle_utility - selected_utility,
             })
     return {
         "split": split,
