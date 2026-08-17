@@ -11,7 +11,13 @@ import torch
 
 from roy_research.analysis import paired_bootstrap_interval
 from roy_research.baselines import evaluate_controlled_arms
-from roy_research.controlled import collect_group, generate_tasks, mechanism_diagnostics, task_event_graph
+from roy_research.controlled import (
+    TERMINAL_SUCCESS_THRESHOLD,
+    collect_group,
+    generate_tasks,
+    mechanism_diagnostics,
+    task_event_graph,
+)
 from roy_research.grpo import clipped_policy_loss, hierarchical_advantages, masked_log_softmax
 from roy_research.model import FrozenTextEncoder, StructuralPolicyNetwork, TEXT_DIMENSION
 from roy_research.policy_server import PolicyServer
@@ -76,6 +82,11 @@ class ControlledTests(unittest.TestCase):
         groups = [collect_group(task) for task in generate_tasks()[:6]]
         result = evaluate_controlled_arms(groups)
         self.assertEqual(result["arms"]["no_derivation"]["episodes"], 6)
+        self.assertEqual(result["arms"]["no_derivation"]["display_name"], "direct (no_derivation)")
+        self.assertEqual(result["arms"]["no_derivation"]["success_threshold"], TERMINAL_SUCCESS_THRESHOLD)
+        self.assertEqual(result["arms"]["no_derivation"]["successes"], 2)
+        self.assertAlmostEqual(result["arms"]["no_derivation"]["success_rate"], 2 / 6)
+        self.assertIn("conclusion", result["arms"]["roy_heuristic"]["paired_success_vs_direct"])
         self.assertIn("conclusion", result["arms"]["roy_heuristic"]["paired_vs_no_derivation"])
         self.assertEqual(paired_bootstrap_interval([1, 1], [0, 0])["conclusion"], "positive")
 

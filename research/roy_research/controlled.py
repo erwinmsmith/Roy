@@ -7,6 +7,8 @@ from typing import Any, Dict, Iterable, List, Tuple
 
 from .grpo import hierarchical_advantages
 
+TERMINAL_SUCCESS_THRESHOLD = 0.8
+
 
 @dataclass(frozen=True)
 class ControlledTask:

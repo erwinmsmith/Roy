@@ -4,6 +4,7 @@ import random
 from typing import Any, Dict, Iterable, List
 
 from .analysis import paired_bootstrap_interval
+from .controlled import TERMINAL_SUCCESS_THRESHOLD
 
 
 def evaluate_controlled_arms(
@@ -25,6 +26,7 @@ def evaluate_controlled_arms(
     }
     rows: Dict[str, Dict[str, Any]] = {}
     baseline_utilities: List[float] = []
+    direct_successes: List[float] = []
     for name, policy in policies.items():
         utilities: List[float] = []
         regrets: List[float] = []
@@ -43,10 +45,19 @@ def evaluate_controlled_arms(
             regrets.append(oracle_value - selected_utility)
         if name == "no_derivation":
             baseline_utilities = utilities
+            direct_successes = [float(value >= TERMINAL_SUCCESS_THRESHOLD) for value in utilities]
+        successes = [float(value >= TERMINAL_SUCCESS_THRESHOLD) for value in utilities]
         rows[name] = {
             "episodes": len(utilities),
+            "display_name": "direct (no_derivation)" if name == "no_derivation" else name,
             "mean_utility": sum(utilities) / max(1, len(utilities)),
             "mean_rollout_policy_regret": sum(regrets) / max(1, len(regrets)),
+            "success_threshold": TERMINAL_SUCCESS_THRESHOLD,
+            "successes": int(sum(successes)),
+            "success_rate": sum(successes) / max(1, len(successes)),
+            "paired_success_vs_direct": None if name == "no_derivation" else paired_bootstrap_interval(
+                successes, direct_successes
+            ),
             "paired_vs_no_derivation": None if name == "no_derivation" else paired_bootstrap_interval(
                 utilities, baseline_utilities
             ),

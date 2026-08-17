@@ -10,6 +10,7 @@ from .analysis import paired_bootstrap_interval, summarize_groups
 from .baselines import evaluate_controlled_arms
 from .benchmarks import build_remote_manifest
 from .controlled import collect_group, generate_tasks, mechanism_diagnostics
+from .controlled import TERMINAL_SUCCESS_THRESHOLD
 from .io import atomic_json, read_jsonl, write_jsonl
 from .live_controlled import collect_live_group
 from .providers import DeepSeekClient
@@ -263,6 +264,10 @@ def main(argv: List[str] | None = None) -> None:
                 [float(item["utility"]) for item in task_results],
                 [no_derivation[item["task_id"]] for item in task_results],
             )
+            values["test"]["paired_success_vs_direct"] = paired_bootstrap_interval(
+                [float(item["success"]) for item in task_results],
+                [float(no_derivation[item["task_id"]] >= TERMINAL_SUCCESS_THRESHOLD) for item in task_results],
+            )
         full_by_task = {
             item["task_id"]: float(item["utility"])
             for item in learned["full"]["test"]["task_results"]
@@ -329,16 +334,20 @@ def _write_report(
     if experiment:
         chart_path = output.with_suffix(".svg")
         write_utility_svg(chart_path, experiment)
-        lines.extend(["", "## Controlled arms", "", "| Arm | Test utility | Regret | 95% CI vs no derivation | 95% CI vs full |", "| --- | ---: | ---: | --- | --- |"])
+        lines.extend(["", "## Controlled arms", "", f"End-to-end success means terminal utility >= `{TERMINAL_SUCCESS_THRESHOLD:.1f}`; `direct` is the existing `no_derivation` arm (`CONTINUE` only).", "", "| Arm | E2E success | Test utility | Regret | Success delta 95% CI vs direct | Utility delta 95% CI vs direct | Utility delta 95% CI vs full |", "| --- | ---: | ---: | ---: | --- | --- | --- |"])
         for name, value in experiment["rule_arms"].items():
             interval = value.get("paired_vs_no_derivation")
             interval_text = "baseline" if interval is None else f"[{interval['ci95_low']:.4f}, {interval['ci95_high']:.4f}] ({interval['conclusion']})"
-            lines.append(f"| `{name}` | {value['mean_utility']:.4f} | {value['mean_rollout_policy_regret']:.4f} | {interval_text} | n/a |")
+            success_interval = value.get("paired_success_vs_direct")
+            success_interval_text = "baseline" if success_interval is None else f"[{success_interval['ci95_low']:.4f}, {success_interval['ci95_high']:.4f}] ({success_interval['conclusion']})"
+            display_name = value.get("display_name", name)
+            lines.append(f"| `{display_name}` | {value['success_rate']:.2%} ({value['successes']}/{value['episodes']}) | {value['mean_utility']:.4f} | {value['mean_rollout_policy_regret']:.4f} | {success_interval_text} | {interval_text} | n/a |")
         for name, value in experiment["learned_arms"].items():
             test = value["test"]
             interval = test["paired_vs_no_derivation"]
+            success_interval = test["paired_success_vs_direct"]
             versus_full = test["paired_vs_full"]
-            lines.append(f"| `{name}` | {test['mean_utility']:.4f} | {test['mean_regret']:.4f} | [{interval['ci95_low']:.4f}, {interval['ci95_high']:.4f}] ({interval['conclusion']}) | [{versus_full['ci95_low']:.4f}, {versus_full['ci95_high']:.4f}] ({versus_full['conclusion']}) |")
+            lines.append(f"| `{name}` | {test['success_rate']:.2%} ({test['successes']}/{test['count']}) | {test['mean_utility']:.4f} | {test['mean_regret']:.4f} | [{success_interval['ci95_low']:.4f}, {success_interval['ci95_high']:.4f}] ({success_interval['conclusion']}) | [{interval['ci95_low']:.4f}, {interval['ci95_high']:.4f}] ({interval['conclusion']}) | [{versus_full['ci95_low']:.4f}, {versus_full['ci95_high']:.4f}] ({versus_full['conclusion']}) |")
         full_ood = experiment["learned_arms"]["full"]["ood"]
         lines.extend([
             "",

@@ -10,6 +10,7 @@ from torch import Tensor
 from .grpo import clipped_policy_loss, select_action_log_probs, standardized_advantages
 from .io import read_jsonl
 from .model import FrozenTextEncoder, StructuralPolicyNetwork, graph_tensors
+from .controlled import TERMINAL_SUCCESS_THRESHOLD
 
 ACTION_INDEX = {"CONTINUE": 0, "BRANCH": 1, "RETURN": 2}
 TRAINING_VARIANTS = ("full_trajectory", "no_event_graph", "node_only", "full")
@@ -141,6 +142,7 @@ def evaluate_groups(
     correct = 0
     regrets: List[float] = []
     utilities: List[float] = []
+    successes: List[float] = []
     confusion = {actual: {predicted: 0 for predicted in ACTION_INDEX} for actual in ACTION_INDEX}
     task_results: List[Dict[str, Any]] = []
     with torch.no_grad():
@@ -185,6 +187,8 @@ def evaluate_groups(
             correct += int(selected_is_optimal)
             confusion[selected if selected_is_optimal else oracle][selected] += 1
             utilities.append(selected_utility)
+            success = float(selected_utility >= TERMINAL_SUCCESS_THRESHOLD)
+            successes.append(success)
             regrets.append(oracle_utility - selected_utility)
             task_results.append({
                 "task_id": group["task"]["id"],
@@ -193,6 +197,7 @@ def evaluate_groups(
                 "oracle_action": oracle,
                 "oracle_actions": oracle_actions,
                 "utility": selected_utility,
+                "success": bool(success),
                 "oracle_utility": oracle_utility,
                 "regret": oracle_utility - selected_utility,
             })
@@ -200,6 +205,9 @@ def evaluate_groups(
         "split": split,
         "count": count,
         "accuracy": correct / max(1, count),
+        "success_threshold": TERMINAL_SUCCESS_THRESHOLD,
+        "successes": int(sum(successes)),
+        "success_rate": sum(successes) / max(1, count),
         "mean_utility": sum(utilities) / max(1, count),
         "mean_regret": sum(regrets) / max(1, count),
         "action_confusion_matrix": confusion,
