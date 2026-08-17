@@ -12,7 +12,7 @@ from .benchmarks import build_remote_manifest
 from .controlled import collect_group, generate_tasks, mechanism_diagnostics
 from .controlled import TERMINAL_SUCCESS_THRESHOLD
 from .io import atomic_json, read_jsonl, write_jsonl
-from .live_controlled import collect_live_group
+from .live_controlled import collect_forced_full_mas, collect_live_group
 from .providers import DeepSeekClient
 from .reporting import write_utility_svg
 from .schema import TraceRecord
@@ -50,6 +50,28 @@ def parser() -> argparse.ArgumentParser:
     collect_live.add_argument("--token-limit", type=int, default=10_000_000)
     collect_live.add_argument("--timeout", type=float, default=90.0)
     collect_live.add_argument("--resume", action="store_true")
+
+    collect_mas = commands.add_parser(
+        "collect-live-mas", help="Aggregate all three matched child agents as a forced complete MAS"
+    )
+    collect_mas.add_argument("--groups", type=Path, required=True)
+    collect_mas.add_argument("--source-events", type=Path, required=True)
+    collect_mas.add_argument("--output", type=Path, required=True)
+    collect_mas.add_argument("--events", type=Path, required=True)
+    collect_mas.add_argument("--ledger", type=Path, required=True)
+    collect_mas.add_argument("--max-tokens", type=int, default=384)
+    collect_mas.add_argument("--temperature", type=float, default=0.0)
+    collect_mas.add_argument("--token-limit", type=int, default=10_000_000)
+    collect_mas.add_argument("--timeout", type=float, default=90.0)
+    collect_mas.add_argument("--resume", action="store_true")
+
+    compare_live = commands.add_parser(
+        "compare-live-arms", help="Compare single-agent direct, forced full MAS and learned full policy"
+    )
+    compare_live.add_argument("--groups", type=Path, required=True)
+    compare_live.add_argument("--evaluation", type=Path, required=True)
+    compare_live.add_argument("--mas", type=Path, required=True)
+    compare_live.add_argument("--output", type=Path, required=True)
 
     train = commands.add_parser("train", help="Train Node CS-GRPO and derivation heads")
     train.add_argument("--groups", type=Path, required=True)
@@ -176,6 +198,41 @@ def main(argv: List[str] | None = None) -> None:
             "collected": collected, "traces": trace_count,
             "output": str(args.output), "ledger": ledger.snapshot(),
         }))
+    elif args.command == "collect-live-mas":
+        groups = list(read_jsonl(args.groups))
+        source_events = list(read_jsonl(args.source_events))
+        completed = set()
+        if args.resume and args.output.exists():
+            completed = {str(record["task_id"]) for record in read_jsonl(args.output)}
+        ledger = PersistentTokenLedger(args.ledger, args.token_limit)
+        client = DeepSeekClient(ledger, timeout=args.timeout, event_log=args.events)
+        collected = 0
+        for group in groups:
+            task_id = str(group["task"]["id"])
+            if task_id in completed:
+                continue
+            result = collect_forced_full_mas(
+                group, source_events, client,
+                max_tokens=args.max_tokens, temperature=args.temperature,
+            )
+            write_jsonl(
+                args.output, [result],
+                append=args.output.exists() and (args.resume or collected > 0),
+            )
+            collected += 1
+            print(json.dumps({
+                "task_id": task_id, "collected": collected,
+                "utility": result["utility"], "ledger": ledger.snapshot(),
+            }), flush=True)
+        print(json.dumps({
+            "collected": collected, "output": str(args.output), "ledger": ledger.snapshot(),
+        }))
+    elif args.command == "compare-live-arms":
+        result = _compare_live_arms(args.groups, args.evaluation, args.mas)
+        atomic_json(args.output, result)
+        report_path = args.output.with_suffix(".md")
+        _write_live_arm_report(result, report_path)
+        print(json.dumps({"output": str(args.output), "report": str(report_path)}))
     elif args.command == "train":
         result = train_groups(
             args.groups, args.output, epochs=args.epochs,
@@ -281,6 +338,152 @@ def main(argv: List[str] | None = None) -> None:
         result = {"schema_version": 1, "rule_arms": rules["arms"], "learned_arms": learned}
         atomic_json(args.output / "experiment.json", result)
         print(json.dumps({"output": str(args.output / "experiment.json"), "learned_arms": len(learned)}))
+
+
+def _compare_live_arms(groups_path: Path, evaluation_path: Path, mas_path: Path) -> Dict[str, Any]:
+    groups = {str(group["task"]["id"]): group for group in read_jsonl(groups_path)}
+    evaluation = json.loads(evaluation_path.read_text(encoding="utf-8"))
+    learned = {str(row["task_id"]): row for row in evaluation["task_results"]}
+    mas = {str(row["task_id"]): row for row in read_jsonl(mas_path)}
+    expected = set(groups)
+    if set(learned) != expected or set(mas) != expected:
+        raise ValueError(
+            "arm task mismatch: "
+            f"groups={sorted(expected)} learned={sorted(learned)} mas={sorted(mas)}"
+        )
+
+    arm_rows: Dict[str, List[Dict[str, Any]]] = {
+        "single_agent_direct": [],
+        "forced_full_mas": [],
+        "learned_full_policy": [],
+    }
+    for task_id in sorted(expected):
+        group = groups[task_id]
+        direct_result = next(
+            result for result in group["results"]
+            if result["action"] == "CONTINUE" and int(result.get("repeat", 0)) == 0
+        )
+        arm_rows["single_agent_direct"].append({
+            "task_id": task_id,
+            "utility": float(direct_result["utility"]),
+            "success": float(direct_result["utility"]) >= TERMINAL_SUCCESS_THRESHOLD,
+            "tokens": int(direct_result.get("token_usage", 0)),
+            "latency_ms": int(direct_result.get("duration_ms", 0)),
+        })
+
+        mas_result = mas[task_id]
+        arm_rows["forced_full_mas"].append({
+            "task_id": task_id,
+            "utility": float(mas_result["utility"]),
+            "success": bool(mas_result["success"]),
+            "tokens": int(mas_result["total_tokens"]),
+            "latency_ms": int(mas_result["parallel_span_ms"]),
+            "work_latency_ms": int(mas_result["work_latency_ms"]),
+            "child_agent_count": int(mas_result["child_agent_count"]),
+        })
+
+        learned_result = learned[task_id]
+        selected_action = str(learned_result["selected_action"])
+        selected_child = learned_result.get("selected_child_specification")
+        candidates = [result for result in group["results"] if result["action"] == selected_action]
+        if selected_action == "BRANCH" and selected_child:
+            candidates = [
+                result for result in candidates
+                if (result.get("child_specification") or {}).get("id") == selected_child
+            ]
+        selected_rollout = next(
+            result for result in candidates if int(result.get("repeat", 0)) == 0
+        )
+        arm_rows["learned_full_policy"].append({
+            "task_id": task_id,
+            "selected_action": selected_action,
+            "selected_child_specification": selected_child,
+            "utility": float(learned_result["utility"]),
+            "success": bool(learned_result["success"]),
+            "tokens": int(selected_rollout.get("token_usage", 0)),
+            "latency_ms": int(selected_rollout.get("duration_ms", 0)),
+        })
+
+    direct_rows = arm_rows["single_agent_direct"]
+    direct_utility = [float(row["utility"]) for row in direct_rows]
+    direct_success = [float(row["success"]) for row in direct_rows]
+    arms: Dict[str, Any] = {}
+    for name, rows in arm_rows.items():
+        utilities = [float(row["utility"]) for row in rows]
+        successes = [float(row["success"]) for row in rows]
+        arm = {
+            "episodes": len(rows),
+            "successes": int(sum(successes)),
+            "success_rate": sum(successes) / len(rows),
+            "mean_utility": sum(utilities) / len(rows),
+            "total_tokens": sum(int(row["tokens"]) for row in rows),
+            "mean_tokens": sum(int(row["tokens"]) for row in rows) / len(rows),
+            "mean_latency_ms": sum(int(row["latency_ms"]) for row in rows) / len(rows),
+            "paired_vs_single_agent_direct": None if name == "single_agent_direct" else {
+                "success": paired_bootstrap_interval(successes, direct_success),
+                "utility": paired_bootstrap_interval(utilities, direct_utility),
+            },
+            "task_results": rows,
+        }
+        if name == "forced_full_mas":
+            arm["mean_work_latency_ms"] = sum(
+                int(row["work_latency_ms"]) for row in rows
+            ) / len(rows)
+            arm["child_agents_per_episode"] = 3
+        arms[name] = arm
+    return {
+        "schema_version": 1,
+        "split": str(evaluation["split"]),
+        "success_threshold": TERMINAL_SUCCESS_THRESHOLD,
+        "task_ids": sorted(expected),
+        "arm_definitions": {
+            "single_agent_direct": "One parent CONTINUE completion; no child agents.",
+            "forced_full_mas": "All three child agents execute, then one parent aggregates all proposals.",
+            "learned_full_policy": "Trained structural policy chooses CONTINUE, RETURN, or one BRANCH specification.",
+        },
+        "arms": arms,
+    }
+
+
+def _write_live_arm_report(result: Dict[str, Any], output: Path) -> None:
+    lines = [
+        "# Live DeepSeek Single-Agent vs MAS Pilot",
+        "",
+        f"Split: `{result['split']}`; tasks: `{len(result['task_ids'])}`; "
+        f"success threshold: `{result['success_threshold']}`.",
+        "",
+        "| Arm | E2E success | Utility | Mean tokens | Mean latency | Delta vs single-agent direct |",
+        "| --- | ---: | ---: | ---: | ---: | --- |",
+    ]
+    for name in ("single_agent_direct", "forced_full_mas", "learned_full_policy"):
+        arm = result["arms"][name]
+        interval = arm["paired_vs_single_agent_direct"]
+        if interval is None:
+            delta = "baseline"
+        else:
+            success = interval["success"]
+            utility = interval["utility"]
+            delta = (
+                f"success {success['mean_difference']:+.4f} "
+                f"[{success['ci95_low']:+.4f}, {success['ci95_high']:+.4f}]; "
+                f"utility {utility['mean_difference']:+.4f} "
+                f"[{utility['ci95_low']:+.4f}, {utility['ci95_high']:+.4f}]"
+            )
+        lines.append(
+            f"| `{name}` | {arm['success_rate']:.2%} ({arm['successes']}/{arm['episodes']}) | "
+            f"{arm['mean_utility']:.4f} | {arm['mean_tokens']:.1f} | "
+            f"{arm['mean_latency_ms']:.1f} ms | {delta} |"
+        )
+    lines.extend([
+        "",
+        "`forced_full_mas` latency is ideal parallel span: slowest child plus parent aggregation. "
+        "Its total token count always includes all three child calls and the parent aggregation.",
+        "",
+        "A confidence interval containing zero is inconclusive; this pilot is not an external benchmark claim.",
+        "",
+    ])
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("\n".join(lines), encoding="utf-8")
 
 
 def _task_from_dict(value: Dict[str, Any]):

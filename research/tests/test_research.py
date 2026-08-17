@@ -25,7 +25,13 @@ from roy_research.schema import require_schema
 from roy_research.token_ledger import PersistentTokenLedger
 from roy_research.training import evaluate_groups, train_groups
 from roy_research.io import write_jsonl
-from roy_research.live_controlled import build_live_problem, collect_live_group, parse_answer, score_output
+from roy_research.live_controlled import (
+    build_live_problem,
+    collect_forced_full_mas,
+    collect_live_group,
+    parse_answer,
+    score_output,
+)
 from roy_research.providers import Completion, DeepSeekClient
 
 
@@ -216,6 +222,37 @@ class LiveRolloutTests(unittest.TestCase):
         self.assertEqual(answer, problem.gold_answer)
         self.assertIsNotNone(parsed)
         self.assertEqual(score_output("not json", problem), 0.0)
+
+    def test_forced_full_mas_aggregates_all_three_child_agents(self) -> None:
+        task = next(task for task in generate_tasks() if task.family == "acquisition")
+        problem = build_live_problem(task)
+        client = self.FakeClient(problem.gold_answer, True)
+        group = collect_live_group(task, client, repeats=1, max_tokens=128)
+        child_content = json.dumps({
+            "answer": problem.gold_answer,
+            "checks": ["independent", "reverse"],
+            "evidence_used": True,
+        })
+        events = [{
+            "status": "completed",
+            "metadata": {
+                "task_id": task.id,
+                "phase": "child",
+                "action": "BRANCH",
+                "child_id": specification["id"],
+                "repeat": 0,
+            },
+            "response": {
+                "choices": [{"message": {"content": child_content}}],
+                "usage": {"total_tokens": 20},
+            },
+            "latency_ms": 5,
+        } for specification in group["branch_specifications"]]
+        result = collect_forced_full_mas(group, events, client, max_tokens=128)
+        self.assertEqual(result["child_agent_count"], 3)
+        self.assertEqual(result["child_tokens"], 60)
+        self.assertEqual(result["total_tokens"], 80)
+        self.assertEqual(result["utility"], 1.0)
 
 
 if __name__ == "__main__":

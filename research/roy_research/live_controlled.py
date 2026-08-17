@@ -7,7 +7,7 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Protocol, Tuple
 
-from .controlled import ControlledTask
+from .controlled import ControlledTask, TERMINAL_SUCCESS_THRESHOLD
 from .grpo import hierarchical_advantages
 from .providers import Completion
 
@@ -242,6 +242,113 @@ def collect_live_group(
         "branch_advantages": advantages.branch_advantages,
         "provider": "deepseek",
         "model": client.model,
+    }
+
+
+def collect_forced_full_mas(
+    group: Dict[str, Any],
+    source_events: List[Dict[str, Any]],
+    client: CompletionClient,
+    max_tokens: int = 384,
+    temperature: float = 0.0,
+) -> Dict[str, Any]:
+    """Aggregate all three previously collected child-agent proposals.
+
+    The child calls come from the matched checkpoint's append-only event log.
+    Only the parent aggregation is newly dispatched, so the complete MAS cost is
+    the three child calls plus this aggregation call; per-child synthesis calls
+    from the counterfactual collection are intentionally excluded.
+    """
+    task = group["task"]
+    task_id = str(task["id"])
+    expected_children = {str(spec["id"]) for spec in group["branch_specifications"]}
+    children: Dict[str, Dict[str, Any]] = {}
+    for event in source_events:
+        metadata = event.get("metadata", {})
+        if (
+            event.get("status") == "completed"
+            and metadata.get("task_id") == task_id
+            and metadata.get("phase") == "child"
+            and int(metadata.get("repeat", 0)) == 0
+        ):
+            child_id = str(metadata.get("child_id"))
+            if child_id in children:
+                raise ValueError(f"duplicate child event for {task_id}: {child_id}")
+            children[child_id] = event
+    if set(children) != expected_children:
+        raise ValueError(
+            f"child event mismatch for {task_id}: expected={sorted(expected_children)} "
+            f"actual={sorted(children)}"
+        )
+
+    proposals: List[str] = []
+    child_tokens = 0
+    child_latencies: List[int] = []
+    for child_id in sorted(children):
+        event = children[child_id]
+        response = event.get("response", {})
+        choice = (response.get("choices") or [{}])[0]
+        content = str(choice.get("message", {}).get("content", ""))
+        if not content:
+            raise ValueError(f"empty child response for {task_id}: {child_id}")
+        proposals.append(f"{child_id}: {content}")
+        child_tokens += int(response.get("usage", {}).get("total_tokens", 0))
+        child_latencies.append(int(event.get("latency_ms", 0)))
+
+    problem_value = task["live_problem"]
+    problem = LiveProblem(
+        task_id=str(problem_value["task_id"]),
+        public_prompt=str(problem_value["public_prompt"]),
+        evidence=str(problem_value["evidence"]),
+        gold_answer=int(problem_value["gold_answer"]),
+        evidence_required=bool(problem_value["evidence_required"]),
+    )
+    evidence = f"\n{problem.evidence}" if problem.evidence_required else ""
+    completion = client.complete([
+        {
+            "role": "system",
+            "content": (
+                "You are the parent aggregator of a complete multi-agent system. Reconcile all three "
+                "independent child proposals and return exactly one JSON object with integer answer, "
+                "a checks array containing at least two checks, and boolean evidence_used. No prose."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Task: {problem.public_prompt}{evidence}\n\nChild proposals:\n"
+                + "\n".join(proposals)
+            ),
+        },
+    ], max_tokens=max_tokens, temperature=temperature, metadata={
+        "task_id": task_id,
+        "arm": "forced_full_mas",
+        "phase": "aggregation",
+        "child_count": len(children),
+    })
+    utility = score_output(completion.content, problem)
+    child_work_ms = sum(child_latencies)
+    return {
+        "schema_version": 1,
+        "task_id": task_id,
+        "split": str(task["split"]),
+        "checkpoint_fingerprint": str(group["checkpoint"]["fingerprint"]),
+        "arm": "forced_full_mas",
+        "child_agent_count": len(children),
+        "child_ids": sorted(children),
+        "utility": utility,
+        "success": utility >= TERMINAL_SUCCESS_THRESHOLD,
+        "success_threshold": TERMINAL_SUCCESS_THRESHOLD,
+        "child_tokens": child_tokens,
+        "aggregation_tokens": completion.total_tokens,
+        "total_tokens": child_tokens + completion.total_tokens,
+        "child_work_latency_ms": child_work_ms,
+        "aggregation_latency_ms": completion.latency_ms,
+        "work_latency_ms": child_work_ms + completion.latency_ms,
+        "parallel_span_ms": max(child_latencies, default=0) + completion.latency_ms,
+        "provider": "deepseek",
+        "model": client.model,
+        "raw_output": completion.content,
     }
 
 
