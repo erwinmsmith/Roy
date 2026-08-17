@@ -34,6 +34,8 @@ PYTHONPATH=research python3 -m roy_research experiment \
 
 The encoder is loaded from the local Hugging Face cache at the pinned revision. To use the learned policy from TypeScript, launch `python3 -m roy_research.policy_server` through `PythonStructuralPolicyClient` and set `ROY_STRUCTURAL_MODEL` to a local checkpoint.
 
+Controlled reports treat terminal utility at or above `0.8` as end-to-end success and report paired bootstrap intervals against `direct`, the compatibility name for the `no_derivation` / `CONTINUE`-only arm. Decision accuracy is reported separately and must not be interpreted as task success.
+
 ## Live and remote execution
 
 Live API execution is opt-in:

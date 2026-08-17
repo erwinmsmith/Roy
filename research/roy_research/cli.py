@@ -326,8 +326,18 @@ def _write_report(
         lines.extend([
             f"- Split: `{evaluation['split']}`",
             f"- Decision accuracy: `{evaluation['accuracy']:.4f}`",
+            f"- End-to-end success: `{evaluation.get('success_rate', 0.0):.2%}`",
             f"- Mean utility: `{evaluation['mean_utility']:.4f}`",
             f"- Mean structural regret: `{evaluation['mean_regret']:.4f}`",
+        ])
+    elif experiment:
+        full_test = experiment["learned_arms"]["full"]["test"]
+        lines.extend([
+            "- Split: `test`",
+            f"- Decision accuracy: `{full_test['accuracy']:.4f}`",
+            f"- End-to-end success: `{full_test['success_rate']:.2%}`",
+            f"- Mean utility: `{full_test['mean_utility']:.4f}`",
+            f"- Mean structural regret: `{full_test['mean_regret']:.4f}`",
         ])
     else:
         lines.append("- Training/evaluation was not part of this smoke run.")
