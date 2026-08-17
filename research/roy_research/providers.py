@@ -8,6 +8,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 from typing import Any, Dict, List
 
 from .io import write_jsonl
@@ -39,6 +40,7 @@ class DeepSeekClient:
         self.api_key = os.environ.get("DEEPSEEK_API_KEY")
         self.timeout = timeout
         self.event_log = event_log
+        self.event_lock = Lock()
         if not self.api_key:
             raise RuntimeError("DEEPSEEK_API_KEY is not configured")
 
@@ -129,4 +131,5 @@ class DeepSeekClient:
 
     def _record_event(self, event: Dict[str, Any]) -> None:
         if self.event_log is not None:
-            write_jsonl(self.event_log, [event], append=self.event_log.exists())
+            with self.event_lock:
+                write_jsonl(self.event_log, [event], append=self.event_log.exists())

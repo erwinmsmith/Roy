@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
@@ -51,6 +52,7 @@ def parser() -> argparse.ArgumentParser:
     collect_live.add_argument("--problem-version", choices=("v1", "v2"), default="v1")
     collect_live.add_argument("--token-limit", type=int, default=10_000_000)
     collect_live.add_argument("--timeout", type=float, default=90.0)
+    collect_live.add_argument("--workers", type=int, default=1)
     collect_live.add_argument("--resume", action="store_true")
 
     collect_mas = commands.add_parser(
@@ -171,20 +173,30 @@ def main(argv: List[str] | None = None) -> None:
             completed = {record["task"]["id"] for record in read_jsonl(args.output)}
         ledger = PersistentTokenLedger(args.ledger, args.token_limit)
         client = DeepSeekClient(ledger, timeout=args.timeout, event_log=args.events)
+        if args.workers < 1:
+            raise ValueError("workers must be positive")
         collected = 0
         trace_count = 0
         trace_batch = 0
-        for task_value in tasks:
-            task = _task_from_dict(task_value)
-            if task.id in completed:
-                continue
-            group = collect_live_group(
+
+        pending_tasks = [
+            _task_from_dict(task_value) for task_value in tasks
+            if str(task_value["id"]) not in completed
+        ]
+
+        def collect_task(task):
+            return collect_live_group(
                 task, client, repeats=args.repeats,
                 max_tokens=args.max_tokens, temperature=args.temperature,
                 problem_version=args.problem_version,
             )
-            append_group = args.output.exists() and (args.resume or collected > 0)
-            write_jsonl(args.output, [group], append=append_group)
+
+        def persist_task(task, group):
+            nonlocal collected, trace_count, trace_batch
+            write_jsonl(
+                args.output, [group],
+                append=args.output.exists() and (args.resume or collected > 0),
+            )
             if args.traces:
                 traces = _group_traces(group)
                 write_jsonl(
@@ -199,6 +211,31 @@ def main(argv: List[str] | None = None) -> None:
                 "collected": collected,
                 "ledger": ledger.snapshot(),
             }), flush=True)
+
+        if args.workers == 1:
+            for task in pending_tasks:
+                persist_task(task, collect_task(task))
+        else:
+            task_iterator = iter(pending_tasks)
+            with ThreadPoolExecutor(max_workers=args.workers) as executor:
+                active: Dict[Future, Any] = {}
+                for _ in range(args.workers):
+                    task = next(task_iterator, None)
+                    if task is not None:
+                        active[executor.submit(collect_task, task)] = task
+                while active:
+                    finished, _ = wait(active, return_when=FIRST_COMPLETED)
+                    for future in finished:
+                        task = active.pop(future)
+                        try:
+                            persist_task(task, future.result())
+                        except Exception:
+                            for remaining in active:
+                                remaining.cancel()
+                            raise
+                        next_task = next(task_iterator, None)
+                        if next_task is not None:
+                            active[executor.submit(collect_task, next_task)] = next_task
         print(json.dumps({
             "collected": collected, "traces": trace_count,
             "output": str(args.output), "ledger": ledger.snapshot(),
