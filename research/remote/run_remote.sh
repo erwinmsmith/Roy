@@ -45,9 +45,8 @@ clone_pinned() {
 
 prepare() {
   audit_tua_images
-  clone_pinned 0 tau2-bench
+  prepare_tau
   clone_pinned 1 TUA-Bench
-  (cd "${work_dir}/tau2-bench" && uv sync --extra knowledge)
   (cd "${work_dir}/TUA-Bench" && uv run setup-env)
   if command -v docker >/dev/null; then
     docker image inspect $(docker image ls --format '{{.Repository}}:{{.Tag}}' | sort) \
@@ -62,6 +61,22 @@ pathlib.Path(sys.argv[2]).write_text(json.dumps({
     "revisions": {b["id"]: b["revision"] for b in manifest["benchmarks"]},
 }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
+}
+
+prepare_tau() {
+  clone_pinned 0 tau2-bench
+  (cd "${work_dir}/tau2-bench" && uv sync --extra knowledge)
+  python3 - "${manifest_path}" "${results_dir}/prepared-tau.json" <<'PY'
+import json, pathlib, sys, time
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+benchmark = manifest["benchmarks"][0]
+pathlib.Path(sys.argv[2]).write_text(json.dumps({
+    "schema_version": 1,
+    "prepared_at": int(time.time()),
+    "revisions": {benchmark["id"]: benchmark["revision"]},
+}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+  echo "tau Knowledge host environment prepared; stamp: ${results_dir}/prepared-tau.json"
 }
 
 audit_tua_images() {
@@ -147,7 +162,8 @@ run_pilot() {
 case "${mode}" in
   dry-run) print_matrix ;;
   audit-images) audit_tua_images ;;
+  prepare-tau) prepare_tau ;;
   prepare) prepare ;;
   run) run_pilot ;;
-  *) echo "usage: $0 [dry-run|audit-images|prepare|run]" >&2; exit 2 ;;
+  *) echo "usage: $0 [dry-run|audit-images|prepare-tau|prepare|run]" >&2; exit 2 ;;
 esac
