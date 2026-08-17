@@ -35,10 +35,16 @@ clone_pinned() {
   revision="$(read_manifest "benchmarks.${index}.revision")"
   destination="${work_dir}/${name}"
   if [[ ! -d "${destination}/.git" ]]; then
-    git clone --filter=blob:none "${repository}" "${destination}"
+    mkdir -p "${destination}"
+    git -C "${destination}" init --quiet
+    git -C "${destination}" remote add origin "${repository}"
+  else
+    git -C "${destination}" remote set-url origin "${repository}"
   fi
-  git -C "${destination}" fetch --depth=1 origin "${revision}"
-  git -C "${destination}" checkout --detach "${revision}"
+  git -C "${destination}" config --unset-all remote.origin.promisor 2>/dev/null || true
+  git -C "${destination}" config --unset-all remote.origin.partialclonefilter 2>/dev/null || true
+  git -C "${destination}" fetch --refetch --depth=1 --no-tags origin "${revision}"
+  git -C "${destination}" checkout --detach --force "${revision}"
   actual="$(git -C "${destination}" rev-parse HEAD)"
   [[ "${actual}" == "${revision}" ]] || { echo "revision mismatch for ${name}" >&2; exit 3; }
 }
