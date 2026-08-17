@@ -155,6 +155,20 @@ class RuntimeBoundaryTests(unittest.TestCase):
             resumed = PersistentTokenLedger(path, limit=10)
             self.assertEqual(resumed.snapshot()["remaining"], 4)
 
+    def test_token_ledger_limit_can_only_be_raised(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.json"
+            ledger = PersistentTokenLedger(path, limit=10)
+            ledger.reserve(6)
+            ledger.settle(6, 4)
+
+            state = PersistentTokenLedger.raise_existing_limit(path, 50)
+            self.assertEqual(state["limit"], 50)
+            self.assertEqual(state["used"], 4)
+            self.assertEqual(state["remaining"], 46)
+            with self.assertRaisesRegex(ValueError, "cannot be lowered"):
+                PersistentTokenLedger.raise_existing_limit(path, 20)
+
     def test_policy_server_has_deterministic_legacy_fallback(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             server = PolicyServer()

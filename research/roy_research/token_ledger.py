@@ -78,5 +78,24 @@ class PersistentTokenLedger:
         value["exhausted"] = self.state.remaining == 0
         return value
 
+    @classmethod
+    def raise_existing_limit(cls, path: Path, new_limit: int) -> Dict[str, Any]:
+        """Increase an existing ledger limit without changing usage accounting."""
+        if not path.exists():
+            raise FileNotFoundError(f"token ledger does not exist: {path}")
+        import json
+
+        value = json.loads(path.read_text(encoding="utf-8"))
+        current_limit = int(value["limit"])
+        ledger = cls(path, limit=current_limit)
+        with ledger.lock:
+            if new_limit < current_limit:
+                raise ValueError("token limit cannot be lowered")
+            if new_limit < ledger.state.used + ledger.state.reserved:
+                raise ValueError("new token limit is below accounted usage")
+            ledger.state.limit = new_limit
+            ledger._persist()
+            return ledger.snapshot()
+
     def _persist(self) -> None:
         atomic_json(self.path, self.snapshot())

@@ -120,6 +120,12 @@ def parser() -> argparse.ArgumentParser:
     api_smoke.add_argument("--max-tokens", type=int, default=256)
     api_smoke.add_argument("--token-limit", type=int, default=10_000_000)
 
+    ledger_limit = commands.add_parser(
+        "raise-ledger-limit", help="Increase an existing persistent token ledger hard limit"
+    )
+    ledger_limit.add_argument("--ledger", type=Path, required=True)
+    ledger_limit.add_argument("--token-limit", type=int, required=True)
+
     experiment = commands.add_parser("experiment", help="Train and compare all controlled CS-GRPO ablations")
     experiment.add_argument("--groups", type=Path, required=True)
     experiment.add_argument("--output", type=Path, required=True)
@@ -135,6 +141,9 @@ def main(argv: List[str] | None = None) -> None:
         tasks = [task.to_dict() for task in generate_tasks(args.seed)]
         write_jsonl(args.output, tasks)
         print(json.dumps({"tasks": len(tasks), "output": str(args.output)}))
+    elif args.command == "raise-ledger-limit":
+        state = PersistentTokenLedger.raise_existing_limit(args.ledger, args.token_limit)
+        print(json.dumps({"ledger": str(args.ledger), **state}))
     elif args.command == "collect":
         tasks = list(read_jsonl(args.tasks))
         if args.limit is not None:
