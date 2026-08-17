@@ -26,3 +26,16 @@ packages = ["roy_research"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+
+# The research runner is CPU-only on remote benchmark hosts. PyPI's Linux
+# PyTorch wheels pull several GiB of CUDA libraries even when no GPU is
+# available, so Linux resolves torch from the official CPU wheel index.
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
