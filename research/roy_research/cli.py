@@ -323,6 +323,7 @@ def _write_report(
         "",
     ]
     if evaluation:
+        direct = evaluation.get("direct")
         lines.extend([
             f"- Split: `{evaluation['split']}`",
             f"- Decision accuracy: `{evaluation['accuracy']:.4f}`",
@@ -330,6 +331,18 @@ def _write_report(
             f"- Mean utility: `{evaluation['mean_utility']:.4f}`",
             f"- Mean structural regret: `{evaluation['mean_regret']:.4f}`",
         ])
+        if direct:
+            success_interval = evaluation["paired_vs_direct"]["success"]
+            utility_interval = evaluation["paired_vs_direct"]["utility"]
+            lines.extend([
+                f"- Direct success/utility: `{direct['success_rate']:.2%}` / `{direct['mean_utility']:.4f}`",
+                f"- Success delta vs direct (paired 95% CI): `{success_interval['mean_difference']:.4f}` "
+                f"`[{success_interval['ci95_low']:.4f}, {success_interval['ci95_high']:.4f}]` "
+                f"(`{success_interval['conclusion']}`)",
+                f"- Utility delta vs direct (paired 95% CI): `{utility_interval['mean_difference']:.4f}` "
+                f"`[{utility_interval['ci95_low']:.4f}, {utility_interval['ci95_high']:.4f}]` "
+                f"(`{utility_interval['conclusion']}`)",
+            ])
     elif experiment:
         full_test = experiment["learned_arms"]["full"]["test"]
         lines.extend([

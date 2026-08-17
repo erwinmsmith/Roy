@@ -7,6 +7,7 @@ from typing import Any, Dict, Iterable, List, Tuple
 import torch
 from torch import Tensor
 
+from .analysis import paired_bootstrap_interval
 from .grpo import clipped_policy_loss, select_action_log_probs, standardized_advantages
 from .io import read_jsonl
 from .model import FrozenTextEncoder, StructuralPolicyNetwork, graph_tensors
@@ -143,6 +144,8 @@ def evaluate_groups(
     regrets: List[float] = []
     utilities: List[float] = []
     successes: List[float] = []
+    direct_utilities: List[float] = []
+    direct_successes: List[float] = []
     confusion = {actual: {predicted: 0 for predicted in ACTION_INDEX} for actual in ACTION_INDEX}
     task_results: List[Dict[str, Any]] = []
     with torch.no_grad():
@@ -163,6 +166,8 @@ def evaluate_groups(
             logits = model(*tensors, resource_tensor(checkpoint["resources"], device), mask)
             selected = list(ACTION_INDEX)[int(torch.argmax(logits).item())]
             values = {key: float(value) for key, value in group["action_values"].items()}
+            direct_utility = values["CONTINUE"]
+            direct_success = float(direct_utility >= TERMINAL_SUCCESS_THRESHOLD)
             branch_values = {key: float(value) for key, value in group.get("branch_values", {}).items()}
             oracle_values = dict(values)
             if branch_values:
@@ -189,6 +194,8 @@ def evaluate_groups(
             utilities.append(selected_utility)
             success = float(selected_utility >= TERMINAL_SUCCESS_THRESHOLD)
             successes.append(success)
+            direct_utilities.append(direct_utility)
+            direct_successes.append(direct_success)
             regrets.append(oracle_utility - selected_utility)
             task_results.append({
                 "task_id": group["task"]["id"],
@@ -198,6 +205,8 @@ def evaluate_groups(
                 "oracle_actions": oracle_actions,
                 "utility": selected_utility,
                 "success": bool(success),
+                "direct_utility": direct_utility,
+                "direct_success": bool(direct_success),
                 "oracle_utility": oracle_utility,
                 "regret": oracle_utility - selected_utility,
             })
@@ -208,6 +217,15 @@ def evaluate_groups(
         "success_threshold": TERMINAL_SUCCESS_THRESHOLD,
         "successes": int(sum(successes)),
         "success_rate": sum(successes) / max(1, count),
+        "direct": {
+            "successes": int(sum(direct_successes)),
+            "success_rate": sum(direct_successes) / max(1, count),
+            "mean_utility": sum(direct_utilities) / max(1, count),
+        },
+        "paired_vs_direct": {
+            "success": paired_bootstrap_interval(successes, direct_successes),
+            "utility": paired_bootstrap_interval(utilities, direct_utilities),
+        },
         "mean_utility": sum(utilities) / max(1, count),
         "mean_regret": sum(regrets) / max(1, count),
         "action_confusion_matrix": confusion,

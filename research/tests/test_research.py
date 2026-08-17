@@ -23,7 +23,7 @@ from roy_research.model import FrozenTextEncoder, StructuralPolicyNetwork, TEXT_
 from roy_research.policy_server import PolicyServer
 from roy_research.schema import require_schema
 from roy_research.token_ledger import PersistentTokenLedger
-from roy_research.training import train_groups
+from roy_research.training import evaluate_groups, train_groups
 from roy_research.io import write_jsonl
 from roy_research.live_controlled import build_live_problem, collect_live_group, parse_answer, score_output
 from roy_research.providers import Completion, DeepSeekClient
@@ -126,9 +126,12 @@ class ModelTests(unittest.TestCase):
             write_jsonl(groups_path, [group])
             first = train_groups(groups_path, model_path, epochs=1, device_name="cpu")
             resumed = train_groups(groups_path, model_path, epochs=2, device_name="cpu", resume=True)
+            evaluation = evaluate_groups(groups_path, model_path, split="train", device_name="cpu")
             self.assertEqual(first["completed_epochs"], 1)
             self.assertEqual(resumed["resumed_from_epoch"], 1)
             self.assertEqual(resumed["completed_epochs"], 2)
+            self.assertEqual(evaluation["direct"]["mean_utility"], task.direct_value)
+            self.assertIn("conclusion", evaluation["paired_vs_direct"]["success"])
 
 
 class RuntimeBoundaryTests(unittest.TestCase):
