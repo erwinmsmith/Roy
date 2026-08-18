@@ -8,7 +8,12 @@ import torch
 from torch import Tensor
 
 from .model import FrozenTextEncoder, graph_tensors
-from .organization import ExplorationEnvelope, envelope_legal_actions
+from .organization import (
+    DEFAULT_EXPLORATION_GROUP,
+    ExplorationEnvelope,
+    envelope_legal_actions,
+    validate_exploration_group,
+)
 from .organization_model import (
     InformationRealizationPolicy,
     action_type_indices,
@@ -69,6 +74,14 @@ class OrganizationGRPOTrainer:
             for value in records
         ):
             raise ValueError("on-policy updates accept only complete tau3 train trajectories")
+        envelopes = tuple(
+            ExplorationEnvelope(**dict(value.get("envelope") or {})) for value in records
+        )
+        validate_exploration_group(envelopes)
+        if {value.id for value in envelopes} != {
+            value.id for value in DEFAULT_EXPLORATION_GROUP
+        }:
+            raise ValueError("on-policy tau3 group does not contain the required exploration envelopes")
 
         advantages = {
             value.trajectory_id: value.advantage
