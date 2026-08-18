@@ -171,7 +171,7 @@ recursive_runtime             open-ended child derivation and structured epistem
 derivation_dependency_graph   immutable lineage, artifact dependencies, WAIT and wake-up
 communication_graph           required routes and optional learned connections
 organization_policy           active-node selection followed by a conditional open action
-expected_resource_projection  E[C(tau)] <= B without adding cost to reward
+runtime_feasibility_mask      observable call/tool/node/depth/decision limits, never reward
 organization_grpo             eight on-policy trajectories and terminal τ³ utility only
 ```
 
@@ -194,7 +194,8 @@ PYTHONPATH=research python3 -m roy_research tau3-manifest \
 PYTHONPATH=research python3 -m roy_research tau3-train \
   --manifest research/output/tau3/manifest.jsonl \
   --trajectories research/output/tau3/train-trajectories.jsonl \
-  --model research/output/tau3/organization-policy.pt --resume
+  --model research/output/tau3/organization-policy.pt \
+  --epochs 4 --max-tokens 50000 --resume
 
 PYTHONPATH=research python3 -m roy_research tau3-evaluate \
   --manifest research/output/tau3/manifest.jsonl \
@@ -203,7 +204,7 @@ PYTHONPATH=research python3 -m roy_research tau3-evaluate \
   --summary research/output/tau3/test-summary.json --split test
 ```
 
-`tau3-train` samples one eight-trajectory group and immediately applies one organization-GRPO update before moving to the next task. Training accepts only `benchmark=tau3`, `split=train`, complete groups, and one `terminal_utility` per trajectory. At test time Roy samples one autonomous organization without the training-only minimum node/depth exploration envelopes. The primary comparison is against `single_agent_direct`; official test and banking-knowledge heldout tasks are never used for updates.
+`tau3-train` runs fresh rollouts over multiple epochs. For each task/epoch it samples eight trajectories from the masked current policy under the same envelope, runtime budget and environment seed, then immediately applies one organization-GRPO update. Only the organization sampling seed differs within a group. Training accepts only `benchmark=tau3`, `split=train`, complete groups, and one `terminal_utility` per trajectory. Early exploration floors anneal across epochs and apply only when a genuine actionable residual gap exists; they never manufacture a child. At test time Roy samples one autonomous organization without minimum node/depth floors. The primary comparison is against `single_agent_direct`; official test and banking-knowledge heldout tasks are never used for updates. Reports distinguish policy termination from resource/environment truncation.
 
 In the controlled benchmark, `utility` is a deterministic terminal task score in `[0, 1]`; it is not an LLM accuracy score. The current pilot reached `0.8266` test utility for the full hierarchical policy, compared with `0.8086` for Node-only CS-GRPO, `0.6396` without the event graph, and `0.5939` without derivation. These are controlled-fixture results, not claims about real-world Agent performance. A separate nine-checkpoint real-DeepSeek pilot now validates rollout collection and training end to end; its three-task test result was inconclusive and the external tau Knowledge/TUA-Bench pilot remains pending.
 

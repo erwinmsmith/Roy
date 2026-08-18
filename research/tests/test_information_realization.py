@@ -9,17 +9,14 @@ from unittest.mock import Mock, patch
 import torch
 
 from roy_research.organization import (
-    DEFAULT_EXPLORATION_GROUP,
+    ExplorationEnvelope,
+    RuntimeBudget,
     envelope_legal_actions,
     require_single_terminal_utility,
+    training_envelope,
     validate_exploration_group,
 )
-from roy_research.organization_model import (
-    InformationRealizationPolicy,
-    expected_resource_log_probs,
-    mixed_behavior_log_probs,
-    uniform_exploration_log_probs,
-)
+from roy_research.organization_model import InformationRealizationPolicy
 from roy_research.organization_replay import (
     replay_joint_log_probability,
     sample_organization_decision,
@@ -32,17 +29,30 @@ from roy_research.tau3 import TAU3_COMMIT, build_tau3_manifest, manifest_summary
 
 
 class InformationRealizationTests(unittest.TestCase):
-    def test_eight_envelopes_control_exploration_without_reward(self) -> None:
-        validate_exploration_group(DEFAULT_EXPLORATION_GROUP)
+    def test_one_shared_envelope_controls_group_without_reward(self) -> None:
+        envelope = training_envelope(0, 4)
+        validate_exploration_group((envelope,) * 8)
         candidates = [
             {"kind": "DERIVE", "legal": True},
             {"kind": "EXECUTE", "legal": True},
             {"kind": "STOP", "legal": True},
         ]
-        mask = envelope_legal_actions(candidates, DEFAULT_EXPLORATION_GROUP[4], 2, 1)
+        mask = envelope_legal_actions(candidates, envelope, 2, 1, True)
         self.assertEqual(mask, [True, True, False])
-        full = envelope_legal_actions(candidates, DEFAULT_EXPLORATION_GROUP[4], 9, 4)
+        no_gap = envelope_legal_actions(candidates, envelope, 2, 1, False)
+        self.assertEqual(no_gap, [True, True, True])
+        full = envelope_legal_actions(candidates, envelope, 12, 5, True)
         self.assertEqual(full, [False, True, True])
+        with self.assertRaisesRegex(ValueError, "share one exploration envelope"):
+            validate_exploration_group((envelope,) * 7 + (training_envelope(3, 4),))
+
+    def test_training_envelope_anneals_without_synthetic_requirements(self) -> None:
+        self.assertEqual(
+            [(training_envelope(epoch, 4).minimum_nodes,
+              training_envelope(epoch, 4).minimum_depth) for epoch in range(4)],
+            [(6, 3), (4, 2), (2, 1), (0, 0)],
+        )
+        self.assertEqual(RuntimeBudget().maximum_nodes, 12)
 
     def test_training_accepts_only_terminal_task_utility(self) -> None:
         self.assertEqual(require_single_terminal_utility({"terminal_utility": 0.75}), 0.75)
@@ -76,24 +86,6 @@ class InformationRealizationTests(unittest.TestCase):
         self.assertEqual(tuple(active.shape), (4,))
         self.assertEqual(tuple(candidates.shape), (11,))
 
-    def test_expected_resource_projection_is_not_a_per_trajectory_cap(self) -> None:
-        logits = torch.tensor([0.0, 2.0])
-        costs = torch.tensor([0.0, 10.0])
-        projected = expected_resource_log_probs(
-            logits, torch.tensor([True, True]), costs, expected_budget=4.0
-        )
-        probabilities = projected.exp()
-        self.assertLessEqual(float((probabilities * costs).sum()), 4.00001)
-        self.assertGreater(float(probabilities[1]), 0.0)
-        self.assertGreater(float(probabilities[1] * costs[1]), 0.0)
-
-    def test_exploration_mixture_records_exact_behavior_distribution(self) -> None:
-        policy = torch.log(torch.tensor([0.8, 0.2]))
-        exploration = uniform_exploration_log_probs(torch.tensor([True, True]))
-        mixed = mixed_behavior_log_probs(policy, exploration, 0.25)
-        self.assertAlmostEqual(float(mixed.exp().sum()), 1.0, places=6)
-        self.assertTrue(torch.allclose(mixed.exp(), torch.tensor([0.575, 0.425])))
-
     def test_sample_and_replay_use_the_same_joint_conditional_policy(self) -> None:
         class FakeEncoder:
             def encode(self, texts):
@@ -121,14 +113,14 @@ class InformationRealizationTests(unittest.TestCase):
                     "kind": "EXECUTE",
                     "description": "reason locally",
                     "legal": True,
-                    "expected_resource_cost": 1.0,
+                    "scheduler_complexity": 1.0,
                 },
                 {
                     "id": "derive",
                     "kind": "DERIVE",
                     "description": "resolve the remaining evidence gap",
                     "legal": True,
-                    "expected_resource_cost": 3.0,
+                    "scheduler_complexity": 3.0,
                     "resolves_gap": True,
                     "depth_delta": 1,
                 },
@@ -136,9 +128,10 @@ class InformationRealizationTests(unittest.TestCase):
             "resources": {},
             "node_count": 2,
             "maximum_depth_reached": 1,
-            "envelope": DEFAULT_EXPLORATION_GROUP[3].to_dict(),
-            "exploration_alpha": 0.4,
-            "expected_resource_budget": 2.0,
+            "envelope": ExplorationEnvelope(
+                "test", 0, 12, 0, 5, "expansive"
+            ).to_dict(),
+            "unresolved_gap_exists": True,
         }
         generator = torch.Generator().manual_seed(17)
         _candidate, record = sample_organization_decision(
@@ -147,10 +140,11 @@ class InformationRealizationTests(unittest.TestCase):
         replayed = replay_joint_log_probability(
             model, FakeEncoder(), record, torch.device("cpu")
         )
-        self.assertLessEqual(float(record["projected_expected_resource_cost"]), 2.00001)
         self.assertAlmostEqual(
-            float(replayed.detach()), float(record["policy_log_probability"]), places=6
+            float(replayed.detach()), float(record["masked_old_log_probability"]), places=6
         )
+        self.assertNotIn("behavior_log_probability", record)
+        self.assertNotIn("exploration_alpha", record)
 
     def test_single_objective_group_advantage_and_loss(self) -> None:
         records = [

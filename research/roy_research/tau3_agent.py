@@ -11,8 +11,8 @@ import torch
 
 from .model import FrozenTextEncoder
 from .organization import (
-    DEFAULT_EXPLORATION_GROUP,
     ExplorationEnvelope,
+    RuntimeBudget,
     envelope_legal_actions,
 )
 from .organization_model import InformationRealizationPolicy
@@ -34,23 +34,18 @@ verifiable termination condition. Do not create a child merely to increase node 
 @dataclass(frozen=True)
 class Tau3OrganizationAgentConfig:
     checkpoint: Path | None = None
-    envelope_id: str = "shallow-1"
-    exploration_alpha: float = 1.0
-    expected_resource_budget: float = 3.0
-    maximum_internal_decisions_per_turn: int = 24
+    maximum_internal_decisions_per_turn: int = 64
     seed: int = 20260818
     local_encoder_only: bool = True
     policy: Any | None = None
     encoder: Any | None = None
     exploration_envelope: ExplorationEnvelope | None = None
+    runtime_budget: RuntimeBudget = RuntimeBudget()
 
     def envelope(self) -> ExplorationEnvelope:
         if self.exploration_envelope is not None:
             return self.exploration_envelope
-        for value in DEFAULT_EXPLORATION_GROUP:
-            if value.id == self.envelope_id:
-                return value
-        raise ValueError(f"unknown organization exploration envelope: {self.envelope_id}")
+        return ExplorationEnvelope("default", 0, 12, 0, 5, "expansive")
 
 
 def register_tau3_organization_agent(
@@ -95,6 +90,11 @@ def register_tau3_organization_agent(
         final_output: str | None = None
         stopped: bool = False
         decision_count: int = 0
+        llm_call_count: int = 0
+        tool_call_count: int = 0
+        termination_type: str | None = None
+        termination_reason: str | None = None
+        initial_snapshot_fingerprint: str = ""
 
     class Tau3OrganizationAgent(LLMConfigMixin, HalfDuplexAgent[OrganizationState]):
         def __init__(self, tools, domain_policy, llm, llm_args=None, task=None):
@@ -129,7 +129,7 @@ def register_tau3_organization_agent(
             if not all(is_valid_agent_history_message(value) for value in history):
                 raise ValueError("invalid initial tau3 agent history")
             task_id = str(getattr(self.task, "id", "unknown"))
-            return OrganizationState(
+            state = OrganizationState(
                 system_messages=[SystemMessage(role="system", content=self.system_prompt)],
                 messages=list(history),
                 task_id=task_id,
@@ -143,11 +143,19 @@ def register_tau3_organization_agent(
                     "report": None,
                 }],
             )
+            state.initial_snapshot_fingerprint = _stable_json_hash({
+                "task_id": task_id,
+                "history": [str(getattr(value, "content", "")) for value in history],
+            })
+            return state
 
         def stop(self, message=None, state: OrganizationState | None = None) -> None:
             if state is None:
                 return
             state.stopped = True
+            if state.termination_type is None:
+                state.termination_type = "truncated_environment"
+                state.termination_reason = "tau3 orchestrator ended the episode"
             if state.final_output is None:
                 for value in reversed(state.messages):
                     if isinstance(value, AssistantMessage) and getattr(value, "content", None):
@@ -169,6 +177,16 @@ def register_tau3_organization_agent(
                     root["status"] = "ready"
 
             for _ in range(config.maximum_internal_decisions_per_turn):
+                if state.decision_count >= config.runtime_budget.maximum_decisions:
+                    return self._truncate_and_finalize(
+                        state, generate, AssistantMessage, SystemMessage,
+                        "decision_budget_exhausted"
+                    )
+                if state.llm_call_count >= config.runtime_budget.maximum_llm_calls:
+                    return self._truncate_and_finalize(
+                        state, generate, AssistantMessage, SystemMessage,
+                        "llm_call_budget_exhausted"
+                    )
                 candidates = self._candidates(state)
                 policy_state = self._policy_state(state, candidates)
                 candidate, record = sample_organization_decision(
@@ -191,13 +209,13 @@ def register_tau3_organization_agent(
                     state.messages.append(outward)
                     return outward, state
 
-            outward = self._final_message(state, generate, SystemMessage)
-            state.final_output = str(outward.content or "")
-            state.stopped = True
-            state.messages.append(outward)
-            return outward, state
+            return self._truncate_and_finalize(
+                state, generate, AssistantMessage, SystemMessage,
+                "internal_turn_decision_limit"
+            )
 
         def _ingest_tool_observation(self, message, state: OrganizationState) -> None:
+            state.tool_call_count += 1
             actor_id = state.pending_acquisition_node or "root"
             state.observations.append({
                 "id": f"observation-{len(state.observations)}",
@@ -214,6 +232,7 @@ def register_tau3_organization_agent(
             kind = str(candidate["kind"])
             actor = self._node(state, str(candidate["actor_node_id"]))
             if kind == "EXECUTE":
+                state.llm_call_count += 1
                 actor["report"] = self._generate_report(actor, state, generate_fn, system_type)
                 actor["status"] = "reported"
                 return None
@@ -264,6 +283,7 @@ def register_tau3_organization_agent(
                         f"{candidate['requirement']}. Make exactly one useful tau3 tool call."
                     ),
                 )
+                state.llm_call_count += 1
                 return generate_fn(
                     model=self.llm,
                     tools=self.tools,
@@ -275,6 +295,8 @@ def register_tau3_organization_agent(
                 outward = self._final_message(state, generate_fn, system_type)
                 state.final_output = str(outward.content or "")
                 state.stopped = True
+                state.termination_type = "policy_stop"
+                state.termination_reason = "organization policy selected STOP"
                 return outward
             raise ValueError(f"unsupported organization action: {kind}")
 
@@ -302,32 +324,7 @@ def register_tau3_organization_agent(
                 call_name="roy_epistemic_report",
                 **self.llm_args,
             )
-            report = _normalize_report(_parse_json_object(str(response.content or "{}")), node)
-            if (
-                (
-                    len(state.nodes) < config.envelope().minimum_nodes
-                    or max(int(value["depth"]) for value in state.nodes)
-                    < config.envelope().minimum_depth
-                )
-                and not report["proposed_children"]
-            ):
-                gap_id = f"validation-gap-{node['id']}-{state.decision_count}"
-                report["residual_requirements"].append({
-                    "id": gap_id,
-                    "description": "Independently validate the most failure-sensitive unresolved assumption",
-                    "why_it_matters": "A shared-model or policy-compliance error could invalidate the terminal answer",
-                    "likely_mechanism": "representation",
-                    "required_information": "A concise independent validation or contradiction",
-                    "possible_external_access": [],
-                })
-                report["proposed_children"].append({
-                    "id": f"validation-proposal-{node['id']}-{state.decision_count}",
-                    "triggering_gap_id": gap_id,
-                    "objective": "Validate the most failure-sensitive assumption in the current conclusion",
-                    "termination_condition": "Return supporting or contradicting evidence with calibrated uncertainty",
-                    "depends_on_node_ids": [],
-                })
-            return report
+            return _normalize_report(_parse_json_object(str(response.content or "{}")), node)
 
         def _final_message(self, state, generate_fn, system_type):
             reports = [value.get("report") for value in state.nodes if value.get("report")]
@@ -339,6 +336,7 @@ def register_tau3_organization_agent(
                     + json.dumps(reports, ensure_ascii=False)
                 ),
             )
+            state.llm_call_count += 1
             return generate_fn(
                 model=self.llm,
                 tools=[],
@@ -346,6 +344,27 @@ def register_tau3_organization_agent(
                 call_name="roy_final_answer",
                 **self.llm_args,
             )
+
+        def _truncate_and_finalize(
+            self, state, generate_fn, assistant_type, system_type, reason: str
+        ):
+            if state.llm_call_count < config.runtime_budget.maximum_llm_calls:
+                outward = self._final_message(state, generate_fn, system_type)
+            else:
+                reports = [
+                    str(value.get("report", {}).get("conclusion", ""))
+                    for value in state.nodes if value.get("report")
+                ]
+                outward = assistant_type(
+                    role="assistant",
+                    content="\n".join(value for value in reports if value),
+                )
+            state.final_output = str(outward.content or "")
+            state.stopped = True
+            state.termination_type = "truncated_resource"
+            state.termination_reason = reason
+            state.messages.append(outward)
+            return outward, state
 
         def _candidates(self, state: OrganizationState) -> list[Dict[str, Any]]:
             result: list[Dict[str, Any]] = []
@@ -404,7 +423,35 @@ def register_tau3_organization_agent(
                         })
             if not result:
                 result.append(_candidate("stop:fallback", "STOP", "root", "Synthesize the terminal answer", 1.0))
+            for candidate in result:
+                candidate["legal"] = self._runtime_action_legal(candidate, state)
             return result
+
+        def _runtime_action_legal(self, candidate, state) -> bool:
+            budget = config.runtime_budget
+            kind = str(candidate["kind"])
+            llm_remaining = budget.maximum_llm_calls - state.llm_call_count
+            if kind in {"EXECUTE", "ACQUIRE"} and llm_remaining <= 1:
+                return False
+            if kind == "STOP" and llm_remaining < 1:
+                return False
+            if kind == "ACQUIRE" and state.tool_call_count >= budget.maximum_tool_calls:
+                return False
+            if kind == "DERIVE":
+                return (
+                    len(state.nodes) < budget.maximum_nodes
+                    and int(candidate.get("resulting_depth", 0)) <= budget.maximum_depth
+                )
+            return state.decision_count < budget.maximum_decisions
+
+        @staticmethod
+        def _has_actionable_residual_gap(candidates) -> bool:
+            return any(
+                bool(value.get("legal", True))
+                and value.get("kind") in {"DERIVE", "ACQUIRE"}
+                and bool(value.get("resolves_gap", False))
+                for value in candidates
+            )
 
         def _policy_state(self, state, candidates):
             nodes = [{
@@ -425,11 +472,13 @@ def register_tau3_organization_agent(
                 for value in state.communication_edges
             ]
             active_ids = sorted({str(value["actor_node_id"]) for value in candidates})
+            unresolved_gap_exists = self._has_actionable_residual_gap(candidates)
             envelope_legal = envelope_legal_actions(
                 candidates,
                 config.envelope(),
                 len(state.nodes),
                 max(int(value["depth"]) for value in state.nodes),
+                unresolved_gap_exists,
             )
             active_legal = [
                 any(
@@ -438,18 +487,52 @@ def register_tau3_organization_agent(
                 )
                 for actor_id in active_ids
             ]
+            resources = self._resource_fractions(state)
+            fingerprint_payload = {
+                "nodes": nodes,
+                "edges": edges,
+                "candidate_ids": [str(value["id"]) for value in candidates],
+                "candidate_legal": envelope_legal,
+                "resources": resources,
+                "envelope": config.envelope().to_dict(),
+            }
             return {
-                "state_fingerprint": _stable_json_hash({"nodes": nodes, "edges": edges}),
+                "state_fingerprint": _stable_json_hash(fingerprint_payload),
                 "event_graph": {"nodes": nodes, "edges": edges},
                 "active_node_ids": active_ids,
                 "active_node_legal": active_legal,
                 "candidates": candidates,
-                "resources": {},
+                "resources": resources,
                 "node_count": len(state.nodes),
                 "maximum_depth_reached": max(int(value["depth"]) for value in state.nodes),
                 "envelope": config.envelope().to_dict(),
-                "exploration_alpha": config.exploration_alpha,
-                "expected_resource_budget": config.expected_resource_budget,
+                "unresolved_gap_exists": unresolved_gap_exists,
+            }
+
+        @staticmethod
+        def _resource_fractions(state):
+            budget = config.runtime_budget
+            maximum_depth = max(int(value["depth"]) for value in state.nodes)
+            return {
+                "llm_calls_remaining_fraction": max(
+                    0.0, (budget.maximum_llm_calls - state.llm_call_count)
+                    / budget.maximum_llm_calls
+                ),
+                "tool_calls_remaining_fraction": max(
+                    0.0, (budget.maximum_tool_calls - state.tool_call_count)
+                    / max(1, budget.maximum_tool_calls)
+                ),
+                "nodes_remaining_fraction": max(
+                    0.0, (budget.maximum_nodes - len(state.nodes)) / budget.maximum_nodes
+                ),
+                "depth_remaining_fraction": max(
+                    0.0, (budget.maximum_depth - maximum_depth)
+                    / max(1, budget.maximum_depth)
+                ),
+                "decisions_remaining_fraction": max(
+                    0.0, (budget.maximum_decisions - state.decision_count)
+                    / budget.maximum_decisions
+                ),
             }
 
         @staticmethod
@@ -477,22 +560,39 @@ def organization_trajectory_from_state(
     domain: str,
     split: str,
     envelope: ExplorationEnvelope,
+    group_id: str,
+    epoch: int,
+    rollout_index: int,
+    environment_seed: int,
+    organization_seed: int,
+    runtime_budget: RuntimeBudget,
     realized_resources: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
+    termination_type = str(state.termination_type or "truncated_environment")
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "id": str(state.trajectory_id),
-        "group_id": f"{domain}:{state.task_id}",
+        "group_id": group_id,
         "benchmark": "tau3",
         "domain": domain,
         "task_id": str(state.task_id),
         "split": split,
+        "epoch": epoch,
+        "rollout_index": rollout_index,
+        "environment_seed": environment_seed,
+        "organization_seed": organization_seed,
+        "initial_snapshot_fingerprint": str(state.initial_snapshot_fingerprint),
         "envelope": envelope.to_dict(),
+        "runtime_budget": runtime_budget.to_dict(),
         "actions": list(state.actions),
         "policy_records": list(state.policy_records),
         "terminal_utility": float(terminal_utility),
         "realized_resources": dict(realized_resources or {}),
         "terminal": bool(state.stopped),
+        "terminated": termination_type == "policy_stop",
+        "truncated": termination_type != "policy_stop",
+        "termination_type": termination_type,
+        "termination_reason": state.termination_reason,
         "final_output": state.final_output,
         "organization": {
             "nodes": list(state.nodes),
@@ -504,13 +604,15 @@ def organization_trajectory_from_state(
     }
 
 
-def _candidate(identifier: str, kind: str, actor: str, description: str, cost: float) -> Dict[str, Any]:
+def _candidate(
+    identifier: str, kind: str, actor: str, description: str, complexity: float
+) -> Dict[str, Any]:
     return {
         "id": identifier,
         "kind": kind,
         "actor_node_id": actor,
         "description": description,
-        "expected_resource_cost": cost,
+        "scheduler_complexity": complexity,
         "legal": True,
     }
 

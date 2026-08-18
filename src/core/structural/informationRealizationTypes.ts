@@ -1,6 +1,6 @@
 import type { ResourceEnvelope } from './types.js';
 
-export const INFORMATION_REALIZATION_SCHEMA_VERSION = 1 as const;
+export const INFORMATION_REALIZATION_SCHEMA_VERSION = 2 as const;
 
 export type OrganizationActionKind =
   | 'DERIVE'
@@ -159,7 +159,7 @@ export interface OrganizationCandidate {
   kind: OrganizationActionKind;
   actorNodeId: string;
   description: string;
-  expectedResourceCost: number;
+  schedulerComplexity: number;
   action: OrganizationAction;
 }
 
@@ -176,13 +176,17 @@ export interface OrganizationPolicyRecord {
   stateFingerprint: string;
   activeNodeId: string;
   candidateId: string;
-  behaviorLogProbability: number;
-  policyLogProbability: number;
-  explorationAlpha: number;
+  maskedOldLogProbability: number;
   envelopeId: string;
-  expectedResourceBudget: number;
-  projectedExpectedResourceCost: number;
   policyState?: unknown;
+}
+
+export interface OrganizationRuntimeBudget {
+  maximumLlmCalls: number;
+  maximumToolCalls: number;
+  maximumNodes: number;
+  maximumDepth: number;
+  maximumDecisions: number;
 }
 
 export interface InformationRealizationTrajectory {
@@ -193,11 +197,21 @@ export interface InformationRealizationTrajectory {
   domain: string;
   taskId: string;
   split: 'train' | 'validation' | 'test' | 'heldout';
+  epoch: number;
+  rolloutIndex: number;
+  environmentSeed: number;
+  organizationSeed: number;
+  initialSnapshotFingerprint: string;
   envelope: ExplorationEnvelope;
+  runtimeBudget: OrganizationRuntimeBudget;
   actions: OrganizationAction[];
   policyRecords: OrganizationPolicyRecord[];
   terminalUtility: number;
   realizedResources: ResourceEnvelope;
   terminal: boolean;
+  terminated: boolean;
+  truncated: boolean;
+  terminationType: 'policy_stop' | 'truncated_resource' | 'truncated_environment';
+  terminationReason?: string;
   finalOutput?: unknown;
 }

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import random
 import uuid
 from collections import defaultdict
 from pathlib import Path
@@ -8,7 +10,12 @@ from typing import Any, Dict, Iterable, Mapping, Sequence
 
 from .analysis import paired_bootstrap_interval
 from .io import read_jsonl, write_jsonl
-from .organization import DEFAULT_EXPLORATION_GROUP, ExplorationEnvelope
+from .organization import (
+    ORGANIZATION_GROUP_SIZE,
+    ExplorationEnvelope,
+    RuntimeBudget,
+    training_envelope,
+)
 from .organization_replay import OrganizationGRPOTrainer
 from .tau3 import TAU3_COMMIT
 from .tau3_agent import (
@@ -26,73 +33,100 @@ def train_tau3_on_policy(
     user_llm: str,
     limit: int | None = None,
     max_steps: int = 100,
-    max_tokens: int = 8192,
-    temperature: float = 0.2,
-    expected_resource_budget: float = 3.0,
+    max_tokens: int = 50000,
+    temperature: float = 0.0,
+    epochs: int = 4,
+    runtime_budget: RuntimeBudget = RuntimeBudget(),
     seed: int = 20260818,
     resume: bool = False,
 ) -> Dict[str, Any]:
-    """Sample one tau3 group and update immediately, with no teacher phase."""
+    """Collect fresh masked-policy groups and update immediately, with no teacher."""
 
+    if resume and trajectories_path.exists() != model_path.exists():
+        raise ValueError("resume requires both the trajectory log and model checkpoint")
     if trajectories_path.exists() and not resume:
         raise ValueError("tau3 trajectory output already exists; use --resume or a new path")
+    if model_path.exists() and not resume:
+        raise ValueError("tau3 model output already exists; use --resume or a new path")
     tasks = [value for value in read_jsonl(manifest_path) if value.get("split") == "train"]
     if limit is not None:
         tasks = tasks[:limit]
     trainer = OrganizationGRPOTrainer(model_path, seed=seed, resume=resume)
+    if not model_path.exists():
+        trainer.save()
     existing = list(read_jsonl(trajectories_path)) if resume and trajectories_path.exists() else []
     by_group: Dict[str, list[Dict[str, Any]]] = defaultdict(list)
     for value in existing:
         by_group[str(value["group_id"])].append(value)
 
     collected = 0
-    for task_index, task in enumerate(tasks):
-        _validate_manifest_record(task, "train")
-        group_id = f"{task['domain']}:{task['task_id']}"
-        records = by_group[group_id]
-        present = {str(value["envelope"]["id"]) for value in records}
-        if len(records) == 8:
-            continue
-        for envelope_index, envelope in enumerate(DEFAULT_EXPLORATION_GROUP):
-            if envelope.id in present:
-                continue
-            name = f"roy_train_{task_index}_{envelope_index}_{uuid.uuid4().hex[:8]}"
-            agent_config = Tau3OrganizationAgentConfig(
-                envelope_id=envelope.id,
-                exploration_alpha=_exploration_weight(trainer.groups),
-                expected_resource_budget=expected_resource_budget,
-                seed=seed + task_index * 101 + envelope_index,
-                policy=trainer.model,
-                encoder=trainer.encoder,
-            )
-            register_tau3_organization_agent(agent_config, name=name)
-            simulation, state = _run_episode(
-                task,
-                name,
-                agent_llm,
-                user_llm,
-                max_steps,
-                max_tokens,
-                temperature,
-                seed + task_index * 101 + envelope_index,
-            )
-            trajectory = organization_trajectory_from_state(
-                state,
-                _reward(simulation),
-                str(task["domain"]),
-                "train",
-                envelope,
-                _resource_summary(simulation, state),
-            )
-            write_jsonl(
-                trajectories_path,
-                [trajectory],
-                append=trajectories_path.exists(),
-            )
-            records.append(trajectory)
-            collected += 1
-        trainer.update_group(records)
-    return {**trainer.metadata(), "new_trajectories": collected, "model": str(model_path)}
+    for epoch in range(epochs):
+        epoch_tasks = list(tasks)
+        random.Random(seed + epoch).shuffle(epoch_tasks)
+        envelope = training_envelope(epoch, epochs)
+        for task_index, task in enumerate(epoch_tasks):
+            _validate_manifest_record(task, "train")
+            group_id = f"{task['domain']}:{task['task_id']}:{epoch}"
+            records = by_group[group_id]
+            present = {int(value["rollout_index"]) for value in records}
+            environment_seed = _stable_group_seed(seed, epoch, task)
+            for rollout_index in range(ORGANIZATION_GROUP_SIZE):
+                if rollout_index in present:
+                    continue
+                name = f"roy_train_{epoch}_{task_index}_{rollout_index}_{uuid.uuid4().hex[:8]}"
+                organization_seed = environment_seed + rollout_index + 1
+                agent_config = Tau3OrganizationAgentConfig(
+                    seed=organization_seed,
+                    policy=trainer.model,
+                    encoder=trainer.encoder,
+                    exploration_envelope=envelope,
+                    runtime_budget=runtime_budget,
+                )
+                register_tau3_organization_agent(agent_config, name=name)
+                simulation, state = _run_episode(
+                    task,
+                    name,
+                    agent_llm,
+                    user_llm,
+                    max_steps,
+                    max_tokens,
+                    temperature,
+                    environment_seed,
+                )
+                trajectory = organization_trajectory_from_state(
+                    state,
+                    _reward(simulation),
+                    str(task["domain"]),
+                    "train",
+                    envelope,
+                    group_id,
+                    epoch,
+                    rollout_index,
+                    environment_seed,
+                    organization_seed,
+                    runtime_budget,
+                    _resource_summary(simulation, state),
+                )
+                write_jsonl(
+                    trajectories_path,
+                    [trajectory],
+                    append=trajectories_path.exists(),
+                )
+                records.append(trajectory)
+                collected += 1
+            if len(records) != ORGANIZATION_GROUP_SIZE:
+                raise ValueError(f"incomplete organization group after collection: {group_id}")
+            if group_id not in trainer.updated_group_ids:
+                trainer.update_group(records)
+    all_records = [value for values in by_group.values() for value in values]
+    return {
+        **trainer.metadata(),
+        "epochs": epochs,
+        "new_trajectories": collected,
+        "truncation_rate": sum(bool(value.get("truncated")) for value in all_records)
+        / max(1, len(all_records)),
+        "model": str(model_path),
+    }
 
 
 def evaluate_tau3_against_direct(
@@ -104,9 +138,9 @@ def evaluate_tau3_against_direct(
     split: str = "test",
     limit: int | None = None,
     max_steps: int = 100,
-    max_tokens: int = 8192,
+    max_tokens: int = 50000,
     temperature: float = 0.0,
-    expected_resource_budget: float = 3.0,
+    runtime_budget: RuntimeBudget = RuntimeBudget(),
     seed: int = 20260818,
 ) -> Dict[str, Any]:
     """Paired tau3 evaluation: single-agent direct versus one learned organization."""
@@ -119,7 +153,7 @@ def evaluate_tau3_against_direct(
     if limit is not None:
         tasks = tasks[:limit]
     trainer = OrganizationGRPOTrainer(model_path, seed=seed, resume=True)
-    evaluation_envelope = ExplorationEnvelope("evaluation", 1, 12, 0, 5, "expansive")
+    evaluation_envelope = ExplorationEnvelope("evaluation", 0, 12, 0, 5, "expansive")
     rows: list[Dict[str, Any]] = []
     for task_index, task in enumerate(tasks):
         _validate_manifest_record(task, split)
@@ -135,12 +169,11 @@ def evaluate_tau3_against_direct(
         )
         name = f"roy_eval_{task_index}_{uuid.uuid4().hex[:8]}"
         config = Tau3OrganizationAgentConfig(
-            exploration_alpha=1.0,
-            expected_resource_budget=expected_resource_budget,
             seed=seed + task_index,
             policy=trainer.model,
             encoder=trainer.encoder,
             exploration_envelope=evaluation_envelope,
+            runtime_budget=runtime_budget,
         )
         register_tau3_organization_agent(config, name=name)
         learned, state = _run_episode(
@@ -206,6 +239,11 @@ def _validate_manifest_record(value: Mapping[str, Any], split: str) -> None:
         raise ValueError("tau3 manifest split mismatch")
 
 
+def _stable_group_seed(seed: int, epoch: int, task: Mapping[str, Any]) -> int:
+    material = f"{seed}:{epoch}:{task['domain']}:{task['task_id']}".encode("utf-8")
+    return int.from_bytes(hashlib.sha256(material).digest()[:4], "big")
+
+
 def _reward(simulation: Any) -> float:
     reward_info = getattr(simulation, "reward_info", None)
     if reward_info is None or getattr(reward_info, "reward", None) is None:
@@ -221,7 +259,12 @@ def _resource_summary(simulation: Any, state: Any) -> Dict[str, Any]:
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
         "organization_decisions": int(getattr(state, "decision_count", 0)),
+        "llm_calls": int(getattr(state, "llm_call_count", 0)),
+        "tool_calls": int(getattr(state, "tool_call_count", 0)),
         "nodes": len(getattr(state, "nodes", [])),
+        "maximum_depth": max(
+            (int(value["depth"]) for value in getattr(state, "nodes", [])), default=0
+        ),
     }
 
 
@@ -262,6 +305,9 @@ def _evaluation_row(task: Mapping[str, Any], arm: str, simulation: Any, state: A
             "dependency_edges": len(state.dependency_edges),
             "communication_edges": len(state.communication_edges),
             "decisions": state.decision_count,
+            "terminated": state.termination_type == "policy_stop",
+            "truncated": state.termination_type != "policy_stop",
+            "termination_type": state.termination_type,
         }
     return row
 
@@ -290,6 +336,9 @@ def _paired_summary(rows: Iterable[Mapping[str, Any]], split: str) -> Dict[str, 
         "learned_information_realization": {
             "mean_utility": sum(learned_utility) / max(1, len(keys)),
             "success_rate": sum(learned_success) / max(1, len(keys)),
+            "truncation_rate": sum(
+                bool(learned[key].get("organization", {}).get("truncated")) for key in keys
+            ) / max(1, len(keys)),
             "paired_utility_vs_direct": paired_bootstrap_interval(
                 learned_utility, direct_utility
             ),
@@ -298,7 +347,3 @@ def _paired_summary(rows: Iterable[Mapping[str, Any]], split: str) -> Dict[str, 
             ),
         },
     }
-
-
-def _exploration_weight(completed_groups: int) -> float:
-    return min(1.0, 0.2 + 0.8 * completed_groups / 100.0)

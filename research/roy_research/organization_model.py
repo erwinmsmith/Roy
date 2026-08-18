@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from pathlib import Path
 from typing import Any, Dict, Sequence, Tuple
 
@@ -127,94 +126,6 @@ class InformationRealizationPolicy(nn.Module):
         model = cls()
         model.load_state_dict(payload["state_dict"])
         return model, dict(payload.get("metadata", {}))
-
-
-def expected_resource_log_probs(
-    logits: Tensor,
-    legal_mask: Tensor,
-    expected_costs: Tensor,
-    expected_budget: float,
-    tolerance: float = 1e-6,
-    iterations: int = 80,
-) -> Tensor:
-    """KL-project an action distribution onto an expected-cost constraint.
-
-    Resource use remains a feasibility constraint. It is not added to task
-    utility, the GRPO advantage, or the policy loss. Individual sampled
-    trajectories may exceed the expectation; only the action distribution is
-    constrained.
-    """
-
-    if logits.shape != legal_mask.shape or logits.shape != expected_costs.shape:
-        raise ValueError("resource projection tensors must have identical shapes")
-    if not bool(legal_mask.any()):
-        raise ValueError("resource projection requires a legal action")
-    legal_costs = expected_costs[legal_mask.bool()].float()
-    if expected_budget + tolerance < float(legal_costs.min().item()):
-        raise ValueError("expected resource constraint is infeasible for the legal action set")
-
-    base_logits = _masked_logits(logits, legal_mask)
-    base_log_probs = torch.log_softmax(base_logits, dim=-1)
-    base_expected = float((base_log_probs.exp() * expected_costs).sum().item())
-    if base_expected <= expected_budget + tolerance:
-        return base_log_probs
-
-    lower = 0.0
-    upper = 1.0
-    for _ in range(60):
-        projected = torch.log_softmax(
-            _masked_logits(logits - upper * expected_costs, legal_mask), dim=-1
-        )
-        if float((projected.exp() * expected_costs).sum().item()) <= expected_budget:
-            break
-        upper *= 2.0
-    else:
-        raise ValueError("unable to satisfy expected resource constraint")
-
-    for _ in range(iterations):
-        multiplier = (lower + upper) / 2.0
-        projected = torch.log_softmax(
-            _masked_logits(logits - multiplier * expected_costs, legal_mask), dim=-1
-        )
-        expected = float((projected.exp() * expected_costs).sum().item())
-        if expected > expected_budget:
-            lower = multiplier
-        else:
-            upper = multiplier
-    return torch.log_softmax(
-        _masked_logits(logits - upper * expected_costs, legal_mask), dim=-1
-    )
-
-
-def mixed_behavior_log_probs(
-    policy_log_probs: Tensor,
-    exploration_log_probs: Tensor,
-    policy_weight: float,
-) -> Tensor:
-    """Exact log-probability of the design's exploration/policy mixture."""
-
-    if policy_log_probs.shape != exploration_log_probs.shape:
-        raise ValueError("mixture distributions must have identical shapes")
-    if not 0.0 <= policy_weight <= 1.0:
-        raise ValueError("policy_weight must be in [0, 1]")
-    if policy_weight == 0.0:
-        return exploration_log_probs
-    if policy_weight == 1.0:
-        return policy_log_probs
-    weights = torch.tensor(
-        [math.log(policy_weight), math.log1p(-policy_weight)],
-        dtype=policy_log_probs.dtype,
-        device=policy_log_probs.device,
-    )
-    return torch.logsumexp(
-        torch.stack([policy_log_probs + weights[0], exploration_log_probs + weights[1]]),
-        dim=0,
-    )
-
-
-def uniform_exploration_log_probs(legal_mask: Tensor) -> Tensor:
-    logits = torch.zeros(legal_mask.shape, dtype=torch.float32, device=legal_mask.device)
-    return torch.log_softmax(_masked_logits(logits, legal_mask), dim=-1)
 
 
 def action_type_indices(kinds: Sequence[str], device: torch.device | None = None) -> Tensor:

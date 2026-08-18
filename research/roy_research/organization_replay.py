@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
@@ -9,25 +10,19 @@ from torch import Tensor
 
 from .model import FrozenTextEncoder, graph_tensors
 from .organization import (
-    DEFAULT_EXPLORATION_GROUP,
     ExplorationEnvelope,
+    ORGANIZATION_GROUP_SIZE,
     envelope_legal_actions,
     validate_exploration_group,
 )
 from .organization_model import (
     InformationRealizationPolicy,
     action_type_indices,
-    expected_resource_log_probs,
-    mixed_behavior_log_probs,
-    uniform_exploration_log_probs,
 )
 from .organization_training import (
     organization_group_advantages,
     single_objective_organization_grpo_loss,
 )
-from .training import resource_tensor
-
-
 class OrganizationGRPOTrainer:
     """Stateful on-policy trainer used by the tau3 sample-and-update loop."""
 
@@ -52,6 +47,8 @@ class OrganizationGRPOTrainer:
         self.trajectories = 0
         self.optimizer_steps = 0
         self.losses: List[float] = []
+        self.loss_sum = 0.0
+        self.updated_group_ids: set[str] = set()
         if resume and output_path.exists():
             payload = torch.load(output_path, map_location=self.device, weights_only=False)
             self.model.load_state_dict(payload["state_dict"])
@@ -60,13 +57,22 @@ class OrganizationGRPOTrainer:
             self.groups = int(metadata.get("groups", 0))
             self.trajectories = int(metadata.get("trajectories", 0))
             self.optimizer_steps = int(metadata.get("optimizer_steps", 0))
+            self.loss_sum = float(
+                metadata.get(
+                    "loss_sum", float(metadata.get("mean_loss", 0.0)) * self.optimizer_steps
+                )
+            )
+            self.updated_group_ids = set(metadata.get("updated_group_ids", []))
 
     def update_group(self, records: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
-        if len(records) != 8:
+        if len(records) != ORGANIZATION_GROUP_SIZE:
             raise ValueError("on-policy tau3 updates require exactly eight trajectories")
         group_ids = {str(value.get("group_id") or "") for value in records}
         if len(group_ids) != 1 or "" in group_ids:
             raise ValueError("all on-policy trajectories must belong to one task group")
+        group_id = next(iter(group_ids))
+        if group_id in self.updated_group_ids:
+            raise ValueError(f"organization group was already optimized: {group_id}")
         if any(
             value.get("benchmark") != "tau3"
             or value.get("split") != "train"
@@ -78,10 +84,21 @@ class OrganizationGRPOTrainer:
             ExplorationEnvelope(**dict(value.get("envelope") or {})) for value in records
         )
         validate_exploration_group(envelopes)
-        if {value.id for value in envelopes} != {
-            value.id for value in DEFAULT_EXPLORATION_GROUP
-        }:
-            raise ValueError("on-policy tau3 group does not contain the required exploration envelopes")
+        if {int(value.get("rollout_index", -1)) for value in records} != set(
+            range(ORGANIZATION_GROUP_SIZE)
+        ):
+            raise ValueError("on-policy tau3 group requires rollout indices zero through seven")
+        if len({int(value.get("environment_seed", -1)) for value in records}) != 1:
+            raise ValueError("counterfactual trajectories must share one environment seed")
+        snapshot_fingerprints = {
+            str(value.get("initial_snapshot_fingerprint") or "") for value in records
+        }
+        if len(snapshot_fingerprints) != 1 or "" in snapshot_fingerprints:
+            raise ValueError("counterfactual trajectories must share one initial snapshot")
+        if len({
+            json.dumps(value.get("runtime_budget") or {}, sort_keys=True) for value in records
+        }) != 1:
+            raise ValueError("counterfactual trajectories must share one runtime budget")
 
         advantages = {
             value.trajectory_id: value.advantage
@@ -101,7 +118,7 @@ class OrganizationGRPOTrainer:
                 for record in policy_records
             ]))
             behavior_probabilities.append(torch.tensor(
-                [float(record["policy_log_probability"]) for record in policy_records],
+                [float(record["masked_old_log_probability"]) for record in policy_records],
                 dtype=torch.float32,
                 device=self.device,
             ))
@@ -117,7 +134,10 @@ class OrganizationGRPOTrainer:
         self.groups += 1
         self.trajectories += len(records)
         self.optimizer_steps += 1
-        self.losses.append(float(loss.detach().cpu()))
+        self.updated_group_ids.add(group_id)
+        loss_value = float(loss.detach().cpu())
+        self.losses.append(loss_value)
+        self.loss_sum += loss_value
         self.save()
         return self.metadata()
 
@@ -128,12 +148,14 @@ class OrganizationGRPOTrainer:
             "objective": "terminal_task_utility_only",
             "policy_source": "autonomous_on_policy_sampling",
             "training_protocol": "on_policy_sample_and_update",
-            "resource_constraint": "expected_distribution_projection",
+            "resource_constraint": "observable_runtime_action_mask",
             "groups": self.groups,
             "trajectories": self.trajectories,
             "optimizer_steps": self.optimizer_steps,
-            "mean_loss": sum(self.losses) / max(1, len(self.losses)),
+            "mean_loss": self.loss_sum / max(1, self.optimizer_steps),
+            "loss_sum": self.loss_sum,
             "seed": self.seed,
+            "updated_group_ids": sorted(self.updated_group_ids),
         }
 
     def save(self) -> None:
@@ -152,7 +174,7 @@ def sample_organization_decision(
     generator: torch.Generator | None = None,
     device: torch.device | None = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Sample from the exact exploration/policy behavior distribution."""
+    """Sample from the exact masked old policy used by GRPO replay."""
 
     resolved_device = device or next(model.parameters()).device
     context = _policy_context(model, encoder, policy_state, resolved_device)
@@ -169,20 +191,12 @@ def sample_organization_decision(
         context["active_log_probs"][active_index]
         + values["candidate_log_probs"][candidate_index]
     )
-    policy_log_probability = (
-        context["active_policy_log_probs"][active_index]
-        + values["candidate_policy_log_probs"][candidate_index]
-    )
     record = {
         "state_fingerprint": str(policy_state.get("state_fingerprint") or ""),
         "active_node_id": active_id,
         "candidate_id": str(candidate["id"]),
-        "behavior_log_probability": float(joint_log_probability.detach().cpu()),
-        "policy_log_probability": float(policy_log_probability.detach().cpu()),
-        "exploration_alpha": float(policy_state["exploration_alpha"]),
+        "masked_old_log_probability": float(joint_log_probability.detach().cpu()),
         "envelope_id": str(policy_state["envelope"]["id"]),
-        "expected_resource_budget": float(policy_state["expected_resource_budget"]),
-        "projected_expected_resource_cost": float(values["projected_expected_cost"]),
         "policy_state": dict(policy_state),
     }
     return dict(candidate), record
@@ -208,8 +222,8 @@ def replay_joint_log_probability(
     except ValueError as error:
         raise ValueError("recorded organization choice is not available during replay") from error
     return (
-        context["active_policy_log_probs"][active_index]
-        + values["candidate_policy_log_probs"][candidate_index]
+        context["active_log_probs"][active_index]
+        + values["candidate_log_probs"][candidate_index]
     )
 
 
@@ -236,15 +250,9 @@ def _policy_context(
         dtype=torch.bool,
         device=device,
     )
-    resources = resource_tensor(dict(policy_state.get("resources", {})), device)
+    resources = _organization_resource_tensor(dict(policy_state.get("resources", {})), device)
     active_logits = model.active_node_logits(active_states, graph_state, resources, active_mask)
-    active_policy_log_probs = torch.log_softmax(active_logits, dim=-1)
-    active_exploration_log_probs = uniform_exploration_log_probs(active_mask)
-    active_log_probs = mixed_behavior_log_probs(
-        active_policy_log_probs,
-        active_exploration_log_probs,
-        float(policy_state["exploration_alpha"]),
-    )
+    active_log_probs = torch.log_softmax(active_logits, dim=-1)
 
     candidates = list(policy_state.get("candidates", []))
     if not candidates:
@@ -259,7 +267,6 @@ def _policy_context(
         "active_node_ids": active_node_ids,
         "active_log_probs": active_log_probs,
         "active_probabilities": active_log_probs.exp(),
-        "active_policy_log_probs": active_policy_log_probs,
         "candidate_embeddings": candidate_embeddings,
         "resources": resources,
     }
@@ -284,6 +291,7 @@ def _candidate_distribution(
         envelope,
         int(policy_state.get("node_count", 1)),
         int(policy_state.get("maximum_depth_reached", 0)),
+        bool(policy_state.get("unresolved_gap_exists", False)),
     )
     legal_values = [
         legal and (
@@ -307,43 +315,32 @@ def _candidate_distribution(
         context["resources"],
         legal_mask,
     )
-    expected_costs = torch.tensor(
-        [float(value.get("expected_resource_cost", 0.0)) for value in candidates],
-        dtype=torch.float32,
-        device=device,
-    )
-    policy_log_probs = expected_resource_log_probs(
-        candidate_logits,
-        legal_mask,
-        expected_costs,
-        float(policy_state["expected_resource_budget"]),
-    )
-    exploration_log_probs = expected_resource_log_probs(
-        torch.zeros_like(candidate_logits),
-        legal_mask,
-        expected_costs,
-        float(policy_state["expected_resource_budget"]),
-    )
-    candidate_log_probs = mixed_behavior_log_probs(
-        policy_log_probs,
-        exploration_log_probs,
-        float(policy_state["exploration_alpha"]),
-    )
+    candidate_log_probs = torch.log_softmax(candidate_logits, dim=-1)
     return {
         "candidates": candidates,
         "candidate_log_probs": candidate_log_probs,
         "candidate_probabilities": candidate_log_probs.exp(),
-        "candidate_policy_log_probs": policy_log_probs,
-        "projected_expected_cost": float(
-            (candidate_log_probs.exp() * expected_costs).sum().detach().cpu()
-        ),
     }
 
 
 def _candidate_features(value: Mapping[str, Any]) -> List[float]:
     return [
-        math.log1p(max(0.0, float(value.get("expected_resource_cost", 0.0)))),
+        math.log1p(max(0.0, float(value.get("scheduler_complexity", 0.0)))),
         float(bool(value.get("external_access", False))),
         float(bool(value.get("resolves_gap", False))),
         float(value.get("depth_delta", 0.0)),
     ]
+
+
+def _organization_resource_tensor(resources: Mapping[str, Any], device: torch.device) -> Tensor:
+    return torch.tensor(
+        [
+            float(resources.get("llm_calls_remaining_fraction", 0.0)),
+            float(resources.get("tool_calls_remaining_fraction", 0.0)),
+            float(resources.get("nodes_remaining_fraction", 0.0)),
+            float(resources.get("depth_remaining_fraction", 0.0)),
+            float(resources.get("decisions_remaining_fraction", 0.0)),
+        ],
+        dtype=torch.float32,
+        device=device,
+    )

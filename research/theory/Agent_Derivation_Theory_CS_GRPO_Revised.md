@@ -2,7 +2,7 @@
 
 Status: canonical research specification for the `exp` branch (2026-08-18).
 
-This document is the normative bridge from MIA to Roy's recursive organization policy. It replaces the earlier staged structural-learning formulation. The implementation must not introduce predefined agent roles, teacher systems, imitation learning, a weighted sum of objectives, or per-trajectory resource caps as the mathematical resource constraint.
+This document is the normative bridge from MIA to Roy's recursive organization policy. It replaces the earlier staged structural-learning formulation. The implementation must not introduce predefined agent roles, teacher systems, imitation learning, or a weighted sum of objectives.
 
 ## 1. Information-realization objective
 
@@ -20,10 +20,10 @@ The operational target is terminal task utility, used as the benchmark estimator
 J(tau) = U_T(Y, Y_hat_terminal)
 
 maximize_pi  E[tau ~ pi][J(tau)]
-subject to   E[tau ~ pi][C(tau)] <= B.
+subject to   C(tau) <= B almost surely.
 ```
 
-Cost is a distribution-level feasibility constraint, not a reward component. Agent count, depth, latency, token use, tool calls, topology complexity, communication, rationality and redundancy are never added to `J`. An individual sampled trajectory may consume more than `B`; feasibility is defined by expected consumption under the sampling distribution.
+The budget is a runtime feasibility boundary, not a reward component. The implementation masks actions from observable remaining LLM-call, tool-call, node, depth and organization-decision budgets. Actual token use and latency are recorded after execution. Agent count, depth, latency, token use, tool calls, topology complexity, communication, rationality and redundancy are never added to `J`.
 
 The implementation may retain a separate provider safety ledger to prevent accidental API overspend. That operational fail-safe is not the theoretical constraint and must not alter utility or advantage.
 
@@ -38,7 +38,7 @@ The organization state contains:
 - claims, evidence, external observations, assumptions, conflicts and residual requirements;
 - node-local epistemic reports, coverage, uncertainty and blind spots;
 - model, environment and randomness metadata needed to replay a trajectory;
-- realized resource measurements and the current expected-resource distribution.
+- realized resource measurements, hard runtime limits and remaining fractions.
 
 Derivation and communication have different meanings. A derivation edge records why a child exists. A communication edge records which nodes may exchange information. A dependency edge records which artifact or claim must be produced before another node can proceed. Combining these edge types into a single tree is invalid.
 
@@ -52,7 +52,7 @@ The organization grammar is fixed:
 DERIVE, ACQUIRE, CONNECT, EXECUTE, RETURN, PRUNE, STOP
 ```
 
-The grammar does not define roles. `DERIVE` takes a freely generated agent specification tied to one residual requirement. A valid child:
+The grammar does not define roles. `DERIVE` takes an open agent specification tied to one residual requirement. In the current implementation a frozen LLM proposer emits those specifications inside the node report, while the trainable organization policy selects among the current open proposals. Therefore the learned claim is proposal selection and organization control, not RL generation of arbitrary specifications. A valid child:
 
 - is a strict, narrower refinement of the parent objective;
 - identifies the parent gap that caused its creation;
@@ -76,45 +76,32 @@ pi_theta(n, a, z | s)
     pi_candidate(a, z | s, n).
 ```
 
-Here `a` is one grammar action and `z` is its open payload, such as a generated child specification, acquisition requirement, connection, report, or prune target. Candidate count and node count are variable. No fixed role ID, fixed child catalog, teacher trajectory, or teacher score is part of the model.
+Here `a` is one grammar action and `z` is its open payload, such as a proposed child specification, acquisition requirement, connection, report, or prune target. Candidate count and node count are variable. No fixed role ID, fixed child catalog, teacher trajectory, or teacher score is part of the model.
 
 The policy encoder is a typed relational network over derivation, dependency, communication, tool-use, evidence and return edges. It scores all currently active nodes, then embeds and scores open candidates conditioned on the sampled node and the full graph representation. Training replay must reconstruct this same joint conditional probability exactly.
 
-The expected resource constraint is enforced by projecting the legal candidate distribution:
+Runtime feasibility is enforced before sampling by the action mask:
 
 ```text
-min_q  KL(q || pi_theta)
-subject to  E[a ~ q][c(s,a)] <= b(s).
+A_B(s) = {a in A(s): executing a leaves the runtime within B}
+pi_theta^B(a | s) = softmax(mask(logits_theta(s), A_B(s))).
 ```
 
-This projection changes the action distribution only. Resource cost is absent from terminal utility, group advantage and the GRPO loss. Legal high-cost actions retain non-zero probability whenever the expected constraint is feasible.
+The same mask semantics are reconstructed during replay. Runtime usage is absent from terminal utility, group advantage and the GRPO loss. The implementation does not assign theoretical costs such as `DERIVE = 2`; non-budget complexity features may be scheduler inputs only.
 
 ## 5. On-policy exploration and group sampling
 
-Training samples complete organization trajectories from exactly one behavior distribution:
+Training samples complete organization trajectories directly from the masked old policy:
 
 ```text
-q_theta(tau | x)
-  = (1 - alpha) q_explore(tau | x)
-    + alpha pi_theta(tau | x).
+tau_i ~ pi_theta_old^B(tau | x, e)
 ```
 
-The behavior log-probability stored for every decision is the exact mixture probability, not the probability from only one component. The sampled old-policy probability is stored separately for the GRPO ratio. `alpha` may be annealed as part of this same training process; there is no imitation warm start or separate optimization phase.
+Every decision stores the exact masked old-policy joint log-probability. Replay computes the current probability with identical active-node and candidate masks, and the ratio is `exp(log pi_theta^B - log pi_theta_old^B)`. Exploration comes from stochastic policy sampling and an epoch-specific envelope, not a uniform-policy mixture. There is no imitation warm start or separate optimization phase.
 
-Each τ³ training query produces a group of eight complete trajectories:
+Each τ³ task and epoch produces a group of eight complete trajectories. All eight share the same task, benchmark revision, isolated initial snapshot fingerprint, environment seed, executor configuration, runtime budget and exploration envelope. Only the organization-policy sampling seed differs. This makes the within-group utility difference interpretable as organization-policy variation rather than a confound from different structural constraints.
 
-| Group member | Node exploration envelope | Depth exploration envelope | Mode |
-| --- | ---: | ---: | --- |
-| 1 | 1–4 | 1–2 | shallow |
-| 2 | 2–5 | 1–3 | shallow |
-| 3 | 4–7 | 2–3 | medium |
-| 4 | 4–7 | 2–4 | medium |
-| 5 | 6–9 | 3–4 | deep |
-| 6 | 6–9 | 3–4 | deep |
-| 7 | 6–12 | 3–5 | expansive |
-| 8 | 6–12 | 4–5 | expansive |
-
-These envelopes define exploration support during training. They do not prescribe roles, tasks, topology or communication, and they are not resource budgets or reward terms. Evaluation removes the minimum node/depth requirements and samples one autonomous organization from the learned policy; it does not use best-of-eight test-time search.
+Fresh trajectories are collected on every epoch. For the default four-epoch run, conditional node/depth floors anneal as `(6,3) → (4,2) → (2,1) → (0,0)`. A floor delays `STOP` only while the model has reported a genuine residual gap with an available `DERIVE` or `ACQUIRE` action. It never inserts a synthetic gap or child. Ceilings remain hard runtime feasibility limits. Evaluation removes all minimum floors and samples one autonomous organization; it does not use best-of-eight test-time search.
 
 ## 6. Single-objective organization GRPO
 
@@ -143,7 +130,7 @@ The benchmark is the official `sierra-research/tau2-bench` τ³ implementation p
 - A deterministic subset of each official training split is held out for validation.
 - Official test tasks are never used for updates or model selection.
 - Banking knowledge tasks have no official training split in the pinned checkout, so they remain held out and are never training trajectories.
-- All eight trajectories for one query use the same task identity and benchmark revision, while their exploration envelopes and random streams are recorded explicitly.
+- All eight trajectories for one task/epoch use the same task identity, benchmark revision, environment seed, runtime budget and envelope; only organization sampling seeds differ.
 
 Primary evaluation compares:
 
@@ -152,16 +139,17 @@ Primary evaluation compares:
 - `roy_runtime_heuristic`: the current Roy delegation behavior;
 - `learned_information_realization`: one organization sampled from the trained policy.
 
-Report official τ³ reward and end-to-end success, paired task-level differences against `single_agent_direct`, bootstrap 95% confidence intervals, tokens, LLM calls, wall-clock, realized nodes/depth, dependencies, waits, communication edges and redundant branches. Results whose interval crosses zero are inconclusive.
+Report official τ³ reward and end-to-end success, paired task-level differences against `single_agent_direct`, bootstrap 95% confidence intervals, tokens, LLM calls, wall-clock, realized nodes/depth, dependencies, waits, communication edges, redundant branches and truncation rate. Results whose interval crosses zero are inconclusive.
 
 ## 8. Training and evaluation invariants
 
 - Training consumes only manifest entries labeled `train`.
 - Every GRPO group contains exactly eight complete trajectories from one task.
-- Every policy record stores state fingerprint, active node, open candidate, exact behavior log-probability, sampled old-policy log-probability, exploration weight, envelope and projected expected resource.
+- Every policy record stores state fingerprint, active node, open candidate, exact masked old-policy joint log-probability, envelope, runtime state and the replayable policy state.
 - The final utility is the only value used to compute advantage.
 - No teacher names, teacher outputs or teacher scores may appear in a training trajectory.
 - Resume restores model, optimizer and completed trajectory/group identifiers without changing the train/test boundary.
+- A policy-selected `STOP` is `terminated`; decision, resource or environment limits are `truncated`. Both receive the benchmark terminal utility, but truncation never creates a fake `STOP` log-probability.
 - Evaluation never updates model weights and never applies training minimum node/depth envelopes.
 - API nondeterminism is addressed by request/response capture, fixed configuration and repeated paired evaluation, not by claiming exact deterministic counterfactuals.
 

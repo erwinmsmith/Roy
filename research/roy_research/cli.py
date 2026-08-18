@@ -19,6 +19,7 @@ from .reporting import write_utility_svg
 from .schema import TraceRecord
 from .token_ledger import PersistentTokenLedger
 from .tau3 import build_tau3_manifest, manifest_summary, verify_tau3_root
+from .organization import RuntimeBudget
 from .tau3_runner import evaluate_tau3_against_direct, train_tau3_on_policy
 from .training import TRAINING_VARIANTS, evaluate_groups, train_groups
 
@@ -152,9 +153,10 @@ def parser() -> argparse.ArgumentParser:
     tau3_train.add_argument("--user-llm", default="deepseek/deepseek-v4-flash")
     tau3_train.add_argument("--limit", type=int)
     tau3_train.add_argument("--max-steps", type=int, default=100)
-    tau3_train.add_argument("--max-tokens", type=int, default=8192)
-    tau3_train.add_argument("--temperature", type=float, default=0.2)
-    tau3_train.add_argument("--expected-resource-budget", type=float, default=3.0)
+    tau3_train.add_argument("--max-tokens", type=int, default=50000)
+    tau3_train.add_argument("--temperature", type=float, default=0.0)
+    tau3_train.add_argument("--epochs", type=int, default=4)
+    _add_tau3_runtime_budget_arguments(tau3_train)
     tau3_train.add_argument("--seed", type=int, default=20260818)
     tau3_train.add_argument("--resume", action="store_true")
 
@@ -170,11 +172,29 @@ def parser() -> argparse.ArgumentParser:
     tau3_evaluate.add_argument("--split", choices=("validation", "test", "heldout"), default="test")
     tau3_evaluate.add_argument("--limit", type=int)
     tau3_evaluate.add_argument("--max-steps", type=int, default=100)
-    tau3_evaluate.add_argument("--max-tokens", type=int, default=8192)
+    tau3_evaluate.add_argument("--max-tokens", type=int, default=50000)
     tau3_evaluate.add_argument("--temperature", type=float, default=0.0)
-    tau3_evaluate.add_argument("--expected-resource-budget", type=float, default=3.0)
+    _add_tau3_runtime_budget_arguments(tau3_evaluate)
     tau3_evaluate.add_argument("--seed", type=int, default=20260818)
     return root
+
+
+def _add_tau3_runtime_budget_arguments(command: argparse.ArgumentParser) -> None:
+    command.add_argument("--max-llm-calls", type=int, default=32)
+    command.add_argument("--max-tool-calls", type=int, default=8)
+    command.add_argument("--max-nodes", type=int, default=12)
+    command.add_argument("--max-depth", type=int, default=5)
+    command.add_argument("--max-decisions", type=int, default=64)
+
+
+def _tau3_runtime_budget(args: argparse.Namespace) -> RuntimeBudget:
+    return RuntimeBudget(
+        maximum_llm_calls=args.max_llm_calls,
+        maximum_tool_calls=args.max_tool_calls,
+        maximum_nodes=args.max_nodes,
+        maximum_depth=args.max_depth,
+        maximum_decisions=args.max_decisions,
+    )
 
 
 def main(argv: List[str] | None = None) -> None:
@@ -451,7 +471,8 @@ def main(argv: List[str] | None = None) -> None:
             max_steps=args.max_steps,
             max_tokens=args.max_tokens,
             temperature=args.temperature,
-            expected_resource_budget=args.expected_resource_budget,
+            epochs=args.epochs,
+            runtime_budget=_tau3_runtime_budget(args),
             seed=args.seed,
             resume=args.resume,
         )
@@ -468,7 +489,7 @@ def main(argv: List[str] | None = None) -> None:
             max_steps=args.max_steps,
             max_tokens=args.max_tokens,
             temperature=args.temperature,
-            expected_resource_budget=args.expected_resource_budget,
+            runtime_budget=_tau3_runtime_budget(args),
             seed=args.seed,
         )
         atomic_json(args.summary, result)
