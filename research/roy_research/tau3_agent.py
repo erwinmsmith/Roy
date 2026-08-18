@@ -604,10 +604,7 @@ def register_tau3_organization_agent(
                             "external_access": True,
                             "resolves_gap": True,
                         })
-                external_residuals = [
-                    value for value in residuals
-                    if isinstance(value, Mapping) and value.get("possible_external_access")
-                ]
+                external_residuals = _tool_access_residuals(residuals)
                 available_tool_names = [str(value["name"]) for value in state.available_tools]
                 hinted_tool_names = _matching_tool_names(
                     external_residuals, available_tool_names
@@ -1238,6 +1235,15 @@ def _matching_tool_names(
                 elif lowered in normalized and len(lowered) >= 6:
                     result.add(name)
     return result
+
+
+def _tool_access_residuals(residuals: Sequence[Any]) -> list[Dict[str, Any]]:
+    return [
+        dict(value) for value in residuals
+        if isinstance(value, Mapping)
+        and value.get("possible_external_access")
+        and not _is_user_interaction_requirement(value)
+    ]
 
 
 def _safe_dependency_ids(value: Any, known: set[str], actor_id: str) -> list[str]:

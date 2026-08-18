@@ -37,6 +37,7 @@ from roy_research.tau3_agent import (
     _residual_child_specifications,
     _stop_content,
     _topology_summary,
+    _tool_access_residuals,
     _tool_argument_prompt,
     _user_acquisition_question,
 )
@@ -203,6 +204,17 @@ class InformationRealizationTests(unittest.TestCase):
                 ["get_user_details", "cancel_reservation"],
             ),
             {"get_user_details"},
+        )
+        self.assertEqual(
+            [value["id"] for value in _tool_access_residuals([
+                report["residual_requirements"][0],
+                {
+                    "id": "gap-user",
+                    "description": "Ask the user for their user_id",
+                    "possible_external_access": ["user"],
+                },
+            ])],
+            ["gap-details"],
         )
 
     def test_optional_communication_candidates_are_sparse_and_acyclic(self) -> None:
