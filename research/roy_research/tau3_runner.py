@@ -32,6 +32,7 @@ def train_tau3_on_policy(
     model_path: Path,
     agent_llm: str,
     user_llm: str,
+    task_keys: Sequence[str] | None = None,
     limit: int | None = None,
     max_steps: int = 100,
     max_tokens: int = 50000,
@@ -51,6 +52,12 @@ def train_tau3_on_policy(
     if model_path.exists() and not resume:
         raise ValueError("tau3 model output already exists; use --resume or a new path")
     tasks = [value for value in read_jsonl(manifest_path) if value.get("split") == "train"]
+    if task_keys:
+        requested = set(task_keys)
+        tasks = [value for value in tasks if _manifest_task_key(value) in requested]
+        missing = requested - {_manifest_task_key(value) for value in tasks}
+        if missing:
+            raise ValueError(f"unknown tau3 train task keys: {sorted(missing)}")
     if limit is not None:
         tasks = tasks[:limit]
     trainer = OrganizationGRPOTrainer(model_path, seed=seed, resume=resume)
@@ -151,6 +158,10 @@ def train_tau3_on_policy(
         / max(1, len(all_records)),
         "model": str(model_path),
     }
+
+
+def _manifest_task_key(task: Mapping[str, Any]) -> str:
+    return f"{task.get('domain')}:{task.get('task_id')}"
 
 
 def evaluate_tau3_against_direct(

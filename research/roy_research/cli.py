@@ -151,6 +151,11 @@ def parser() -> argparse.ArgumentParser:
     tau3_train.add_argument("--model", type=Path, required=True)
     tau3_train.add_argument("--agent-llm", default="deepseek/deepseek-v4-flash")
     tau3_train.add_argument("--user-llm", default="deepseek/deepseek-v4-flash")
+    tau3_train.add_argument(
+        "--task-keys",
+        nargs="*",
+        help="Optional domain:task_id train records for a leakage-safe focused run",
+    )
     tau3_train.add_argument("--limit", type=int)
     tau3_train.add_argument("--max-steps", type=int, default=100)
     tau3_train.add_argument("--max-tokens", type=int, default=50000)
@@ -469,6 +474,7 @@ def main(argv: List[str] | None = None) -> None:
             args.model,
             args.agent_llm,
             args.user_llm,
+            task_keys=args.task_keys,
             limit=args.limit,
             max_steps=args.max_steps,
             max_tokens=args.max_tokens,
