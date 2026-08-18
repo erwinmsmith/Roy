@@ -324,13 +324,12 @@ def register_tau3_organization_agent(
                 outward = generate_fn(
                     model=self.llm,
                     tools=selected_tools,
+                    tool_choice="required",
                     messages=state.system_messages + state.messages + [prompt],
                     call_name="roy_acquire",
                     **self.llm_args,
                 )
-                tool_calls = list(getattr(outward, "tool_calls", None) or [])
-                if len(tool_calls) > 1:
-                    outward = outward.model_copy(update={"tool_calls": tool_calls[:1]})
+                _validate_selected_tool_call(outward, str(candidate["tool_name"]))
                 self._record_llm_event(state, "roy_acquire", actor["id"], outward)
                 return outward
             if kind == "STOP":
@@ -724,6 +723,31 @@ def _candidate(
         "scheduler_complexity": complexity,
         "legal": True,
     }
+
+
+def _validate_selected_tool_call(response: Any, selected_tool: str) -> None:
+    """Fail closed unless ACQUIRE produced exactly its bound tau3 tool call."""
+
+    tool_calls = list(getattr(response, "tool_calls", None) or [])
+    if len(tool_calls) != 1:
+        raise ValueError(
+            f"ACQUIRE expected exactly one {selected_tool} tool call; got {len(tool_calls)}"
+        )
+    call = tool_calls[0]
+    if isinstance(call, Mapping):
+        called_tool = call.get("name") or dict(call.get("function") or {}).get("name")
+    else:
+        called_tool = getattr(call, "name", None)
+        function = getattr(call, "function", None)
+        if called_tool is None and function is not None:
+            called_tool = (
+                function.get("name") if isinstance(function, Mapping)
+                else getattr(function, "name", None)
+            )
+    if str(called_tool or "") != selected_tool:
+        raise ValueError(
+            f"ACQUIRE selected {selected_tool}, but provider called {called_tool or 'unknown'}"
+        )
 
 
 def _parse_json_object(text: str) -> Dict[str, Any]:

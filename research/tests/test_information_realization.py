@@ -26,7 +26,7 @@ from roy_research.organization_training import (
     single_objective_organization_grpo_loss,
 )
 from roy_research.tau3 import TAU3_COMMIT, build_tau3_manifest, manifest_summary
-from roy_research.tau3_agent import _normalize_report
+from roy_research.tau3_agent import _normalize_report, _validate_selected_tool_call
 
 
 class InformationRealizationTests(unittest.TestCase):
@@ -81,6 +81,16 @@ class InformationRealizationTests(unittest.TestCase):
             report["residual_requirements"][0]["possible_external_access"],
             ["reservation tool"],
         )
+
+    def test_acquire_requires_exactly_its_bound_tau3_tool(self) -> None:
+        valid = Mock(tool_calls=[{"name": "get_user_details", "arguments": {}}])
+        _validate_selected_tool_call(valid, "get_user_details")
+        with self.assertRaisesRegex(ValueError, "expected exactly one"):
+            _validate_selected_tool_call(Mock(tool_calls=[]), "get_user_details")
+        with self.assertRaisesRegex(ValueError, "provider called get_order_details"):
+            _validate_selected_tool_call(
+                Mock(tool_calls=[{"name": "get_order_details"}]), "get_user_details"
+            )
 
     def test_policy_supports_variable_nodes_and_open_candidates(self) -> None:
         model = InformationRealizationPolicy(hidden_dim=64, layers=2)
