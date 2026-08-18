@@ -26,7 +26,11 @@ from roy_research.organization_training import (
     single_objective_organization_grpo_loss,
 )
 from roy_research.tau3 import TAU3_COMMIT, build_tau3_manifest, manifest_summary
-from roy_research.tau3_agent import _normalize_report, _validate_selected_tool_call
+from roy_research.tau3_agent import (
+    _non_thinking_tool_arguments,
+    _normalize_report,
+    _validate_selected_tool_call,
+)
 
 
 class InformationRealizationTests(unittest.TestCase):
@@ -91,6 +95,13 @@ class InformationRealizationTests(unittest.TestCase):
             _validate_selected_tool_call(
                 Mock(tool_calls=[{"name": "get_order_details"}]), "get_user_details"
             )
+        arguments = _non_thinking_tool_arguments({
+            "max_tokens": 50000,
+            "extra_body": {"provider_option": "preserved", "thinking": {"type": "enabled"}},
+        })
+        self.assertEqual(arguments["max_tokens"], 50000)
+        self.assertEqual(arguments["extra_body"]["provider_option"], "preserved")
+        self.assertEqual(arguments["extra_body"]["thinking"], {"type": "disabled"})
 
     def test_policy_supports_variable_nodes_and_open_candidates(self) -> None:
         model = InformationRealizationPolicy(hidden_dim=64, layers=2)

@@ -320,6 +320,7 @@ def register_tau3_organization_agent(
                     raise ValueError(
                         f"selected tau3 tool is unavailable or ambiguous: {candidate['tool_name']}"
                     )
+                acquire_arguments = _non_thinking_tool_arguments(self.llm_args)
                 state.llm_call_count += 1
                 outward = generate_fn(
                     model=self.llm,
@@ -327,7 +328,7 @@ def register_tau3_organization_agent(
                     tool_choice="required",
                     messages=state.system_messages + state.messages + [prompt],
                     call_name="roy_acquire",
-                    **self.llm_args,
+                    **acquire_arguments,
                 )
                 _validate_selected_tool_call(outward, str(candidate["tool_name"]))
                 self._record_llm_event(state, "roy_acquire", actor["id"], outward)
@@ -748,6 +749,16 @@ def _validate_selected_tool_call(response: Any, selected_tool: str) -> None:
         raise ValueError(
             f"ACQUIRE selected {selected_tool}, but provider called {called_tool or 'unknown'}"
         )
+
+
+def _non_thinking_tool_arguments(arguments: Mapping[str, Any]) -> Dict[str, Any]:
+    """Disable DeepSeek thinking only where required tool choice is necessary."""
+
+    result = dict(arguments)
+    extra_body = dict(result.get("extra_body") or {})
+    extra_body["thinking"] = {"type": "disabled"}
+    result["extra_body"] = extra_body
+    return result
 
 
 def _parse_json_object(text: str) -> Dict[str, Any]:
