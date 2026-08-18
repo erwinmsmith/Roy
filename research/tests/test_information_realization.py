@@ -28,10 +28,13 @@ from roy_research.organization_training import (
 from roy_research.tau3 import TAU3_COMMIT, build_tau3_manifest, manifest_summary
 from roy_research.tau3_agent import (
     _bound_tool_call_payload,
+    _communication_candidate_allowed,
     _is_stop_message,
     _non_thinking_arguments,
     _normalize_report,
+    _residual_child_specifications,
     _stop_content,
+    _topology_summary,
     _tool_argument_prompt,
 )
 
@@ -46,7 +49,7 @@ class InformationRealizationTests(unittest.TestCase):
             {"kind": "STOP", "legal": True},
         ]
         mask = envelope_legal_actions(candidates, envelope, 2, 1, True)
-        self.assertEqual(mask, [True, True, False])
+        self.assertEqual(mask, [True, False, False])
         no_gap = envelope_legal_actions(candidates, envelope, 2, 1, False)
         self.assertEqual(no_gap, [True, True, True])
         full = envelope_legal_actions(candidates, envelope, 12, 5, True)
@@ -61,6 +64,22 @@ class InformationRealizationTests(unittest.TestCase):
             [(6, 3), (4, 2), (2, 1), (0, 0)],
         )
         self.assertEqual(RuntimeBudget().maximum_nodes, 12)
+
+    def test_depth_floor_prefers_only_depth_increasing_derivations(self) -> None:
+        envelope = ExplorationEnvelope("depth", 3, 12, 3, 5, "expansive")
+        candidates = [
+            {"kind": "DERIVE", "legal": True, "resulting_depth": 2},
+            {"kind": "DERIVE", "legal": True, "resulting_depth": 3},
+            {"kind": "ACQUIRE", "legal": True},
+        ]
+        self.assertEqual(
+            envelope_legal_actions(candidates, envelope, 3, 2, True),
+            [False, True, False],
+        )
+        self.assertEqual(
+            envelope_legal_actions(candidates, envelope, 3, 2, False),
+            [True, True, True],
+        )
 
     def test_training_accepts_only_terminal_task_utility(self) -> None:
         self.assertEqual(require_single_terminal_utility({"terminal_utility": 0.75}), 0.75)
@@ -88,6 +107,87 @@ class InformationRealizationTests(unittest.TestCase):
             report["residual_requirements"][0]["possible_external_access"],
             ["reservation tool"],
         )
+
+    def test_residual_requirement_becomes_open_child_specification(self) -> None:
+        report = _normalize_report({
+            "residual_requirements": [
+                {
+                    "description": "Verify the account holder before changing the booking",
+                    "possible_external_access": ["get_user_details"],
+                    "termination_condition": "Return the verified user id with evidence",
+                },
+                {
+                    "id": "gap-policy",
+                    "description": "Check the cancellation policy",
+                },
+            ],
+            "proposed_children": [],
+        }, {"id": "root"})
+        specifications = _residual_child_specifications(
+            report, {"id": "root"}, ["root", "node-1"]
+        )
+        self.assertEqual(len(specifications), 2)
+        self.assertEqual(specifications[0]["origin"], "model_reported_residual")
+        self.assertEqual(
+            specifications[0]["termination_condition"],
+            "Return the verified user id with evidence",
+        )
+        self.assertEqual(specifications[1]["triggering_gap_id"], "gap-policy")
+
+    def test_explicit_child_wins_and_dependencies_are_validated(self) -> None:
+        report = _normalize_report({
+            "residual_requirements": [{"id": "gap-1", "description": "Cross-check fare"}],
+            "proposed_children": [{
+                "triggering_gap_id": "gap-1",
+                "objective": "Independently verify the fare",
+                "termination_condition": "Return the matching fare",
+                "depends_on_node_ids": ["node-1", "missing"],
+            }],
+        }, {"id": "node-2"})
+        specifications = _residual_child_specifications(
+            report, {"id": "node-2"}, ["root", "node-1", "node-2"]
+        )
+        self.assertEqual(len(specifications), 1)
+        self.assertEqual(specifications[0]["objective"], "Independently verify the fare")
+        self.assertEqual(specifications[0]["depends_on_node_ids"], ["node-1"])
+
+    def test_optional_communication_candidates_are_sparse_and_acyclic(self) -> None:
+        root = {"id": "root", "status": "reported", "report": {"conclusion": "x"}}
+        first = {"id": "node-1", "status": "reported", "report": {"conclusion": "y"}}
+        second = {"id": "node-2", "status": "ready", "report": None}
+        self.assertTrue(_communication_candidate_allowed(
+            first, second, ("node-1", "node-2"), set(), set(), set(),
+            "connect:node-1:node-2",
+        ))
+        self.assertFalse(_communication_candidate_allowed(
+            second, first, ("node-2", "node-1"), set(), set(), set(),
+            "connect:node-2:node-1",
+        ))
+        self.assertFalse(_communication_candidate_allowed(
+            root, second, ("root", "node-2"), set(), {"node-2"}, set(),
+            "connect:root:node-2",
+        ))
+
+    def test_saved_topology_summary_distinguishes_tree_and_dag(self) -> None:
+        nodes = [
+            {"id": "root", "depth": 0},
+            {"id": "node-1", "depth": 1},
+            {"id": "node-2", "depth": 1},
+        ]
+        derivations = [
+            {"from": "root", "to": "node-1"},
+            {"from": "root", "to": "node-2"},
+        ]
+        tree = _topology_summary(nodes, derivations, [], [])
+        self.assertEqual(tree["class"], "fan_out_tree")
+        self.assertEqual(tree["derived_agent_count"], 2)
+        dag = _topology_summary(
+            nodes,
+            derivations,
+            [{"from": "node-1", "to": "node-2"}],
+            [{"from": "root", "to": "node-2"}],
+        )
+        self.assertEqual(dag["class"], "hybrid_dag")
 
     def test_acquire_generates_arguments_without_delegating_tool_identity(self) -> None:
         arguments = _non_thinking_arguments({

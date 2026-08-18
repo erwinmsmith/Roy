@@ -97,8 +97,11 @@ def envelope_legal_actions(
 ) -> List[bool]:
     """Apply training exploration structure without introducing a reward term.
 
-    Floors delay STOP only while a genuine model-reported residual requirement
-    exists. They never synthesize a gap or a child proposal. Ceilings are hard
+    Floors direct sampling toward DERIVE only while a genuine model-reported
+    residual requirement and a legal child specification exist. They never
+    synthesize a gap, child, reward, or topology. When no derivation is currently
+    available, ordinary actions remain legal so a node can reason or acquire the
+    information needed to expose its next residual requirement. Ceilings are
     runtime feasibility bounds, not utility components.
     """
 
@@ -119,6 +122,23 @@ def envelope_legal_actions(
             if not derivation_allowed or resulting_depth > envelope.maximum_depth:
                 legal = False
         result.append(legal)
+    legal_derivations = [
+        index for index, (candidate, legal) in enumerate(zip(candidates, result))
+        if legal and str(candidate.get("kind")) == "DERIVE"
+    ]
+    if unresolved_gap_exists and legal_derivations:
+        preferred = legal_derivations
+        if maximum_depth_reached < envelope.minimum_depth:
+            depth_increasing = [
+                index for index in legal_derivations
+                if int(candidates[index].get("resulting_depth", 0))
+                > maximum_depth_reached
+            ]
+            if depth_increasing:
+                preferred = depth_increasing
+        if node_count < envelope.minimum_nodes or maximum_depth_reached < envelope.minimum_depth:
+            preferred_set = set(preferred)
+            result = [legal and index in preferred_set for index, legal in enumerate(result)]
     if not any(result):
         raise ValueError("exploration envelope removed every organization action")
     return result

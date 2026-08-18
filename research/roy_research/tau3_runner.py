@@ -129,6 +129,7 @@ def train_tau3_on_policy(
                     "termination_type": trajectory["termination_type"],
                     "nodes": trajectory["realized_resources"]["nodes"],
                     "maximum_depth": trajectory["realized_resources"]["maximum_depth"],
+                    "topology": trajectory["topology"],
                     "path": str(trajectories_path),
                 }, sort_keys=True), flush=True)
             if len(records) != ORGANIZATION_GROUP_SIZE:

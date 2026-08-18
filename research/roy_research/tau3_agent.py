@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import uuid
@@ -33,6 +34,11 @@ requested from the user. When an available tool can resolve missing task informa
 residual requirement whose possible_external_access names that tool. Do not claim that a lookup
 is unavailable when its tool is listed. Use proposed_children only for genuinely separable
 reasoning, verification, evidence, or planning gaps; tool access itself belongs in ACQUIRE.
+When the local graph exposes another node whose report is genuinely required by a proposed
+child, include that exact node id in depends_on_node_ids. Do not name the current node or one
+of its ancestors as a dependency. Roy may derive a child directly from a residual requirement
+when proposed_children is empty, so residual descriptions and termination conditions must be
+specific and verifiable.
 """.strip()
 
 
@@ -99,6 +105,7 @@ def register_tau3_organization_agent(
         available_tools: list[Dict[str, Any]] = Field(default_factory=list)
         actions: list[Dict[str, Any]] = Field(default_factory=list)
         used_candidates: list[str] = Field(default_factory=list)
+        derived_gap_keys: list[str] = Field(default_factory=list)
         pending_acquisition_node: str | None = None
         final_output: str | None = None
         stopped: bool = False
@@ -222,11 +229,18 @@ def register_tau3_organization_agent(
                     device=self.device,
                 )
                 state.policy_records.append(record)
-                state.actions.append({
+                action_record = {
                     "kind": candidate["kind"],
                     "actor_node_id": record["active_node_id"],
                     "candidate_id": candidate["id"],
-                })
+                    "description": candidate.get("description"),
+                }
+                for key in ("tool_name", "from", "to", "resulting_depth"):
+                    if candidate.get(key) is not None:
+                        action_record[key] = candidate[key]
+                if candidate.get("proposal") is not None:
+                    action_record["child_specification"] = dict(candidate["proposal"])
+                state.actions.append(action_record)
                 print(json.dumps({
                     "event": "organization_action",
                     "task_id": state.task_id,
@@ -274,6 +288,9 @@ def register_tau3_organization_agent(
             if kind == "DERIVE":
                 proposal = dict(candidate["proposal"])
                 child_id = f"node-{len(state.nodes)}"
+                dependency_ids = self._valid_dependency_ids(
+                    state, actor["id"], proposal.get("depends_on_node_ids", [])
+                )
                 state.nodes.append({
                     "id": child_id,
                     "parent_id": actor["id"],
@@ -284,24 +301,37 @@ def register_tau3_organization_agent(
                     "report": None,
                 })
                 state.derivation_edges.append({"from": actor["id"], "to": child_id})
-                known_nodes = {value["id"] for value in state.nodes}
-                for producer_id in proposal.get("depends_on_node_ids", []):
-                    if producer_id in known_nodes and producer_id != child_id:
-                        producer = self._node(state, str(producer_id))
-                        state.dependency_edges.append({
-                            "from": str(producer_id),
-                            "to": child_id,
-                            "artifact_id": f"report:{producer_id}",
-                            "resolved": producer.get("status") == "returned",
-                        })
+                state.derived_gap_keys.append(
+                    _derived_gap_key(actor["id"], proposal["triggering_gap_id"])
+                )
+                for producer_id in dependency_ids:
+                    producer = self._node(state, producer_id)
+                    state.dependency_edges.append({
+                        "from": producer_id,
+                        "to": child_id,
+                        "artifact_id": f"report:{producer_id}",
+                        "resolved": producer.get("status") == "returned",
+                    })
+                if dependency_ids and not all(
+                    edge["resolved"] for edge in state.dependency_edges
+                    if edge["to"] == child_id
+                ):
+                    self._node(state, child_id)["status"] = "waiting_dependency"
                 return None
             if kind == "CONNECT":
                 state.communication_edges.append({
                     "from": candidate["from"], "to": candidate["to"], "required": False
                 })
+                target = self._node(state, str(candidate["to"]))
+                if target["status"] == "reported":
+                    target["status"] = "ready"
                 return None
             if kind == "RETURN":
                 actor["status"] = "returned"
+                for edge in state.dependency_edges:
+                    if edge["from"] == actor["id"]:
+                        edge["resolved"] = True
+                self._wake_dependency_nodes(state)
                 if actor.get("parent_id"):
                     self._node(state, actor["parent_id"])["status"] = "ready"
                 return None
@@ -385,6 +415,14 @@ def register_tau3_organization_agent(
                     value for value in state.observations if value.get("node_id") == node["id"]
                 ],
                 "returned_child_reports": [value.get("report") for value in returned],
+                "local_graph": _local_graph_context(state, node["id"]),
+                "incoming_communications": [
+                    {
+                        "from": edge["from"],
+                        "report": self._node(state, str(edge["from"])).get("report"),
+                    }
+                    for edge in state.communication_edges if edge["to"] == node["id"]
+                ],
                 "conversation": [str(getattr(value, "content", "")) for value in state.messages[-8:]],
                 "domain_policy": self.domain_policy,
                 "available_tools": state.available_tools,
@@ -488,14 +526,23 @@ def register_tau3_organization_agent(
             result: list[Dict[str, Any]] = []
             used = set(state.used_candidates)
             for node in state.nodes:
-                if node["status"] in {"pruned", "returned", "waiting"}:
+                if node["status"] in {
+                    "pruned", "returned", "waiting", "waiting_dependency"
+                }:
                     continue
                 actor = str(node["id"])
                 if node["status"] == "ready":
                     result.append(_candidate(f"execute:{actor}:{state.decision_count}", "EXECUTE", actor, "Update the node epistemic report", 1.0))
                     continue
                 report = node.get("report") or {}
-                for index, proposal in enumerate(report.get("proposed_children", [])):
+                proposals = _residual_child_specifications(
+                    report, node, [str(value["id"]) for value in state.nodes]
+                )
+                derived_gap_keys = set(state.derived_gap_keys)
+                for index, proposal in enumerate(proposals):
+                    gap_key = _derived_gap_key(actor, proposal.get("triggering_gap_id"))
+                    if gap_key in derived_gap_keys:
+                        continue
                     identifier = f"derive:{actor}:{proposal.get('triggering_gap_id')}:{index}"
                     if identifier not in used:
                         result.append({
@@ -544,15 +591,30 @@ def register_tau3_organization_agent(
                         **_candidate(identifier, "PRUNE", "root", "Prune a returned redundant branch", 0.1),
                         "target_node_id": node["id"],
                     })
-            active = [value for value in state.nodes if value["status"] not in {"pruned"}]
+            active = [
+                value for value in state.nodes
+                if value["status"] not in {"pruned", "waiting", "waiting_dependency"}
+            ]
             existing = {(value["from"], value["to"]) for value in state.communication_edges}
+            incoming_targets = {value["to"] for value in state.communication_edges}
             for source in active:
                 for target in active:
                     pair = (source["id"], target["id"])
                     identifier = f"connect:{pair[0]}:{pair[1]}"
-                    if pair[0] != pair[1] and pair not in existing and identifier not in used:
+                    if _communication_candidate_allowed(
+                        source, target, pair, existing, incoming_targets, used, identifier
+                    ):
                         result.append({
-                            **_candidate(identifier, "CONNECT", str(source["id"]), "Share relevant epistemic state", 0.2),
+                            **_candidate(
+                                identifier,
+                                "CONNECT",
+                                str(source["id"]),
+                                (
+                                    f"Share report from {source['id']} with {target['id']}: "
+                                    f"{source.get('objective', '')} -> {target.get('objective', '')}"
+                                ),
+                                0.2,
+                            ),
                             "from": pair[0], "to": pair[1],
                         })
             if not result:
@@ -579,6 +641,24 @@ def register_tau3_organization_agent(
                     and int(candidate.get("resulting_depth", 0)) <= min(
                         budget.maximum_depth, config.envelope().maximum_depth
                     )
+                )
+            if kind == "RETURN":
+                actor = self._node(state, str(candidate["actor_node_id"]))
+                report = actor.get("report") or {}
+                unresolved_dependencies = any(
+                    edge["to"] == actor["id"] and not bool(edge.get("resolved"))
+                    for edge in state.dependency_edges
+                )
+                active_children = any(
+                    value.get("parent_id") == actor["id"]
+                    and value.get("status") not in {"returned", "pruned"}
+                    for value in state.nodes
+                )
+                unresolved_report = bool(report.get("residual_requirements")) and not bool(
+                    report.get("resolved_parent_gap")
+                )
+                return not (
+                    unresolved_dependencies or active_children or unresolved_report
                 )
             return state.decision_count < budget.maximum_decisions
 
@@ -681,6 +761,30 @@ def register_tau3_organization_agent(
                     return value
             raise ValueError(f"unknown organization node: {node_id}")
 
+        @staticmethod
+        def _valid_dependency_ids(state, actor_id, identifiers):
+            known = {str(value["id"]) for value in state.nodes}
+            ancestors = {str(actor_id)}
+            cursor = Tau3OrganizationAgent._node(state, str(actor_id))
+            while cursor.get("parent_id"):
+                ancestors.add(str(cursor["parent_id"]))
+                cursor = Tau3OrganizationAgent._node(state, str(cursor["parent_id"]))
+            return [
+                str(identifier) for identifier in identifiers
+                if str(identifier) in known and str(identifier) not in ancestors
+            ]
+
+        @staticmethod
+        def _wake_dependency_nodes(state):
+            for node in state.nodes:
+                if node.get("status") != "waiting_dependency":
+                    continue
+                incoming = [
+                    edge for edge in state.dependency_edges if edge["to"] == node["id"]
+                ]
+                if incoming and all(bool(edge.get("resolved")) for edge in incoming):
+                    node["status"] = "ready"
+
     def factory(tools, domain_policy, **kwargs):
         return Tau3OrganizationAgent(
             tools=tools,
@@ -710,8 +814,14 @@ def organization_trajectory_from_state(
     benchmark_episode: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
     termination_type = str(state.termination_type or "truncated_environment")
+    topology = _topology_summary(
+        state.nodes,
+        state.derivation_edges,
+        state.dependency_edges,
+        state.communication_edges,
+    )
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "id": str(state.trajectory_id),
         "group_id": group_id,
         "benchmark": "tau3",
@@ -737,6 +847,7 @@ def organization_trajectory_from_state(
         "termination_type": termination_type,
         "termination_reason": state.termination_reason,
         "final_output": state.final_output,
+        "topology": topology,
         "organization": {
             "nodes": list(state.nodes),
             "derivation_edges": list(state.derivation_edges),
@@ -759,6 +870,41 @@ def _candidate(
         "description": description,
         "scheduler_complexity": complexity,
         "legal": True,
+    }
+
+
+def _topology_summary(
+    nodes: Sequence[Mapping[str, Any]],
+    derivation_edges: Sequence[Mapping[str, Any]],
+    dependency_edges: Sequence[Mapping[str, Any]],
+    communication_edges: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    out_degree: Dict[str, int] = {}
+    for edge in derivation_edges:
+        source = str(edge["from"])
+        out_degree[source] = out_degree.get(source, 0) + 1
+    branched = any(value > 1 for value in out_degree.values())
+    if dependency_edges and communication_edges:
+        topology_class = "hybrid_dag"
+    elif dependency_edges:
+        topology_class = "dependency_dag"
+    elif communication_edges:
+        topology_class = "communication_dag"
+    elif branched:
+        topology_class = "fan_out_tree"
+    elif len(nodes) > 1:
+        topology_class = "chain"
+    else:
+        topology_class = "single"
+    return {
+        "class": topology_class,
+        "node_count": len(nodes),
+        "derived_agent_count": max(0, len(nodes) - 1),
+        "maximum_depth": max((int(value.get("depth", 0)) for value in nodes), default=0),
+        "derivation_edge_count": len(derivation_edges),
+        "dependency_edge_count": len(dependency_edges),
+        "communication_edge_count": len(communication_edges),
+        "maximum_derivation_fanout": max(out_degree.values(), default=0),
     }
 
 
@@ -833,13 +979,20 @@ def _normalize_report(value: Mapping[str, Any], node: Mapping[str, Any]) -> Dict
     gaps = _as_list(value.get("residual_requirements"))
     proposals = _as_list(value.get("proposed_children"))
     normalized_gaps = []
-    for index, gap in enumerate(gaps):
+    for gap in gaps:
         if not isinstance(gap, Mapping):
             continue
+        description = str(
+            gap.get("description")
+            or gap.get("required_information")
+            or "unresolved requirement"
+        )
+        fallback_material = f"{node['id']}:{description}".encode("utf-8")
+        fallback_id = hashlib.sha256(fallback_material).hexdigest()[:12]
         normalized_gaps.append({
             **dict(gap),
-            "id": str(gap.get("id") or f"gap-{node['id']}-{index}"),
-            "description": str(gap.get("description") or gap.get("required_information") or "unresolved requirement"),
+            "id": str(gap.get("id") or f"gap-{node['id']}-{fallback_id}"),
+            "description": description,
             "possible_external_access": _as_list(gap.get("possible_external_access")),
         })
     normalized_proposals = []
@@ -893,6 +1046,133 @@ def _as_list(value: Any) -> list[Any]:
     return [value]
 
 
+def _derived_gap_key(actor_id: Any, gap_id: Any) -> str:
+    return f"{actor_id}:{gap_id}"
+
+
+def _residual_child_specifications(
+    report: Mapping[str, Any],
+    node: Mapping[str, Any],
+    known_node_ids: Sequence[str],
+) -> list[Dict[str, Any]]:
+    """Build open child specifications from the node's own residual gaps.
+
+    Explicit model proposals remain authoritative. A residual without an explicit
+    proposal receives one conservative specification so the structural policy can
+    actually choose DERIVE. This is neither a role catalog nor teacher annotation:
+    its objective, stopping condition, access hints, and dependencies all come from
+    the current node report.
+    """
+
+    residuals = [
+        dict(value) for value in _as_list(report.get("residual_requirements"))
+        if isinstance(value, Mapping)
+    ]
+    gaps = {str(value.get("id")): value for value in residuals if value.get("id")}
+    known = set(str(value) for value in known_node_ids)
+    actor_id = str(node.get("id"))
+    result: list[Dict[str, Any]] = []
+    explicit_gap_ids: set[str] = set()
+    for proposal in _as_list(report.get("proposed_children")):
+        if not isinstance(proposal, Mapping):
+            continue
+        gap_id = str(proposal.get("triggering_gap_id") or "")
+        if gap_id not in gaps:
+            continue
+        child = dict(proposal)
+        child["depends_on_node_ids"] = _safe_dependency_ids(
+            child.get("depends_on_node_ids"), known, actor_id
+        )
+        result.append(child)
+        explicit_gap_ids.add(gap_id)
+    for index, gap in enumerate(residuals):
+        gap_id = str(gap.get("id") or f"gap-{actor_id}-{index}")
+        if gap_id in explicit_gap_ids:
+            continue
+        description = str(
+            gap.get("description")
+            or gap.get("required_information")
+            or "Resolve the remaining information requirement"
+        ).strip()
+        termination = str(
+            gap.get("termination_condition")
+            or gap.get("verification_condition")
+            or f"Return an evidence-backed resolution of: {description}"
+        ).strip()
+        result.append({
+            "id": f"residual-spec-{actor_id}-{index}",
+            "triggering_gap_id": gap_id,
+            "objective": description,
+            "termination_condition": termination,
+            "possible_external_access": _as_list(gap.get("possible_external_access")),
+            "depends_on_node_ids": _safe_dependency_ids(
+                gap.get("depends_on_node_ids"), known, actor_id
+            ),
+            "origin": "model_reported_residual",
+        })
+    return result
+
+
+def _safe_dependency_ids(value: Any, known: set[str], actor_id: str) -> list[str]:
+    return list(dict.fromkeys(
+        str(identifier) for identifier in _as_list(value)
+        if str(identifier) in known and str(identifier) != actor_id
+    ))
+
+
+def _communication_candidate_allowed(
+    source: Mapping[str, Any],
+    target: Mapping[str, Any],
+    pair: tuple[Any, Any],
+    existing: set[tuple[Any, Any]],
+    incoming_targets: set[Any],
+    used: set[str],
+    identifier: str,
+) -> bool:
+    """Offer sparse forward communication choices so the realized graph stays a DAG."""
+
+    if pair[0] == pair[1] or pair in existing or identifier in used:
+        return False
+    if (
+        pair[1] in incoming_targets
+        or not source.get("report")
+        or source.get("status") not in {"reported", "returned"}
+    ):
+        return False
+    source_index = _node_sequence(source.get("id"))
+    target_index = _node_sequence(target.get("id"))
+    return source_index < target_index and target.get("status") in {"ready", "reported"}
+
+
+def _node_sequence(identifier: Any) -> int:
+    value = str(identifier)
+    if value == "root":
+        return 0
+    match = re.fullmatch(r"node-(\d+)", value)
+    return int(match.group(1)) + 1 if match else 2**31 - 1
+
+
+def _local_graph_context(state: Any, actor_id: str) -> Dict[str, Any]:
+    """Expose IDs the current node may use for autonomous dependency proposals."""
+
+    return {
+        "current_node_id": actor_id,
+        "nodes": [
+            {
+                "id": str(node["id"]),
+                "parent_id": node.get("parent_id"),
+                "objective": node.get("objective"),
+                "status": node.get("status"),
+                "report_available": bool(node.get("report")),
+            }
+            for node in state.nodes
+        ],
+        "derivation_edges": list(state.derivation_edges),
+        "dependency_edges": list(state.dependency_edges),
+        "communication_edges": list(state.communication_edges),
+    }
+
+
 def _as_mapping(value: Any) -> Dict[str, Any]:
     if isinstance(value, Mapping):
         return dict(value)
@@ -902,7 +1182,5 @@ def _as_mapping(value: Any) -> Dict[str, Any]:
 
 
 def _stable_json_hash(value: Mapping[str, Any]) -> str:
-    import hashlib
-
     material = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
