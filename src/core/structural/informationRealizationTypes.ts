@@ -208,6 +208,7 @@ export interface InformationRealizationTrajectory {
   policyRecords: OrganizationPolicyRecord[];
   terminalUtility: number;
   realizedResources: ResourceEnvelope;
+  benchmarkEpisode: unknown;
   terminal: boolean;
   terminated: boolean;
   truncated: boolean;

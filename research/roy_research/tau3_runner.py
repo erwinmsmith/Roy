@@ -106,6 +106,7 @@ def train_tau3_on_policy(
                     organization_seed,
                     runtime_budget,
                     _resource_summary(simulation, state),
+                    _simulation_record(simulation),
                 )
                 write_jsonl(
                     trajectories_path,
@@ -114,10 +115,27 @@ def train_tau3_on_policy(
                 )
                 records.append(trajectory)
                 collected += 1
+                print(json.dumps({
+                    "event": "trajectory_saved",
+                    "group_id": group_id,
+                    "rollout_index": rollout_index,
+                    "trajectory_id": trajectory["id"],
+                    "terminal_utility": trajectory["terminal_utility"],
+                    "termination_type": trajectory["termination_type"],
+                    "nodes": trajectory["realized_resources"]["nodes"],
+                    "maximum_depth": trajectory["realized_resources"]["maximum_depth"],
+                    "path": str(trajectories_path),
+                }, sort_keys=True), flush=True)
             if len(records) != ORGANIZATION_GROUP_SIZE:
                 raise ValueError(f"incomplete organization group after collection: {group_id}")
             if group_id not in trainer.updated_group_ids:
                 trainer.update_group(records)
+                print(json.dumps({
+                    "event": "group_updated",
+                    "group_id": group_id,
+                    "optimizer_steps": trainer.optimizer_steps,
+                    "model": str(model_path),
+                }, sort_keys=True), flush=True)
     all_records = [value for values in by_group.values() for value in values]
     return {
         **trainer.metadata(),
@@ -266,6 +284,13 @@ def _resource_summary(simulation: Any, state: Any) -> Dict[str, Any]:
             (int(value["depth"]) for value in getattr(state, "nodes", [])), default=0
         ),
     }
+
+
+def _simulation_record(simulation: Any) -> Dict[str, Any]:
+    if not hasattr(simulation, "model_dump"):
+        return {"representation": str(simulation)}
+    value = simulation.model_dump(mode="json")
+    return dict(value) if isinstance(value, Mapping) else {"value": value}
 
 
 def _token_counts(value: Any) -> tuple[int, int]:

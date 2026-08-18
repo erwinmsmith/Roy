@@ -580,6 +580,7 @@ def organization_trajectory_from_state(
     organization_seed: int,
     runtime_budget: RuntimeBudget,
     realized_resources: Mapping[str, Any] | None = None,
+    benchmark_episode: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
     termination_type = str(state.termination_type or "truncated_environment")
     return {
@@ -601,6 +602,7 @@ def organization_trajectory_from_state(
         "policy_records": list(state.policy_records),
         "terminal_utility": float(terminal_utility),
         "realized_resources": dict(realized_resources or {}),
+        "benchmark_episode": dict(benchmark_episode or {}),
         "terminal": bool(state.stopped),
         "terminated": termination_type == "policy_stop",
         "truncated": termination_type != "policy_stop",
