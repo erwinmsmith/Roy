@@ -111,6 +111,7 @@ def register_tau3_organization_agent(
         actions: list[Dict[str, Any]] = Field(default_factory=list)
         used_candidates: list[str] = Field(default_factory=list)
         derived_gap_keys: list[str] = Field(default_factory=list)
+        child_spec_node_ids: Dict[str, str] = Field(default_factory=dict)
         pending_acquisition_node: str | None = None
         pending_user_acquisition_node: str | None = None
         final_output: str | None = None
@@ -324,6 +325,11 @@ def register_tau3_organization_agent(
                     "report": None,
                 })
                 state.derivation_edges.append({"from": actor["id"], "to": child_id})
+                proposal_id = str(proposal.get("id") or "")
+                if proposal_id:
+                    state.child_spec_node_ids[
+                        _child_spec_alias_key(actor["id"], proposal_id)
+                    ] = child_id
                 state.derived_gap_keys.append(
                     _derived_gap_key(actor["id"], proposal["triggering_gap_id"])
                 )
@@ -578,6 +584,9 @@ def register_tau3_organization_agent(
                         result.append({
                             **_candidate(identifier, "DERIVE", actor, str(proposal.get("objective")), 2.0),
                             "proposal": proposal,
+                            "dependencies_available": self._dependencies_available(
+                                state, actor, proposal.get("depends_on_node_ids", [])
+                            ),
                             "resulting_depth": int(node["depth"]) + 1,
                             "resolves_gap": True,
                             "depth_delta": 1,
@@ -704,7 +713,8 @@ def register_tau3_organization_agent(
                 return False
             if kind == "DERIVE":
                 return (
-                    len(state.nodes) < min(
+                    bool(candidate.get("dependencies_available", True))
+                    and len(state.nodes) < min(
                         budget.maximum_nodes, config.envelope().maximum_nodes
                     )
                     and int(candidate.get("resulting_depth", 0)) <= min(
@@ -838,10 +848,27 @@ def register_tau3_organization_agent(
             while cursor.get("parent_id"):
                 ancestors.add(str(cursor["parent_id"]))
                 cursor = Tau3OrganizationAgent._node(state, str(cursor["parent_id"]))
-            return [
-                str(identifier) for identifier in identifiers
-                if str(identifier) in known and str(identifier) not in ancestors
-            ]
+            result: list[str] = []
+            for identifier in identifiers:
+                value = str(identifier)
+                resolved = (
+                    value if value in known
+                    else state.child_spec_node_ids.get(
+                        _child_spec_alias_key(actor_id, value)
+                    )
+                )
+                if resolved and resolved not in ancestors and resolved not in result:
+                    result.append(str(resolved))
+            return result
+
+        @staticmethod
+        def _dependencies_available(state, actor_id, identifiers):
+            known = {str(value["id"]) for value in state.nodes}
+            return all(
+                str(identifier) in known
+                or _child_spec_alias_key(actor_id, identifier) in state.child_spec_node_ids
+                for identifier in identifiers
+            )
 
         @staticmethod
         def _wake_dependency_nodes(state):
@@ -1044,32 +1071,70 @@ def _parse_json_object(text: str) -> Dict[str, Any]:
             return {}
 
 
+def _proposal_gap_id(
+    proposal: Mapping[str, Any],
+    index: int,
+    normalized_gaps: Sequence[Mapping[str, Any]],
+) -> str:
+    explicit = str(
+        proposal.get("triggering_gap_id") or proposal.get("triggering_gap") or ""
+    )
+    gap_ids = {str(value.get("id")) for value in normalized_gaps}
+    if explicit in gap_ids:
+        return explicit
+    if index < len(normalized_gaps):
+        return str(normalized_gaps[index]["id"])
+    proposal_tokens = set(re.findall(
+        r"[a-z0-9_]+",
+        " ".join(
+            str(proposal.get(key) or "").lower()
+            for key in ("objective", "termination_condition", "possible_external_access")
+        ),
+    ))
+    ranked = sorted(
+        (
+            len(proposal_tokens & set(re.findall(
+                r"[a-z0-9_]+", str(gap.get("description") or "").lower()
+            ))),
+            str(gap["id"]),
+        )
+        for gap in normalized_gaps
+    )
+    return ranked[-1][1] if ranked and ranked[-1][0] > 0 else ""
+
+
 def _normalize_report(value: Mapping[str, Any], node: Mapping[str, Any]) -> Dict[str, Any]:
     gaps = _as_list(value.get("residual_requirements"))
     proposals = _as_list(value.get("proposed_children"))
     normalized_gaps = []
     for gap in gaps:
-        if not isinstance(gap, Mapping):
+        if isinstance(gap, Mapping):
+            gap_value = dict(gap)
+        elif str(gap).strip():
+            gap_value = {"description": str(gap).strip()}
+        else:
             continue
         description = str(
-            gap.get("description")
-            or gap.get("required_information")
+            gap_value.get("description")
+            or gap_value.get("required_information")
             or "unresolved requirement"
         )
         fallback_material = f"{node['id']}:{description}".encode("utf-8")
         fallback_id = hashlib.sha256(fallback_material).hexdigest()[:12]
         normalized_gaps.append({
-            **dict(gap),
-            "id": str(gap.get("id") or f"gap-{node['id']}-{fallback_id}"),
+            **gap_value,
+            "id": str(gap_value.get("id") or f"gap-{node['id']}-{fallback_id}"),
             "description": description,
-            "possible_external_access": _as_list(gap.get("possible_external_access")),
+            "possible_external_access": _as_list(
+                gap_value.get("possible_external_access")
+            ),
         })
     normalized_proposals = []
     gap_ids = {value["id"] for value in normalized_gaps}
     for index, proposal in enumerate(proposals):
         if not isinstance(proposal, Mapping):
             continue
-        gap_id = str(proposal.get("triggering_gap_id") or proposal.get("triggering_gap") or "")
+        gap_id = _proposal_gap_id(proposal, index, normalized_gaps)
         if gap_id not in gap_ids:
             continue
         objective = str(proposal.get("objective") or "").strip()
@@ -1119,6 +1184,10 @@ def _derived_gap_key(actor_id: Any, gap_id: Any) -> str:
     return f"{actor_id}:{gap_id}"
 
 
+def _child_spec_alias_key(actor_id: Any, proposal_id: Any) -> str:
+    return f"{actor_id}:{proposal_id}"
+
+
 def _residual_child_specifications(
     report: Mapping[str, Any],
     node: Mapping[str, Any],
@@ -1142,6 +1211,10 @@ def _residual_child_specifications(
     actor_id = str(node.get("id"))
     result: list[Dict[str, Any]] = []
     explicit_gap_ids: set[str] = set()
+    proposal_aliases = {
+        str(value.get("id")) for value in _as_list(report.get("proposed_children"))
+        if isinstance(value, Mapping) and value.get("id")
+    }
     for proposal in _as_list(report.get("proposed_children")):
         if not isinstance(proposal, Mapping):
             continue
@@ -1152,7 +1225,7 @@ def _residual_child_specifications(
             continue
         child = dict(proposal)
         child["depends_on_node_ids"] = _safe_dependency_ids(
-            child.get("depends_on_node_ids"), known, actor_id
+            child.get("depends_on_node_ids"), known, actor_id, proposal_aliases
         )
         result.append(child)
         explicit_gap_ids.add(gap_id)
@@ -1246,10 +1319,16 @@ def _tool_access_residuals(residuals: Sequence[Any]) -> list[Dict[str, Any]]:
     ]
 
 
-def _safe_dependency_ids(value: Any, known: set[str], actor_id: str) -> list[str]:
+def _safe_dependency_ids(
+    value: Any,
+    known: set[str],
+    actor_id: str,
+    symbolic: set[str] | None = None,
+) -> list[str]:
+    allowed = known | set(symbolic or set())
     return list(dict.fromkeys(
         str(identifier) for identifier in _as_list(value)
-        if str(identifier) in known and str(identifier) != actor_id
+        if str(identifier) in allowed and str(identifier) != actor_id
     ))
 
 

@@ -125,6 +125,37 @@ class InformationRealizationTests(unittest.TestCase):
             ["reservation tool"],
         )
 
+    def test_report_recovers_unlabeled_proposals_and_symbolic_dependencies(self) -> None:
+        report = _normalize_report({
+            "residual_requirements": [
+                "Retrieve reservation details with get_reservation_details.",
+                "Search and compare the cheapest business flights.",
+            ],
+            "proposed_children": [
+                {
+                    "id": "child-1",
+                    "objective": "Retrieve and inspect reservation details",
+                    "termination_condition": "Reservation fields are available",
+                },
+                {
+                    "id": "child-2",
+                    "objective": "Compare business flight options",
+                    "termination_condition": "The cheapest round trip is identified",
+                    "depends_on_node_ids": ["child-1"],
+                },
+            ],
+        }, {"id": "root"})
+        self.assertEqual(len(report["residual_requirements"]), 2)
+        self.assertEqual(len(report["proposed_children"]), 2)
+        self.assertEqual(
+            report["proposed_children"][0]["triggering_gap_id"],
+            report["residual_requirements"][0]["id"],
+        )
+        specifications = _residual_child_specifications(
+            report, {"id": "root"}, ["root"]
+        )
+        self.assertEqual(specifications[1]["depends_on_node_ids"], ["child-1"])
+
     def test_residual_requirement_becomes_open_child_specification(self) -> None:
         report = _normalize_report({
             "residual_requirements": [
