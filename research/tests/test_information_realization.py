@@ -28,8 +28,10 @@ from roy_research.organization_training import (
 from roy_research.tau3 import TAU3_COMMIT, build_tau3_manifest, manifest_summary
 from roy_research.tau3_agent import (
     _bound_tool_call_payload,
+    _is_stop_message,
     _non_thinking_arguments,
     _normalize_report,
+    _stop_content,
     _tool_argument_prompt,
 )
 
@@ -111,6 +113,10 @@ class InformationRealizationTests(unittest.TestCase):
         self.assertEqual(bound["name"], "update_reservation_flights")
         self.assertEqual(bound["arguments"], {"reservation_id": "ABC123"})
         self.assertEqual(bound["requestor"], "assistant")
+        stop_token = "###ROY_ORGANIZATION_STOP###"
+        marked = _stop_content("final answer", stop_token)
+        self.assertTrue(_is_stop_message(Mock(content=marked), stop_token))
+        self.assertEqual(_stop_content(marked, stop_token).count(stop_token), 1)
 
     def test_policy_supports_variable_nodes_and_open_candidates(self) -> None:
         model = InformationRealizationPolicy(hidden_dim=64, layers=2)

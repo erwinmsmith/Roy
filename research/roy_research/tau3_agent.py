@@ -110,6 +110,8 @@ def register_tau3_organization_agent(
         initial_snapshot_fingerprint: str = ""
 
     class Tau3OrganizationAgent(LLMConfigMixin, HalfDuplexAgent[OrganizationState]):
+        STOP_TOKEN = "###ROY_ORGANIZATION_STOP###"
+
         def __init__(self, tools, domain_policy, llm, llm_args=None, task=None):
             super().__init__(tools=tools, domain_policy=domain_policy, llm=llm, llm_args=llm_args)
             self.task = task
@@ -175,6 +177,10 @@ def register_tau3_organization_agent(
                     if isinstance(value, AssistantMessage) and getattr(value, "content", None):
                         state.final_output = str(value.content)
                         break
+
+        @classmethod
+        def is_stop(cls, message) -> bool:
+            return _is_stop_message(message, cls.STOP_TOKEN)
 
         def generate_next_message(self, message, state: OrganizationState):
             if isinstance(message, MultiToolMessage):
@@ -364,7 +370,7 @@ def register_tau3_organization_agent(
                 state.stopped = True
                 state.termination_type = "policy_stop"
                 state.termination_reason = "organization policy selected STOP"
-                return outward
+                return self._mark_stop(outward)
             raise ValueError(f"unsupported organization action: {kind}")
 
         def _generate_report(self, node, state, generate_fn, system_type) -> Dict[str, Any]:
@@ -470,8 +476,13 @@ def register_tau3_organization_agent(
             state.stopped = True
             state.termination_type = "truncated_resource"
             state.termination_reason = reason
+            outward = self._mark_stop(outward)
             state.messages.append(outward)
             return outward, state
+
+        def _mark_stop(self, message):
+            content = _stop_content(getattr(message, "content", None), self.STOP_TOKEN)
+            return message.model_copy(update={"content": content})
 
         def _candidates(self, state: OrganizationState) -> list[Dict[str, Any]]:
             result: list[Dict[str, Any]] = []
@@ -792,6 +803,15 @@ def _bound_tool_call_payload(
         "arguments": dict(arguments),
         "requestor": "assistant",
     }
+
+
+def _stop_content(content: Any, stop_token: str) -> str:
+    value = str(content or "")
+    return value if stop_token in value else f"{value}\n{stop_token}".strip()
+
+
+def _is_stop_message(message: Any, stop_token: str) -> bool:
+    return stop_token in str(getattr(message, "content", "") or "")
 
 
 def _parse_json_object(text: str) -> Dict[str, Any]:
