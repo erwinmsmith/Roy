@@ -6,3 +6,5 @@ export * from './policy.js';
 export * from './pythonPolicy.js';
 export * from './tokenLedger.js';
 export * from './controlledEnvironment.js';
+export * from './informationRealizationTypes.js';
+export * from './recursiveRuntime.js';

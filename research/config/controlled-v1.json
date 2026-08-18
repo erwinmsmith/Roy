@@ -29,7 +29,7 @@
     "full_trajectory_grpo",
     "cs_grpo_no_event_graph",
     "node_only_cs_grpo",
-    "full_v0_v4"
+    "learned_information_realization"
   ],
   "statistics": {
     "paired_bootstrap_samples": 2000,

@@ -18,6 +18,8 @@ from .providers import DeepSeekClient
 from .reporting import write_utility_svg
 from .schema import TraceRecord
 from .token_ledger import PersistentTokenLedger
+from .tau3 import build_tau3_manifest, manifest_summary, verify_tau3_root
+from .tau3_runner import evaluate_tau3_against_direct, train_tau3_on_policy
 from .training import TRAINING_VARIANTS, evaluate_groups, train_groups
 
 
@@ -132,6 +134,46 @@ def parser() -> argparse.ArgumentParser:
     experiment.add_argument("--epochs", type=int, default=3)
     experiment.add_argument("--device")
     experiment.add_argument("--resume", action="store_true")
+
+    tau3_manifest = commands.add_parser(
+        "tau3-manifest", help="Verify the pinned tau3 checkout and write leakage-safe splits"
+    )
+    tau3_manifest.add_argument("--tau3-root", type=Path, required=True)
+    tau3_manifest.add_argument("--output", type=Path, required=True)
+    tau3_manifest.add_argument("--validation-modulus", type=int, default=10)
+
+    tau3_train = commands.add_parser(
+        "tau3-train", help="Sample tau3 groups and update the organization policy on-policy"
+    )
+    tau3_train.add_argument("--manifest", type=Path, required=True)
+    tau3_train.add_argument("--trajectories", type=Path, required=True)
+    tau3_train.add_argument("--model", type=Path, required=True)
+    tau3_train.add_argument("--agent-llm", default="deepseek/deepseek-v4-flash")
+    tau3_train.add_argument("--user-llm", default="deepseek/deepseek-v4-flash")
+    tau3_train.add_argument("--limit", type=int)
+    tau3_train.add_argument("--max-steps", type=int, default=100)
+    tau3_train.add_argument("--max-tokens", type=int, default=8192)
+    tau3_train.add_argument("--temperature", type=float, default=0.2)
+    tau3_train.add_argument("--expected-resource-budget", type=float, default=3.0)
+    tau3_train.add_argument("--seed", type=int, default=20260818)
+    tau3_train.add_argument("--resume", action="store_true")
+
+    tau3_evaluate = commands.add_parser(
+        "tau3-evaluate", help="Compare single-agent direct with one learned organization"
+    )
+    tau3_evaluate.add_argument("--manifest", type=Path, required=True)
+    tau3_evaluate.add_argument("--model", type=Path, required=True)
+    tau3_evaluate.add_argument("--output", type=Path, required=True)
+    tau3_evaluate.add_argument("--summary", type=Path, required=True)
+    tau3_evaluate.add_argument("--agent-llm", default="deepseek/deepseek-v4-flash")
+    tau3_evaluate.add_argument("--user-llm", default="deepseek/deepseek-v4-flash")
+    tau3_evaluate.add_argument("--split", choices=("validation", "test", "heldout"), default="test")
+    tau3_evaluate.add_argument("--limit", type=int)
+    tau3_evaluate.add_argument("--max-steps", type=int, default=100)
+    tau3_evaluate.add_argument("--max-tokens", type=int, default=8192)
+    tau3_evaluate.add_argument("--temperature", type=float, default=0.0)
+    tau3_evaluate.add_argument("--expected-resource-budget", type=float, default=3.0)
+    tau3_evaluate.add_argument("--seed", type=int, default=20260818)
     return root
 
 
@@ -389,6 +431,48 @@ def main(argv: List[str] | None = None) -> None:
         result = {"schema_version": 1, "rule_arms": rules["arms"], "learned_arms": learned}
         atomic_json(args.output / "experiment.json", result)
         print(json.dumps({"output": str(args.output / "experiment.json"), "learned_arms": len(learned)}))
+    elif args.command == "tau3-manifest":
+        revision = verify_tau3_root(args.tau3_root)
+        manifest = build_tau3_manifest(args.tau3_root, args.validation_modulus)
+        write_jsonl(args.output, [value.to_dict() for value in manifest])
+        print(json.dumps({
+            "output": str(args.output),
+            "revision": revision,
+            **manifest_summary(manifest),
+        }, sort_keys=True))
+    elif args.command == "tau3-train":
+        metadata = train_tau3_on_policy(
+            args.manifest,
+            args.trajectories,
+            args.model,
+            args.agent_llm,
+            args.user_llm,
+            limit=args.limit,
+            max_steps=args.max_steps,
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            expected_resource_budget=args.expected_resource_budget,
+            seed=args.seed,
+            resume=args.resume,
+        )
+        print(json.dumps(metadata, sort_keys=True))
+    elif args.command == "tau3-evaluate":
+        result = evaluate_tau3_against_direct(
+            args.manifest,
+            args.model,
+            args.output,
+            args.agent_llm,
+            args.user_llm,
+            split=args.split,
+            limit=args.limit,
+            max_steps=args.max_steps,
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            expected_resource_budget=args.expected_resource_budget,
+            seed=args.seed,
+        )
+        atomic_json(args.summary, result)
+        print(json.dumps({"output": str(args.output), "summary": str(args.summary), **result}, sort_keys=True))
 
 
 def _compare_live_arms(groups_path: Path, evaluation_path: Path, mas_path: Path) -> Dict[str, Any]:

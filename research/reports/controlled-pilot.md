@@ -24,7 +24,7 @@ Generated datasets, traces and weights remain under `research/output/` and are e
 | Full-trajectory GRPO | 0.8086 | 0.0760 | [0.1534, 0.2771], positive | [-0.0257, -0.0113], negative |
 | CS-GRPO without event graph | 0.6396 | 0.2450 | [-0.0588, 0.1552], inconclusive | [-0.2335, -0.1384], negative |
 | Node-only CS-GRPO | 0.8086 | 0.0760 | [0.1534, 0.2771], positive | [-0.0257, -0.0113], negative |
-| Full hierarchical V0-V4 | 0.8266 | 0.0580 | [0.1685, 0.2977], positive | baseline, inconclusive |
+| Full information-realization policy | 0.8266 | 0.0580 | [0.1685, 0.2977], positive | baseline, inconclusive |
 | Fixed-rollout joint oracle diagnostic | 0.8846 | 0.0000 | [0.2252, 0.3586], positive | n/a |
 
 ![Controlled pilot mean task utility](controlled-pilot.svg)

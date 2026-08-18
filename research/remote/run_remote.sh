@@ -123,7 +123,7 @@ URLS
 
 print_matrix() {
   for benchmark in tau-knowledge tua; do
-    for arm in no_derivation roy_heuristic node_only full_v0_v4; do
+    for arm in single_agent_direct roy_runtime_heuristic node_policy learned_information_realization; do
       for repeat in 0 1 2; do
         echo "${benchmark} arm=${arm} repeat=${repeat} tasks=5"
       done
@@ -147,7 +147,7 @@ run_pilot() {
   export OPENAI_API_BASE="http://127.0.0.1:${proxy_port}/v1"
   export ROY_STRUCTURAL_POLICY_COMMAND="${ROY_STRUCTURAL_POLICY_COMMAND:-python3 -m roy_research.policy_server}"
 
-  for arm in no_derivation roy_heuristic node_only full_v0_v4; do
+  for arm in single_agent_direct roy_runtime_heuristic node_policy learned_information_realization; do
     export ROY_STRUCTURAL_ARM="${arm}"
     (cd "${work_dir}/tau2-bench" && uv run tau2 run \
       --domain banking_knowledge \

@@ -52,7 +52,12 @@ def build_remote_manifest(token_limit: int = 10_000_000) -> Dict[str, Any]:
         "token_limit": token_limit,
         "task_selection": {"strategy": "pinned_prefix", "count": 5, "seed": 20260815},
         "repeats": 3,
-        "arms": ["no_derivation", "roy_heuristic", "node_only", "full_v0_v4"],
+        "arms": [
+            "single_agent_direct",
+            "roy_runtime_heuristic",
+            "node_policy",
+            "learned_information_realization",
+        ],
         "expected_episodes": 120,
         "benchmarks": [asdict(benchmark) for benchmark in REMOTE_BENCHMARKS.values()],
         "notes": [

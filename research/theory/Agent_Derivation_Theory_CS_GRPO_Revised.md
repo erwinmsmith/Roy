@@ -1,165 +1,170 @@
-# Agent Derivation Theory and CS-GRPO
+# Roy Information Realization and Autonomous Organization GRPO
 
-Status: canonical Roy research theory, revision 1 (2026-08-15).
+Status: canonical research specification for the `exp` branch (2026-08-18).
 
-This document is the repository authority for the first Roy structural-learning experiments. It revises `Agent_Derivation_Theory_CS_GRPO_Revised.md` from the research input without modifying that source file. It adopts the information-preservation and bounded-conversion distinctions in *Meta-Information Activation* (MIA), while replacing dimensionally mixed optimization claims with an operational task-utility objective.
+This document is the normative bridge from MIA to Roy's recursive organization policy. It replaces the earlier staged structural-learning formulation. The implementation must not introduce predefined agent roles, teacher systems, imitation learning, a weighted sum of objectives, or per-trajectory resource caps as the mathematical resource constraint.
 
-Reviewed source provenance:
+## 1. Information-realization objective
 
-- Input Markdown SHA-256: `57f9abb3c499b2eb96a6f78a4865ee8230acdc118b85de2009d208ee6c3d46e6`.
-- MIA PDF SHA-256: `391cec40d5d7f01414a2ffec202c88322dabf8ea99f0daf8fbbae120bc59dd8d`.
-
-The Downloads copies are the immutable research inputs. This repository document is the consolidated normative revision used by code, tests and experiments; details from the input remain informative unless they conflict with an explicit rule below.
-
-## 1. Scope and claims
-
-An agent derivation policy decides whether a running parent should continue locally, derive a child, or return. The policy may also choose the child specification and optional communication shortcuts. Its purpose is not to maximize the number of agents. It should improve terminal task utility under a finite resource envelope.
-
-MIA supplies two constraints that remain intact:
-
-1. For a Markov chain from complete context through a representation to an answer, the Data Processing Inequality bounds the information retained downstream. Agent communication does not violate this bound.
-2. Preserving task-relevant information and converting preserved information into a calibrated final output are distinct. A bounded architecture can retain useful evidence and still fail at aggregation.
-
-Task utility, best-trace retention, and conversion deficit are operational diagnostics. They are not assumed to be unbiased estimators of mutual information.
-
-## 2. Objective
-
-The former scalar objective `IL + EL + DL - beta GL` adds quantities without a shared measurement scale and is withdrawn. Let `U_T(y, o) in [0, 1]` be the terminal utility for task `T`, latent or reference answer `y`, and terminal output `o`. Let `B` be a finite resource envelope. The structural objective is
+Let `Y` denote the task-relevant latent answer, `C_t` the information available to the organization at time `t`, and `Y_hat_t` its current output. Roy separates three factors:
 
 ```text
-maximize_pi  E_pi[U_T(Y, O_terminal)]
-subject to   cumulative resource use <= B
-             terminal constraints are satisfied.
+A_t  available task-relevant information,
+S_t  fidelity of the distributed representation of that information,
+G_t  conversion of represented information into a useful output.
 ```
 
-Intrinsic load, extraneous load, depth load, and germane conversion remain explanatory variables and stratification axes. They are not summed into the training reward unless separately normalized and empirically validated.
-
-## 3. Finite-resource terminating SMDP
-
-The process is a stochastic semi-Markov decision process
+The operational target is terminal task utility, used as the benchmark estimator of information realization:
 
 ```text
-M = (S, A, A_legal, P, D, R, gamma, B, S_terminal).
+J(tau) = U_T(Y, Y_hat_terminal)
+
+maximize_pi  E[tau ~ pi][J(tau)]
+subject to   E[tau ~ pi][C(tau)] <= B.
 ```
 
-- `S` contains the Parent-local observable event graph, local projections of the derivation tree, dependency DAG and communication graph, resource state, environment revision, model metadata, and randomness metadata.
-- `A = {CONTINUE, BRANCH, RETURN}` at the node level. `BRANCH` additionally samples a `ChildSpecification`.
-- `A_legal(s)` is an action mask. `BRANCH` requires remaining branch capacity. `RETURN` is illegal while a required dependency is unresolved or the output contract is unsatisfied.
-- `P(s', delta, r | s, a)` is the transition kernel over state, duration and reward.
-- `D` records action duration and resource consumption.
-- Reward is zero or shaped during execution and equals terminal task utility at termination. Evaluation always reports unshaped terminal utility.
-- The resource envelope and termination rule make the process finite. An implementation must stop on terminal output, exhaustion, explicit horizon, or unrecoverable environment failure.
+Cost is a distribution-level feasibility constraint, not a reward component. Agent count, depth, latency, token use, tool calls, topology complexity, communication, rationality and redundancy are never added to `J`. An individual sampled trajectory may consume more than `B`; feasibility is defined by expected consumption under the sampling distribution.
 
-The Parent observes only events addressed to it, events emitted by it, public events, and results legally returned along derivation/dependency/communication edges. Sibling private traces are not visible by default.
+The implementation may retain a separate provider safety ledger to prevent accidental API overspend. That operational fail-safe is not the theoretical constraint and must not alter utility or advantage.
 
-## 4. Checkpoints and counterfactual validity
+## 2. State and information flow
 
-A `StructuralCheckpoint` is immutable and versioned. It contains:
+The organization state contains:
 
-- Parent-local events and graph edges;
-- local tree, dependency and communication projections;
-- remaining resources and legal actions;
-- environment revision and restorable environment state reference;
-- provider/model parameters and randomness metadata;
-- an immutable fingerprint over all semantically relevant fields.
+- the current task and dynamic context;
+- a task-derivation tree with immutable parent lineage;
+- a separate dependency DAG;
+- a separate communication graph;
+- claims, evidence, external observations, assumptions, conflicts and residual requirements;
+- node-local epistemic reports, coverage, uncertainty and blind spots;
+- model, environment and randomness metadata needed to replay a trajectory;
+- realized resource measurements and the current expected-resource distribution.
 
-Controlled environments must support full clone and restore. External environments use deterministic fixtures/replay when possible, otherwise isolated instances. Counterfactuals within one group must start from the same checkpoint fingerprint, total resources, termination condition, environment revision and common-random-number seed. The intervened structural action is the only intended difference.
+Derivation and communication have different meanings. A derivation edge records why a child exists. A communication edge records which nodes may exchange information. A dependency edge records which artifact or claim must be produced before another node can proceed. Combining these edge types into a single tree is invalid.
 
-When a snapshot cannot be cloned, the experiment reports that limitation and does not describe the comparison as an exact counterfactual.
+External observations must be stored separately from model inference. Tool, API, database, KB, code and environment results require provenance and their claim-support links. This preserves the distinction between information acquisition and reasoning over already available information.
 
-## 5. Theoretical and estimated values
+## 3. Fixed grammar, open agent space
 
-The theoretical action value is
+The organization grammar is fixed:
 
 ```text
-Q*(s, a) = sup_pi E[U_terminal | s, a, pi].
+DERIVE, ACQUIRE, CONNECT, EXECUTE, RETURN, PRUNE, STOP
 ```
 
-The optimal branch gap is the difference between the best legal structural action and a selected action under `Q*`. Finite experiments do not observe `Q*`. They estimate
+The grammar does not define roles. `DERIVE` takes a freely generated agent specification tied to one residual requirement. A valid child:
+
+- is a strict, narrower refinement of the parent objective;
+- identifies the parent gap that caused its creation;
+- states the new information or transformation required;
+- receives only relevant claims, evidence and reports;
+- states permitted external access without receiving a hidden answer;
+- has a verifiable output contract and termination condition;
+- is not a duplicate of an active or completed node.
+
+Every node returns a structured epistemic report containing concise reasoning summaries rather than hidden chain-of-thought. The report includes claims, evidence, external observations, assumptions, uncertainty, conflicts, coverage, blind spots, residual requirements, optional open child proposals, whether the parent gap was resolved, and information to propagate.
+
+`ACQUIRE` performs admissible external information access. `CONNECT` adds a legal communication route. `EXECUTE` updates a node's report. `RETURN` propagates a report to the parent. `PRUNE` removes a node only when no unresolved dependency requires it. `STOP` is a root action and is illegal while required dependencies remain unresolved.
+
+## 4. One autonomous policy
+
+Roy learns one organization policy. At each organization decision it first selects an active node and then selects an open candidate conditioned on that node:
 
 ```text
-Q^mu(s, a) = E[U_terminal | s, a, downstream rollout policy mu],
+pi_theta(n, a, z | s)
+  = pi_active(n | s)
+    pi_candidate(a, z | s, n).
 ```
 
-where `mu` is fixed within a comparison. `Q^mu` approaches `Q*` only under a stated consistency condition, such as increasingly capable rollout policies with sufficient coverage and convergent value estimates. Reports must label measured regret as rollout-policy structural regret unless such a condition is justified.
+Here `a` is one grammar action and `z` is its open payload, such as a generated child specification, acquisition requirement, connection, report, or prune target. Candidate count and node count are variable. No fixed role ID, fixed child catalog, teacher trajectory, or teacher score is part of the model.
 
-## 6. Joint structural policy and hierarchical credit
+The policy encoder is a typed relational network over derivation, dependency, communication, tool-use, evidence and return edges. It scores all currently active nodes, then embeds and scores open candidates conditioned on the sampled node and the full graph representation. Training replay must reconstruct this same joint conditional probability exactly.
 
-The joint policy factorizes as
+The expected resource constraint is enforced by projecting the legal candidate distribution:
 
 ```text
-pi(a, c | s) = pi_node(a | s) p_derive(c | s, a = BRANCH).
+min_q  KL(q || pi_theta)
+subject to  E[a ~ q][c(s,a)] <= b(s).
 ```
 
-The outer group compares three node-level quantities:
+This projection changes the action distribution only. Resource cost is absent from terminal utility, group advantage and the GRPO loss. Legal high-cost actions retain non-zero probability whenever the expected constraint is feasible.
+
+## 5. On-policy exploration and group sampling
+
+Training samples complete organization trajectories from exactly one behavior distribution:
 
 ```text
-V_CONTINUE, V_RETURN, aggregate_c(V_BRANCH,c).
+q_theta(tau | x)
+  = (1 - alpha) q_explore(tau | x)
+    + alpha pi_theta(tau | x).
 ```
 
-The default branch aggregate is the arithmetic mean over the fixed candidate set. The inner group compares child specifications only after conditioning on `BRANCH`. Outer standardized advantages update `pi_node`; inner standardized advantages update `p_derive`. The `BRANCH` node log-probability appears once per checkpoint group. It is not duplicated for every child, and it never receives mutually conflicting child-level advantages.
+The behavior log-probability stored for every decision is the exact mixture probability, not the probability from only one component. The sampled old-policy probability is stored separately for the GRPO ratio. `alpha` may be annealed as part of this same training process; there is no imitation warm start or separate optimization phase.
 
-For either level, CS-GRPO applies an action mask and the clipped surrogate
+Each τ³ training query produces a group of eight complete trajectories:
+
+| Group member | Node exploration envelope | Depth exploration envelope | Mode |
+| --- | ---: | ---: | --- |
+| 1 | 1–4 | 1–2 | shallow |
+| 2 | 2–5 | 1–3 | shallow |
+| 3 | 4–7 | 2–3 | medium |
+| 4 | 4–7 | 2–4 | medium |
+| 5 | 6–9 | 3–4 | deep |
+| 6 | 6–9 | 3–4 | deep |
+| 7 | 6–12 | 3–5 | expansive |
+| 8 | 6–12 | 4–5 | expansive |
+
+These envelopes define exploration support during training. They do not prescribe roles, tasks, topology or communication, and they are not resource budgets or reward terms. Evaluation removes the minimum node/depth requirements and samples one autonomous organization from the learned policy; it does not use best-of-eight test-time search.
+
+## 6. Single-objective organization GRPO
+
+For a group of terminal utilities `J_1 ... J_8`, compute only group-relative advantages:
 
 ```text
-L = -E[min(r(theta) A, clip(r(theta), 1-epsilon, 1+epsilon) A)].
+A_i = (J_i - mean(J)) / (std(J) + epsilon).
 ```
 
-A zero-variance group has zero standardized advantage and therefore contributes no preference gradient.
-
-## 7. Acquisition and activation
-
-For a clonable deterministic environment, define matched runs:
+The policy update is the length-normalized clipped surrogate over the stored joint decision probabilities:
 
 ```text
-U_0 = utility without child-acquired evidence,
-U_E = utility after evidence acquisition with the acquisition cost charged,
-U_F = utility after evidence acquisition and downstream activation.
-
-G_acq = U_E - U_0
-G_act = U_F - U_E
-U_F - U_0 = G_acq + G_act.
+L(theta) = -mean_i [
+  (1 / |tau_i|) sum_t
+  min(r_i,t A_i, clip(r_i,t, 1-epsilon, 1+epsilon) A_i)
+]
 ```
 
-All three runs share the initial checkpoint, total resource budget and terminal condition. `U_E` explicitly records the budget remaining after evidence acquisition. The deterministic reconstruction error must be at most `1e-6`.
+There is one optimization target: τ³ terminal task utility. There are no cost, node-count, depth, communication, entropy, rationality, redundancy, teacher or auxiliary reward terms. A zero-variance group contributes zero preference gradient. Node necessity and counterfactual pruning may be reported as diagnostics but are not separate optimization objectives.
 
-If obtaining tool evidence changes external state in a way that cannot be replayed or isolated, acquisition and activation are not separately identified. The report omits the decomposition rather than assigning an artificial value.
+## 7. τ³ benchmark protocol
 
-## 8. Structural runtime versions
+The benchmark is the official `sierra-research/tau2-bench` τ³ implementation pinned to commit `fc0055dc4e0a316c3f83133267fbd6faaa770992`.
 
-- **V0 - Tree runtime:** immutable lineage, restorable controlled state, resource accounting and exact checkpoint fingerprints.
-- **V1 - Node policy:** masked `CONTINUE`, `BRANCH`, `RETURN` decisions over Parent-local state.
-- **V2 - Open derivation:** `BRANCH` creates a typed child specification with task, context, tools, resource slice, output contract and dependencies.
-- **V3 - Dependency execution:** artifact/subgoal dependency DAG, automatic `WAIT`, and wake-up when all required producers resolve.
-- **V4 - Communication:** dependency-required routes cannot be removed; optional communication shortcuts may be learned and closed.
-- **V5 - CS-GRPO:** relational event-graph policy, hierarchical node/derivation credit, trajectory collection, checkpointed training and evaluation.
+- Airline, retail and telecom retain the official train/test boundary.
+- A deterministic subset of each official training split is held out for validation.
+- Official test tasks are never used for updates or model selection.
+- Banking knowledge tasks have no official training split in the pinned checkout, so they remain held out and are never training trajectories.
+- All eight trajectories for one query use the same task identity and benchmark revision, while their exploration envelopes and random streams are recorded explicitly.
 
-The TypeScript runtime keeps structural learning behind `structuralLearning.enabled`. When disabled, a compatibility adapter preserves existing Roy delegation behavior. A Python/PyTorch sidecar communicates over versioned JSONL on stdio, with bounded timeout, restart and fallback.
+Primary evaluation compares:
 
-## 9. Controlled benchmark
+- `single_agent_direct`: one τ³ LLM agent without recursive derivation;
+- `fixed_complete_mas`: a non-learned complete multi-agent organization with matched reporting;
+- `roy_runtime_heuristic`: the current Roy delegation behavior;
+- `learned_information_realization`: one organization sampled from the trained policy.
 
-Controlled Derivation Benchmark v1 contains 180 deterministically generated English instances: 90 train, 30 validation and 60 test. It balances Activation, Acquisition and Mixed families. The final half of each family's test slice is OOD in depth and, where applicable, tool and branch pattern.
+Report official τ³ reward and end-to-end success, paired task-level differences against `single_agent_direct`, bootstrap 95% confidence intervals, tokens, LLM calls, wall-clock, realized nodes/depth, dependencies, waits, communication edges and redundant branches. Results whose interval crosses zero are inconclusive.
 
-Each instance exposes one checkpoint, three child specifications and two repeated rollouts per action/specification with a common environment seed. Baselines are no derivation, random derivation, fixed branch count, current Roy heuristic, full-trajectory GRPO, graph-ablated CS-GRPO, Node-only CS-GRPO and full V0-V4.
+## 8. Training and evaluation invariants
 
-## 10. External pilot and statistics
+- Training consumes only manifest entries labeled `train`.
+- Every GRPO group contains exactly eight complete trajectories from one task.
+- Every policy record stores state fingerprint, active node, open candidate, exact behavior log-probability, sampled old-policy log-probability, exploration weight, envelope and projected expected resource.
+- The final utility is the only value used to compute advantage.
+- No teacher names, teacher outputs or teacher scores may appear in a training trajectory.
+- Resume restores model, optimizer and completed trajectory/group identifiers without changing the train/test boundary.
+- Evaluation never updates model weights and never applies training minimum node/depth envelopes.
+- API nondeterminism is addressed by request/response capture, fixed configuration and repeated paired evaluation, not by claiming exact deterministic counterfactuals.
 
-The first external pilot is text/tool based: tau Knowledge and TUA-Bench, each with five fixed tasks and three repeats, across no derivation, current heuristic, Node-only and full policies. This is 120 episodes. Voice is future work.
+## 9. Limits
 
-All DeepSeek runs share one persistent 10,000,000-token ledger. A request reserves its maximum possible use before dispatch. If reservation would cross the cap, the runner saves current state and stops; it never automatically exceeds the cap.
-
-Reports include terminal utility, rollout-policy structural regret, action confusion matrix, `G_acq`, `G_act`, work, span, nodes, wait time, redundant branches, communication edges, token use and wall time. Paired bootstrap 95% confidence intervals and multiple random repeats are required. If an interval crosses zero, the result is reported as inconclusive.
-
-## 11. Limits and threats to validity
-
-- External API sampling may remain nondeterministic despite a seed. Reproducibility relies on complete request/response capture, pinned configuration and paired repeats.
-- Shared foundation models induce correlated errors across agents, violating naive independence assumptions.
-- Snapshot cloning may be incomplete for external services; fixture/replay changes ecological validity.
-- Utility judges may be biased, noisy or contaminated by model-family preference.
-- Tool and benchmark environments may drift after the pinned revision.
-- The first encoder is the frozen English `sentence-transformers/all-MiniLM-L6-v2`, revision `c9745ed1d9f207416be6d2e6f8de32d1f16199bf`, with 384 dimensions. No Chinese structural-decision generalization claim follows.
-- A high `Q^mu` value demonstrates benefit under `mu`, not global optimality.
-
-## 12. Falsification criteria
-
-The central empirical claim is weakened if full CS-GRPO fails to improve paired task utility or structural regret over the Roy heuristic, if gains disappear under matched resource accounting, if event-graph ablations perform equivalently, or if acquisition/activation effects do not reconstruct under deterministic controls. Such outcomes remain reportable results and must not be filtered by expected direction.
+MIA's data-processing bound still applies: communication and recursion cannot create information unavailable from context, tools or environment. The organization can improve acquisition, representation and conversion, but shared foundation models create correlated errors. Utility judges can be biased, external environments can drift, tool side effects may be non-clonable, and snapshot replay may be incomplete. Claims therefore concern measured τ³ performance under the pinned protocol, not global optimality or universal information gain.

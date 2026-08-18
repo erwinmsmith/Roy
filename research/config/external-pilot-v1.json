@@ -17,6 +17,6 @@
       "repeats": 3
     }
   },
-  "arms": ["no_derivation", "roy_heuristic", "node_only", "full_v0_v4"],
+  "arms": ["single_agent_direct", "roy_runtime_heuristic", "node_policy", "learned_information_realization"],
   "episodes": 120
 }

@@ -5,6 +5,7 @@ import {
   ControlledDerivationEnvironment,
   DependencyScheduler,
   LegacyStructuralPolicyAdapter,
+  RecursiveInformationRealizationRuntime,
   PythonStructuralPolicyClient,
   StructuralCheckpointStore,
   StructuralCommunicationGraph,
@@ -15,6 +16,8 @@ import {
   runCounterfactualGroup,
   standardizedRecord,
   type ChildSpecification,
+  type EpistemicReport,
+  type OpenAgentSpecification,
   type StructuralCheckpoint,
 } from '../src/core/structural/index.js';
 
@@ -201,5 +204,82 @@ describe('structural runtime primitives', () => {
     });
     await expect(policy.decide(checkpoint())).resolves.toMatchObject({ action: 'CONTINUE' });
     await policy.close();
+  });
+});
+
+describe('recursive information realization runtime', () => {
+  const report = (nodeId: string, gapId?: string): EpistemicReport => ({
+    id: `report-${nodeId}`, nodeId, depth: nodeId === 'root' ? 0 : 1,
+    localObjective: `objective-${nodeId}`, conclusion: 'partial', reasoningSummary: 'summary',
+    claims: [{ id: `claim-${nodeId}`, statement: 'claim', status: 'tentative', originNodeId: nodeId }],
+    evidence: [], externalObservations: [], assumptions: [],
+    uncertainty: { confidence: 0.5, uncertainAbout: [], confidenceBasis: 'insufficient evidence' },
+    conflicts: [], coverage: { resolved: [], unresolved: gapId ? [gapId] : [], notExamined: [] },
+    blindSpots: [],
+    residualRequirements: gapId ? [{
+      id: gapId, description: 'obtain missing evidence', whyItMatters: 'claim depends on it',
+      likelyMechanism: 'acquisition', requiredInformation: 'primary evidence', status: 'open',
+      parentNodeId: nodeId,
+    }] : [],
+    proposedChildren: [], resolvedParentGap: false, informationToPropagate: [],
+  });
+
+  const specification = (): OpenAgentSpecification => ({
+    id: 'spec-child', nodeId: 'child', parentId: 'root', depth: 1,
+    parentGoal: 'answer task', triggeringGapId: 'gap-1',
+    localObjective: 'obtain the primary evidence for the claim',
+    refinement: {
+      parentScope: 'answer task', childScope: 'obtain one primary source',
+      triggeringRequirementId: 'gap-1', narrowerThanParent: true,
+      newInformationNeeded: 'primary evidence', executableEndCondition: 'source is found or absence established',
+      duplicatedByExistingNode: false,
+    },
+    requiredClaims: [], requiredEvidence: [], relevantReportIds: [],
+    externalAccess: { allowed: true, tools: ['kb.search'], purpose: 'obtain evidence' },
+    expectedOutput: { requiredInformation: 'source and finding', outputType: 'epistemic_report' },
+    terminationCondition: 'return a sourced finding',
+  });
+
+  it('derives only from explicit residual requirements and preserves observations', () => {
+    const runtime = new RecursiveInformationRealizationRuntime('root', 'answer task', 1);
+    runtime.apply({ kind: 'EXECUTE', actorNodeId: 'root', report: report('root', 'gap-1') }, 2);
+    runtime.apply({ kind: 'DERIVE', actorNodeId: 'root', childSpecification: specification() }, 3);
+    runtime.apply({
+      kind: 'ACQUIRE', actorNodeId: 'child',
+      observation: {
+        id: 'observation-1', sourceType: 'kb', queryOrAction: 'search evidence',
+        observation: 'external fact', provenance: 'fixture://kb', supports: ['claim-child'],
+      },
+    }, 4);
+    const snapshot = runtime.snapshot();
+    expect(snapshot.nodes.map(node => node.id)).toEqual(['root', 'child']);
+    expect(snapshot.requirements[0]?.status).toBe('assigned');
+    expect(snapshot.observations[0]?.observation).toBe('external fact');
+    expect(snapshot.derivationEdges).toEqual([{ parentId: 'root', childId: 'child' }]);
+    expect(RecursiveInformationRealizationRuntime.restore(snapshot).snapshot()).toEqual(snapshot);
+    expect(() => RecursiveInformationRealizationRuntime.restore({
+      ...snapshot,
+      stopped: true,
+    })).toThrow(/fingerprint/);
+  });
+
+  it('keeps dependency and communication graphs distinct and wakes consumers', () => {
+    const runtime = new RecursiveInformationRealizationRuntime('root', 'answer task', 1);
+    runtime.apply({ kind: 'EXECUTE', actorNodeId: 'root', report: report('root', 'gap-1') }, 2);
+    runtime.apply({ kind: 'DERIVE', actorNodeId: 'root', childSpecification: specification() }, 3);
+    runtime.addDependency('child', 'root', 'artifact:evidence');
+    expect(runtime.waitForDependencies('root', 4)).toBe(true);
+    runtime.apply({
+      kind: 'CONNECT', actorNodeId: 'root',
+      connection: { from: 'child', to: 'root', required: true },
+    }, 5);
+    expect(() => runtime.apply({ kind: 'STOP', actorNodeId: 'root', finalOutput: 'answer' }, 6))
+      .toThrow(/dependencies/);
+    expect(runtime.resolveArtifact('child', 'artifact:evidence', 7)).toEqual(['root']);
+    runtime.apply({ kind: 'STOP', actorNodeId: 'root', finalOutput: 'answer' }, 8);
+    const snapshot = runtime.snapshot();
+    expect(snapshot.stopped).toBe(true);
+    expect(snapshot.dependencyEdges).toHaveLength(1);
+    expect(snapshot.communicationEdges).toHaveLength(1);
   });
 });

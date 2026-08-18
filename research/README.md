@@ -1,40 +1,40 @@
-# Roy structural-learning research
+# Roy information-realization research
 
-This directory contains the canonical theory, controlled benchmark, CS-GRPO policy code and pinned external-pilot packaging. Generated trajectories, model weights, embedding caches and external benchmark assets are intentionally ignored by Git.
+This directory contains the canonical theory, recursive epistemic runtime, autonomous organization policy, organization-GRPO training code and τ³ integration. Generated trajectories, model weights, embedding caches and benchmark assets are intentionally ignored by Git.
 
-## Local quick start
+The current research method uses one policy, one on-policy training process and one optimization signal: terminal τ³ task utility. It has no teacher policy, predefined agent-role catalog, imitation warm start or weighted objective sum. Resource use is constrained in expectation by projecting the action distribution; it is never subtracted from reward.
+
+## τ³ preparation and training
 
 ```bash
 npm run research:test
 npm run research:smoke
 
-PYTHONPATH=research python3 -m roy_research generate --output research/output/tasks.jsonl
-PYTHONPATH=research python3 -m roy_research collect \
-  --tasks research/output/tasks.jsonl \
-  --output research/output/groups.jsonl \
-  --traces research/output/traces.jsonl \
-  --resume
-PYTHONPATH=research python3 -m roy_research train \
-  --groups research/output/groups.jsonl \
-  --output research/output/cs_grpo.pt
-PYTHONPATH=research python3 -m roy_research evaluate \
-  --groups research/output/groups.jsonl \
-  --model research/output/cs_grpo.pt \
-  --output research/output/evaluation.json
-PYTHONPATH=research python3 -m roy_research report \
-  --groups research/output/groups.jsonl \
-  --evaluation research/output/evaluation.json \
-  --output research/output/report.md
+PYTHONPATH=research python3 -m roy_research tau3-manifest \
+  --tau3-root ~/rivermind-data/benchmarks/tau3-bench-v1.0.1 \
+  --output research/output/tau3/manifest.jsonl
 
-PYTHONPATH=research python3 -m roy_research experiment \
-  --groups research/output/groups.jsonl \
-  --output research/output/experiment \
-  --epochs 3 --resume
+PYTHONPATH=research python3 -m roy_research tau3-train \
+  --manifest research/output/tau3/manifest.jsonl \
+  --trajectories research/output/tau3/train-trajectories.jsonl \
+  --model research/output/tau3/organization-policy.pt --resume
+
+PYTHONPATH=research python3 -m roy_research tau3-evaluate \
+  --manifest research/output/tau3/manifest.jsonl \
+  --model research/output/tau3/organization-policy.pt \
+  --output research/output/tau3/test-results.jsonl \
+  --summary research/output/tau3/test-summary.json --split test
 ```
 
-The encoder is loaded from the local Hugging Face cache at the pinned revision. To use the learned policy from TypeScript, launch `python3 -m roy_research.policy_server` through `PythonStructuralPolicyClient` and set `ROY_STRUCTURAL_MODEL` to a local checkpoint.
+The τ³ checkout is pinned to commit `fc0055dc4e0a316c3f83133267fbd6faaa770992`. Airline, retail and telecom preserve their official train/test split; validation is reserved deterministically from official training tasks. Banking knowledge is held out because the pinned benchmark does not define an official training split for it.
 
-Controlled reports treat terminal utility at or above `0.8` as end-to-end success and report paired bootstrap intervals against `direct`, the compatibility name for the `no_derivation` / `CONTINUE`-only arm. Decision accuracy is reported separately and must not be interpreted as task success.
+Each training task provides exactly eight complete organization trajectories using the shallow, medium, deep and expansive exploration envelopes defined in the canonical theory. The exact behavior-mixture probability and the sampled policy probability are recorded for every `active node → conditional candidate` decision. One GRPO update follows each freshly sampled group. Evaluation removes minimum node/depth exploration requirements and runs one organization per episode.
+
+The primary baseline is `single_agent_direct`. Reports also distinguish `fixed_complete_mas`, `roy_runtime_heuristic` and `learned_information_realization`; end-to-end success and official τ³ reward are reported separately from organization diagnostics.
+
+## Legacy controlled fixtures
+
+The older deterministic controlled commands remain available as regression fixtures for runtime and math tests. They are not the benchmark or training protocol for the current theory.
 
 ## Live and remote execution
 
