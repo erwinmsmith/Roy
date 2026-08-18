@@ -304,7 +304,11 @@ def register_tau3_organization_agent(
             )
             report = _normalize_report(_parse_json_object(str(response.content or "{}")), node)
             if (
-                len(state.nodes) < config.envelope().minimum_nodes
+                (
+                    len(state.nodes) < config.envelope().minimum_nodes
+                    or max(int(value["depth"]) for value in state.nodes)
+                    < config.envelope().minimum_depth
+                )
                 and not report["proposed_children"]
             ):
                 gap_id = f"validation-gap-{node['id']}-{state.decision_count}"
