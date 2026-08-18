@@ -227,6 +227,9 @@ def _run_episode(
     from tau2.run import build_text_orchestrator, get_tasks, run_simulation
 
     domain = str(task_record["domain"])
+    retrieval_config = None
+    if domain == "banking_knowledge":
+        retrieval_config = _register_local_banking_all_tools()
     official_split = str(task_record["official_split"])
     tasks = get_tasks(
         task_set_name=domain,
@@ -240,7 +243,7 @@ def _run_episode(
     api_base = os.environ.get("DEEPSEEK_BASE_URL")
     if api_base:
         llm_arguments["api_base"] = api_base.rstrip("/")
-    config = TextRunConfig(
+    config_values: Dict[str, Any] = dict(
         domain=domain,
         agent=agent_name,
         user="user_simulator",
@@ -253,9 +256,51 @@ def _run_episode(
         seed=seed,
         max_concurrency=1,
     )
+    if retrieval_config is not None:
+        config_values["retrieval_config"] = retrieval_config
+    config = TextRunConfig(**config_values)
     orchestrator = build_text_orchestrator(config, tasks[0], seed=seed)
     simulation = run_simulation(orchestrator)
     return simulation, getattr(orchestrator, "agent_state", None)
+
+
+def _register_local_banking_all_tools() -> str:
+    """Expose banking AllTools without an external embedding credential."""
+
+    from tau2.domains.banking_knowledge.retrieval import (
+        RETRIEVAL_VARIANTS,
+        all_tools_variant,
+    )
+    from tau2.knowledge.document_preprocessors.embedding_indexer import (
+        EMBEDDER_REGISTRY as DOCUMENT_EMBEDDERS,
+    )
+    from tau2.knowledge.input_preprocessors.embedding_encoder import (
+        EMBEDDER_REGISTRY as QUERY_EMBEDDERS,
+    )
+    from .model import FrozenTextEncoder, MINILM_MODEL_ID
+
+    class RoyLocalEmbedder:
+        def __init__(self, model: str | None = None, **_kwargs: Any) -> None:
+            self.model_name = model or MINILM_MODEL_ID
+            self.encoder = FrozenTextEncoder(device="cpu", local_only=True)
+
+        def embed(self, texts: list[str]):
+            return self.encoder.encode(texts).cpu().numpy()
+
+        def get_name(self) -> str:
+            return f"roy-local:{self.model_name}"
+
+    embedder_name = "roy_local_minilm"
+    variant_name = "roy_alltools_local"
+    DOCUMENT_EMBEDDERS[embedder_name] = RoyLocalEmbedder
+    QUERY_EMBEDDERS[embedder_name] = RoyLocalEmbedder
+    if variant_name not in RETRIEVAL_VARIANTS:
+        RETRIEVAL_VARIANTS[variant_name] = all_tools_variant(
+            variant_name,
+            embedder_type=embedder_name,
+            embedder_model=MINILM_MODEL_ID,
+        )
+    return variant_name
 
 
 def _validate_manifest_record(value: Mapping[str, Any], split: str) -> None:
