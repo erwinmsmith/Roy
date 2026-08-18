@@ -111,6 +111,7 @@ def register_tau3_organization_agent(
         actions: list[Dict[str, Any]] = Field(default_factory=list)
         used_candidates: list[str] = Field(default_factory=list)
         derived_gap_keys: list[str] = Field(default_factory=list)
+        derived_objective_fingerprints: list[str] = Field(default_factory=list)
         child_spec_node_ids: Dict[str, str] = Field(default_factory=dict)
         pending_acquisition_node: str | None = None
         pending_user_acquisition_node: str | None = None
@@ -332,6 +333,9 @@ def register_tau3_organization_agent(
                     ] = child_id
                 state.derived_gap_keys.append(
                     _derived_gap_key(actor["id"], proposal["triggering_gap_id"])
+                )
+                state.derived_objective_fingerprints.append(
+                    _objective_fingerprint(proposal["objective"])
                 )
                 for producer_id in dependency_ids:
                     producer = self._node(state, producer_id)
@@ -575,9 +579,16 @@ def register_tau3_organization_agent(
                     report, node, [str(value["id"]) for value in state.nodes]
                 )
                 derived_gap_keys = set(state.derived_gap_keys)
+                derived_objectives = set(state.derived_objective_fingerprints)
                 for index, proposal in enumerate(proposals):
                     gap_key = _derived_gap_key(actor, proposal.get("triggering_gap_id"))
-                    if gap_key in derived_gap_keys:
+                    objective_fingerprint = _objective_fingerprint(
+                        proposal.get("objective")
+                    )
+                    if (
+                        gap_key in derived_gap_keys
+                        or objective_fingerprint in derived_objectives
+                    ):
                         continue
                     identifier = f"derive:{actor}:{proposal.get('triggering_gap_id')}:{index}"
                     if identifier not in used:
@@ -1186,6 +1197,11 @@ def _derived_gap_key(actor_id: Any, gap_id: Any) -> str:
 
 def _child_spec_alias_key(actor_id: Any, proposal_id: Any) -> str:
     return f"{actor_id}:{proposal_id}"
+
+
+def _objective_fingerprint(objective: Any) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(objective).lower()).strip()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def _residual_child_specifications(

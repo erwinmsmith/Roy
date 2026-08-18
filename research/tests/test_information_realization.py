@@ -34,6 +34,7 @@ from roy_research.tau3_agent import (
     _is_stop_message,
     _non_thinking_arguments,
     _normalize_report,
+    _objective_fingerprint,
     _residual_child_specifications,
     _stop_content,
     _topology_summary,
@@ -155,6 +156,10 @@ class InformationRealizationTests(unittest.TestCase):
             report, {"id": "root"}, ["root"]
         )
         self.assertEqual(specifications[1]["depends_on_node_ids"], ["child-1"])
+        self.assertEqual(
+            _objective_fingerprint("Retrieve reservation K1NW8N."),
+            _objective_fingerprint("retrieve RESERVATION k1nw8n"),
+        )
 
     def test_residual_requirement_becomes_open_child_specification(self) -> None:
         report = _normalize_report({
