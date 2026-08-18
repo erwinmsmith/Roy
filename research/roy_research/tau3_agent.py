@@ -34,6 +34,11 @@ requested from the user. When an available tool can resolve missing task informa
 residual requirement whose possible_external_access names that tool. Do not claim that a lookup
 is unavailable when its tool is listed. Use proposed_children only for genuinely separable
 reasoning, verification, evidence, or planning gaps; tool access itself belongs in ACQUIRE.
+Do not propose a child whose only job is to ask the user for information, wait for the next
+user message, or repeat an ancestor's interaction gap. Report that as a residual requirement;
+Roy handles user interaction as ACQUIRE and resumes this node after the reply. When the task
+contains several separable downstream investigations, expose those substantive gaps even when
+they share an unresolved prerequisite.
 When the local graph exposes another node whose report is genuinely required by a proposed
 child, include that exact node id in depends_on_node_ids. Do not name the current node or one
 of its ancestors as a dependency. Roy may derive a child directly from a residual requirement
@@ -107,6 +112,7 @@ def register_tau3_organization_agent(
         used_candidates: list[str] = Field(default_factory=list)
         derived_gap_keys: list[str] = Field(default_factory=list)
         pending_acquisition_node: str | None = None
+        pending_user_acquisition_node: str | None = None
         final_output: str | None = None
         stopped: bool = False
         decision_count: int = 0
@@ -199,9 +205,12 @@ def register_tau3_organization_agent(
                 if isinstance(message, ToolMessage):
                     self._ingest_tool_observation(message, state)
                 elif isinstance(message, UserMessage):
-                    root = state.nodes[0]
-                    root["objective"] = str(message.content)
-                    root["status"] = "ready"
+                    if state.pending_user_acquisition_node:
+                        self._ingest_user_observation(message, state)
+                    else:
+                        root = state.nodes[0]
+                        root["objective"] = str(message.content)
+                        root["status"] = "ready"
 
             for _ in range(config.maximum_internal_decisions_per_turn):
                 if state.decision_count >= config.runtime_budget.maximum_decisions:
@@ -235,7 +244,9 @@ def register_tau3_organization_agent(
                     "candidate_id": candidate["id"],
                     "description": candidate.get("description"),
                 }
-                for key in ("tool_name", "from", "to", "resulting_depth"):
+                for key in (
+                    "tool_name", "from", "to", "resulting_depth", "user_interaction"
+                ):
                     if candidate.get(key) is not None:
                         action_record[key] = candidate[key]
                 if candidate.get("proposal") is not None:
@@ -276,6 +287,18 @@ def register_tau3_organization_agent(
             node = self._node(state, actor_id)
             node["status"] = "ready"
             state.pending_acquisition_node = None
+
+        def _ingest_user_observation(self, message, state: OrganizationState) -> None:
+            actor_id = state.pending_user_acquisition_node or "root"
+            state.observations.append({
+                "id": f"observation-{len(state.observations)}",
+                "node_id": actor_id,
+                "source_type": "user",
+                "observation": str(getattr(message, "content", message)),
+                "provenance": "tau3-user-conversation",
+            })
+            self._node(state, actor_id)["status"] = "ready"
+            state.pending_user_acquisition_node = None
 
         def _apply(self, candidate, state, generate_fn, assistant_type, system_type):
             kind = str(candidate["kind"])
@@ -339,6 +362,13 @@ def register_tau3_organization_agent(
                 self._node(state, str(candidate["target_node_id"]))["status"] = "pruned"
                 return None
             if kind == "ACQUIRE":
+                if candidate.get("user_interaction"):
+                    state.pending_user_acquisition_node = actor["id"]
+                    actor["status"] = "waiting"
+                    return assistant_type(
+                        role="assistant",
+                        content=_user_acquisition_question(candidate["requirement"]),
+                    )
                 state.pending_acquisition_node = actor["id"]
                 actor["status"] = "waiting"
                 selected_tools = [
@@ -553,6 +583,27 @@ def register_tau3_organization_agent(
                             "depth_delta": 1,
                         })
                 residuals = list(report.get("residual_requirements", []))
+                for residual in residuals:
+                    if not isinstance(residual, Mapping) or not _is_user_interaction_requirement(
+                        residual
+                    ):
+                        continue
+                    gap_id = str(residual.get("id") or "interaction")
+                    identifier = f"acquire-user:{actor}:{gap_id}"
+                    if identifier not in used:
+                        result.append({
+                            **_candidate(
+                                identifier,
+                                "ACQUIRE",
+                                actor,
+                                f"Acquire required information from the user: {residual.get('description', '')}",
+                                0.5,
+                            ),
+                            "requirement": dict(residual),
+                            "user_interaction": True,
+                            "external_access": True,
+                            "resolves_gap": True,
+                        })
                 external_residuals = [
                     value for value in residuals
                     if isinstance(value, Mapping) and value.get("possible_external_access")
@@ -627,11 +678,17 @@ def register_tau3_organization_agent(
             budget = config.runtime_budget
             kind = str(candidate["kind"])
             llm_remaining = budget.maximum_llm_calls - state.llm_call_count
-            if kind in {"EXECUTE", "ACQUIRE"} and llm_remaining <= 1:
+            if kind == "EXECUTE" and llm_remaining <= 1:
+                return False
+            if kind == "ACQUIRE" and not candidate.get("user_interaction") and llm_remaining <= 1:
                 return False
             if kind == "STOP" and llm_remaining < 1:
                 return False
-            if kind == "ACQUIRE" and state.tool_call_count >= budget.maximum_tool_calls:
+            if (
+                kind == "ACQUIRE"
+                and not candidate.get("user_interaction")
+                and state.tool_call_count >= budget.maximum_tool_calls
+            ):
                 return False
             if kind == "DERIVE":
                 return (
@@ -1079,6 +1136,8 @@ def _residual_child_specifications(
         gap_id = str(proposal.get("triggering_gap_id") or "")
         if gap_id not in gaps:
             continue
+        if _is_user_interaction_requirement(gaps[gap_id]):
+            continue
         child = dict(proposal)
         child["depends_on_node_ids"] = _safe_dependency_ids(
             child.get("depends_on_node_ids"), known, actor_id
@@ -1088,6 +1147,8 @@ def _residual_child_specifications(
     for index, gap in enumerate(residuals):
         gap_id = str(gap.get("id") or f"gap-{actor_id}-{index}")
         if gap_id in explicit_gap_ids:
+            continue
+        if _is_user_interaction_requirement(gap):
             continue
         description = str(
             gap.get("description")
@@ -1111,6 +1172,38 @@ def _residual_child_specifications(
             "origin": "model_reported_residual",
         })
     return result
+
+
+def _is_user_interaction_requirement(requirement: Mapping[str, Any]) -> bool:
+    access = {
+        str(value).strip().lower()
+        for value in _as_list(requirement.get("possible_external_access"))
+    }
+    text = " ".join(
+        str(requirement.get(key) or "").lower()
+        for key in ("description", "required_information", "termination_condition")
+    )
+    interaction_phrases = (
+        "ask the user",
+        "ask user",
+        "prompt the user",
+        "user message",
+        "user's user_id",
+        "user id from the user",
+        "provided by the user",
+        "confirm with the user",
+    )
+    user_access = bool(access & {"user", "customer", "human", "user_simulator"})
+    return user_access or any(phrase in text for phrase in interaction_phrases)
+
+
+def _user_acquisition_question(requirement: Mapping[str, Any]) -> str:
+    description = str(
+        requirement.get("description")
+        or requirement.get("required_information")
+        or "the missing information needed to continue"
+    ).strip()
+    return f"To continue, could you please provide this information: {description}?"
 
 
 def _safe_dependency_ids(value: Any, known: set[str], actor_id: str) -> list[str]:

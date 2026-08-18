@@ -29,6 +29,7 @@ from roy_research.tau3 import TAU3_COMMIT, build_tau3_manifest, manifest_summary
 from roy_research.tau3_agent import (
     _bound_tool_call_payload,
     _communication_candidate_allowed,
+    _is_user_interaction_requirement,
     _is_stop_message,
     _non_thinking_arguments,
     _normalize_report,
@@ -36,6 +37,7 @@ from roy_research.tau3_agent import (
     _stop_content,
     _topology_summary,
     _tool_argument_prompt,
+    _user_acquisition_question,
 )
 
 
@@ -150,6 +152,26 @@ class InformationRealizationTests(unittest.TestCase):
         self.assertEqual(len(specifications), 1)
         self.assertEqual(specifications[0]["objective"], "Independently verify the fare")
         self.assertEqual(specifications[0]["depends_on_node_ids"], ["node-1"])
+
+    def test_user_interaction_gap_is_acquired_instead_of_recursively_derived(self) -> None:
+        report = _normalize_report({
+            "residual_requirements": [{
+                "id": "gap-user-id",
+                "description": "Ask the user for their user_id and wait for the next user message",
+                "possible_external_access": ["user"],
+            }],
+            "proposed_children": [{
+                "triggering_gap_id": "gap-user-id",
+                "objective": "Prompt the user for their user_id",
+                "termination_condition": "Receive the next user message",
+            }],
+        }, {"id": "root"})
+        self.assertTrue(_is_user_interaction_requirement(report["residual_requirements"][0]))
+        self.assertEqual(
+            _residual_child_specifications(report, {"id": "root"}, ["root"]), []
+        )
+        question = _user_acquisition_question(report["residual_requirements"][0])
+        self.assertIn("user_id", question)
 
     def test_optional_communication_candidates_are_sparse_and_acyclic(self) -> None:
         root = {"id": "root", "status": "reported", "report": {"conclusion": "x"}}
