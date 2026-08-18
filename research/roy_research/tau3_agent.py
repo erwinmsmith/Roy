@@ -188,6 +188,11 @@ def register_tau3_organization_agent(
                         "llm_call_budget_exhausted"
                     )
                 candidates = self._candidates(state)
+                if not any(bool(value.get("legal", True)) for value in candidates):
+                    return self._truncate_and_finalize(
+                        state, generate, AssistantMessage, SystemMessage,
+                        "runtime_action_budget_exhausted"
+                    )
                 policy_state = self._policy_state(state, candidates)
                 candidate, record = sample_organization_decision(
                     self.policy,
@@ -284,13 +289,17 @@ def register_tau3_organization_agent(
                     ),
                 )
                 state.llm_call_count += 1
-                return generate_fn(
+                outward = generate_fn(
                     model=self.llm,
                     tools=self.tools,
                     messages=state.system_messages + state.messages + [prompt],
                     call_name="roy_acquire",
                     **self.llm_args,
                 )
+                tool_calls = list(getattr(outward, "tool_calls", None) or [])
+                if len(tool_calls) > 1:
+                    outward = outward.model_copy(update={"tool_calls": tool_calls[:1]})
+                return outward
             if kind == "STOP":
                 outward = self._final_message(state, generate_fn, system_type)
                 state.final_output = str(outward.content or "")
@@ -439,8 +448,12 @@ def register_tau3_organization_agent(
                 return False
             if kind == "DERIVE":
                 return (
-                    len(state.nodes) < budget.maximum_nodes
-                    and int(candidate.get("resulting_depth", 0)) <= budget.maximum_depth
+                    len(state.nodes) < min(
+                        budget.maximum_nodes, config.envelope().maximum_nodes
+                    )
+                    and int(candidate.get("resulting_depth", 0)) <= min(
+                        budget.maximum_depth, config.envelope().maximum_depth
+                    )
                 )
             return state.decision_count < budget.maximum_decisions
 
