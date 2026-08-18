@@ -30,6 +30,7 @@ from roy_research.tau3_agent import (
     _bound_tool_call_payload,
     _communication_candidate_allowed,
     _is_user_interaction_requirement,
+    _matching_tool_names,
     _is_stop_message,
     _non_thinking_arguments,
     _normalize_report,
@@ -83,6 +84,19 @@ class InformationRealizationTests(unittest.TestCase):
             [True, True, True],
         )
 
+    def test_floor_prefers_report_grounded_acquisition_when_no_child_exists(self) -> None:
+        envelope = ExplorationEnvelope("acquire", 6, 12, 3, 5, "expansive")
+        candidates = [
+            {"kind": "ACQUIRE", "legal": True, "resolves_gap": False},
+            {"kind": "ACQUIRE", "legal": True, "resolves_gap": True},
+            {"kind": "EXECUTE", "legal": True},
+            {"kind": "STOP", "legal": True},
+        ]
+        self.assertEqual(
+            envelope_legal_actions(candidates, envelope, 2, 1, True),
+            [False, True, False, False],
+        )
+
     def test_training_accepts_only_terminal_task_utility(self) -> None:
         self.assertEqual(require_single_terminal_utility({"terminal_utility": 0.75}), 0.75)
         with self.assertRaisesRegex(ValueError, "forbidden reward"):
@@ -114,9 +128,8 @@ class InformationRealizationTests(unittest.TestCase):
         report = _normalize_report({
             "residual_requirements": [
                 {
-                    "description": "Verify the account holder before changing the booking",
-                    "possible_external_access": ["get_user_details"],
-                    "termination_condition": "Return the verified user id with evidence",
+                    "description": "Independently verify the applicable booking policy",
+                    "termination_condition": "Return the verified policy with evidence",
                 },
                 {
                     "id": "gap-policy",
@@ -132,7 +145,7 @@ class InformationRealizationTests(unittest.TestCase):
         self.assertEqual(specifications[0]["origin"], "model_reported_residual")
         self.assertEqual(
             specifications[0]["termination_condition"],
-            "Return the verified user id with evidence",
+            "Return the verified policy with evidence",
         )
         self.assertEqual(specifications[1]["triggering_gap_id"], "gap-policy")
 
@@ -172,6 +185,25 @@ class InformationRealizationTests(unittest.TestCase):
         )
         question = _user_acquisition_question(report["residual_requirements"][0])
         self.assertIn("user_id", question)
+
+    def test_tool_access_gap_is_acquired_instead_of_recursively_derived(self) -> None:
+        report = _normalize_report({
+            "residual_requirements": [{
+                "id": "gap-details",
+                "description": "Look up the user's account details",
+                "possible_external_access": ["get_user_details tool"],
+            }],
+        }, {"id": "root"})
+        self.assertEqual(
+            _residual_child_specifications(report, {"id": "root"}, ["root"]), []
+        )
+        self.assertEqual(
+            _matching_tool_names(
+                report["residual_requirements"],
+                ["get_user_details", "cancel_reservation"],
+            ),
+            {"get_user_details"},
+        )
 
     def test_optional_communication_candidates_are_sparse_and_acyclic(self) -> None:
         root = {"id": "root", "status": "reported", "report": {"conclusion": "x"}}

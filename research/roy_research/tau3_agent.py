@@ -608,8 +608,21 @@ def register_tau3_organization_agent(
                     value for value in residuals
                     if isinstance(value, Mapping) and value.get("possible_external_access")
                 ]
+                available_tool_names = [str(value["name"]) for value in state.available_tools]
+                hinted_tool_names = _matching_tool_names(
+                    external_residuals, available_tool_names
+                )
                 for tool in state.available_tools:
                     tool_name = str(tool["name"])
+                    matched_residuals = [
+                        value for value in external_residuals
+                        if tool_name in _matching_tool_names([value], available_tool_names)
+                    ]
+                    resolves_gap = (
+                        tool_name in hinted_tool_names
+                        if hinted_tool_names
+                        else bool(external_residuals)
+                    )
                     identifier = (
                         f"acquire-tool:{actor}:{tool_name}:{state.decision_count}"
                     )
@@ -622,12 +635,14 @@ def register_tau3_organization_agent(
                             3.0,
                         ),
                         "requirement": {
-                            "residual_requirements": external_residuals,
+                            "residual_requirements": (
+                                matched_residuals if hinted_tool_names else external_residuals
+                            ),
                             "selected_tool": tool_name,
                         },
                         "tool_name": tool_name,
                         "external_access": True,
-                        "resolves_gap": bool(external_residuals),
+                        "resolves_gap": resolves_gap,
                     })
                 if actor != "root":
                     result.append(_candidate(f"return:{actor}", "RETURN", actor, "Return the epistemic report to the parent", 0.2))
@@ -1150,6 +1165,8 @@ def _residual_child_specifications(
             continue
         if _is_user_interaction_requirement(gap):
             continue
+        if _as_list(gap.get("possible_external_access")):
+            continue
         description = str(
             gap.get("description")
             or gap.get("required_information")
@@ -1204,6 +1221,23 @@ def _user_acquisition_question(requirement: Mapping[str, Any]) -> str:
         or "the missing information needed to continue"
     ).strip()
     return f"To continue, could you please provide this information: {description}?"
+
+
+def _matching_tool_names(
+    residuals: Sequence[Mapping[str, Any]], available_tool_names: Sequence[str]
+) -> set[str]:
+    names = {str(value) for value in available_tool_names}
+    result: set[str] = set()
+    for residual in residuals:
+        for hint in _as_list(residual.get("possible_external_access")):
+            normalized = re.sub(r"[^a-z0-9_]+", "_", str(hint).lower()).strip("_")
+            for name in names:
+                lowered = name.lower()
+                if normalized == lowered or lowered in normalized.split("_"):
+                    result.add(name)
+                elif lowered in normalized and len(lowered) >= 6:
+                    result.add(name)
+    return result
 
 
 def _safe_dependency_ids(value: Any, known: set[str], actor_id: str) -> list[str]:

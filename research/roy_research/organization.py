@@ -126,17 +126,30 @@ def envelope_legal_actions(
         index for index, (candidate, legal) in enumerate(zip(candidates, result))
         if legal and str(candidate.get("kind")) == "DERIVE"
     ]
-    if unresolved_gap_exists and legal_derivations:
-        preferred = legal_derivations
-        if maximum_depth_reached < envelope.minimum_depth:
-            depth_increasing = [
-                index for index in legal_derivations
-                if int(candidates[index].get("resulting_depth", 0))
-                > maximum_depth_reached
+    floors_unmet = (
+        node_count < envelope.minimum_nodes
+        or maximum_depth_reached < envelope.minimum_depth
+    )
+    if unresolved_gap_exists and floors_unmet:
+        preferred: list[int] = []
+        if legal_derivations:
+            preferred = legal_derivations
+            if maximum_depth_reached < envelope.minimum_depth:
+                depth_increasing = [
+                    index for index in legal_derivations
+                    if int(candidates[index].get("resulting_depth", 0))
+                    > maximum_depth_reached
+                ]
+                if depth_increasing:
+                    preferred = depth_increasing
+        else:
+            preferred = [
+                index for index, (candidate, legal) in enumerate(zip(candidates, result))
+                if legal
+                and str(candidate.get("kind")) == "ACQUIRE"
+                and bool(candidate.get("resolves_gap"))
             ]
-            if depth_increasing:
-                preferred = depth_increasing
-        if node_count < envelope.minimum_nodes or maximum_depth_reached < envelope.minimum_depth:
+        if preferred:
             preferred_set = set(preferred)
             result = [legal and index in preferred_set for index, legal in enumerate(result)]
     if not any(result):
