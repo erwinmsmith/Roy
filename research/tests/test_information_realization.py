@@ -28,7 +28,7 @@ from roy_research.organization_training import (
 from roy_research.tau3 import TAU3_COMMIT, build_tau3_manifest, manifest_summary
 from roy_research.tau3_agent import (
     _bound_tool_call_payload,
-    _non_thinking_tool_arguments,
+    _non_thinking_arguments,
     _normalize_report,
     _tool_argument_prompt,
 )
@@ -88,7 +88,7 @@ class InformationRealizationTests(unittest.TestCase):
         )
 
     def test_acquire_generates_arguments_without_delegating_tool_identity(self) -> None:
-        arguments = _non_thinking_tool_arguments({
+        arguments = _non_thinking_arguments({
             "max_tokens": 50000,
             "extra_body": {"provider_option": "preserved", "thinking": {"type": "enabled"}},
         })

@@ -323,7 +323,7 @@ def register_tau3_organization_agent(
                         dict(candidate["requirement"]),
                     ),
                 )
-                acquire_arguments = _non_thinking_tool_arguments(self.llm_args)
+                acquire_arguments = _non_thinking_arguments(self.llm_args)
                 acquire_arguments["response_format"] = {"type": "json_object"}
                 state.llm_call_count += 1
                 argument_response = generate_fn(
@@ -391,7 +391,7 @@ def register_tau3_organization_agent(
                     system_type(role="system", content=json.dumps(context, ensure_ascii=False)),
                 ],
                 call_name="roy_epistemic_report",
-                **self.llm_args,
+                **_non_thinking_arguments(self.llm_args),
             )
             self._record_llm_event(state, "roy_epistemic_report", node["id"], response)
             return _normalize_report(_parse_json_object(str(response.content or "{}")), node)
@@ -435,7 +435,7 @@ def register_tau3_organization_agent(
                 tools=[],
                 messages=state.system_messages + state.messages + [synthesis],
                 call_name="roy_final_answer",
-                **self.llm_args,
+                **_non_thinking_arguments(self.llm_args),
             )
             self._record_llm_event(state, "roy_final_answer", "root", response)
             return response
@@ -751,8 +751,8 @@ def _candidate(
     }
 
 
-def _non_thinking_tool_arguments(arguments: Mapping[str, Any]) -> Dict[str, Any]:
-    """Disable DeepSeek thinking for short structured tool-argument generation."""
+def _non_thinking_arguments(arguments: Mapping[str, Any]) -> Dict[str, Any]:
+    """Disable thinking because tau3 does not preserve DeepSeek reasoning metadata."""
 
     result = dict(arguments)
     extra_body = dict(result.get("extra_body") or {})
