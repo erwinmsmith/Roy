@@ -666,8 +666,8 @@ def _parse_json_object(text: str) -> Dict[str, Any]:
 
 
 def _normalize_report(value: Mapping[str, Any], node: Mapping[str, Any]) -> Dict[str, Any]:
-    gaps = list(value.get("residual_requirements") or [])
-    proposals = list(value.get("proposed_children") or [])
+    gaps = _as_list(value.get("residual_requirements"))
+    proposals = _as_list(value.get("proposed_children"))
     normalized_gaps = []
     for index, gap in enumerate(gaps):
         if not isinstance(gap, Mapping):
@@ -676,7 +676,7 @@ def _normalize_report(value: Mapping[str, Any], node: Mapping[str, Any]) -> Dict
             **dict(gap),
             "id": str(gap.get("id") or f"gap-{node['id']}-{index}"),
             "description": str(gap.get("description") or gap.get("required_information") or "unresolved requirement"),
-            "possible_external_access": list(gap.get("possible_external_access") or []),
+            "possible_external_access": _as_list(gap.get("possible_external_access")),
         })
     normalized_proposals = []
     gap_ids = {value["id"] for value in normalized_gaps}
@@ -695,23 +695,46 @@ def _normalize_report(value: Mapping[str, Any], node: Mapping[str, Any]) -> Dict
                 "triggering_gap_id": gap_id,
                 "objective": objective,
                 "termination_condition": termination,
+                "depends_on_node_ids": [
+                    str(identifier) for identifier in _as_list(
+                        proposal.get("depends_on_node_ids")
+                    )
+                ],
             })
     return {
         "conclusion": str(value.get("conclusion") or ""),
         "reasoning_summary": str(value.get("reasoning_summary") or ""),
-        "claims": list(value.get("claims") or []),
-        "evidence": list(value.get("evidence") or []),
-        "external_observations": list(value.get("external_observations") or []),
-        "assumptions": list(value.get("assumptions") or []),
-        "uncertainty": dict(value.get("uncertainty") or {}),
-        "conflicts": list(value.get("conflicts") or []),
-        "coverage": dict(value.get("coverage") or {}),
-        "blind_spots": list(value.get("blind_spots") or []),
+        "claims": _as_list(value.get("claims")),
+        "evidence": _as_list(value.get("evidence")),
+        "external_observations": _as_list(value.get("external_observations")),
+        "assumptions": _as_list(value.get("assumptions")),
+        "uncertainty": _as_mapping(value.get("uncertainty")),
+        "conflicts": _as_list(value.get("conflicts")),
+        "coverage": _as_mapping(value.get("coverage")),
+        "blind_spots": _as_list(value.get("blind_spots")),
         "residual_requirements": normalized_gaps,
         "proposed_children": normalized_proposals,
         "resolved_parent_gap": bool(value.get("resolved_parent_gap", False)),
-        "information_to_propagate": list(value.get("information_to_propagate") or []),
+        "information_to_propagate": _as_list(value.get("information_to_propagate")),
     }
+
+
+def _as_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
+
+
+def _as_mapping(value: Any) -> Dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    if value is None:
+        return {}
+    return {"summary": value}
 
 
 def _stable_json_hash(value: Mapping[str, Any]) -> str:

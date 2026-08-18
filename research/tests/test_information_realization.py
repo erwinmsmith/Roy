@@ -26,6 +26,7 @@ from roy_research.organization_training import (
     single_objective_organization_grpo_loss,
 )
 from roy_research.tau3 import TAU3_COMMIT, build_tau3_manifest, manifest_summary
+from roy_research.tau3_agent import _normalize_report
 
 
 class InformationRealizationTests(unittest.TestCase):
@@ -61,6 +62,25 @@ class InformationRealizationTests(unittest.TestCase):
                 "terminal_utility": 1.0,
                 "communication_reward": 0.1,
             })
+
+    def test_node_report_normalizes_real_model_shape_variants(self) -> None:
+        report = _normalize_report({
+            "conclusion": "done",
+            "uncertainty": "moderate",
+            "coverage": ["refund policy"],
+            "claims": "one claim",
+            "residual_requirements": {
+                "description": "look up booking",
+                "possible_external_access": "reservation tool",
+            },
+        }, {"id": "root"})
+        self.assertEqual(report["uncertainty"], {"summary": "moderate"})
+        self.assertEqual(report["coverage"], {"summary": ["refund policy"]})
+        self.assertEqual(report["claims"], ["one claim"])
+        self.assertEqual(
+            report["residual_requirements"][0]["possible_external_access"],
+            ["reservation tool"],
+        )
 
     def test_policy_supports_variable_nodes_and_open_candidates(self) -> None:
         model = InformationRealizationPolicy(hidden_dim=64, layers=2)
