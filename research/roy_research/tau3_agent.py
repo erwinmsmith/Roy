@@ -84,6 +84,7 @@ def register_tau3_organization_agent(
         communication_edges: list[Dict[str, Any]] = Field(default_factory=list)
         observations: list[Dict[str, Any]] = Field(default_factory=list)
         policy_records: list[Dict[str, Any]] = Field(default_factory=list)
+        llm_events: list[Dict[str, Any]] = Field(default_factory=list)
         actions: list[Dict[str, Any]] = Field(default_factory=list)
         used_candidates: list[str] = Field(default_factory=list)
         pending_acquisition_node: str | None = None
@@ -299,6 +300,7 @@ def register_tau3_organization_agent(
                 tool_calls = list(getattr(outward, "tool_calls", None) or [])
                 if len(tool_calls) > 1:
                     outward = outward.model_copy(update={"tool_calls": tool_calls[:1]})
+                self._record_llm_event(state, "roy_acquire", actor["id"], outward)
                 return outward
             if kind == "STOP":
                 outward = self._final_message(state, generate_fn, system_type)
@@ -333,6 +335,7 @@ def register_tau3_organization_agent(
                 call_name="roy_epistemic_report",
                 **self.llm_args,
             )
+            self._record_llm_event(state, "roy_epistemic_report", node["id"], response)
             return _normalize_report(_parse_json_object(str(response.content or "{}")), node)
 
         def _final_message(self, state, generate_fn, system_type):
@@ -346,13 +349,27 @@ def register_tau3_organization_agent(
                 ),
             )
             state.llm_call_count += 1
-            return generate_fn(
+            response = generate_fn(
                 model=self.llm,
                 tools=[],
                 messages=state.system_messages + state.messages + [synthesis],
                 call_name="roy_final_answer",
                 **self.llm_args,
             )
+            self._record_llm_event(state, "roy_final_answer", "root", response)
+            return response
+
+        @staticmethod
+        def _record_llm_event(state, call_name: str, node_id: str, response) -> None:
+            if hasattr(response, "model_dump"):
+                message = response.model_dump(mode="json", exclude_none=True)
+            else:
+                message = {"representation": str(response)}
+            state.llm_events.append({
+                "call_name": call_name,
+                "node_id": node_id,
+                "message": message,
+            })
 
         def _truncate_and_finalize(
             self, state, generate_fn, assistant_type, system_type, reason: str
@@ -615,6 +632,7 @@ def organization_trajectory_from_state(
             "dependency_edges": list(state.dependency_edges),
             "communication_edges": list(state.communication_edges),
             "observations": list(state.observations),
+            "llm_events": list(state.llm_events),
         },
     }
 

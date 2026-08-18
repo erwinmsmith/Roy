@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import random
 import uuid
 from collections import defaultdict
@@ -232,14 +233,21 @@ def _run_episode(
         task_split_name=official_split,
         task_ids=[str(task_record["task_id"])],
     )
+    llm_arguments: Dict[str, Any] = {
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    api_base = os.environ.get("DEEPSEEK_BASE_URL")
+    if api_base:
+        llm_arguments["api_base"] = api_base.rstrip("/")
     config = TextRunConfig(
         domain=domain,
         agent=agent_name,
         user="user_simulator",
         llm_agent=agent_llm,
-        llm_args_agent={"temperature": temperature, "max_tokens": max_tokens},
+        llm_args_agent=dict(llm_arguments),
         llm_user=user_llm,
-        llm_args_user={"temperature": temperature, "max_tokens": max_tokens},
+        llm_args_user=dict(llm_arguments),
         max_steps=max_steps,
         max_errors=10,
         seed=seed,
