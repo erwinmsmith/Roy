@@ -27,10 +27,10 @@ from roy_research.organization_training import (
 )
 from roy_research.tau3 import TAU3_COMMIT, build_tau3_manifest, manifest_summary
 from roy_research.tau3_agent import (
-    _forced_tool_choice,
+    _bound_tool_call_payload,
     _non_thinking_tool_arguments,
     _normalize_report,
-    _validate_selected_tool_call,
+    _tool_argument_prompt,
 )
 
 
@@ -87,15 +87,7 @@ class InformationRealizationTests(unittest.TestCase):
             ["reservation tool"],
         )
 
-    def test_acquire_requires_exactly_its_bound_tau3_tool(self) -> None:
-        valid = Mock(tool_calls=[{"name": "get_user_details", "arguments": {}}])
-        _validate_selected_tool_call(valid, "get_user_details")
-        with self.assertRaisesRegex(ValueError, "expected exactly one"):
-            _validate_selected_tool_call(Mock(tool_calls=[]), "get_user_details")
-        with self.assertRaisesRegex(ValueError, "provider called get_order_details"):
-            _validate_selected_tool_call(
-                Mock(tool_calls=[{"name": "get_order_details"}]), "get_user_details"
-            )
+    def test_acquire_generates_arguments_without_delegating_tool_identity(self) -> None:
         arguments = _non_thinking_tool_arguments({
             "max_tokens": 50000,
             "extra_body": {"provider_option": "preserved", "thinking": {"type": "enabled"}},
@@ -103,10 +95,22 @@ class InformationRealizationTests(unittest.TestCase):
         self.assertEqual(arguments["max_tokens"], 50000)
         self.assertEqual(arguments["extra_body"]["provider_option"], "preserved")
         self.assertEqual(arguments["extra_body"]["thinking"], {"type": "disabled"})
-        self.assertEqual(
-            _forced_tool_choice("get_user_details"),
+        prompt = _tool_argument_prompt(
+            "get_user_details",
             {"type": "function", "function": {"name": "get_user_details"}},
+            {"selected_tool": "get_user_details"},
         )
+        self.assertIn("Selected tool: get_user_details", prompt)
+        self.assertIn("Return only one JSON object", prompt)
+        self.assertIn("Do not return a tool name", prompt)
+        bound = _bound_tool_call_payload(
+            "update_reservation_flights",
+            {"reservation_id": "ABC123"},
+            "call-test",
+        )
+        self.assertEqual(bound["name"], "update_reservation_flights")
+        self.assertEqual(bound["arguments"], {"reservation_id": "ABC123"})
+        self.assertEqual(bound["requestor"], "assistant")
 
     def test_policy_supports_variable_nodes_and_open_candidates(self) -> None:
         model = InformationRealizationPolicy(hidden_dim=64, layers=2)

@@ -95,6 +95,7 @@ def train_tau3_on_policy(
                     max_tokens,
                     temperature,
                     environment_seed,
+                    trajectories_path.parent / "llm-calls",
                 )
                 trajectory = organization_trajectory_from_state(
                     state,
@@ -189,6 +190,7 @@ def evaluate_tau3_against_direct(
             max_tokens,
             temperature,
             seed + task_index,
+            output_path.parent / "llm-calls",
         )
         name = f"roy_eval_{task_index}_{uuid.uuid4().hex[:8]}"
         config = Tau3OrganizationAgentConfig(
@@ -209,6 +211,7 @@ def evaluate_tau3_against_direct(
             max_tokens,
             temperature,
             seed + task_index,
+            output_path.parent / "llm-calls",
         )
         rows.extend([
             _evaluation_row(task, "single_agent_direct", direct, None),
@@ -227,9 +230,14 @@ def _run_episode(
     max_tokens: int,
     temperature: float,
     seed: int,
+    llm_log_dir: Path,
 ):
     from tau2.data_model.simulation import TextRunConfig
     from tau2.run import build_text_orchestrator, get_tasks, run_simulation
+    from tau2.utils.llm_utils import set_llm_log_dir, set_llm_log_mode
+
+    set_llm_log_dir(llm_log_dir)
+    set_llm_log_mode("all")
 
     domain = str(task_record["domain"])
     retrieval_config = None

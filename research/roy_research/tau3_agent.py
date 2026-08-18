@@ -73,6 +73,7 @@ def register_tau3_organization_agent(
         Message,
         MultiToolMessage,
         SystemMessage,
+        ToolCall,
         ToolMessage,
         UserMessage,
     )
@@ -304,14 +305,6 @@ def register_tau3_organization_agent(
             if kind == "ACQUIRE":
                 state.pending_acquisition_node = actor["id"]
                 actor["status"] = "waiting"
-                prompt = system_type(
-                    role="system",
-                    content=(
-                        "The organization selected ACQUIRE for this residual requirement: "
-                        f"{candidate['requirement']}. Call exactly the selected tau3 tool "
-                        f"{candidate['tool_name']} once with policy-compliant arguments."
-                    ),
-                )
                 selected_tools = [
                     tool for tool in self.tools
                     if self._tool_name(tool) == str(candidate["tool_name"])
@@ -320,18 +313,50 @@ def register_tau3_organization_agent(
                     raise ValueError(
                         f"selected tau3 tool is unavailable or ambiguous: {candidate['tool_name']}"
                     )
+                selected_tool = selected_tools[0]
+                selected_name = str(candidate["tool_name"])
+                prompt = system_type(
+                    role="system",
+                    content=_tool_argument_prompt(
+                        selected_name,
+                        dict(selected_tool.openai_schema),
+                        dict(candidate["requirement"]),
+                    ),
+                )
                 acquire_arguments = _non_thinking_tool_arguments(self.llm_args)
+                acquire_arguments["response_format"] = {"type": "json_object"}
                 state.llm_call_count += 1
-                outward = generate_fn(
+                argument_response = generate_fn(
                     model=self.llm,
-                    tools=selected_tools,
-                    tool_choice=_forced_tool_choice(str(candidate["tool_name"])),
+                    tools=[],
                     messages=state.system_messages + state.messages + [prompt],
-                    call_name="roy_acquire",
+                    call_name="roy_acquire_arguments",
                     **acquire_arguments,
                 )
-                _validate_selected_tool_call(outward, str(candidate["tool_name"]))
-                self._record_llm_event(state, "roy_acquire", actor["id"], outward)
+                arguments = _parse_json_object(str(argument_response.content or "{}"))
+                bound_call = _bound_tool_call_payload(
+                    selected_name,
+                    arguments,
+                    f"call_roy_{uuid.uuid4().hex}",
+                )
+                outward = assistant_type(
+                    role="assistant",
+                    content=None,
+                    tool_calls=[ToolCall(**bound_call)],
+                    cost=getattr(argument_response, "cost", None),
+                    usage=getattr(argument_response, "usage", None),
+                    raw_data={
+                        "roy_bound_tool": selected_name,
+                        "argument_generation": getattr(argument_response, "raw_data", None),
+                    },
+                    generation_time_seconds=getattr(
+                        argument_response, "generation_time_seconds", None
+                    ),
+                )
+                self._record_llm_event(
+                    state, "roy_acquire_arguments", actor["id"], argument_response
+                )
+                self._record_llm_event(state, "roy_acquire_bound", actor["id"], outward)
                 return outward
             if kind == "STOP":
                 outward = self._final_message(state, generate_fn, system_type)
@@ -726,33 +751,8 @@ def _candidate(
     }
 
 
-def _validate_selected_tool_call(response: Any, selected_tool: str) -> None:
-    """Fail closed unless ACQUIRE produced exactly its bound tau3 tool call."""
-
-    tool_calls = list(getattr(response, "tool_calls", None) or [])
-    if len(tool_calls) != 1:
-        raise ValueError(
-            f"ACQUIRE expected exactly one {selected_tool} tool call; got {len(tool_calls)}"
-        )
-    call = tool_calls[0]
-    if isinstance(call, Mapping):
-        called_tool = call.get("name") or dict(call.get("function") or {}).get("name")
-    else:
-        called_tool = getattr(call, "name", None)
-        function = getattr(call, "function", None)
-        if called_tool is None and function is not None:
-            called_tool = (
-                function.get("name") if isinstance(function, Mapping)
-                else getattr(function, "name", None)
-            )
-    if str(called_tool or "") != selected_tool:
-        raise ValueError(
-            f"ACQUIRE selected {selected_tool}, but provider called {called_tool or 'unknown'}"
-        )
-
-
 def _non_thinking_tool_arguments(arguments: Mapping[str, Any]) -> Dict[str, Any]:
-    """Disable DeepSeek thinking only where required tool choice is necessary."""
+    """Disable DeepSeek thinking for short structured tool-argument generation."""
 
     result = dict(arguments)
     extra_body = dict(result.get("extra_body") or {})
@@ -761,10 +761,37 @@ def _non_thinking_tool_arguments(arguments: Mapping[str, Any]) -> Dict[str, Any]
     return result
 
 
-def _forced_tool_choice(selected_tool: str) -> Dict[str, Any]:
-    """Return the OpenAI-compatible exact-function tool choice."""
+def _tool_argument_prompt(
+    selected_tool: str,
+    openai_schema: Mapping[str, Any],
+    requirement: Mapping[str, Any],
+) -> str:
+    """Ask only for arguments; Roy, rather than the provider, binds the tool name."""
 
-    return {"type": "function", "function": {"name": selected_tool}}
+    return (
+        "Roy has already selected exactly one tau3 tool. Return only one JSON object "
+        "containing that tool's arguments. Do not return a tool name, wrapper, prose, "
+        "Markdown, or a tool call. Use only information available in the conversation and "
+        "domain policy. The official tau3 environment will validate and execute the object.\n"
+        f"Selected tool: {selected_tool}\n"
+        f"Residual requirement: {json.dumps(requirement, ensure_ascii=False)}\n"
+        f"Official schema: {json.dumps(dict(openai_schema), ensure_ascii=False)}"
+    )
+
+
+def _bound_tool_call_payload(
+    selected_tool: str,
+    arguments: Mapping[str, Any],
+    identifier: str,
+) -> Dict[str, Any]:
+    """Bind model-generated arguments to the policy-selected tool identity."""
+
+    return {
+        "id": identifier,
+        "name": selected_tool,
+        "arguments": dict(arguments),
+        "requestor": "assistant",
+    }
 
 
 def _parse_json_object(text: str) -> Dict[str, Any]:
