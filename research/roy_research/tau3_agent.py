@@ -90,6 +90,7 @@ def register_tau3_organization_agent(
         observations: list[Dict[str, Any]] = Field(default_factory=list)
         policy_records: list[Dict[str, Any]] = Field(default_factory=list)
         llm_events: list[Dict[str, Any]] = Field(default_factory=list)
+        available_tools: list[Dict[str, Any]] = Field(default_factory=list)
         actions: list[Dict[str, Any]] = Field(default_factory=list)
         used_candidates: list[str] = Field(default_factory=list)
         pending_acquisition_node: str | None = None
@@ -139,6 +140,7 @@ def register_tau3_organization_agent(
                 system_messages=[SystemMessage(role="system", content=self.system_prompt)],
                 messages=list(history),
                 task_id=task_id,
+                available_tools=self._tool_context(),
                 nodes=[{
                     "id": "root",
                     "parent_id": None,
@@ -291,13 +293,22 @@ def register_tau3_organization_agent(
                     role="system",
                     content=(
                         "The organization selected ACQUIRE for this residual requirement: "
-                        f"{candidate['requirement']}. Make exactly one useful tau3 tool call."
+                        f"{candidate['requirement']}. Call exactly the selected tau3 tool "
+                        f"{candidate['tool_name']} once with policy-compliant arguments."
                     ),
                 )
+                selected_tools = [
+                    tool for tool in self.tools
+                    if self._tool_name(tool) == str(candidate["tool_name"])
+                ]
+                if len(selected_tools) != 1:
+                    raise ValueError(
+                        f"selected tau3 tool is unavailable or ambiguous: {candidate['tool_name']}"
+                    )
                 state.llm_call_count += 1
                 outward = generate_fn(
                     model=self.llm,
-                    tools=self.tools,
+                    tools=selected_tools,
                     messages=state.system_messages + state.messages + [prompt],
                     call_name="roy_acquire",
                     **self.llm_args,
@@ -330,7 +341,7 @@ def register_tau3_organization_agent(
                 "returned_child_reports": [value.get("report") for value in returned],
                 "conversation": [str(getattr(value, "content", "")) for value in state.messages[-8:]],
                 "domain_policy": self.domain_policy,
-                "available_tools": self._tool_context(),
+                "available_tools": state.available_tools,
             }
             response = generate_fn(
                 model=self.llm,
@@ -354,8 +365,19 @@ def register_tau3_organization_agent(
                     value = dict(tool)
                 else:
                     value = {"representation": str(tool)}
-                result.append(dict(value) if isinstance(value, Mapping) else {"value": value})
+                record = dict(value) if isinstance(value, Mapping) else {"value": value}
+                record["name"] = self._tool_name(tool)
+                result.append(record)
             return result
+
+        @staticmethod
+        def _tool_name(tool) -> str:
+            name = getattr(tool, "name", None) or getattr(tool, "__name__", None)
+            if name:
+                return str(name)
+            if isinstance(tool, Mapping) and tool.get("name"):
+                return str(tool["name"])
+            return type(tool).__name__
 
         def _final_message(self, state, generate_fn, system_type):
             reports = [value.get("report") for value in state.nodes if value.get("report")]
@@ -432,16 +454,32 @@ def register_tau3_organization_agent(
                             "resolves_gap": True,
                             "depth_delta": 1,
                         })
-                for index, gap in enumerate(report.get("residual_requirements", [])):
-                    if gap.get("possible_external_access"):
-                        identifier = f"acquire:{actor}:{gap.get('id')}:{index}"
-                        if identifier not in used:
-                            result.append({
-                                **_candidate(identifier, "ACQUIRE", actor, str(gap.get("description")), 3.0),
-                                "requirement": gap,
-                                "external_access": True,
-                                "resolves_gap": True,
-                            })
+                residuals = list(report.get("residual_requirements", []))
+                external_residuals = [
+                    value for value in residuals
+                    if isinstance(value, Mapping) and value.get("possible_external_access")
+                ]
+                for tool in state.available_tools:
+                    tool_name = str(tool["name"])
+                    identifier = (
+                        f"acquire-tool:{actor}:{tool_name}:{state.decision_count}"
+                    )
+                    result.append({
+                        **_candidate(
+                            identifier,
+                            "ACQUIRE",
+                            actor,
+                            f"Use tau3 tool {tool_name}: {json.dumps(tool, ensure_ascii=False)}",
+                            3.0,
+                        ),
+                        "requirement": {
+                            "residual_requirements": external_residuals,
+                            "selected_tool": tool_name,
+                        },
+                        "tool_name": tool_name,
+                        "external_access": True,
+                        "resolves_gap": bool(external_residuals),
+                    })
                 if actor != "root":
                     result.append(_candidate(f"return:{actor}", "RETURN", actor, "Return the epistemic report to the parent", 0.2))
                 elif not any(value["status"] in {"ready", "reported", "waiting"} for value in state.nodes[1:]):
@@ -652,6 +690,7 @@ def organization_trajectory_from_state(
             "communication_edges": list(state.communication_edges),
             "observations": list(state.observations),
             "llm_events": list(state.llm_events),
+            "available_tools": list(state.available_tools),
         },
     }
 
