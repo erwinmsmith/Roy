@@ -28,6 +28,11 @@ external_observations, assumptions, uncertainty, conflicts, coverage, blind_spot
 residual_requirements, proposed_children, resolved_parent_gap, information_to_propagate.
 Every proposed child must be a strict refinement tied to one residual requirement and have a
 verifiable termination condition. Do not create a child merely to increase node count.
+Inspect the available tool schemas and domain policy before deciding that information must be
+requested from the user. When an available tool can resolve missing task information, emit a
+residual requirement whose possible_external_access names that tool. Do not claim that a lookup
+is unavailable when its tool is listed. Use proposed_children only for genuinely separable
+reasoning, verification, evidence, or planning gaps; tool access itself belongs in ACQUIRE.
 """.strip()
 
 
@@ -324,6 +329,8 @@ def register_tau3_organization_agent(
                 ],
                 "returned_child_reports": [value.get("report") for value in returned],
                 "conversation": [str(getattr(value, "content", "")) for value in state.messages[-8:]],
+                "domain_policy": self.domain_policy,
+                "available_tools": self._tool_context(),
             }
             response = generate_fn(
                 model=self.llm,
@@ -337,6 +344,18 @@ def register_tau3_organization_agent(
             )
             self._record_llm_event(state, "roy_epistemic_report", node["id"], response)
             return _normalize_report(_parse_json_object(str(response.content or "{}")), node)
+
+        def _tool_context(self) -> list[Dict[str, Any]]:
+            result: list[Dict[str, Any]] = []
+            for tool in self.tools:
+                if hasattr(tool, "model_dump"):
+                    value = tool.model_dump(mode="json", exclude_none=True)
+                elif isinstance(tool, Mapping):
+                    value = dict(tool)
+                else:
+                    value = {"representation": str(tool)}
+                result.append(dict(value) if isinstance(value, Mapping) else {"value": value})
+            return result
 
         def _final_message(self, state, generate_fn, system_type):
             reports = [value.get("report") for value in state.nodes if value.get("report")]
