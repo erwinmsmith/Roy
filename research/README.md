@@ -26,6 +26,17 @@ PYTHONPATH=research python3 -m roy_research tau3-evaluate \
   --summary research/output/tau3/test-summary.json --split test
 ```
 
+On the configured server, Roy and τ³ use separate Python environments. Use the checked-in launcher so Roy's PyTorch/encoder dependencies and τ³'s benchmark dependencies are resolved in a stable order:
+
+```bash
+research/remote/run_tau3.sh tau3-train \
+  --manifest research/output/tau3/manifest.jsonl \
+  --trajectories research/output/tau3/train-trajectories.jsonl \
+  --model research/output/tau3/organization-policy.pt --resume
+```
+
+Set `TAU3_ROOT` only when the pinned checkout is not at the sibling `benchmarks/tau3-bench-v1.0.1` path.
+
 The τ³ checkout is pinned to commit `fc0055dc4e0a316c3f83133267fbd6faaa770992`. Airline, retail and telecom preserve their official train/test split; validation is reserved deterministically from official training tasks. Banking knowledge is held out because the pinned benchmark does not define an official training split for it.
 
 Each training task provides exactly eight complete organization trajectories using the shallow, medium, deep and expansive exploration envelopes defined in the canonical theory. The exact behavior-mixture probability and the sampled policy probability are recorded for every `active node → conditional candidate` decision. One GRPO update follows each freshly sampled group. Evaluation removes minimum node/depth exploration requirements and runs one organization per episode.
