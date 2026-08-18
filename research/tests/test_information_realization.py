@@ -27,6 +27,7 @@ from roy_research.organization_training import (
 )
 from roy_research.tau3 import TAU3_COMMIT, build_tau3_manifest, manifest_summary
 from roy_research.tau3_agent import (
+    _forced_tool_choice,
     _non_thinking_tool_arguments,
     _normalize_report,
     _validate_selected_tool_call,
@@ -102,6 +103,10 @@ class InformationRealizationTests(unittest.TestCase):
         self.assertEqual(arguments["max_tokens"], 50000)
         self.assertEqual(arguments["extra_body"]["provider_option"], "preserved")
         self.assertEqual(arguments["extra_body"]["thinking"], {"type": "disabled"})
+        self.assertEqual(
+            _forced_tool_choice("get_user_details"),
+            {"type": "function", "function": {"name": "get_user_details"}},
+        )
 
     def test_policy_supports_variable_nodes_and_open_candidates(self) -> None:
         model = InformationRealizationPolicy(hidden_dim=64, layers=2)

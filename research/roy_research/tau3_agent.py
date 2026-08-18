@@ -325,7 +325,7 @@ def register_tau3_organization_agent(
                 outward = generate_fn(
                     model=self.llm,
                     tools=selected_tools,
-                    tool_choice="required",
+                    tool_choice=_forced_tool_choice(str(candidate["tool_name"])),
                     messages=state.system_messages + state.messages + [prompt],
                     call_name="roy_acquire",
                     **acquire_arguments,
@@ -759,6 +759,12 @@ def _non_thinking_tool_arguments(arguments: Mapping[str, Any]) -> Dict[str, Any]
     extra_body["thinking"] = {"type": "disabled"}
     result["extra_body"] = extra_body
     return result
+
+
+def _forced_tool_choice(selected_tool: str) -> Dict[str, Any]:
+    """Return the OpenAI-compatible exact-function tool choice."""
+
+    return {"type": "function", "function": {"name": selected_tool}}
 
 
 def _parse_json_object(text: str) -> Dict[str, Any]:
