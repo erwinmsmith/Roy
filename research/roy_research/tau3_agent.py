@@ -46,6 +46,11 @@ class Tau3OrganizationAgentConfig:
     encoder: Any | None = None
     exploration_envelope: ExplorationEnvelope | None = None
     runtime_budget: RuntimeBudget = RuntimeBudget()
+    organization_temperature: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.organization_temperature <= 0:
+            raise ValueError("organization temperature must be positive")
 
     def envelope(self) -> ExplorationEnvelope:
         if self.exploration_envelope is not None:
@@ -215,6 +220,16 @@ def register_tau3_organization_agent(
                     "actor_node_id": record["active_node_id"],
                     "candidate_id": candidate["id"],
                 })
+                print(json.dumps({
+                    "event": "organization_action",
+                    "task_id": state.task_id,
+                    "decision": state.decision_count + 1,
+                    "kind": candidate["kind"],
+                    "actor_node_id": record["active_node_id"],
+                    "candidate_id": candidate["id"],
+                    "tool_name": candidate.get("tool_name"),
+                    "nodes": len(state.nodes),
+                }, sort_keys=True), flush=True)
                 state.used_candidates.append(str(candidate["id"]))
                 state.decision_count += 1
                 outward = self._apply(candidate, state, generate, AssistantMessage, SystemMessage)
@@ -594,6 +609,7 @@ def register_tau3_organization_agent(
                 "maximum_depth_reached": max(int(value["depth"]) for value in state.nodes),
                 "envelope": config.envelope().to_dict(),
                 "unresolved_gap_exists": unresolved_gap_exists,
+                "organization_temperature": config.organization_temperature,
             }
 
         @staticmethod
@@ -652,6 +668,7 @@ def organization_trajectory_from_state(
     rollout_index: int,
     environment_seed: int,
     organization_seed: int,
+    organization_temperature: float,
     runtime_budget: RuntimeBudget,
     realized_resources: Mapping[str, Any] | None = None,
     benchmark_episode: Mapping[str, Any] | None = None,
@@ -669,6 +686,7 @@ def organization_trajectory_from_state(
         "rollout_index": rollout_index,
         "environment_seed": environment_seed,
         "organization_seed": organization_seed,
+        "organization_temperature": organization_temperature,
         "initial_snapshot_fingerprint": str(state.initial_snapshot_fingerprint),
         "envelope": envelope.to_dict(),
         "runtime_budget": runtime_budget.to_dict(),

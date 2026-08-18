@@ -37,6 +37,7 @@ def train_tau3_on_policy(
     max_tokens: int = 50000,
     temperature: float = 0.0,
     epochs: int = 4,
+    organization_temperature: float = 2.0,
     runtime_budget: RuntimeBudget = RuntimeBudget(),
     seed: int = 20260818,
     resume: bool = False,
@@ -82,6 +83,7 @@ def train_tau3_on_policy(
                     encoder=trainer.encoder,
                     exploration_envelope=envelope,
                     runtime_budget=runtime_budget,
+                    organization_temperature=organization_temperature,
                 )
                 register_tau3_organization_agent(agent_config, name=name)
                 simulation, state = _run_episode(
@@ -105,6 +107,7 @@ def train_tau3_on_policy(
                     rollout_index,
                     environment_seed,
                     organization_seed,
+                    organization_temperature,
                     runtime_budget,
                     _resource_summary(simulation, state),
                     _simulation_record(simulation),
@@ -159,6 +162,7 @@ def evaluate_tau3_against_direct(
     max_steps: int = 100,
     max_tokens: int = 50000,
     temperature: float = 0.0,
+    organization_temperature: float = 1.0,
     runtime_budget: RuntimeBudget = RuntimeBudget(),
     seed: int = 20260818,
 ) -> Dict[str, Any]:
@@ -193,6 +197,7 @@ def evaluate_tau3_against_direct(
             encoder=trainer.encoder,
             exploration_envelope=evaluation_envelope,
             runtime_budget=runtime_budget,
+            organization_temperature=organization_temperature,
         )
         register_tau3_organization_agent(config, name=name)
         learned, state = _run_episode(

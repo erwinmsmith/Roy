@@ -18,7 +18,7 @@ PYTHONPATH=research python3 -m roy_research tau3-train \
   --manifest research/output/tau3/manifest.jsonl \
   --trajectories research/output/tau3/train-trajectories.jsonl \
   --model research/output/tau3/organization-policy.pt \
-  --epochs 4 --max-tokens 50000 --resume
+  --epochs 4 --organization-temperature 2.0 --max-tokens 50000 --resume
 
 PYTHONPATH=research python3 -m roy_research tau3-evaluate \
   --manifest research/output/tau3/manifest.jsonl \
@@ -41,7 +41,9 @@ Set `TAU3_ROOT` only when the pinned checkout is not at the sibling `benchmarks/
 
 The τ³ checkout is pinned to commit `fc0055dc4e0a316c3f83133267fbd6faaa770992`. Airline, retail and telecom preserve their official train/test split; validation is reserved deterministically from official training tasks. Banking knowledge is held out because the pinned benchmark does not define an official training split for it.
 
-Each task/epoch provides exactly eight complete organization trajectories under one shared exploration envelope, runtime budget and environment seed. Only the organization sampling seed differs. The exact masked old-policy probability is recorded for every `active node → conditional candidate` decision and replay uses the identical mask. One GRPO update follows each freshly sampled group. The default four epochs anneal conditional node/depth floors as `(6,3) → (4,2) → (2,1) → (0,0)`; floors apply only to genuine actionable residual gaps and never synthesize a gap. Evaluation removes minimum node/depth floors and runs one organization per episode.
+Each task/epoch provides exactly eight complete organization trajectories under one shared exploration envelope, runtime budget and environment seed. Only the organization sampling seed differs. Every tool exposed by the selected τ³ domain becomes its own legal `ACQUIRE` candidate, and the selected candidate is bound to exactly that official tool schema. Airline, retail and telecom expose 14, 16 and 13 tools respectively. Banking uses the official AllTools construction with the pinned local MiniLM encoder, BM25, dense retrieval, shell and dynamically discovered tools; it does not require a remote embedding service.
+
+The exact masked old-policy probability is recorded for every `active node → conditional candidate` decision and replay uses the identical mask and organization temperature. Training defaults to temperature `2.0` to broaden genuine on-policy exploration without mixing in a separate random behavior policy; evaluation defaults to `1.0`. One GRPO update follows each freshly sampled group. The default four epochs anneal conditional node/depth floors as `(6,3) → (4,2) → (2,1) → (0,0)`; floors apply only to genuine actionable residual gaps and never synthesize a gap. Evaluation removes minimum node/depth floors and runs one organization per episode.
 
 The primary baseline is `single_agent_direct`. Reports also distinguish `fixed_complete_mas`, `roy_runtime_heuristic` and `learned_information_realization`; end-to-end success and official τ³ reward are reported separately from organization diagnostics.
 

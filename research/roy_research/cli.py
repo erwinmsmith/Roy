@@ -156,6 +156,7 @@ def parser() -> argparse.ArgumentParser:
     tau3_train.add_argument("--max-tokens", type=int, default=50000)
     tau3_train.add_argument("--temperature", type=float, default=0.0)
     tau3_train.add_argument("--epochs", type=int, default=4)
+    tau3_train.add_argument("--organization-temperature", type=float, default=2.0)
     _add_tau3_runtime_budget_arguments(tau3_train)
     tau3_train.add_argument("--seed", type=int, default=20260818)
     tau3_train.add_argument("--resume", action="store_true")
@@ -174,6 +175,7 @@ def parser() -> argparse.ArgumentParser:
     tau3_evaluate.add_argument("--max-steps", type=int, default=100)
     tau3_evaluate.add_argument("--max-tokens", type=int, default=50000)
     tau3_evaluate.add_argument("--temperature", type=float, default=0.0)
+    tau3_evaluate.add_argument("--organization-temperature", type=float, default=1.0)
     _add_tau3_runtime_budget_arguments(tau3_evaluate)
     tau3_evaluate.add_argument("--seed", type=int, default=20260818)
     return root
@@ -472,6 +474,7 @@ def main(argv: List[str] | None = None) -> None:
             max_tokens=args.max_tokens,
             temperature=args.temperature,
             epochs=args.epochs,
+            organization_temperature=args.organization_temperature,
             runtime_budget=_tau3_runtime_budget(args),
             seed=args.seed,
             resume=args.resume,
@@ -489,6 +492,7 @@ def main(argv: List[str] | None = None) -> None:
             max_steps=args.max_steps,
             max_tokens=args.max_tokens,
             temperature=args.temperature,
+            organization_temperature=args.organization_temperature,
             runtime_budget=_tau3_runtime_budget(args),
             seed=args.seed,
         )

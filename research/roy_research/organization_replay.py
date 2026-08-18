@@ -251,8 +251,11 @@ def _policy_context(
         device=device,
     )
     resources = _organization_resource_tensor(dict(policy_state.get("resources", {})), device)
+    temperature = float(policy_state.get("organization_temperature", 1.0))
+    if temperature <= 0:
+        raise ValueError("organization temperature must be positive during replay")
     active_logits = model.active_node_logits(active_states, graph_state, resources, active_mask)
-    active_log_probs = torch.log_softmax(active_logits, dim=-1)
+    active_log_probs = torch.log_softmax(active_logits / temperature, dim=-1)
 
     candidates = list(policy_state.get("candidates", []))
     if not candidates:
@@ -315,7 +318,10 @@ def _candidate_distribution(
         context["resources"],
         legal_mask,
     )
-    candidate_log_probs = torch.log_softmax(candidate_logits, dim=-1)
+    temperature = float(policy_state.get("organization_temperature", 1.0))
+    if temperature <= 0:
+        raise ValueError("organization temperature must be positive during replay")
+    candidate_log_probs = torch.log_softmax(candidate_logits / temperature, dim=-1)
     return {
         "candidates": candidates,
         "candidate_log_probs": candidate_log_probs,

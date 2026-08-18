@@ -152,6 +152,7 @@ class InformationRealizationTests(unittest.TestCase):
                 "test", 0, 12, 0, 5, "expansive"
             ).to_dict(),
             "unresolved_gap_exists": True,
+            "organization_temperature": 2.0,
         }
         generator = torch.Generator().manual_seed(17)
         _candidate, record = sample_organization_decision(
