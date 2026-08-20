@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import os
 import queue
@@ -22,7 +23,8 @@ class PersistentNodeRPC:
     """Timeout-aware JSONL RPC client with one automatic restore after restart."""
 
     def __init__(self, command: Sequence[str], timeout: float = 120.0,
-                 environment: Mapping[str, str] | None = None) -> None:
+                 environment: Mapping[str, str] | None = None,
+                 stderr_path: Path | None = None) -> None:
         self.command = list(command)
         self.timeout = timeout
         self.process: subprocess.Popen[str] | None = None
@@ -30,6 +32,7 @@ class PersistentNodeRPC:
         self.next_id = 0
         self.last_snapshot: Mapping[str, Any] | None = None
         self.environment = dict(environment or os.environ)
+        self.stderr_path = stderr_path
 
     def start(self) -> None:
         if self.process and self.process.poll() is None:
@@ -40,6 +43,8 @@ class PersistentNodeRPC:
         )
         assert self.process.stdout is not None
         threading.Thread(target=self._read_stdout, args=(self.process.stdout,), daemon=True).start()
+        assert self.process.stderr is not None
+        threading.Thread(target=self._read_stderr, args=(self.process.stderr,), daemon=True).start()
 
     def request(self, method: str, params: Mapping[str, Any], retry: bool = True) -> Mapping[str, Any]:
         self.start()
@@ -99,6 +104,13 @@ class PersistentNodeRPC:
             if line.strip():
                 self.responses.put(line)
 
+    def _read_stderr(self, stream: Any) -> None:
+        for line in stream:
+            if self.stderr_path is not None:
+                self.stderr_path.parent.mkdir(parents=True, exist_ok=True)
+                with self.stderr_path.open("a", encoding="utf-8") as handle:
+                    handle.write(line)
+
 
 try:
     from harbor.agents.base import BaseAgent
@@ -127,8 +139,10 @@ class RoyHarborAgent(BaseAgent):
         child_environment["ROY_LHTB_SEMANTIC_ROOT"] = str(self.semantic_root)
         child_environment["ROY_LHTB_AUDIT_ROOT"] = str(self.runtime_audit_root)
         self.rpc = PersistentNodeRPC(
-            shlex.split(configured), timeout=rpc_timeout, environment=child_environment
+            shlex.split(configured), timeout=rpc_timeout, environment=child_environment,
+            stderr_path=self.runtime_audit_root / "child-stderr.log",
         )
+        atexit.register(self.close)
         self.partial_path = Path(self.logs_dir) / "roy-partial-trajectory.json"
         self.track_file_changes = track_file_changes
 
@@ -143,39 +157,44 @@ class RoyHarborAgent(BaseAgent):
         self.rpc.start()
 
     async def run(self, instruction: str, environment: Any, context: Any) -> None:
-        trajectory_id = str(uuid.uuid4())
-        base_seed = int(os.environ.get("ROY_LHTB_ORGANIZATION_SEED", "20260820"))
-        session_seed = int(hashlib.sha256(
-            str(getattr(environment, "session_id", trajectory_id)).encode("utf-8")
-        ).hexdigest()[:8], 16)
-        response = await asyncio.to_thread(self.rpc.request, "run", {
-            "trajectoryId": trajectory_id,
-            "taskId": getattr(environment, "environment_name", "unknown"),
-            "instruction": instruction,
-            "environmentRevision": os.environ.get("LHTB_COMMIT", "pinned"),
-            "organizationMode": os.environ.get(
-                "ROY_LHTB_ARM", "learned_information_realization"
-            ),
-            "organizationSeed": base_seed ^ session_seed,
-            "initialSnapshotFingerprint": os.environ.get(
-                "ROY_LHTB_INITIAL_FINGERPRINT", ""
-            ),
-        })
-        self._save_partial()
-        await self._drive(response, environment)
-        snapshot = self.rpc.last_snapshot
-        self._save_partial()
-        context.metadata = {
-            **(context.metadata or {}), "roy_trajectory_id": trajectory_id,
-            "roy_partial_trajectory": str(self.partial_path),
-            "roy_semantic_audit_root": str(self.semantic_root),
-            "roy_runtime_audit_root": str(self.runtime_audit_root),
-        }
-        if snapshot:
-            states = list(snapshot.get("processStates", []))
-            usage = dict(states[-1].get("usage", {})) if states else {}
-            context.n_input_tokens = int(usage.get("inputTokens", 0))
-            context.n_output_tokens = int(usage.get("outputTokens", 0))
+        try:
+            trajectory_id = str(uuid.uuid4())
+            base_seed = int(os.environ.get("ROY_LHTB_ORGANIZATION_SEED", "20260820"))
+            session_seed = int(hashlib.sha256(
+                str(getattr(environment, "session_id", trajectory_id)).encode("utf-8")
+            ).hexdigest()[:8], 16)
+            response = await asyncio.to_thread(self.rpc.request, "run", {
+                "trajectoryId": trajectory_id,
+                "taskId": getattr(environment, "environment_name", "unknown"),
+                "instruction": instruction,
+                "environmentRevision": os.environ.get("LHTB_COMMIT", "pinned"),
+                "organizationMode": os.environ.get(
+                    "ROY_LHTB_ARM", "learned_information_realization"
+                ),
+                "organizationSeed": base_seed ^ session_seed,
+                "initialSnapshotFingerprint": os.environ.get(
+                    "ROY_LHTB_INITIAL_FINGERPRINT", ""
+                ),
+            })
+            self._save_partial()
+            await self._drive(response, environment)
+            snapshot = self.rpc.last_snapshot
+            self._save_partial()
+            context.metadata = {
+                **(context.metadata or {}), "roy_trajectory_id": trajectory_id,
+                "roy_partial_trajectory": str(self.partial_path),
+                "roy_semantic_audit_root": str(self.semantic_root),
+                "roy_runtime_audit_root": str(self.runtime_audit_root),
+            }
+            if snapshot:
+                states = list(snapshot.get("processStates", []))
+                usage = dict(states[-1].get("usage", {})) if states else {}
+                context.n_input_tokens = int(usage.get("inputTokens", 0))
+                context.n_output_tokens = int(usage.get("outputTokens", 0))
+        except BaseException:
+            self._save_partial()
+            self.close()
+            raise
 
     async def resume_after_verifier_rejection(self, environment: Any, context: Any) -> None:
         """Compatible with official same-conversation mode when a provider supports it."""

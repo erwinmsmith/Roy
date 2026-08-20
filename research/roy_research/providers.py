@@ -50,6 +50,8 @@ class DeepSeekClient:
         max_tokens: int = 1024,
         temperature: float = 0.7,
         metadata: Dict[str, Any] | None = None,
+        json_mode: bool = False,
+        thinking: str | None = None,
     ) -> Completion:
         # UTF-8 bytes are a conservative upper bound for ordinary tokenizer input
         # units; reserve before dispatch so concurrent callers cannot cross the cap.
@@ -64,6 +66,10 @@ class DeepSeekClient:
             "temperature": temperature,
             "stream": False,
         }
+        if json_mode:
+            request_value["response_format"] = {"type": "json_object"}
+        if thinking is not None:
+            request_value["thinking"] = {"type": thinking}
         payload = json.dumps(request_value).encode("utf-8")
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",

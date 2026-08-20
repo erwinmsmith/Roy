@@ -17,6 +17,7 @@ from roy_research.lhtb import (
     require_training_task,
 )
 from roy_research.process_state import (
+    FrozenDeepSeekSemanticClient,
     GlobalEpistemicState,
     SemanticStateBuilder,
     append_state,
@@ -82,6 +83,36 @@ class FakeSemanticClient:
 
 
 class LHTBProtocolTests(unittest.TestCase):
+    def test_frozen_semantic_client_retries_invalid_json_with_strict_json_mode(self) -> None:
+        class Client:
+            model = "deepseek-v4-flash"
+
+            def __init__(self) -> None:
+                self.calls = []
+                self.responses = ["not-json", json.dumps({
+                    "requirements": [], "claims": [], "assumptions": [], "evidence": [],
+                    "external_observations": [], "blind_spots": [],
+                })]
+
+            def complete(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+                return SimpleNamespace(content=self.responses.pop(0))
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = Client()
+            semantic = FrozenDeepSeekSemanticClient(
+                client, Path(directory) / "cache.jsonl", "frozen", max_attempts=2
+            )
+            result = semantic.complete_json("epistemic_extractor_v1", {"event": {"id": "e"}})
+            self.assertEqual(result["claims"], [])
+            self.assertEqual(len(client.calls), 2)
+            self.assertTrue(all(call[1]["json_mode"] for call in client.calls))
+            self.assertTrue(all(call[1]["thinking"] == "disabled" for call in client.calls))
+            failures = (Path(directory) / "semantic-failures.jsonl").read_text(
+                encoding="utf-8"
+            ).splitlines()
+            self.assertEqual(len(failures), 1)
+
     def test_json_rpc_process_restarts_and_restores_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             server = Path(directory) / "server.py"
@@ -147,6 +178,28 @@ for line in sys.stdin:
             self.assertEqual(environment.calls, [("pwd", "/workspace", 1)])
             self.assertTrue((Path(directory) / "roy-partial-trajectory.json").exists())
             self.assertIn("roy_trajectory_id", context.metadata)
+
+    def test_harbor_agent_closes_rpc_process_after_failed_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            server = Path(directory) / "server.py"
+            server.write_text("""import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    print(json.dumps({'jsonrpc': '2.0', 'id': request['id'],
+                      'error': {'code': -32000, 'message': 'failed'}}), flush=True)
+""", encoding="utf-8")
+
+            class Environment:
+                environment_name = "fake-task"
+
+            agent = RoyHarborAgent(
+                logs_dir=Path(directory), model_name="deepseek/deepseek-v4-flash",
+                node_command=f"{sys.executable} -u {server}", rpc_timeout=1,
+                track_file_changes=False,
+            )
+            with self.assertRaisesRegex(RuntimeError, "failed"):
+                asyncio.run(agent.run("solve", Environment(), SimpleNamespace(metadata=None)))
+            self.assertIsNone(agent.rpc.process)
 
     def test_pinned_split_is_exact_and_trainer_rejects_dev_test(self) -> None:
         records = build_lhtb_split()

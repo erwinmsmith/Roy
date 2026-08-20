@@ -10,11 +10,13 @@ from typing import Any, Dict, Iterable, List, Mapping, Protocol, Sequence, Tuple
 PROCESS_STATE_SCHEMA_VERSION = 1
 SEMANTIC_LABELS = ("entail", "contradict", "unknown")
 
-EXTRACTOR_SYSTEM_PROMPT = """You are a frozen epistemic event extractor. Return JSON only.
-Represent only entities explicit in the supplied event: requirements, claims, assumptions,
-evidence, external_observations, and blind_spots. Give every entity a deterministic stable ID
-derived from its source event ID and local index. Do not infer semantic relations and do not use
-benchmark answer keys or keyword fields."""
+EXTRACTOR_SYSTEM_PROMPT = """You are a frozen epistemic event extractor. Return one JSON object.
+It must contain exactly these six array fields: requirements, claims, assumptions, evidence,
+external_observations, and blind_spots. Requirements need id and description; claims and
+assumptions need id and statement; evidence needs id and content; external observations need id
+and observation; blind spots are strings. Represent only entities explicit in the supplied event.
+Give every entity a deterministic stable ID derived from its source event ID and local index. Do
+not infer semantic relations and do not use benchmark answer keys or keyword fields."""
 
 VERIFIER_SYSTEM_PROMPT = """You are a frozen semantic relation verifier. Return JSON only with
 label (entail, contradict, or unknown) and probabilities for all three labels. Judge meaning in
@@ -83,11 +85,12 @@ class FrozenDeepSeekSemanticClient:
     """Two prompt channels over one frozen DeepSeek endpoint with full cache provenance."""
 
     def __init__(self, client: Any, cache_path: Path, model_revision: str,
-                 max_tokens: int = 4096) -> None:
+                 max_tokens: int = 4096, max_attempts: int = 3) -> None:
         self.client = client
         self.cache_path = cache_path
         self.model_revision = model_revision
         self.max_tokens = max_tokens
+        self.max_attempts = max_attempts
         self.cache: Dict[str, Mapping[str, Any]] = {}
         if cache_path.exists():
             for line in cache_path.read_text(encoding="utf-8").splitlines():
@@ -107,16 +110,36 @@ class FrozenDeepSeekSemanticClient:
         ).encode("utf-8")).hexdigest()
         if cache_key in self.cache:
             return self.cache[cache_key]
-        completion = self.client.complete(
-            [{"role": "system", "content": system},
-             {"role": "user", "content": json.dumps(payload, ensure_ascii=False, sort_keys=True)}],
-            max_tokens=self.max_tokens, temperature=0.0,
-            metadata={"semantic_operation": prompt_name, "cache_key": cache_key,
-                      "model_revision": self.model_revision},
-        )
-        response = json.loads(completion.content)
-        if not isinstance(response, Mapping):
-            raise ValueError("semantic DeepSeek response must be a JSON object")
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False,
+                                                     sort_keys=True)},
+        ]
+        response: Mapping[str, Any] | None = None
+        last_error: Exception | None = None
+        for attempt in range(1, self.max_attempts + 1):
+            completion = None
+            try:
+                completion = self.client.complete(
+                    messages, max_tokens=self.max_tokens, temperature=0.0,
+                    metadata={"semantic_operation": prompt_name, "cache_key": cache_key,
+                              "model_revision": self.model_revision,
+                              "semantic_attempt": attempt},
+                    json_mode=True, thinking="disabled",
+                )
+                parsed = _parse_json_object(completion.content)
+                _validate_semantic_response(prompt_name, parsed)
+                response = parsed
+                break
+            except Exception as error:
+                last_error = error
+                self._record_failure(cache_key, request, prompt_name, attempt,
+                                     getattr(completion, "content", None), error)
+        if response is None:
+            raise ValueError(
+                f"semantic DeepSeek response failed schema validation after "
+                f"{self.max_attempts} attempts: {last_error}"
+            ) from last_error
         enriched = dict(response)
         enriched["_provenance"] = {
             "provider": "deepseek", "model": self.client.model,
@@ -130,6 +153,72 @@ class FrozenDeepSeekSemanticClient:
                                     ensure_ascii=False) + "\n")
         self.cache[cache_key] = enriched
         return enriched
+
+    def _record_failure(self, cache_key: str, request: Mapping[str, Any], prompt_name: str,
+                        attempt: int, content: str | None, error: Exception) -> None:
+        path = self.cache_path.parent / "semantic-failures.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "cache_key": cache_key, "request": request, "prompt_name": prompt_name,
+                "attempt": attempt, "response_content": content,
+                "error_type": type(error).__name__, "error": str(error),
+            }, sort_keys=True, ensure_ascii=False) + "\n")
+
+
+def _parse_json_object(content: str) -> Mapping[str, Any]:
+    text = content.strip()
+    candidates = [text]
+    if text.startswith("```") and text.endswith("```"):
+        body = text[3:-3].strip()
+        if body.lower().startswith("json"):
+            body = body[4:].strip()
+        candidates.append(body)
+    start, end = text.find("{"), text.rfind("}")
+    if start >= 0 and end > start:
+        candidates.append(text[start:end + 1])
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            value = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, Mapping):
+            return value
+    raise ValueError("semantic DeepSeek response must contain one JSON object")
+
+
+def _validate_semantic_response(prompt_name: str, response: Mapping[str, Any]) -> None:
+    if prompt_name == "semantic_verifier_v1":
+        probabilities = response.get("probabilities")
+        if response.get("label") not in SEMANTIC_LABELS or not isinstance(probabilities, Mapping) \
+                or set(probabilities) != set(SEMANTIC_LABELS):
+            raise ValueError("semantic verifier response does not match its schema")
+        if any(not isinstance(probabilities[label], (int, float))
+               for label in SEMANTIC_LABELS):
+            raise ValueError("semantic verifier probabilities must be numeric")
+        return
+    fields = {
+        "requirements": ("id", "description"),
+        "claims": ("id", "statement"),
+        "assumptions": ("id", "statement"),
+        "evidence": ("id", "content"),
+        "external_observations": ("id", "observation"),
+    }
+    if set(fields).union({"blind_spots"}) - set(response):
+        raise ValueError("semantic extractor response is missing required arrays")
+    for field_name, required in fields.items():
+        values = response.get(field_name)
+        if not isinstance(values, list) or any(
+            not isinstance(value, Mapping) or any(value.get(key) is None for key in required)
+            for value in values
+        ):
+            raise ValueError(f"semantic extractor field {field_name} does not match its schema")
+    if not isinstance(response.get("blind_spots"), list) or any(
+        not isinstance(value, str) for value in response["blind_spots"]
+    ):
+        raise ValueError("semantic extractor blind_spots does not match its schema")
 
 
 class SemanticStateBuilder:
