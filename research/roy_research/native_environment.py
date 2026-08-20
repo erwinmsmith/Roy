@@ -250,6 +250,13 @@ class NativeProcessEnvironment(BaseEnvironment):
     def _command(self, command: str, cwd: str | None, env: Mapping[str, str]) -> list[str]:
         assert self.session_root is not None
         template = self.template_root / self.native_task_id
+        default_working_directory = str(
+            self._manifest.get("working_directory", "/app")  # type: ignore[union-attr]
+        )
+        working_directory = cwd or default_working_directory
+        if not working_directory.startswith("/"):
+            working_directory = str(Path(default_working_directory) / working_directory)
+        self._mounted_path(working_directory)
         binds: list[tuple[Path, str]] = [
             (self.session_root / "home", "/root"),
             (self.session_root / "tmp", "/tmp"),
@@ -264,10 +271,9 @@ class NativeProcessEnvironment(BaseEnvironment):
             binds.append((template / "venv", "/opt/roy-native/venv"))
         if (template / "bin").exists():
             binds.append((template / "bin", "/opt/roy-native/bin"))
-        proot = ["proot", "-0", "-R", "/"]
+        proot = ["proot", "-0", "-R", "/", "-w", working_directory]
         for source, target in binds:
             proot.extend(["-b", f"{source}:{target}"])
-        working_directory = cwd or str(self._manifest.get("working_directory", "/app"))  # type: ignore[union-attr]
         shell = (
             f"cd -- {shlex.quote(working_directory)} && "
             f"exec /bin/bash -lc {shlex.quote(command)}"

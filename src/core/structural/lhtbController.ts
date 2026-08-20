@@ -107,6 +107,9 @@ Cover every active node that has a semantically useful next action; candidate ac
 that node's exact ID. A node with no proposed candidate cannot be selected by the policy.
 Never repeat an unchanged terminal command immediately after it failed without file changes;
 propose a command that diagnoses or repairs the observed failure.
+When the requested artifacts exist and the task's own end-to-end command succeeds, include a
+legal RETURN candidate for a child or STOP candidate for root alongside any optional extra check;
+record remaining uncertainty instead of creating an endless verification loop.
 Propose only semantically useful actions. Do not expose hidden reasoning, benchmark grader data,
 keyword fields or reward. The preferred candidate is your best next organization decision.`;
 
