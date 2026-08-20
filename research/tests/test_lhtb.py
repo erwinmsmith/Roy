@@ -267,6 +267,7 @@ for line in sys.stdin:
                 "same_conversation",
             )
             self.assertEqual(native_value["retry"]["max_retries"], 0)
+            self.assertEqual(native_value["agents"][0]["kwargs"]["rpc_timeout"], 720)
 
     def test_native_audit_is_fail_closed_and_uses_environment_digest(self) -> None:
         self.assertEqual(

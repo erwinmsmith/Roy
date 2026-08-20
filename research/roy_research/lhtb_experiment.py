@@ -221,7 +221,7 @@ def write_harbor_group_config(
         "agents": [{
             "import_path": "roy_research.harbor_agent:RoyHarborAgent",
             "model_name": "deepseek/deepseek-v4-flash",
-            "kwargs": {"rpc_timeout": 120},
+            "kwargs": {"rpc_timeout": 720},
             "env": {"ROY_LHTB_ARM": arm,
                     "ROY_LHTB_ENVIRONMENT_BACKEND": environment_backend,
                     "ROY_LHTB_INITIAL_FINGERPRINT": initial_fingerprint,

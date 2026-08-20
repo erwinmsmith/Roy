@@ -210,6 +210,7 @@ class RoyHarborAgent(BaseAgent):
             response = await asyncio.to_thread(self.rpc.request, "verifier_rejection", {
                 "feedback": user_prompt,
             })
+            self._save_partial()
             await self._drive(response, self._environment)
             self._save_partial()
             self._update_context(context, confirmed_complete=True)
@@ -239,6 +240,7 @@ class RoyHarborAgent(BaseAgent):
 
     async def _drive(self, response: Mapping[str, Any], environment: Any) -> None:
         while response.get("status") in ("terminal_request", "continue"):
+            self._save_partial()
             if response.get("status") == "continue":
                 response = await asyncio.to_thread(self.rpc.request, "advance", {})
                 self._save_partial()
