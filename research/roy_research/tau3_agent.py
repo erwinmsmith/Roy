@@ -420,6 +420,25 @@ def register_tau3_organization_agent(
                         selected_name,
                         dict(selected_tool.openai_schema),
                         dict(candidate["requirement"]),
+                        {
+                            "actor_node_id": actor["id"],
+                            "local_objective": actor.get("objective"),
+                            "local_report": actor.get("report"),
+                            "external_observations": [
+                                value for value in state.observations
+                                if value.get("node_id") == actor["id"]
+                            ],
+                            "incoming_communications": [
+                                {
+                                    "from": edge["from"],
+                                    "report": self._node(
+                                        state, str(edge["from"])
+                                    ).get("report"),
+                                }
+                                for edge in state.communication_edges
+                                if edge["to"] == actor["id"]
+                            ],
+                        },
                     ),
                 )
                 acquire_arguments = _non_thinking_arguments(self.llm_args)
@@ -1099,6 +1118,7 @@ def _tool_argument_prompt(
     selected_tool: str,
     openai_schema: Mapping[str, Any],
     requirement: Mapping[str, Any],
+    local_context: Mapping[str, Any],
 ) -> str:
     """Ask only for arguments; Roy, rather than the provider, binds the tool name."""
 
@@ -1106,9 +1126,11 @@ def _tool_argument_prompt(
         "Roy has already selected exactly one tau3 tool. Return only one JSON object "
         "containing that tool's arguments. Do not return a tool name, wrapper, prose, "
         "Markdown, or a tool call. Use only information available in the conversation and "
-        "domain policy. The official tau3 environment will validate and execute the object.\n"
+        "the actor-local context below. The official tau3 environment will validate and "
+        "execute the object.\n"
         f"Selected tool: {selected_tool}\n"
         f"Residual requirement: {json.dumps(requirement, ensure_ascii=False)}\n"
+        f"Actor-local context: {json.dumps(dict(local_context), ensure_ascii=False)}\n"
         f"Official schema: {json.dumps(dict(openai_schema), ensure_ascii=False)}"
     )
 

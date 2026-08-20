@@ -346,10 +346,13 @@ class InformationRealizationTests(unittest.TestCase):
             "get_user_details",
             {"type": "function", "function": {"name": "get_user_details"}},
             {"selected_tool": "get_user_details"},
+            {"local_report": {"conclusion": "user id is account-1"}},
         )
         self.assertIn("Selected tool: get_user_details", prompt)
         self.assertIn("Return only one JSON object", prompt)
         self.assertIn("Do not return a tool name", prompt)
+        self.assertIn("Actor-local context", prompt)
+        self.assertIn("account-1", prompt)
         bound = _bound_tool_call_payload(
             "update_reservation_flights",
             {"reservation_id": "ABC123"},
