@@ -322,7 +322,7 @@ def _run_episode(
         llm_user=user_llm,
         llm_args_user=dict(llm_arguments),
         max_steps=max_steps,
-        max_errors=10,
+        max_errors=max_steps,
         seed=seed,
         max_concurrency=1,
     )
