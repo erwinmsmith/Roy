@@ -59,7 +59,7 @@ async function dispatch(request: Request): Promise<unknown> {
     return controller.advance(session, organizationSeed++);
   }
   if (request.method === 'verifier_rejection') {
-    session.resumeAfterVerifierRejection();
+    session.resumeAfterVerifierRejection(String(params.feedback ?? 'Verifier rejected completion'));
     controller ??= new LHTBAutonomousController();
     return controller.advance(session, organizationSeed++);
   }

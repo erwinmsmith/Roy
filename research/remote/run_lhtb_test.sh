@@ -38,6 +38,7 @@ selected_epoch="$("${python_bin}" -c 'import json,sys; print(json.load(open(sys.
 mkdir -p "${run_root}/jobs" "${run_root}/configs"
 export PYTHONPATH="${roy_root}/research${PYTHONPATH:+:${PYTHONPATH}}"
 export ROY_LHTB_NODE_COMMAND="node ${roy_root}/dist/cli/LhtbAgent.js"
+export HB_CONTINUE_MODE=same_conversation
 export ROY_LHTB_POLICY_COMMAND="${python_bin} -m roy_research.lhtb_policy_server"
 export ROY_LHTB_SEMANTIC_COMMAND="${python_bin} -m roy_research.semantic_server"
 export ROY_LHTB_SEMANTIC_ROOT="${run_root}/semantic-test"

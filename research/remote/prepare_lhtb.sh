@@ -80,6 +80,7 @@ roy_smoke() {
   [[ -n "${DEEPSEEK_API_KEY:-}" ]] || { echo "DEEPSEEK_API_KEY is required" >&2; exit 4; }
   export PYTHONPATH="${roy_root}/research${PYTHONPATH:+:${PYTHONPATH}}"
   export ROY_LHTB_NODE_COMMAND="node ${roy_root}/dist/cli/LhtbAgent.js"
+  export HB_CONTINUE_MODE=same_conversation
   export ROY_LHTB_SEMANTIC_COMMAND="${roy_root}/research/.venv/bin/python -m roy_research.semantic_server"
   export ROY_LHTB_SEMANTIC_ROOT="${roy_root}/research/output/lhtb/semantic-smoke"
   export ROY_LHTB_POLICY_COMMAND="${roy_root}/research/.venv/bin/python -m roy_research.lhtb_policy_server"

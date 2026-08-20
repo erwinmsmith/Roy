@@ -128,6 +128,7 @@ class RoyHarborAgent(BaseAgent):
 
     def __init__(self, *args: Any, node_command: str | None = None,
                  rpc_timeout: float = 120.0, track_file_changes: bool = True,
+                 extra_env: Mapping[str, str] | None = None,
                  **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         configured = node_command or os.environ.get(
@@ -136,8 +137,13 @@ class RoyHarborAgent(BaseAgent):
         self.semantic_root = Path(self.logs_dir) / "semantic"
         self.runtime_audit_root = Path(self.logs_dir) / "runtime-audit"
         child_environment = dict(os.environ)
+        child_environment.update({str(key): str(value)
+                                  for key, value in (extra_env or {}).items()})
         child_environment["ROY_LHTB_SEMANTIC_ROOT"] = str(self.semantic_root)
         child_environment["ROY_LHTB_AUDIT_ROOT"] = str(self.runtime_audit_root)
+        self.agent_environment = child_environment
+        if child_environment.get("HB_CONTINUE_MODE"):
+            os.environ["HB_CONTINUE_MODE"] = child_environment["HB_CONTINUE_MODE"]
         self.rpc = PersistentNodeRPC(
             shlex.split(configured), timeout=rpc_timeout, environment=child_environment,
             stderr_path=self.runtime_audit_root / "child-stderr.log",
@@ -145,6 +151,9 @@ class RoyHarborAgent(BaseAgent):
         atexit.register(self.close)
         self.partial_path = Path(self.logs_dir) / "roy-partial-trajectory.json"
         self.track_file_changes = track_file_changes
+        self._environment: Any | None = None
+        self._trajectory_id: str | None = None
+        self._continuation_count = 0
 
     @staticmethod
     def name() -> str:
@@ -154,12 +163,17 @@ class RoyHarborAgent(BaseAgent):
         return "1"
 
     async def setup(self, environment: Any) -> None:
+        self._environment = environment
         self.rpc.start()
 
     async def run(self, instruction: str, environment: Any, context: Any) -> None:
         try:
             trajectory_id = str(uuid.uuid4())
-            base_seed = int(os.environ.get("ROY_LHTB_ORGANIZATION_SEED", "20260820"))
+            self._environment = environment
+            self._trajectory_id = trajectory_id
+            base_seed = int(self.agent_environment.get(
+                "ROY_LHTB_ORGANIZATION_SEED", "20260820"
+            ))
             session_seed = int(hashlib.sha256(
                 str(getattr(environment, "session_id", trajectory_id)).encode("utf-8")
             ).hexdigest()[:8], 16)
@@ -167,41 +181,61 @@ class RoyHarborAgent(BaseAgent):
                 "trajectoryId": trajectory_id,
                 "taskId": getattr(environment, "environment_name", "unknown"),
                 "instruction": instruction,
-                "environmentRevision": os.environ.get("LHTB_COMMIT", "pinned"),
-                "organizationMode": os.environ.get(
+                "environmentRevision": self.agent_environment.get("LHTB_COMMIT", "pinned"),
+                "organizationMode": self.agent_environment.get(
                     "ROY_LHTB_ARM", "learned_information_realization"
                 ),
                 "organizationSeed": base_seed ^ session_seed,
-                "initialSnapshotFingerprint": os.environ.get(
+                "initialSnapshotFingerprint": self.agent_environment.get(
                     "ROY_LHTB_INITIAL_FINGERPRINT", ""
                 ),
             })
             self._save_partial()
             await self._drive(response, environment)
-            snapshot = self.rpc.last_snapshot
             self._save_partial()
-            context.metadata = {
-                **(context.metadata or {}), "roy_trajectory_id": trajectory_id,
-                "roy_partial_trajectory": str(self.partial_path),
-                "roy_semantic_audit_root": str(self.semantic_root),
-                "roy_runtime_audit_root": str(self.runtime_audit_root),
-            }
-            if snapshot:
-                states = list(snapshot.get("processStates", []))
-                usage = dict(states[-1].get("usage", {})) if states else {}
-                context.n_input_tokens = int(usage.get("inputTokens", 0))
-                context.n_output_tokens = int(usage.get("outputTokens", 0))
+            self._update_context(context, confirmed_complete=True)
         except BaseException:
             self._save_partial()
             self.close()
             raise
 
-    async def resume_after_verifier_rejection(self, environment: Any, context: Any) -> None:
+    async def resume_after_verifier_rejection(
+        self, user_prompt: str, context: Any
+    ) -> None:
         """Compatible with official same-conversation mode when a provider supports it."""
-        if self.rpc.last_snapshot is None:
+        if self.rpc.last_snapshot is None or self._environment is None:
             raise RuntimeError("Roy has no session to resume")
-        response = await asyncio.to_thread(self.rpc.request, "verifier_rejection", {})
-        await self._drive(response, environment)
+        try:
+            self._continuation_count += 1
+            response = await asyncio.to_thread(self.rpc.request, "verifier_rejection", {
+                "feedback": user_prompt,
+            })
+            await self._drive(response, self._environment)
+            self._save_partial()
+            self._update_context(context, confirmed_complete=True)
+        except BaseException:
+            self._save_partial()
+            self.close()
+            raise
+
+    def _update_context(self, context: Any, confirmed_complete: bool) -> None:
+        context.metadata = {
+            **(context.metadata or {}),
+            "roy_trajectory_id": self._trajectory_id,
+            "roy_partial_trajectory": str(self.partial_path),
+            "roy_semantic_audit_root": str(self.semantic_root),
+            "roy_runtime_audit_root": str(self.runtime_audit_root),
+            "same_conversation_continuations": self._continuation_count,
+            "termination_reason": (
+                "confirmed_task_complete" if confirmed_complete else "agent_stopped"
+            ),
+        }
+        snapshot = self.rpc.last_snapshot
+        if snapshot:
+            states = list(snapshot.get("processStates", []))
+            usage = dict(states[-1].get("usage", {})) if states else {}
+            context.n_input_tokens = int(usage.get("inputTokens", 0))
+            context.n_output_tokens = int(usage.get("outputTokens", 0))
 
     async def _drive(self, response: Mapping[str, Any], environment: Any) -> None:
         while response.get("status") in ("terminal_request", "continue"):

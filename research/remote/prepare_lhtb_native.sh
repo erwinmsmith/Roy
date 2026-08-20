@@ -175,6 +175,7 @@ open(sys.argv[1], "w", encoding="utf-8").write(json.dumps(value, indent=2) + "\n
 PY
   export PYTHONPATH="${roy_root}/research${PYTHONPATH:+:${PYTHONPATH}}"
   export ROY_LHTB_NATIVE_ROOT="${native_root}"
+  export HB_CONTINUE_MODE=same_conversation
   cd "${lhtb_root}"
   "${harbor_bin}" run -c "${config}" --yes
   "${python_bin}" - "${jobs_root}/${job_name}/result.json" <<'PY'
@@ -201,6 +202,7 @@ roy_smoke() {
   smoke_root="${roy_root}/research/output/lhtb/native/smoke-jobs/${run_id}"
   export PYTHONPATH="${roy_root}/research${PYTHONPATH:+:${PYTHONPATH}}"
   export ROY_LHTB_NODE_COMMAND="node ${roy_root}/dist/cli/LhtbAgent.js"
+  export HB_CONTINUE_MODE=same_conversation
   export ROY_LHTB_SEMANTIC_COMMAND="${python_bin} -m roy_research.semantic_server"
   export ROY_LHTB_SEMANTIC_ROOT="${smoke_root}/semantic"
   export ROY_LHTB_POLICY_COMMAND="${python_bin} -m roy_research.lhtb_policy_server"

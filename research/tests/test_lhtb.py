@@ -173,11 +173,19 @@ for line in sys.stdin:
             environment = Environment()
             try:
                 asyncio.run(agent.run("solve", environment, context))
+                continuation = SimpleNamespace(metadata=None)
+                asyncio.run(agent.resume_after_verifier_rejection(
+                    user_prompt="Verifier rejected phase one", context=continuation
+                ))
             finally:
                 agent.close()
             self.assertEqual(environment.calls, [("pwd", "/workspace", 1)])
             self.assertTrue((Path(directory) / "roy-partial-trajectory.json").exists())
             self.assertIn("roy_trajectory_id", context.metadata)
+            self.assertEqual(continuation.metadata["same_conversation_continuations"], 1)
+            self.assertEqual(
+                continuation.metadata["roy_trajectory_id"], context.metadata["roy_trajectory_id"]
+            )
 
     def test_harbor_agent_closes_rpc_process_after_failed_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -253,6 +261,10 @@ for line in sys.stdin:
             self.assertEqual(
                 native_value["agents"][0]["env"]["ROY_LHTB_ENVIRONMENT_BACKEND"],
                 "native",
+            )
+            self.assertEqual(
+                native_value["agents"][0]["env"]["HB_CONTINUE_MODE"],
+                "same_conversation",
             )
             self.assertEqual(native_value["retry"]["max_retries"], 0)
 

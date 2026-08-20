@@ -205,7 +205,7 @@ export class RoyLHTBSession {
     return this.recordState();
   }
 
-  resumeAfterVerifierRejection(): GlobalEpistemicState {
+  resumeAfterVerifierRejection(feedback?: string): GlobalEpistemicState {
     const snapshot = this.runtime.snapshot();
     const material = {
       ...snapshot,
@@ -221,7 +221,7 @@ export class RoyLHTBSession {
       fingerprint: stableStructuralFingerprint(withoutFingerprint),
     } as RecursiveRuntimeSnapshot);
     this.events.push({ id: `verifier-${this.events.length}`, kind: 'verifier', at: Date.now(),
-      attributes: { result: 'rejected', continuation: 'same_session' } });
+      attributes: { result: 'rejected', continuation: 'same_session', feedback } });
     return this.recordState();
   }
 

@@ -225,7 +225,8 @@ def write_harbor_group_config(
             "env": {"ROY_LHTB_ARM": arm,
                     "ROY_LHTB_ENVIRONMENT_BACKEND": environment_backend,
                     "ROY_LHTB_INITIAL_FINGERPRINT": initial_fingerprint,
-                    "ROY_LHTB_ORGANIZATION_SEED": str(organization_seed)},
+                    "ROY_LHTB_ORGANIZATION_SEED": str(organization_seed),
+                    "HB_CONTINUE_MODE": "same_conversation"},
         }],
         "datasets": [{"path": "./tasks", "task_names": [task_id]}],
     }

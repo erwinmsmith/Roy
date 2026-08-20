@@ -53,9 +53,11 @@ describe('LHTB process state', () => {
     const session = new RoyLHTBSession('resume', 'task', 'solve it', 'commit');
     session.applyOrganizationAction({ kind: 'STOP', actorNodeId: 'root', finalOutput: 'draft' });
     expect(session.snapshot().runtime.stopped).toBe(true);
-    session.resumeAfterVerifierRejection();
+    session.resumeAfterVerifierRejection('Verifier rejected phase one');
     expect(session.snapshot().runtime.stopped).toBe(false);
     expect(session.snapshot().processStates.at(-1)?.runtimeEvents.at(-1)?.kind).toBe('verifier');
+    expect(session.snapshot().processStates.at(-1)?.runtimeEvents.at(-1)?.attributes?.feedback)
+      .toBe('Verifier rejected phase one');
   });
 
   it('integrates mock DeepSeek semantics before the next organization decision', async () => {
