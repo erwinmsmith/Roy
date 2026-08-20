@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { GlobalEpistemicStateRecorder, LHTBAutonomousController,
   RoyLHTBSession } from '../src/core/structural/index.js';
+import { LLMJSONParseError } from '../src/core/llm/providers/openai.js';
 
 function baseInput(sequence: number, previousFingerprint?: string) {
   return {
@@ -122,5 +126,69 @@ describe('LHTB process state', () => {
       expect(result.request.nodeId).toBe('root');
     }
     controller.close();
+  });
+
+  it('runs EXECUTE candidates through the same audited terminal boundary', async () => {
+    const session = new RoyLHTBSession('execute', 'task', 'change the workspace', 'commit',
+      'roy_runtime_heuristic');
+    const semantic = { async processEvent(event: { id: string }) {
+      return { event_id: event.id, requirements: [], claims: [], assumptions: [], evidence: [],
+        external_observations: [], blind_spots: [], relations: [] };
+    }, close() {} };
+    const provider = { isConfigured: () => true, async completeJSONWithUsage() {
+      return { value: { preferred_candidate_id: 'implement', candidates: [{
+        id: 'implement', kind: 'EXECUTE', actorNodeId: 'root', description: 'Implement',
+        schedulerComplexity: 2, command: 'python implement.py',
+        action: { kind: 'EXECUTE', actorNodeId: 'root' },
+      }] }, completion: { content: '{}', model: 'mock', usage: {
+        promptTokens: 1, completionTokens: 1, totalTokens: 2,
+      } } };
+    } };
+    const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false });
+    const result = await controller.advance(session, 1);
+    expect(result.status).toBe('terminal_request');
+    if (result.status === 'terminal_request') {
+      expect(result.request.organizationActionKind).toBe('EXECUTE');
+      expect(result.request.command).toBe('python implement.py');
+    }
+    controller.close();
+  });
+
+  it('audits and repairs a malformed proposer response without losing token usage', async () => {
+    const auditRoot = await mkdtemp(path.join(tmpdir(), 'roy-lhtb-proposal-'));
+    const session = new RoyLHTBSession('repair', 'task', 'finish', 'commit',
+      'roy_runtime_heuristic');
+    const semantic = { async processEvent(event: { id: string }) {
+      return { event_id: event.id, requirements: [], claims: [], assumptions: [], evidence: [],
+        external_observations: [], blind_spots: [], relations: [] };
+    }, close() {} };
+    let calls = 0;
+    const provider = { isConfigured: () => true, async completeJSONWithUsage() {
+      calls += 1;
+      if (calls === 1) throw new LLMJSONParseError('malformed', {
+        content: '{bad', model: 'mock', usage: { promptTokens: 2, completionTokens: 3,
+          totalTokens: 5 },
+      });
+      return { value: { preferred_candidate_id: 'stop', candidates: [{
+        id: 'stop', kind: 'STOP', actorNodeId: 'root', description: 'finish',
+        schedulerComplexity: 0, action: { kind: 'STOP', actorNodeId: 'root', finalOutput: 'done' },
+      }] }, completion: { content: '{}', model: 'mock', usage: {
+        promptTokens: 5, completionTokens: 7, totalTokens: 12,
+      } } };
+    } };
+    const controller = new LHTBAutonomousController({ provider, semantic, auditRoot });
+    try {
+      const result = await controller.advance(session, 1);
+      expect(result.status).toBe('completed');
+      expect(calls).toBe(2);
+      expect(session.snapshot().processStates.at(-1)?.usage).toMatchObject({
+        inputTokens: 7, outputTokens: 10,
+      });
+      expect((await readFile(path.join(auditRoot, 'proposal-failures.jsonl'), 'utf8')).trim())
+        .not.toBe('');
+    } finally {
+      controller.close();
+      await rm(auditRoot, { recursive: true, force: true });
+    }
   });
 });

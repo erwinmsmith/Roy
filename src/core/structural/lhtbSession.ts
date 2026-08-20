@@ -38,6 +38,7 @@ export interface TerminalRequest {
   cwd?: string;
   timeoutMs: number;
   nodeId: string;
+  organizationActionKind?: 'ACQUIRE' | 'EXECUTE';
 }
 
 export interface TerminalResult {

@@ -1,4 +1,4 @@
-import { DeepSeekProvider } from '../llm/providers/openai.js';
+import { DeepSeekProvider, LLMJSONParseError } from '../llm/providers/openai.js';
 import type { OrganizationCandidate,
   OrganizationPolicyRecord } from './informationRealizationTypes.js';
 import { PythonOrganizationPolicyClient } from './pythonOrganizationPolicy.js';
@@ -69,14 +69,18 @@ Every candidate must have this exact outer shape:
 {"id": string, "kind": string, "actorNodeId": string, "description": string,
  "schedulerComplexity": number, "action": object}.
 Allowed kinds are DERIVE, ACQUIRE, CONNECT, EXECUTE, RETURN, PRUNE, STOP.
-For ACQUIRE only, command, optional cwd and timeoutMs are outer candidate fields, while action is
-exactly {"kind":"ACQUIRE","actorNodeId":"<same actor>"}. Example:
+For ACQUIRE and EXECUTE, command, optional cwd and timeoutMs are outer candidate fields, while
+action contains only kind and actorNodeId. ACQUIRE inspects external state. EXECUTE changes the
+workspace or runs verification. Examples:
 {"id":"inspect","kind":"ACQUIRE","actorNodeId":"root","description":"Inspect files",
  "schedulerComplexity":1,"command":"find . -maxdepth 2 -type f","timeoutMs":120000,
  "action":{"kind":"ACQUIRE","actorNodeId":"root"}}.
-Do not put command inside action and do not fabricate an observation.
+{"id":"implement","kind":"EXECUTE","actorNodeId":"root","description":"Implement and test",
+ "schedulerComplexity":3,"command":"python /app/implement.py && pytest -q","timeoutMs":120000,
+ "action":{"kind":"EXECUTE","actorNodeId":"root"}}.
+Do not put command inside action and do not fabricate an observation or execution report.
 DERIVE action must contain a strict childSpecification tied to an existing open requirement.
-EXECUTE/RETURN action must contain a complete epistemic report using the repository schema.
+RETURN action must contain a complete epistemic report using the repository schema.
 CONNECT uses existing distinct nodes. PRUNE targets a non-root node. STOP is root-only.
 Propose only semantically useful actions. Do not expose hidden reasoning, benchmark grader data,
 keyword fields or reward. The preferred candidate is your best next organization decision.`;
@@ -130,10 +134,33 @@ export class LHTBAutonomousController {
       runtime: snapshot.runtime,
       recentProcessStates: snapshot.processStates.slice(-3),
     };
-    const completion = await this.provider.completeJSONWithUsage<ProposalResponse>([
+    const messages: LLMMessage[] = [
       { role: 'system', content: PROPOSER_PROMPT },
       { role: 'user', content: JSON.stringify(requestState) },
-    ], { temperature: 0, maxTokens: 32_768, thinking: { type: 'disabled' } });
+    ];
+    const proposalAttempts = Math.max(1, Number(process.env.ROY_LHTB_PROPOSAL_ATTEMPTS ?? 3));
+    let completion: LLMJSONCompletionResult<ProposalResponse> | undefined;
+    for (let attempt = 1; attempt <= proposalAttempts; attempt += 1) {
+      try {
+        completion = await this.provider.completeJSONWithUsage<ProposalResponse>(messages,
+          { temperature: 0, maxTokens: 32_768, thinking: { type: 'disabled' } });
+        break;
+      } catch (error) {
+        if (!(error instanceof LLMJSONParseError)) throw error;
+        session.recordModelUsage(error.completion.usage?.inputTokens
+          ?? error.completion.usage?.promptTokens ?? 0,
+        error.completion.usage?.outputTokens
+          ?? error.completion.usage?.completionTokens ?? 0,
+        error.completion.model);
+        await this.auditProposalFailure(requestState, error, attempt);
+        if (attempt === proposalAttempts) throw error;
+        messages.push(
+          { role: 'assistant', content: error.completion.content },
+          { role: 'user', content: 'The preceding response was malformed JSON. Return only one corrected JSON object in the exact candidate schema.' },
+        );
+      }
+    }
+    if (!completion) throw new Error('DeepSeek proposer did not return a completion');
     await this.auditProposal(requestState, completion);
     session.recordModelUsage(completion.completion.usage?.inputTokens
       ?? completion.completion.usage?.promptTokens ?? 0,
@@ -162,11 +189,13 @@ export class LHTBAutonomousController {
         ?? candidates[0];
     }
     if (policyRecord) session.recordPolicyDecision(policyRecord);
-    if (selected.kind === 'ACQUIRE') {
-      if (!selected.command?.trim()) throw new Error('ACQUIRE candidate requires a terminal command');
+    if (selected.kind === 'ACQUIRE' || selected.kind === 'EXECUTE') {
+      if (!selected.command?.trim()) {
+        throw new Error(`${selected.kind} candidate requires a terminal command`);
+      }
       const request = { id: `terminal-${snapshot.processStates.length}-${selected.id}`,
         command: selected.command, cwd: selected.cwd, timeoutMs: selected.timeoutMs ?? 120_000,
-        nodeId: selected.actorNodeId };
+        nodeId: selected.actorNodeId, organizationActionKind: selected.kind };
       session.requestTerminal(request);
       return { status: 'terminal_request', request, snapshot: session.snapshot() };
     }
@@ -229,13 +258,14 @@ export class LHTBAutonomousController {
       const timeoutValue = raw?.timeoutMs ?? actionValue.timeoutMs;
       const timeoutMs = timeoutValue === undefined ? undefined : Number(timeoutValue);
       if (kind === 'ACQUIRE' && !commandValue?.trim()) reasons.push('acquire_missing_command');
+      if (kind === 'EXECUTE' && !commandValue?.trim()) reasons.push('execute_missing_command');
       if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
         reasons.push('invalid_timeout');
       }
       const action = { ...actionValue, kind, actorNodeId } as OrganizationCandidate['action'];
       const candidate = { id, kind, actorNodeId, description, schedulerComplexity,
         action, command: commandValue?.trim(), cwd: cwdValue?.trim(), timeoutMs } as ProposedCandidate;
-      if (reasons.length === 0 && kind !== 'ACQUIRE') {
+      if (reasons.length === 0 && kind !== 'ACQUIRE' && kind !== 'EXECUTE') {
         try {
           const probe = RecursiveInformationRealizationRuntime.restore(snapshot.runtime);
           probe.apply(action, Date.now());
@@ -314,6 +344,20 @@ export class LHTBAutonomousController {
       schemaVersion: 1,
       acceptedCandidateIds: validation.candidates.map(value => value.id),
       dispositions: validation.dispositions,
+    })}\n`, 'utf8');
+  }
+
+  private async auditProposalFailure(request: Record<string, unknown>, error: LLMJSONParseError,
+    attempt: number): Promise<void> {
+    const root = this.auditRoot;
+    if (!root) throw new Error('ROY_LHTB_AUDIT_ROOT is required');
+    await mkdir(root, { recursive: true });
+    await appendFile(path.join(root, 'proposal-failures.jsonl'), `${JSON.stringify({
+      schemaVersion: 1, provider: 'deepseek', model: error.completion.model,
+      configuredRevision: process.env.DEEPSEEK_MODEL_REVISION ?? 'api-alias-unversioned',
+      temperature: 0, maxTokens: 32_768, attempt, request,
+      responseContent: error.completion.content, usage: error.completion.usage,
+      error: error.message,
     })}\n`, 'utf8');
   }
 }

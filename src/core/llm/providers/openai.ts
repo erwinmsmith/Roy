@@ -12,6 +12,13 @@ import type {
 } from '../types.js';
 import { tokenUsageRegistry } from '../usage.js';
 
+export class LLMJSONParseError extends Error {
+  constructor(message: string, readonly completion: LLMCompletionResult) {
+    super(message);
+    this.name = 'LLMJSONParseError';
+  }
+}
+
 export class OpenAIProvider implements LLMProvider {
   readonly name: string;
   readonly defaultModel: string;
@@ -185,18 +192,19 @@ export class OpenAIProvider implements LLMProvider {
       reasoning_content?: string | null;
     };
     const content = message.content || message.reasoning_content || '';
+    const completion = {
+      content,
+      usage: tokenUsageRegistry.normalize({ provider: this.name, model, usage: response.usage, messages, output: content }),
+      model,
+      finishReason: response.choices[0].finish_reason ?? undefined,
+    };
     try {
       return {
         value: parseJSONResponse<T>(content),
-        completion: {
-          content,
-          usage: tokenUsageRegistry.normalize({ provider: this.name, model, usage: response.usage, messages, output: content }),
-          model,
-          finishReason: response.choices[0].finish_reason ?? undefined,
-        },
+        completion,
       };
     } catch {
-      throw new Error(`Failed to parse JSON response: ${content}`);
+      throw new LLMJSONParseError(`Failed to parse JSON response: ${content}`, completion);
     }
   }
 }

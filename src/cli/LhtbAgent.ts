@@ -42,11 +42,15 @@ async function dispatch(request: Request): Promise<unknown> {
     const result = params.result as unknown as TerminalResult;
     session.acceptTerminalResult(result);
     if (!before) throw new Error('resume has no pending terminal request');
-    session.applyOrganizationAction({ kind: 'ACQUIRE', actorNodeId: before.nodeId,
-      observation: { id: `observation-${before.id}`, sourceType: 'environment',
-        queryOrAction: before.command,
-        observation: `${result.stdout}${result.stderr}`,
-        provenance: `harbor:${before.id}:exit-${result.exitCode}`, supports: [] } });
+    if (before.organizationActionKind === 'EXECUTE') {
+      session.applyOrganizationAction({ kind: 'EXECUTE', actorNodeId: before.nodeId });
+    } else {
+      session.applyOrganizationAction({ kind: 'ACQUIRE', actorNodeId: before.nodeId,
+        observation: { id: `observation-${before.id}`, sourceType: 'environment',
+          queryOrAction: before.command,
+          observation: `${result.stdout}${result.stderr}`,
+          provenance: `harbor:${before.id}:exit-${result.exitCode}`, supports: [] } });
+    }
     controller ??= new LHTBAutonomousController();
     return controller.advance(session, organizationSeed++);
   }
