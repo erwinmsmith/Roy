@@ -1328,7 +1328,7 @@ def _residual_child_specifications(
 
 def _is_user_interaction_requirement(requirement: Mapping[str, Any]) -> bool:
     access = {
-        str(value).strip().lower()
+        re.sub(r"[^a-z0-9]+", " ", str(value).strip().lower()).strip()
         for value in _as_list(requirement.get("possible_external_access"))
     }
     text = " ".join(
@@ -1341,11 +1341,19 @@ def _is_user_interaction_requirement(requirement: Mapping[str, Any]) -> bool:
         "prompt the user",
         "user message",
         "user's user_id",
+        "user's user id",
         "user id from the user",
+        "obtain the user's user id",
         "provided by the user",
         "confirm with the user",
     )
-    user_access = bool(access & {"user", "customer", "human", "user_simulator"})
+    user_access = bool(access & {
+        "user",
+        "customer",
+        "human",
+        "user simulator",
+        "user interaction",
+    })
     return user_access or any(phrase in text for phrase in interaction_phrases)
 
 

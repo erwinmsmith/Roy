@@ -225,6 +225,10 @@ class InformationRealizationTests(unittest.TestCase):
         )
         question = _user_acquisition_question(report["residual_requirements"][0])
         self.assertIn("user_id", question)
+        self.assertTrue(_is_user_interaction_requirement({
+            "description": "Obtain the user's user ID before account lookup",
+            "possible_external_access": ["user_interaction"],
+        }))
 
     def test_tool_access_gap_is_acquired_instead_of_recursively_derived(self) -> None:
         report = _normalize_report({
