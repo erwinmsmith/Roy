@@ -18,10 +18,12 @@ and observation; blind spots are strings. Represent only entities explicit in th
 Give every entity a deterministic stable ID derived from its source event ID and local index. Do
 not infer semantic relations and do not use benchmark answer keys or keyword fields."""
 
-VERIFIER_SYSTEM_PROMPT = """You are a frozen semantic relation verifier. Return JSON only with
-label (entail, contradict, or unknown) and probabilities for all three labels. Judge meaning in
-context; surface word overlap is not evidence of entailment. Do not inspect benchmark answer
-keys, keyword fields, embedding similarity, or reward."""
+VERIFIER_SYSTEM_PROMPT = """You are a frozen semantic relation verifier. Return one JSON object
+with exactly this schema: {"label":"unknown","probabilities":{"entail":0.0,
+"contradict":0.0,"unknown":1.0}}. Label must be entail, contradict, or unknown. Probabilities
+must be numeric, use those three named object keys, and sum to 1. Judge meaning in context;
+surface word overlap is not evidence of entailment. Do not inspect benchmark answer keys,
+keyword fields, embedding similarity, or reward."""
 
 
 def canonical_fingerprint(value: Mapping[str, Any]) -> str:
@@ -117,11 +119,20 @@ class FrozenDeepSeekSemanticClient:
         ]
         response: Mapping[str, Any] | None = None
         last_error: Exception | None = None
+        prior_content: str | None = None
         for attempt in range(1, self.max_attempts + 1):
             completion = None
             try:
+                attempt_messages = list(messages)
+                if prior_content is not None:
+                    attempt_messages.extend([
+                        {"role": "assistant", "content": prior_content},
+                        {"role": "user", "content":
+                         "The preceding response failed the required JSON schema. Return only "
+                         "a corrected object in the exact schema from the system message."},
+                    ])
                 completion = self.client.complete(
-                    messages, max_tokens=self.max_tokens, temperature=0.0,
+                    attempt_messages, max_tokens=self.max_tokens, temperature=0.0,
                     metadata={"semantic_operation": prompt_name, "cache_key": cache_key,
                               "model_revision": self.model_revision,
                               "semantic_attempt": attempt},
@@ -133,8 +144,9 @@ class FrozenDeepSeekSemanticClient:
                 break
             except Exception as error:
                 last_error = error
+                prior_content = getattr(completion, "content", None)
                 self._record_failure(cache_key, request, prompt_name, attempt,
-                                     getattr(completion, "content", None), error)
+                                     prior_content, error)
         if response is None:
             raise ValueError(
                 f"semantic DeepSeek response failed schema validation after "
@@ -198,6 +210,10 @@ def _validate_semantic_response(prompt_name: str, response: Mapping[str, Any]) -
         if any(not isinstance(probabilities[label], (int, float))
                for label in SEMANTIC_LABELS):
             raise ValueError("semantic verifier probabilities must be numeric")
+        values = [float(probabilities[label]) for label in SEMANTIC_LABELS]
+        if any(value < 0.0 or value > 1.0 for value in values) \
+                or abs(sum(values) - 1.0) > 1e-6:
+            raise ValueError("semantic verifier probabilities must be in [0,1] and sum to 1")
         return
     fields = {
         "requirements": ("id", "description"),
