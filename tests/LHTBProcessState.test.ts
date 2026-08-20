@@ -59,8 +59,10 @@ describe('LHTB process state', () => {
     session.requestTerminal({ id: 'one', command: 'pwd', timeoutMs: 1000, nodeId: 'root' });
     session.acceptTerminalResult({ requestId: 'one', exitCode: 0, stdout: '/workspace',
       stderr: '', durationMs: 1 });
+    let semanticCalls = 0;
     const semantic = {
       async processEvent(event: { id: string }) {
+        semanticCalls += 1;
         return { event_id: event.id, requirements: [], claims: [{ id: `claim-${event.id}`,
           statement: 'The command completed', status: 'supported', originNodeId: 'root' }],
         assumptions: [], evidence: [], external_observations: [], blind_spots: [],
@@ -83,7 +85,8 @@ describe('LHTB process state', () => {
     const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false });
     const result = await controller.advance(session, 1);
     expect(result.status).toBe('completed');
-    expect(session.snapshot().processStates.at(-1)?.claims.length).toBe(2);
+    expect(semanticCalls).toBe(1);
+    expect(session.snapshot().processStates.at(-1)?.claims.length).toBe(1);
     expect(session.snapshot().processedSemanticEventIds).toHaveLength(2);
     controller.close();
   });

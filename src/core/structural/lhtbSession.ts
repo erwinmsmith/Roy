@@ -121,7 +121,13 @@ export class RoyLHTBSession {
   }
 
   unprocessedSemanticEvents(): RuntimeProcessEvent[] {
-    return structuredClone(this.events.filter(event => !this.processedSemanticEventIds.has(event.id)));
+    const semanticEvents: RuntimeProcessEvent[] = [];
+    for (const event of this.events) {
+      if (this.processedSemanticEventIds.has(event.id)) continue;
+      if (event.kind === 'terminal_result') semanticEvents.push(event);
+      else this.processedSemanticEventIds.add(event.id);
+    }
+    return structuredClone(semanticEvents);
   }
 
   applySemanticUpdate(update: SemanticUpdate): GlobalEpistemicState {
