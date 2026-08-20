@@ -39,6 +39,12 @@ from roy_research.lhtb_experiment import (
 )
 from roy_research.lhtb_results import official_lhtb_reward
 from roy_research.lhtb_training import LHTBProcessGRPOTrainer
+from roy_research.lhtb_native import (
+    audit_native_tasks,
+    native_environment_digest,
+    provision_native_task,
+    tree_digest,
+)
 from roy_research.organization_replay import sample_organization_decision
 
 
@@ -176,6 +182,90 @@ for line in sys.stdin:
             value = json.loads(path.read_text())
             self.assertEqual(value["n_attempts"], 3)
             self.assertNotIn("override_timeout_sec", value["agents"][0])
+
+            native = Path(directory) / "native.json"
+            write_harbor_group_config(
+                native, "task", Path(directory) / "jobs", "single_agent_direct",
+                "fingerprint", 1, attempts=1, environment_backend="native",
+                native_runtime_root=Path(directory) / "runtime",
+                native_template_root=Path(directory) / "templates",
+            )
+            native_value = json.loads(native.read_text())
+            self.assertEqual(
+                native_value["environment"]["import_path"],
+                "roy_research.native_environment:NativeProcessEnvironment",
+            )
+            self.assertEqual(
+                native_value["agents"][0]["env"]["ROY_LHTB_ENVIRONMENT_BACKEND"],
+                "native",
+            )
+
+    def test_native_audit_is_fail_closed_and_uses_environment_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lhtb = root / "LHTB"
+            templates = root / "templates"
+            split_path = root / "split.json"
+            records = build_lhtb_split()
+            split_path.write_text(json.dumps({
+                "commit": LHTB_COMMIT,
+                "tasks": [value.to_dict() for value in records],
+            }))
+            for value in records:
+                task = lhtb / "tasks" / value.task_id
+                (task / "environment").mkdir(parents=True)
+                (task / "environment" / "Dockerfile").write_text("FROM python:3.11-slim\n")
+                (task / "task.toml").write_text(
+                    "[environment]\nallow_internet = true\ngpus = 0\n"
+                )
+            selected = records[0]
+            task_root = lhtb / "tasks" / selected.task_id
+            native_root = templates / selected.task_id
+            native_root.mkdir(parents=True)
+            (native_root / "native-manifest.json").write_text(json.dumps({
+                "schema_version": 1,
+                "lhtb_commit": LHTB_COMMIT,
+                "task_digest": tree_digest(task_root),
+                "environment_digest": "sha256:native",
+            }))
+            audit = audit_native_tasks(lhtb, split_path, templates)
+            self.assertEqual(audit["counts"], {"compatible": 1, "needs_provisioning": 45})
+            self.assertEqual(native_environment_digest(audit, selected.task_id), "sha256:native")
+            missing = next(
+                value for value in records if value.task_id != selected.task_id
+            )
+            with self.assertRaisesRegex(ValueError, "not runnable"):
+                native_environment_digest(audit, missing.task_id)
+
+    def test_reviewed_native_provisioning_is_immutable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task = root / "LHTB" / "tasks" / "fixture"
+            environment = task / "environment"
+            (environment / "project").mkdir(parents=True)
+            (environment / "project" / "input.txt").write_text("fixture")
+            (environment / "Dockerfile").write_text("FROM python:3.11-slim\n")
+            (task / "task.toml").write_text("[environment]\nallow_internet = true\n")
+            specs = root / "specs.json"
+            specs.write_text(json.dumps({"schema_version": 1, "tasks": {
+                "fixture": {
+                    "copies": [{"source": "project", "target": "app"}],
+                    "required_commands": ["bash"],
+                    "wrappers": [{"name": "fixture-tool", "content": "#!/bin/sh\nexit 0\n"}],
+                }
+            }}))
+            result = provision_native_task(
+                root / "LHTB", root / "templates", specs, "fixture"
+            )
+            self.assertTrue(str(result["environment_digest"]).startswith("sha256:"))
+            self.assertEqual(
+                (root / "templates" / "fixture" / "app" / "input.txt").read_text(),
+                "fixture",
+            )
+            self.assertTrue(
+                (root / "templates" / "fixture" / "bin" / "fixture-tool").stat().st_mode
+                & 0o111
+            )
 
     def test_dev_selection_and_test_report_follow_locked_rules(self) -> None:
         dev = []

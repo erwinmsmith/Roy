@@ -96,7 +96,7 @@ Coverage, assumption closure, conflicts and blind spots are structural inputs to
 
 ## 6. On-policy groups and continuous process credit
 
-Training samples fresh complete trajectories from the current masked policy. Each LHTB task and epoch produces `G=8` trajectories from eight fresh Docker environments with the same task checksum, image digest, initial-state fingerprint, environment configuration and actor revision. Only organization sampling seeds differ. Every decision stores its exact masked old-policy joint log-probability.
+Training samples fresh complete trajectories from the current masked policy. Each LHTB task and epoch produces `G=8` trajectories from eight fresh matched execution environments with the same task checksum, immutable environment digest, initial-state fingerprint, environment configuration and actor revision. Only organization sampling seeds differ. The official protocol realizes these environments as fresh Docker containers. A native portability backend may be used only as a separately labeled experimental condition and does not imply Docker-equivalent isolation. Every decision stores its exact masked old-policy joint log-probability.
 
 The sole environment target is the official LHTB final score `R_i` in `[0,1]`. An independent relational value model `V_psi(M_t)` shares only the frozen MiniLM encoder with the actor; it shares no trainable parameters. It is fitted with equal trajectory weight:
 
@@ -135,10 +135,10 @@ Report mean reward, success rate at `R >= 0.95`, paired bootstrap 95% confidence
 - Every actor/value update consumes exactly eight complete current-policy train trajectories.
 - Runtime crashes, environment failures and incomplete trajectories are preserved for audit but excluded from actor and value updates.
 - A normal 60-minute training deadline triggers the official verifier; its partial score is a valid terminal label.
-- Every trajectory preserves `M_0...M_T`, runtime events, semantic audits, exact old probabilities, task checksum, image digest, model revisions and final Harbor result.
+- Every trajectory preserves `M_0...M_T`, runtime events, semantic audits, exact old probabilities, task checksum, environment digest, backend capabilities, model revisions and final Harbor result.
 - Actor, value, EMA, both optimizers and updated group IDs are restored together; a group ID can be optimized only once.
 - Dev selects checkpoints but never updates them. Test runs only after selection and never updates weights.
-- The local Docker protocol does not claim Harbor's timed process verifier. “Continuous process reward” means final-score-supervised `V_psi` and `Delta V` credit.
+- Neither the local Docker protocol nor the native portability backend claims Harbor's timed process verifier. “Continuous process reward” means final-score-supervised `V_psi` and `Delta V` credit.
 
 ## 9. Limits
 

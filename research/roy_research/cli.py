@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import sys
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
@@ -26,6 +27,12 @@ from .lhtb_experiment import build_training_schedule, disk_preflight, select_dev
 from .lhtb_training import LHTBProcessGRPOTrainer
 from .lhtb_results import import_harbor_group, validate_smoke
 from .lhtb_value_metrics import value_metrics, annotate_value_traces
+from .lhtb_native import (
+    native_environment_digest,
+    native_preflight,
+    provision_native_task,
+    write_native_audit,
+)
 from .training import TRAINING_VARIANTS, evaluate_groups, train_groups
 
 
@@ -207,6 +214,36 @@ def parser() -> argparse.ArgumentParser:
     lhtb_preflight.add_argument("--path", type=Path, required=True)
     lhtb_preflight.add_argument("--output", type=Path, required=True)
 
+    native_preflight_parser = commands.add_parser(
+        "lhtb-native-preflight", help="Validate the non-container GPUHome native backend"
+    )
+    native_preflight_parser.add_argument("--runtime-root", type=Path, required=True)
+    native_preflight_parser.add_argument("--output", type=Path, required=True)
+
+    native_audit = commands.add_parser(
+        "lhtb-native-audit", help="Audit pinned tasks for native-process compatibility"
+    )
+    native_audit.add_argument("--lhtb-root", type=Path, required=True)
+    native_audit.add_argument("--manifest", type=Path, required=True)
+    native_audit.add_argument("--template-root", type=Path, required=True)
+    native_audit.add_argument("--output", type=Path, required=True)
+    native_audit.add_argument("--allow-network-degraded", action="store_true")
+
+    native_provision = commands.add_parser(
+        "lhtb-native-provision", help="Provision one reviewed native task template"
+    )
+    native_provision.add_argument("--lhtb-root", type=Path, required=True)
+    native_provision.add_argument("--template-root", type=Path, required=True)
+    native_provision.add_argument("--specs", type=Path, required=True)
+    native_provision.add_argument("--task-id", required=True)
+    native_provision.add_argument("--python", default=sys.executable)
+
+    native_digest = commands.add_parser(
+        "lhtb-native-digest", help="Resolve an audited immutable native environment digest"
+    )
+    native_digest.add_argument("--audit", type=Path, required=True)
+    native_digest.add_argument("--task-id", required=True)
+
     lhtb_schedule = commands.add_parser(
         "lhtb-schedule", help="Create the formal four-epoch, 960-rollout schedule"
     )
@@ -254,7 +291,10 @@ def parser() -> argparse.ArgumentParser:
     lhtb_import.add_argument("--split", choices=("train", "dev", "test"), required=True)
     lhtb_import.add_argument("--epoch", type=int, required=True)
     lhtb_import.add_argument("--policy-revision", type=int, required=True)
-    lhtb_import.add_argument("--docker-digest", required=True)
+    lhtb_import.add_argument("--environment-digest")
+    lhtb_import.add_argument("--docker-digest", help="Deprecated Docker-only alias")
+    lhtb_import.add_argument("--environment-backend", choices=("docker", "native"),
+                             default="docker")
     lhtb_import.add_argument("--expected", type=int, default=8)
     lhtb_import.add_argument("--arm", choices=("single_agent_direct", "roy_runtime_heuristic",
                                                "learned_information_realization"),
@@ -272,6 +312,11 @@ def parser() -> argparse.ArgumentParser:
     lhtb_config.add_argument("--organization-seed", type=int, required=True)
     lhtb_config.add_argument("--attempts", type=int, default=8)
     lhtb_config.add_argument("--official-timeout", action="store_true")
+    lhtb_config.add_argument("--environment-backend", choices=("docker", "native"),
+                             default="docker")
+    lhtb_config.add_argument("--native-runtime-root", type=Path)
+    lhtb_config.add_argument("--native-template-root", type=Path)
+    lhtb_config.add_argument("--allow-network-degraded", action="store_true")
 
     lhtb_dev = commands.add_parser(
         "lhtb-dev-metrics", help="Append checkpoint-selection metrics for one dev epoch"
@@ -325,6 +370,29 @@ def main(argv: List[str] | None = None) -> None:
         result = disk_preflight(args.path)
         write_json(args.output, result)
         print(json.dumps(result))
+    elif args.command == "lhtb-native-preflight":
+        result = native_preflight(args.runtime_root)
+        write_json(args.output, result)
+        print(json.dumps(result))
+    elif args.command == "lhtb-native-audit":
+        result = write_native_audit(
+            args.output, args.lhtb_root, args.manifest, args.template_root,
+            allow_network_degraded=args.allow_network_degraded,
+        )
+        print(json.dumps({"output": str(args.output), **result["counts"]}))
+    elif args.command == "lhtb-native-provision":
+        result = provision_native_task(
+            args.lhtb_root, args.template_root, args.specs, args.task_id,
+            python_executable=args.python,
+        )
+        print(json.dumps({
+            "task_id": args.task_id,
+            "environment_digest": result["environment_digest"],
+            "template_root": str(args.template_root),
+        }))
+    elif args.command == "lhtb-native-digest":
+        audit = json.loads(args.audit.read_text(encoding="utf-8"))
+        print(native_environment_digest(audit, args.task_id))
     elif args.command == "lhtb-schedule":
         schedule = build_training_schedule(load_lhtb_manifest(args.manifest))
         write_json(args.output, {"schema_version": 1, "epochs": 4, "group_size": 8,
@@ -374,19 +442,25 @@ def main(argv: List[str] | None = None) -> None:
         trainer.save()
         print(json.dumps({"model": str(args.model), **trainer.metadata()}))
     elif args.command == "lhtb-import-group":
+        environment_digest = args.environment_digest or args.docker_digest
+        if not environment_digest:
+            raise ValueError("an immutable environment digest is required")
         records = import_harbor_group(
             args.job_dir, args.output, args.group_id, args.task_id, args.category,
-            args.split, args.epoch, args.policy_revision, args.docker_digest,
+            args.split, args.epoch, args.policy_revision, environment_digest,
             {"maximum_rollout_seconds": 3600, "max_response_tokens": 32768,
              "concurrency": 4},
             expected=args.expected,
             arm=args.arm,
+            environment_backend=args.environment_backend,
         )
         print(json.dumps({"imported": len(records), "output": str(args.output)}))
     elif args.command == "lhtb-group-config":
         write_harbor_group_config(args.output, args.task_id, args.jobs_dir, args.arm,
                                   args.initial_fingerprint, args.organization_seed, args.attempts,
-                                  args.official_timeout)
+                                  args.official_timeout, args.environment_backend,
+                                  args.native_runtime_root, args.native_template_root,
+                                  args.allow_network_degraded)
         print(json.dumps({"output": str(args.output), "task_id": args.task_id}))
     elif args.command == "lhtb-dev-metrics":
         records = [value for value in read_jsonl(args.trajectories)

@@ -7,6 +7,7 @@ dependencies = [
   "numpy>=1.26,<3",
   "torch>=2.1",
   "sentence-transformers>=3.0",
+  "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]

@@ -31,9 +31,10 @@ def official_lhtb_reward(result: Mapping[str, Any]) -> float:
 
 def import_harbor_group(
     job_dir: Path, output: Path, group_id: str, task_id: str, category: str,
-    split: str, epoch: int, policy_revision: int, docker_digest: str,
+    split: str, epoch: int, policy_revision: int, environment_digest: str,
     runtime_config: Mapping[str, Any], expected: int = 8,
     arm: str = "learned_information_realization",
+    environment_backend: str = "docker",
 ) -> List[Dict[str, Any]]:
     result_paths = []
     for candidate in sorted(job_dir.rglob("result.json")):
@@ -78,7 +79,10 @@ def import_harbor_group(
             "arm": arm,
             "rollout_index": rollout_index, "policy_revision": policy_revision,
             "organization_seed": snapshot.get("organizationSeed"),
-            "task_checksum": result.get("task_checksum"), "docker_digest": docker_digest,
+            "task_checksum": result.get("task_checksum"),
+            "environment_backend": environment_backend,
+            "environment_digest": environment_digest,
+            "docker_digest": environment_digest if environment_backend == "docker" else None,
             "runtime_config": dict(runtime_config),
             "initial_snapshot_fingerprint": snapshot.get("initialSnapshotFingerprint"),
             "actions": _actions(snapshot), "policy_records": snapshot.get("policyRecords", []),

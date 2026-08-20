@@ -13,6 +13,11 @@ trajectories="${run_root}/train-trajectories.jsonl"
 updates="${run_root}/update-audit.jsonl"
 dev_trajectories="${run_root}/dev-trajectories.jsonl"
 dev_metrics="${run_root}/dev-metrics.jsonl"
+environment_backend="${ROY_LHTB_ENVIRONMENT_BACKEND:-docker}"
+native_runtime_root="${ROY_LHTB_NATIVE_ROOT:-${roy_root}/research/output/lhtb/native/runtime}"
+native_template_root="${ROY_LHTB_NATIVE_TEMPLATE_ROOT:-${roy_root}/research/output/lhtb/native/templates}"
+native_audit="${ROY_LHTB_NATIVE_AUDIT:-${roy_root}/research/output/lhtb/native/audit.json}"
+allow_network_degraded="${ROY_LHTB_ALLOW_NETWORK_DEGRADED:-false}"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=load_roy_env.sh
 source "${script_dir}/load_roy_env.sh"
@@ -20,7 +25,11 @@ load_deepseek_api_key "${roy_root}"
 
 [[ -n "${DEEPSEEK_API_KEY:-}" ]] || { echo "DEEPSEEK_API_KEY is required" >&2; exit 4; }
 [[ -x "${python_bin}" && -x "${harbor_bin}" ]] || {
-  echo "run prepare_lhtb.sh prepare first" >&2
+  if [[ "${environment_backend}" == "native" ]]; then
+    echo "run prepare_lhtb_native.sh prepare first" >&2
+  else
+    echo "run prepare_lhtb.sh prepare first" >&2
+  fi
   exit 4
 }
 [[ "$(git -C "${lhtb_root}" rev-parse HEAD)" == \
@@ -38,6 +47,16 @@ export ROY_LHTB_SEMANTIC_ROOT="${run_root}/semantic"
 export ROY_LHTB_MODEL="${model}"
 export DEEPSEEK_MODEL_REVISION="${DEEPSEEK_MODEL_REVISION:-deepseek-v4-flash-api-alias}"
 
+group_environment_args=(--environment-backend "${environment_backend}")
+if [[ "${environment_backend}" == "native" ]]; then
+  [[ -f "${native_audit}" ]] || { echo "native audit is missing" >&2; exit 4; }
+  group_environment_args+=(--native-runtime-root "${native_runtime_root}"
+    --native-template-root "${native_template_root}")
+  if [[ "${allow_network_degraded}" == "true" ]]; then
+    group_environment_args+=(--allow-network-degraded)
+  fi
+fi
+
 cd "${roy_root}"
 npm run build
 if [[ ! -f "${model}" ]]; then
@@ -47,6 +66,11 @@ fi
 
 resolve_digest() {
   local task_id="$1" digest
+  if [[ "${environment_backend}" == "native" ]]; then
+    "${python_bin}" -m roy_research lhtb-native-digest \
+      --audit "${native_audit}" --task-id "${task_id}"
+    return
+  fi
   digest="$(docker image ls --no-trunc --format '{{.Repository}} {{.ID}}' \
     | awk -v task="${task_id}" 'index($1, task) {print $2}' | sort -u | head -n 1)"
   [[ "${digest}" == sha256:* ]] || {
@@ -91,7 +115,8 @@ PY
     mkdir -p "${job_dir}"
     "${python_bin}" -m roy_research lhtb-group-config --output "${config_path}" \
       --jobs-dir "${job_dir}" --task-id "${task_id}" --arm learned_information_realization \
-      --initial-fingerprint "${initial_fingerprint}" --organization-seed "${seed}" --attempts 1
+      --initial-fingerprint "${initial_fingerprint}" --organization-seed "${seed}" --attempts 1 \
+      "${group_environment_args[@]}"
     cd "${lhtb_root}"
     "${harbor_bin}" run -c "${config_path}" --yes
     cd "${roy_root}"
@@ -99,7 +124,8 @@ PY
     "${python_bin}" -m roy_research lhtb-import-group --job-dir "${job_dir}" \
       --output "${dev_trajectories}" --group-id "${group_id}" --task-id "${task_id}" \
       --category "${category}" --split dev --epoch "${dev_epoch}" \
-      --policy-revision "${revision}" --docker-digest "${digest}" --expected 1
+      --policy-revision "${revision}" --environment-digest "${digest}" \
+      --environment-backend "${environment_backend}" --expected 1
   done < <("${python_bin}" - "${manifest}" <<'PY'
 import json, sys
 for value in json.load(open(sys.argv[1], encoding="utf-8"))["tasks"]:
@@ -135,8 +161,13 @@ PY
     continue
   fi
 
-  "${python_bin}" -m roy_research lhtb-preflight --path "$(dirname "${lhtb_root}")" \
-    --output "${run_root}/preflight-latest.json"
+  if [[ "${environment_backend}" == "native" ]]; then
+    "${python_bin}" -m roy_research lhtb-native-preflight --runtime-root "${native_runtime_root}" \
+      --output "${run_root}/preflight-latest.json"
+  else
+    "${python_bin}" -m roy_research lhtb-preflight --path "$(dirname "${lhtb_root}")" \
+      --output "${run_root}/preflight-latest.json"
+  fi
   policy_revision="$("${python_bin}" - "${model}" <<'PY'
 import sys, torch
 print(torch.load(sys.argv[1], map_location="cpu", weights_only=False)["metadata"]["groups"])
@@ -150,17 +181,18 @@ PY
   "${python_bin}" -m roy_research lhtb-group-config \
     --output "${config_path}" --jobs-dir "${job_dir}" --task-id "${task_id}" \
     --arm learned_information_realization --initial-fingerprint "${initial_fingerprint}" \
-    --organization-seed "${base_seed}"
+    --organization-seed "${base_seed}" "${group_environment_args[@]}"
 
   cd "${lhtb_root}"
   "${harbor_bin}" run -c "${config_path}" --yes
   cd "${roy_root}"
 
-  docker_digest="$(resolve_digest "${task_id}")"
+  environment_digest="$(resolve_digest "${task_id}")"
   "${python_bin}" -m roy_research lhtb-import-group \
     --job-dir "${job_dir}" --output "${trajectories}" --group-id "${group_id}" \
     --task-id "${task_id}" --category "${category}" --split train --epoch "${epoch}" \
-    --policy-revision "${policy_revision}" --docker-digest "${docker_digest}"
+    --policy-revision "${policy_revision}" --environment-digest "${environment_digest}" \
+    --environment-backend "${environment_backend}"
   "${python_bin}" -m roy_research lhtb-update \
     --manifest "${manifest}" --trajectories "${trajectories}" --model "${model}" \
     --updates "${updates}" --resume

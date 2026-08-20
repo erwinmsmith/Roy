@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "tasks": {
+    "great-expectations-audit": {
+      "copies": [
+        {"source": "project", "target": "app"}
+      ],
+      "python_project": "project",
+      "python_dependencies": ["pytest==8.4.1"],
+      "required_commands": ["bash", "git", "curl", "tmux", "asciinema"],
+      "working_directory": "/app",
+      "environment": {
+        "PATH": "/opt/roy-native/bin:/opt/roy-native/venv/bin:/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH": "/app/src",
+        "PYTHONDONTWRITEBYTECODE": "1"
+      },
+      "wrappers": [
+        {"name": "dq-audit", "content": "#!/bin/sh\nexec python -m dq_audit.cli \"$@\"\n"}
+      ]
+    },
+    "poc-exploit-craft": {
+      "copies": [
+        {"source": "harness", "target": "app/harness"},
+        {"source": "workspace", "target": "app/workspace"}
+      ],
+      "python_dependencies": [],
+      "required_commands": ["bash", "make", "cc", "tmux", "asciinema"],
+      "build_commands": [
+        "mkdir -p app/output && make -C app/harness/stages/stage1 && make -C app/harness/stages/stage2 && make -C app/harness/stages/stage3"
+      ],
+      "working_directory": "/app",
+      "environment": {
+        "ASAN_OPTIONS": "detect_leaks=0:halt_on_error=1:print_stacktrace=1",
+        "PATH": "/opt/roy-native/bin:/usr/local/bin:/usr/bin:/bin"
+      },
+      "wrappers": [
+        {"name": "try_poc", "content": "#!/bin/sh\nexec python3 /app/harness/try_poc_cli.py \"$@\"\n"}
+      ]
+    },
+    "opensees-seismic-structural-regression-audit": {
+      "copies": [
+        {"source": "project", "target": "app"}
+      ],
+      "python_project": "project",
+      "python_dependencies": ["pytest==8.4.1", "fastapi==0.115.14", "uvicorn==0.35.0"],
+      "required_commands": ["bash", "tmux"],
+      "working_directory": "/app",
+      "environment": {
+        "PATH": "/opt/roy-native/bin:/opt/roy-native/venv/bin:/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH": "/app/src",
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONDONTWRITEBYTECODE": "1"
+      }
+    }
+  }
+}

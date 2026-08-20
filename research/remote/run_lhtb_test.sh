@@ -9,11 +9,24 @@ run_root="${ROY_LHTB_RUN_ROOT:-${roy_root}/research/output/lhtb/formal}"
 manifest="${ROY_LHTB_MANIFEST:-${roy_root}/research/config/lhtb_split.json}"
 selection="${run_root}/selected-checkpoint.json"
 results="${run_root}/test-results.jsonl"
+environment_backend="${ROY_LHTB_ENVIRONMENT_BACKEND:-docker}"
+native_runtime_root="${ROY_LHTB_NATIVE_ROOT:-${roy_root}/research/output/lhtb/native/runtime}"
+native_template_root="${ROY_LHTB_NATIVE_TEMPLATE_ROOT:-${roy_root}/research/output/lhtb/native/templates}"
+native_audit="${ROY_LHTB_NATIVE_AUDIT:-${roy_root}/research/output/lhtb/native/audit.json}"
+allow_network_degraded="${ROY_LHTB_ALLOW_NETWORK_DEGRADED:-false}"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=load_roy_env.sh
 source "${script_dir}/load_roy_env.sh"
 load_deepseek_api_key "${roy_root}"
 
+[[ -x "${python_bin}" && -x "${harbor_bin}" ]] || {
+  if [[ "${environment_backend}" == "native" ]]; then
+    echo "run prepare_lhtb_native.sh prepare first" >&2
+  else
+    echo "run prepare_lhtb.sh prepare first" >&2
+  fi
+  exit 4
+}
 [[ -n "${DEEPSEEK_API_KEY:-}" && -f "${selection}" ]] || {
   echo "DeepSeek key and selected-checkpoint.json are required" >&2
   exit 4
@@ -30,6 +43,16 @@ export ROY_LHTB_SEMANTIC_COMMAND="${python_bin} -m roy_research.semantic_server"
 export ROY_LHTB_SEMANTIC_ROOT="${run_root}/semantic-test"
 export ROY_LHTB_MODEL="${selected_model}"
 export DEEPSEEK_MODEL_REVISION="${DEEPSEEK_MODEL_REVISION:-deepseek-v4-flash-api-alias}"
+
+group_environment_args=(--environment-backend "${environment_backend}")
+if [[ "${environment_backend}" == "native" ]]; then
+  [[ -f "${native_audit}" ]] || { echo "native audit is missing" >&2; exit 4; }
+  group_environment_args+=(--native-runtime-root "${native_runtime_root}"
+    --native-template-root "${native_template_root}")
+  if [[ "${allow_network_degraded}" == "true" ]]; then
+    group_environment_args+=(--allow-network-degraded)
+  fi
+fi
 
 while IFS=$'\t' read -r task_id category; do
   task_tree="$(git -C "${lhtb_root}" rev-parse "HEAD:tasks/${task_id}")"
@@ -50,17 +73,23 @@ PY
     "${python_bin}" -m roy_research lhtb-group-config --output "${config_path}" \
       --jobs-dir "${job_dir}" --task-id "${task_id}" --arm "${arm}" \
       --initial-fingerprint "${initial_fingerprint}" --organization-seed "${seed}" \
-      --attempts 3 --official-timeout
+      --attempts 3 --official-timeout "${group_environment_args[@]}"
     cd "${lhtb_root}"
     "${harbor_bin}" run -c "${config_path}" --yes
     cd "${roy_root}"
-    digest="$(docker image ls --no-trunc --format '{{.Repository}} {{.ID}}' \
-      | awk -v task="${task_id}" 'index($1, task) {print $2}' | sort -u | head -n 1)"
+    if [[ "${environment_backend}" == "native" ]]; then
+      digest="$("${python_bin}" -m roy_research lhtb-native-digest \
+        --audit "${native_audit}" --task-id "${task_id}")"
+    else
+      digest="$(docker image ls --no-trunc --format '{{.Repository}} {{.ID}}' \
+        | awk -v task="${task_id}" 'index($1, task) {print $2}' | sort -u | head -n 1)"
+    fi
     [[ "${digest}" == sha256:* ]] || { echo "missing image digest for ${task_id}" >&2; exit 5; }
     "${python_bin}" -m roy_research lhtb-import-group --job-dir "${job_dir}" \
       --output "${results}" --group-id "test:${arm}:${task_id}" --task-id "${task_id}" \
       --category "${category}" --split test --epoch "${selected_epoch}" \
-      --policy-revision 0 --docker-digest "${digest}" --expected 3 --arm "${arm}"
+      --policy-revision 0 --environment-digest "${digest}" \
+      --environment-backend "${environment_backend}" --expected 3 --arm "${arm}"
   done
 done < <("${python_bin}" - "${manifest}" <<'PY'
 import json, sys

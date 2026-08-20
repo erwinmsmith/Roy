@@ -188,11 +188,17 @@ class LHTBProcessGRPOTrainer:
             raise ValueError("rollout indices must be zero through seven")
         if len({int(value.get("organization_seed", -1)) for value in records}) != 8:
             raise ValueError("each LHTB rollout requires a distinct organization seed")
-        immutable = ("initial_snapshot_fingerprint", "task_checksum", "docker_digest", "runtime_config")
+        immutable = ("initial_snapshot_fingerprint", "task_checksum", "runtime_config")
         for key in immutable:
             values = {json.dumps(value.get(key), sort_keys=True) for value in records}
             if len(values) != 1 or values == {"null"}:
                 raise ValueError(f"counterfactual trajectories must share {key}")
+        environment_values = {
+            json.dumps(value.get("environment_digest", value.get("docker_digest")), sort_keys=True)
+            for value in records
+        }
+        if len(environment_values) != 1 or environment_values == {"null"}:
+            raise ValueError("counterfactual trajectories must share environment_digest")
         for value in records:
             states = value.get("process_states")
             policy = value.get("policy_records")

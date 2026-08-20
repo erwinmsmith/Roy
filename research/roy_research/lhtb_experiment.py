@@ -184,22 +184,43 @@ def write_json(path: Path, value: Mapping[str, Any]) -> None:
 def write_harbor_group_config(
     path: Path, task_id: str, jobs_dir: Path, arm: str,
     initial_fingerprint: str, organization_seed: int, attempts: int = GROUP_SIZE,
-    official_timeout: bool = False,
+    official_timeout: bool = False, environment_backend: str = "docker",
+    native_runtime_root: Path | None = None,
+    native_template_root: Path | None = None,
+    allow_network_degraded: bool = False,
 ) -> None:
     if arm not in ("single_agent_direct", "roy_runtime_heuristic",
                    "learned_information_realization"):
         raise ValueError(f"unknown LHTB arm {arm}")
+    if environment_backend == "docker":
+        environment = {"type": "docker", "force_build": False, "delete": True}
+    elif environment_backend == "native":
+        if native_runtime_root is None or native_template_root is None:
+            raise ValueError("native Harbor config requires runtime and template roots")
+        environment = {
+            "import_path": "roy_research.native_environment:NativeProcessEnvironment",
+            "force_build": False,
+            "delete": True,
+            "kwargs": {
+                "runtime_root": str(native_runtime_root),
+                "template_root": str(native_template_root),
+                "allow_network_degraded": allow_network_degraded,
+            },
+        }
+    else:
+        raise ValueError(f"unknown LHTB environment backend {environment_backend}")
     value = {
         "job_name": f"roy-{task_id}-{organization_seed}",
         "jobs_dir": str(jobs_dir), "n_attempts": attempts,
         "n_concurrent_trials": min(CONCURRENCY, attempts), "timeout_multiplier": 1.0,
         "retry": {"max_retries": 2},
-        "environment": {"type": "docker", "force_build": False, "delete": True},
+        "environment": environment,
         "agents": [{
             "import_path": "roy_research.harbor_agent:RoyHarborAgent",
             "model_name": "deepseek/deepseek-v4-flash",
             "kwargs": {"rpc_timeout": 120},
             "env": {"ROY_LHTB_ARM": arm,
+                    "ROY_LHTB_ENVIRONMENT_BACKEND": environment_backend,
                     "ROY_LHTB_INITIAL_FINGERPRINT": initial_fingerprint,
                     "ROY_LHTB_ORGANIZATION_SEED": str(organization_seed)},
         }],

@@ -25,7 +25,7 @@ PYTHONPATH=research python3 -m roy_research lhtb-update \
   --updates research/output/lhtb/update-audit.jsonl --resume
 ```
 
-The formal schedule is four epochs over all 30 train tasks, `G=8`, for 960 rollouts. Every group uses fresh Docker environments with matching task checksum, image digest, initial fingerprint and runtime config. Each rollout has a 60-minute training deadline, concurrency is four, and one DeepSeek response is capped at 32,768 tokens. These are execution settings, not reward terms and not forced node/depth limits.
+The formal schedule is four epochs over all 30 train tasks, `G=8`, for 960 rollouts. Every group uses fresh matched environments with the same task checksum, immutable environment digest, initial fingerprint and runtime config. Each rollout has a 60-minute training deadline, concurrency is four, and one DeepSeek response is capped at 32,768 tokens. These are execution settings, not reward terms and not forced node/depth limits.
 
 Each organization action and terminal result appends an immutable `GlobalEpistemicState` `M_t`. Frozen DeepSeek prompts separately extract entities and verify `entail / contradict / unknown`; pinned MiniLM only recalls top-eight candidate pairs. All requests, responses, cache keys and model revisions are retained. No benchmark keyword field, lexical rule, regex, frequency score or embedding threshold labels meaning.
 
@@ -47,6 +47,29 @@ research/remote/run_lhtb_test.sh
 ```
 
 The preflight stops below 15% free disk and never runs destructive Docker prune. Every optimizer group and Harbor trial is persisted before proceeding. The current `exp-roy` host is a container without a Docker socket, so it is not a valid formal LHTB runner; use the planned `exp-roy-lhtb` VM.
+
+### GPUHome native-process track
+
+GPUHome container instances do not expose the kernel capabilities needed for Docker, containerd, Podman, Buildah, Apptainer or a nested VM. For this host, Roy provides a non-official Harbor `BaseEnvironment` implementation backed by native Linux processes:
+
+```bash
+ssh exp-roy
+cd ~/rivermind-data/roy
+research/remote/prepare_lhtb_native.sh check
+research/remote/prepare_lhtb_native.sh prepare
+research/remote/prepare_lhtb_native.sh provision
+research/remote/prepare_lhtb_native.sh oracle-smoke
+research/remote/prepare_lhtb_native.sh roy-smoke
+
+# These fail closed until every task in the selected split has a reviewed,
+# digest-matched native provisioning manifest.
+research/remote/run_lhtb_native_training.sh
+research/remote/run_lhtb_native_test.sh
+```
+
+Each trial gets a copied workspace and an unprivileged UID. PRoot supplies stable `/app`, `/workspace`, `/tests`, `/solution`, `/tmp`, `/opt`, `/root` and `/logs` paths; process groups are terminated on cleanup, the task/template digest is checked before execution, and provider secrets are not inherited by task commands. The initial reviewed catalog covers three smoke tasks (`great-expectations-audit`, `poc-exploit-craft`, and `opensees-seismic-structural-regression-audit`). The remaining tasks must be audited and provisioned before the 30-task training schedule can start.
+
+This backend intentionally records `network_isolation=false` and the absence of PID/mount namespaces. A task declaring `allow_internet=false` is rejected unless `ROY_LHTB_ALLOW_NETWORK_DEGRADED=true` is explicitly set, and such a run is labeled degraded. Native results use a content-derived environment digest and the original final verifier, but they are not Docker-equivalent or official leaderboard-comparable. Reports must keep them separate from the official Docker protocol.
 
 Dev checkpoint selection uses highest mean reward, then lower value MAE, fewer tokens and earlier epoch. Final test compares `single_agent_direct`, `roy_runtime_heuristic` and `learned_information_realization` for three repetitions. Direct uses the same model/executor/runtime while enforcing one root node and no communication. Report mean reward, success at `R >= 0.95`, paired bootstrap 95% CI, tokens, time, topology, `Delta V`, value calibration and failures.
 
