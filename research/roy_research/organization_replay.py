@@ -46,6 +46,7 @@ class OrganizationGRPOTrainer:
         self.groups = 0
         self.trajectories = 0
         self.optimizer_steps = 0
+        self.zero_variance_groups = 0
         self.losses: List[float] = []
         self.loss_sum = 0.0
         self.updated_group_ids: set[str] = set()
@@ -57,6 +58,9 @@ class OrganizationGRPOTrainer:
             self.groups = int(metadata.get("groups", 0))
             self.trajectories = int(metadata.get("trajectories", 0))
             self.optimizer_steps = int(metadata.get("optimizer_steps", 0))
+            self.zero_variance_groups = int(
+                metadata.get("zero_variance_groups", 0)
+            )
             self.loss_sum = float(
                 metadata.get(
                     "loss_sum", float(metadata.get("mean_loss", 0.0)) * self.optimizer_steps
@@ -80,6 +84,8 @@ class OrganizationGRPOTrainer:
             for value in records
         ):
             raise ValueError("on-policy updates accept only complete tau3 train trajectories")
+        if any(bool(value.get("truncated")) for value in records):
+            raise ValueError("on-policy updates reject censored or truncated trajectories")
         envelopes = tuple(
             ExplorationEnvelope(**dict(value.get("envelope") or {})) for value in records
         )
@@ -104,6 +110,22 @@ class OrganizationGRPOTrainer:
             value.trajectory_id: value.advantage
             for value in organization_group_advantages(records)
         }
+        utilities = [float(value["terminal_utility"]) for value in records]
+        utility_mean = sum(utilities) / len(utilities)
+        utility_std = math.sqrt(
+            sum((value - utility_mean) ** 2 for value in utilities) / len(utilities)
+        )
+        if utility_std <= 1e-8:
+            self.groups += 1
+            self.trajectories += len(records)
+            self.zero_variance_groups += 1
+            self.updated_group_ids.add(group_id)
+            self.save()
+            return {
+                **self.metadata(),
+                "update_applied": False,
+                "utility_std": utility_std,
+            }
         current_probabilities: List[Tensor] = []
         behavior_probabilities: List[Tensor] = []
         trajectory_advantages: List[float] = []
@@ -139,7 +161,11 @@ class OrganizationGRPOTrainer:
         self.losses.append(loss_value)
         self.loss_sum += loss_value
         self.save()
-        return self.metadata()
+        return {
+            **self.metadata(),
+            "update_applied": True,
+            "utility_std": utility_std,
+        }
 
     def metadata(self) -> Dict[str, Any]:
         return {
@@ -152,6 +178,7 @@ class OrganizationGRPOTrainer:
             "groups": self.groups,
             "trajectories": self.trajectories,
             "optimizer_steps": self.optimizer_steps,
+            "zero_variance_groups": self.zero_variance_groups,
             "mean_loss": self.loss_sum / max(1, self.optimizer_steps),
             "loss_sum": self.loss_sum,
             "seed": self.seed,

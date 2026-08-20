@@ -41,25 +41,31 @@ ORGANIZATION_GROUP_SIZE = 8
 
 @dataclass(frozen=True)
 class RuntimeBudget:
-    """Hard limits on observable runtime events, never reward components."""
+    """Optional emergency ceilings, never reward components.
 
-    maximum_llm_calls: int = 32
-    maximum_tool_calls: int = 8
-    maximum_nodes: int = 12
-    maximum_depth: int = 5
-    maximum_decisions: int = 64
+    ``None`` disables a ceiling.  The benchmark's own episode termination still
+    applies, but Roy does not censor an otherwise valid trajectory by default.
+    """
+
+    maximum_llm_calls: int | None = None
+    maximum_tool_calls: int | None = None
+    maximum_nodes: int | None = None
+    maximum_depth: int | None = None
+    maximum_decisions: int | None = None
 
     def __post_init__(self) -> None:
-        if min(
+        positive_limits = (
             self.maximum_llm_calls,
             self.maximum_nodes,
             self.maximum_decisions,
-        ) < 1:
+        )
+        if any(value is not None and value < 1 for value in positive_limits):
             raise ValueError("llm-call, node, and decision budgets must be positive")
-        if self.maximum_tool_calls < 0 or self.maximum_depth < 0:
+        non_negative_limits = (self.maximum_tool_calls, self.maximum_depth)
+        if any(value is not None and value < 0 for value in non_negative_limits):
             raise ValueError("tool-call and depth budgets must be non-negative")
 
-    def to_dict(self) -> Dict[str, int]:
+    def to_dict(self) -> Dict[str, int | None]:
         return asdict(self)
 
 
@@ -74,9 +80,9 @@ def training_envelope(epoch: int, epochs: int) -> ExplorationEnvelope:
     return ExplorationEnvelope(
         id=f"epoch-{epoch}",
         minimum_nodes=minimum_nodes,
-        maximum_nodes=12,
+        maximum_nodes=24,
         minimum_depth=minimum_depth,
-        maximum_depth=5,
+        maximum_depth=8,
         mode="expansive",
     )
 

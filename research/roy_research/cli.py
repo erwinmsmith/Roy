@@ -157,11 +157,17 @@ def parser() -> argparse.ArgumentParser:
         help="Optional domain:task_id train records for a leakage-safe focused run",
     )
     tau3_train.add_argument("--limit", type=int)
-    tau3_train.add_argument("--max-steps", type=int, default=100)
+    tau3_train.add_argument("--max-steps", type=int, default=1000)
     tau3_train.add_argument("--max-tokens", type=int, default=50000)
     tau3_train.add_argument("--temperature", type=float, default=0.0)
     tau3_train.add_argument("--epochs", type=int, default=4)
     tau3_train.add_argument("--organization-temperature", type=float, default=2.0)
+    tau3_train.add_argument(
+        "--max-rollout-attempts",
+        type=int,
+        default=3,
+        help="Retries per rollout slot when an episode is censored; every attempt is saved",
+    )
     _add_tau3_runtime_budget_arguments(tau3_train)
     tau3_train.add_argument("--seed", type=int, default=20260818)
     tau3_train.add_argument("--resume", action="store_true")
@@ -177,7 +183,7 @@ def parser() -> argparse.ArgumentParser:
     tau3_evaluate.add_argument("--user-llm", default="deepseek/deepseek-v4-flash")
     tau3_evaluate.add_argument("--split", choices=("validation", "test", "heldout"), default="test")
     tau3_evaluate.add_argument("--limit", type=int)
-    tau3_evaluate.add_argument("--max-steps", type=int, default=100)
+    tau3_evaluate.add_argument("--max-steps", type=int, default=1000)
     tau3_evaluate.add_argument("--max-tokens", type=int, default=50000)
     tau3_evaluate.add_argument("--temperature", type=float, default=0.0)
     tau3_evaluate.add_argument("--organization-temperature", type=float, default=1.0)
@@ -187,11 +193,11 @@ def parser() -> argparse.ArgumentParser:
 
 
 def _add_tau3_runtime_budget_arguments(command: argparse.ArgumentParser) -> None:
-    command.add_argument("--max-llm-calls", type=int, default=32)
-    command.add_argument("--max-tool-calls", type=int, default=8)
-    command.add_argument("--max-nodes", type=int, default=12)
-    command.add_argument("--max-depth", type=int, default=5)
-    command.add_argument("--max-decisions", type=int, default=64)
+    command.add_argument("--max-llm-calls", type=int)
+    command.add_argument("--max-tool-calls", type=int)
+    command.add_argument("--max-nodes", type=int)
+    command.add_argument("--max-depth", type=int)
+    command.add_argument("--max-decisions", type=int)
 
 
 def _tau3_runtime_budget(args: argparse.Namespace) -> RuntimeBudget:
@@ -482,6 +488,7 @@ def main(argv: List[str] | None = None) -> None:
             epochs=args.epochs,
             organization_temperature=args.organization_temperature,
             runtime_budget=_tau3_runtime_budget(args),
+            max_rollout_attempts=args.max_rollout_attempts,
             seed=args.seed,
             resume=args.resume,
         )

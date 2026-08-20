@@ -34,12 +34,13 @@ def train_tau3_on_policy(
     user_llm: str,
     task_keys: Sequence[str] | None = None,
     limit: int | None = None,
-    max_steps: int = 100,
+    max_steps: int = 1000,
     max_tokens: int = 50000,
     temperature: float = 0.0,
     epochs: int = 4,
     organization_temperature: float = 2.0,
     runtime_budget: RuntimeBudget = RuntimeBudget(),
+    max_rollout_attempts: int = 3,
     seed: int = 20260818,
     resume: bool = False,
 ) -> Dict[str, Any]:
@@ -63,12 +64,22 @@ def train_tau3_on_policy(
     trainer = OrganizationGRPOTrainer(model_path, seed=seed, resume=resume)
     if not model_path.exists():
         trainer.save()
+    if max_rollout_attempts < 1:
+        raise ValueError("max_rollout_attempts must be positive")
     existing = list(read_jsonl(trajectories_path)) if resume and trajectories_path.exists() else []
     by_group: Dict[str, list[Dict[str, Any]]] = defaultdict(list)
+    attempts_by_slot: Dict[tuple[str, int], int] = defaultdict(int)
     for value in existing:
-        by_group[str(value["group_id"])].append(value)
+        group_id = str(value["group_id"])
+        rollout_index = int(value["rollout_index"])
+        attempts_by_slot[(group_id, rollout_index)] += 1
+        accepted = bool(value.get("accepted_for_training", not value.get("truncated")))
+        if accepted:
+            by_group[group_id].append(value)
 
     collected = 0
+    accepted_trajectories = 0
+    incomplete_groups = 0
     for epoch in range(epochs):
         epoch_tasks = list(tasks)
         random.Random(seed + epoch).shuffle(epoch_tasks)
@@ -82,78 +93,112 @@ def train_tau3_on_policy(
             for rollout_index in range(ORGANIZATION_GROUP_SIZE):
                 if rollout_index in present:
                     continue
-                name = f"roy_train_{epoch}_{task_index}_{rollout_index}_{uuid.uuid4().hex[:8]}"
-                organization_seed = environment_seed + rollout_index + 1
-                agent_config = Tau3OrganizationAgentConfig(
-                    seed=organization_seed,
-                    policy=trainer.model,
-                    encoder=trainer.encoder,
-                    exploration_envelope=envelope,
-                    runtime_budget=runtime_budget,
-                    organization_temperature=organization_temperature,
-                )
-                register_tau3_organization_agent(agent_config, name=name)
-                simulation, state = _run_episode(
-                    task,
-                    name,
-                    agent_llm,
-                    user_llm,
-                    max_steps,
-                    max_tokens,
-                    temperature,
-                    environment_seed,
-                    trajectories_path.parent / "llm-calls",
-                )
-                trajectory = organization_trajectory_from_state(
-                    state,
-                    _reward(simulation),
-                    str(task["domain"]),
-                    "train",
-                    envelope,
-                    group_id,
-                    epoch,
-                    rollout_index,
-                    environment_seed,
-                    organization_seed,
-                    organization_temperature,
-                    runtime_budget,
-                    _resource_summary(simulation, state),
-                    _simulation_record(simulation),
-                )
-                write_jsonl(
-                    trajectories_path,
-                    [trajectory],
-                    append=trajectories_path.exists(),
-                )
-                records.append(trajectory)
-                collected += 1
-                print(json.dumps({
-                    "event": "trajectory_saved",
-                    "group_id": group_id,
-                    "rollout_index": rollout_index,
-                    "trajectory_id": trajectory["id"],
-                    "terminal_utility": trajectory["terminal_utility"],
-                    "termination_type": trajectory["termination_type"],
-                    "nodes": trajectory["realized_resources"]["nodes"],
-                    "maximum_depth": trajectory["realized_resources"]["maximum_depth"],
-                    "topology": trajectory["topology"],
-                    "path": str(trajectories_path),
-                }, sort_keys=True), flush=True)
+                for _attempt in range(max_rollout_attempts):
+                    attempt_index = attempts_by_slot[(group_id, rollout_index)]
+                    name = (
+                        f"roy_train_{epoch}_{task_index}_{rollout_index}_"
+                        f"{uuid.uuid4().hex[:8]}"
+                    )
+                    organization_seed = (
+                        environment_seed
+                        + rollout_index
+                        + 1
+                        + attempt_index * ORGANIZATION_GROUP_SIZE
+                    )
+                    agent_config = Tau3OrganizationAgentConfig(
+                        seed=organization_seed,
+                        policy=trainer.model,
+                        encoder=trainer.encoder,
+                        exploration_envelope=envelope,
+                        runtime_budget=runtime_budget,
+                        organization_temperature=organization_temperature,
+                    )
+                    register_tau3_organization_agent(agent_config, name=name)
+                    simulation, state = _run_episode(
+                        task,
+                        name,
+                        agent_llm,
+                        user_llm,
+                        max_steps,
+                        max_tokens,
+                        temperature,
+                        environment_seed,
+                        trajectories_path.parent / "llm-calls",
+                    )
+                    trajectory = organization_trajectory_from_state(
+                        state,
+                        _reward(simulation),
+                        str(task["domain"]),
+                        "train",
+                        envelope,
+                        group_id,
+                        epoch,
+                        rollout_index,
+                        environment_seed,
+                        organization_seed,
+                        organization_temperature,
+                        runtime_budget,
+                        _resource_summary(simulation, state),
+                        _simulation_record(simulation),
+                    )
+                    trajectory["attempt_index"] = attempt_index
+                    trajectory["accepted_for_training"] = not bool(
+                        trajectory["truncated"]
+                    )
+                    write_jsonl(
+                        trajectories_path,
+                        [trajectory],
+                        append=trajectories_path.exists(),
+                    )
+                    attempts_by_slot[(group_id, rollout_index)] += 1
+                    collected += 1
+                    print(json.dumps({
+                        "event": "trajectory_saved",
+                        "group_id": group_id,
+                        "rollout_index": rollout_index,
+                        "attempt_index": attempt_index,
+                        "accepted_for_training": trajectory["accepted_for_training"],
+                        "trajectory_id": trajectory["id"],
+                        "terminal_utility": trajectory["terminal_utility"],
+                        "termination_type": trajectory["termination_type"],
+                        "nodes": trajectory["realized_resources"]["nodes"],
+                        "maximum_depth": trajectory["realized_resources"]["maximum_depth"],
+                        "topology": trajectory["topology"],
+                        "path": str(trajectories_path),
+                    }, sort_keys=True), flush=True)
+                    if trajectory["accepted_for_training"]:
+                        records.append(trajectory)
+                        accepted_trajectories += 1
+                        break
             if len(records) != ORGANIZATION_GROUP_SIZE:
-                raise ValueError(f"incomplete organization group after collection: {group_id}")
-            if group_id not in trainer.updated_group_ids:
-                trainer.update_group(records)
+                incomplete_groups += 1
                 print(json.dumps({
-                    "event": "group_updated",
+                    "event": "group_incomplete",
                     "group_id": group_id,
+                    "accepted_rollouts": len(records),
+                    "required_rollouts": ORGANIZATION_GROUP_SIZE,
+                    "optimizer_steps": trainer.optimizer_steps,
+                }, sort_keys=True), flush=True)
+                continue
+            if group_id not in trainer.updated_group_ids:
+                update = trainer.update_group(records)
+                print(json.dumps({
+                    "event": (
+                        "group_updated" if update["update_applied"]
+                        else "group_zero_variance"
+                    ),
+                    "group_id": group_id,
+                    "utility_std": update["utility_std"],
                     "optimizer_steps": trainer.optimizer_steps,
                     "model": str(model_path),
                 }, sort_keys=True), flush=True)
-    all_records = [value for values in by_group.values() for value in values]
+    all_records = list(read_jsonl(trajectories_path)) if trajectories_path.exists() else []
     return {
         **trainer.metadata(),
         "epochs": epochs,
         "new_trajectories": collected,
+        "new_accepted_trajectories": accepted_trajectories,
+        "incomplete_groups": incomplete_groups,
         "truncation_rate": sum(bool(value.get("truncated")) for value in all_records)
         / max(1, len(all_records)),
         "model": str(model_path),
@@ -172,7 +217,7 @@ def evaluate_tau3_against_direct(
     user_llm: str,
     split: str = "test",
     limit: int | None = None,
-    max_steps: int = 100,
+    max_steps: int = 1000,
     max_tokens: int = 50000,
     temperature: float = 0.0,
     organization_temperature: float = 1.0,
@@ -189,7 +234,7 @@ def evaluate_tau3_against_direct(
     if limit is not None:
         tasks = tasks[:limit]
     trainer = OrganizationGRPOTrainer(model_path, seed=seed, resume=True)
-    evaluation_envelope = ExplorationEnvelope("evaluation", 0, 12, 0, 5, "expansive")
+    evaluation_envelope = ExplorationEnvelope("evaluation", 0, 24, 0, 8, "expansive")
     rows: list[Dict[str, Any]] = []
     for task_index, task in enumerate(tasks):
         _validate_manifest_record(task, split)

@@ -50,7 +50,7 @@ specific and verifiable.
 @dataclass(frozen=True)
 class Tau3OrganizationAgentConfig:
     checkpoint: Path | None = None
-    maximum_internal_decisions_per_turn: int = 64
+    maximum_internal_decisions_per_turn: int = 4096
     seed: int = 20260818
     local_encoder_only: bool = True
     policy: Any | None = None
@@ -66,7 +66,7 @@ class Tau3OrganizationAgentConfig:
     def envelope(self) -> ExplorationEnvelope:
         if self.exploration_envelope is not None:
             return self.exploration_envelope
-        return ExplorationEnvelope("default", 0, 12, 0, 5, "expansive")
+        return ExplorationEnvelope("default", 0, 24, 0, 8, "expansive")
 
 
 def register_tau3_organization_agent(
@@ -215,12 +215,16 @@ def register_tau3_organization_agent(
                         root["status"] = "ready"
 
             for _ in range(config.maximum_internal_decisions_per_turn):
-                if state.decision_count >= config.runtime_budget.maximum_decisions:
+                if _limit_reached(
+                    state.decision_count, config.runtime_budget.maximum_decisions
+                ):
                     return self._truncate_and_finalize(
                         state, generate, AssistantMessage, SystemMessage,
                         "decision_budget_exhausted"
                     )
-                if state.llm_call_count >= config.runtime_budget.maximum_llm_calls:
+                if _limit_reached(
+                    state.llm_call_count, config.runtime_budget.maximum_llm_calls
+                ):
                     return self._truncate_and_finalize(
                         state, generate, AssistantMessage, SystemMessage,
                         "llm_call_budget_exhausted"
@@ -539,7 +543,9 @@ def register_tau3_organization_agent(
         def _truncate_and_finalize(
             self, state, generate_fn, assistant_type, system_type, reason: str
         ):
-            if state.llm_call_count < config.runtime_budget.maximum_llm_calls:
+            if not _limit_reached(
+                state.llm_call_count, config.runtime_budget.maximum_llm_calls
+            ):
                 outward = self._final_message(state, generate_fn, system_type)
             else:
                 reports = [
@@ -624,43 +630,9 @@ def register_tau3_organization_agent(
                             "external_access": True,
                             "resolves_gap": True,
                         })
-                external_residuals = _tool_access_residuals(residuals)
-                available_tool_names = [str(value["name"]) for value in state.available_tools]
-                hinted_tool_names = _matching_tool_names(
-                    external_residuals, available_tool_names
-                )
-                for tool in state.available_tools:
-                    tool_name = str(tool["name"])
-                    matched_residuals = [
-                        value for value in external_residuals
-                        if tool_name in _matching_tool_names([value], available_tool_names)
-                    ]
-                    resolves_gap = (
-                        tool_name in hinted_tool_names
-                        if hinted_tool_names
-                        else bool(external_residuals)
-                    )
-                    identifier = (
-                        f"acquire-tool:{actor}:{tool_name}:{state.decision_count}"
-                    )
-                    result.append({
-                        **_candidate(
-                            identifier,
-                            "ACQUIRE",
-                            actor,
-                            f"Use tau3 tool {tool_name}: {json.dumps(tool, ensure_ascii=False)}",
-                            3.0,
-                        ),
-                        "requirement": {
-                            "residual_requirements": (
-                                matched_residuals if hinted_tool_names else external_residuals
-                            ),
-                            "selected_tool": tool_name,
-                        },
-                        "tool_name": tool_name,
-                        "external_access": True,
-                        "resolves_gap": resolves_gap,
-                    })
+                result.extend(_tool_acquisition_candidates(
+                    actor, residuals, state.available_tools, used
+                ))
                 if actor != "root":
                     result.append(_candidate(f"return:{actor}", "RETURN", actor, "Return the epistemic report to the parent", 0.2))
                 elif not any(value["status"] in {"ready", "reported", "waiting"} for value in state.nodes[1:]):
@@ -709,32 +681,44 @@ def register_tau3_organization_agent(
         def _runtime_action_legal(self, candidate, state) -> bool:
             budget = config.runtime_budget
             kind = str(candidate["kind"])
-            llm_remaining = budget.maximum_llm_calls - state.llm_call_count
-            if kind == "EXECUTE" and llm_remaining <= 1:
-                return False
-            if kind == "ACQUIRE" and not candidate.get("user_interaction") and llm_remaining <= 1:
-                return False
-            if kind == "STOP" and llm_remaining < 1:
+            if kind == "EXECUTE" and _remaining_at_most(
+                state.llm_call_count, budget.maximum_llm_calls, 1
+            ):
                 return False
             if (
                 kind == "ACQUIRE"
                 and not candidate.get("user_interaction")
-                and state.tool_call_count >= budget.maximum_tool_calls
+                and _remaining_at_most(
+                    state.llm_call_count, budget.maximum_llm_calls, 1
+                )
+            ):
+                return False
+            if kind == "STOP" and _remaining_at_most(
+                state.llm_call_count, budget.maximum_llm_calls, 0
+            ):
+                return False
+            if (
+                kind == "ACQUIRE"
+                and not candidate.get("user_interaction")
+                and _limit_reached(
+                    state.tool_call_count, budget.maximum_tool_calls
+                )
             ):
                 return False
             if kind == "DERIVE":
+                node_ceiling = _effective_ceiling(
+                    budget.maximum_nodes, config.envelope().maximum_nodes
+                )
+                depth_ceiling = _effective_ceiling(
+                    budget.maximum_depth, config.envelope().maximum_depth
+                )
                 return (
                     bool(candidate.get("dependencies_available", True))
-                    and len(state.nodes) < min(
-                        budget.maximum_nodes, config.envelope().maximum_nodes
-                    )
-                    and int(candidate.get("resulting_depth", 0)) <= min(
-                        budget.maximum_depth, config.envelope().maximum_depth
-                    )
+                    and len(state.nodes) < node_ceiling
+                    and int(candidate.get("resulting_depth", 0)) <= depth_ceiling
                 )
             if kind == "RETURN":
                 actor = self._node(state, str(candidate["actor_node_id"]))
-                report = actor.get("report") or {}
                 unresolved_dependencies = any(
                     edge["to"] == actor["id"] and not bool(edge.get("resolved"))
                     for edge in state.dependency_edges
@@ -744,13 +728,10 @@ def register_tau3_organization_agent(
                     and value.get("status") not in {"returned", "pruned"}
                     for value in state.nodes
                 )
-                unresolved_report = bool(report.get("residual_requirements")) and not bool(
-                    report.get("resolved_parent_gap")
-                )
-                return not (
-                    unresolved_dependencies or active_children or unresolved_report
-                )
-            return state.decision_count < budget.maximum_decisions
+                return not (unresolved_dependencies or active_children)
+            return not _limit_reached(
+                state.decision_count, budget.maximum_decisions
+            )
 
         @staticmethod
         def _has_actionable_residual_gap(candidates) -> bool:
@@ -823,24 +804,20 @@ def register_tau3_organization_agent(
             budget = config.runtime_budget
             maximum_depth = max(int(value["depth"]) for value in state.nodes)
             return {
-                "llm_calls_remaining_fraction": max(
-                    0.0, (budget.maximum_llm_calls - state.llm_call_count)
-                    / budget.maximum_llm_calls
+                "llm_calls_remaining_fraction": _remaining_fraction(
+                    state.llm_call_count, budget.maximum_llm_calls
                 ),
-                "tool_calls_remaining_fraction": max(
-                    0.0, (budget.maximum_tool_calls - state.tool_call_count)
-                    / max(1, budget.maximum_tool_calls)
+                "tool_calls_remaining_fraction": _remaining_fraction(
+                    state.tool_call_count, budget.maximum_tool_calls
                 ),
-                "nodes_remaining_fraction": max(
-                    0.0, (budget.maximum_nodes - len(state.nodes)) / budget.maximum_nodes
+                "nodes_remaining_fraction": _remaining_fraction(
+                    len(state.nodes), budget.maximum_nodes
                 ),
-                "depth_remaining_fraction": max(
-                    0.0, (budget.maximum_depth - maximum_depth)
-                    / max(1, budget.maximum_depth)
+                "depth_remaining_fraction": _remaining_fraction(
+                    maximum_depth, budget.maximum_depth
                 ),
-                "decisions_remaining_fraction": max(
-                    0.0, (budget.maximum_decisions - state.decision_count)
-                    / budget.maximum_decisions
+                "decisions_remaining_fraction": _remaining_fraction(
+                    state.decision_count, budget.maximum_decisions
                 ),
             }
 
@@ -978,6 +955,78 @@ def _candidate(
         "scheduler_complexity": complexity,
         "legal": True,
     }
+
+
+def _tool_acquisition_candidates(
+    actor: str,
+    residuals: Sequence[Any],
+    available_tools: Sequence[Mapping[str, Any]],
+    used_candidate_ids: set[str],
+) -> list[Dict[str, Any]]:
+    """Expose each relevant tool once for the current semantic requirement.
+
+    The old decision-index identifier made the same tool and unchanged gap look
+    new forever.  That let an untrained policy loop until a resource ceiling.
+    Stable requirement-derived identifiers preserve open tool choice while
+    removing those no-op repetitions from the on-policy action space.
+    """
+
+    external_residuals = _tool_access_residuals(residuals)
+    if not external_residuals:
+        return []
+    available_names = [str(value["name"]) for value in available_tools]
+    hinted_names = _matching_tool_names(external_residuals, available_names)
+    selected_names = hinted_names or set(available_names)
+    result: list[Dict[str, Any]] = []
+    for tool in available_tools:
+        tool_name = str(tool["name"])
+        if tool_name not in selected_names:
+            continue
+        matched = [
+            value for value in external_residuals
+            if tool_name in _matching_tool_names([value], available_names)
+        ]
+        requirements = matched if hinted_names else external_residuals
+        requirement = {
+            "residual_requirements": requirements,
+            "selected_tool": tool_name,
+        }
+        semantic_key = _stable_json_hash(requirement)[:16]
+        identifier = f"acquire-tool:{actor}:{tool_name}:{semantic_key}"
+        if identifier in used_candidate_ids:
+            continue
+        short_description = str(
+            tool.get("short_desc") or tool.get("description") or ""
+        ).strip()
+        description = f"Use tau3 tool {tool_name}"
+        if short_description:
+            description += f" to resolve the reported gap: {short_description}"
+        result.append({
+            **_candidate(identifier, "ACQUIRE", actor, description, 3.0),
+            "requirement": requirement,
+            "tool_name": tool_name,
+            "external_access": True,
+            "resolves_gap": True,
+        })
+    return result
+
+
+def _limit_reached(used: int, limit: int | None) -> bool:
+    return limit is not None and used >= limit
+
+
+def _remaining_at_most(used: int, limit: int | None, threshold: int) -> bool:
+    return limit is not None and limit - used <= threshold
+
+
+def _remaining_fraction(used: int, limit: int | None) -> float:
+    if limit is None:
+        return 1.0
+    return max(0.0, (limit - used) / max(1, limit))
+
+
+def _effective_ceiling(optional_limit: int | None, envelope_limit: int) -> int:
+    return envelope_limit if optional_limit is None else min(optional_limit, envelope_limit)
 
 
 def _topology_summary(

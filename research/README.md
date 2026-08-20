@@ -2,7 +2,7 @@
 
 This directory contains the canonical theory, recursive epistemic runtime, autonomous organization policy, organization-GRPO training code and τ³ integration. Generated trajectories, model weights, embedding caches and benchmark assets are intentionally ignored by Git.
 
-The current research method uses one policy, one on-policy training process and one optimization signal: terminal τ³ task utility. It has no teacher policy, predefined agent-role catalog, imitation warm start or weighted objective sum. Observable LLM-call, tool-call, node, depth and decision budgets are enforced through the legal-action mask; resource use is never subtracted from reward.
+The current research method uses one policy, one on-policy training process and one optimization signal: terminal τ³ task utility. It has no teacher policy, predefined agent-role catalog, imitation warm start or weighted objective sum. LLM-call, tool-call, node, depth and decision ceilings are disabled by default; optional emergency ceilings affect only the legal-action mask, and resource use is never subtracted from reward.
 
 ## τ³ preparation and training
 
@@ -18,7 +18,8 @@ PYTHONPATH=research python3 -m roy_research tau3-train \
   --manifest research/output/tau3/manifest.jsonl \
   --trajectories research/output/tau3/train-trajectories.jsonl \
   --model research/output/tau3/organization-policy.pt \
-  --epochs 4 --organization-temperature 2.0 --max-tokens 50000 --resume
+  --epochs 4 --organization-temperature 2.0 --max-tokens 50000 \
+  --max-steps 1000 --max-rollout-attempts 3 --resume
 
 PYTHONPATH=research python3 -m roy_research tau3-evaluate \
   --manifest research/output/tau3/manifest.jsonl \
@@ -34,14 +35,17 @@ research/remote/run_tau3.sh tau3-train \
   --manifest research/output/tau3/manifest.jsonl \
   --trajectories research/output/tau3/train-trajectories.jsonl \
   --model research/output/tau3/organization-policy.pt \
-  --epochs 4 --max-tokens 50000 --resume
+  --epochs 4 --max-tokens 50000 --max-steps 1000 \
+  --max-rollout-attempts 3 --resume
 ```
 
 Set `TAU3_ROOT` only when the pinned checkout is not at the sibling `benchmarks/tau3-bench-v1.0.1` path.
 
 The τ³ checkout is pinned to commit `fc0055dc4e0a316c3f83133267fbd6faaa770992`. Airline, retail and telecom preserve their official train/test split; validation is reserved deterministically from official training tasks. Banking knowledge is held out because the pinned benchmark does not define an official training split for it.
 
-Each task/epoch provides exactly eight complete organization trajectories under one shared exploration envelope, runtime budget and environment seed. Only the organization sampling seed differs. Every tool exposed by the selected τ³ domain becomes its own legal `ACQUIRE` candidate. DeepSeek generates only a JSON argument object from the selected tool's official schema; Roy deterministically binds the policy-selected tool name and constructs the τ³ ToolCall, so the provider cannot substitute another tool. The official environment remains responsible for argument validation and execution. Roy's report, argument and final-synthesis calls use DeepSeek non-thinking mode because the pinned τ³ message adapter does not preserve the `reasoning_content` required after tool calls; the direct baseline and user simulator retain their configured mode. Roy marks policy `STOP` and resource truncation with the official Agent stop protocol so the orchestrator terminates and scores the episode immediately. Every LLM request and response is written under the run's `llm-calls/` directory. Airline, retail and telecom expose 14, 16 and 13 tools respectively. Banking uses the official AllTools construction with the pinned local MiniLM encoder, BM25, dense retrieval, shell and dynamically discovered tools; it does not require a remote embedding service.
+Each task/epoch provides exactly eight complete organization trajectories under one shared exploration envelope, runtime configuration and environment seed. Only the organization sampling seed differs. Every tool exposed by the selected τ³ domain is available, but it becomes a legal `ACQUIRE` candidate only when the current report identifies a tool-access residual. Exact tool hints narrow the candidates; a generic tool residual keeps all domain tools open. A stable `node + requirement + tool` identity prevents an unchanged acquisition from being sampled repeatedly. DeepSeek generates only a JSON argument object from the selected tool's official schema; Roy deterministically binds the policy-selected tool name and constructs the τ³ ToolCall, so the provider cannot substitute another tool. The official environment remains responsible for argument validation and execution. Roy's report, argument and final-synthesis calls use DeepSeek non-thinking mode because the pinned τ³ message adapter does not preserve the `reasoning_content` required after tool calls; the direct baseline and user simulator retain their configured mode. Every LLM request and response is written under the run's `llm-calls/` directory. Airline, retail and telecom expose 14, 16 and 13 tools respectively. Banking uses the official AllTools construction with the pinned local MiniLM encoder, BM25, dense retrieval, shell and dynamically discovered tools; it does not require a remote embedding service.
+
+Every rollout attempt is appended to the trajectory JSONL immediately. A censored attempt is marked `accepted_for_training=false` and retried with the same environment seed but a fresh organization seed; it is never passed to GRPO. Complete zero-variance groups remain in the sample record but do not execute an optimizer step, because terminal utility supplies no preference signal. Training continues over the complete train split so later groups can provide nonzero within-group utility variance.
 
 The exact masked old-policy probability is recorded for every `active node → conditional candidate` decision and replay uses the identical mask and organization temperature. Training defaults to temperature `2.0` to broaden genuine on-policy exploration without mixing in a separate random behavior policy; evaluation defaults to `1.0`. One GRPO update follows each freshly sampled group. The default four epochs anneal conditional node/depth floors as `(6,3) → (4,2) → (2,1) → (0,0)`. While a floor is unmet, sampling is directed among legal `DERIVE` actions only when the LLM report contains a genuine residual requirement; otherwise reasoning and acquisition remain available. A report residual without an explicit child proposal becomes an open child specification grounded in that residual, rather than a predefined role or synthetic task. Evaluation removes minimum node/depth floors and runs one organization per episode.
 

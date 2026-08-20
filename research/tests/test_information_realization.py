@@ -18,6 +18,7 @@ from roy_research.organization import (
 )
 from roy_research.organization_model import InformationRealizationPolicy
 from roy_research.organization_replay import (
+    OrganizationGRPOTrainer,
     replay_joint_log_probability,
     sample_organization_decision,
 )
@@ -37,6 +38,7 @@ from roy_research.tau3_agent import (
     _objective_fingerprint,
     _residual_child_specifications,
     _stop_content,
+    _tool_acquisition_candidates,
     _topology_summary,
     _tool_access_residuals,
     _tool_argument_prompt,
@@ -57,7 +59,7 @@ class InformationRealizationTests(unittest.TestCase):
         self.assertEqual(mask, [True, False, False])
         no_gap = envelope_legal_actions(candidates, envelope, 2, 1, False)
         self.assertEqual(no_gap, [True, True, True])
-        full = envelope_legal_actions(candidates, envelope, 12, 5, True)
+        full = envelope_legal_actions(candidates, envelope, 24, 8, True)
         self.assertEqual(full, [False, True, True])
         with self.assertRaisesRegex(ValueError, "share one exploration envelope"):
             validate_exploration_group((envelope,) * 7 + (training_envelope(3, 4),))
@@ -68,7 +70,8 @@ class InformationRealizationTests(unittest.TestCase):
               training_envelope(epoch, 4).minimum_depth) for epoch in range(4)],
             [(6, 3), (4, 2), (2, 1), (0, 0)],
         )
-        self.assertEqual(RuntimeBudget().maximum_nodes, 12)
+        self.assertIsNone(RuntimeBudget().maximum_nodes)
+        self.assertEqual(training_envelope(0, 4).maximum_nodes, 24)
 
     def test_depth_floor_prefers_only_depth_increasing_derivations(self) -> None:
         envelope = ExplorationEnvelope("depth", 3, 12, 3, 5, "expansive")
@@ -253,6 +256,27 @@ class InformationRealizationTests(unittest.TestCase):
             ["gap-details"],
         )
 
+    def test_tool_candidates_require_a_gap_and_do_not_repeat_semantically(self) -> None:
+        tools = [
+            {"name": "get_user_details", "short_desc": "Get user details"},
+            {"name": "cancel_reservation", "short_desc": "Cancel a reservation"},
+        ]
+        self.assertEqual(_tool_acquisition_candidates("root", [], tools, set()), [])
+        residual = {
+            "id": "gap-details",
+            "description": "Look up account details",
+            "possible_external_access": ["get_user_details tool"],
+        }
+        candidates = _tool_acquisition_candidates("root", [residual], tools, set())
+        self.assertEqual([value["tool_name"] for value in candidates], ["get_user_details"])
+        self.assertNotIn("properties", candidates[0]["description"])
+        self.assertEqual(
+            _tool_acquisition_candidates(
+                "root", [residual], tools, {str(candidates[0]["id"])}
+            ),
+            [],
+        )
+
     def test_optional_communication_candidates_are_sparse_and_acyclic(self) -> None:
         root = {"id": "root", "status": "reported", "report": {"conclusion": "x"}}
         first = {"id": "node-1", "status": "reported", "report": {"conclusion": "y"}}
@@ -420,6 +444,39 @@ class InformationRealizationTests(unittest.TestCase):
         )
         loss.backward()
         self.assertTrue(torch.isfinite(loss))
+
+    def test_zero_variance_complete_group_does_not_step_optimizer(self) -> None:
+        trainer = OrganizationGRPOTrainer.__new__(OrganizationGRPOTrainer)
+        trainer.groups = 0
+        trainer.trajectories = 0
+        trainer.optimizer_steps = 0
+        trainer.zero_variance_groups = 0
+        trainer.losses = []
+        trainer.loss_sum = 0.0
+        trainer.updated_group_ids = set()
+        trainer.seed = 17
+        trainer.save = Mock()
+        envelope = training_envelope(0, 1).to_dict()
+        records = [{
+            "id": f"trajectory-{index}",
+            "group_id": "task:epoch",
+            "benchmark": "tau3",
+            "split": "train",
+            "terminal": True,
+            "truncated": False,
+            "terminal_utility": 0.0,
+            "envelope": envelope,
+            "rollout_index": index,
+            "environment_seed": 9,
+            "initial_snapshot_fingerprint": "same",
+            "runtime_budget": RuntimeBudget().to_dict(),
+            "policy_records": [{"unused": True}],
+        } for index in range(8)]
+        result = trainer.update_group(records)
+        self.assertFalse(result["update_applied"])
+        self.assertEqual(trainer.optimizer_steps, 0)
+        self.assertEqual(trainer.zero_variance_groups, 1)
+        trainer.save.assert_called_once()
 
     def test_tau3_manifest_keeps_official_test_and_knowledge_held_out(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
