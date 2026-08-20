@@ -124,6 +124,8 @@ class NativeProcessEnvironment(BaseEnvironment):
             raise RuntimeError(f"native session already exists: {self.session_root}")
         for name in ("app", "opt", "tests", "solution", "tmp", "home", "logs"):
             (self.session_root / name).mkdir(parents=True, exist_ok=True)
+        for name in ("agent", "verifier", "artifacts"):
+            (self.session_root / "logs" / name).mkdir(parents=True, exist_ok=True)
         template = self.template_root / self.native_task_id
         for name in ("app", "opt"):
             source = template / name

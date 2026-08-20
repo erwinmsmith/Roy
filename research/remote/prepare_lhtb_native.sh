@@ -149,11 +149,13 @@ provision_smoke_tasks() {
 
 oracle_smoke() {
   local config="${roy_root}/research/output/lhtb/native/oracle-smoke.json"
+  local jobs_root="${roy_root}/research/output/lhtb/native/oracle-jobs"
+  local job_name="roy-native-oracle-smoke-$(date -u +%Y%m%dT%H%M%SZ)"
   PYTHONPATH="${roy_root}/research" "${python_bin}" - "${config}" "${template_root}" \
-    "${native_root}" "${roy_root}/research/output/lhtb/native/oracle-jobs" <<'PY'
+    "${native_root}" "${jobs_root}" "${job_name}" <<'PY'
 import json, sys
 value = {
-    "job_name": "roy-native-oracle-smoke",
+    "job_name": sys.argv[5],
     "jobs_dir": sys.argv[4],
     "n_attempts": 1,
     "n_concurrent_trials": 1,
@@ -172,6 +174,21 @@ PY
   export ROY_LHTB_NATIVE_ROOT="${native_root}"
   cd "${lhtb_root}"
   "${harbor_bin}" run -c "${config}" --yes
+  "${python_bin}" - "${jobs_root}/${job_name}/result.json" <<'PY'
+import json, sys
+result = json.load(open(sys.argv[1], encoding="utf-8"))
+stats = result["stats"]
+evaluation = next(iter(stats["evals"].values()))
+mean_reward = float(evaluation["metrics"][0]["mean"])
+if (stats["n_completed_trials"] != 1 or stats["n_errored_trials"] != 0
+        or mean_reward < 0.95):
+    raise SystemExit(
+        f"native oracle smoke failed: completed={stats['n_completed_trials']} "
+        f"errored={stats['n_errored_trials']} mean={mean_reward}"
+    )
+print(json.dumps({"oracle_smoke": "passed", "mean": mean_reward,
+                  "result": sys.argv[1]}))
+PY
 }
 
 roy_smoke() {
