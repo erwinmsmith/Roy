@@ -231,4 +231,52 @@ describe('LHTB process state', () => {
       await rm(auditRoot, { recursive: true, force: true });
     }
   });
+
+  it('rejects an unchanged failed command and requests a legal replacement', async () => {
+    const auditRoot = await mkdtemp(path.join(tmpdir(), 'roy-lhtb-command-repair-'));
+    const session = new RoyLHTBSession('command-repair', 'task', 'finish', 'commit',
+      'roy_runtime_heuristic');
+    session.requestTerminal({ id: 'failed', command: 'python missing.py', timeoutMs: 1000,
+      nodeId: 'root', organizationActionKind: 'EXECUTE' });
+    session.acceptTerminalResult({ requestId: 'failed', exitCode: 2, stdout: '',
+      stderr: 'missing', durationMs: 1, fileChanges: [] });
+    session.applyOrganizationAction({ kind: 'EXECUTE', actorNodeId: 'root' });
+    const semantic = { async processEvent(event: { id: string }) {
+      return { event_id: event.id, requirements: [], claims: [], assumptions: [], evidence: [],
+        external_observations: [], blind_spots: [], relations: [] };
+    }, close() {} };
+    let calls = 0;
+    const provider = { isConfigured: () => true, async completeJSONWithUsage() {
+      calls += 1;
+      const candidate = calls === 1 ? {
+        id: 'repeat', kind: 'EXECUTE', actorNodeId: 'root', description: 'Repeat failure',
+        schedulerComplexity: 1, command: 'python missing.py',
+        action: { kind: 'EXECUTE', actorNodeId: 'root' },
+      } : {
+        id: 'repair', kind: 'EXECUTE', actorNodeId: 'root', description: 'Inspect and repair',
+        schedulerComplexity: 1, command: 'ls -la && python repair.py',
+        action: { kind: 'EXECUTE', actorNodeId: 'root' },
+      };
+      return { value: { preferred_candidate_id: candidate.id, candidates: [candidate] },
+        completion: { content: JSON.stringify({ candidates: [candidate] }), model: 'mock',
+          usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } } };
+    } };
+    const controller = new LHTBAutonomousController({ provider, semantic, auditRoot });
+    try {
+      const result = await controller.advance(session, 1);
+      expect(result.status).toBe('terminal_request');
+      if (result.status === 'terminal_request') {
+        expect(result.request.command).toBe('ls -la && python repair.py');
+      }
+      expect(calls).toBe(2);
+      const validations = (await readFile(
+        path.join(auditRoot, 'candidate-validation.jsonl'), 'utf8'
+      )).trim().split('\n').map(line => JSON.parse(line));
+      expect(validations[0].dispositions[0].reasons)
+        .toContain('repeats_unchanged_failed_command');
+    } finally {
+      controller.close();
+      await rm(auditRoot, { recursive: true, force: true });
+    }
+  });
 });

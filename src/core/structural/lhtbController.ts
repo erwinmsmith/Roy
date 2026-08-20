@@ -105,6 +105,8 @@ Claims, evidence, observations, assumptions, conflicts, residual requirements an
 must use their typed runtime schemas when non-empty. STOP is root-only and uses finalOutput.
 Cover every active node that has a semantically useful next action; candidate actorNodeId must be
 that node's exact ID. A node with no proposed candidate cannot be selected by the policy.
+Never repeat an unchanged terminal command immediately after it failed without file changes;
+propose a command that diagnoses or repairs the observed failure.
 Propose only semantically useful actions. Do not expose hidden reasoning, benchmark grader data,
 keyword fields or reward. The preferred candidate is your best next organization decision.`;
 
@@ -163,11 +165,12 @@ export class LHTBAutonomousController {
     ];
     const proposalAttempts = Math.max(1, Number(process.env.ROY_LHTB_PROPOSAL_ATTEMPTS ?? 3));
     let completion: LLMJSONCompletionResult<ProposalResponse> | undefined;
+    let validation: CandidateValidation | undefined;
     for (let attempt = 1; attempt <= proposalAttempts; attempt += 1) {
+      let current: LLMJSONCompletionResult<ProposalResponse>;
       try {
-        completion = await this.provider.completeJSONWithUsage<ProposalResponse>(messages,
+        current = await this.provider.completeJSONWithUsage<ProposalResponse>(messages,
           { temperature: 0, maxTokens: 32_768, thinking: { type: 'disabled' } });
-        break;
       } catch (error) {
         if (!(error instanceof LLMJSONParseError)) throw error;
         session.recordModelUsage(error.completion.usage?.inputTokens
@@ -181,22 +184,34 @@ export class LHTBAutonomousController {
           { role: 'assistant', content: error.completion.content },
           { role: 'user', content: 'The preceding response was malformed JSON. Return only one corrected JSON object in the exact candidate schema.' },
         );
+        continue;
       }
+      await this.auditProposal(requestState, current);
+      session.recordModelUsage(current.completion.usage?.inputTokens
+        ?? current.completion.usage?.promptTokens ?? 0,
+      current.completion.usage?.outputTokens
+        ?? current.completion.usage?.completionTokens ?? 0,
+      current.completion.model);
+      const currentValidation = this.validateCandidates(current.value, session);
+      await this.auditCandidateValidation(currentValidation);
+      if (currentValidation.candidates.length > 0) {
+        completion = current;
+        validation = currentValidation;
+        break;
+      }
+      const reasons = [...new Set(currentValidation.dispositions.flatMap(
+        value => value.reasons
+      ))];
+      if (attempt === proposalAttempts) {
+        throw new Error(`DeepSeek proposer returned no legal candidates: ${reasons.join('; ')}`);
+      }
+      messages.push(
+        { role: 'assistant', content: current.completion.content },
+        { role: 'user', content: `Every preceding candidate was rejected by the runtime: ${reasons.join('; ')}. Return a corrected set of genuinely legal candidates.` },
+      );
     }
-    if (!completion) throw new Error('DeepSeek proposer did not return a completion');
-    await this.auditProposal(requestState, completion);
-    session.recordModelUsage(completion.completion.usage?.inputTokens
-      ?? completion.completion.usage?.promptTokens ?? 0,
-    completion.completion.usage?.outputTokens
-      ?? completion.completion.usage?.completionTokens ?? 0,
-    completion.completion.model);
-    const validation = this.validateCandidates(completion.value, session);
-    await this.auditCandidateValidation(validation);
+    if (!completion || !validation) throw new Error('DeepSeek proposer did not return a completion');
     const candidates = validation.candidates;
-    if (candidates.length === 0) {
-      const reasons = [...new Set(validation.dispositions.flatMap(value => value.reasons))];
-      throw new Error(`DeepSeek proposer returned no legal candidates: ${reasons.join('; ')}`);
-    }
     let selected: ProposedCandidate;
     let policyRecord: OrganizationPolicyRecord | undefined;
     if (snapshot.organizationMode === 'learned_information_realization') {
@@ -243,6 +258,23 @@ export class LHTBAutonomousController {
       .filter(node => ['ready', 'running', 'waiting', 'completed'].includes(node.status))
       .map(node => node.id));
     const direct = snapshot.organizationMode === 'single_agent_direct';
+    const runtimeEvents = snapshot.processStates.at(-1)?.runtimeEvents ?? [];
+    let lastFailedCommand: { command?: string; cwd?: string } | undefined;
+    for (let index = runtimeEvents.length - 1; index >= 0; index -= 1) {
+      const event = runtimeEvents[index];
+      if (event.kind !== 'terminal_result') continue;
+      const fileChanges = event.attributes?.fileChanges;
+      if ((event.exitCode ?? 0) !== 0 && (!Array.isArray(fileChanges) || fileChanges.length === 0)) {
+        for (let commandIndex = index - 1; commandIndex >= 0; commandIndex -= 1) {
+          const commandEvent = runtimeEvents[commandIndex];
+          if (commandEvent.kind === 'terminal_command') {
+            lastFailedCommand = { command: commandEvent.command, cwd: commandEvent.cwd };
+            break;
+          }
+        }
+      }
+      break;
+    }
     const allowedKinds = new Set(['DERIVE', 'ACQUIRE', 'CONNECT', 'EXECUTE', 'RETURN',
       'PRUNE', 'STOP']);
     const seenIds = new Set<string>();
@@ -282,6 +314,11 @@ export class LHTBAutonomousController {
       const timeoutMs = timeoutValue === undefined ? undefined : Number(timeoutValue);
       if (kind === 'ACQUIRE' && !commandValue?.trim()) reasons.push('acquire_missing_command');
       if (kind === 'EXECUTE' && !commandValue?.trim()) reasons.push('execute_missing_command');
+      if ((kind === 'ACQUIRE' || kind === 'EXECUTE') && commandValue?.trim()
+        && commandValue.trim() === lastFailedCommand?.command?.trim()
+        && (cwdValue?.trim() ?? '') === (lastFailedCommand.cwd?.trim() ?? '')) {
+        reasons.push('repeats_unchanged_failed_command');
+      }
       if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
         reasons.push('invalid_timeout');
       }
