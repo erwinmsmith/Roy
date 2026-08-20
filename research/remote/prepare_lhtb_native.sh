@@ -196,11 +196,13 @@ PY
 
 roy_smoke() {
   [[ -n "${DEEPSEEK_API_KEY:-}" ]] || { echo "DEEPSEEK_API_KEY is required" >&2; exit 4; }
-  local task_id category seed fingerprint job_dir config
+  local task_id category seed fingerprint job_dir config result_path run_id smoke_root
+  run_id="smoke-$(date -u +%Y%m%dT%H%M%SZ)"
+  smoke_root="${roy_root}/research/output/lhtb/native/smoke-jobs/${run_id}"
   export PYTHONPATH="${roy_root}/research${PYTHONPATH:+:${PYTHONPATH}}"
   export ROY_LHTB_NODE_COMMAND="node ${roy_root}/dist/cli/LhtbAgent.js"
   export ROY_LHTB_SEMANTIC_COMMAND="${python_bin} -m roy_research.semantic_server"
-  export ROY_LHTB_SEMANTIC_ROOT="${roy_root}/research/output/lhtb/native/semantic-smoke"
+  export ROY_LHTB_SEMANTIC_ROOT="${smoke_root}/semantic"
   export ROY_LHTB_POLICY_COMMAND="${python_bin} -m roy_research.lhtb_policy_server"
   export ROY_LHTB_MODEL="${roy_root}/research/output/lhtb/native/smoke-initial.pt"
   export ROY_LHTB_NATIVE_ROOT="${native_root}"
@@ -218,23 +220,36 @@ for value in json.load(open(sys.argv[1], encoding="utf-8"))["tasks"]:
 PY
 )"
     fingerprint="$(printf '%s' "native-smoke:${task_id}:${revision}" | sha256sum | awk '{print $1}')"
-    job_dir="${roy_root}/research/output/lhtb/native/smoke-jobs/${task_id}"
-    config="${roy_root}/research/output/lhtb/native/configs/${task_id}.json"
+    job_dir="${smoke_root}/${task_id}"
+    config="${roy_root}/research/output/lhtb/native/configs/${run_id}-${task_id}.json"
     mkdir -p "${job_dir}" "$(dirname "${config}")"
     "${python_bin}" -m roy_research lhtb-group-config --output "${config}" \
       --jobs-dir "${job_dir}" --task-id "${task_id}" \
       --arm learned_information_realization --initial-fingerprint "${fingerprint}" \
       --organization-seed "${seed}" --attempts 8 --environment-backend native \
       --native-runtime-root "${native_root}" --native-template-root "${template_root}" \
-      --allow-network-degraded
+      --allow-network-degraded --max-retries 0
     cd "${lhtb_root}"
     "${harbor_bin}" run -c "${config}" --yes
     cd "${roy_root}"
+    result_path="${job_dir}/roy-${task_id}-${seed}/result.json"
+    "${python_bin}" - "${result_path}" "${task_id}" <<'PY'
+import json, sys
+result = json.load(open(sys.argv[1], encoding="utf-8"))
+stats = result["stats"]
+if stats["n_completed_trials"] != 8 or stats["n_errored_trials"] != 0:
+    raise SystemExit(
+        f"Roy smoke group failed for {sys.argv[2]}: "
+        f"completed={stats['n_completed_trials']} errored={stats['n_errored_trials']}"
+    )
+print(json.dumps({"task_id": sys.argv[2], "completed": 8, "result": sys.argv[1]}))
+PY
     seed=$((seed + 1))
   done
   "${python_bin}" -m roy_research lhtb-smoke-validate \
-    --jobs-dir "${roy_root}/research/output/lhtb/native/smoke-jobs" \
-    --output "${roy_root}/research/output/lhtb/native/smoke-validation.json"
+    --jobs-dir "${smoke_root}" \
+    --output "${smoke_root}/smoke-validation.json"
+  echo "Roy native smoke saved at ${smoke_root}"
 }
 
 case "${mode}" in

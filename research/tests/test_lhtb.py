@@ -243,6 +243,7 @@ for line in sys.stdin:
                 "fingerprint", 1, attempts=1, environment_backend="native",
                 native_runtime_root=Path(directory) / "runtime",
                 native_template_root=Path(directory) / "templates",
+                max_retries=0,
             )
             native_value = json.loads(native.read_text())
             self.assertEqual(
@@ -253,6 +254,7 @@ for line in sys.stdin:
                 native_value["agents"][0]["env"]["ROY_LHTB_ENVIRONMENT_BACKEND"],
                 "native",
             )
+            self.assertEqual(native_value["retry"]["max_retries"], 0)
 
     def test_native_audit_is_fail_closed_and_uses_environment_digest(self) -> None:
         self.assertEqual(

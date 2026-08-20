@@ -188,6 +188,7 @@ def write_harbor_group_config(
     native_runtime_root: Path | None = None,
     native_template_root: Path | None = None,
     allow_network_degraded: bool = False,
+    max_retries: int = 2,
 ) -> None:
     if arm not in ("single_agent_direct", "roy_runtime_heuristic",
                    "learned_information_realization"):
@@ -209,11 +210,13 @@ def write_harbor_group_config(
         }
     else:
         raise ValueError(f"unknown LHTB environment backend {environment_backend}")
+    if max_retries < 0:
+        raise ValueError("Harbor max_retries cannot be negative")
     value = {
         "job_name": f"roy-{task_id}-{organization_seed}",
         "jobs_dir": str(jobs_dir), "n_attempts": attempts,
         "n_concurrent_trials": min(CONCURRENCY, attempts), "timeout_multiplier": 1.0,
-        "retry": {"max_retries": 2},
+        "retry": {"max_retries": max_retries},
         "environment": environment,
         "agents": [{
             "import_path": "roy_research.harbor_agent:RoyHarborAgent",

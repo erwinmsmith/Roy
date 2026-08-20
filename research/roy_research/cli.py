@@ -317,6 +317,7 @@ def parser() -> argparse.ArgumentParser:
     lhtb_config.add_argument("--native-runtime-root", type=Path)
     lhtb_config.add_argument("--native-template-root", type=Path)
     lhtb_config.add_argument("--allow-network-degraded", action="store_true")
+    lhtb_config.add_argument("--max-retries", type=int, default=2)
 
     lhtb_dev = commands.add_parser(
         "lhtb-dev-metrics", help="Append checkpoint-selection metrics for one dev epoch"
@@ -460,7 +461,7 @@ def main(argv: List[str] | None = None) -> None:
                                   args.initial_fingerprint, args.organization_seed, args.attempts,
                                   args.official_timeout, args.environment_backend,
                                   args.native_runtime_root, args.native_template_root,
-                                  args.allow_network_degraded)
+                                  args.allow_network_degraded, args.max_retries)
         print(json.dumps({"output": str(args.output), "task_id": args.task_id}))
     elif args.command == "lhtb-dev-metrics":
         records = [value for value in read_jsonl(args.trajectories)
