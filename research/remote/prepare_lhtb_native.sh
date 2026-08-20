@@ -10,6 +10,7 @@ audit_path="${ROY_LHTB_NATIVE_AUDIT:-${roy_root}/research/output/lhtb/native/aud
 node_runtime="${roy_root}/research/.runtime/node-v22"
 python_bin="${roy_root}/research/.venv/bin/python"
 harbor_bin="${roy_root}/research/.venv/bin/harbor"
+native_task_python="${ROY_LHTB_NATIVE_TASK_PYTHON:-3.12}"
 revision="84d7ba5ee34fae6c11f0d7cb8ed5faa73a9ece54"
 mode="${1:-check}"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -138,7 +139,7 @@ provision_smoke_tasks() {
     PYTHONPATH="${roy_root}/research" "${python_bin}" -m roy_research lhtb-native-provision \
       --lhtb-root "${lhtb_root}" --template-root "${template_root}" \
       --specs "${roy_root}/research/config/lhtb_native_provisioning.json" \
-      --task-id "${task_id}" --python 3.11
+      --task-id "${task_id}" --python "${native_task_python}"
   done
   PYTHONPATH="${roy_root}/research" "${python_bin}" -m roy_research lhtb-native-audit \
     --lhtb-root "${lhtb_root}" --manifest "${roy_root}/research/config/lhtb_split.json" \
