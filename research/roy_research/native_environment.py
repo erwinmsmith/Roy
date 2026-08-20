@@ -17,6 +17,7 @@ from .lhtb_native import (
     NATIVE_BACKEND_ID,
     load_task_native_manifest,
     native_preflight,
+    normalize_native_task_id,
     tree_digest,
 )
 
@@ -47,6 +48,10 @@ class NativeProcessEnvironment(BaseEnvironment):
         if self.uid_slots < 1:
             raise ValueError("uid_slots must be positive")
         self.allow_network_degraded = bool(allow_network_degraded)
+        environment_name = str(kwargs.get("environment_name", ""))
+        if not environment_name and len(args) > 1:
+            environment_name = str(args[1])
+        self.native_task_id = normalize_native_task_id(environment_name)
         self.session_root: Path | None = None
         self._manifest: Mapping[str, Any] | None = None
         self._process_groups: set[int] = set()
@@ -73,7 +78,7 @@ class NativeProcessEnvironment(BaseEnvironment):
     def _validate_definition(self) -> None:
         if not (self.environment_dir / "Dockerfile").exists():
             raise FileNotFoundError(f"native task has no Dockerfile context: {self.environment_dir}")
-        load_task_native_manifest(self.template_root, self.environment_name)
+        load_task_native_manifest(self.template_root, self.native_task_id)
 
     def _validate_internet_config(self) -> None:
         if not self.task_env_config.allow_internet and not self.allow_network_degraded:
@@ -84,14 +89,14 @@ class NativeProcessEnvironment(BaseEnvironment):
         if not self.task_env_config.allow_internet:
             self.logger.warning(
                 "Running %s without required network isolation; result is degraded",
-                self.environment_name,
+                self.native_task_id,
             )
 
     @property
     def environment_digest(self) -> str:
         if self._manifest is None:
             self._manifest = load_task_native_manifest(
-                self.template_root, self.environment_name
+                self.template_root, self.native_task_id
             )
         return str(self._manifest["environment_digest"])
 
@@ -105,7 +110,7 @@ class NativeProcessEnvironment(BaseEnvironment):
         if force_build:
             raise ValueError("LHTB-native templates must be provisioned before Harbor starts")
         native_preflight(self.runtime_root)
-        manifest = load_task_native_manifest(self.template_root, self.environment_name)
+        manifest = load_task_native_manifest(self.template_root, self.native_task_id)
         task_digest = tree_digest(self.environment_dir.parent)
         if manifest.get("task_digest") != task_digest:
             raise RuntimeError("native task template is stale relative to the pinned task")
@@ -119,7 +124,7 @@ class NativeProcessEnvironment(BaseEnvironment):
             raise RuntimeError(f"native session already exists: {self.session_root}")
         for name in ("app", "opt", "tests", "solution", "tmp", "home", "logs"):
             (self.session_root / name).mkdir(parents=True, exist_ok=True)
-        template = self.template_root / self.environment_name
+        template = self.template_root / self.native_task_id
         for name in ("app", "opt"):
             source = template / name
             if source.exists():
@@ -133,7 +138,7 @@ class NativeProcessEnvironment(BaseEnvironment):
             "schema_version": 1,
             "backend": NATIVE_BACKEND_ID,
             "environment_digest": self.environment_digest,
-            "task_id": self.environment_name,
+            "task_id": self.native_task_id,
             "task_digest": task_digest,
             "session_id": self.session_id,
             "uid": self._uid,
@@ -236,7 +241,7 @@ class NativeProcessEnvironment(BaseEnvironment):
 
     def _command(self, command: str, cwd: str | None, env: Mapping[str, str]) -> list[str]:
         assert self.session_root is not None
-        template = self.template_root / self.environment_name
+        template = self.template_root / self.native_task_id
         binds: list[tuple[Path, str]] = [
             (self.session_root / "home", "/root"),
             (self.session_root / "tmp", "/tmp"),

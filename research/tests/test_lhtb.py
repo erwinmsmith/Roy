@@ -42,6 +42,7 @@ from roy_research.lhtb_training import LHTBProcessGRPOTrainer
 from roy_research.lhtb_native import (
     audit_native_tasks,
     native_environment_digest,
+    normalize_native_task_id,
     provision_native_task,
     tree_digest,
 )
@@ -201,6 +202,12 @@ for line in sys.stdin:
             )
 
     def test_native_audit_is_fail_closed_and_uses_environment_digest(self) -> None:
+        self.assertEqual(
+            normalize_native_task_id(
+                "long-horizon-terminal-bench/great-expectations-audit"
+            ),
+            "great-expectations-audit",
+        )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             lhtb = root / "LHTB"

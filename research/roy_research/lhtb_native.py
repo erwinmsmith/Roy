@@ -23,6 +23,13 @@ NATIVE_SCHEMA_VERSION = 1
 NATIVE_BACKEND_ID = "lhtb-native-process-v1"
 
 
+def normalize_native_task_id(environment_name: str) -> str:
+    task_id = environment_name.rstrip("/").rsplit("/", 1)[-1]
+    if not task_id or task_id in (".", ".."):
+        raise ValueError(f"invalid native environment name: {environment_name!r}")
+    return task_id
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
