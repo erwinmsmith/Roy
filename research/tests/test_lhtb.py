@@ -363,6 +363,11 @@ for line in sys.stdin:
         left = [{"id": "a", "statement": "The service is available"}]
         right = [{"id": "b", "statement": "The service is not available"}]
         self.assertEqual(len(embedding_candidate_pairs(left, right, FakeEncoder(), 8)), 1)
+        many_left = [{"id": f"left-{index}", "statement": str(index)} for index in range(3)]
+        many_right = [{"id": f"right-{index}", "statement": str(index)} for index in range(3)]
+        self.assertEqual(
+            len(embedding_candidate_pairs(many_left, many_right, FakeEncoder(), 2)), 2
+        )
         with tempfile.TemporaryDirectory() as directory:
             client = FakeSemanticClient()
             builder = SemanticStateBuilder(client, FakeEncoder(), Path(directory) / "audit.jsonl")

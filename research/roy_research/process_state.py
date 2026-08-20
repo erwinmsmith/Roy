@@ -287,7 +287,7 @@ class SemanticStateBuilder:
 def embedding_candidate_pairs(
     left: Sequence[Mapping[str, Any]], right: Sequence[Mapping[str, Any]], encoder: Any, top_k: int = 8
 ) -> List[Tuple[int, int, float]]:
-    """Return recall candidates only; similarity never becomes a semantic label."""
+    """Return at most top_k recall pairs for one entity type, never semantic labels."""
     if not left or not right:
         return []
     import torch
@@ -295,12 +295,11 @@ def embedding_candidate_pairs(
     left_vectors = encoder.encode([str(value["statement"]) for value in left])
     right_vectors = encoder.encode([str(value["statement"]) for value in right])
     similarities = torch.as_tensor(left_vectors) @ torch.as_tensor(right_vectors).T
-    result: List[Tuple[int, int, float]] = []
-    for left_index in range(len(left)):
-        count = min(top_k, len(right))
-        values, indices = torch.topk(similarities[left_index], count)
-        result.extend((left_index, int(index), float(value)) for value, index in zip(values, indices))
-    return result
+    count = min(top_k, similarities.numel())
+    values, indices = torch.topk(similarities.reshape(-1), count)
+    right_count = len(right)
+    return [(int(index) // right_count, int(index) % right_count, float(value))
+            for value, index in zip(values, indices)]
 
 
 def append_state(path: Path, state: GlobalEpistemicState) -> str:
