@@ -114,10 +114,12 @@ prepare_checkout() {
   uv pip install --python "${python_bin}" -e "${lhtb_root}/harbor"
   "${python_bin}" - <<'PY'
 from sentence_transformers import SentenceTransformer
-SentenceTransformer(
-    "sentence-transformers/all-MiniLM-L6-v2",
-    revision="c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
-)
+model_id = "sentence-transformers/all-MiniLM-L6-v2"
+revision = "c9745ed1d9f207416be6d2e6f8de32d1f16199bf"
+try:
+    SentenceTransformer(model_id, revision=revision, local_files_only=True)
+except OSError:
+    SentenceTransformer(model_id, revision=revision)
 PY
   cd "${roy_root}"
   npm ci
