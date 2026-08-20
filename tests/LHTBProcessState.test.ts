@@ -87,4 +87,37 @@ describe('LHTB process state', () => {
     expect(session.snapshot().processedSemanticEventIds).toHaveLength(2);
     controller.close();
   });
+
+  it('accepts a terminal acquisition candidate whose command is stored outside action', async () => {
+    const session = new RoyLHTBSession('acquire', 'task', 'inspect the workspace', 'commit',
+      'roy_runtime_heuristic');
+    const semantic = {
+      async processEvent(event: { id: string }) {
+        return { event_id: event.id, requirements: [], claims: [], assumptions: [], evidence: [],
+          external_observations: [], blind_spots: [], relations: [] };
+      },
+      close() {},
+    };
+    const provider = {
+      isConfigured: () => true,
+      async completeJSONWithUsage() {
+        return { value: { preferred_candidate_id: 'inspect', candidates: [{
+          id: 'inspect', kind: 'ACQUIRE', actorNodeId: 'root',
+          description: 'Inspect files', schedulerComplexity: 1,
+          command: 'find . -maxdepth 2 -type f', timeoutMs: 120_000,
+          action: { kind: 'ACQUIRE', actorNodeId: 'root' },
+        }] }, completion: { content: '{}', model: 'mock', usage: {
+          promptTokens: 1, completionTokens: 1, totalTokens: 2,
+        } } };
+      },
+    };
+    const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false });
+    const result = await controller.advance(session, 1);
+    expect(result.status).toBe('terminal_request');
+    if (result.status === 'terminal_request') {
+      expect(result.request.command).toBe('find . -maxdepth 2 -type f');
+      expect(result.request.nodeId).toBe('root');
+    }
+    controller.close();
+  });
 });

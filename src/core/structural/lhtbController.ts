@@ -15,9 +15,26 @@ interface ProposedCandidate extends OrganizationCandidate {
   timeoutMs?: number;
 }
 
+interface RawProposedCandidate {
+  id?: unknown;
+  kind?: unknown;
+  actorNodeId?: unknown;
+  description?: unknown;
+  schedulerComplexity?: unknown;
+  command?: unknown;
+  cwd?: unknown;
+  timeoutMs?: unknown;
+  action?: unknown;
+}
+
 interface ProposalResponse {
   preferred_candidate_id: string;
+  candidates: RawProposedCandidate[];
+}
+
+interface CandidateValidation {
   candidates: ProposedCandidate[];
+  dispositions: Array<{ index: number; id?: string; accepted: boolean; reasons: string[] }>;
 }
 
 export type ControllerResult =
@@ -48,9 +65,16 @@ export interface LHTBControllerOptions {
 
 const PROPOSER_PROMPT = `You generate open organization candidates for Roy on LHTB.
 Return JSON only: {"preferred_candidate_id": string, "candidates": [...]}.
-Each candidate has id, kind, actorNodeId, description, schedulerComplexity and action.
+Every candidate must have this exact outer shape:
+{"id": string, "kind": string, "actorNodeId": string, "description": string,
+ "schedulerComplexity": number, "action": object}.
 Allowed kinds are DERIVE, ACQUIRE, CONNECT, EXECUTE, RETURN, PRUNE, STOP.
-ACQUIRE also has command, optional cwd, timeoutMs; do not fabricate its observation.
+For ACQUIRE only, command, optional cwd and timeoutMs are outer candidate fields, while action is
+exactly {"kind":"ACQUIRE","actorNodeId":"<same actor>"}. Example:
+{"id":"inspect","kind":"ACQUIRE","actorNodeId":"root","description":"Inspect files",
+ "schedulerComplexity":1,"command":"find . -maxdepth 2 -type f","timeoutMs":120000,
+ "action":{"kind":"ACQUIRE","actorNodeId":"root"}}.
+Do not put command inside action and do not fabricate an observation.
 DERIVE action must contain a strict childSpecification tied to an existing open requirement.
 EXECUTE/RETURN action must contain a complete epistemic report using the repository schema.
 CONNECT uses existing distinct nodes. PRUNE targets a non-root node. STOP is root-only.
@@ -116,7 +140,13 @@ export class LHTBAutonomousController {
     completion.completion.usage?.outputTokens
       ?? completion.completion.usage?.completionTokens ?? 0,
     completion.completion.model);
-    const candidates = this.validateCandidates(completion.value, session);
+    const validation = this.validateCandidates(completion.value, session);
+    await this.auditCandidateValidation(validation);
+    const candidates = validation.candidates;
+    if (candidates.length === 0) {
+      const reasons = [...new Set(validation.dispositions.flatMap(value => value.reasons))];
+      throw new Error(`DeepSeek proposer returned no legal candidates: ${reasons.join('; ')}`);
+    }
     let selected: ProposedCandidate;
     let policyRecord: OrganizationPolicyRecord | undefined;
     if (snapshot.organizationMode === 'learned_information_realization') {
@@ -151,34 +181,74 @@ export class LHTBAutonomousController {
     this.semantic.close();
   }
 
-  private validateCandidates(response: ProposalResponse, session: RoyLHTBSession): ProposedCandidate[] {
+  private validateCandidates(response: ProposalResponse, session: RoyLHTBSession): CandidateValidation {
     if (!Array.isArray(response.candidates) || response.candidates.length === 0) {
-      throw new Error('DeepSeek proposer returned no organization candidates');
+      return { candidates: [], dispositions: [{ index: -1, accepted: false,
+        reasons: ['response_has_no_candidates'] }] };
     }
     const snapshot = session.snapshot();
     const active = new Set(snapshot.runtime.nodes
       .filter(node => ['ready', 'running', 'waiting', 'completed'].includes(node.status))
       .map(node => node.id));
     const direct = snapshot.organizationMode === 'single_agent_direct';
-    const candidates = response.candidates.filter(candidate => {
-      if (!candidate?.id || candidate.action?.kind !== candidate.kind
-        || candidate.action?.actorNodeId !== candidate.actorNodeId || !active.has(candidate.actorNodeId)) {
-        return false;
+    const allowedKinds = new Set(['DERIVE', 'ACQUIRE', 'CONNECT', 'EXECUTE', 'RETURN',
+      'PRUNE', 'STOP']);
+    const seenIds = new Set<string>();
+    const candidates: ProposedCandidate[] = [];
+    const dispositions: CandidateValidation['dispositions'] = [];
+    response.candidates.forEach((raw, index) => {
+      const reasons: string[] = [];
+      const id = typeof raw?.id === 'string' ? raw.id.trim() : '';
+      const kind = typeof raw?.kind === 'string' ? raw.kind.trim() : '';
+      const actorNodeId = typeof raw?.actorNodeId === 'string' ? raw.actorNodeId.trim() : '';
+      const description = typeof raw?.description === 'string' ? raw.description.trim() : '';
+      const schedulerComplexity = Number(raw?.schedulerComplexity);
+      const actionValue = raw?.action && typeof raw.action === 'object'
+        ? raw.action as Record<string, unknown> : {};
+      const explicitActionKind = typeof actionValue.kind === 'string' ? actionValue.kind
+        : typeof actionValue.type === 'string' ? actionValue.type : undefined;
+      const explicitActionActor = typeof actionValue.actorNodeId === 'string'
+        ? actionValue.actorNodeId : undefined;
+      if (!id) reasons.push('missing_id');
+      else if (seenIds.has(id)) reasons.push('duplicate_id');
+      if (!allowedKinds.has(kind)) reasons.push('invalid_kind');
+      if (!actorNodeId || !active.has(actorNodeId)) reasons.push('inactive_actor');
+      if (!description) reasons.push('missing_description');
+      if (!Number.isFinite(schedulerComplexity)) reasons.push('invalid_scheduler_complexity');
+      if (explicitActionKind && explicitActionKind !== kind) reasons.push('action_kind_mismatch');
+      if (explicitActionActor && explicitActionActor !== actorNodeId) {
+        reasons.push('action_actor_mismatch');
       }
-      const directLegal = !direct || (candidate.actorNodeId === 'root'
-        && ['ACQUIRE', 'EXECUTE', 'RETURN', 'STOP'].includes(candidate.kind));
-      if (!directLegal) return false;
-      if (candidate.kind === 'ACQUIRE') return Boolean(candidate.command?.trim());
-      try {
-        const probe = RecursiveInformationRealizationRuntime.restore(snapshot.runtime);
-        probe.apply(candidate.action, Date.now());
-        return true;
-      } catch {
-        return false;
+      const directLegal = !direct || (actorNodeId === 'root'
+        && ['ACQUIRE', 'EXECUTE', 'RETURN', 'STOP'].includes(kind));
+      if (!directLegal) reasons.push('direct_mode_forbids_action');
+      const commandValue = typeof raw?.command === 'string' ? raw.command
+        : typeof actionValue.command === 'string' ? actionValue.command : undefined;
+      const cwdValue = typeof raw?.cwd === 'string' ? raw.cwd
+        : typeof actionValue.cwd === 'string' ? actionValue.cwd : undefined;
+      const timeoutValue = raw?.timeoutMs ?? actionValue.timeoutMs;
+      const timeoutMs = timeoutValue === undefined ? undefined : Number(timeoutValue);
+      if (kind === 'ACQUIRE' && !commandValue?.trim()) reasons.push('acquire_missing_command');
+      if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
+        reasons.push('invalid_timeout');
       }
+      const action = { ...actionValue, kind, actorNodeId } as OrganizationCandidate['action'];
+      const candidate = { id, kind, actorNodeId, description, schedulerComplexity,
+        action, command: commandValue?.trim(), cwd: cwdValue?.trim(), timeoutMs } as ProposedCandidate;
+      if (reasons.length === 0 && kind !== 'ACQUIRE') {
+        try {
+          const probe = RecursiveInformationRealizationRuntime.restore(snapshot.runtime);
+          probe.apply(action, Date.now());
+        } catch (error) {
+          reasons.push(`runtime_rejected:${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      if (id) seenIds.add(id);
+      const accepted = reasons.length === 0;
+      dispositions.push({ index, id: id || undefined, accepted, reasons });
+      if (accepted) candidates.push(candidate);
     });
-    if (candidates.length === 0) throw new Error('DeepSeek proposer returned no legal candidates');
-    return candidates;
+    return { candidates, dispositions };
   }
 
   private policyState(snapshot: ReturnType<RoyLHTBSession['snapshot']>,
@@ -232,6 +302,18 @@ export class LHTBAutonomousController {
       configuredRevision: process.env.DEEPSEEK_MODEL_REVISION ?? 'api-alias-unversioned',
       temperature: 0, maxTokens: 32_768, request,
       response: completion.value, usage: completion.completion.usage,
+    })}\n`, 'utf8');
+  }
+
+  private async auditCandidateValidation(validation: CandidateValidation): Promise<void> {
+    const root = this.auditRoot;
+    if (!root && this.provider.constructor.name !== 'DeepSeekProvider') return;
+    if (!root) throw new Error('ROY_LHTB_AUDIT_ROOT is required');
+    await mkdir(root, { recursive: true });
+    await appendFile(path.join(root, 'candidate-validation.jsonl'), `${JSON.stringify({
+      schemaVersion: 1,
+      acceptedCandidateIds: validation.candidates.map(value => value.id),
+      dispositions: validation.dispositions,
     })}\n`, 'utf8');
   }
 }
