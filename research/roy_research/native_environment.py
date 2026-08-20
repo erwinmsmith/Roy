@@ -7,6 +7,7 @@ import os
 import shlex
 import shutil
 import signal
+import time
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -55,6 +56,7 @@ class NativeProcessEnvironment(BaseEnvironment):
         self.session_root: Path | None = None
         self._manifest: Mapping[str, Any] | None = None
         self._process_groups: set[int] = set()
+        self._exec_index = 0
         super().__init__(*args, **kwargs)
 
     @staticmethod
@@ -293,6 +295,7 @@ class NativeProcessEnvironment(BaseEnvironment):
             **dict(self._manifest.get("environment", {})),
             **(self._merge_env(env) or {}),
         }
+        started = time.monotonic()
         process = await asyncio.create_subprocess_exec(
             *self._command(command, cwd, merged),
             stdout=asyncio.subprocess.PIPE,
@@ -300,23 +303,41 @@ class NativeProcessEnvironment(BaseEnvironment):
             start_new_session=True,
         )
         self._process_groups.add(process.pid)
+        timed_out = False
         try:
             stdout, stderr = await asyncio.wait_for(
                 process.communicate(), timeout=timeout_sec
             ) if timeout_sec else await process.communicate()
         except asyncio.TimeoutError:
+            timed_out = True
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             await process.wait()
-            return ExecResult(
-                stdout="",
-                stderr=f"command timed out after {timeout_sec} seconds",
-                return_code=124,
-            )
-        return ExecResult(
+            stdout = b""
+            stderr = f"command timed out after {timeout_sec} seconds".encode()
+        finally:
+            self._process_groups.discard(process.pid)
+        result = ExecResult(
             stdout=stdout.decode("utf-8", errors="replace"),
             stderr=stderr.decode("utf-8", errors="replace"),
-            return_code=int(process.returncode or 0),
+            return_code=124 if timed_out else int(process.returncode or 0),
         )
+        self._exec_index += 1
+        audit = {
+            "schema_version": 1,
+            "index": self._exec_index,
+            "command": command,
+            "cwd": cwd,
+            "timeout_sec": timeout_sec,
+            "timed_out": timed_out,
+            "return_code": result.return_code,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "duration_ms": int((time.monotonic() - started) * 1000),
+        }
+        audit_path = self.trial_paths.trial_dir / "native-exec.jsonl"
+        with audit_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(audit, sort_keys=True) + "\n")
+        return result
