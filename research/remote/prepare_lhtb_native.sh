@@ -55,7 +55,6 @@ install_system_dependencies() {
       python3 python3-pip python3-venv
     python3 -m pip install uv || python3 -m pip install --break-system-packages uv
   fi
-  uv python install 3.12
 }
 
 install_node_22() {
