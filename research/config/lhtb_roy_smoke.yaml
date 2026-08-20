@@ -1,0 +1,27 @@
+job_name: roy-lhtb-smoke
+jobs_dir: ./jobs
+n_attempts: 8
+n_concurrent_trials: 4
+timeout_multiplier: 1.0
+
+environment:
+  type: docker
+  force_build: false
+  delete: true
+
+agents:
+  - import_path: roy_research.harbor_agent:RoyHarborAgent
+    model_name: deepseek/deepseek-v4-flash
+    override_timeout_sec: 3600
+    env:
+      ROY_LHTB_ARM: learned_information_realization
+      ROY_LHTB_INITIAL_FINGERPRINT: smoke-matched-initial-state
+    kwargs:
+      rpc_timeout: 120
+
+datasets:
+  - path: ./tasks
+    task_names:
+      - great-expectations-audit
+      - poc-exploit-craft
+      - opensees-seismic-structural-regression-audit

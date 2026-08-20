@@ -235,16 +235,16 @@ def replay_joint_log_probability(
     record: Mapping[str, Any],
     device: torch.device,
 ) -> Tensor:
-    policy_state = record.get("policy_state")
+    policy_state = record.get("policy_state", record.get("policyState"))
     if not isinstance(policy_state, Mapping):
         raise ValueError("policy record is missing policy_state")
     context = _policy_context(model, encoder, policy_state, device)
     try:
-        active_id = str(record["active_node_id"])
+        active_id = str(record.get("active_node_id", record.get("activeNodeId")))
         active_index = context["active_node_ids"].index(active_id)
         values = _candidate_distribution(model, policy_state, context, active_id, device)
         candidate_index = [str(value["id"]) for value in values["candidates"]].index(
-            str(record["candidate_id"])
+            str(record.get("candidate_id", record.get("candidateId")))
         )
     except ValueError as error:
         raise ValueError("recorded organization choice is not available during replay") from error
@@ -316,13 +316,16 @@ def _candidate_distribution(
     if not candidates:
         raise ValueError("organization policy state contains no candidates")
     envelope = ExplorationEnvelope(**dict(policy_state["envelope"]))
-    legal_values = envelope_legal_actions(
-        candidates,
-        envelope,
-        int(policy_state.get("node_count", 1)),
-        int(policy_state.get("maximum_depth_reached", 0)),
-        bool(policy_state.get("unresolved_gap_exists", False)),
-    )
+    if bool(policy_state.get("unbounded_structure", False)):
+        legal_values = [bool(value.get("legal", True)) for value in candidates]
+    else:
+        legal_values = envelope_legal_actions(
+            candidates,
+            envelope,
+            int(policy_state.get("node_count", 1)),
+            int(policy_state.get("maximum_depth_reached", 0)),
+            bool(policy_state.get("unresolved_gap_exists", False)),
+        )
     legal_values = [
         legal and (
             not value.get("actor_node_id")

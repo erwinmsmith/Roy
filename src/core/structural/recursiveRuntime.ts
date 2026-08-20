@@ -131,6 +131,12 @@ export class RecursiveInformationRealizationRuntime {
     }
   }
 
+  ingestRequirement(requirement: ResidualRequirement): void {
+    this.requireNode(requirement.parentNodeId);
+    if (this.requirements.has(requirement.id)) return;
+    this.requirements.set(requirement.id, structuredClone(requirement));
+  }
+
   waitForDependencies(nodeId: string, at = Date.now()): boolean {
     const node = this.requireNode(nodeId);
     const waiting = this.dependencyEdges.some(edge => edge.consumerId === nodeId && !edge.resolved);

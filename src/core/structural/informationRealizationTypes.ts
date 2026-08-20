@@ -216,3 +216,31 @@ export interface InformationRealizationTrajectory {
   terminationReason?: string;
   finalOutput?: unknown;
 }
+
+export interface LHTBInformationRealizationTrajectory {
+  schemaVersion: 1;
+  id: string;
+  groupId: string;
+  benchmark: 'lhtb';
+  taskId: string;
+  category: string;
+  split: 'train' | 'dev' | 'test';
+  epoch: number;
+  rolloutIndex: number;
+  policyRevision: number;
+  organizationSeed: number;
+  taskChecksum: string;
+  dockerDigest: string;
+  runtimeConfig: Record<string, unknown>;
+  initialSnapshotFingerprint: string;
+  actions: OrganizationAction[];
+  policyRecords: OrganizationPolicyRecord[];
+  processStates: unknown[];
+  terminalReward: number;
+  complete: boolean;
+  environmentFailure: boolean;
+  acceptedForTraining: boolean;
+  semanticAuditPath: string;
+  runtimeEventsPath: string;
+  harborResultPath: string;
+}

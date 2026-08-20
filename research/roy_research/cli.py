@@ -21,6 +21,11 @@ from .token_ledger import PersistentTokenLedger
 from .tau3 import build_tau3_manifest, manifest_summary, verify_tau3_root
 from .organization import RuntimeBudget
 from .tau3_runner import evaluate_tau3_against_direct, train_tau3_on_policy
+from .lhtb import build_lhtb_split, verify_lhtb_checkout, write_lhtb_manifest, load_lhtb_manifest
+from .lhtb_experiment import build_training_schedule, disk_preflight, select_dev_checkpoint, summarize_test, write_json, write_harbor_group_config, write_lhtb_svg
+from .lhtb_training import LHTBProcessGRPOTrainer
+from .lhtb_results import import_harbor_group, validate_smoke
+from .lhtb_value_metrics import value_metrics, annotate_value_traces
 from .training import TRAINING_VARIANTS, evaluate_groups, train_groups
 
 
@@ -189,6 +194,99 @@ def parser() -> argparse.ArgumentParser:
     tau3_evaluate.add_argument("--organization-temperature", type=float, default=1.0)
     _add_tau3_runtime_budget_arguments(tau3_evaluate)
     tau3_evaluate.add_argument("--seed", type=int, default=20260818)
+
+    lhtb_manifest = commands.add_parser(
+        "lhtb-manifest", help="Write the pinned leakage-safe LHTB 30/8/8 split"
+    )
+    lhtb_manifest.add_argument("--output", type=Path, required=True)
+    lhtb_manifest.add_argument("--lhtb-root", type=Path)
+
+    lhtb_preflight = commands.add_parser(
+        "lhtb-preflight", help="Fail-closed VM and disk preflight for formal LHTB runs"
+    )
+    lhtb_preflight.add_argument("--path", type=Path, required=True)
+    lhtb_preflight.add_argument("--output", type=Path, required=True)
+
+    lhtb_schedule = commands.add_parser(
+        "lhtb-schedule", help="Create the formal four-epoch, 960-rollout schedule"
+    )
+    lhtb_schedule.add_argument("--manifest", type=Path, required=True)
+    lhtb_schedule.add_argument("--output", type=Path, required=True)
+
+    lhtb_select = commands.add_parser(
+        "lhtb-select", help="Select one checkpoint from complete dev metrics"
+    )
+    lhtb_select.add_argument("--metrics", type=Path, required=True)
+    lhtb_select.add_argument("--output", type=Path, required=True)
+
+    lhtb_report = commands.add_parser(
+        "lhtb-report", help="Summarize the one-shot three-arm LHTB test"
+    )
+    lhtb_report.add_argument("--results", type=Path, required=True)
+    lhtb_report.add_argument("--output", type=Path, required=True)
+    lhtb_report.add_argument("--checkpoint", type=Path)
+
+    lhtb_update = commands.add_parser(
+        "lhtb-update", help="Apply current-policy LHTB G=8 groups with value/EMA process credit"
+    )
+    lhtb_update.add_argument("--manifest", type=Path, required=True)
+    lhtb_update.add_argument("--trajectories", type=Path, required=True)
+    lhtb_update.add_argument("--model", type=Path, required=True)
+    lhtb_update.add_argument("--updates", type=Path, required=True)
+    lhtb_update.add_argument("--device", default="cpu")
+    lhtb_update.add_argument("--resume", action="store_true")
+
+    lhtb_init = commands.add_parser(
+        "lhtb-init", help="Initialize independent actor/value/EMA state for LHTB"
+    )
+    lhtb_init.add_argument("--manifest", type=Path, required=True)
+    lhtb_init.add_argument("--model", type=Path, required=True)
+    lhtb_init.add_argument("--device", default="cpu")
+
+    lhtb_import = commands.add_parser(
+        "lhtb-import-group", help="Import one Harbor G=8 job into append-only trajectories"
+    )
+    lhtb_import.add_argument("--job-dir", type=Path, required=True)
+    lhtb_import.add_argument("--output", type=Path, required=True)
+    lhtb_import.add_argument("--group-id", required=True)
+    lhtb_import.add_argument("--task-id", required=True)
+    lhtb_import.add_argument("--category", required=True)
+    lhtb_import.add_argument("--split", choices=("train", "dev", "test"), required=True)
+    lhtb_import.add_argument("--epoch", type=int, required=True)
+    lhtb_import.add_argument("--policy-revision", type=int, required=True)
+    lhtb_import.add_argument("--docker-digest", required=True)
+    lhtb_import.add_argument("--expected", type=int, default=8)
+    lhtb_import.add_argument("--arm", choices=("single_agent_direct", "roy_runtime_heuristic",
+                                               "learned_information_realization"),
+                             default="learned_information_realization")
+
+    lhtb_config = commands.add_parser(
+        "lhtb-group-config", help="Write one pinned Harbor task/group config"
+    )
+    lhtb_config.add_argument("--output", type=Path, required=True)
+    lhtb_config.add_argument("--jobs-dir", type=Path, required=True)
+    lhtb_config.add_argument("--task-id", required=True)
+    lhtb_config.add_argument("--arm", choices=("single_agent_direct", "roy_runtime_heuristic",
+                                                "learned_information_realization"), required=True)
+    lhtb_config.add_argument("--initial-fingerprint", required=True)
+    lhtb_config.add_argument("--organization-seed", type=int, required=True)
+    lhtb_config.add_argument("--attempts", type=int, default=8)
+    lhtb_config.add_argument("--official-timeout", action="store_true")
+
+    lhtb_dev = commands.add_parser(
+        "lhtb-dev-metrics", help="Append checkpoint-selection metrics for one dev epoch"
+    )
+    lhtb_dev.add_argument("--trajectories", type=Path, required=True)
+    lhtb_dev.add_argument("--checkpoint", type=Path, required=True)
+    lhtb_dev.add_argument("--epoch", type=int, required=True)
+    lhtb_dev.add_argument("--output", type=Path, required=True)
+    lhtb_dev.add_argument("--device", default="cpu")
+
+    lhtb_smoke_validate = commands.add_parser(
+        "lhtb-smoke-validate", help="Validate matched G=8 Harbor smoke groups"
+    )
+    lhtb_smoke_validate.add_argument("--jobs-dir", type=Path, required=True)
+    lhtb_smoke_validate.add_argument("--output", type=Path, required=True)
     return root
 
 
@@ -216,6 +314,93 @@ def main(argv: List[str] | None = None) -> None:
         tasks = [task.to_dict() for task in generate_tasks(args.seed)]
         write_jsonl(args.output, tasks)
         print(json.dumps({"tasks": len(tasks), "output": str(args.output)}))
+    elif args.command == "lhtb-manifest":
+        records = build_lhtb_split()
+        if args.lhtb_root:
+            verify_lhtb_checkout(args.lhtb_root, records)
+        write_lhtb_manifest(args.output, records)
+        print(json.dumps({"tasks": 46, "train": 30, "dev": 8, "test": 8,
+                          "output": str(args.output)}))
+    elif args.command == "lhtb-preflight":
+        result = disk_preflight(args.path)
+        write_json(args.output, result)
+        print(json.dumps(result))
+    elif args.command == "lhtb-schedule":
+        schedule = build_training_schedule(load_lhtb_manifest(args.manifest))
+        write_json(args.output, {"schema_version": 1, "epochs": 4, "group_size": 8,
+            "rollouts": 960, "groups": [{"epoch": value.epoch, "task_id": value.task_id,
+                "group_id": value.group_id, "organization_seeds": value.organization_seeds}
+                for value in schedule]})
+        print(json.dumps({"groups": len(schedule), "rollouts": 960}))
+    elif args.command == "lhtb-select":
+        selected = select_dev_checkpoint(list(read_jsonl(args.metrics)))
+        write_json(args.output, dict(selected))
+        print(json.dumps(selected))
+    elif args.command == "lhtb-report":
+        records = list(read_jsonl(args.results))
+        calibration = None
+        if args.checkpoint:
+            calibration = value_metrics(records, str(args.checkpoint))
+            records = list(annotate_value_traces(records, str(args.checkpoint)))
+            write_jsonl(args.output.with_suffix(".value-traces.jsonl"), records)
+        summary = summarize_test(records)
+        if calibration is not None:
+            summary["value_calibration"] = calibration
+        write_json(args.output, summary)
+        write_lhtb_svg(args.output.with_suffix(".svg"), summary)
+        print(json.dumps(summary))
+    elif args.command == "lhtb-update":
+        manifest = load_lhtb_manifest(args.manifest)
+        trainer = LHTBProcessGRPOTrainer(
+            args.model, manifest, device_name=args.device, resume=args.resume
+        )
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for record in read_jsonl(args.trajectories):
+            if not record.get("accepted_for_training", True):
+                continue
+            grouped.setdefault(str(record.get("group_id", "")), []).append(record)
+        updates = []
+        for group_id, records in grouped.items():
+            if group_id in trainer.updated_group_ids:
+                continue
+            update = trainer.update_group(records)
+            updates.append(update)
+            write_jsonl(args.updates, [update], append=args.updates.exists())
+        print(json.dumps({"new_updates": len(updates), **trainer.metadata()}))
+    elif args.command == "lhtb-init":
+        trainer = LHTBProcessGRPOTrainer(
+            args.model, load_lhtb_manifest(args.manifest), device_name=args.device
+        )
+        trainer.save()
+        print(json.dumps({"model": str(args.model), **trainer.metadata()}))
+    elif args.command == "lhtb-import-group":
+        records = import_harbor_group(
+            args.job_dir, args.output, args.group_id, args.task_id, args.category,
+            args.split, args.epoch, args.policy_revision, args.docker_digest,
+            {"maximum_rollout_seconds": 3600, "max_response_tokens": 32768,
+             "concurrency": 4},
+            expected=args.expected,
+            arm=args.arm,
+        )
+        print(json.dumps({"imported": len(records), "output": str(args.output)}))
+    elif args.command == "lhtb-group-config":
+        write_harbor_group_config(args.output, args.task_id, args.jobs_dir, args.arm,
+                                  args.initial_fingerprint, args.organization_seed, args.attempts,
+                                  args.official_timeout)
+        print(json.dumps({"output": str(args.output), "task_id": args.task_id}))
+    elif args.command == "lhtb-dev-metrics":
+        records = [value for value in read_jsonl(args.trajectories)
+                   if value.get("split") == "dev" and int(value.get("epoch", -1)) == args.epoch]
+        metrics = value_metrics(records, str(args.checkpoint), args.device)
+        rows = [{"split": "dev", "epoch": args.epoch, "task_id": value["task_id"],
+                 "checkpoint": str(args.checkpoint), "reward": value["terminal_reward"],
+                 "tokens": value.get("tokens", 0), **metrics} for value in records]
+        write_jsonl(args.output, rows, append=args.output.exists())
+        print(json.dumps({"records": len(rows), **metrics}))
+    elif args.command == "lhtb-smoke-validate":
+        result = validate_smoke(args.jobs_dir)
+        write_json(args.output, result)
+        print(json.dumps(result))
     elif args.command == "raise-ledger-limit":
         state = PersistentTokenLedger.raise_existing_limit(args.ledger, args.token_limit)
         print(json.dumps({"ledger": str(args.ledger), **state}))

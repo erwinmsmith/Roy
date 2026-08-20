@@ -58,6 +58,7 @@
   "bin": {
     "roy": "dist/cli/Roy.js",
     "roy-run": "dist/cli/Run.js",
+    "roy-lhtb-agent": "dist/cli/LhtbAgent.js",
     "roy-server": "dist/server/index.js"
   },
   "files": [

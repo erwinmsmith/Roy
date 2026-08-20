@@ -1,10 +1,60 @@
 # Roy information-realization research
 
-This directory contains the canonical theory, recursive epistemic runtime, autonomous organization policy, organization-GRPO training code and τ³ integration. Generated trajectories, model weights, embedding caches and benchmark assets are intentionally ignored by Git.
+This directory contains the canonical theory, recursive epistemic runtime, autonomous organization policy, LHTB/Harbor adapter, continuous process-credit GRPO code and τ³ transfer integration. Generated trajectories, model weights, embedding caches, Docker images and benchmark assets are intentionally ignored by Git.
 
-The current research method uses one policy, one on-policy training process and one optimization signal: terminal τ³ task utility. It has no teacher policy, predefined agent-role catalog, imitation warm start or weighted objective sum. LLM-call, tool-call, node, depth and decision ceilings are disabled by default; optional emergency ceilings affect only the legal-action mask, and resource use is never subtracted from reward.
+The current research method uses one policy, one on-policy training process and one environment objective: official LHTB final reward. A separately trained value model turns that target into telescoping `Delta V` decision credit; it does not add a second reward. There is no teacher policy, predefined agent-role catalog, imitation warm start, weighted objective sum, keyword scoring, node target, depth target or token penalty.
 
-## τ³ preparation and training
+## Primary LHTB workflow
+
+LHTB and its bundled Harbor are pinned to commit `84d7ba5ee34fae6c11f0d7cb8ed5faa73a9ece54`. The checked [split manifest](config/lhtb_split.json) fixes all 46 official tasks to 30 train, 8 dev and 8 test records by per-category SHA-256 ordering. The trainer rejects dev/test IDs and stale policy revisions.
+
+```bash
+PYTHONPATH=research python3 -m roy_research lhtb-manifest \
+  --lhtb-root /path/to/LHTB --output research/output/lhtb/manifest.json
+
+PYTHONPATH=research python3 -m roy_research lhtb-schedule \
+  --manifest research/output/lhtb/manifest.json \
+  --output research/output/lhtb/schedule.json
+
+# Apply one freshly sampled current-policy G=8 group at a time. This updates
+# actor -> value -> EMA and refuses a repeated group optimizer step.
+PYTHONPATH=research python3 -m roy_research lhtb-update \
+  --manifest research/output/lhtb/manifest.json \
+  --trajectories research/output/lhtb/train-trajectories.jsonl \
+  --model research/output/lhtb/checkpoints/current.pt \
+  --updates research/output/lhtb/update-audit.jsonl --resume
+```
+
+The formal schedule is four epochs over all 30 train tasks, `G=8`, for 960 rollouts. Every group uses fresh Docker environments with matching task checksum, image digest, initial fingerprint and runtime config. Each rollout has a 60-minute training deadline, concurrency is four, and one DeepSeek response is capped at 32,768 tokens. These are execution settings, not reward terms and not forced node/depth limits.
+
+Each organization action and terminal result appends an immutable `GlobalEpistemicState` `M_t`. Frozen DeepSeek prompts separately extract entities and verify `entail / contradict / unknown`; pinned MiniLM only recalls top-eight candidate pairs. All requests, responses, cache keys and model revisions are retained. No benchmark keyword field, lexical rule, regex, frequency score or embedding threshold labels meaning.
+
+The critic is independent of the actor except for the frozen encoder. For non-final decisions `r_proc = V_bar(M_t+1)-V_bar(M_t)` and the final credit is `R-V_bar(M_T-1)`, so returns telescope to `R-V_bar(M_t)`. Every trajectory has total group-statistic weight one. Equal terminal rewards still train value; actor updates only when shaped returns vary.
+
+Use a dedicated x86_64 Docker VM (16 vCPU, 64 GB RAM, at least 200 GB and preferably 300 GB SSD):
+
+```bash
+ssh exp-roy-lhtb
+cd ~/rivermind-data/roy
+research/remote/prepare_lhtb.sh check
+research/remote/prepare_lhtb.sh prepare
+research/remote/prepare_lhtb.sh oracle-smoke
+research/remote/prepare_lhtb.sh roy-smoke
+
+# Formal on-policy training, per-epoch dev selection, then frozen three-arm test.
+research/remote/run_lhtb_training.sh
+research/remote/run_lhtb_test.sh
+```
+
+The preflight stops below 15% free disk and never runs destructive Docker prune. Every optimizer group and Harbor trial is persisted before proceeding. The current `exp-roy` host is a container without a Docker socket, so it is not a valid formal LHTB runner; use the planned `exp-roy-lhtb` VM.
+
+Dev checkpoint selection uses highest mean reward, then lower value MAE, fewer tokens and earlier epoch. Final test compares `single_agent_direct`, `roy_runtime_heuristic` and `learned_information_realization` for three repetitions. Direct uses the same model/executor/runtime while enforcing one root node and no communication. Report mean reward, success at `R >= 0.95`, paired bootstrap 95% CI, tokens, time, topology, `Delta V`, value calibration and failures.
+
+See [the implementation note](reports/lhtb-process-reward-implementation.md) for the delivered components, validation boundary and formal-run outputs.
+
+## τ³ transfer compatibility (not primary training)
+
+The commands below preserve the earlier τ³ adapter and its historical exploration-envelope behavior for regression and transfer work. Its node/depth floors are not used by LHTB, are not part of the current theory, and must not be reported as the primary training method.
 
 ```bash
 npm run research:test

@@ -1,4 +1,4 @@
-"""Roy Counterfactual Structural GRPO research package."""
+"""Roy information-realization, LHTB process-credit, and transfer research package."""
 
 from .schema import SCHEMA_VERSION, ACTIONS
 

@@ -1,6 +1,6 @@
 # Roy Information Realization and Autonomous Organization GRPO
 
-Status: canonical research specification for the `exp` branch (2026-08-18).
+Status: canonical research specification for the `exp` branch (2026-08-20).
 
 This document is the normative bridge from MIA to Roy's recursive organization policy. It replaces the earlier staged structural-learning formulation. The implementation must not introduce predefined agent roles, teacher systems, imitation learning, or a weighted sum of objectives.
 
@@ -20,12 +20,9 @@ The operational target is terminal task utility, used as the benchmark estimator
 J(tau) = U_T(Y, Y_hat_terminal)
 
 maximize_pi  E[tau ~ pi][J(tau)]
-subject to   C(tau) <= B almost surely.
 ```
 
-The budget is a runtime feasibility boundary, not a reward component. The implementation masks actions from observable remaining LLM-call, tool-call, node, depth and organization-decision budgets. Actual token use and latency are recorded after execution. Agent count, depth, latency, token use, tool calls, topology complexity, communication, rationality and redundancy are never added to `J`.
-
-The implementation may retain a separate provider safety ledger to prevent accidental API overspend. That operational fail-safe is not the theoretical constraint and must not alter utility or advantage.
+Agent count, depth, latency, token use, tool calls, topology complexity, communication, rationality and redundancy are never added to `J`. Roy does not impose a learned node-count, depth, or total-token preference. Benchmark timeouts, unavailable actions, Docker isolation and provider safety controls remain operational execution conditions, not theoretical reward terms or artificial structural ceilings.
 
 ## 2. State and information flow
 
@@ -38,7 +35,7 @@ The organization state contains:
 - claims, evidence, external observations, assumptions, conflicts and residual requirements;
 - node-local epistemic reports, coverage, uncertainty and blind spots;
 - model, environment and randomness metadata needed to replay a trajectory;
-- realized resource measurements, hard runtime limits and remaining fractions.
+- realized resource measurements, official benchmark timeout and provider provenance.
 
 Derivation and communication have different meanings. A derivation edge records why a child exists. A communication edge records which nodes may exchange information. A dependency edge records which artifact or claim must be produced before another node can proceed. Combining these edge types into a single tree is invalid.
 
@@ -80,79 +77,69 @@ Here `a` is one grammar action and `z` is its open payload, such as a proposed c
 
 The policy encoder is a typed relational network over derivation, dependency, communication, tool-use, evidence and return edges. It scores all currently active nodes, then embeds and scores open candidates conditioned on the sampled node and the full graph representation. Training replay must reconstruct this same joint conditional probability exactly.
 
-Runtime feasibility is enforced before sampling by the action mask:
+Environment and graph validity are enforced before sampling by the action mask:
 
 ```text
-A_B(s) = {a in A(s): executing a leaves the runtime within B}
-pi_theta^B(a | s) = softmax(mask(logits_theta(s), A_B(s))).
+A_legal(s) = {a in A(s): graph, dependency and environment preconditions hold}
+pi_theta(a | s) = softmax(mask(logits_theta(s), A_legal(s))).
 ```
 
-The same mask semantics are reconstructed during replay. Runtime usage is absent from terminal utility, group advantage and the GRPO loss. The implementation does not assign theoretical costs such as `DERIVE = 2`; non-budget complexity features may be scheduler inputs only.
+The same mask semantics are reconstructed during replay. Runtime usage is absent from terminal utility, process credit, advantage and the GRPO loss. The implementation does not assign theoretical costs such as `DERIVE = 2`.
 
-## 5. On-policy exploration and group sampling
+## 5. LHTB state and semantic construction
 
-Training samples complete organization trajectories directly from the masked old policy:
+LHTB is the primary training environment. After every organization decision and every terminal/tool result Roy appends an immutable global epistemic state `M_t`. It contains requirements, claims, assumptions, evidence, external observations, semantic relations, blind spots, dependencies, organization nodes, DAG edges, active subtree, commands, exit codes, file changes, failures, tokens and wall time. Programmatically known events are recorded directly.
+
+A frozen DeepSeek extractor creates typed entities. A separate frozen DeepSeek semantic verifier assigns `entail`, `contradict`, or `unknown` probabilities. Frozen MiniLM embeddings retrieve at most eight candidate pairs per entity type, but similarity cannot create or override a semantic relation. Benchmark keyword fields, lexical rules, regular expressions and word-frequency thresholds are excluded from state construction and decisions. Every extraction, candidate source, verification request, response, model revision and cache key is retained.
+
+Coverage, assumption closure, conflicts and blind spots are structural inputs to the policy. They are not reward terms.
+
+## 6. On-policy groups and continuous process credit
+
+Training samples fresh complete trajectories from the current masked policy. Each LHTB task and epoch produces `G=8` trajectories from eight fresh Docker environments with the same task checksum, image digest, initial-state fingerprint, environment configuration and actor revision. Only organization sampling seeds differ. Every decision stores its exact masked old-policy joint log-probability.
+
+The sole environment target is the official LHTB final score `R_i` in `[0,1]`. An independent relational value model `V_psi(M_t)` shares only the frozen MiniLM encoder with the actor; it shares no trainable parameters. It is fitted with equal trajectory weight:
 
 ```text
-tau_i ~ pi_theta_old^B(tau | x, e)
+L_V = (1/G) sum_i (1/T_i) sum_t Huber(V_psi(M_i,t), R_i).
 ```
 
-Every decision stores the exact masked old-policy joint log-probability. Replay computes the current probability with identical active-node and candidate masks, and the ratio is `exp(log pi_theta^B - log pi_theta_old^B)`. Exploration comes from stochastic policy sampling and an epoch-specific envelope, not a uniform-policy mixture. There is no imitation warm start or separate optimization phase.
-
-Each τ³ task and epoch produces a group of eight complete trajectories. All eight share the same task, benchmark revision, isolated initial snapshot fingerprint, environment seed, executor configuration, runtime budget and exploration envelope. Only the organization-policy sampling seed differs. This makes the within-group utility difference interpretable as organization-policy variation rather than a confound from different structural constraints.
-
-Fresh trajectories are collected on every epoch. For the default four-epoch run, conditional node/depth floors anneal as `(6,3) → (4,2) → (2,1) → (0,0)`. A floor delays `STOP` only while the model has reported a genuine residual gap with an available `DERIVE` or `ACQUIRE` action. It never inserts a synthetic gap or child. Ceilings remain hard runtime feasibility limits. Evaluation removes all minimum floors and samples one autonomous organization; it does not use best-of-eight test-time search.
-
-## 6. Single-objective organization GRPO
-
-For a group of terminal utilities `J_1 ... J_8`, compute only group-relative advantages:
+An EMA target network `V_bar` is frozen while a group is sampled and updated. Its potential difference gives process credit:
 
 ```text
-A_i = (J_i - mean(J)) / (std(J) + epsilon).
+r_proc(i,t) = V_bar(M_i,t+1) - V_bar(M_i,t)       for non-final decisions
+r_proc(i,T-1) = R_i - V_bar(M_i,T-1)             for the final decision
+G_i,t = R_i - V_bar(M_i,t).
 ```
 
-The policy update is the length-normalized clipped surrogate over the stored joint decision probabilities:
+Thus the process rewards telescope exactly to `R_i - V_bar(M_i,0)` and do not introduce another objective. Across all decisions in the group, mean and variance use step weight `1/T_i`; every trajectory therefore has total statistical weight one. The resulting single advantage enters the length-normalized clipped surrogate with exact old-policy ratios. Update order is actor, value, then EMA. The value head starts at constant `0.5`, so the first group preserves terminal-GRPO ordering. When final scores are equal, the value model still learns; the actor updates only if shaped returns have variance.
 
-```text
-L(theta) = -mean_i [
-  (1 / |tau_i|) sum_t
-  min(r_i,t A_i, clip(r_i,t, 1-epsilon, 1+epsilon) A_i)
-]
-```
+There is no teacher, imitation, predefined role pool, staged objective, entropy bonus, cost penalty or weighted reward sum.
 
-There is one optimization target: τ³ terminal task utility. There are no cost, node-count, depth, communication, entropy, rationality, redundancy, teacher or auxiliary reward terms. A zero-variance group contributes zero preference gradient. Node necessity and counterfactual pruning may be reported as diagnostics but are not separate optimization objectives.
+## 7. LHTB protocol and evaluation
 
-## 7. τ³ benchmark protocol
+The benchmark is `zli12321/LHTB` pinned with its bundled Harbor to commit `84d7ba5ee34fae6c11f0d7cb8ed5faa73a9ece54`. Its 46 tasks follow the pinned README's eight-category taxonomy. Within each category, fixed SHA-256 ordering selects one dev task and one test task; the remaining tasks form the 30-task train split. The checked manifest is `30 train / 8 dev / 8 test`, and the trainer rejects dev or test task IDs.
 
-The benchmark is the official `sierra-research/tau2-bench` τ³ implementation pinned to commit `fc0055dc4e0a316c3f83133267fbd6faaa770992`.
+Formal training uses four epochs, eight trajectories per train task and 960 rollouts total. Each training rollout may run for up to 60 minutes, with concurrency four and a DeepSeek response ceiling of 32,768 tokens. These execution settings do not add structural reward or force an agent count. At each epoch boundary, learned Roy runs once on every dev task. Checkpoint selection maximizes dev mean reward, breaking ties by lower value MAE, fewer tokens and earlier epoch.
 
-- Airline, retail and telecom retain the official train/test boundary.
-- A deterministic subset of each official training split is held out for validation.
-- Official test tasks are never used for updates or model selection.
-- Banking knowledge tasks have no official training split in the pinned checkout, so they remain held out and are never training trajectories.
-- All eight trajectories for one task/epoch use the same task identity, benchmark revision, environment seed, runtime budget and envelope; only organization sampling seeds differ.
+The selected checkpoint is tested once, with three repetitions, against:
 
-Primary evaluation compares:
+- `single_agent_direct`: the same DeepSeek and terminal executor in the same runtime, restricted to the root node with no derivation or communication;
+- `roy_runtime_heuristic`: the same recursive runtime controlled by the compatibility heuristic;
+- `learned_information_realization`: the learned seven-action policy.
 
-- `single_agent_direct`: one τ³ LLM agent without recursive derivation;
-- `fixed_complete_mas`: a non-learned complete multi-agent organization with matched reporting;
-- `roy_runtime_heuristic`: the current Roy delegation behavior;
-- `learned_information_realization`: one organization sampled from the trained policy.
+Report mean reward, success rate at `R >= 0.95`, paired bootstrap 95% confidence intervals, tokens, time, nodes, DAG structure, waits, communication edges, process-value traces, value MAE/Spearman and failures. An interval crossing zero is reported as inconclusive. After freezing the selected model, τ³ is used only for smoke and held-out zero-shot transfer, with no benchmark-specific update.
 
-Report official τ³ reward and end-to-end success, paired task-level differences against `single_agent_direct`, bootstrap 95% confidence intervals, tokens, LLM calls, wall-clock, realized nodes/depth, dependencies, waits, communication edges, redundant branches and truncation rate. Results whose interval crosses zero are inconclusive.
+## 8. Training and recovery invariants
 
-## 8. Training and evaluation invariants
-
-- Training consumes only manifest entries labeled `train`.
-- Every GRPO group contains exactly eight complete trajectories from one task.
-- Every policy record stores state fingerprint, active node, open candidate, exact masked old-policy joint log-probability, envelope, runtime state and the replayable policy state.
-- The final utility is the only value used to compute advantage.
-- No teacher names, teacher outputs or teacher scores may appear in a training trajectory.
-- Resume restores model, optimizer and completed trajectory/group identifiers without changing the train/test boundary.
-- A policy-selected `STOP` is `terminated`; decision, resource or environment limits are `truncated`. Both receive the benchmark terminal utility, but truncation never creates a fake `STOP` log-probability.
-- Evaluation never updates model weights and never applies training minimum node/depth envelopes.
-- API nondeterminism is addressed by request/response capture, fixed configuration and repeated paired evaluation, not by claiming exact deterministic counterfactuals.
+- Every actor/value update consumes exactly eight complete current-policy train trajectories.
+- Runtime crashes, environment failures and incomplete trajectories are preserved for audit but excluded from actor and value updates.
+- A normal 60-minute training deadline triggers the official verifier; its partial score is a valid terminal label.
+- Every trajectory preserves `M_0...M_T`, runtime events, semantic audits, exact old probabilities, task checksum, image digest, model revisions and final Harbor result.
+- Actor, value, EMA, both optimizers and updated group IDs are restored together; a group ID can be optimized only once.
+- Dev selects checkpoints but never updates them. Test runs only after selection and never updates weights.
+- The local Docker protocol does not claim Harbor's timed process verifier. “Continuous process reward” means final-score-supervised `V_psi` and `Delta V` credit.
 
 ## 9. Limits
 
-MIA's data-processing bound still applies: communication and recursion cannot create information unavailable from context, tools or environment. The organization can improve acquisition, representation and conversion, but shared foundation models create correlated errors. Utility judges can be biased, external environments can drift, tool side effects may be non-clonable, and snapshot replay may be incomplete. Claims therefore concern measured τ³ performance under the pinned protocol, not global optimality or universal information gain.
+MIA's data-processing bound still applies: communication and recursion cannot create information unavailable from context, tools or environment. DeepSeek participates in execution, extraction and semantic verification, creating correlated errors despite separate frozen prompts and provenance. Utility judges can be biased, external environments can drift, tool side effects may be non-clonable, API sampling is not guaranteed deterministic, and snapshot replay may be incomplete. Claims therefore concern measured LHTB performance under the pinned protocol, not global optimality or universal information gain.

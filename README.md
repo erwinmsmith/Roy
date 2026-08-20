@@ -162,7 +162,7 @@ Team execution is policy controlled. A team can run sequentially or with bounded
 
 ## Research Branch: `exp`
 
-The `exp` branch contains Roy's Information Realization and autonomous organization-GRPO research track. The benchmark-facing implementation targets τ³, while the default runtime remains backward compatible when structural learning is disabled.
+The `exp` branch contains Roy's Information Realization and autonomous organization-GRPO research track. LHTB is the primary training environment; τ³ is retained for smoke and zero-shot transfer. The default product runtime remains backward compatible when structural learning is disabled.
 
 The research track currently includes:
 
@@ -171,11 +171,13 @@ recursive_runtime             open-ended child derivation and structured epistem
 derivation_dependency_graph   immutable lineage, artifact dependencies, WAIT and wake-up
 communication_graph           required routes and optional learned connections
 organization_policy           active-node selection followed by a conditional open action
-runtime_feasibility_mask      observable call/tool/node/depth/decision limits, never reward
-organization_grpo             eight on-policy trajectories and terminal τ³ utility only
+legal_action_mask             graph, dependency and environment preconditions
+global_epistemic_state        immutable M_0...M_T with terminal/tool side effects
+semantic_state_builder        DeepSeek labels; MiniLM top-8 candidate recall only
+process_credit_grpo           official LHTB final reward with telescoping EMA Delta V
 ```
 
-The organization grammar is `DERIVE / ACQUIRE / CONNECT / EXECUTE / RETURN / PRUNE / STOP`. Agents are generated from residual requirements rather than selected from predefined roles. Training uses no teacher, no imitation warm start, no separate optimization phases, and no weighted multi-objective reward.
+The organization grammar is `DERIVE / ACQUIRE / CONNECT / EXECUTE / RETURN / PRUNE / STOP`. Agents are generated from residual requirements rather than selected from predefined roles. Training uses no teacher, no imitation warm start, no weighted multi-objective reward, no keyword matching and no forced agent-count/depth target.
 
 Run the lightweight checks with:
 
@@ -184,31 +186,30 @@ npm run research:test
 npm run research:smoke
 ```
 
-Create the pinned τ³ manifest and train from completed τ³ organization trajectories with:
+Create the pinned LHTB split and formal 960-rollout schedule with:
 
 ```bash
-PYTHONPATH=research python3 -m roy_research tau3-manifest \
-  --tau3-root /path/to/tau2-bench \
-  --output research/output/tau3/manifest.jsonl
+PYTHONPATH=research python3 -m roy_research lhtb-manifest \
+  --lhtb-root /path/to/LHTB --output research/output/lhtb/manifest.json
 
-PYTHONPATH=research python3 -m roy_research tau3-train \
-  --manifest research/output/tau3/manifest.jsonl \
-  --trajectories research/output/tau3/train-trajectories.jsonl \
-  --model research/output/tau3/organization-policy.pt \
-  --epochs 4 --max-tokens 50000 --resume
+PYTHONPATH=research python3 -m roy_research lhtb-schedule \
+  --manifest research/output/lhtb/manifest.json \
+  --output research/output/lhtb/schedule.json
 
-PYTHONPATH=research python3 -m roy_research tau3-evaluate \
-  --manifest research/output/tau3/manifest.jsonl \
-  --model research/output/tau3/organization-policy.pt \
-  --output research/output/tau3/test-results.jsonl \
-  --summary research/output/tau3/test-summary.json --split test
+PYTHONPATH=research python3 -m roy_research lhtb-update \
+  --manifest research/output/lhtb/manifest.json \
+  --trajectories research/output/lhtb/train-trajectories.jsonl \
+  --model research/output/lhtb/checkpoints/current.pt \
+  --updates research/output/lhtb/update-audit.jsonl --resume
 ```
 
-`tau3-train` runs fresh rollouts over multiple epochs. For each task/epoch it samples eight trajectories from the masked current policy under the same envelope, runtime budget and environment seed, then immediately applies one organization-GRPO update. Only the organization sampling seed differs within a group. Training accepts only `benchmark=tau3`, `split=train`, complete groups, and one `terminal_utility` per trajectory. Early exploration floors anneal across epochs and direct sampling among legal `DERIVE` actions only when an LLM report contains a genuine actionable residual gap. A substantive residual without an explicit child proposal is exposed as an open child specification grounded in that residual; user-information gaps instead use resumable `ACQUIRE` interaction and are never recursively copied into agents. No teacher or predefined role is introduced. Saved trajectories include full child specifications and topology summaries for chain, fan-out, dependency, communication, and hybrid DAGs. At test time Roy samples one autonomous organization without minimum node/depth floors. The primary comparison is against `single_agent_direct`; official test and banking-knowledge heldout tasks are never used for updates. Reports distinguish policy termination from resource/environment truncation.
+Formal LHTB training runs four epochs over the fixed 30-task train split. Each current-policy group contains eight fresh, matched Docker rollouts; only the organization sampling seed differs. The sole environment target is the official final score. An independent EMA value model supplies telescoping decision credit and is updated after the actor. Crashed/incomplete trajectories remain in the audit log but never update either model. Dev chooses one checkpoint; test runs only that frozen checkpoint against true single-agent direct and the Roy heuristic. The checked [research README](research/README.md) contains VM preparation, protocol details and reproduction commands.
+
+On the dedicated `exp-roy-lhtb` Docker VM, run `research/remote/prepare_lhtb.sh oracle-smoke`, then `research/remote/run_lhtb_training.sh` and `research/remote/run_lhtb_test.sh`. Generated trajectories, semantic audits, checkpoints, benchmark assets and Docker state remain outside Git.
 
 In the controlled benchmark, `utility` is a deterministic terminal task score in `[0, 1]`; it is not an LLM accuracy score. The current pilot reached `0.8266` test utility for the full hierarchical policy, compared with `0.8086` for Node-only CS-GRPO, `0.6396` without the event graph, and `0.5939` without derivation. These are controlled-fixture results, not claims about real-world Agent performance. A separate nine-checkpoint real-DeepSeek pilot now validates rollout collection and training end to end; its three-task test result was inconclusive and the external tau Knowledge/TUA-Bench pilot remains pending.
 
-See the [research README](research/README.md), [canonical theory](research/theory/Agent_Derivation_Theory_CS_GRPO_Revised.md), [controlled pilot report](research/reports/controlled-pilot.md), and [real-DeepSeek pilot report](research/reports/live-deepseek-pilot.md) for experiment details, limitations, and reproducibility information.
+See the [research README](research/README.md), [canonical theory](research/theory/Agent_Derivation_Theory_CS_GRPO_Revised.md), [LHTB implementation note](research/reports/lhtb-process-reward-implementation.md), [controlled pilot report](research/reports/controlled-pilot.md), and [real-DeepSeek pilot report](research/reports/live-deepseek-pilot.md) for experiment details, limitations, and reproducibility information.
 
 ## ToM-Aware Delegation
 

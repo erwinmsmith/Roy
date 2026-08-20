@@ -1,0 +1,284 @@
+{
+  "commit": "84d7ba5ee34fae6c11f0d7cb8ed5faa73a9ece54",
+  "repository": "https://github.com/zli12321/LHTB.git",
+  "schema_version": 1,
+  "split_seed": "roy-lhtb-20260820",
+  "tasks": [
+    {
+      "category": "apex_professional_workflows",
+      "order_hash": "2061b7dae5b989d830d896a540e60f7e3d5ef37f2b7f4b7e22ecf28f74a95880",
+      "split": "dev",
+      "task_id": "apex-management-consulting-matter"
+    },
+    {
+      "category": "earth_climate_and_energy",
+      "order_hash": "12b9c77b43e47dd2e4da8e53c7e9834223947a2ae8095241286dece472226ea9",
+      "split": "dev",
+      "task_id": "modflow6-groundwater-regression-audit"
+    },
+    {
+      "category": "interactive_games_and_puzzles",
+      "order_hash": "23b09427906198e82fd5bbabc0b46607bdad7b5bc6aaf14f711dcd64a9db7ac3",
+      "split": "dev",
+      "task_id": "super-mario"
+    },
+    {
+      "category": "multimodal_and_imaging_analysis",
+      "order_hash": "09c66375cb3f7946026f16ea09f770fad495bae721a6ad90c46b3979f77a89e1",
+      "split": "dev",
+      "task_id": "microscopy-cell-count-qc-audit"
+    },
+    {
+      "category": "research_reproduction_and_ml",
+      "order_hash": "02ef217da7588a20a32047278a5344603cd4db061805d76da5b6d5328608f7d0",
+      "split": "dev",
+      "task_id": "foldseek-paper-reproduction"
+    },
+    {
+      "category": "scientific_computing_and_simulation",
+      "order_hash": "265ecbf71dbc8ccac8f74149b212c8413d6df7caa6ad6ba4c58d77e35d14bcec",
+      "split": "dev",
+      "task_id": "nbody-accel-iterative"
+    },
+    {
+      "category": "software_and_reverse_engineering",
+      "order_hash": "0f71390163da4240b9ffb88d9ab39ee8c7d6749577b99d04e2eddc9fa9a4f328",
+      "split": "dev",
+      "task_id": "commit0-multilib-tdd"
+    },
+    {
+      "category": "systems_performance_and_security",
+      "order_hash": "02d215c245dd8e608b9a9ce23209c4cd248d8e70c1105be0ccbd2dbd393dee6a",
+      "split": "dev",
+      "task_id": "grammar-fuzz-coverage-hunt"
+    },
+    {
+      "category": "apex_professional_workflows",
+      "order_hash": "7b8f9aea542ac4d1d02f6d9da4773efed424cf1c67a2dd28c182fa582183675e",
+      "split": "test",
+      "task_id": "apex-investment-banking-matter"
+    },
+    {
+      "category": "earth_climate_and_energy",
+      "order_hash": "4422efa5b21dca3db1ca98bc71a10cdc269ae3a6dceef6516245fa6e64eda3ba",
+      "split": "test",
+      "task_id": "matpower-opf-regression"
+    },
+    {
+      "category": "interactive_games_and_puzzles",
+      "order_hash": "531a767c80547260bcfaa3e2f7593dc1538bd3f083e165d04063fa2b4a5067ed",
+      "split": "test",
+      "task_id": "generals-bot-arena"
+    },
+    {
+      "category": "multimodal_and_imaging_analysis",
+      "order_hash": "2af31bb04395f3d518bc9505487ef1b160adcc04819f52294a1ef052c315ff66",
+      "split": "test",
+      "task_id": "audio-visual-event-alignment"
+    },
+    {
+      "category": "research_reproduction_and_ml",
+      "order_hash": "0e6ee27f93161da24a7aed3a015b7f41b39dbd188f8ed6fc5e30b9482f50962d",
+      "split": "test",
+      "task_id": "tabular-data-feature-covshift"
+    },
+    {
+      "category": "scientific_computing_and_simulation",
+      "order_hash": "27ef227fb8552155abe2500ce61fdacd538bfb6090d633e505b76e61fabac9ab",
+      "split": "test",
+      "task_id": "spice-ephemeris-regression"
+    },
+    {
+      "category": "software_and_reverse_engineering",
+      "order_hash": "0f7199521fad6defbab0d2a89666a504003201e3c1fb032625c09a7d046f6a04",
+      "split": "test",
+      "task_id": "langchain-version-migration"
+    },
+    {
+      "category": "systems_performance_and_security",
+      "order_hash": "06f97bfe33433924158a3831b79df16a46c521eea18c9b184805fd721a32b9af",
+      "split": "test",
+      "task_id": "duckdb-optimizer-closure"
+    },
+    {
+      "category": "apex_professional_workflows",
+      "order_hash": "8debe990b28247adf81ef00cbd2c213d687d020ca140aca8fc96f6a5d4ec3f9f",
+      "split": "train",
+      "task_id": "apex-law433-matter"
+    },
+    {
+      "category": "apex_professional_workflows",
+      "order_hash": "e82dfdaadbd98b9ec961fd74f93583b132e97f9d537d076713951f70bcd2c0ac",
+      "split": "train",
+      "task_id": "apex-ib244-matter"
+    },
+    {
+      "category": "earth_climate_and_energy",
+      "order_hash": "8a8c29bb626dba0905de5605cedb898fb0813e9aa08784ec21bd66e694b2539c",
+      "split": "train",
+      "task_id": "epa-swmm-stormwater-regression-audit"
+    },
+    {
+      "category": "earth_climate_and_energy",
+      "order_hash": "9eb5524f37dba4411240794456cd5c8f6f43255964ea2c031ffbf2b2afd144e2",
+      "split": "train",
+      "task_id": "gdal-proj-raster-regression"
+    },
+    {
+      "category": "earth_climate_and_energy",
+      "order_hash": "eb4a54386f7b05d9fcb9f5b4d9a1cca1b3ceb08118bb66ab6b76ab29b594336b",
+      "split": "train",
+      "task_id": "nrel-pysam-hybrid-renewables-audit"
+    },
+    {
+      "category": "earth_climate_and_energy",
+      "order_hash": "f9360d3de362476a8a8ae58f6dee7601f862c076a289a1b1960e90eea6c56984",
+      "split": "train",
+      "task_id": "climate-netcdf-extreme-event-audit"
+    },
+    {
+      "category": "interactive_games_and_puzzles",
+      "order_hash": "5f3d62724afab62101fa42db847be27c63dee4f550ba6d6426bb14f0561c0a9c",
+      "split": "train",
+      "task_id": "snake_maze_campaign"
+    },
+    {
+      "category": "interactive_games_and_puzzles",
+      "order_hash": "63713114caf4242b2f3f6ac0b2ee801ab7f64d107033ee441572ce695d4d0a09",
+      "split": "train",
+      "task_id": "2048"
+    },
+    {
+      "category": "interactive_games_and_puzzles",
+      "order_hash": "7c20bf175c36023d45e4fac387a844d8c913e51918ab17660dfe890f2af8d3bb",
+      "split": "train",
+      "task_id": "chess-mate"
+    },
+    {
+      "category": "interactive_games_and_puzzles",
+      "order_hash": "a6b9db2e43baf3857a9e58d5c244e9413f018fa15e0b7789fee879b03afe819c",
+      "split": "train",
+      "task_id": "sokoban"
+    },
+    {
+      "category": "interactive_games_and_puzzles",
+      "order_hash": "b9d986b6dba17e5c6b9d05a113e31b37a9eb436098034b5539af7970b656f348",
+      "split": "train",
+      "task_id": "sudoku-recovery"
+    },
+    {
+      "category": "interactive_games_and_puzzles",
+      "order_hash": "dcc4b1cd8a29044881052b3fc985aa68da15b69a623645b0559f914209ff510a",
+      "split": "train",
+      "task_id": "rush_hour_campaign"
+    },
+    {
+      "category": "multimodal_and_imaging_analysis",
+      "order_hash": "9b06ca7da5d73483784be85d99136bc56c52ce5c75391cf51f07f979dcbbf814",
+      "split": "train",
+      "task_id": "scientific-figure-data-reconstruction"
+    },
+    {
+      "category": "multimodal_and_imaging_analysis",
+      "order_hash": "e5f6ca14aa8b847232f5c6494d57bd66a686d09a6ed865b0035e5627a48f37de",
+      "split": "train",
+      "task_id": "satellite-flood-change-detection-audit"
+    },
+    {
+      "category": "multimodal_and_imaging_analysis",
+      "order_hash": "eb2fb19b4372a1bc3bb82124803a2678bbea64ae5949f0be65b7d55f6d94ce8f",
+      "split": "train",
+      "task_id": "document-table-layout-reconstruction"
+    },
+    {
+      "category": "multimodal_and_imaging_analysis",
+      "order_hash": "fd397a199ef4ef81cf6e5383e366b96b91a02698be6e3cb22199c0986f24e3d0",
+      "split": "train",
+      "task_id": "dicom-radiology-audit"
+    },
+    {
+      "category": "research_reproduction_and_ml",
+      "order_hash": "a68048513eb5bb2a7f9ab6412d71d2bf902ac99dc947db472be41819699c25ab",
+      "split": "train",
+      "task_id": "alp-paper-reproduction"
+    },
+    {
+      "category": "research_reproduction_and_ml",
+      "order_hash": "b97cf03511afd29485ab67a7384c7c0ec7b89ef3bd174a0a286ae4a6315d645a",
+      "split": "train",
+      "task_id": "apex-openroad-ibex-signoff"
+    },
+    {
+      "category": "research_reproduction_and_ml",
+      "order_hash": "d690080e0e2bf30bff26894b390621a097627c380a2e15bf004f82ad910897ac",
+      "split": "train",
+      "task_id": "unison-paper-reproduction"
+    },
+    {
+      "category": "scientific_computing_and_simulation",
+      "order_hash": "3e22fe490a78c40b66b6ce5d5c35b6795b9412d49d4f72acc120386818853e83",
+      "split": "train",
+      "task_id": "epidemic-inverse-control-audit"
+    },
+    {
+      "category": "scientific_computing_and_simulation",
+      "order_hash": "64df776cef76156a89f82fbaf35db8f0758cbc3cc0494688f54e927b44cbaf24",
+      "split": "train",
+      "task_id": "su2-airfoil-regression"
+    },
+    {
+      "category": "scientific_computing_and_simulation",
+      "order_hash": "7400859d8b4e03f7aa7110db17d2e9ea18a241b9d62cd0b2dd0e68d1aaa96b4a",
+      "split": "train",
+      "task_id": "materials-phase-diagram-audit"
+    },
+    {
+      "category": "scientific_computing_and_simulation",
+      "order_hash": "ff92af2588e418403850365bc4d27be4ee45347e6b6d0d98085dee8f05d9754b",
+      "split": "train",
+      "task_id": "opensees-seismic-structural-regression-audit"
+    },
+    {
+      "category": "software_and_reverse_engineering",
+      "order_hash": "7307dfa24148ee6854975983a5df85eb3ec7509fd884bfe89147a191d4b8d23e",
+      "split": "train",
+      "task_id": "great-expectations-audit"
+    },
+    {
+      "category": "software_and_reverse_engineering",
+      "order_hash": "84902cde8684166fd4ba1156774741a3db55abd2c9a1646506ae58aab05c4d34",
+      "split": "train",
+      "task_id": "robotics-slam-benchmark-repair"
+    },
+    {
+      "category": "software_and_reverse_engineering",
+      "order_hash": "c903766edd30bda8c725a6f6654354dc07692d0700ab3cbeac189ec7062443ba",
+      "split": "train",
+      "task_id": "unknown-config-semantics"
+    },
+    {
+      "category": "software_and_reverse_engineering",
+      "order_hash": "d425810e637cea95e6019a95b0f86fe4af04abdcee2e7a866fd69160bd757842",
+      "split": "train",
+      "task_id": "riscv-core-debug"
+    },
+    {
+      "category": "systems_performance_and_security",
+      "order_hash": "33d5bc30c67f342e5885f16449d975ff6be15f775a58d4ddb08764afc6c81693",
+      "split": "train",
+      "task_id": "poc-exploit-craft"
+    },
+    {
+      "category": "systems_performance_and_security",
+      "order_hash": "7b7ef1491d36a44b76f15c8e85a0014155bc1c55802960b63b0489819416f46e",
+      "split": "train",
+      "task_id": "spot-scheduler-traces"
+    },
+    {
+      "category": "systems_performance_and_security",
+      "order_hash": "8a308ef1e673e4235f1ba69cb243b95896baebb5557eba4b354969e60a1a7a5c",
+      "split": "train",
+      "task_id": "vector-db-iterative-build"
+    }
+  ]
+}

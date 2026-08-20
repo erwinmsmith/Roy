@@ -1,7 +1,7 @@
 [project]
-name = "roy-cs-grpo-research"
+name = "roy-information-realization-research"
 version = "0.1.0"
-description = "Counterfactual Structural GRPO research harness for Roy"
+description = "LHTB continuous process-credit training and transfer harness for Roy"
 requires-python = ">=3.9"
 dependencies = [
   "numpy>=1.26,<3",
