@@ -9,6 +9,10 @@ run_root="${ROY_LHTB_RUN_ROOT:-${roy_root}/research/output/lhtb/formal}"
 manifest="${ROY_LHTB_MANIFEST:-${roy_root}/research/config/lhtb_split.json}"
 selection="${run_root}/selected-checkpoint.json"
 results="${run_root}/test-results.jsonl"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=load_roy_env.sh
+source "${script_dir}/load_roy_env.sh"
+load_deepseek_api_key "${roy_root}"
 
 [[ -n "${DEEPSEEK_API_KEY:-}" && -f "${selection}" ]] || {
   echo "DeepSeek key and selected-checkpoint.json are required" >&2

@@ -5,6 +5,10 @@ roy_root="${ROY_ROOT:-${HOME}/rivermind-data/roy}"
 benchmark_root="${LHTB_ROOT:-${HOME}/rivermind-data/benchmarks/LHTB}"
 lhtb_revision="84d7ba5ee34fae6c11f0d7cb8ed5faa73a9ece54"
 mode="${1:-check}"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=load_roy_env.sh
+source "${script_dir}/load_roy_env.sh"
+load_deepseek_api_key "${roy_root}"
 
 for command_name in docker git git-lfs node python3 uv; do
   command -v "${command_name}" >/dev/null || {

@@ -13,6 +13,10 @@ trajectories="${run_root}/train-trajectories.jsonl"
 updates="${run_root}/update-audit.jsonl"
 dev_trajectories="${run_root}/dev-trajectories.jsonl"
 dev_metrics="${run_root}/dev-metrics.jsonl"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=load_roy_env.sh
+source "${script_dir}/load_roy_env.sh"
+load_deepseek_api_key "${roy_root}"
 
 [[ -n "${DEEPSEEK_API_KEY:-}" ]] || { echo "DEEPSEEK_API_KEY is required" >&2; exit 4; }
 [[ -x "${python_bin}" && -x "${harbor_bin}" ]] || {
