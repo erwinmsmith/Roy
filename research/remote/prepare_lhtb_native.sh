@@ -19,10 +19,37 @@ load_deepseek_api_key "${roy_root}"
 
 install_system_dependencies() {
   [[ "$(id -u)" == "0" ]] || { echo "native prepare requires root for apt packages" >&2; exit 2; }
-  apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    asciinema build-essential ca-certificates coreutils curl git git-lfs \
-    libblas3 libgfortran5 liblapack3 libquadmath0 proot tmux util-linux xz-utils
+  # GPUHome images can retain sources from an older Ubuntu release. Install only
+  # missing packages and pin them to the running OS suite to prevent cross-release
+  # upgrades. ROY_LHTB_APT_UPDATE=false reuses a previously refreshed package index.
+  # shellcheck source=/dev/null
+  source /etc/os-release
+  local apt_suite="${VERSION_CODENAME:?missing VERSION_CODENAME}" package_name
+  local -a packages=()
+  command -v asciinema >/dev/null || packages+=(asciinema)
+  command -v cc >/dev/null || packages+=(build-essential)
+  command -v cp >/dev/null || packages+=(coreutils)
+  command -v curl >/dev/null || packages+=(ca-certificates curl)
+  command -v git >/dev/null || packages+=(git)
+  command -v git-lfs >/dev/null || packages+=(git-lfs)
+  command -v proot >/dev/null || packages+=(proot)
+  command -v setpriv >/dev/null || packages+=(util-linux)
+  command -v tmux >/dev/null || packages+=(tmux)
+  command -v xz >/dev/null || packages+=(xz-utils)
+  ldconfig -p | grep 'libblas\.so' >/dev/null || packages+=(libblas3)
+  ldconfig -p | grep 'libgfortran\.so' >/dev/null || packages+=(libgfortran5)
+  ldconfig -p | grep 'liblapack\.so' >/dev/null || packages+=(liblapack3)
+  ldconfig -p | grep 'libquadmath\.so' >/dev/null || packages+=(libquadmath0)
+  if (( ${#packages[@]} )); then
+    if [[ "${ROY_LHTB_APT_UPDATE:-true}" == "true" ]]; then
+      apt-get update
+    fi
+    for package_name in "${!packages[@]}"; do
+      packages[package_name]="${packages[package_name]}/${apt_suite}"
+    done
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      "${packages[@]}"
+  fi
   if ! command -v uv >/dev/null; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       python3 python3-pip python3-venv
