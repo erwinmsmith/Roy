@@ -39,6 +39,7 @@ class NativeProcessEnvironment(BaseEnvironment):
         template_root: str,
         uid_base: int = 210000,
         uid_slots: int = 20000,
+        task_gid: int = 210000,
         allow_network_degraded: bool = False,
         **kwargs: Any,
     ) -> None:
@@ -46,6 +47,7 @@ class NativeProcessEnvironment(BaseEnvironment):
         self.template_root = Path(template_root).expanduser().resolve()
         self.uid_base = int(uid_base)
         self.uid_slots = int(uid_slots)
+        self.task_gid = int(task_gid)
         if self.uid_slots < 1:
             raise ValueError("uid_slots must be positive")
         self.allow_network_degraded = bool(allow_network_degraded)
@@ -128,6 +130,7 @@ class NativeProcessEnvironment(BaseEnvironment):
             (self.session_root / name).mkdir(parents=True, exist_ok=True)
         for name in ("agent", "verifier", "artifacts"):
             (self.session_root / "logs" / name).mkdir(parents=True, exist_ok=True)
+        self.session_root.chmod(0o700)
         template = self.template_root / self.native_task_id
         for name in ("app", "opt"):
             source = template / name
@@ -146,6 +149,7 @@ class NativeProcessEnvironment(BaseEnvironment):
             "task_digest": task_digest,
             "session_id": self.session_id,
             "uid": self._uid,
+            "gid": self.task_gid,
             "network_isolation": False,
             "pid_namespace": False,
             "mount_namespace": False,
@@ -157,11 +161,11 @@ class NativeProcessEnvironment(BaseEnvironment):
     def _chown_session(self) -> None:
         assert self.session_root is not None
         for root, dirs, files in os.walk(self.session_root):
-            os.chown(root, self._uid, self._uid)
+            os.chown(root, self._uid, self.task_gid)
             for name in dirs:
-                os.chown(Path(root) / name, self._uid, self._uid)
+                os.chown(Path(root) / name, self._uid, self.task_gid)
             for name in files:
-                os.chown(Path(root) / name, self._uid, self._uid)
+                os.chown(Path(root) / name, self._uid, self.task_gid)
 
     async def stop(self, delete: bool) -> None:
         for process_group in tuple(self._process_groups):
@@ -209,7 +213,7 @@ class NativeProcessEnvironment(BaseEnvironment):
         destination = self._mounted_path(target_path)
         destination.parent.mkdir(parents=True, exist_ok=True)
         await asyncio.to_thread(shutil.copy2, source_path, destination)
-        os.chown(destination, self._uid, self._uid)
+        os.chown(destination, self._uid, self.task_gid)
 
     async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
         destination = self._mounted_path(target_dir)
@@ -221,12 +225,12 @@ class NativeProcessEnvironment(BaseEnvironment):
         await asyncio.to_thread(self._chown_path, destination)
 
     def _chown_path(self, path: Path) -> None:
-        os.chown(path, self._uid, self._uid)
+        os.chown(path, self._uid, self.task_gid)
         for root, dirs, files in os.walk(path):
             for name in dirs:
-                os.chown(Path(root) / name, self._uid, self._uid)
+                os.chown(Path(root) / name, self._uid, self.task_gid)
             for name in files:
-                os.chown(Path(root) / name, self._uid, self._uid)
+                os.chown(Path(root) / name, self._uid, self.task_gid)
 
     async def download_file(self, source_path: str, target_path: Path | str) -> None:
         source = self._mounted_path(source_path)
@@ -270,7 +274,7 @@ class NativeProcessEnvironment(BaseEnvironment):
         )
         exported = [f"{key}={value}" for key, value in env.items()]
         return [
-            "setpriv", f"--reuid={self._uid}", f"--regid={self._uid}",
+            "setpriv", f"--reuid={self._uid}", f"--regid={self.task_gid}",
             "--clear-groups", "--no-new-privs", "env", "-i", *exported,
             *proot, "/bin/bash", "-c", shell,
         ]

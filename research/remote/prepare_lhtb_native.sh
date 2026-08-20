@@ -11,6 +11,7 @@ node_runtime="${roy_root}/research/.runtime/node-v22"
 python_bin="${roy_root}/research/.venv/bin/python"
 harbor_bin="${roy_root}/research/.venv/bin/harbor"
 native_task_python="${ROY_LHTB_NATIVE_TASK_PYTHON:-3.12}"
+native_task_gid=210000
 revision="84d7ba5ee34fae6c11f0d7cb8ed5faa73a9ece54"
 mode="${1:-check}"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,6 +29,7 @@ install_system_dependencies() {
   local apt_suite="${VERSION_CODENAME:?missing VERSION_CODENAME}" package_name
   local -a packages=()
   command -v asciinema >/dev/null || packages+=(asciinema)
+  command -v setfacl >/dev/null || packages+=(acl)
   command -v cc >/dev/null || packages+=(build-essential)
   command -v cp >/dev/null || packages+=(coreutils)
   command -v curl >/dev/null || packages+=(ca-certificates curl)
@@ -56,6 +58,7 @@ install_system_dependencies() {
       python3 python3-pip python3-venv
     python3 -m pip install uv || python3 -m pip install --break-system-packages uv
   fi
+  setfacl -m "g:${native_task_gid}:--x" /
 }
 
 install_node_22() {

@@ -186,8 +186,8 @@ def native_environment_digest(audit: Mapping[str, Any], task_id: str) -> str:
     return digest
 
 
-def native_preflight(runtime_root: Path) -> Dict[str, Any]:
-    required = ("proot", "setpriv", "timeout", "cp")
+def native_preflight(runtime_root: Path, *, task_gid: int = 210000) -> Dict[str, Any]:
+    required = ("proot", "setpriv", "timeout", "cp", "getfacl")
     missing = [name for name in required if shutil.which(name) is None]
     result = {
         "backend": NATIVE_BACKEND_ID,
@@ -199,12 +199,24 @@ def native_preflight(runtime_root: Path) -> Dict[str, Any]:
         "network_isolation": False,
         "pid_namespace": False,
         "mount_namespace": False,
+        "task_gid": task_gid,
         "official_leaderboard_comparable": False,
     }
     if sys.platform != "linux" or platform.machine() not in ("x86_64", "AMD64"):
         raise RuntimeError("LHTB-native requires x86_64 Linux")
     if missing:
         raise RuntimeError(f"LHTB-native is missing commands: {', '.join(missing)}")
+    traversal = subprocess.run([
+        "setpriv", "--reuid=229999", f"--regid={task_gid}", "--clear-groups",
+        "--no-new-privs", "/usr/bin/true",
+    ], capture_output=True, text=True)
+    if traversal.returncode != 0:
+        raise RuntimeError(
+            "LHTB-native task GID cannot traverse the GPUHome host root; "
+            "run prepare_lhtb_native.sh prepare to install the execute-only ACL: "
+            + traversal.stderr.strip()
+        )
+    result["root_traversal_acl"] = "execute-only"
     runtime_root.mkdir(parents=True, exist_ok=True)
     probe = runtime_root / ".write-probe"
     probe.write_text("ok", encoding="utf-8")
