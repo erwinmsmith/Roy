@@ -280,6 +280,17 @@ class InformationRealizationTests(unittest.TestCase):
             ),
             [],
         )
+        reworded = {
+            **residual,
+            "id": "new-gap-id",
+            "description": "Retrieve the same account with slightly different wording",
+        }
+        self.assertEqual(
+            _tool_acquisition_candidates(
+                "root", [reworded], tools, {str(candidates[0]["id"])}
+            ),
+            [],
+        )
 
     def test_optional_communication_candidates_are_sparse_and_acyclic(self) -> None:
         root = {"id": "root", "status": "reported", "report": {"conclusion": "x"}}

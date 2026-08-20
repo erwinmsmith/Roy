@@ -404,7 +404,6 @@ def register_tau3_organization_agent(
                     ),
                 )
                 acquire_arguments = _non_thinking_arguments(self.llm_args)
-                acquire_arguments["response_format"] = {"type": "json_object"}
                 state.llm_call_count += 1
                 argument_response = generate_fn(
                     model=self.llm,
@@ -991,8 +990,7 @@ def _tool_acquisition_candidates(
             "residual_requirements": requirements,
             "selected_tool": tool_name,
         }
-        semantic_key = _stable_json_hash(requirement)[:16]
-        identifier = f"acquire-tool:{actor}:{tool_name}:{semantic_key}"
+        identifier = f"acquire-tool:{actor}:{tool_name}"
         if identifier in used_candidate_ids:
             continue
         short_description = str(
