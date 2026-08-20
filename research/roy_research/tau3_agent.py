@@ -113,6 +113,7 @@ def register_tau3_organization_agent(
         derived_gap_keys: list[str] = Field(default_factory=list)
         derived_objective_fingerprints: list[str] = Field(default_factory=list)
         child_spec_node_ids: Dict[str, str] = Field(default_factory=dict)
+        failed_tool_candidate_ids: list[str] = Field(default_factory=list)
         pending_acquisition_node: str | None = None
         pending_user_acquisition_node: str | None = None
         final_output: str | None = None
@@ -283,15 +284,27 @@ def register_tau3_organization_agent(
         def _ingest_tool_observation(self, message, state: OrganizationState) -> None:
             state.tool_call_count += 1
             actor_id = state.pending_acquisition_node or "root"
+            observation = str(getattr(message, "content", message))
             state.observations.append({
                 "id": f"observation-{len(state.observations)}",
                 "node_id": actor_id,
                 "source_type": "tool",
-                "observation": str(getattr(message, "content", message)),
+                "observation": observation,
                 "provenance": str(getattr(message, "tool_call_id", "tau3-environment")),
             })
             node = self._node(state, actor_id)
             node["status"] = "ready"
+            if _is_failed_tool_observation(observation):
+                for action in reversed(state.actions):
+                    if (
+                        action.get("kind") == "ACQUIRE"
+                        and action.get("tool_name")
+                        and action.get("candidate_id")
+                    ):
+                        candidate_id = str(action["candidate_id"])
+                        if candidate_id not in state.failed_tool_candidate_ids:
+                            state.failed_tool_candidate_ids.append(candidate_id)
+                        break
             state.pending_acquisition_node = None
 
         def _ingest_user_observation(self, message, state: OrganizationState) -> None:
@@ -305,6 +318,12 @@ def register_tau3_organization_agent(
             })
             self._node(state, actor_id)["status"] = "ready"
             state.pending_user_acquisition_node = None
+            if state.failed_tool_candidate_ids:
+                failed = set(state.failed_tool_candidate_ids)
+                state.used_candidates = [
+                    value for value in state.used_candidates if value not in failed
+                ]
+                state.failed_tool_candidate_ids = []
 
         def _apply(self, candidate, state, generate_fn, assistant_type, system_type):
             kind = str(candidate["kind"])
@@ -1011,6 +1030,10 @@ def _tool_acquisition_candidates(
 
 def _limit_reached(used: int, limit: int | None) -> bool:
     return limit is not None and used >= limit
+
+
+def _is_failed_tool_observation(observation: Any) -> bool:
+    return bool(re.match(r"\s*(?:error\b|\{?\s*\"?error\"?\s*:)", str(observation), re.I))
 
 
 def _remaining_at_most(used: int, limit: int | None, threshold: int) -> bool:

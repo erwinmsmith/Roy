@@ -31,6 +31,7 @@ from roy_research.tau3_agent import (
     _bound_tool_call_payload,
     _communication_candidate_allowed,
     _is_user_interaction_requirement,
+    _is_failed_tool_observation,
     _matching_tool_names,
     _is_stop_message,
     _non_thinking_arguments,
@@ -280,6 +281,9 @@ class InformationRealizationTests(unittest.TestCase):
             ),
             [],
         )
+        self.assertTrue(_is_failed_tool_observation("Error: missing user_id"))
+        self.assertTrue(_is_failed_tool_observation('{"error": "invalid id"}'))
+        self.assertFalse(_is_failed_tool_observation('{"user_id": "valid"}'))
         reworded = {
             **residual,
             "id": "new-gap-id",
