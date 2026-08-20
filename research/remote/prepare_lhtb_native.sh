@@ -98,10 +98,15 @@ prepare_checkout() {
     echo "LHTB checkout has local changes; refusing to switch revisions" >&2
     exit 3
   }
-  git -C "${lhtb_root}" fetch origin "${revision}"
+  if [[ "$(git -C "${lhtb_root}" rev-parse HEAD 2>/dev/null || true)" != "${revision}" ]]; then
+    git -C "${lhtb_root}" fetch origin "${revision}"
+  fi
   git -C "${lhtb_root}" checkout --detach "${revision}"
   [[ "$(git -C "${lhtb_root}" rev-parse HEAD)" == "${revision}" ]]
-  git -C "${lhtb_root}" lfs pull
+  if ! git -C "${lhtb_root}" lfs fsck; then
+    git -C "${lhtb_root}" lfs pull
+    git -C "${lhtb_root}" lfs fsck
+  fi
   if [[ ! -x "${python_bin}" ]]; then
     uv venv --python 3.12 "${roy_root}/research/.venv"
   fi
