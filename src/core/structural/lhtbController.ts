@@ -79,9 +79,32 @@ workspace or runs verification. Examples:
  "schedulerComplexity":3,"command":"python /app/implement.py && pytest -q","timeoutMs":120000,
  "action":{"kind":"EXECUTE","actorNodeId":"root"}}.
 Do not put command inside action and do not fabricate an observation or execution report.
-DERIVE action must contain a strict childSpecification tied to an existing open requirement.
-RETURN action must contain a complete epistemic report using the repository schema.
-CONNECT uses existing distinct nodes. PRUNE targets a non-root node. STOP is root-only.
+DERIVE must use an exact open requirement ID from runtime.requirements and this action schema:
+{"kind":"DERIVE","actorNodeId":"<parent>","childSpecification":{"id":"<spec-id>",
+"nodeId":"<new-agent-id>","parentId":"<parent>","depth":<parent-depth+1>,
+"parentGoal":"<parent objective>","triggeringGapId":"<open requirement id>",
+"localObjective":"<strictly narrower executable objective>","refinement":{"parentScope":"...",
+"childScope":"...","triggeringRequirementId":"<same requirement id>",
+"narrowerThanParent":true,"newInformationNeeded":"...","executableEndCondition":"...",
+"duplicatedByExistingNode":false},"requiredClaims":[],"requiredEvidence":[],
+"relevantReportIds":[],"externalAccess":{"allowed":true,"tools":["terminal"],
+"purpose":"..."},"expectedOutput":{"requiredInformation":"...",
+"outputType":"epistemic_report"},"terminationCondition":"..."}}.
+When independent unresolved requirements can be handled concurrently, include distinct legal
+DERIVE candidates. Do not force a node count and do not derive duplicate or non-refining work.
+CONNECT action is {"kind":"CONNECT","actorNodeId":"<actor>","connection":{"from":"<existing>",
+"to":"<different existing>","required":false}}. PRUNE uses targetNodeId for a non-root node.
+RETURN action uses the property report (never epistemicReport), with this exact report shape:
+{"id":"...","nodeId":"<actor>","parentId":"...","depth":<actor-depth>,"localObjective":"...",
+"triggeringGapId":"...","conclusion":"...","reasoningSummary":"...","claims":[],
+"evidence":[],"externalObservations":[],"assumptions":[],"uncertainty":{"confidence":0.5,
+"uncertainAbout":[],"confidenceBasis":"..."},"conflicts":[],"coverage":{"resolved":[],
+"unresolved":[],"notExamined":[]},"blindSpots":[],"residualRequirements":[],
+"proposedChildren":[],"resolvedParentGap":false,"informationToPropagate":[]}.
+Claims, evidence, observations, assumptions, conflicts, residual requirements and proposed children
+must use their typed runtime schemas when non-empty. STOP is root-only and uses finalOutput.
+Cover every active node that has a semantically useful next action; candidate actorNodeId must be
+that node's exact ID. A node with no proposed candidate cannot be selected by the policy.
 Propose only semantically useful actions. Do not expose hidden reasoning, benchmark grader data,
 keyword fields or reward. The preferred candidate is your best next organization decision.`;
 
@@ -283,6 +306,8 @@ export class LHTBAutonomousController {
 
   private policyState(snapshot: ReturnType<RoyLHTBSession['snapshot']>,
     candidates: ProposedCandidate[]): Record<string, unknown> {
+    const activeNodes = snapshot.runtime.nodes
+      .filter(node => ['ready', 'running', 'waiting', 'completed'].includes(node.status));
     const nodes = snapshot.runtime.nodes.map(node => ({ id: node.id, kind: 'agent',
       timestamp: node.createdAt, text: node.localObjective, status: node.status,
       attributes: { signal: node.status === 'returned' || node.status === 'completed' ? 1 : 0 } }));
@@ -297,12 +322,10 @@ export class LHTBAutonomousController {
     return {
       state_fingerprint: snapshot.processStates.at(-1)?.fingerprint,
       event_graph: { nodes, edges },
-      active_node_ids: snapshot.runtime.nodes
-        .filter(node => ['ready', 'running', 'waiting', 'completed'].includes(node.status))
-        .map(node => node.id),
-      active_node_legal: snapshot.runtime.nodes
-        .filter(node => ['ready', 'running', 'waiting', 'completed'].includes(node.status))
-        .map(() => true),
+      active_node_ids: activeNodes.map(node => node.id),
+      active_node_legal: activeNodes.map(node => candidates.some(
+        candidate => candidate.actorNodeId === node.id
+      )),
       candidates: candidates.map(candidate => ({ id: candidate.id, kind: candidate.kind,
         actor_node_id: candidate.actorNodeId, description: candidate.description,
         scheduler_complexity: candidate.schedulerComplexity, external_access: candidate.kind === 'ACQUIRE',

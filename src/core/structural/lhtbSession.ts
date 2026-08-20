@@ -71,6 +71,12 @@ export class RoyLHTBSession {
     readonly organizationMode: LHTBSessionSnapshot['organizationMode'] = 'learned_information_realization',
     readonly initialSnapshotFingerprint = '', readonly organizationSeed = 20260820) {
     this.runtime = new RecursiveInformationRealizationRuntime('root', instruction);
+    this.runtime.ingestRequirement({
+      id: 'root-task-requirement', description: instruction,
+      whyItMatters: 'This is the environment task the organization must complete.',
+      likelyMechanism: 'mixed', requiredInformation: 'A verified task completion result.',
+      status: 'open', parentNodeId: 'root',
+    });
     this.recordState();
   }
 

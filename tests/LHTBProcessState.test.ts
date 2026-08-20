@@ -44,6 +44,7 @@ describe('LHTB process state', () => {
   it('makes direct a true single root agent in the same runtime', () => {
     const direct = new RoyLHTBSession('direct', 'task', 'solve it', 'commit',
       'single_agent_direct');
+    expect(direct.snapshot().runtime.requirements[0]?.id).toBe('root-task-requirement');
     expect(() => direct.applyOrganizationAction({ kind: 'CONNECT', actorNodeId: 'root',
       connection: { from: 'root', to: 'root', required: false } })).toThrow(/single_agent_direct/);
   });
@@ -151,6 +152,45 @@ describe('LHTB process state', () => {
       expect(result.request.organizationActionKind).toBe('EXECUTE');
       expect(result.request.command).toBe('python implement.py');
     }
+    controller.close();
+  });
+
+  it('accepts a strict open child specification for autonomous derivation', async () => {
+    const session = new RoyLHTBSession('derive', 'task', 'implement and verify', 'commit',
+      'roy_runtime_heuristic');
+    const semantic = { async processEvent(event: { id: string }) {
+      return { event_id: event.id, requirements: [], claims: [], assumptions: [], evidence: [],
+        external_observations: [], blind_spots: [], relations: [] };
+    }, close() {} };
+    const childSpecification = {
+      id: 'spec-worker', nodeId: 'worker', parentId: 'root', depth: 1,
+      parentGoal: 'implement and verify', triggeringGapId: 'root-task-requirement',
+      localObjective: 'Implement the bounded code change and report verification evidence.',
+      refinement: { parentScope: 'implement and verify', childScope: 'implement code change',
+        triggeringRequirementId: 'root-task-requirement', narrowerThanParent: true,
+        newInformationNeeded: 'Repository implementation details',
+        executableEndCondition: 'Tests pass and evidence is recorded',
+        duplicatedByExistingNode: false },
+      requiredClaims: [], requiredEvidence: [], relevantReportIds: [],
+      externalAccess: { allowed: true, tools: ['terminal'], purpose: 'Modify and test files' },
+      expectedOutput: { requiredInformation: 'Implementation and test evidence',
+        outputType: 'epistemic_report' },
+      terminationCondition: 'Return after tests pass or a concrete blocker is established',
+    };
+    const provider = { isConfigured: () => true, async completeJSONWithUsage() {
+      return { value: { preferred_candidate_id: 'derive-worker', candidates: [{
+        id: 'derive-worker', kind: 'DERIVE', actorNodeId: 'root',
+        description: 'Delegate the bounded implementation', schedulerComplexity: 2,
+        action: { kind: 'DERIVE', actorNodeId: 'root', childSpecification },
+      }] }, completion: { content: '{}', model: 'mock', usage: {
+        promptTokens: 1, completionTokens: 1, totalTokens: 2,
+      } } };
+    } };
+    const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false });
+    const result = await controller.advance(session, 1);
+    expect(result.status).toBe('continue');
+    expect(session.snapshot().runtime.nodes.map(value => value.id)).toEqual(['root', 'worker']);
+    expect(session.snapshot().runtime.derivationEdges).toEqual([{ parentId: 'root', childId: 'worker' }]);
     controller.close();
   });
 
