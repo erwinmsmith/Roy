@@ -205,7 +205,11 @@ describe('LHTB process state', () => {
         external_observations: [], blind_spots: [], relations: [] };
     }, close() {} };
     let calls = 0;
-    const provider = { isConfigured: () => true, async completeJSONWithUsage() {
+    const requests: Array<Array<{ role: string; content: string }>> = [];
+    const provider = { isConfigured: () => true, async completeJSONWithUsage(messages: Array<{
+      role: string; content: string;
+    }>) {
+      requests.push(messages);
       calls += 1;
       if (calls === 1) throw new LLMJSONParseError('malformed', {
         content: '{bad', model: 'mock', usage: { promptTokens: 2, completionTokens: 3,
@@ -223,6 +227,8 @@ describe('LHTB process state', () => {
       const result = await controller.advance(session, 1);
       expect(result.status).toBe('completed');
       expect(calls).toBe(2);
+      expect(requests[1]).toHaveLength(2);
+      expect(requests[1]?.some(message => message.content.includes('{bad'))).toBe(false);
       expect(session.snapshot().processStates.at(-1)?.usage).toMatchObject({
         inputTokens: 7, outputTokens: 10,
       });
@@ -231,6 +237,48 @@ describe('LHTB process state', () => {
     } finally {
       controller.close();
       await rm(auditRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('projects cumulative terminal text for the proposer without mutating M_t', async () => {
+    const session = new RoyLHTBSession('projection', 'task', 'finish', 'commit',
+      'roy_runtime_heuristic');
+    const longOutput = `head-${'x'.repeat(40_000)}-tail`;
+    session.requestTerminal({ id: 'large', command: 'python inspect.py', timeoutMs: 1000,
+      nodeId: 'root', organizationActionKind: 'ACQUIRE' });
+    session.acceptTerminalResult({ requestId: 'large', exitCode: 0, stdout: longOutput,
+      stderr: '', durationMs: 1, fileChanges: [] });
+    session.applyOrganizationAction({ kind: 'ACQUIRE', actorNodeId: 'root', observation: {
+      id: 'large-observation', sourceType: 'environment', queryOrAction: 'python inspect.py',
+      observation: 'large output retained in the process event', provenance: 'test', supports: [],
+    } });
+    const semantic = { async processEvent(event: { id: string }) {
+      return { event_id: event.id, requirements: [], claims: [], assumptions: [], evidence: [],
+        external_observations: [], blind_spots: [], relations: [] };
+    }, close() {} };
+    let proposerInput = '';
+    const provider = { isConfigured: () => true, async completeJSONWithUsage(messages: Array<{
+      role: string; content: string;
+    }>) {
+      proposerInput = messages.at(-1)?.content ?? '';
+      return { value: { preferred_candidate_id: 'stop', candidates: [{
+        id: 'stop', kind: 'STOP', actorNodeId: 'root', description: 'finish',
+        schedulerComplexity: 0, action: { kind: 'STOP', actorNodeId: 'root', finalOutput: 'done' },
+      }] }, completion: { content: '{}', model: 'mock', usage: {
+        promptTokens: 1, completionTokens: 1, totalTokens: 2,
+      } } };
+    } };
+    const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false });
+    try {
+      await controller.advance(session, 1);
+      expect(proposerInput).toContain('proposer projection omitted');
+      expect(proposerInput.length).toBeLessThan(30_000);
+      const rawEvent = session.snapshot().processStates
+        .flatMap(state => state.runtimeEvents)
+        .find(event => event.id === 'result-large');
+      expect(rawEvent?.output).toBe(longOutput);
+    } finally {
+      controller.close();
     }
   });
 

@@ -22,7 +22,9 @@ from roy_research.process_state import (
     SemanticStateBuilder,
     append_state,
     embedding_candidate_pairs,
+    _semantic_payload_projection,
 )
+from roy_research.semantic_server import SemanticServer
 from roy_research.value_model import (
     EpistemicValueModel,
     equal_trajectory_value_loss,
@@ -112,6 +114,34 @@ class LHTBProtocolTests(unittest.TestCase):
                 encoding="utf-8"
             ).splitlines()
             self.assertEqual(len(failures), 1)
+            self.assertEqual(len(client.calls[1][0][0]), 3)
+            self.assertNotIn("not-json", json.dumps(client.calls[1][0][0]))
+
+    def test_semantic_projection_preserves_raw_event_and_bounds_model_text(self) -> None:
+        raw = "head" + ("x" * 50_000) + "tail"
+        payload = {"event": {"id": "event", "output": raw}}
+        projected = _semantic_payload_projection(payload)
+        self.assertEqual(payload["event"]["output"], raw)
+        self.assertLess(len(projected["event"]["output"]), len(raw))
+        self.assertIn("semantic projection omitted", projected["event"]["output"])
+
+    def test_semantic_extractor_failure_is_audited_without_killing_rollout(self) -> None:
+        class Builder:
+            def extract(self, event):
+                raise TimeoutError("provider unavailable")
+
+        with tempfile.TemporaryDirectory() as directory:
+            server = SemanticServer.__new__(SemanticServer)
+            server.root = Path(directory)
+            server.builder = Builder()
+            result = server.process({"id": "event-1"}, {})
+            self.assertEqual(result["event_id"], "event-1")
+            self.assertEqual(result["claims"], [])
+            self.assertEqual(
+                result["provenance"]["status"], "unresolved_semantic_event"
+            )
+            audit = (Path(directory) / "semantic-fallbacks.jsonl").read_text()
+            self.assertIn("no_relation_or_entity_fabricated", audit)
 
     def test_json_rpc_process_restarts_and_restores_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

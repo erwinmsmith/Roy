@@ -38,10 +38,11 @@ class SemanticServer:
         root = Path(os.environ.get(
             "ROY_LHTB_SEMANTIC_ROOT", "research/output/lhtb/semantic"
         )) / f"process-{os.getpid()}"
+        self.root = root
         ledger = AccountingLedger()
         deepseek = DeepSeekClient(
             ledger, model=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash"),
-            timeout=float(os.environ.get("ROY_LHTB_SEMANTIC_TIMEOUT", "600")),
+            timeout=float(os.environ.get("ROY_LHTB_SEMANTIC_TIMEOUT", "150")),
             event_log=root / "llm-events.jsonl",
         )
         client = FrozenDeepSeekSemanticClient(
@@ -54,7 +55,11 @@ class SemanticServer:
         )
 
     def process(self, event: Mapping[str, Any], existing_state: Mapping[str, Any]) -> Dict[str, Any]:
-        extracted = dict(self.builder.extract(event))
+        try:
+            extracted = dict(self.builder.extract(event))
+        except Exception as error:
+            self._record_fallback("extractor", event, error)
+            return self._empty_update(event, error)
         claims = [_claim(value, str(event.get("nodeId") or "root"))
                   for value in _objects(extracted.get("claims"))]
         extracted["claims"] = claims
@@ -67,8 +72,16 @@ class SemanticServer:
             left = _semantic_entities(_objects(extracted.get(entity_type)), text_field)
             right = _semantic_entities(_objects(existing_state.get(entity_type)), text_field)
             if left and right:
-                relations.extend({**relation, "entity_type": entity_type}
-                                 for relation in self.builder.verify_candidates(left, right))
+                try:
+                    relations.extend({**relation, "entity_type": entity_type}
+                                     for relation in self.builder.verify_candidates(left, right))
+                except Exception as error:
+                    # Missing a relation is the conservative outcome of a transport/schema
+                    # failure. Never fabricate an LLM label and never abort the rollout.
+                    self._record_fallback("verifier", {
+                        "event_id": event.get("id"), "entity_type": entity_type,
+                        "candidate_count": min(8, len(left) * len(right)),
+                    }, error)
         return {
             "event_id": event.get("id"),
             "requirements": _objects(extracted.get("requirements")), "claims": claims,
@@ -78,6 +91,26 @@ class SemanticServer:
             "blind_spots": [str(value) for value in extracted.get("blind_spots", [])],
             "relations": relations, "provenance": extracted.get("_provenance"),
         }
+
+    def _empty_update(self, event: Mapping[str, Any], error: Exception) -> Dict[str, Any]:
+        return {
+            "event_id": event.get("id"), "requirements": [], "claims": [],
+            "assumptions": [], "evidence": [], "external_observations": [],
+            "blind_spots": [], "relations": [],
+            "provenance": {"status": "unresolved_semantic_event",
+                           "error_type": type(error).__name__},
+        }
+
+    def _record_fallback(self, operation: str, request: Mapping[str, Any],
+                         error: Exception) -> None:
+        path = self.root / "semantic-fallbacks.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "operation": operation, "request": request,
+                "resolution": "no_relation_or_entity_fabricated",
+                "error_type": type(error).__name__, "error": str(error),
+            }, sort_keys=True, ensure_ascii=False) + "\n")
 
 
 def _objects(value: Any) -> List[Mapping[str, Any]]:

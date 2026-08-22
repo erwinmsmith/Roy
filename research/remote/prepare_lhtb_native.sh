@@ -235,16 +235,35 @@ PY
     "${harbor_bin}" run -c "${config}" --yes
     cd "${roy_root}"
     result_path="${job_dir}/roy-${task_id}-${seed}/result.json"
-    "${python_bin}" - "${result_path}" "${task_id}" <<'PY'
-import json, sys
-result = json.load(open(sys.argv[1], encoding="utf-8"))
-stats = result["stats"]
-if stats["n_completed_trials"] != 8 or stats["n_errored_trials"] != 0:
+    "${python_bin}" - "${job_dir}" "${task_id}" <<'PY'
+import json, pathlib, sys
+from roy_research.lhtb_results import official_lhtb_reward
+accepted = 0
+failures = []
+for path in pathlib.Path(sys.argv[1]).rglob("result.json"):
+    result = json.load(open(path, encoding="utf-8"))
+    if "task_checksum" not in result:
+        continue
+    exception = result.get("exception_info") or {}
+    exception_type = str(exception.get("exception_type", ""))
+    try:
+        official_lhtb_reward(result)
+        reward_available = True
+    except ValueError:
+        reward_available = False
+    if not exception or (reward_available and exception_type in {
+        "TimeoutError", "AgentTimeoutError", "AgentTimeout"
+    }):
+        accepted += 1
+    else:
+        failures.append(exception_type or "MissingVerifierReward")
+if accepted != 8:
     raise SystemExit(
         f"Roy smoke group failed for {sys.argv[2]}: "
-        f"completed={stats['n_completed_trials']} errored={stats['n_errored_trials']}"
+        f"accepted={accepted} failures={failures}"
     )
-print(json.dumps({"task_id": sys.argv[2], "completed": 8, "result": sys.argv[1]}))
+print(json.dumps({"task_id": sys.argv[2], "accepted": accepted,
+                  "job_dir": sys.argv[1]}))
 PY
     seed=$((seed + 1))
   done

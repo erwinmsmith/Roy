@@ -16,7 +16,8 @@ external_observations, and blind_spots. Requirements need id and description; cl
 assumptions need id and statement; evidence needs id and content; external observations need id
 and observation; blind spots are strings. Represent only entities explicit in the supplied event.
 Give every entity a deterministic stable ID derived from its source event ID and local index. Do
-not infer semantic relations and do not use benchmark answer keys or keyword fields."""
+not infer semantic relations and do not use benchmark answer keys or keyword fields. Be concise
+and represent each explicit fact only once."""
 
 VERIFIER_SYSTEM_PROMPT = """You are a frozen semantic relation verifier. Return one JSON object
 with exactly this schema: {"label":"unknown","probabilities":{"entail":0.0,
@@ -24,6 +25,8 @@ with exactly this schema: {"label":"unknown","probabilities":{"entail":0.0,
 must be numeric, use those three named object keys, and sum to 1. Judge meaning in context;
 surface word overlap is not evidence of entailment. Do not inspect benchmark answer keys,
 keyword fields, embedding similarity, or reward."""
+
+SEMANTIC_EVENT_TEXT_LIMIT = 24_000
 
 
 def canonical_fingerprint(value: Mapping[str, Any]) -> str:
@@ -87,7 +90,7 @@ class FrozenDeepSeekSemanticClient:
     """Two prompt channels over one frozen DeepSeek endpoint with full cache provenance."""
 
     def __init__(self, client: Any, cache_path: Path, model_revision: str,
-                 max_tokens: int = 4096, max_attempts: int = 3) -> None:
+                 max_tokens: int = 16_384, max_attempts: int = 3) -> None:
         self.client = client
         self.cache_path = cache_path
         self.model_revision = model_revision
@@ -105,8 +108,9 @@ class FrozenDeepSeekSemanticClient:
             raise ValueError(f"unknown semantic prompt {prompt_name}")
         system = EXTRACTOR_SYSTEM_PROMPT if prompt_name == "epistemic_extractor_v1" \
             else VERIFIER_SYSTEM_PROMPT
+        projected_payload = _semantic_payload_projection(payload)
         request = {"prompt": prompt_name, "model": self.client.model,
-                   "revision": self.model_revision, "payload": payload}
+                   "revision": self.model_revision, "payload": projected_payload}
         cache_key = hashlib.sha256(json.dumps(
             request, sort_keys=True, ensure_ascii=False
         ).encode("utf-8")).hexdigest()
@@ -114,23 +118,24 @@ class FrozenDeepSeekSemanticClient:
             return self.cache[cache_key]
         messages = [
             {"role": "system", "content": system},
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False,
+            {"role": "user", "content": json.dumps(projected_payload, ensure_ascii=False,
                                                      sort_keys=True)},
         ]
         response: Mapping[str, Any] | None = None
         last_error: Exception | None = None
-        prior_content: str | None = None
         for attempt in range(1, self.max_attempts + 1):
             completion = None
             try:
                 attempt_messages = list(messages)
-                if prior_content is not None:
-                    attempt_messages.extend([
-                        {"role": "assistant", "content": prior_content},
-                        {"role": "user", "content":
-                         "The preceding response failed the required JSON schema. Return only "
-                         "a corrected object in the exact schema from the system message."},
-                    ])
+                if attempt > 1:
+                    # Do not echo a potentially huge, truncated response back into the next
+                    # request. It caused recursive repetition and context growth in live G=8
+                    # runs. The original projected event plus a short correction is sufficient.
+                    attempt_messages.append({
+                        "role": "user", "content":
+                        "A prior independent attempt failed validation. Be concise and return "
+                        "only one complete object in the exact schema from the system message."
+                    })
                 completion = self.client.complete(
                     attempt_messages, max_tokens=self.max_tokens, temperature=0.0,
                     metadata={"semantic_operation": prompt_name, "cache_key": cache_key,
@@ -176,6 +181,29 @@ class FrozenDeepSeekSemanticClient:
                 "attempt": attempt, "response_content": content,
                 "error_type": type(error).__name__, "error": str(error),
             }, sort_keys=True, ensure_ascii=False) + "\n")
+
+
+def _semantic_payload_projection(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """Bound model input growth while leaving the immutable raw process event untouched."""
+    projected = json.loads(json.dumps(payload, ensure_ascii=False))
+    event = projected.get("event")
+    if not isinstance(event, dict):
+        return projected
+    for field_name in ("output", "stdout", "stderr"):
+        value = event.get(field_name)
+        if isinstance(value, str) and len(value) > SEMANTIC_EVENT_TEXT_LIMIT:
+            half = SEMANTIC_EVENT_TEXT_LIMIT // 2
+            event[field_name] = (
+                value[:half]
+                + f"\n...[semantic projection omitted {len(value) - 2 * half} characters]...\n"
+                + value[-half:]
+            )
+            event.setdefault("attributes", {})[f"{field_name}Projection"] = {
+                "originalCharacters": len(value),
+                "retainedCharacters": 2 * half,
+                "strategy": "head_tail",
+            }
+    return projected
 
 
 def _parse_json_object(content: str) -> Mapping[str, Any]:

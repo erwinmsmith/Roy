@@ -113,6 +113,41 @@ record remaining uncertainty instead of creating an endless verification loop.
 Propose only semantically useful actions. Do not expose hidden reasoning, benchmark grader data,
 keyword fields or reward. The preferred candidate is your best next organization decision.`;
 
+const PROPOSER_RECENT_EVENT_COUNT = 12;
+const PROPOSER_EVENT_TEXT_LIMIT = 12_000;
+
+function projectText(value: unknown): unknown {
+  if (typeof value !== 'string' || value.length <= PROPOSER_EVENT_TEXT_LIMIT) return value;
+  const half = PROPOSER_EVENT_TEXT_LIMIT / 2;
+  const omitted = value.length - (2 * half);
+  return `${value.slice(0, half)}\n...[proposer projection omitted ${omitted} characters]...\n${value.slice(-half)}`;
+}
+
+function proposerRequestState(snapshot: ReturnType<RoyLHTBSession['snapshot']>): Record<string, unknown> {
+  const latest = snapshot.processStates.at(-1);
+  const recentRuntimeEvents = (latest?.runtimeEvents ?? [])
+    .slice(-PROPOSER_RECENT_EVENT_COUNT)
+    .map(event => ({ ...event, output: projectText(event.output),
+      command: projectText(event.command) }));
+  return {
+    task: snapshot.instruction,
+    organizationMode: snapshot.organizationMode,
+    runtime: snapshot.runtime,
+    latestProcessState: latest ? {
+      sequence: latest.sequence, fingerprint: latest.fingerprint,
+      requirements: latest.requirements, claims: latest.claims,
+      assumptions: latest.assumptions, evidence: latest.evidence,
+      externalObservations: latest.externalObservations,
+      semanticRelations: latest.semanticRelations, blindSpots: latest.blindSpots,
+      dependencies: latest.dependencies, nodes: latest.nodes, dagEdges: latest.dagEdges,
+      activeSubtree: latest.activeSubtree, runtimeEvents: recentRuntimeEvents,
+      usage: latest.usage,
+    } : undefined,
+    projection: { recentRuntimeEventCount: PROPOSER_RECENT_EVENT_COUNT,
+      eventTextLimit: PROPOSER_EVENT_TEXT_LIMIT, immutableStatePreserved: true },
+  };
+}
+
 export class LHTBAutonomousController {
   private readonly provider: ControllerProvider;
   private readonly learnedPolicy?: PythonOrganizationPolicyClient;
@@ -156,12 +191,7 @@ export class LHTBAutonomousController {
     }
     const snapshot = session.snapshot();
     if (snapshot.runtime.stopped) return { status: 'completed', snapshot };
-    const requestState = {
-      task: snapshot.instruction,
-      organizationMode: snapshot.organizationMode,
-      runtime: snapshot.runtime,
-      recentProcessStates: snapshot.processStates.slice(-3),
-    };
+    const requestState = proposerRequestState(snapshot);
     const messages: LLMMessage[] = [
       { role: 'system', content: PROPOSER_PROMPT },
       { role: 'user', content: JSON.stringify(requestState) },
@@ -183,9 +213,9 @@ export class LHTBAutonomousController {
         error.completion.model);
         await this.auditProposalFailure(requestState, error, attempt);
         if (attempt === proposalAttempts) throw error;
-        messages.push(
-          { role: 'assistant', content: error.completion.content },
-          { role: 'user', content: 'The preceding response was malformed JSON. Return only one corrected JSON object in the exact candidate schema.' },
+        messages.splice(0, messages.length,
+          { role: 'system', content: PROPOSER_PROMPT },
+          { role: 'user', content: `${JSON.stringify(requestState)}\nA prior independent attempt was malformed. Return one concise, complete JSON object only.` }
         );
         continue;
       }
@@ -208,9 +238,9 @@ export class LHTBAutonomousController {
       if (attempt === proposalAttempts) {
         throw new Error(`DeepSeek proposer returned no legal candidates: ${reasons.join('; ')}`);
       }
-      messages.push(
-        { role: 'assistant', content: current.completion.content },
-        { role: 'user', content: `Every preceding candidate was rejected by the runtime: ${reasons.join('; ')}. Return a corrected set of genuinely legal candidates.` },
+      messages.splice(0, messages.length,
+        { role: 'system', content: PROPOSER_PROMPT },
+        { role: 'user', content: `${JSON.stringify(requestState)}\nA prior independent candidate set was rejected by the runtime: ${reasons.join('; ')}. Return a concise, genuinely legal candidate set.` }
       );
     }
     if (!completion || !validation) throw new Error('DeepSeek proposer did not return a completion');
