@@ -163,6 +163,99 @@
         "PYTHONUNBUFFERED": "1"
       }
     },
+    "dicom-radiology-audit": {
+      "copies": [{"source": "project", "target": "app"}],
+      "python_project": "project",
+      "python_dependencies": ["pytest==8.4.1", "uvicorn==0.35.0", "fastapi==0.115.14"],
+      "required_commands": ["bash", "git", "curl", "tmux", "asciinema"],
+      "working_directory": "/app",
+      "environment": {
+        "PATH": "/opt/roy-native/bin:/opt/roy-native/venv/bin:/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH": "/app:/app/src",
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
+    "epa-swmm-stormwater-regression-audit": {
+      "copies": [{"source": "project", "target": "app"}],
+      "python_project": "project",
+      "python_dependencies": ["pytest==8.4.1", "uvicorn==0.35.0", "fastapi==0.115.14"],
+      "required_commands": ["bash", "git", "curl", "tmux", "asciinema"],
+      "working_directory": "/app",
+      "environment": {
+        "PATH": "/opt/roy-native/bin:/opt/roy-native/venv/bin:/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH": "/app:/app/src",
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
+    "epidemic-inverse-control-audit": {
+      "copies": [{"source": "project", "target": "app"}],
+      "python_project": "project",
+      "python_dependencies": ["pytest==8.4.1", "uvicorn==0.35.0", "fastapi==0.115.14"],
+      "required_commands": ["bash", "git", "curl", "tmux", "asciinema"],
+      "working_directory": "/app",
+      "environment": {
+        "PATH": "/opt/roy-native/bin:/opt/roy-native/venv/bin:/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH": "/app:/app/src",
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
+    "nrel-pysam-hybrid-renewables-audit": {
+      "copies": [{"source": "project", "target": "app"}],
+      "python_project": "project",
+      "python_dependencies": ["pytest==8.4.1", "uvicorn==0.35.0", "fastapi==0.115.14"],
+      "required_commands": ["bash", "git", "curl", "tmux", "asciinema"],
+      "working_directory": "/app",
+      "environment": {
+        "PATH": "/opt/roy-native/bin:/opt/roy-native/venv/bin:/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH": "/app:/app/src",
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
+    "robotics-slam-benchmark-repair": {
+      "copies": [{"source": "project", "target": "app"}],
+      "python_project": "project",
+      "python_dependencies": ["pytest==8.4.1", "numpy==2.2.6", "pandas==2.2.3"],
+      "required_commands": ["bash", "git", "curl", "tmux", "asciinema"],
+      "working_directory": "/app",
+      "environment": {
+        "PATH": "/opt/roy-native/bin:/opt/roy-native/venv/bin:/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH": "/app/src"
+      }
+    },
+    "spice-ephemeris-regression": {
+      "copies": [{"source": "project", "target": "app"}],
+      "python_project": "project",
+      "python_dependencies": ["pytest==8.4.1"],
+      "required_commands": ["bash", "tmux", "asciinema"],
+      "working_directory": "/app",
+      "environment": {
+        "PATH": "/opt/roy-native/bin:/opt/roy-native/venv/bin:/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH": "/app:/app/src"
+      }
+    },
+    "su2-airfoil-regression": {
+      "copies": [{"source": "project", "target": "app"}],
+      "python_project": "project",
+      "python_dependencies": ["pytest==8.4.1", "pandas==2.2.3", "PyYAML==6.0.2"],
+      "required_commands": ["bash", "tmux", "asciinema"],
+      "working_directory": "/app",
+      "environment": {
+        "PATH": "/opt/roy-native/bin:/opt/roy-native/venv/bin:/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH": "/app:/app/src"
+      }
+    },
+    "unison-paper-reproduction": {
+      "copies": [{"source": "project", "target": "app"}],
+      "python_project": "project",
+      "python_dependencies": ["pytest==8.4.1", "fastapi", "uvicorn"],
+      "required_commands": ["bash", "git", "curl", "tmux", "asciinema"],
+      "working_directory": "/app",
+      "environment": {
+        "PATH": "/opt/roy-native/bin:/opt/roy-native/venv/bin:/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH": "/app:/app/src",
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
     "opensees-seismic-structural-regression-audit": {
       "copies": [
         {"source": "project", "target": "app"}
