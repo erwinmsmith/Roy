@@ -1,6 +1,67 @@
 {
   "schema_version": 1,
   "tasks": {
+    "alp-paper-reproduction": {
+      "copies": [{"source": "project", "target": "app"}],
+      "python_project": "project",
+      "python_dependencies": ["pytest==8.4.1", "fastapi", "uvicorn"],
+      "required_commands": ["bash", "git", "curl", "tmux", "asciinema"],
+      "working_directory": "/app",
+      "environment": {
+        "PATH": "/opt/roy-native/bin:/opt/roy-native/venv/bin:/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH": "/app:/app/src",
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
+    "audio-visual-event-alignment": {
+      "copies": [{"source": "project", "target": "app"}],
+      "python_project": "project",
+      "python_dependencies": ["numpy==2.2.6", "scipy==1.15.3", "opencv-python-headless==4.12.0.88", "pytest==8.4.1", "uvicorn==0.35.0", "fastapi==0.115.14"],
+      "required_commands": ["bash", "git", "curl", "tmux", "asciinema", "ffmpeg", "patch"],
+      "build_commands": ["PYTHONPATH=app/src venv/bin/python app/scripts/generate_public_assets.py"],
+      "working_directory": "/app",
+      "environment": {
+        "PATH": "/opt/roy-native/bin:/opt/roy-native/venv/bin:/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH": "/app/src",
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
+    "climate-netcdf-extreme-event-audit": {
+      "copies": [{"source": "project", "target": "app"}],
+      "python_project": "project",
+      "python_dependencies": ["pytest==8.4.1", "numpy==2.2.6", "pandas==2.2.3"],
+      "required_commands": ["bash", "git", "curl", "tmux", "asciinema"],
+      "working_directory": "/app",
+      "environment": {
+        "PATH": "/opt/roy-native/bin:/opt/roy-native/venv/bin:/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH": "/app/src"
+      }
+    },
+    "document-table-layout-reconstruction": {
+      "copies": [{"source": "project", "target": "app"}],
+      "python_project": "project",
+      "python_dependencies": ["numpy==2.2.6", "opencv-python-headless==4.12.0.88"],
+      "required_commands": ["bash", "git", "curl", "tmux", "asciinema", "patch"],
+      "build_commands": ["PYTHONPATH=app/src venv/bin/python app/scripts/generate_public_assets.py"],
+      "working_directory": "/app",
+      "environment": {
+        "PATH": "/opt/roy-native/bin:/opt/roy-native/venv/bin:/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH": "/app/src",
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
+    "foldseek-paper-reproduction": {
+      "copies": [{"source": "project", "target": "app"}],
+      "python_project": "project",
+      "python_dependencies": ["pytest==8.4.1"],
+      "required_commands": ["bash", "git", "curl", "tmux", "asciinema"],
+      "working_directory": "/app",
+      "environment": {
+        "PATH": "/opt/roy-native/bin:/opt/roy-native/venv/bin:/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH": "/app:/app/src",
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
     "great-expectations-audit": {
       "copies": [
         {"source": "project", "target": "app"}
@@ -17,6 +78,42 @@
       "wrappers": [
         {"name": "dq-audit", "content": "#!/bin/sh\nexec python -m dq_audit.cli \"$@\"\n"}
       ]
+    },
+    "materials-phase-diagram-audit": {
+      "copies": [{"source": "project", "target": "app"}],
+      "python_project": "project",
+      "python_dependencies": ["pytest==8.4.1", "numpy==2.2.6", "pandas==2.2.3"],
+      "required_commands": ["bash", "git", "curl", "tmux", "asciinema"],
+      "working_directory": "/app",
+      "environment": {
+        "PATH": "/opt/roy-native/bin:/opt/roy-native/venv/bin:/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH": "/app/src",
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
+    "matpower-opf-regression": {
+      "copies": [{"source": "project", "target": "app"}],
+      "python_project": "project",
+      "python_dependencies": ["pytest==8.4.1"],
+      "required_commands": ["bash", "tmux", "asciinema"],
+      "working_directory": "/app",
+      "environment": {
+        "PATH": "/opt/roy-native/bin:/opt/roy-native/venv/bin:/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH": "/app:/app/src"
+      }
+    },
+    "microscopy-cell-count-qc-audit": {
+      "copies": [{"source": "project", "target": "app"}],
+      "python_project": "project",
+      "python_dependencies": ["numpy", "opencv-python-headless"],
+      "required_commands": ["bash", "git", "curl", "tmux", "asciinema", "patch"],
+      "build_commands": ["PYTHONPATH=app/src venv/bin/python app/scripts/generate_public_assets.py"],
+      "working_directory": "/app",
+      "environment": {
+        "PATH": "/opt/roy-native/bin:/opt/roy-native/venv/bin:/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH": "/app/src",
+        "PYTHONUNBUFFERED": "1"
+      }
     },
     "poc-exploit-craft": {
       "copies": [
@@ -36,6 +133,32 @@
       "wrappers": [
         {"name": "try_poc", "content": "#!/bin/sh\nexec python3 /app/harness/try_poc_cli.py \"$@\"\n"}
       ]
+    },
+    "satellite-flood-change-detection-audit": {
+      "copies": [{"source": "project", "target": "app"}],
+      "python_project": "project",
+      "python_dependencies": ["numpy==2.2.6", "opencv-python-headless==4.12.0.88", "pytest==8.4.1", "uvicorn==0.35.0", "fastapi==0.115.14"],
+      "required_commands": ["bash", "git", "curl", "tmux", "asciinema", "patch"],
+      "build_commands": ["PYTHONPATH=app/src venv/bin/python app/scripts/generate_public_assets.py"],
+      "working_directory": "/app",
+      "environment": {
+        "PATH": "/opt/roy-native/bin:/opt/roy-native/venv/bin:/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH": "/app/src",
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
+    "scientific-figure-data-reconstruction": {
+      "copies": [{"source": "project", "target": "app"}],
+      "python_project": "project",
+      "python_dependencies": ["numpy==2.2.6", "opencv-python-headless==4.12.0.88", "pytest==8.4.1"],
+      "required_commands": ["bash", "git", "curl", "tmux", "asciinema", "patch"],
+      "build_commands": ["PYTHONPATH=app/src venv/bin/python app/scripts/generate_public_assets.py"],
+      "working_directory": "/app",
+      "environment": {
+        "PATH": "/opt/roy-native/bin:/opt/roy-native/venv/bin:/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH": "/app/src",
+        "PYTHONUNBUFFERED": "1"
+      }
     },
     "opensees-seismic-structural-regression-audit": {
       "copies": [
