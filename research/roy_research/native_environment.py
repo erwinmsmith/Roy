@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import os
 import shlex
@@ -18,6 +17,7 @@ from .lhtb_native import (
     NATIVE_BACKEND_ID,
     load_task_native_manifest,
     native_preflight,
+    native_session_uids,
     normalize_native_task_id,
     tree_digest,
 )
@@ -106,9 +106,12 @@ class NativeProcessEnvironment(BaseEnvironment):
 
     @property
     def _uid(self) -> int:
-        value = int(hashlib.sha256(self.session_id.encode("utf-8")).hexdigest()[:8], 16)
-        value %= self.uid_slots
-        return self.uid_base + value
+        return native_session_uids(self.session_id, self.uid_base, self.uid_slots)[0]
+
+    @property
+    def _service_uid(self) -> int:
+        """A distinct kernel UID for hidden task services and official verification."""
+        return native_session_uids(self.session_id, self.uid_base, self.uid_slots)[1]
 
     async def start(self, force_build: bool) -> None:
         if force_build:
@@ -141,6 +144,7 @@ class NativeProcessEnvironment(BaseEnvironment):
         if (template / "bin").exists():
             (self.session_root / "opt" / "roy-native" / "bin").mkdir(parents=True)
         await asyncio.to_thread(self._chown_session)
+        await asyncio.to_thread(self._apply_path_permissions)
         audit = {
             "schema_version": 1,
             "backend": NATIVE_BACKEND_ID,
@@ -149,6 +153,7 @@ class NativeProcessEnvironment(BaseEnvironment):
             "task_digest": task_digest,
             "session_id": self.session_id,
             "uid": self._uid,
+            "service_uid": self._service_uid,
             "gid": self.task_gid,
             "network_isolation": False,
             "pid_namespace": False,
@@ -166,6 +171,37 @@ class NativeProcessEnvironment(BaseEnvironment):
                 os.chown(Path(root) / name, self._uid, self.task_gid)
             for name in files:
                 os.chown(Path(root) / name, self._uid, self.task_gid)
+        # The Agent owns the trial root; the shared task GID gives the distinct
+        # service/verifier UID traverse-only access to its protected descendants.
+        self.session_root.chmod(0o710)
+
+    def _apply_path_permissions(self) -> None:
+        for value in (self._manifest or {}).get("path_permissions", []):
+            if not isinstance(value, Mapping):
+                raise ValueError("native path permission must be an object")
+            virtual_path = str(value.get("path") or "")
+            target = self._mounted_path(virtual_path)
+            if not target.exists():
+                raise FileNotFoundError(
+                    f"native protected path does not exist: {virtual_path}"
+                )
+            owner = str(value.get("owner", "service"))
+            if owner not in ("agent", "service"):
+                raise ValueError(f"unsupported native path owner: {owner}")
+            uid = self._service_uid if owner == "service" else self._uid
+            recursive = bool(value.get("recursive", True))
+            os.chown(target, uid, self.task_gid)
+            if recursive and target.is_dir():
+                for root, dirs, files in os.walk(target):
+                    os.chown(root, uid, self.task_gid)
+                    for name in dirs:
+                        os.chown(Path(root) / name, uid, self.task_gid)
+                    for name in files:
+                        os.chown(Path(root) / name, uid, self.task_gid)
+            mode = value.get("mode")
+            if mode is not None:
+                parsed = int(str(mode), 8) if isinstance(mode, str) else int(mode)
+                os.chmod(target, parsed)
 
     async def stop(self, delete: bool) -> None:
         for process_group in tuple(self._process_groups):
@@ -180,8 +216,29 @@ class NativeProcessEnvironment(BaseEnvironment):
             except ProcessLookupError:
                 pass
         self._process_groups.clear()
+        # Daemon-style task CLIs can detach from the command process group. Each
+        # trial has dedicated real UIDs, so clean every remaining process owned by
+        # either identity before deleting its filesystem.
+        await asyncio.to_thread(self._kill_uid_processes, signal.SIGTERM)
+        await asyncio.sleep(0.2)
+        await asyncio.to_thread(self._kill_uid_processes, signal.SIGKILL)
         if delete and self.session_root is not None:
             await asyncio.to_thread(shutil.rmtree, self.session_root, True)
+
+    def _kill_uid_processes(self, requested_signal: signal.Signals) -> None:
+        own_pid = os.getpid()
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit() or int(entry.name) == own_pid:
+                continue
+            try:
+                status = (entry / "status").read_text(encoding="utf-8")
+                uid_line = next(line for line in status.splitlines() if line.startswith("Uid:"))
+                effective_uid = int(uid_line.split()[2])
+                if effective_uid in (self._uid, self._service_uid):
+                    os.kill(int(entry.name), requested_signal)
+            except (FileNotFoundError, ProcessLookupError, PermissionError, StopIteration,
+                    ValueError):
+                continue
 
     def _mounted_path(self, path: str) -> Path:
         if not path.startswith("/"):
@@ -213,7 +270,9 @@ class NativeProcessEnvironment(BaseEnvironment):
         destination = self._mounted_path(target_path)
         destination.parent.mkdir(parents=True, exist_ok=True)
         await asyncio.to_thread(shutil.copy2, source_path, destination)
-        os.chown(destination, self._uid, self.task_gid)
+        hidden = target_path == "/tests" or target_path.startswith("/tests/") \
+            or target_path == "/solution" or target_path.startswith("/solution/")
+        os.chown(destination, self._service_uid if hidden else self._uid, self.task_gid)
 
     async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
         destination = self._mounted_path(target_dir)
@@ -222,15 +281,23 @@ class NativeProcessEnvironment(BaseEnvironment):
             shutil.copytree, source_dir, destination,
             dirs_exist_ok=True, symlinks=True,
         )
-        await asyncio.to_thread(self._chown_path, destination)
+        hidden = target_dir == "/tests" or target_dir.startswith("/tests/") \
+            or target_dir == "/solution" or target_dir.startswith("/solution/")
+        await asyncio.to_thread(
+            self._chown_path, destination,
+            self._service_uid if hidden else self._uid,
+        )
+        if hidden:
+            destination.chmod(0o700)
 
-    def _chown_path(self, path: Path) -> None:
-        os.chown(path, self._uid, self.task_gid)
+    def _chown_path(self, path: Path, uid: int | None = None) -> None:
+        owner = self._uid if uid is None else uid
+        os.chown(path, owner, self.task_gid)
         for root, dirs, files in os.walk(path):
             for name in dirs:
-                os.chown(Path(root) / name, self._uid, self.task_gid)
+                os.chown(Path(root) / name, owner, self.task_gid)
             for name in files:
-                os.chown(Path(root) / name, self._uid, self.task_gid)
+                os.chown(Path(root) / name, owner, self.task_gid)
 
     async def download_file(self, source_path: str, target_path: Path | str) -> None:
         source = self._mounted_path(source_path)
@@ -247,7 +314,8 @@ class NativeProcessEnvironment(BaseEnvironment):
             dirs_exist_ok=True, symlinks=True,
         )
 
-    def _command(self, command: str, cwd: str | None, env: Mapping[str, str]) -> list[str]:
+    def _command(self, command: str, cwd: str | None, env: Mapping[str, str],
+                 execution_uid: int | None = None) -> list[str]:
         assert self.session_root is not None
         template = self.template_root / self.native_task_id
         default_working_directory = str(
@@ -279,8 +347,9 @@ class NativeProcessEnvironment(BaseEnvironment):
             f"exec /bin/bash -lc {shlex.quote(command)}"
         )
         exported = [f"{key}={value}" for key, value in env.items()]
+        uid = self._uid if execution_uid is None else execution_uid
         return [
-            "setpriv", f"--reuid={self._uid}", f"--regid={self.task_gid}",
+            "setpriv", f"--reuid={uid}", f"--regid={self.task_gid}",
             "--clear-groups", "--no-new-privs", "env", "-i", *exported,
             *proot, "/bin/bash", "-c", shell,
         ]
@@ -295,7 +364,7 @@ class NativeProcessEnvironment(BaseEnvironment):
     ) -> ExecResult:
         if self.session_root is None or self._manifest is None:
             raise RuntimeError("native environment is not started")
-        if user not in (None, "root", "agent") and not isinstance(user, int):
+        if user not in (None, "root", "agent", "verifier") and not isinstance(user, int):
             raise ValueError(f"unsupported native environment user {user!r}")
         merged = {
             "HOME": "/root",
@@ -306,8 +375,9 @@ class NativeProcessEnvironment(BaseEnvironment):
             **(self._merge_env(env) or {}),
         }
         started = time.monotonic()
+        execution_uid = self._service_uid if user in ("root", "verifier", 0) else self._uid
         process = await asyncio.create_subprocess_exec(
-            *self._command(command, cwd, merged),
+            *self._command(command, cwd, merged, execution_uid),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,

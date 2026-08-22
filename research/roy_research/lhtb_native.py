@@ -23,6 +23,15 @@ NATIVE_SCHEMA_VERSION = 1
 NATIVE_BACKEND_ID = "lhtb-native-process-v1"
 
 
+def native_session_uids(session_id: str, uid_base: int, uid_slots: int) -> tuple[int, int]:
+    if uid_slots < 1:
+        raise ValueError("uid_slots must be positive")
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+    agent_uid = uid_base + (int(digest[:8], 16) % uid_slots)
+    service_uid = uid_base + uid_slots + (int(digest[8:16], 16) % uid_slots)
+    return agent_uid, service_uid
+
+
 def normalize_native_task_id(environment_name: str) -> str:
     task_id = environment_name.rstrip("/").rsplit("/", 1)[-1]
     if not task_id or task_id in (".", ".."):
@@ -311,6 +320,7 @@ def provision_native_task(
             **fingerprint_payload,
             "environment_digest": environment_digest,
             "environment": dict(spec.get("environment", {})),
+            "path_permissions": list(spec.get("path_permissions", [])),
             "working_directory": str(spec.get("working_directory", "/app")),
             "network_isolation": False,
             "official_leaderboard_comparable": False,

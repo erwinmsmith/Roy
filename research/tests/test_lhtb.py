@@ -45,6 +45,7 @@ from roy_research.lhtb_training import LHTBProcessGRPOTrainer
 from roy_research.lhtb_native import (
     audit_native_tasks,
     native_environment_digest,
+    native_session_uids,
     normalize_native_task_id,
     provision_native_task,
     tree_digest,
@@ -356,6 +357,10 @@ for line in sys.stdin:
                 "fixture": {
                     "copies": [{"source": "project", "target": "app"}],
                     "required_commands": ["bash"],
+                    "path_permissions": [{
+                        "path": "/app/input.txt", "owner": "service",
+                        "mode": "0400", "recursive": False,
+                    }],
                     "wrappers": [{"name": "fixture-tool", "content": "#!/bin/sh\nexit 0\n"}],
                 }
             }}))
@@ -363,6 +368,7 @@ for line in sys.stdin:
                 root / "LHTB", root / "templates", specs, "fixture"
             )
             self.assertTrue(str(result["environment_digest"]).startswith("sha256:"))
+            self.assertEqual(result["path_permissions"][0]["owner"], "service")
             self.assertEqual(
                 (root / "templates" / "fixture" / "app" / "input.txt").read_text(),
                 "fixture",
@@ -371,6 +377,12 @@ for line in sys.stdin:
                 (root / "templates" / "fixture" / "bin" / "fixture-tool").stat().st_mode
                 & 0o111
             )
+
+    def test_native_agent_and_service_use_disjoint_kernel_identities(self) -> None:
+        agent, service = native_session_uids("identity-test", 210_000, 20_000)
+        self.assertTrue(210_000 <= agent < 230_000)
+        self.assertTrue(230_000 <= service < 250_000)
+        self.assertNotEqual(agent, service)
 
     def test_dev_selection_and_test_report_follow_locked_rules(self) -> None:
         dev = []
