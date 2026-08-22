@@ -33,6 +33,7 @@ install_system_dependencies() {
   command -v cc >/dev/null || packages+=(build-essential)
   command -v cp >/dev/null || packages+=(coreutils)
   command -v curl >/dev/null || packages+=(ca-certificates curl)
+  command -v ffmpeg >/dev/null || packages+=(ffmpeg)
   command -v git >/dev/null || packages+=(git)
   command -v git-lfs >/dev/null || packages+=(git-lfs)
   command -v proot >/dev/null || packages+=(proot)
