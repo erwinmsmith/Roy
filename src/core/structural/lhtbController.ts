@@ -93,7 +93,7 @@ DERIVE must use an exact open requirement ID from organization.requirements and 
 When structuralExploration requests expansion and independent unresolved requirements exist,
 include up to three distinct legal DERIVE candidates, each using a different exact open gap ID.
 This is candidate coverage, not permission to invent work: never create a fake gap, duplicate an
-existing objective, or derive non-refining work. A requirement extracted from a child event belongs
+existing node ID or objective, reuse an assigned gap, or derive non-refining work. A requirement extracted from a child event belongs
 to that child unless its provenance explicitly identifies another active parent.
 CONNECT action is {"kind":"CONNECT","actorNodeId":"<actor>","connection":{"from":"<existing>",
 "to":"<different existing>","required":false}}. Once at least three nodes exist, include a novel
@@ -608,14 +608,14 @@ export class LHTBAutonomousController {
     const minimumNodes = Math.max(0, Number(
       process.env.ROY_LHTB_EXPLORATION_MIN_NODES ?? 0
     ));
-    if (minimumNodes <= 0 || snapshot.runtime.nodes.length >= minimumNodes) return [];
+    if (minimumNodes <= 0) return [];
     const active = new Set(snapshot.runtime.nodes.filter(node =>
       ['ready', 'running', 'waiting', 'completed'].includes(node.status)).map(node => node.id));
     const openGapIds = new Set(snapshot.runtime.requirements.filter(requirement =>
       requirement.status === 'open' && active.has(requirement.parentNodeId)
     ).map(requirement => requirement.id));
-    const requiredDerives = Math.min(3, minimumNodes - snapshot.runtime.nodes.length,
-      openGapIds.size);
+    const requiredDerives = snapshot.runtime.nodes.length < minimumNodes
+      ? Math.min(3, minimumNodes - snapshot.runtime.nodes.length, openGapIds.size) : 0;
     const offeredGapIds = new Set(candidates.filter(candidate => candidate.kind === 'DERIVE')
       .map(candidate => candidate.action.childSpecification?.triggeringGapId)
       .filter((gapId): gapId is string => typeof gapId === 'string'
@@ -624,7 +624,8 @@ export class LHTBAutonomousController {
     if (offeredGapIds.size < requiredDerives) {
       deficits.push(`missing_real_gap_derive_candidates:${offeredGapIds.size}/${requiredDerives}`);
     }
-    if (snapshot.runtime.nodes.length >= 3) {
+    if (snapshot.runtime.nodes.length >= minimumNodes
+      && snapshot.runtime.communicationEdges.every(edge => !edge.active)) {
       const activeIds = [...active];
       const existing = new Set(snapshot.runtime.communicationEdges.filter(edge => edge.active)
         .map(edge => `${edge.from}\u0000${edge.to}`));
