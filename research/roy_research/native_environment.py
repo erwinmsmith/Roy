@@ -167,10 +167,15 @@ class NativeProcessEnvironment(BaseEnvironment):
         assert self.session_root is not None
         for root, dirs, files in os.walk(self.session_root):
             os.chown(root, self._uid, self.task_gid)
+            os.chmod(root, os.stat(root).st_mode | 0o070)
             for name in dirs:
-                os.chown(Path(root) / name, self._uid, self.task_gid)
+                path = Path(root) / name
+                os.chown(path, self._uid, self.task_gid)
+                os.chmod(path, path.stat().st_mode | 0o070)
             for name in files:
-                os.chown(Path(root) / name, self._uid, self.task_gid)
+                path = Path(root) / name
+                os.chown(path, self._uid, self.task_gid)
+                os.chmod(path, path.stat().st_mode | 0o060)
         # The Agent owns the trial root; the shared task GID gives the distinct
         # service/verifier UID traverse-only access to its protected descendants.
         self.session_root.chmod(0o710)
@@ -194,10 +199,18 @@ class NativeProcessEnvironment(BaseEnvironment):
             if recursive and target.is_dir():
                 for root, dirs, files in os.walk(target):
                     os.chown(root, uid, self.task_gid)
+                    if owner == "service":
+                        os.chmod(root, os.stat(root).st_mode & ~0o022)
                     for name in dirs:
-                        os.chown(Path(root) / name, uid, self.task_gid)
+                        path = Path(root) / name
+                        os.chown(path, uid, self.task_gid)
+                        if owner == "service":
+                            os.chmod(path, path.stat().st_mode & ~0o022)
                     for name in files:
-                        os.chown(Path(root) / name, uid, self.task_gid)
+                        path = Path(root) / name
+                        os.chown(path, uid, self.task_gid)
+                        if owner == "service":
+                            os.chmod(path, path.stat().st_mode & ~0o022)
             mode = value.get("mode")
             if mode is not None:
                 parsed = int(str(mode), 8) if isinstance(mode, str) else int(mode)

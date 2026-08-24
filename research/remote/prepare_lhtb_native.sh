@@ -171,6 +171,7 @@ value = {
     "agents": [{"name": "oracle"}],
     "datasets": [{"path": "./tasks", "task_names": ["great-expectations-audit"]}],
 }
+
 open(sys.argv[1], "w", encoding="utf-8").write(json.dumps(value, indent=2) + "\n")
 PY
   export PYTHONPATH="${roy_root}/research${PYTHONPATH:+:${PYTHONPATH}}"
@@ -193,6 +194,82 @@ if (stats["n_completed_trials"] != 1 or stats["n_errored_trials"] != 0
 print(json.dumps({"oracle_smoke": "passed", "mean": mean_reward,
                   "result": sys.argv[1]}))
 PY
+}
+
+oracle_suite() {
+  local run_id config jobs_root job_name suite_audit
+  run_id="$(date -u +%Y%m%dT%H%M%SZ)"
+  config="${roy_root}/research/output/lhtb/native/configs/oracle-suite-${run_id}.json"
+  jobs_root="${roy_root}/research/output/lhtb/native/oracle-jobs"
+  job_name="roy-native-oracle-suite-${run_id}"
+  suite_audit="${roy_root}/research/output/lhtb/native/oracle-suite-audit-${run_id}.json"
+  mkdir -p "$(dirname "${config}")" "${jobs_root}"
+  PYTHONPATH="${roy_root}/research" "${python_bin}" -m roy_research lhtb-native-audit \
+    --lhtb-root "${lhtb_root}" --manifest "${roy_root}/research/config/lhtb_split.json" \
+    --template-root "${template_root}" --output "${suite_audit}"
+  PYTHONPATH="${roy_root}/research" "${python_bin}" - \
+    "${config}" "${suite_audit}" "${template_root}" "${native_root}" \
+    "${jobs_root}" "${job_name}" <<'PY'
+import json, sys
+audit = json.load(open(sys.argv[2], encoding="utf-8"))
+tasks = [value["task_id"] for value in audit["tasks"]
+         if value["status"] == "compatible"]
+if not tasks:
+    raise SystemExit("oracle suite has no compatible native tasks")
+value = {
+    "job_name": sys.argv[6], "jobs_dir": sys.argv[5],
+    "n_attempts": 1, "n_concurrent_trials": min(4, len(tasks)),
+    "environment": {
+        "import_path": "roy_research.native_environment:NativeProcessEnvironment",
+        "force_build": False, "delete": True,
+        "kwargs": {"template_root": sys.argv[3], "runtime_root": sys.argv[4]},
+    },
+    "agents": [{"name": "oracle"}],
+    "datasets": [{"path": "./tasks", "task_names": tasks}],
+}
+open(sys.argv[1], "w", encoding="utf-8").write(json.dumps(value, indent=2) + "\n")
+print(json.dumps({"oracle_tasks": len(tasks), "task_ids": tasks}))
+PY
+  export PYTHONPATH="${roy_root}/research${PYTHONPATH:+:${PYTHONPATH}}"
+  export ROY_LHTB_NATIVE_ROOT="${native_root}"
+  export HB_CONTINUE_MODE=same_conversation
+  cd "${lhtb_root}"
+  "${harbor_bin}" run -c "${config}" --yes
+  cd "${roy_root}"
+  PYTHONPATH="${roy_root}/research" "${python_bin}" - \
+    "${jobs_root}/${job_name}" "${suite_audit}" <<'PY'
+import json, pathlib, sys
+from roy_research.lhtb_results import official_lhtb_reward
+root = pathlib.Path(sys.argv[1])
+audit = json.load(open(sys.argv[2], encoding="utf-8"))
+expected = {value["task_id"] for value in audit["tasks"]
+            if value["status"] == "compatible"}
+results = {}
+for path in root.rglob("result.json"):
+    value = json.load(open(path, encoding="utf-8"))
+    if "task_checksum" not in value:
+        continue
+    task_id = str(value.get("task_name"))
+    reward = official_lhtb_reward(value)
+    results[task_id] = {
+        "reward": reward,
+        "exception": (value.get("exception_info") or {}).get("exception_type"),
+        "result": str(path),
+    }
+missing = sorted(expected - set(results))
+failed = {task: value for task, value in results.items()
+          if value["exception"] is not None or value["reward"] < 0.95}
+summary = {"expected": len(expected), "completed": len(results),
+           "missing": missing, "failed": failed, "results": results}
+(root / "oracle-suite-validation.json").write_text(
+    json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+print(json.dumps({"expected": len(expected), "completed": len(results),
+                  "failed": sorted(failed), "missing": missing}))
+if missing or failed:
+    raise SystemExit("native oracle suite failed validation")
+PY
+  echo "Native oracle suite saved at ${jobs_root}/${job_name}"
 }
 
 roy_smoke() {
@@ -278,8 +355,9 @@ case "${mode}" in
   prepare) install_system_dependencies; install_node_22; check_environment; prepare_checkout ;;
   provision) install_node_22; check_environment; prepare_checkout; provision_smoke_tasks ;;
   oracle-smoke) install_node_22; check_environment; prepare_checkout; provision_smoke_tasks; oracle_smoke ;;
+  oracle-suite) install_node_22; check_environment; prepare_checkout; oracle_suite ;;
   roy-smoke) install_node_22; check_environment; prepare_checkout; provision_smoke_tasks; roy_smoke ;;
-  *) echo "usage: $0 [check|prepare|provision|oracle-smoke|roy-smoke]" >&2; exit 2 ;;
+  *) echo "usage: $0 [check|prepare|provision|oracle-smoke|oracle-suite|roy-smoke]" >&2; exit 2 ;;
 esac
 
 echo "LHTB-native ${mode} completed; results are not official leaderboard comparable"
