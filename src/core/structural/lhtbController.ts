@@ -292,8 +292,12 @@ export class LHTBAutonomousController {
   async advance(session: RoyLHTBSession, seed: number): Promise<ControllerResult> {
     for (const event of session.unprocessedSemanticEvents()) {
       const latest = session.snapshot().processStates.at(-1);
+      const existingRequirements = (latest?.requirements ?? [])
+        .filter(value => event.kind !== 'task_instruction'
+          || value.id !== 'root-task-requirement')
+        .slice(-SEMANTIC_RECALL_ENTITY_COUNT);
       const update = await this.semantic.processEvent(event, {
-        requirements: (latest?.requirements ?? []).slice(-SEMANTIC_RECALL_ENTITY_COUNT),
+        requirements: existingRequirements,
         claims: (latest?.claims ?? []).slice(-SEMANTIC_RECALL_ENTITY_COUNT),
         assumptions: (latest?.assumptions ?? []).slice(-SEMANTIC_RECALL_ENTITY_COUNT),
         evidence: (latest?.evidence ?? []).slice(-SEMANTIC_RECALL_ENTITY_COUNT),

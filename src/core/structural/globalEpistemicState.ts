@@ -18,7 +18,7 @@ export interface SemanticRelation {
 
 export interface RuntimeProcessEvent {
   id: string;
-  kind: 'organization_action' | 'terminal_command' | 'terminal_result' | 'file_change'
+  kind: 'task_instruction' | 'organization_action' | 'terminal_command' | 'terminal_result' | 'file_change'
     | 'failure' | 'usage' | 'verifier';
   at: number;
   nodeId?: string;

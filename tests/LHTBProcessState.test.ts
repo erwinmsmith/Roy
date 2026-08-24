@@ -92,10 +92,28 @@ describe('LHTB process state', () => {
     const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false });
     const result = await controller.advance(session, 1);
     expect(result.status).toBe('completed');
-    expect(semanticCalls).toBe(1);
-    expect(session.snapshot().processStates.at(-1)?.claims.length).toBe(1);
-    expect(session.snapshot().processedSemanticEventIds).toHaveLength(2);
+    expect(semanticCalls).toBe(2);
+    expect(session.snapshot().processStates.at(-1)?.claims.length).toBe(2);
+    expect(session.snapshot().processedSemanticEventIds).toHaveLength(3);
     controller.close();
+  });
+
+  it('replaces the aggregate root gap with explicit task requirements', () => {
+    const session = new RoyLHTBSession('task-decomposition', 'task',
+      'produce an audit and a reconciliation report', 'commit');
+    session.applySemanticUpdate({ event_id: 'task-instruction', requirements: [{
+      id: 'audit-output', description: 'produce the requested audit',
+      requiredInformation: 'verified audit artifact', likelyMechanism: 'conversion',
+    }, {
+      id: 'reconciliation-output', description: 'produce the reconciliation report',
+      requiredInformation: 'verified reconciliation artifact', likelyMechanism: 'conversion',
+    }], claims: [], assumptions: [], evidence: [], external_observations: [], blind_spots: [],
+    relations: [] });
+    const requirements = session.snapshot().runtime.requirements;
+    expect(requirements.find(value => value.id === 'root-task-requirement')?.status)
+      .toBe('rejected');
+    expect(requirements.filter(value => value.status === 'open').map(value => value.id))
+      .toEqual(['audit-output', 'reconciliation-output']);
   });
 
   it('accepts a terminal acquisition candidate whose command is stored outside action', async () => {

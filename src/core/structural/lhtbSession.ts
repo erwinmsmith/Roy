@@ -77,6 +77,9 @@ export class RoyLHTBSession {
       likelyMechanism: 'mixed', requiredInformation: 'A verified task completion result.',
       status: 'open', parentNodeId: 'root',
     });
+    this.events.push({ id: 'task-instruction', kind: 'task_instruction', at: Date.now(),
+      nodeId: 'root', output: instruction,
+      attributes: { source: 'benchmark_instruction', semanticallyExtractable: true } });
     this.recordState();
   }
 
@@ -131,7 +134,9 @@ export class RoyLHTBSession {
     const semanticEvents: RuntimeProcessEvent[] = [];
     for (const event of this.events) {
       if (this.processedSemanticEventIds.has(event.id)) continue;
-      if (event.kind === 'terminal_result') semanticEvents.push(event);
+      if (event.kind === 'task_instruction' || event.kind === 'terminal_result') {
+        semanticEvents.push(event);
+      }
       else this.processedSemanticEventIds.add(event.id);
     }
     return structuredClone(semanticEvents);
@@ -142,8 +147,8 @@ export class RoyLHTBSession {
       throw new Error(`Semantic event ${update.event_id} was already processed`);
     }
     this.processedSemanticEventIds.add(update.event_id);
-    const sourceNodeId = this.events.find(event => event.id === update.event_id)?.nodeId
-      ?? this.runtime.snapshot().rootId;
+    const sourceEvent = this.events.find(event => event.id === update.event_id);
+    const sourceNodeId = sourceEvent?.nodeId ?? this.runtime.snapshot().rootId;
     for (const value of update.requirements) this.runtime.ingestRequirement({
       id: String(value.id), description: String(value.description ?? ''),
       whyItMatters: String(value.whyItMatters ?? value.why_it_matters ?? ''),
@@ -156,6 +161,9 @@ export class RoyLHTBSession {
         value.parentNodeId ?? value.parent_node_id ?? sourceNodeId
       ),
     });
+    if (sourceEvent?.kind === 'task_instruction' && update.requirements.length > 0) {
+      this.runtime.supersedeRequirement('root-task-requirement');
+    }
     for (const value of update.claims) this.semanticClaims.push({
       id: String(value.id), statement: String(value.statement),
       status: ['supported', 'rejected'].includes(String(value.status))

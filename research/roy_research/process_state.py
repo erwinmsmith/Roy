@@ -15,6 +15,8 @@ It must contain exactly these six array fields: requirements, claims, assumption
 external_observations, and blind_spots. Requirements need id and description; claims and
 assumptions need id and statement; evidence needs id and content; external observations need id
 and observation; blind spots are strings. Represent only entities explicit in the supplied event.
+For a task_instruction event, split explicitly requested, independently verifiable deliverables and
+constraints into separate atomic requirements; do not infer work that the instruction does not state.
 Give every entity a deterministic stable ID derived from its source event ID and local index. Do
 not infer semantic relations and do not use benchmark answer keys or keyword fields. Be concise
 and represent each explicit fact only once."""
