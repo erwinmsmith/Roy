@@ -143,6 +143,9 @@ check_environment() {
 }
 
 prepare_checkout() {
+  mkdir -p "${roy_root}/research/.runtime"
+  exec 8>"${roy_root}/research/.runtime/.prepare-checkout.lock"
+  flock 8
   if [[ ! -d "${lhtb_root}/.git" ]]; then
     mkdir -p "$(dirname "${lhtb_root}")"
     git clone https://github.com/zli12321/LHTB.git "${lhtb_root}"
@@ -182,6 +185,7 @@ PY
   PYTHONPATH="${roy_root}/research" "${python_bin}" -m roy_research lhtb-native-preflight \
     --runtime-root "${native_root}" \
     --output "${roy_root}/research/output/lhtb/native/preflight.json"
+  flock -u 8
 }
 
 provision_smoke_tasks() {
