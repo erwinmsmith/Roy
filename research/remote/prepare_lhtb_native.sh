@@ -179,6 +179,25 @@ provision_smoke_tasks() {
     --allow-network-degraded
 }
 
+provision_reviewed_tasks() {
+  local task_id
+  while IFS= read -r task_id; do
+    PYTHONPATH="${roy_root}/research" "${python_bin}" -m roy_research lhtb-native-provision \
+      --lhtb-root "${lhtb_root}" --template-root "${template_root}" \
+      --specs "${roy_root}/research/config/lhtb_native_provisioning.json" \
+      --task-id "${task_id}" --python "${native_task_python}"
+  done < <("${python_bin}" - "${roy_root}/research/config/lhtb_native_provisioning.json" <<'PY'
+import json, sys
+for task_id in sorted(json.load(open(sys.argv[1], encoding="utf-8"))["tasks"]):
+    print(task_id)
+PY
+)
+  PYTHONPATH="${roy_root}/research" "${python_bin}" -m roy_research lhtb-native-audit \
+    --lhtb-root "${lhtb_root}" --manifest "${roy_root}/research/config/lhtb_split.json" \
+    --template-root "${template_root}" --output "${audit_path}" \
+    --allow-network-degraded
+}
+
 oracle_smoke() {
   local config="${roy_root}/research/output/lhtb/native/oracle-smoke.json"
   local jobs_root="${roy_root}/research/output/lhtb/native/oracle-jobs"
@@ -243,6 +262,10 @@ PY
 
 oracle_suite() {
   local run_id config jobs_root job_name suite_audit overlay_root
+  local -a audit_network_args=()
+  if [[ "${ROY_LHTB_ALLOW_NETWORK_DEGRADED:-false}" == "true" ]]; then
+    audit_network_args+=(--allow-network-degraded)
+  fi
   run_id="$(date -u +%Y%m%dT%H%M%SZ)"
   config="${roy_root}/research/output/lhtb/native/configs/oracle-suite-${run_id}.json"
   jobs_root="${roy_root}/research/output/lhtb/native/oracle-jobs"
@@ -252,14 +275,17 @@ oracle_suite() {
   mkdir -p "$(dirname "${config}")" "${jobs_root}"
   PYTHONPATH="${roy_root}/research" "${python_bin}" -m roy_research lhtb-native-audit \
     --lhtb-root "${lhtb_root}" --manifest "${roy_root}/research/config/lhtb_split.json" \
-    --template-root "${template_root}" --output "${suite_audit}"
+    --template-root "${template_root}" --output "${suite_audit}" \
+    "${audit_network_args[@]}"
   PYTHONPATH="${roy_root}/research" "${python_bin}" - \
     "${config}" "${suite_audit}" "${template_root}" "${native_root}" \
     "${jobs_root}" "${job_name}" "${overlay_root}" "${lhtb_root}" <<'PY'
 import json, os, pathlib, sys
 audit = json.load(open(sys.argv[2], encoding="utf-8"))
+allow_degraded = os.environ.get("ROY_LHTB_ALLOW_NETWORK_DEGRADED", "false") == "true"
+accepted_statuses = {"compatible", "degraded"} if allow_degraded else {"compatible"}
 tasks = [value["task_id"] for value in audit["tasks"]
-         if value["status"] == "compatible"]
+         if value["status"] in accepted_statuses]
 requested = [value.strip() for value in
              os.environ.get("ROY_LHTB_ORACLE_TASKS", "").split(",") if value.strip()]
 if requested:
@@ -282,8 +308,8 @@ for task_id in tasks:
                 entry.resolve(), target_is_directory=entry.is_dir()
             )
     text = (source / "task.toml").read_text(encoding="utf-8")
-    if text.count(needle) != 1:
-        raise SystemExit(f"oracle overlay expected one {needle!r} in {task_id}")
+    if text.count(needle) > 1:
+        raise SystemExit(f"oracle overlay found repeated {needle!r} in {task_id}")
     (target / "task.toml").write_text(
         text.replace(needle, "continue_until_timeout = false"), encoding="utf-8"
     )
@@ -296,7 +322,8 @@ value = {
     "environment": {
         "import_path": "roy_research.native_environment:NativeProcessEnvironment",
         "force_build": False, "delete": True,
-        "kwargs": {"template_root": sys.argv[3], "runtime_root": sys.argv[4]},
+        "kwargs": {"template_root": sys.argv[3], "runtime_root": sys.argv[4],
+                   "allow_network_degraded": allow_degraded},
     },
     "agents": [{"name": "oracle"}],
     "datasets": [{"path": sys.argv[7], "task_names": tasks}],
@@ -432,7 +459,7 @@ PY
 case "${mode}" in
   check) export PATH="${node_runtime}/bin:${proot_runtime}/bin:${PATH}"; check_environment ;;
   prepare) install_system_dependencies; install_node_22; install_proot_runtime; check_environment; prepare_checkout ;;
-  provision) install_node_22; install_proot_runtime; check_environment; prepare_checkout; provision_smoke_tasks ;;
+  provision) install_node_22; install_proot_runtime; check_environment; prepare_checkout; provision_reviewed_tasks ;;
   oracle-smoke) install_node_22; install_proot_runtime; check_environment; prepare_checkout; provision_smoke_tasks; oracle_smoke ;;
   oracle-suite) install_node_22; install_proot_runtime; check_environment; prepare_checkout; oracle_suite ;;
   roy-smoke) install_node_22; install_proot_runtime; check_environment; prepare_checkout; provision_smoke_tasks; roy_smoke ;;

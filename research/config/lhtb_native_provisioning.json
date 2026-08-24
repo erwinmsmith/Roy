@@ -1,6 +1,23 @@
 {
   "schema_version": 1,
   "tasks": {
+    "2048": {
+      "copies": [{"source": "harness", "target": "opt/g2048"}],
+      "python_dependencies": ["numpy<2", "opencv-python-headless==4.10.0.84", "imageio==2.34.2", "pytest==8.4.1"],
+      "required_commands": ["bash", "git", "curl", "tmux", "asciinema"],
+      "build_commands": ["mkdir -p opt/g2048/runs && chmod 777 opt/g2048/runs"],
+      "working_directory": "/app",
+      "environment": {
+        "PATH": "/opt/roy-native/bin:/opt/roy-native/venv/bin:/usr/local/bin:/usr/bin:/bin",
+        "G2048_SOCKET": "/tmp/g2048.sock",
+        "G2048_RUN_DIR": "/opt/g2048/runs",
+        "G2048_SEED": "20240601",
+        "G2048_SIZE": "4"
+      },
+      "wrappers": [
+        {"name": "g2048", "content": "#!/bin/sh\nexec python /opt/g2048/game2048_cli.py \"$@\"\n"}
+      ]
+    },
     "alp-paper-reproduction": {
       "copies": [{"source": "project", "target": "app"}],
       "python_project": "project",
@@ -81,6 +98,19 @@
       "wrappers": [
         {"name": "dq-audit", "content": "#!/bin/sh\nexec python -m dq_audit.cli \"$@\"\n"}
       ]
+    },
+    "gdal-proj-raster-regression": {
+      "copies": [{"source": "project", "target": "app"}],
+      "python_project": "project",
+      "python_dependencies": ["pytest==8.4.1"],
+      "required_commands": ["bash", "tmux", "asciinema"],
+      "build_commands": ["rm -rf app/outputs"],
+      "working_directory": "/app",
+      "environment": {
+        "PATH": "/opt/roy-native/bin:/opt/roy-native/venv/bin:/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH": "/app/src",
+        "PYTHONUNBUFFERED": "1"
+      }
     },
     "materials-phase-diagram-audit": {
       "copies": [{"source": "project", "target": "app"}],
@@ -222,6 +252,65 @@
         "PYTHONPATH": "/app/src"
       }
     },
+    "rush_hour_campaign": {
+      "required_commands": ["bash", "python3", "tmux", "asciinema"],
+      "working_directory": "/app",
+      "environment": {
+        "PATH": "/opt/roy-native/bin:/usr/local/bin:/usr/bin:/bin",
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
+    "snake_maze_campaign": {
+      "copies": [{"source": "harness", "target": "opt/gsnake"}],
+      "python_dependencies": ["pytest==8.4.1"],
+      "required_commands": ["bash", "git", "curl", "tmux", "asciinema"],
+      "build_commands": ["mkdir -p opt/gsnake/runs && chmod 777 opt/gsnake/runs"],
+      "working_directory": "/app",
+      "environment": {
+        "PATH": "/opt/roy-native/bin:/opt/roy-native/venv/bin:/usr/local/bin:/usr/bin:/bin",
+        "GSNAKE_SOCKET": "/tmp/gsnake.sock",
+        "GSNAKE_RUN_DIR": "/opt/gsnake/runs",
+        "GSNAKE_SEED": "20260614",
+        "GSNAKE_HUNGER_LIMIT": "95",
+        "GSNAKE_MAX_MOVES_PER_CMD": "30"
+      },
+      "wrappers": [
+        {"name": "gsnake", "content": "#!/bin/sh\nexec python /opt/gsnake/snake_cli.py \"$@\"\n"}
+      ]
+    },
+    "sokoban": {
+      "copies": [{"source": "harness", "target": "opt/sokoban"}],
+      "python_dependencies": ["numpy<2", "opencv-python-headless==4.10.0.84", "imageio==2.34.2", "pytest==8.4.1"],
+      "required_commands": ["bash", "git", "curl", "tmux", "asciinema"],
+      "build_commands": ["mkdir -p opt/sokoban/runs && chmod 777 opt/sokoban/runs"],
+      "working_directory": "/app",
+      "environment": {
+        "PATH": "/opt/roy-native/bin:/opt/roy-native/venv/bin:/usr/local/bin:/usr/bin:/bin",
+        "SOKOBAN_SOCKET": "/tmp/sokoban.sock",
+        "SOKOBAN_RUN_DIR": "/opt/sokoban/runs",
+        "SOKOBAN_SURFACE_DIR": "/opt/sokoban/surface"
+      },
+      "wrappers": [
+        {"name": "sokoban", "content": "#!/bin/sh\nexec python /opt/sokoban/sokoban_cli.py \"$@\"\n"}
+      ]
+    },
+    "spot-scheduler-traces": {
+      "copies": [
+        {"source": "harness", "target": "app/harness"},
+        {"source": "workspace", "target": "app/workspace"}
+      ],
+      "python_dependencies": ["numpy"],
+      "required_commands": ["bash", "tmux", "asciinema"],
+      "build_commands": ["mkdir -p app/harness/traces app/output && venv/bin/python app/harness/trace_generator.py"],
+      "working_directory": "/app",
+      "environment": {
+        "PATH": "/opt/roy-native/bin:/opt/roy-native/venv/bin:/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH": "/app"
+      },
+      "wrappers": [
+        {"name": "simulate", "content": "#!/bin/sh\nexec python /app/harness/simulate_cli.py \"$@\"\n"}
+      ]
+    },
     "spice-ephemeris-regression": {
       "copies": [{"source": "project", "target": "app"}],
       "python_project": "project",
@@ -244,6 +333,26 @@
         "PYTHONPATH": "/app:/app/src"
       }
     },
+    "unknown-config-semantics": {
+      "copies": [{"source": "harness", "target": "opt/cfg"}],
+      "python_dependencies": ["pytest==8.4.1"],
+      "required_commands": ["bash", "git", "curl", "tmux", "asciinema"],
+      "build_commands": ["cp opt/cfg/engine.py opt/cfg/engine.orig.py && mkdir -p opt/cfg/runs/submissions && chmod -R 777 opt/cfg"],
+      "working_directory": "/app",
+      "environment": {
+        "PATH": "/opt/roy-native/bin:/opt/roy-native/venv/bin:/usr/local/bin:/usr/bin:/bin",
+        "CFG_SOCKET": "/tmp/cfg.sock",
+        "CFG_RUN_DIR": "/opt/cfg/runs",
+        "CFG_ENGINE": "/opt/cfg/engine.py",
+        "CFG_DATA": "/opt/cfg/cfgd_data.json",
+        "CFG_KEY_PATH": "/opt/cfg/runs/.key",
+        "CFG_NONCE_FILE": "/tmp/cfg.nonce",
+        "CFG_SPEC": "/opt/cfg/spec.md"
+      },
+      "wrappers": [
+        {"name": "cfg", "content": "#!/bin/sh\nexec python /opt/cfg/cfg_cli.py \"$@\"\n"}
+      ]
+    },
     "unison-paper-reproduction": {
       "copies": [{"source": "project", "target": "app"}],
       "python_project": "project",
@@ -255,6 +364,24 @@
         "PYTHONPATH": "/app:/app/src",
         "PYTHONUNBUFFERED": "1"
       }
+    },
+    "vector-db-iterative-build": {
+      "copies": [
+        {"source": "harness", "target": "app/harness"},
+        {"source": "workspace", "target": "app/workspace"}
+      ],
+      "python_dependencies": ["numpy==1.26.4", "flask==3.0.0", "fastapi==0.109.0", "uvicorn==0.27.0", "requests==2.31.0", "httpx==0.26.0", "gunicorn==21.2.0", "scipy==1.12.0"],
+      "required_commands": ["bash", "curl", "tmux", "asciinema", "pkill", "fuser"],
+      "build_commands": ["mkdir -p app/output"],
+      "working_directory": "/app",
+      "environment": {
+        "PATH": "/opt/roy-native/bin:/opt/roy-native/venv/bin:/app/harness:/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH": "/app",
+        "PYTHONUNBUFFERED": "1"
+      },
+      "wrappers": [
+        {"name": "vecdb", "content": "#!/bin/sh\nexec python /app/harness/vecdb_cli.py \"$@\"\n"}
+      ]
     },
     "opensees-seismic-structural-regression-audit": {
       "copies": [
