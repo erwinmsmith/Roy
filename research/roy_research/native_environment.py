@@ -359,7 +359,7 @@ class NativeProcessEnvironment(BaseEnvironment):
             protected_root = "/tests" if target_path.startswith("/tests") else "/solution"
             mounted_root = self._mounted_path(protected_root)
             os.chown(mounted_root, self._service_uid, self.task_gid)
-            mounted_root.chmod(0o700)
+            mounted_root.chmod(0o700 if protected_root == "/tests" else 0o750)
             self._protected_material_roots.add(protected_root)
 
     async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
@@ -376,8 +376,8 @@ class NativeProcessEnvironment(BaseEnvironment):
             self._service_uid if hidden else self._uid,
         )
         if hidden:
-            destination.chmod(0o700)
             protected_root = "/tests" if target_dir.startswith("/tests") else "/solution"
+            destination.chmod(0o700 if protected_root == "/tests" else 0o750)
             self._protected_material_roots.add(protected_root)
 
     async def reset_dirs(
@@ -450,7 +450,7 @@ class NativeProcessEnvironment(BaseEnvironment):
             )
             self._chown_path(target, self._service_uid if root else self._uid)
             if root:
-                self._mounted_path(root).chmod(0o700)
+                self._mounted_path(root).chmod(0o700 if root == "/tests" else 0o750)
         for virtual_path in chmod_dirs:
             target = self._mounted_path(virtual_path)
             if target.exists():
@@ -510,7 +510,7 @@ class NativeProcessEnvironment(BaseEnvironment):
             proot.extend(["-b", f"{source}:{target}"])
         shell = (
             f"cd -- {shlex.quote(working_directory)} && "
-            f"exec /bin/bash -lc {shlex.quote(command)}"
+            f"exec /bin/bash -c {shlex.quote(command)}"
         )
         exported = [f"{key}={value}" for key, value in env.items()]
         uid = self._uid if execution_uid is None else execution_uid
@@ -544,10 +544,11 @@ class NativeProcessEnvironment(BaseEnvironment):
         effective_user = self._resolve_user(user)
         service_execution = effective_user in ("root", "verifier", 0)
         # LHTB tasks omit both Agent and verifier users because Docker normally
-        # runs both as root. Protected material is uploaded immediately before
-        # oracle/verifier execution, which gives the native backend an explicit,
-        # auditable phase boundary even when default_user remains None.
-        if effective_user is None and self._protected_material_roots:
+        # runs both as root. Tests are uploaded immediately before verification,
+        # which gives the native backend an explicit, auditable verifier phase
+        # boundary even when default_user remains None. Oracle solutions execute
+        # as the Agent UID so ownership-sensitive copies into /app remain valid.
+        if effective_user is None and "/tests" in self._protected_material_roots:
             service_execution = True
         execution_uid = self._service_uid if service_execution else self._uid
         tree_signal = self._harbor_agent_tree_signal(command)

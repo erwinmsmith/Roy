@@ -278,6 +278,7 @@ PY
     "${jobs_root}/${job_name}" "${suite_audit}" <<'PY'
 import json, pathlib, sys
 from roy_research.lhtb_results import official_lhtb_reward
+from roy_research.lhtb_native import normalize_native_task_id
 root = pathlib.Path(sys.argv[1])
 audit = json.load(open(sys.argv[2], encoding="utf-8"))
 expected = {value["task_id"] for value in audit["tasks"]
@@ -287,7 +288,7 @@ for path in root.rglob("result.json"):
     value = json.load(open(path, encoding="utf-8"))
     if "task_checksum" not in value:
         continue
-    task_id = str(value.get("task_name"))
+    task_id = normalize_native_task_id(str(value.get("task_name")))
     try:
         reward = official_lhtb_reward(value)
     except ValueError:
