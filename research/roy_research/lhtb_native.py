@@ -382,18 +382,30 @@ def provision_native_task(
                 raise RuntimeError(
                     f"task {task_id} OCI digest mismatch: {inspect.get('Digest')}"
                 )
-            layout = target / ".oci-layout"
+            cache_root = template_root / ".oci-cache" / task_id
+            layout = cache_root / "layout"
             bundle = target / ".oci-bundle"
-            copied_digest_path = target / ".oci-copied-digest"
+            copied_digest_path = cache_root / "copied-digest"
+            cache_root.mkdir(parents=True, exist_ok=True)
             source_reference = (
                 f"{oci_repository_reference(pull_image)}@{expected_oci_digest}"
             )
-            subprocess.run([
-                "skopeo", "copy", "--retry-times", "3",
-                "--digestfile", str(copied_digest_path),
-                "--override-os", "linux", "--override-arch", "amd64",
-                f"docker://{source_reference}", f"oci:{layout}:mirror",
-            ], check=True)
+            copy_attempts = max(1, int(os.environ.get(
+                "ROY_LHTB_OCI_COPY_ATTEMPTS", "5"
+            )))
+            for copy_attempt in range(1, copy_attempts + 1):
+                copied_digest_path.unlink(missing_ok=True)
+                try:
+                    subprocess.run([
+                        "skopeo", "copy", "--retry-times", "3",
+                        "--digestfile", str(copied_digest_path),
+                        "--override-os", "linux", "--override-arch", "amd64",
+                        f"docker://{source_reference}", f"oci:{layout}:mirror",
+                    ], check=True)
+                    break
+                except subprocess.CalledProcessError:
+                    if copy_attempt == copy_attempts:
+                        raise
             copied = json.loads(subprocess.run([
                 "skopeo", "inspect", "--override-os", "linux", "--override-arch", "amd64",
                 f"oci:{layout}:mirror",
@@ -418,8 +430,6 @@ def provision_native_task(
             image_working_directory = str(process_config.get("cwd") or "") or None
             shutil.move(str(bundle / "rootfs"), str(target / "rootfs"))
             shutil.rmtree(bundle)
-            shutil.rmtree(layout)
-            copied_digest_path.unlink()
             (target / "source-digest.txt").write_text(
                 expected_oci_digest + "\n", encoding="utf-8"
             )

@@ -3,7 +3,7 @@ set -euo pipefail
 
 roy_root="${ROY_ROOT:-${HOME}/rivermind-data/roy}"
 lhtb_root="${LHTB_ROOT:-${HOME}/rivermind-data/benchmarks/LHTB}"
-execution_base="${ROY_LHTB_NATIVE_EXECUTION_BASE:-/tmp/Dev_4/roy-lhtb-native}"
+execution_base="${ROY_LHTB_NATIVE_EXECUTION_BASE:-${HOME}/rivermind-data/lhtb-native}"
 native_root="${ROY_LHTB_NATIVE_ROOT:-${execution_base}/runtime}"
 template_root="${ROY_LHTB_NATIVE_TEMPLATE_ROOT:-${execution_base}/templates}"
 audit_path="${ROY_LHTB_NATIVE_AUDIT:-${roy_root}/research/output/lhtb/native/audit.json}"

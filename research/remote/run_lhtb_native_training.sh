@@ -2,7 +2,7 @@
 set -euo pipefail
 
 roy_root="${ROY_ROOT:-${HOME}/rivermind-data/roy}"
-execution_base="${ROY_LHTB_NATIVE_EXECUTION_BASE:-/tmp/Dev_4/roy-lhtb-native}"
+execution_base="${ROY_LHTB_NATIVE_EXECUTION_BASE:-${HOME}/rivermind-data/lhtb-native}"
 export ROY_LHTB_ENVIRONMENT_BACKEND=native
 export ROY_LHTB_NATIVE_ROOT="${ROY_LHTB_NATIVE_ROOT:-${execution_base}/runtime}"
 export ROY_LHTB_NATIVE_TEMPLATE_ROOT="${ROY_LHTB_NATIVE_TEMPLATE_ROOT:-${execution_base}/templates}"
