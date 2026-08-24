@@ -176,7 +176,7 @@ open(sys.argv[1], "w", encoding="utf-8").write(json.dumps(value, indent=2) + "\n
 PY
   export PYTHONPATH="${roy_root}/research${PYTHONPATH:+:${PYTHONPATH}}"
   export ROY_LHTB_NATIVE_ROOT="${native_root}"
-  export HB_CONTINUE_MODE=same_conversation
+  unset HB_CONTINUE_MODE
   cd "${lhtb_root}"
   "${harbor_bin}" run -c "${config}" --yes
   "${python_bin}" - "${jobs_root}/${job_name}/result.json" <<'PY'
@@ -232,7 +232,7 @@ print(json.dumps({"oracle_tasks": len(tasks), "task_ids": tasks}))
 PY
   export PYTHONPATH="${roy_root}/research${PYTHONPATH:+:${PYTHONPATH}}"
   export ROY_LHTB_NATIVE_ROOT="${native_root}"
-  export HB_CONTINUE_MODE=same_conversation
+  unset HB_CONTINUE_MODE
   cd "${lhtb_root}"
   "${harbor_bin}" run -c "${config}" --yes
   cd "${roy_root}"
@@ -250,7 +250,10 @@ for path in root.rglob("result.json"):
     if "task_checksum" not in value:
         continue
     task_id = str(value.get("task_name"))
-    reward = official_lhtb_reward(value)
+    try:
+        reward = official_lhtb_reward(value)
+    except ValueError:
+        reward = None
     results[task_id] = {
         "reward": reward,
         "exception": (value.get("exception_info") or {}).get("exception_type"),
@@ -258,7 +261,8 @@ for path in root.rglob("result.json"):
     }
 missing = sorted(expected - set(results))
 failed = {task: value for task, value in results.items()
-          if value["exception"] is not None or value["reward"] < 0.95}
+          if value["exception"] is not None or value["reward"] is None
+          or value["reward"] < 0.95}
 summary = {"expected": len(expected), "completed": len(results),
            "missing": missing, "failed": failed, "results": results}
 (root / "oracle-suite-validation.json").write_text(
