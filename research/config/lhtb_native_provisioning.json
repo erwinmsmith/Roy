@@ -371,7 +371,7 @@
         {"source": "workspace", "target": "app/workspace"}
       ],
       "python_dependencies": ["numpy==1.26.4", "flask==3.0.0", "fastapi==0.109.0", "uvicorn==0.27.0", "requests==2.31.0", "httpx==0.26.0", "gunicorn==21.2.0", "scipy==1.12.0"],
-      "required_commands": ["bash", "curl", "tmux", "asciinema", "pkill", "fuser"],
+      "required_commands": ["bash", "curl", "tmux", "asciinema", "pkill"],
       "build_commands": ["mkdir -p app/output"],
       "working_directory": "/app",
       "environment": {
