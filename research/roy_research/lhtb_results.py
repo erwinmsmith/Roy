@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Mapping
@@ -224,6 +225,10 @@ def validate_smoke(root: Path, task_ids: tuple[str, ...] = (
         state_counts = []
         input_tokens = 0
         policy_diagnostics = True
+        compact_interface = True
+        raw_terminal_events = True
+        derive_available = False
+        derive_selected = False
         for result_path, result in selected:
             rewards.append(official_lhtb_reward(result))
             partials = list(result_path.parent.rglob("roy-partial-trajectory.json")) \
@@ -243,7 +248,29 @@ def validate_smoke(root: Path, task_ids: tuple[str, ...] = (
                 isinstance(value.get("rawProbabilities"), Mapping)
                 and isinstance(value.get("maskedProbabilities"), Mapping)
                 and value.get("selectedAction")
+                and math.isfinite(float(value.get("maskedOldLogProbability", float("nan"))))
+                and abs(sum(float(probability) for probability in
+                            value["rawProbabilities"].values()) - 1.0) <= 1e-4
+                and abs(sum(float(probability) for probability in
+                            value["maskedProbabilities"].values()) - 1.0) <= 1e-4
                 for value in records
+            )
+            compact_interface = compact_interface and all(
+                (value.get("policyState") or {}).get("interface_revision")
+                == "compact-epistemic-event-driven-v1"
+                and "terminal_result_count" in (value.get("policyState") or {})
+                and "organization_action_count" in (value.get("policyState") or {})
+                for value in records
+            )
+            derive_available = derive_available or any(
+                "DERIVE" in value.get("availableActions", []) for value in records
+            )
+            derive_selected = derive_selected or any(
+                value.get("selectedAction") == "DERIVE" for value in records
+            )
+            raw_terminal_events = raw_terminal_events and any(
+                event.get("kind") == "terminal_result" and "output" in event
+                for state in states for event in state.get("runtimeEvents", [])
             )
         if len(fingerprints) != 1 or "" in fingerprints:
             raise ValueError(f"smoke initial fingerprints do not match for {task_id}")
@@ -256,11 +283,21 @@ def validate_smoke(root: Path, task_ids: tuple[str, ...] = (
             )
         if not policy_diagnostics:
             raise ValueError(f"smoke policy diagnostics are incomplete for {task_id}")
+        if not compact_interface:
+            raise ValueError(f"smoke policy interface is stale for {task_id}")
+        if not raw_terminal_events:
+            raise ValueError(f"smoke raw terminal ledger is incomplete for {task_id}")
+        if not derive_available or not derive_selected:
+            raise ValueError(f"smoke did not preserve and sample DERIVE for {task_id}")
         groups[task_id] = {"rewards": rewards, "state_counts": state_counts,
                            "reward_std": float(np.std(rewards)),
                            "input_tokens": input_tokens,
                            "input_token_gate": max_input_tokens,
-                           "policy_diagnostics": True}
+                           "policy_diagnostics": True,
+                           "compact_interface": True,
+                           "raw_terminal_ledger": True,
+                           "derive_available": True,
+                           "derive_selected": True}
     if len(groups) != len(task_ids):
         raise ValueError(f"expected {len(task_ids)} complete smoke groups, found {len(groups)}")
     if not any(value["reward_std"] > 1e-8 for value in groups.values()):
