@@ -365,6 +365,8 @@ class NativeProcessEnvironment(BaseEnvironment):
         raise ValueError(f"native backend does not expose host path {path}")
 
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
+        if target_path == "/tests" or target_path.startswith("/tests/"):
+            await asyncio.to_thread(self._make_app_group_writable)
         destination = self._mounted_path(target_path)
         destination.parent.mkdir(parents=True, exist_ok=True)
         await asyncio.to_thread(shutil.copy2, source_path, destination)
@@ -379,6 +381,8 @@ class NativeProcessEnvironment(BaseEnvironment):
             self._protected_material_roots.add(protected_root)
 
     async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
+        if target_dir == "/tests" or target_dir.startswith("/tests/"):
+            await asyncio.to_thread(self._make_app_group_writable)
         destination = self._mounted_path(target_dir)
         destination.mkdir(parents=True, exist_ok=True)
         await asyncio.to_thread(
@@ -456,6 +460,8 @@ class NativeProcessEnvironment(BaseEnvironment):
             for root in protected:
                 if virtual_path == root or virtual_path.startswith(root + "/"):
                     self._protected_material_roots.discard(root)
+            if virtual_path == "/tests" or virtual_path.startswith("/tests/"):
+                self._make_app_group_writable()
         for virtual_path in create_dirs:
             target = self._mounted_path(virtual_path)
             target.mkdir(parents=True, exist_ok=True)
@@ -471,6 +477,20 @@ class NativeProcessEnvironment(BaseEnvironment):
             target = self._mounted_path(virtual_path)
             if target.exists():
                 target.chmod(0o777)
+
+    def _make_app_group_writable(self) -> None:
+        """Match Docker-root workspace mutation through the shared trial GID."""
+        assert self.session_root is not None
+        app_root = self.session_root / "app"
+        for root, dirs, files in os.walk(app_root):
+            root_path = Path(root)
+            os.chmod(root_path, root_path.stat().st_mode | 0o070)
+            for name in dirs:
+                path = root_path / name
+                os.chmod(path, path.stat().st_mode | 0o070)
+            for name in files:
+                path = root_path / name
+                os.chmod(path, path.stat().st_mode | 0o060)
 
     def _chown_path(self, path: Path, uid: int | None = None) -> None:
         owner = self._uid if uid is None else uid
