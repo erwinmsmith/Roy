@@ -179,6 +179,14 @@ export interface OrganizationPolicyRecord {
   maskedOldLogProbability: number;
   envelopeId: string;
   policyState?: unknown;
+  availableActions?: OrganizationActionKind[];
+  rawProbabilities?: Partial<Record<OrganizationActionKind, number>>;
+  maskedProbabilities?: Partial<Record<OrganizationActionKind, number>>;
+  selectedAction?: OrganizationActionKind;
+  numRealResidualGaps?: number;
+  numChildProposals?: number;
+  stopLegalReason?: string;
+  explorationStopMasked?: boolean;
 }
 
 export interface OrganizationRuntimeBudget {

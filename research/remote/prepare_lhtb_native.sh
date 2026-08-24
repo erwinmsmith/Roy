@@ -397,6 +397,7 @@ PY
 roy_smoke() {
   [[ -n "${DEEPSEEK_API_KEY:-}" ]] || { echo "DEEPSEEK_API_KEY is required" >&2; exit 4; }
   local task_id category seed fingerprint job_dir config result_path run_id smoke_root
+  local -a smoke_tasks validation_args
   run_id="smoke-$(date -u +%Y%m%dT%H%M%SZ)"
   smoke_root="${roy_root}/research/output/lhtb/native/smoke-jobs/${run_id}"
   export PYTHONPATH="${roy_root}/research${PYTHONPATH:+:${PYTHONPATH}}"
@@ -407,13 +408,17 @@ roy_smoke() {
   export ROY_LHTB_POLICY_COMMAND="${python_bin} -m roy_research.lhtb_policy_server"
   export ROY_LHTB_MODEL="${roy_root}/research/output/lhtb/native/smoke-initial.pt"
   export ROY_LHTB_NATIVE_ROOT="${native_root}"
+  export ROY_LHTB_ORGANIZATION_INTERVAL="${ROY_LHTB_ORGANIZATION_INTERVAL:-5}"
+  export ROY_LHTB_EXPLORATION_MIN_NODES="${ROY_LHTB_EXPLORATION_MIN_NODES:-3}"
+  export ROY_LHTB_EXPLORATION_MIN_DEPTH="${ROY_LHTB_EXPLORATION_MIN_DEPTH:-2}"
   if [[ ! -f "${ROY_LHTB_MODEL}" ]]; then
     "${python_bin}" -m roy_research lhtb-init \
       --manifest "${roy_root}/research/config/lhtb_split.json" --model "${ROY_LHTB_MODEL}"
   fi
   seed=20260820
-  for task_id in great-expectations-audit poc-exploit-craft \
-    opensees-seismic-structural-regression-audit; do
+  IFS=',' read -r -a smoke_tasks <<< \
+    "${ROY_LHTB_SMOKE_TASKS:-great-expectations-audit}"
+  for task_id in "${smoke_tasks[@]}"; do
     category="$("${python_bin}" - "${roy_root}/research/config/lhtb_split.json" "${task_id}" <<'PY'
 import json, sys
 for value in json.load(open(sys.argv[1], encoding="utf-8"))["tasks"]:
@@ -429,7 +434,7 @@ PY
       --arm learned_information_realization --initial-fingerprint "${fingerprint}" \
       --organization-seed "${seed}" --attempts 8 --environment-backend native \
       --native-runtime-root "${native_root}" --native-template-root "${template_root}" \
-      --allow-network-degraded --max-retries 0
+      --allow-network-degraded --max-retries "${ROY_LHTB_MAX_ENV_RETRIES:-8}"
     cd "${lhtb_root}"
     "${harbor_bin}" run -c "${config}" --yes
     cd "${roy_root}"
@@ -466,9 +471,10 @@ print(json.dumps({"task_id": sys.argv[2], "accepted": accepted,
 PY
     seed=$((seed + 1))
   done
-  "${python_bin}" -m roy_research lhtb-smoke-validate \
-    --jobs-dir "${smoke_root}" \
-    --output "${smoke_root}/smoke-validation.json"
+  validation_args=(--jobs-dir "${smoke_root}"
+    --output "${smoke_root}/smoke-validation.json" --max-input-tokens 15000000)
+  for task_id in "${smoke_tasks[@]}"; do validation_args+=(--task-id "${task_id}"); done
+  "${python_bin}" -m roy_research lhtb-smoke-validate "${validation_args[@]}"
   echo "Roy native smoke saved at ${smoke_root}"
 }
 

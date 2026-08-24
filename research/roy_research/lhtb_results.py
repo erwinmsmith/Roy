@@ -68,10 +68,29 @@ def import_harbor_group(
             )
         timeout_types = {"TimeoutError", "AgentTimeoutError", "AgentTimeout"}
         exception_type = str((exception or {}).get("exception_type", ""))
+        exception_message = str((exception or {}).get("exception_message", ""))
         normal_deadline = reward_available and exception_type in timeout_types
         if normal_deadline and snapshot:
             snapshot = _deadline_terminal_snapshot(snapshot, reward)
-        complete = bool(partial_candidates) and (exception is None or normal_deadline)
+        final_output = (snapshot.get("runtime") or {}).get("finalOutput") \
+            if isinstance(snapshot.get("runtime"), Mapping) else None
+        policy_dead_end = (
+            isinstance(final_output, Mapping)
+            and final_output.get("status") == "policy_dead_end"
+        ) or "policy_dead_end:" in exception_message
+        environment_invalid = "environment_invalid:" in exception_message
+        complete = bool(partial_candidates) and reward_available \
+            and (exception is None or normal_deadline)
+        if normal_deadline:
+            termination_type = "timeout_with_reward"
+        elif policy_dead_end and reward_available:
+            termination_type = "policy_dead_end"
+        elif exception is None and reward_available:
+            termination_type = "completed_with_reward"
+        elif environment_invalid:
+            termination_type = "environment_invalid"
+        else:
+            termination_type = "environment_failure"
         record = {
             "schema_version": 1, "id": str(result.get("id", result_path.parent.name)),
             "group_id": group_id, "benchmark": "lhtb", "task_id": task_id,
@@ -86,12 +105,15 @@ def import_harbor_group(
             "runtime_config": dict(runtime_config),
             "initial_snapshot_fingerprint": snapshot.get("initialSnapshotFingerprint"),
             "actions": _actions(snapshot), "policy_records": snapshot.get("policyRecords", []),
+            "policy_interface_revision": _policy_interface_revision(snapshot),
             "process_states": snapshot.get("processStates", []),
             "terminal_reward": reward, "complete": complete,
-            "environment_failure": exception is not None and not normal_deadline,
+            "environment_failure": termination_type in {
+                "environment_invalid", "environment_failure"
+            },
+            "environment_invalid": environment_invalid,
             "accepted_for_training": complete,
-            "termination_type": "official_deadline_verifier" if normal_deadline else
-                "completed" if exception is None else "environment_failure",
+            "termination_type": termination_type,
             "harbor_result": result, "harbor_result_path": str(result_path),
             "wall_time_seconds": wall_seconds,
             "tokens": _token_total(result),
@@ -158,10 +180,18 @@ def _actions(snapshot: Mapping[str, Any]) -> List[Mapping[str, Any]]:
     return result
 
 
+def _policy_interface_revision(snapshot: Mapping[str, Any]) -> str:
+    for record in snapshot.get("policyRecords", []):
+        state = record.get("policyState", record.get("policy_state"))
+        if isinstance(state, Mapping) and state.get("interface_revision"):
+            return str(state["interface_revision"])
+    return "legacy-full-growing-context"
+
+
 def validate_smoke(root: Path, task_ids: tuple[str, ...] = (
     "great-expectations-audit", "poc-exploit-craft",
     "opensees-seismic-structural-regression-audit",
-)) -> Dict[str, Any]:
+), max_input_tokens: int = 15_000_000) -> Dict[str, Any]:
     by_task: Dict[str, List[tuple[Path, Mapping[str, Any]]]] = {}
     for path in root.rglob("result.json"):
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -171,12 +201,29 @@ def validate_smoke(root: Path, task_ids: tuple[str, ...] = (
             by_task.setdefault(str(value["task_name"]), []).append((path, value))
     groups = {}
     for task_id, values in by_task.items():
-        selected = sorted(values, key=lambda item: item[0].stat().st_mtime)[-8:]
+        valid = []
+        for item in values:
+            result = item[1]
+            exception = result.get("exception_info") or {}
+            exception_type = str(exception.get("exception_type", ""))
+            try:
+                official_lhtb_reward(result)
+                reward_available = True
+            except ValueError:
+                reward_available = False
+            if reward_available and (not exception or exception_type in {
+                "TimeoutError", "AgentTimeoutError", "AgentTimeout"
+            }):
+                valid.append(item)
+        selected = sorted(valid, key=lambda item: item[0].stat().st_mtime)[-8:]
         if len(selected) != 8:
             continue
         rewards = []
         fingerprints = set()
+        seeds = set()
         state_counts = []
+        input_tokens = 0
+        policy_diagnostics = True
         for result_path, result in selected:
             rewards.append(official_lhtb_reward(result))
             partials = list(result_path.parent.rglob("roy-partial-trajectory.json")) \
@@ -185,14 +232,35 @@ def validate_smoke(root: Path, task_ids: tuple[str, ...] = (
                 raise ValueError(f"smoke trajectory is missing for {task_id}")
             snapshot = json.loads(partials[0].read_text(encoding="utf-8"))
             fingerprints.add(str(snapshot.get("initialSnapshotFingerprint") or ""))
+            seeds.add(int(snapshot.get("organizationSeed", -1)))
             states = list(snapshot.get("processStates", []))
             if not states or any(not value.get("fingerprint") for value in states):
                 raise ValueError(f"smoke M_0...M_T is incomplete for {task_id}")
             state_counts.append(len(states))
+            input_tokens += int((states[-1].get("usage") or {}).get("inputTokens", 0))
+            records = list(snapshot.get("policyRecords", []))
+            policy_diagnostics = policy_diagnostics and bool(records) and all(
+                isinstance(value.get("rawProbabilities"), Mapping)
+                and isinstance(value.get("maskedProbabilities"), Mapping)
+                and value.get("selectedAction")
+                for value in records
+            )
         if len(fingerprints) != 1 or "" in fingerprints:
             raise ValueError(f"smoke initial fingerprints do not match for {task_id}")
+        if len(seeds) != 8:
+            raise ValueError(f"smoke organization seeds are not unique for {task_id}")
+        if input_tokens > max_input_tokens:
+            raise ValueError(
+                f"smoke input-token gate exceeded for {task_id}: "
+                f"{input_tokens} > {max_input_tokens}"
+            )
+        if not policy_diagnostics:
+            raise ValueError(f"smoke policy diagnostics are incomplete for {task_id}")
         groups[task_id] = {"rewards": rewards, "state_counts": state_counts,
-                           "reward_std": float(np.std(rewards))}
+                           "reward_std": float(np.std(rewards)),
+                           "input_tokens": input_tokens,
+                           "input_token_gate": max_input_tokens,
+                           "policy_diagnostics": True}
     if len(groups) != len(task_ids):
         raise ValueError(f"expected {len(task_ids)} complete smoke groups, found {len(groups)}")
     if not any(value["reward_std"] > 1e-8 for value in groups.values()):

@@ -45,6 +45,17 @@ export class PythonOrganizationPolicyClient {
       candidateId: String(raw.candidate_id),
       maskedOldLogProbability: Number(raw.masked_old_log_probability),
       envelopeId: String(raw.envelope_id), policyState: raw.policy_state,
+      availableActions: Array.isArray(raw.available_actions)
+        ? raw.available_actions.map(String) as OrganizationPolicyRecord['availableActions']
+        : undefined,
+      rawProbabilities: raw.raw_probabilities as OrganizationPolicyRecord['rawProbabilities'],
+      maskedProbabilities: raw.masked_probabilities as
+        OrganizationPolicyRecord['maskedProbabilities'],
+      selectedAction: raw.selected_action as OrganizationPolicyRecord['selectedAction'],
+      numRealResidualGaps: Number(raw.num_real_residual_gaps ?? 0),
+      numChildProposals: Number(raw.num_child_proposals ?? 0),
+      stopLegalReason: String(raw.stop_legal_reason ?? ''),
+      explorationStopMasked: Boolean(raw.exploration_stop_masked),
     } };
   }
 

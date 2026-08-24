@@ -47,8 +47,12 @@ export ROY_LHTB_SEMANTIC_COMMAND="${python_bin} -m roy_research.semantic_server"
 export ROY_LHTB_SEMANTIC_ROOT="${run_root}/semantic"
 export ROY_LHTB_MODEL="${model}"
 export DEEPSEEK_MODEL_REVISION="${DEEPSEEK_MODEL_REVISION:-deepseek-v4-flash-api-alias}"
+export ROY_LHTB_ORGANIZATION_INTERVAL="${ROY_LHTB_ORGANIZATION_INTERVAL:-5}"
+export ROY_LHTB_EXPLORATION_MIN_NODES="${ROY_LHTB_EXPLORATION_MIN_NODES:-3}"
+export ROY_LHTB_EXPLORATION_MIN_DEPTH="${ROY_LHTB_EXPLORATION_MIN_DEPTH:-2}"
 
-group_environment_args=(--environment-backend "${environment_backend}")
+group_environment_args=(--environment-backend "${environment_backend}"
+  --max-retries "${ROY_LHTB_MAX_ENV_RETRIES:-8}")
 if [[ "${environment_backend}" == "native" ]]; then
   [[ -f "${native_audit}" ]] || { echo "native audit is missing" >&2; exit 4; }
   group_environment_args+=(--native-runtime-root "${native_runtime_root}"

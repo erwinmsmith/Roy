@@ -376,20 +376,28 @@ def provision_native_task(
                 )
             layout = target / ".oci-layout"
             bundle = target / ".oci-bundle"
+            copied_digest_path = target / ".oci-copied-digest"
+            source_reference = f"{pull_image.rsplit('@', 1)[0]}@{expected_oci_digest}"
             subprocess.run([
-                "skopeo", "copy", "--preserve-digests",
+                "skopeo", "copy", "--all", "--retry-times", "3",
+                "--digestfile", str(copied_digest_path),
                 "--override-os", "linux", "--override-arch", "amd64",
-                f"docker://{pull_image}", f"oci:{layout}:image",
+                f"docker://{source_reference}", f"oci:{layout}:mirror",
             ], check=True)
             copied = json.loads(subprocess.run([
-                "skopeo", "inspect", f"oci:{layout}:image",
+                "skopeo", "inspect", "--override-os", "linux", "--override-arch", "amd64",
+                f"oci:{layout}:mirror",
             ], capture_output=True, text=True, check=True).stdout)
-            if copied.get("Digest") != expected_oci_digest:
+            copied_oci_digest = str(copied.get("Digest") or "")
+            digestfile_value = copied_digest_path.read_text(encoding="utf-8").strip()
+            if not copied_oci_digest.startswith("sha256:") \
+                    or digestfile_value != copied_oci_digest:
                 raise RuntimeError(
-                    f"task {task_id} copied OCI digest mismatch: {copied.get('Digest')}"
+                    f"task {task_id} copied OCI layout digest is not self-consistent: "
+                    f"inspect={copied_oci_digest} digestfile={digestfile_value}"
                 )
             subprocess.run([
-                "umoci", "unpack", "--image", f"{layout}:image", str(bundle),
+                "umoci", "unpack", "--image", f"{layout}:mirror", str(bundle),
             ], check=True)
             runtime_config = json.loads((bundle / "config.json").read_text(encoding="utf-8"))
             process_config = runtime_config.get("process") or {}
@@ -401,6 +409,13 @@ def provision_native_task(
             shutil.move(str(bundle / "rootfs"), str(target / "rootfs"))
             shutil.rmtree(bundle)
             shutil.rmtree(layout)
+            copied_digest_path.unlink()
+            (target / "source-digest.txt").write_text(
+                expected_oci_digest + "\n", encoding="utf-8"
+            )
+            (target / "oci-layout-digest.txt").write_text(
+                copied_oci_digest + "\n", encoding="utf-8"
+            )
             rootfs_relative = "rootfs"
             for virtual_path in (
                 "app", "workspace", "tests", "solution", "logs", "tmp", "root",
@@ -464,6 +479,7 @@ def provision_native_task(
             "template_digest": template_digest,
             "oci_image": oci_image or None,
             "oci_digest": expected_oci_digest or None,
+            "oci_layout_digest": copied_oci_digest if oci_image else None,
         }
         environment_digest = "sha256:" + hashlib.sha256(
             json.dumps(fingerprint_payload, sort_keys=True).encode("utf-8")

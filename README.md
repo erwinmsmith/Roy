@@ -179,6 +179,8 @@ process_credit_grpo           official LHTB final reward with telescoping EMA De
 
 The organization grammar is `DERIVE / ACQUIRE / CONNECT / EXECUTE / RETURN / PRUNE / STOP`. Agents are generated from residual requirements rather than selected from predefined roles. Training uses no teacher, no imitation warm start, no weighted multi-objective reward, no keyword matching and no forced agent-count/depth target.
 
+For LHTB sampling, Roy preserves the full append-only process ledger while feeding the policy a compact epistemic working state. Organization decisions are event-driven, and each decision saves raw/masked probabilities, exact old log-probability and real-gap/STOP diagnostics. Environment-invalid attempts are audited and resampled, never converted to a zero-reward sample. A `G=8` group must contain eight valid matched trajectories and remain below the 15-million aggregate input-token sampling gate before it can update the model.
+
 Run the lightweight checks with:
 
 ```bash

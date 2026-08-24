@@ -196,6 +196,39 @@ describe('LHTB process state', () => {
     controller.close();
   });
 
+  it('classifies exhausted inactive-actor proposals as environment-invalid', async () => {
+    const priorAttempts = process.env.ROY_LHTB_PROPOSAL_ATTEMPTS;
+    process.env.ROY_LHTB_PROPOSAL_ATTEMPTS = '2';
+    const session = new RoyLHTBSession('inactive', 'task', 'finish', 'commit',
+      'roy_runtime_heuristic');
+    const semantic = { async processEvent(event: { id: string }) {
+      return { event_id: event.id, requirements: [], claims: [], assumptions: [], evidence: [],
+        external_observations: [], blind_spots: [], relations: [] };
+    }, close() {} };
+    let calls = 0;
+    const provider = { isConfigured: () => true, async completeJSONWithUsage() {
+      calls += 1;
+      return { value: { preferred_candidate_id: 'stale', candidates: [{
+        id: 'stale', kind: 'EXECUTE', actorNodeId: 'returned-worker',
+        description: 'stale actor', schedulerComplexity: 1, command: 'true',
+        action: { kind: 'EXECUTE', actorNodeId: 'returned-worker' },
+      }] }, completion: { content: '{}', model: 'mock', usage: {
+        promptTokens: 1, completionTokens: 1, totalTokens: 2,
+      } } };
+    } };
+    const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false });
+    try {
+      await expect(controller.advance(session, 1)).rejects
+        .toThrow('environment_invalid:inactive_actor');
+      expect(calls).toBe(2);
+      expect(session.snapshot().runtime.stopped).toBe(false);
+    } finally {
+      controller.close();
+      if (priorAttempts === undefined) delete process.env.ROY_LHTB_PROPOSAL_ATTEMPTS;
+      else process.env.ROY_LHTB_PROPOSAL_ATTEMPTS = priorAttempts;
+    }
+  });
+
   it('audits and repairs a malformed proposer response without losing token usage', async () => {
     const auditRoot = await mkdtemp(path.join(tmpdir(), 'roy-lhtb-proposal-'));
     const session = new RoyLHTBSession('repair', 'task', 'finish', 'commit',

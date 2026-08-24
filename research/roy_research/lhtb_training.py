@@ -22,6 +22,8 @@ from .value_model import (
 
 
 LHTB_GROUP_SIZE = 8
+LHTB_POLICY_INTERFACE_REVISION = "compact-epistemic-event-driven-v1"
+LHTB_GROUP_INPUT_TOKEN_GATE = 15_000_000
 
 
 def dense_clipped_policy_loss(
@@ -178,6 +180,9 @@ class LHTBProcessGRPOTrainer:
             raise ValueError("trainer accepts only LHTB train trajectories")
         if any(not value.get("complete") or value.get("environment_failure") for value in records):
             raise ValueError("crashed or incomplete trajectories are audit-only")
+        if any(value.get("policy_interface_revision") != LHTB_POLICY_INTERFACE_REVISION
+               for value in records):
+            raise ValueError("LHTB group uses a stale policy-state interface")
         if any(int(value.get("policy_revision", -1)) != self.groups for value in records):
             raise ValueError("LHTB group is stale; sampling must use the current actor revision")
         if any(int(value.get("epoch", -1)) not in range(4) for value in records):
@@ -207,6 +212,14 @@ class LHTBProcessGRPOTrainer:
             if len(states) < len(policy) + 1:
                 raise ValueError("trajectory must save all decision states plus a terminal state")
             self._decision_states(states, policy)
+        group_input_tokens = sum(int(
+            (list(value["process_states"])[-1].get("usage") or {}).get("inputTokens", 0)
+        ) for value in records)
+        if group_input_tokens > LHTB_GROUP_INPUT_TOKEN_GATE:
+            raise ValueError(
+                f"LHTB group exceeds compact-state input-token gate: "
+                f"{group_input_tokens} > {LHTB_GROUP_INPUT_TOKEN_GATE}"
+            )
 
     def metadata(self) -> Dict[str, Any]:
         return {

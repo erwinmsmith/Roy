@@ -94,6 +94,8 @@ A frozen DeepSeek extractor creates typed entities. A separate frozen DeepSeek s
 
 Coverage, assumption closure, conflicts and blind spots are structural inputs to the policy. They are not reward terms.
 
+The immutable ledger and the policy input are intentionally distinct. The ledger retains every event and full text needed for audit or later retrieval. The proposer and actor receive a bounded working projection containing active structure, unresolved gaps, selected epistemic entities, recent event deltas and immutable references back to the raw ledger. This projection is not a lossy replacement for `M_t`. Organization-policy decisions are event-driven: they occur initially and when a real state change exposes a gap, failure, file mutation, contradiction, completed node, structural transition or a bounded accumulation of terminal results. Local execution may continue between organization decisions.
+
 ## 6. On-policy groups and continuous process credit
 
 Training samples fresh complete trajectories from the current masked policy. Each LHTB task and epoch produces `G=8` trajectories from eight fresh matched execution environments with the same task checksum, immutable environment digest, initial-state fingerprint, environment configuration and actor revision. Only organization sampling seeds differ. The official protocol realizes these environments as fresh Docker containers. A native portability backend may be used only as a separately labeled experimental condition and does not imply Docker-equivalent isolation. Every decision stores its exact masked old-policy joint log-probability.
@@ -133,9 +135,9 @@ Report mean reward, success rate at `R >= 0.95`, paired bootstrap 95% confidence
 ## 8. Training and recovery invariants
 
 - Every actor/value update consumes exactly eight complete current-policy train trajectories.
-- Runtime crashes, environment failures and incomplete trajectories are preserved for audit but excluded from actor and value updates.
+- Runtime crashes, environment-invalid attempts, environment failures and incomplete trajectories are preserved for audit but excluded from actor and value updates. Environment-invalid attempts are resampled rather than assigned reward zero.
 - A normal 60-minute training deadline triggers the official verifier; its partial score is a valid terminal label.
-- Every trajectory preserves `M_0...M_T`, runtime events, semantic audits, exact old probabilities, task checksum, environment digest, backend capabilities, model revisions and final Harbor result.
+- Every trajectory preserves `M_0...M_T`, runtime events, semantic audits, raw and masked action probabilities, selected actions, exact old log-probabilities, real-gap diagnostics, task checksum, source and converted environment digests, backend capabilities, model revisions and final Harbor result.
 - Actor, value, EMA, both optimizers and updated group IDs are restored together; a group ID can be optimized only once.
 - Dev selects checkpoints but never updates them. Test runs only after selection and never updates weights.
 - Neither the local Docker protocol nor the native portability backend claims Harbor's timed process verifier. “Continuous process reward” means final-score-supervised `V_psi` and `Delta V` credit.

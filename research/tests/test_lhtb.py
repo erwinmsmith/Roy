@@ -41,7 +41,10 @@ from roy_research.lhtb_experiment import (
     write_harbor_group_config,
 )
 from roy_research.lhtb_results import official_lhtb_reward
-from roy_research.lhtb_training import LHTBProcessGRPOTrainer
+from roy_research.lhtb_training import (
+    LHTB_POLICY_INTERFACE_REVISION,
+    LHTBProcessGRPOTrainer,
+)
 from roy_research.lhtb_native import (
     audit_native_tasks,
     native_task_id_from_harbor,
@@ -540,6 +543,7 @@ for line in sys.stdin:
             encoder = FakeEncoder384()
             trainer = LHTBProcessGRPOTrainer(checkpoint, manifest, encoder=encoder)
             policy_state = {
+                "interface_revision": LHTB_POLICY_INTERFACE_REVISION,
                 "state_fingerprint": "m0",
                 "event_graph": {"nodes": [{"id": "root", "kind": "agent",
                     "timestamp": 0, "text": "solve", "status": "ready"}], "edges": []},
@@ -560,6 +564,13 @@ for line in sys.stdin:
                 _, policy_record = sample_organization_decision(
                     trainer.actor, encoder, policy_state, device=torch.device("cpu")
                 )
+                self.assertEqual(policy_record["selected_action"], "STOP")
+                self.assertAlmostEqual(
+                    sum(policy_record["raw_probabilities"].values()), 1.0, places=6
+                )
+                self.assertAlmostEqual(
+                    sum(policy_record["masked_probabilities"].values()), 1.0, places=6
+                )
                 records.append({
                     "group_id": f"lhtb:0:{task_id}", "benchmark": "lhtb",
                     "task_id": task_id, "split": "train", "epoch": 0,
@@ -569,6 +580,7 @@ for line in sys.stdin:
                     "terminal_reward": 0.4, "initial_snapshot_fingerprint": "same",
                     "task_checksum": "checksum", "docker_digest": "sha256:image",
                     "runtime_config": {"timeout": 3600}, "policy_records": [policy_record],
+                    "policy_interface_revision": LHTB_POLICY_INTERFACE_REVISION,
                     "process_states": [
                         {"fingerprint": "m0", "nodes": [{"id": "root",
                             "localObjective": "solve", "createdAt": 0, "status": "ready"}],

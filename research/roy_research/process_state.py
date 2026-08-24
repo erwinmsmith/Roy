@@ -26,7 +26,7 @@ must be numeric, use those three named object keys, and sum to 1. Judge meaning 
 surface word overlap is not evidence of entailment. Do not inspect benchmark answer keys,
 keyword fields, embedding similarity, or reward."""
 
-SEMANTIC_EVENT_TEXT_LIMIT = 24_000
+SEMANTIC_EVENT_TEXT_LIMIT = 8_000
 
 
 def canonical_fingerprint(value: Mapping[str, Any]) -> str:

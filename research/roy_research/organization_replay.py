@@ -11,6 +11,7 @@ from torch import Tensor
 from .model import FrozenTextEncoder, graph_tensors
 from .organization import (
     ExplorationEnvelope,
+    ORGANIZATION_ACTIONS,
     ORGANIZATION_GROUP_SIZE,
     envelope_legal_actions,
     validate_exploration_group,
@@ -225,6 +226,21 @@ def sample_organization_decision(
         "masked_old_log_probability": float(joint_log_probability.detach().cpu()),
         "envelope_id": str(policy_state["envelope"]["id"]),
         "policy_state": dict(policy_state),
+        "available_actions": sorted({str(value.get("kind"))
+                                     for value in values["candidates"]}),
+        "raw_probabilities": _action_probability_summary(
+            values["candidates"], values["candidate_raw_probabilities"]
+        ),
+        "masked_probabilities": _action_probability_summary(
+            values["candidates"], values["candidate_probabilities"]
+        ),
+        "selected_action": str(candidate.get("kind")),
+        "num_real_residual_gaps": int(policy_state.get("num_real_residual_gaps", 0)),
+        "num_child_proposals": int(policy_state.get("num_child_proposals", 0)),
+        "stop_legal_reason": str(policy_state.get("stop_legal_reason", "unspecified")),
+        "exploration_stop_masked": bool(
+            policy_state.get("exploration_stop_masked", False)
+        ),
     }
     return dict(candidate), record
 
@@ -326,6 +342,11 @@ def _candidate_distribution(
             int(policy_state.get("maximum_depth_reached", 0)),
             bool(policy_state.get("unresolved_gap_exists", False)),
         )
+    actor_values = [
+        not value.get("actor_node_id")
+        or str(value.get("actor_node_id")) == actor_node_id
+        for value in candidates
+    ]
     legal_values = [
         legal and (
             not value.get("actor_node_id")
@@ -336,6 +357,7 @@ def _candidate_distribution(
     if not any(legal_values):
         raise ValueError(f"active node {actor_node_id} has no legal organization candidates")
     legal_mask = torch.tensor(legal_values, dtype=torch.bool, device=device)
+    actor_mask = torch.tensor(actor_values, dtype=torch.bool, device=device)
     candidate_features = torch.tensor(
         [_candidate_features(value) for value in candidates], dtype=torch.float32, device=device
     )
@@ -346,17 +368,33 @@ def _candidate_distribution(
         action_type_indices([str(value["kind"]) for value in candidates], device),
         candidate_features,
         context["resources"],
-        legal_mask,
+        actor_mask,
     )
     temperature = float(policy_state.get("organization_temperature", 1.0))
     if temperature <= 0:
         raise ValueError("organization temperature must be positive during replay")
-    candidate_log_probs = torch.log_softmax(candidate_logits / temperature, dim=-1)
+    candidate_raw_log_probs = torch.log_softmax(candidate_logits / temperature, dim=-1)
+    masked_logits = candidate_logits.masked_fill(
+        ~legal_mask, torch.finfo(candidate_logits.dtype).min
+    )
+    candidate_log_probs = torch.log_softmax(masked_logits / temperature, dim=-1)
     return {
         "candidates": candidates,
+        "candidate_raw_probabilities": candidate_raw_log_probs.exp(),
         "candidate_log_probs": candidate_log_probs,
         "candidate_probabilities": candidate_log_probs.exp(),
     }
+
+
+def _action_probability_summary(
+    candidates: Sequence[Mapping[str, Any]], probabilities: Tensor
+) -> Dict[str, float]:
+    result = {kind: 0.0 for kind in ORGANIZATION_ACTIONS}
+    for candidate, probability in zip(candidates, probabilities.detach().cpu()):
+        kind = str(candidate.get("kind"))
+        if kind in result:
+            result[kind] += float(probability)
+    return result
 
 
 def _candidate_features(value: Mapping[str, Any]) -> List[float]:

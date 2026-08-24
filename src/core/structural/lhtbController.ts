@@ -79,7 +79,7 @@ workspace or runs verification. Examples:
  "schedulerComplexity":3,"command":"python /app/implement.py && pytest -q","timeoutMs":120000,
  "action":{"kind":"EXECUTE","actorNodeId":"root"}}.
 Do not put command inside action and do not fabricate an observation or execution report.
-DERIVE must use an exact open requirement ID from runtime.requirements and this action schema:
+DERIVE must use an exact open requirement ID from organization.requirements and this action schema:
 {"kind":"DERIVE","actorNodeId":"<parent>","childSpecification":{"id":"<spec-id>",
 "nodeId":"<new-agent-id>","parentId":"<parent>","depth":<parent-depth+1>,
 "parentGoal":"<parent objective>","triggeringGapId":"<open requirement id>",
@@ -113,8 +113,12 @@ record remaining uncertainty instead of creating an endless verification loop.
 Propose only semantically useful actions. Do not expose hidden reasoning, benchmark grader data,
 keyword fields or reward. The preferred candidate is your best next organization decision.`;
 
-const PROPOSER_RECENT_EVENT_COUNT = 12;
-const PROPOSER_EVENT_TEXT_LIMIT = 12_000;
+const PROPOSER_RECENT_EVENT_COUNT = 6;
+const PROPOSER_EVENT_TEXT_LIMIT = 2_000;
+const PROPOSER_ENTITY_TEXT_LIMIT = 600;
+const PROPOSER_ENTITY_COUNT = 16;
+const PROPOSER_GOAL_TEXT_LIMIT = 6_000;
+const SEMANTIC_RECALL_ENTITY_COUNT = 32;
 
 function projectText(value: unknown): unknown {
   if (typeof value !== 'string' || value.length <= PROPOSER_EVENT_TEXT_LIMIT) return value;
@@ -123,28 +127,106 @@ function projectText(value: unknown): unknown {
   return `${value.slice(0, half)}\n...[proposer projection omitted ${omitted} characters]...\n${value.slice(-half)}`;
 }
 
-function proposerRequestState(snapshot: ReturnType<RoyLHTBSession['snapshot']>): Record<string, unknown> {
+function compactText(value: unknown, limit = PROPOSER_ENTITY_TEXT_LIMIT): unknown {
+  if (typeof value !== 'string' || value.length <= limit) return value;
+  const retained = Math.floor(limit / 2);
+  return `${value.slice(0, retained)}\n...[compact state ref omitted ${value.length - 2 * retained} characters]...\n${value.slice(-retained)}`;
+}
+
+function compactEntities(values: unknown[], textFields: string[]): unknown[] {
+  return values.slice(-PROPOSER_ENTITY_COUNT).map(value => {
+    if (!value || typeof value !== 'object') return value;
+    const source = value as Record<string, unknown>;
+    const compact: Record<string, unknown> = {};
+    for (const key of ['id', 'status', 'originNodeId', 'parentNodeId', 'sourceType',
+      'provenance', 'supports', 'contradicts', 'likelyMechanism']) {
+      if (source[key] !== undefined) compact[key] = source[key];
+    }
+    for (const key of textFields) {
+      if (source[key] !== undefined) compact[key] = compactText(source[key]);
+    }
+    return compact;
+  });
+}
+
+function compactEvent(event: Record<string, unknown>): Record<string, unknown> {
+  const attributes = event.attributes && typeof event.attributes === 'object'
+    ? event.attributes as Record<string, unknown> : undefined;
+  const action = attributes?.action && typeof attributes.action === 'object'
+    ? attributes.action as Record<string, unknown> : undefined;
+  return {
+    id: event.id, kind: event.kind, nodeId: event.nodeId, exitCode: event.exitCode,
+    command: compactText(event.command, 1_000), cwd: event.cwd,
+    outputPreview: projectText(event.output),
+    traceRef: `raw-event:${String(event.id ?? 'unknown')}`,
+    fileChanges: Array.isArray(attributes?.fileChanges)
+      ? attributes.fileChanges.slice(0, 32) : undefined,
+    action: action ? { kind: action.kind, actorNodeId: action.actorNodeId,
+      targetNodeId: action.targetNodeId,
+      childNodeId: (action.childSpecification as Record<string, unknown> | undefined)?.nodeId }
+      : undefined,
+  };
+}
+
+export function compactEpistemicWorkingState(
+  snapshot: ReturnType<RoyLHTBSession['snapshot']>
+): Record<string, unknown> {
   const latest = snapshot.processStates.at(-1);
   const recentRuntimeEvents = (latest?.runtimeEvents ?? [])
     .slice(-PROPOSER_RECENT_EVENT_COUNT)
-    .map(event => ({ ...event, output: projectText(event.output),
-      command: projectText(event.command) }));
+    .map(event => compactEvent(event as unknown as Record<string, unknown>));
+  const activeNodes = snapshot.runtime.nodes.filter(node =>
+    ['ready', 'running', 'waiting', 'completed'].includes(node.status));
+  const compactNodes = activeNodes.map(node => ({ id: node.id, parentId: node.parentId,
+    depth: node.depth, status: node.status, triggeringGapId: node.triggeringGapId,
+    objective: compactText(node.localObjective) }));
+  const requirements = snapshot.runtime.requirements.map(value => ({ id: value.id,
+    status: value.status, parentNodeId: value.parentNodeId,
+    description: compactText(value.description),
+    requiredInformation: compactText(value.requiredInformation) }));
   return {
-    task: snapshot.instruction,
+    rootGoal: compactText(snapshot.instruction, PROPOSER_GOAL_TEXT_LIMIT),
     organizationMode: snapshot.organizationMode,
-    runtime: snapshot.runtime,
-    latestProcessState: latest ? {
+    organization: {
+      rootId: snapshot.runtime.rootId, stopped: snapshot.runtime.stopped,
+      activeNodes: compactNodes,
+      archivedNodeRefs: snapshot.runtime.nodes.filter(node => !activeNodes.some(
+        active => active.id === node.id)).map(node => ({ id: node.id, status: node.status,
+        reportId: node.reportId })),
+      requirements,
+      deriveEdges: snapshot.runtime.derivationEdges,
+      dependencies: snapshot.runtime.dependencyEdges,
+      communications: snapshot.runtime.communicationEdges,
+      reportRefs: snapshot.runtime.reports.map(report => ({ id: report.id,
+        nodeId: report.nodeId, residualRequirementIds: report.residualRequirements.map(
+          value => value.id) })),
+      observationRefs: snapshot.runtime.observations.slice(-PROPOSER_ENTITY_COUNT).map(
+        value => ({ id: value.id, sourceType: value.sourceType, provenance: value.provenance,
+          supports: value.supports })),
+    },
+    compactEpistemicState: latest ? {
       sequence: latest.sequence, fingerprint: latest.fingerprint,
-      requirements: latest.requirements, claims: latest.claims,
-      assumptions: latest.assumptions, evidence: latest.evidence,
-      externalObservations: latest.externalObservations,
-      semanticRelations: latest.semanticRelations, blindSpots: latest.blindSpots,
-      dependencies: latest.dependencies, nodes: latest.nodes, dagEdges: latest.dagEdges,
-      activeSubtree: latest.activeSubtree, runtimeEvents: recentRuntimeEvents,
-      usage: latest.usage,
+      unresolvedRequirements: compactEntities(latest.requirements.filter(
+        value => value.status === 'open'), ['description', 'requiredInformation', 'whyItMatters']),
+      resolvedRequirementRefs: latest.requirements.filter(value => value.status !== 'open')
+        .slice(-PROPOSER_ENTITY_COUNT).map(value => ({ id: value.id, status: value.status })),
+      highRelevanceClaims: compactEntities(latest.claims, ['statement']),
+      unresolvedAssumptions: compactEntities(latest.assumptions.filter(value =>
+        String(value.status ?? 'unverified') !== 'verified'), ['statement']),
+      evidenceRefs: compactEntities(latest.evidence, ['content']),
+      observationRefs: compactEntities(latest.externalObservations,
+        ['queryOrAction', 'observation']),
+      unresolvedConflicts: latest.semanticRelations.filter(value => value.label === 'contradict')
+        .slice(-PROPOSER_ENTITY_COUNT),
+      blindSpots: latest.blindSpots.slice(-PROPOSER_ENTITY_COUNT).map(value => compactText(value)),
+      recentStateDelta: recentRuntimeEvents,
+      activeSubtree: latest.activeSubtree,
+      resourceState: latest.usage,
     } : undefined,
     projection: { recentRuntimeEventCount: PROPOSER_RECENT_EVENT_COUNT,
-      eventTextLimit: PROPOSER_EVENT_TEXT_LIMIT, immutableStatePreserved: true },
+      eventTextLimit: PROPOSER_EVENT_TEXT_LIMIT, entityTextLimit: PROPOSER_ENTITY_TEXT_LIMIT,
+      entityCount: PROPOSER_ENTITY_COUNT, immutableRawLedgerPreserved: true,
+      retrieval: 'Use raw-event/report/observation references only when more detail is needed' },
   };
 }
 
@@ -183,15 +265,18 @@ export class LHTBAutonomousController {
     for (const event of session.unprocessedSemanticEvents()) {
       const latest = session.snapshot().processStates.at(-1);
       const update = await this.semantic.processEvent(event, {
-        requirements: latest?.requirements ?? [], claims: latest?.claims ?? [],
-        assumptions: latest?.assumptions ?? [], evidence: latest?.evidence ?? [],
-        external_observations: latest?.externalObservations ?? [],
+        requirements: (latest?.requirements ?? []).slice(-SEMANTIC_RECALL_ENTITY_COUNT),
+        claims: (latest?.claims ?? []).slice(-SEMANTIC_RECALL_ENTITY_COUNT),
+        assumptions: (latest?.assumptions ?? []).slice(-SEMANTIC_RECALL_ENTITY_COUNT),
+        evidence: (latest?.evidence ?? []).slice(-SEMANTIC_RECALL_ENTITY_COUNT),
+        external_observations: (latest?.externalObservations ?? [])
+          .slice(-SEMANTIC_RECALL_ENTITY_COUNT),
       });
       session.applySemanticUpdate(update);
     }
     const snapshot = session.snapshot();
     if (snapshot.runtime.stopped) return { status: 'completed', snapshot };
-    const requestState = proposerRequestState(snapshot);
+    const requestState = compactEpistemicWorkingState(snapshot);
     const messages: LLMMessage[] = [
       { role: 'system', content: PROPOSER_PROMPT },
       { role: 'user', content: JSON.stringify(requestState) },
@@ -236,7 +321,23 @@ export class LHTBAutonomousController {
         value => value.reasons
       ))];
       if (attempt === proposalAttempts) {
-        throw new Error(`DeepSeek proposer returned no legal candidates: ${reasons.join('; ')}`);
+        if (reasons.length > 0 && reasons.every(reason => reason === 'inactive_actor')) {
+          throw new Error('environment_invalid:inactive_actor');
+        }
+        const root = snapshot.runtime.nodes.find(node => node.id === snapshot.runtime.rootId
+          && !['returned', 'pruned', 'failed'].includes(node.status));
+        if (root) {
+          try {
+            session.applyOrganizationAction({ kind: 'STOP', actorNodeId: root.id,
+              finalOutput: { status: 'policy_dead_end', reasons,
+                message: 'The current policy produced no legal continuation.' } });
+            return { status: 'completed', snapshot: session.snapshot() };
+          } catch {
+            // A required unresolved dependency can make STOP illegal. Preserve the
+            // trajectory for audit rather than misclassifying it as environment-invalid.
+          }
+        }
+        throw new Error(`policy_dead_end:no_legal_candidates:${reasons.join('; ')}`);
       }
       const rejectedCandidates = currentValidation.dispositions
         .filter(value => !value.accepted && value.index >= 0)
@@ -254,7 +355,8 @@ export class LHTBAutonomousController {
     const candidates = validation.candidates;
     let selected: ProposedCandidate;
     let policyRecord: OrganizationPolicyRecord | undefined;
-    if (snapshot.organizationMode === 'learned_information_realization') {
+    if (snapshot.organizationMode === 'learned_information_realization'
+      && this.shouldInvokeOrganizationPolicy(snapshot)) {
       if (!this.learnedPolicy) {
         throw new Error('Learned mode requires ROY_LHTB_POLICY_COMMAND and has no heuristic fallback');
       }
@@ -262,6 +364,20 @@ export class LHTBAutonomousController {
       const decision = await this.learnedPolicy.select(policyState, candidates, seed);
       selected = decision.candidate as ProposedCandidate;
       policyRecord = decision.record;
+    } else if (snapshot.organizationMode === 'learned_information_realization') {
+      const local = this.localContinuationCandidate(snapshot, candidates,
+        completion.value.preferred_candidate_id);
+      if (local) selected = local;
+      else {
+        if (!this.learnedPolicy) {
+          throw new Error('Learned mode requires ROY_LHTB_POLICY_COMMAND and has no heuristic fallback');
+        }
+        const decision = await this.learnedPolicy.select(
+          this.policyState(snapshot, candidates), candidates, seed
+        );
+        selected = decision.candidate as ProposedCandidate;
+        policyRecord = decision.record;
+      }
     } else {
       selected = candidates.find(value => value.id === completion.value.preferred_candidate_id)
         ?? candidates[0];
@@ -286,6 +402,51 @@ export class LHTBAutonomousController {
   close(): void {
     this.learnedPolicy?.close();
     this.semantic.close();
+  }
+
+  private shouldInvokeOrganizationPolicy(snapshot: ReturnType<RoyLHTBSession['snapshot']>): boolean {
+    const previous = snapshot.policyRecords.at(-1)?.policyState;
+    if (!previous || typeof previous !== 'object') return true;
+    const policyState = previous as Record<string, unknown>;
+    const events = snapshot.processStates.at(-1)?.runtimeEvents ?? [];
+    const priorTerminalCount = Number(policyState.terminal_result_count ?? 0);
+    const terminalResults = events.filter(event => event.kind === 'terminal_result');
+    const newTerminalResults = terminalResults.slice(priorTerminalCount);
+    const interval = Math.max(1, Number(process.env.ROY_LHTB_ORGANIZATION_INTERVAL ?? 5));
+    if (newTerminalResults.length >= interval) return true;
+    if (newTerminalResults.some(event => (event.exitCode ?? 0) !== 0
+      || (Array.isArray(event.attributes?.fileChanges) && event.attributes.fileChanges.length > 0))) {
+      return true;
+    }
+    const previousRequirements = new Set(Array.isArray(policyState.unresolved_requirement_ids)
+      ? policyState.unresolved_requirement_ids.map(String) : []);
+    const currentRequirements = snapshot.runtime.requirements
+      .filter(value => value.status === 'open').map(value => value.id);
+    if (currentRequirements.some(value => !previousRequirements.has(value))) return true;
+    const priorOrganizationActionCount = Number(policyState.organization_action_count ?? 0);
+    const newOrganizationActions = events.filter(event => event.kind === 'organization_action')
+      .slice(priorOrganizationActionCount);
+    if (newOrganizationActions.some(event => {
+      const action = event.attributes?.action as Record<string, unknown> | undefined;
+      return action && ['DERIVE', 'CONNECT', 'RETURN', 'PRUNE'].includes(String(action.kind));
+    })) return true;
+    const contradictionCount = snapshot.processStates.at(-1)?.semanticRelations.filter(value =>
+      value.label === 'contradict').length ?? 0;
+    if (contradictionCount > Number(policyState.contradiction_count ?? 0)) return true;
+    const completedNodeCount = snapshot.runtime.nodes.filter(node =>
+      ['completed', 'returned'].includes(node.status)).length;
+    return completedNodeCount > Number(policyState.completed_node_count ?? 0);
+  }
+
+  private localContinuationCandidate(snapshot: ReturnType<RoyLHTBSession['snapshot']>,
+    candidates: ProposedCandidate[], preferredId: string): ProposedCandidate | undefined {
+    const events = snapshot.processStates.at(-1)?.runtimeEvents ?? [];
+    const actorId = [...events].reverse().find(event =>
+      event.kind === 'terminal_result' || event.kind === 'terminal_command')?.nodeId;
+    const local = candidates.filter(candidate =>
+      ['ACQUIRE', 'EXECUTE'].includes(candidate.kind)
+      && (!actorId || candidate.actorNodeId === actorId));
+    return local.find(candidate => candidate.id === preferredId) ?? local[0];
   }
 
   private validateCandidates(response: ProposalResponse, session: RoyLHTBSession): CandidateValidation {
@@ -396,23 +557,53 @@ export class LHTBAutonomousController {
       ...snapshot.runtime.communicationEdges.map((edge, index) => ({ id: `c-${index}`,
         kind: 'communication', from: edge.from, to: edge.to })),
     ];
+    const openRequirements = snapshot.runtime.requirements.filter(value => value.status === 'open');
+    const minimumNodes = Math.max(0, Number(
+      process.env.ROY_LHTB_EXPLORATION_MIN_NODES ?? 0
+    ));
+    const minimumDepth = Math.max(0, Number(
+      process.env.ROY_LHTB_EXPLORATION_MIN_DEPTH ?? 0
+    ));
+    const maximumDepthReached = Math.max(0, ...snapshot.runtime.nodes.map(node => node.depth));
+    const explorationStopMasked = openRequirements.length > 0
+      && (snapshot.runtime.nodes.length < minimumNodes || maximumDepthReached < minimumDepth);
+    const policyCandidates = candidates.map(candidate => ({ id: candidate.id, kind: candidate.kind,
+      actor_node_id: candidate.actorNodeId, description: candidate.description,
+      scheduler_complexity: candidate.schedulerComplexity,
+      external_access: candidate.kind === 'ACQUIRE',
+      resolves_gap: candidate.kind === 'ACQUIRE' || candidate.kind === 'RETURN',
+      depth_delta: candidate.kind === 'DERIVE' ? 1 : 0,
+      legal: !(candidate.kind === 'STOP' && explorationStopMasked) }));
+    const events = snapshot.processStates.at(-1)?.runtimeEvents ?? [];
     return {
+      interface_revision: 'compact-epistemic-event-driven-v1',
       state_fingerprint: snapshot.processStates.at(-1)?.fingerprint,
       event_graph: { nodes, edges },
       active_node_ids: activeNodes.map(node => node.id),
       active_node_legal: activeNodes.map(node => candidates.some(
         candidate => candidate.actorNodeId === node.id
       )),
-      candidates: candidates.map(candidate => ({ id: candidate.id, kind: candidate.kind,
-        actor_node_id: candidate.actorNodeId, description: candidate.description,
-        scheduler_complexity: candidate.schedulerComplexity, external_access: candidate.kind === 'ACQUIRE',
-        resolves_gap: candidate.kind === 'ACQUIRE' || candidate.kind === 'RETURN',
-        depth_delta: candidate.kind === 'DERIVE' ? 1 : 0, legal: true })),
-      envelope: { id: 'lhtb-open', minimum_nodes: 0, maximum_nodes: 1_000_000,
-        minimum_depth: 0, maximum_depth: 1_000_000, mode: 'expansive' },
+      candidates: policyCandidates,
+      envelope: { id: 'lhtb-open', minimum_nodes: minimumNodes, maximum_nodes: 1_000_000,
+        minimum_depth: minimumDepth, maximum_depth: 1_000_000, mode: 'expansive' },
       node_count: snapshot.runtime.nodes.length,
-      maximum_depth_reached: Math.max(...snapshot.runtime.nodes.map(node => node.depth)),
-      unresolved_gap_exists: snapshot.runtime.requirements.some(value => value.status === 'open'),
+      maximum_depth_reached: maximumDepthReached,
+      unresolved_gap_exists: openRequirements.length > 0,
+      unresolved_requirement_ids: openRequirements.map(value => value.id),
+      num_real_residual_gaps: openRequirements.length,
+      num_child_proposals: candidates.filter(candidate => candidate.kind === 'DERIVE').length,
+      available_actions: [...new Set(candidates.map(candidate => candidate.kind))],
+      exploration_stop_masked: explorationStopMasked,
+      stop_legal_reason: explorationStopMasked
+        ? 'masked_during_early_exploration_with_real_open_residual_gap'
+        : openRequirements.length === 0 ? 'no_real_open_residual_gap'
+          : 'exploration_minimum_satisfied',
+      terminal_result_count: events.filter(event => event.kind === 'terminal_result').length,
+      organization_action_count: events.filter(event => event.kind === 'organization_action').length,
+      contradiction_count: snapshot.processStates.at(-1)?.semanticRelations.filter(value =>
+        value.label === 'contradict').length ?? 0,
+      completed_node_count: snapshot.runtime.nodes.filter(node =>
+        ['completed', 'returned'].includes(node.status)).length,
       resources: { llm_calls_remaining_fraction: 1, tool_calls_remaining_fraction: 1,
         nodes_remaining_fraction: 1, depth_remaining_fraction: 1,
         decisions_remaining_fraction: 1 },

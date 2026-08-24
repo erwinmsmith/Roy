@@ -333,6 +333,8 @@ def parser() -> argparse.ArgumentParser:
     )
     lhtb_smoke_validate.add_argument("--jobs-dir", type=Path, required=True)
     lhtb_smoke_validate.add_argument("--output", type=Path, required=True)
+    lhtb_smoke_validate.add_argument("--task-id", action="append")
+    lhtb_smoke_validate.add_argument("--max-input-tokens", type=int, default=15_000_000)
     return root
 
 
@@ -473,7 +475,11 @@ def main(argv: List[str] | None = None) -> None:
         write_jsonl(args.output, rows, append=args.output.exists())
         print(json.dumps({"records": len(rows), **metrics}))
     elif args.command == "lhtb-smoke-validate":
-        result = validate_smoke(args.jobs_dir)
+        task_ids = tuple(args.task_id) if args.task_id else (
+            "great-expectations-audit", "poc-exploit-craft",
+            "opensees-seismic-structural-regression-audit",
+        )
+        result = validate_smoke(args.jobs_dir, task_ids, args.max_input_tokens)
         write_json(args.output, result)
         print(json.dumps(result))
     elif args.command == "raise-ledger-limit":
