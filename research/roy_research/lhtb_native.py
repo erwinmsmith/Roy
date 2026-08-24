@@ -389,7 +389,7 @@ def provision_native_task(
                 f"{oci_repository_reference(pull_image)}@{expected_oci_digest}"
             )
             subprocess.run([
-                "skopeo", "copy", "--all", "--retry-times", "3",
+                "skopeo", "copy", "--retry-times", "3",
                 "--digestfile", str(copied_digest_path),
                 "--override-os", "linux", "--override-arch", "amd64",
                 f"docker://{source_reference}", f"oci:{layout}:mirror",
