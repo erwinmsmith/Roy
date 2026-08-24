@@ -154,9 +154,25 @@ oracle_smoke() {
   local config="${roy_root}/research/output/lhtb/native/oracle-smoke.json"
   local jobs_root="${roy_root}/research/output/lhtb/native/oracle-jobs"
   local job_name="roy-native-oracle-smoke-$(date -u +%Y%m%dT%H%M%SZ)"
+  local overlay_root="${roy_root}/research/output/lhtb/native/oracle-overlays/${job_name}/tasks"
   PYTHONPATH="${roy_root}/research" "${python_bin}" - "${config}" "${template_root}" \
-    "${native_root}" "${jobs_root}" "${job_name}" <<'PY'
-import json, sys
+    "${native_root}" "${jobs_root}" "${job_name}" "${overlay_root}" "${lhtb_root}" <<'PY'
+import json, pathlib, sys
+task_id = "great-expectations-audit"
+source = pathlib.Path(sys.argv[7]) / "tasks" / task_id
+target = pathlib.Path(sys.argv[6]) / task_id
+target.mkdir(parents=True)
+for entry in source.iterdir():
+    if entry.name != "task.toml":
+        (target / entry.name).symlink_to(entry.resolve(), target_is_directory=entry.is_dir())
+text = (source / "task.toml").read_text(encoding="utf-8")
+needle = "continue_until_timeout = true"
+if text.count(needle) != 1:
+    raise SystemExit(f"oracle overlay expected one {needle!r} in {task_id}")
+(target / "task.toml").write_text(text.replace(needle, "continue_until_timeout = false"),
+                                  encoding="utf-8")
+(target / ".roy-native-source-task").write_text(str(source.resolve()) + "\n",
+                                                 encoding="utf-8")
 value = {
     "job_name": sys.argv[5],
     "jobs_dir": sys.argv[4],
@@ -169,7 +185,7 @@ value = {
         "kwargs": {"template_root": sys.argv[2], "runtime_root": sys.argv[3]},
     },
     "agents": [{"name": "oracle"}],
-    "datasets": [{"path": "./tasks", "task_names": ["great-expectations-audit"]}],
+    "datasets": [{"path": sys.argv[6], "task_names": [task_id]}],
 }
 
 open(sys.argv[1], "w", encoding="utf-8").write(json.dumps(value, indent=2) + "\n")
@@ -197,25 +213,47 @@ PY
 }
 
 oracle_suite() {
-  local run_id config jobs_root job_name suite_audit
+  local run_id config jobs_root job_name suite_audit overlay_root
   run_id="$(date -u +%Y%m%dT%H%M%SZ)"
   config="${roy_root}/research/output/lhtb/native/configs/oracle-suite-${run_id}.json"
   jobs_root="${roy_root}/research/output/lhtb/native/oracle-jobs"
   job_name="roy-native-oracle-suite-${run_id}"
   suite_audit="${roy_root}/research/output/lhtb/native/oracle-suite-audit-${run_id}.json"
+  overlay_root="${roy_root}/research/output/lhtb/native/oracle-overlays/${job_name}/tasks"
   mkdir -p "$(dirname "${config}")" "${jobs_root}"
   PYTHONPATH="${roy_root}/research" "${python_bin}" -m roy_research lhtb-native-audit \
     --lhtb-root "${lhtb_root}" --manifest "${roy_root}/research/config/lhtb_split.json" \
     --template-root "${template_root}" --output "${suite_audit}"
   PYTHONPATH="${roy_root}/research" "${python_bin}" - \
     "${config}" "${suite_audit}" "${template_root}" "${native_root}" \
-    "${jobs_root}" "${job_name}" <<'PY'
-import json, sys
+    "${jobs_root}" "${job_name}" "${overlay_root}" "${lhtb_root}" <<'PY'
+import json, pathlib, sys
 audit = json.load(open(sys.argv[2], encoding="utf-8"))
 tasks = [value["task_id"] for value in audit["tasks"]
          if value["status"] == "compatible"]
 if not tasks:
     raise SystemExit("oracle suite has no compatible native tasks")
+source_tasks = pathlib.Path(sys.argv[8]) / "tasks"
+overlay_tasks = pathlib.Path(sys.argv[7])
+needle = "continue_until_timeout = true"
+for task_id in tasks:
+    source = source_tasks / task_id
+    target = overlay_tasks / task_id
+    target.mkdir(parents=True)
+    for entry in source.iterdir():
+        if entry.name != "task.toml":
+            (target / entry.name).symlink_to(
+                entry.resolve(), target_is_directory=entry.is_dir()
+            )
+    text = (source / "task.toml").read_text(encoding="utf-8")
+    if text.count(needle) != 1:
+        raise SystemExit(f"oracle overlay expected one {needle!r} in {task_id}")
+    (target / "task.toml").write_text(
+        text.replace(needle, "continue_until_timeout = false"), encoding="utf-8"
+    )
+    (target / ".roy-native-source-task").write_text(
+        str(source.resolve()) + "\n", encoding="utf-8"
+    )
 value = {
     "job_name": sys.argv[6], "jobs_dir": sys.argv[5],
     "n_attempts": 1, "n_concurrent_trials": min(4, len(tasks)),
@@ -225,7 +263,7 @@ value = {
         "kwargs": {"template_root": sys.argv[3], "runtime_root": sys.argv[4]},
     },
     "agents": [{"name": "oracle"}],
-    "datasets": [{"path": "./tasks", "task_names": tasks}],
+    "datasets": [{"path": sys.argv[7], "task_names": tasks}],
 }
 open(sys.argv[1], "w", encoding="utf-8").write(json.dumps(value, indent=2) + "\n")
 print(json.dumps({"oracle_tasks": len(tasks), "task_ids": tasks}))

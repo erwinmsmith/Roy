@@ -48,6 +48,7 @@ from roy_research.lhtb_native import (
     native_session_uids,
     normalize_native_task_id,
     provision_native_task,
+    resolve_native_task_source,
     tree_digest,
 )
 from roy_research.organization_replay import sample_organization_decision
@@ -383,6 +384,23 @@ for line in sys.stdin:
         self.assertTrue(210_000 <= agent < 230_000)
         self.assertTrue(230_000 <= service < 250_000)
         self.assertNotEqual(agent, service)
+
+    def test_native_control_overlay_resolves_only_matching_official_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "LHTB" / "tasks" / "fixture"
+            (source / "environment").mkdir(parents=True)
+            (source / "task.toml").write_text("[agent]\n", encoding="utf-8")
+            overlay = root / "overlay" / "fixture"
+            overlay.mkdir(parents=True)
+            (overlay / ".roy-native-source-task").write_text(
+                str(source), encoding="utf-8"
+            )
+            self.assertEqual(
+                resolve_native_task_source(overlay, "fixture"), source.resolve()
+            )
+            with self.assertRaisesRegex(ValueError, "invalid native source"):
+                resolve_native_task_source(overlay, "different")
 
     def test_dev_selection_and_test_report_follow_locked_rules(self) -> None:
         dev = []

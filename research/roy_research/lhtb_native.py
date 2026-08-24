@@ -21,6 +21,7 @@ from .lhtb import LHTB_COMMIT, load_lhtb_manifest
 
 NATIVE_SCHEMA_VERSION = 1
 NATIVE_BACKEND_ID = "lhtb-native-process-v1"
+NATIVE_SOURCE_TASK_MARKER = ".roy-native-source-task"
 
 
 def native_session_uids(session_id: str, uid_base: int, uid_slots: int) -> tuple[int, int]:
@@ -37,6 +38,19 @@ def normalize_native_task_id(environment_name: str) -> str:
     if not task_id or task_id in (".", ".."):
         raise ValueError(f"invalid native environment name: {environment_name!r}")
     return task_id
+
+
+def resolve_native_task_source(task_root: Path, task_id: str) -> Path:
+    """Resolve an immutable official task behind a native control-only overlay."""
+    marker = task_root / NATIVE_SOURCE_TASK_MARKER
+    if not marker.exists():
+        return task_root.resolve()
+    source = Path(marker.read_text(encoding="utf-8").strip()).resolve(strict=True)
+    if source.name != task_id or source.parent.name != "tasks":
+        raise ValueError(f"invalid native source task marker for {task_id}: {source}")
+    if not (source / "task.toml").is_file() or not (source / "environment").is_dir():
+        raise ValueError(f"native source task is incomplete: {source}")
+    return source
 
 
 def _sha256_file(path: Path) -> str:

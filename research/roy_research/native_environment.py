@@ -19,6 +19,7 @@ from .lhtb_native import (
     native_preflight,
     native_session_uids,
     normalize_native_task_id,
+    resolve_native_task_source,
     tree_digest,
 )
 
@@ -120,7 +121,10 @@ class NativeProcessEnvironment(BaseEnvironment):
             raise ValueError("LHTB-native templates must be provisioned before Harbor starts")
         native_preflight(self.runtime_root)
         manifest = load_task_native_manifest(self.template_root, self.native_task_id)
-        task_digest = tree_digest(self.environment_dir.parent)
+        source_task_root = resolve_native_task_source(
+            self.environment_dir.parent, self.native_task_id
+        )
+        task_digest = tree_digest(source_task_root)
         if manifest.get("task_digest") != task_digest:
             raise RuntimeError("native task template is stale relative to the pinned task")
         self._manifest = manifest
@@ -153,6 +157,8 @@ class NativeProcessEnvironment(BaseEnvironment):
             "environment_digest": self.environment_digest,
             "task_id": self.native_task_id,
             "task_digest": task_digest,
+            "task_source_root": str(source_task_root),
+            "task_control_overlay": source_task_root != self.environment_dir.parent.resolve(),
             "session_id": self.session_id,
             "uid": self._uid,
             "service_uid": self._service_uid,
