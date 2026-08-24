@@ -252,6 +252,20 @@ def native_preflight(runtime_root: Path, *, task_gid: int = 210000) -> Dict[str,
         raise RuntimeError("LHTB-native requires x86_64 Linux")
     if missing:
         raise RuntimeError(f"LHTB-native is missing commands: {', '.join(missing)}")
+    runtime_root.mkdir(parents=True, exist_ok=True)
+    disk = shutil.disk_usage(runtime_root)
+    free_fraction = disk.free / disk.total
+    result.update({
+        "disk_total_bytes": disk.total,
+        "disk_free_bytes": disk.free,
+        "disk_free_fraction": free_fraction,
+        "minimum_disk_free_fraction": 0.15,
+    })
+    if free_fraction < 0.15:
+        raise RuntimeError(
+            "LHTB-native has less than 15% free disk; preserve checkpoints and "
+            "expand storage before continuing"
+        )
     proot_version = subprocess.run(
         ["proot", "--version"], capture_output=True, text=True, check=True
     ).stdout
@@ -282,7 +296,6 @@ def native_preflight(runtime_root: Path, *, task_gid: int = 210000) -> Dict[str,
             + traversal.stderr.strip()
         )
     result["root_traversal_acl"] = "execute-only"
-    runtime_root.mkdir(parents=True, exist_ok=True)
     probe = runtime_root / ".write-probe"
     probe.write_text("ok", encoding="utf-8")
     probe.unlink()
