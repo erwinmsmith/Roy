@@ -190,8 +190,9 @@ PY
 
 provision_smoke_tasks() {
   local task_id
-  for task_id in great-expectations-audit poc-exploit-craft \
-    opensees-seismic-structural-regression-audit; do
+  local -a smoke_tasks
+  IFS=',' read -r -a smoke_tasks <<< "${ROY_LHTB_SMOKE_TASKS:-great-expectations-audit,poc-exploit-craft,opensees-seismic-structural-regression-audit}"
+  for task_id in "${smoke_tasks[@]}"; do
     PYTHONPATH="${roy_root}/research" "${python_bin}" -m roy_research lhtb-native-provision \
       --lhtb-root "${lhtb_root}" --template-root "${template_root}" \
       --specs "${roy_root}/research/config/lhtb_native_provisioning.json" \
