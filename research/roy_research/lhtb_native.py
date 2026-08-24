@@ -376,7 +376,8 @@ def provision_native_task(
             layout = target / ".oci-layout"
             bundle = target / ".oci-bundle"
             subprocess.run([
-                "skopeo", "copy", "--override-os", "linux", "--override-arch", "amd64",
+                "skopeo", "copy", "--preserve-digests",
+                "--override-os", "linux", "--override-arch", "amd64",
                 f"docker://{pull_image}", f"oci:{layout}:image",
             ], check=True)
             copied = json.loads(subprocess.run([

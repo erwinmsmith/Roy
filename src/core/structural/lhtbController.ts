@@ -238,9 +238,16 @@ export class LHTBAutonomousController {
       if (attempt === proposalAttempts) {
         throw new Error(`DeepSeek proposer returned no legal candidates: ${reasons.join('; ')}`);
       }
+      const rejectedCandidates = currentValidation.dispositions
+        .filter(value => !value.accepted && value.index >= 0)
+        .map(value => ({
+          candidate: current.value.candidates[value.index],
+          reasons: value.reasons,
+        }));
+      const rejectedContext = JSON.stringify(rejectedCandidates).slice(0, 12_000);
       messages.splice(0, messages.length,
         { role: 'system', content: PROPOSER_PROMPT },
-        { role: 'user', content: `${JSON.stringify(requestState)}\nA prior independent candidate set was rejected by the runtime: ${reasons.join('; ')}. Return a concise, genuinely legal candidate set.` }
+        { role: 'user', content: `${JSON.stringify(requestState)}\nA prior candidate set was rejected by the runtime: ${reasons.join('; ')}. Rejected candidates and their exact reasons: ${rejectedContext}. Do not reproduce an unchanged rejected candidate. Return a concise, genuinely legal candidate set with a different command, cwd, or organization action.` }
       );
     }
     if (!completion || !validation) throw new Error('DeepSeek proposer did not return a completion');

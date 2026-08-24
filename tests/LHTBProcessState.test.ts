@@ -296,7 +296,11 @@ describe('LHTB process state', () => {
         external_observations: [], blind_spots: [], relations: [] };
     }, close() {} };
     let calls = 0;
-    const provider = { isConfigured: () => true, async completeJSONWithUsage() {
+    const requests: Array<Array<{ role: string; content: string }>> = [];
+    const provider = { isConfigured: () => true, async completeJSONWithUsage(messages: Array<{
+      role: string; content: string;
+    }>) {
+      requests.push(messages);
       calls += 1;
       const candidate = calls === 1 ? {
         id: 'repeat', kind: 'EXECUTE', actorNodeId: 'root', description: 'Repeat failure',
@@ -319,6 +323,8 @@ describe('LHTB process state', () => {
         expect(result.request.command).toBe('ls -la && python repair.py');
       }
       expect(calls).toBe(2);
+      expect(requests[1]?.at(-1)?.content).toContain('python missing.py');
+      expect(requests[1]?.at(-1)?.content).toContain('Do not reproduce an unchanged rejected candidate');
       const validations = (await readFile(
         path.join(auditRoot, 'candidate-validation.jsonl'), 'utf8'
       )).trim().split('\n').map(line => JSON.parse(line));
