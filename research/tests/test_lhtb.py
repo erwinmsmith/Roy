@@ -44,6 +44,7 @@ from roy_research.lhtb_results import official_lhtb_reward
 from roy_research.lhtb_training import LHTBProcessGRPOTrainer
 from roy_research.lhtb_native import (
     audit_native_tasks,
+    native_task_id_from_harbor,
     native_environment_digest,
     native_session_uids,
     normalize_native_task_id,
@@ -384,6 +385,15 @@ for line in sys.stdin:
         self.assertTrue(210_000 <= agent < 230_000)
         self.assertTrue(230_000 <= service < 250_000)
         self.assertNotEqual(agent, service)
+
+    def test_native_task_id_uses_dataset_directory_not_display_name(self) -> None:
+        self.assertEqual(
+            native_task_id_from_harbor(
+                "/dataset/tasks/snake_maze_campaign/environment",
+                "custom/snake-obstacle-campaign",
+            ),
+            "snake_maze_campaign",
+        )
 
     def test_native_control_overlay_resolves_only_matching_official_task(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

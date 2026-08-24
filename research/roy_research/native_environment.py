@@ -17,9 +17,9 @@ from harbor.environments.capabilities import EnvironmentCapabilities
 from .lhtb_native import (
     NATIVE_BACKEND_ID,
     load_task_native_manifest,
+    native_task_id_from_harbor,
     native_preflight,
     native_session_uids,
-    normalize_native_task_id,
     resolve_native_task_source,
     tree_digest,
 )
@@ -57,10 +57,19 @@ class NativeProcessEnvironment(BaseEnvironment):
         if self.uid_slots < 1:
             raise ValueError("uid_slots must be positive")
         self.allow_network_degraded = bool(allow_network_degraded)
+        environment_dir = kwargs.get("environment_dir")
+        if environment_dir is None and args:
+            environment_dir = args[0]
         environment_name = str(kwargs.get("environment_name", ""))
         if not environment_name and len(args) > 1:
             environment_name = str(args[1])
-        self.native_task_id = normalize_native_task_id(environment_name)
+        # Harbor's task.name is a display identifier and is not required to
+        # match the pinned dataset directory (for example
+        # custom/snake-obstacle-campaign lives in snake_maze_campaign).
+        # The task definition path is therefore the canonical native key.
+        self.native_task_id = native_task_id_from_harbor(
+            environment_dir, environment_name
+        )
         self.session_root: Path | None = None
         self._manifest: Mapping[str, Any] | None = None
         self._process_groups: set[int] = set()

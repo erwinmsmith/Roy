@@ -40,6 +40,16 @@ def normalize_native_task_id(environment_name: str) -> str:
     return task_id
 
 
+def native_task_id_from_harbor(
+    environment_dir: Path | str | None,
+    environment_name: str,
+) -> str:
+    """Resolve the pinned task directory ID instead of Harbor's display name."""
+    if environment_dir is not None:
+        return normalize_native_task_id(Path(environment_dir).parent.name)
+    return normalize_native_task_id(environment_name)
+
+
 def resolve_native_task_source(task_root: Path, task_id: str) -> Path:
     """Resolve an immutable official task behind a native control-only overlay."""
     marker = task_root / NATIVE_SOURCE_TASK_MARKER
