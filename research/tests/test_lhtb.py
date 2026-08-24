@@ -380,6 +380,20 @@ for line in sys.stdin:
                 & 0o111
             )
 
+    def test_native_template_digest_can_exclude_pinned_rootfs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "rootfs" / "usr" / "bin").mkdir(parents=True)
+            (root / "rootfs" / "usr" / "bin" / "tool").write_text("image-v1")
+            (root / "app").mkdir()
+            mutable = root / "app" / "state.json"
+            mutable.write_text("one")
+            first = tree_digest(root, excluded_prefixes=("rootfs",))
+            (root / "rootfs" / "usr" / "bin" / "tool").write_text("image-v2")
+            self.assertEqual(first, tree_digest(root, excluded_prefixes=("rootfs",)))
+            mutable.write_text("two")
+            self.assertNotEqual(first, tree_digest(root, excluded_prefixes=("rootfs",)))
+
     def test_native_agent_and_service_use_disjoint_kernel_identities(self) -> None:
         agent, service = native_session_uids("identity-test", 210_000, 20_000)
         self.assertTrue(210_000 <= agent < 230_000)

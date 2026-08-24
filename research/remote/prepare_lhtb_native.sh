@@ -12,6 +12,7 @@ proot_runtime="${execution_base}/tools/proot-v5.3.1-99a84175"
 python_bin="${roy_root}/research/.venv/bin/python"
 harbor_bin="${roy_root}/research/.venv/bin/harbor"
 native_task_python="${ROY_LHTB_NATIVE_TASK_PYTHON:-3.12}"
+export ROY_LHTB_OCI_MIRROR="${ROY_LHTB_OCI_MIRROR:-docker.1ms.run}"
 native_task_gid=210000
 revision="84d7ba5ee34fae6c11f0d7cb8ed5faa73a9ece54"
 mode="${1:-check}"
@@ -38,7 +39,9 @@ install_system_dependencies() {
   command -v git-lfs >/dev/null || packages+=(git-lfs)
   command -v proot >/dev/null || packages+=(proot)
   command -v setpriv >/dev/null || packages+=(util-linux)
+  command -v skopeo >/dev/null || packages+=(skopeo)
   command -v tmux >/dev/null || packages+=(tmux)
+  command -v umoci >/dev/null || packages+=(umoci)
   command -v xz >/dev/null || packages+=(xz-utils)
   ldconfig -p | grep 'libblas\.so' >/dev/null || packages+=(libblas3)
   ldconfig -p | grep 'libgfortran\.so' >/dev/null || packages+=(libgfortran5)
@@ -111,7 +114,7 @@ install_proot_runtime() {
 }
 
 check_environment() {
-  for command_name in git git-lfs node npm proot python3 setpriv tmux timeout uv; do
+  for command_name in git git-lfs node npm proot python3 setpriv skopeo tmux timeout umoci uv; do
     command -v "${command_name}" >/dev/null || {
       echo "missing required command: ${command_name}" >&2
       exit 2

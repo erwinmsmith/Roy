@@ -30,6 +30,24 @@
         "PYTHONUNBUFFERED": "1"
       }
     },
+    "apex-ib244-matter": {
+      "oci_image": "docker.io/zli12321/lhtb-apex-ib244-matter:20260729",
+      "oci_digest": "sha256:6ed14da0ee4e551d2770ae83f3d82bb0de7c5ec225a42e3e3d7150a74158abb0",
+      "rootfs_copies": [{"source": "app", "target": "app"}],
+      "working_directory": "/app"
+    },
+    "apex-law433-matter": {
+      "oci_image": "docker.io/zli12321/lhtb-apex-law433-matter:20260615",
+      "oci_digest": "sha256:ffc1e75103002a6643afa020a2813b0cf918bc2e824d4bd21c5a59e8cb1b35b2",
+      "rootfs_copies": [{"source": "app", "target": "app"}],
+      "working_directory": "/app"
+    },
+    "apex-openroad-ibex-signoff": {
+      "oci_image": "docker.io/zli12321/lhtb-apex-openroad-ibex-signoff:20260615",
+      "oci_digest": "sha256:18b9b04fc40faa017f4ff29250f52699f805ea0d52f3ee8d785bb9b45464dd59",
+      "rootfs_copies": [{"source": "app", "target": "app"}],
+      "working_directory": "/app"
+    },
     "audio-visual-event-alignment": {
       "copies": [{"source": "project", "target": "app"}],
       "python_project": "project",
@@ -252,6 +270,12 @@
         "PYTHONPATH": "/app/src"
       }
     },
+    "riscv-core-debug": {
+      "oci_image": "docker.io/zli12321/lhtb-riscv-core-debug:20260615",
+      "oci_digest": "sha256:00a4e509042ba6d3687b75897433e26c2b30742b13c3e8020b34b4b89afc5da9",
+      "rootfs_copies": [{"source": "app", "target": "app"}],
+      "working_directory": "/app"
+    },
     "rush_hour_campaign": {
       "required_commands": ["bash", "python3", "tmux", "asciinema"],
       "working_directory": "/app",
@@ -332,6 +356,21 @@
         "PATH": "/opt/roy-native/bin:/opt/roy-native/venv/bin:/usr/local/bin:/usr/bin:/bin",
         "PYTHONPATH": "/app:/app/src"
       }
+    },
+    "sudoku-recovery": {
+      "oci_image": "docker.io/zhongzhi660/lhtb-sudoku-recovery:20260709",
+      "oci_digest": "sha256:dc7d60c86c309766100e22a45e5157673ad828f450b35664ea646b6910d2cb40",
+      "rootfs_copies": [
+        {"source": "app", "target": "app"},
+        {"source": "opt/sudoku", "target": "opt/sudoku"}
+      ],
+      "bind_opt": true,
+      "service_commands": ["sudoku status"],
+      "path_permissions": [
+        {"path": "/opt/sudoku/private", "owner": "service", "mode": "0700", "recursive": true},
+        {"path": "/opt/sudoku/runs", "owner": "service", "mode": "0755", "recursive": true}
+      ],
+      "working_directory": "/app"
     },
     "unknown-config-semantics": {
       "copies": [{"source": "harness", "target": "opt/cfg"}],

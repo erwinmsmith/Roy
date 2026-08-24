@@ -71,12 +71,21 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def tree_digest(root: Path, *, excluded: Iterable[str] = ()) -> str:
+def tree_digest(
+    root: Path,
+    *,
+    excluded: Iterable[str] = (),
+    excluded_prefixes: Iterable[str] = (),
+) -> str:
     excluded_names = set(excluded)
+    excluded_roots = tuple(value.rstrip("/") for value in excluded_prefixes)
     digest = hashlib.sha256()
     for path in sorted(value for value in root.rglob("*") if value.is_file()):
         relative = path.relative_to(root).as_posix()
         if relative in excluded_names:
+            continue
+        if any(relative == value or relative.startswith(value + "/")
+               for value in excluded_roots):
             continue
         digest.update(relative.encode("utf-8"))
         digest.update(b"\0")
@@ -315,6 +324,59 @@ def provision_native_task(
         raise RuntimeError(f"refusing to overwrite stale native template {target}")
     target.mkdir(parents=True)
     try:
+        rootfs_relative: str | None = None
+        image_environment: Dict[str, str] = {}
+        image_working_directory: str | None = None
+        oci_image = str(spec.get("oci_image") or "")
+        expected_oci_digest = str(spec.get("oci_digest") or "")
+        if oci_image:
+            if not expected_oci_digest.startswith("sha256:"):
+                raise ValueError(f"task {task_id} OCI image has no pinned digest")
+            missing_oci = [name for name in ("skopeo", "umoci") if shutil.which(name) is None]
+            if missing_oci:
+                raise RuntimeError(
+                    f"task {task_id} is missing OCI tools: {', '.join(missing_oci)}"
+                )
+            mirror = os.environ.get("ROY_LHTB_OCI_MIRROR", "").strip().rstrip("/")
+            pull_image = oci_image
+            if mirror and oci_image.startswith("docker.io/"):
+                pull_image = mirror + "/" + oci_image.removeprefix("docker.io/")
+            inspect = json.loads(subprocess.run([
+                "skopeo", "inspect", "--override-os", "linux", "--override-arch", "amd64",
+                f"docker://{pull_image}",
+            ], capture_output=True, text=True, check=True).stdout)
+            if inspect.get("Digest") != expected_oci_digest:
+                raise RuntimeError(
+                    f"task {task_id} OCI digest mismatch: {inspect.get('Digest')}"
+                )
+            layout = target / ".oci-layout"
+            bundle = target / ".oci-bundle"
+            subprocess.run([
+                "skopeo", "copy", "--override-os", "linux", "--override-arch", "amd64",
+                f"docker://{pull_image}", f"oci:{layout}:image",
+            ], check=True)
+            subprocess.run([
+                "umoci", "unpack", "--image", f"{layout}:image", str(bundle),
+            ], check=True)
+            runtime_config = json.loads((bundle / "config.json").read_text(encoding="utf-8"))
+            process_config = runtime_config.get("process") or {}
+            for value in process_config.get("env") or []:
+                key, separator, environment_value = str(value).partition("=")
+                if separator and key:
+                    image_environment[key] = environment_value
+            image_working_directory = str(process_config.get("cwd") or "") or None
+            shutil.move(str(bundle / "rootfs"), str(target / "rootfs"))
+            shutil.rmtree(bundle)
+            shutil.rmtree(layout)
+            rootfs_relative = "rootfs"
+            for virtual_path in (
+                "app", "workspace", "tests", "solution", "logs", "tmp", "root",
+            ):
+                (target / "rootfs" / virtual_path).mkdir(parents=True, exist_ok=True)
+            for copy in spec.get("rootfs_copies", [{"source": "app", "target": "app"}]):
+                source = target / "rootfs" / str(copy["source"])
+                destination = target / str(copy["target"])
+                _copy_entry(source, destination)
         for copy in spec.get("copies", []):
             source = environment_root / str(copy["source"])
             destination = target / str(copy["target"])
@@ -347,13 +409,18 @@ def provision_native_task(
             path.write_text(str(wrapper["content"]), encoding="utf-8")
             path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
+        template_digest = tree_digest(
+            target, excluded_prefixes=((rootfs_relative,) if rootfs_relative else ())
+        )
         fingerprint_payload = {
             "backend": NATIVE_BACKEND_ID,
             "lhtb_commit": LHTB_COMMIT,
             "task_id": task_id,
             "task_digest": tree_digest(task_root),
             "spec": spec,
-            "template_digest": tree_digest(target),
+            "template_digest": template_digest,
+            "oci_image": oci_image or None,
+            "oci_digest": expected_oci_digest or None,
         }
         environment_digest = "sha256:" + hashlib.sha256(
             json.dumps(fingerprint_payload, sort_keys=True).encode("utf-8")
@@ -362,9 +429,17 @@ def provision_native_task(
             "schema_version": NATIVE_SCHEMA_VERSION,
             **fingerprint_payload,
             "environment_digest": environment_digest,
-            "environment": dict(spec.get("environment", {})),
+            "environment": {
+                **image_environment,
+                **dict(spec.get("environment", {})),
+            },
             "path_permissions": list(spec.get("path_permissions", [])),
-            "working_directory": str(spec.get("working_directory", "/app")),
+            "working_directory": str(
+                spec.get("working_directory", image_working_directory or "/app")
+            ),
+            "rootfs": rootfs_relative,
+            "bind_opt": bool(spec.get("bind_opt", False)),
+            "service_commands": list(spec.get("service_commands", [])),
             "network_isolation": False,
             "official_leaderboard_comparable": False,
         }
@@ -373,6 +448,8 @@ def provision_native_task(
         )
         for path in target.rglob("*"):
             if path.is_file():
+                if rootfs_relative and path.is_relative_to(target / rootfs_relative):
+                    continue
                 path.chmod(path.stat().st_mode & ~stat.S_IWOTH)
         return manifest
     except BaseException:

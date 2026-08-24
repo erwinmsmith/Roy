@@ -71,6 +71,7 @@ class NativeProcessEnvironment(BaseEnvironment):
             environment_dir, environment_name
         )
         self.session_root: Path | None = None
+        self._rootfs: Path | None = None
         self._manifest: Mapping[str, Any] | None = None
         self._process_groups: set[int] = set()
         self._stopped_agent_pids: set[int] = set()
@@ -142,6 +143,13 @@ class NativeProcessEnvironment(BaseEnvironment):
         if manifest.get("task_digest") != task_digest:
             raise RuntimeError("native task template is stale relative to the pinned task")
         self._manifest = manifest
+        rootfs_relative = manifest.get("rootfs")
+        if rootfs_relative:
+            rootfs = (self.template_root / self.native_task_id / str(rootfs_relative)).resolve()
+            template = (self.template_root / self.native_task_id).resolve()
+            if not rootfs.is_relative_to(template) or not (rootfs / "bin" / "bash").exists():
+                raise RuntimeError(f"native task rootfs is invalid: {rootfs}")
+            self._rootfs = rootfs
         safe_session = "".join(
             character if character.isalnum() or character in "-_" else "_"
             for character in self.session_id
@@ -182,6 +190,9 @@ class NativeProcessEnvironment(BaseEnvironment):
             "mount_namespace": False,
             "official_leaderboard_comparable": False,
             "proot_executable": self.proot_executable,
+            "rootfs": str(self._rootfs) if self._rootfs else None,
+            "oci_image": manifest.get("oci_image"),
+            "oci_digest": manifest.get("oci_digest"),
         }
         audit_path = self.trial_paths.trial_dir / "native-environment.json"
         audit_path.write_text(json.dumps(audit, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -543,14 +554,19 @@ class NativeProcessEnvironment(BaseEnvironment):
             (self.session_root / "app", "/workspace"),
             (self.session_root / "tests", "/tests"),
             (self.session_root / "solution", "/solution"),
-            (self.session_root / "opt", "/opt"),
             (self.session_root / "logs", "/logs"),
         ]
+        if self._rootfs is None or bool(self._manifest.get("bind_opt", False)):
+            binds.append((self.session_root / "opt", "/opt"))
         if (template / "venv").exists():
             binds.append((template / "venv", "/opt/roy-native/venv"))
         if (template / "bin").exists():
             binds.append((template / "bin", "/opt/roy-native/bin"))
-        proot = [self.proot_executable, "-0", "-R", "/", "-w", working_directory]
+        proot_root = str(self._rootfs) if self._rootfs else "/"
+        proot = [
+            self.proot_executable, "-0", "-R", proot_root,
+            "-w", working_directory,
+        ]
         for source, target in binds:
             proot.extend(["-b", f"{source}:{target}"])
         shell = (
@@ -588,6 +604,8 @@ class NativeProcessEnvironment(BaseEnvironment):
         started = time.monotonic()
         effective_user = self._resolve_user(user)
         service_execution = effective_user in ("root", "verifier", 0)
+        if command in set(self._manifest.get("service_commands", [])):
+            service_execution = True
         # LHTB tasks omit both Agent and verifier users because Docker normally
         # runs both as root. Tests are uploaded immediately before verification,
         # which gives the native backend an explicit, auditable verifier phase
