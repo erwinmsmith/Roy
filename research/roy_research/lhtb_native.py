@@ -355,6 +355,13 @@ def provision_native_task(
                 "skopeo", "copy", "--override-os", "linux", "--override-arch", "amd64",
                 f"docker://{pull_image}", f"oci:{layout}:image",
             ], check=True)
+            copied = json.loads(subprocess.run([
+                "skopeo", "inspect", f"oci:{layout}:image",
+            ], capture_output=True, text=True, check=True).stdout)
+            if copied.get("Digest") != expected_oci_digest:
+                raise RuntimeError(
+                    f"task {task_id} copied OCI digest mismatch: {copied.get('Digest')}"
+                )
             subprocess.run([
                 "umoci", "unpack", "--image", f"{layout}:image", str(bundle),
             ], check=True)
