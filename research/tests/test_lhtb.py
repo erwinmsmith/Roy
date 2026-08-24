@@ -51,6 +51,7 @@ from roy_research.lhtb_native import (
     native_environment_digest,
     native_session_uids,
     normalize_native_task_id,
+    oci_repository_reference,
     provision_native_task,
     resolve_native_task_source,
     tree_digest,
@@ -91,6 +92,16 @@ class FakeSemanticClient:
 
 
 class LHTBProtocolTests(unittest.TestCase):
+    def test_oci_repository_reference_removes_tag_but_preserves_registry_port(self) -> None:
+        self.assertEqual(
+            oci_repository_reference("mirror.example:5000/team/image:revision"),
+            "mirror.example:5000/team/image",
+        )
+        self.assertEqual(
+            oci_repository_reference("docker.io/team/image@sha256:abc"),
+            "docker.io/team/image",
+        )
+
     def test_frozen_semantic_client_retries_invalid_json_with_strict_json_mode(self) -> None:
         class Client:
             model = "deepseek-v4-flash"

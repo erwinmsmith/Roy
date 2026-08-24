@@ -24,6 +24,14 @@ NATIVE_BACKEND_ID = "lhtb-native-process-v1"
 NATIVE_SOURCE_TASK_MARKER = ".roy-native-source-task"
 
 
+def oci_repository_reference(image: str) -> str:
+    """Remove a tag/digest without mistaking a registry port for an image tag."""
+    without_digest = image.split("@", 1)[0]
+    slash = without_digest.rfind("/")
+    colon = without_digest.rfind(":")
+    return without_digest[:colon] if colon > slash else without_digest
+
+
 def native_session_uids(session_id: str, uid_base: int, uid_slots: int) -> tuple[int, int]:
     if uid_slots < 1:
         raise ValueError("uid_slots must be positive")
@@ -377,7 +385,9 @@ def provision_native_task(
             layout = target / ".oci-layout"
             bundle = target / ".oci-bundle"
             copied_digest_path = target / ".oci-copied-digest"
-            source_reference = f"{pull_image.rsplit('@', 1)[0]}@{expected_oci_digest}"
+            source_reference = (
+                f"{oci_repository_reference(pull_image)}@{expected_oci_digest}"
+            )
             subprocess.run([
                 "skopeo", "copy", "--all", "--retry-times", "3",
                 "--digestfile", str(copied_digest_path),
