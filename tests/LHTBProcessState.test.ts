@@ -196,6 +196,36 @@ describe('LHTB process state', () => {
     controller.close();
   });
 
+  it('assigns a semantic requirement to the child that produced its terminal event', () => {
+    const session = new RoyLHTBSession('semantic-child', 'task', 'implement and verify', 'commit',
+      'roy_runtime_heuristic');
+    session.applyOrganizationAction({ kind: 'DERIVE', actorNodeId: 'root',
+      childSpecification: {
+        id: 'spec-child', nodeId: 'child', parentId: 'root', depth: 1,
+        parentGoal: 'implement and verify', triggeringGapId: 'root-task-requirement',
+        localObjective: 'verify one bounded behavior', refinement: {
+          parentScope: 'implement and verify', childScope: 'verify one bounded behavior',
+          triggeringRequirementId: 'root-task-requirement', narrowerThanParent: true,
+          newInformationNeeded: 'test output', executableEndCondition: 'test result is recorded',
+          duplicatedByExistingNode: false,
+        }, requiredClaims: [], requiredEvidence: [], relevantReportIds: [],
+        externalAccess: { allowed: true, tools: ['terminal'], purpose: 'run the test' },
+        expectedOutput: { requiredInformation: 'test result', outputType: 'epistemic_report' },
+        terminationCondition: 'return the test result',
+      } });
+    session.requestTerminal({ id: 'child-command', command: 'pytest -q', timeoutMs: 1000,
+      nodeId: 'child', organizationActionKind: 'EXECUTE' });
+    session.acceptTerminalResult({ requestId: 'child-command', exitCode: 1, stdout: '',
+      stderr: 'one assertion failed', durationMs: 1, fileChanges: [] });
+    session.applySemanticUpdate({ event_id: 'result-child-command', requirements: [{
+      id: 'child-gap', description: 'diagnose the failing assertion',
+      requiredInformation: 'the root cause', likelyMechanism: 'conversion',
+    }], claims: [], assumptions: [], evidence: [], external_observations: [], blind_spots: [],
+    relations: [] });
+    expect(session.snapshot().runtime.requirements.find(value => value.id === 'child-gap')
+      ?.parentNodeId).toBe('child');
+  });
+
   it('classifies exhausted inactive-actor proposals as environment-invalid', async () => {
     const priorAttempts = process.env.ROY_LHTB_PROPOSAL_ATTEMPTS;
     process.env.ROY_LHTB_PROPOSAL_ATTEMPTS = '2';
@@ -226,6 +256,42 @@ describe('LHTB process state', () => {
       controller.close();
       if (priorAttempts === undefined) delete process.env.ROY_LHTB_PROPOSAL_ATTEMPTS;
       else process.env.ROY_LHTB_PROPOSAL_ATTEMPTS = priorAttempts;
+    }
+  });
+
+  it('rejects a shallow learned candidate interface while a real derivation gap exists', async () => {
+    const priorAttempts = process.env.ROY_LHTB_PROPOSAL_ATTEMPTS;
+    const priorMinimum = process.env.ROY_LHTB_EXPLORATION_MIN_NODES;
+    process.env.ROY_LHTB_PROPOSAL_ATTEMPTS = '2';
+    process.env.ROY_LHTB_EXPLORATION_MIN_NODES = '6';
+    const session = new RoyLHTBSession('shallow-interface', 'task', 'solve it', 'commit',
+      'learned_information_realization');
+    const semantic = { async processEvent(event: { id: string }) {
+      return { event_id: event.id, requirements: [], claims: [], assumptions: [], evidence: [],
+        external_observations: [], blind_spots: [], relations: [] };
+    }, close() {} };
+    let calls = 0;
+    const provider = { isConfigured: () => true, async completeJSONWithUsage() {
+      calls += 1;
+      return { value: { preferred_candidate_id: 'inspect', candidates: [{
+        id: 'inspect', kind: 'ACQUIRE', actorNodeId: 'root', description: 'inspect',
+        schedulerComplexity: 1, command: 'pwd', action: { kind: 'ACQUIRE', actorNodeId: 'root' },
+      }] }, completion: { content: '{}', model: 'mock', usage: {
+        promptTokens: 1, completionTokens: 1, totalTokens: 2,
+      } } };
+    } };
+    const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false });
+    try {
+      await expect(controller.advance(session, 1)).rejects
+        .toThrow('sampling_invalid:missing_real_gap_derive_candidates:0/1');
+      expect(calls).toBe(2);
+      expect(session.snapshot().runtime.stopped).toBe(false);
+    } finally {
+      controller.close();
+      if (priorAttempts === undefined) delete process.env.ROY_LHTB_PROPOSAL_ATTEMPTS;
+      else process.env.ROY_LHTB_PROPOSAL_ATTEMPTS = priorAttempts;
+      if (priorMinimum === undefined) delete process.env.ROY_LHTB_EXPLORATION_MIN_NODES;
+      else process.env.ROY_LHTB_EXPLORATION_MIN_NODES = priorMinimum;
     }
   });
 

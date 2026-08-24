@@ -267,7 +267,7 @@ describe('recursive information realization runtime', () => {
     const runtime = new RecursiveInformationRealizationRuntime('root', 'answer task', 1);
     runtime.apply({ kind: 'EXECUTE', actorNodeId: 'root', report: report('root', 'gap-1') }, 2);
     runtime.apply({ kind: 'DERIVE', actorNodeId: 'root', childSpecification: specification() }, 3);
-    runtime.addDependency('child', 'root', 'artifact:evidence');
+    runtime.addDependency('child', 'root', 'report:child');
     expect(runtime.waitForDependencies('root', 4)).toBe(true);
     runtime.apply({
       kind: 'CONNECT', actorNodeId: 'root',
@@ -275,7 +275,9 @@ describe('recursive information realization runtime', () => {
     }, 5);
     expect(() => runtime.apply({ kind: 'STOP', actorNodeId: 'root', finalOutput: 'answer' }, 6))
       .toThrow(/dependencies/);
-    expect(runtime.resolveArtifact('child', 'artifact:evidence', 7)).toEqual(['root']);
+    runtime.apply({ kind: 'RETURN', actorNodeId: 'child', report: report('child') }, 7);
+    expect(runtime.snapshot().dependencyEdges[0]?.resolved).toBe(true);
+    expect(runtime.snapshot().nodes.find(node => node.id === 'root')?.status).toBe('ready');
     runtime.apply({ kind: 'STOP', actorNodeId: 'root', finalOutput: 'answer' }, 8);
     const snapshot = runtime.snapshot();
     expect(snapshot.stopped).toBe(true);

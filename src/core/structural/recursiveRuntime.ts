@@ -262,6 +262,12 @@ export class RecursiveInformationRealizationRuntime {
       if (!this.observations.has(observation.id)) this.observations.set(observation.id, structuredClone(observation));
     }
     this.reports.set(report.id, structuredClone(report));
+    for (const artifactId of [report.id, `report:${actor.id}`,
+      ...report.claims.map(value => value.id),
+      ...report.evidence.map(value => value.id),
+      ...report.externalObservations.map(value => value.id)]) {
+      this.resolveArtifact(actor.id, artifactId, at);
+    }
     actor.reportId = report.id;
     actor.status = returning ? (actor.id === this.rootId ? 'completed' : 'returned') : 'ready';
     actor.updatedAt = at;

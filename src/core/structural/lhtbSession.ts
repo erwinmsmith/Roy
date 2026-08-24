@@ -142,6 +142,8 @@ export class RoyLHTBSession {
       throw new Error(`Semantic event ${update.event_id} was already processed`);
     }
     this.processedSemanticEventIds.add(update.event_id);
+    const sourceNodeId = this.events.find(event => event.id === update.event_id)?.nodeId
+      ?? this.runtime.snapshot().rootId;
     for (const value of update.requirements) this.runtime.ingestRequirement({
       id: String(value.id), description: String(value.description ?? ''),
       whyItMatters: String(value.whyItMatters ?? value.why_it_matters ?? ''),
@@ -150,7 +152,9 @@ export class RoyLHTBSession {
         ? String(value.likelyMechanism ?? value.likely_mechanism) as
           'acquisition' | 'representation' | 'conversion' : 'mixed',
       requiredInformation: String(value.requiredInformation ?? value.required_information ?? ''),
-      status: 'open', parentNodeId: String(value.parentNodeId ?? value.parent_node_id ?? 'root'),
+      status: 'open', parentNodeId: String(
+        value.parentNodeId ?? value.parent_node_id ?? sourceNodeId
+      ),
     });
     for (const value of update.claims) this.semanticClaims.push({
       id: String(value.id), statement: String(value.statement),

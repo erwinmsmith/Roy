@@ -160,6 +160,36 @@ class LHTBProtocolTests(unittest.TestCase):
             audit = (Path(directory) / "semantic-fallbacks.jsonl").read_text()
             self.assertIn("no_relation_or_entity_fabricated", audit)
 
+    def test_existing_requirement_must_entail_new_requirement_before_suppression(self) -> None:
+        class Builder:
+            calls = []
+
+            def extract(self, event):
+                return {"requirements": [{"id": "new", "description": "new requirement"}],
+                        "claims": [], "assumptions": [], "evidence": [],
+                        "external_observations": [], "blind_spots": []}
+
+            def verify_candidates(self, left, right):
+                self.calls.append((left, right))
+                return [{"left_id": left[0]["id"], "right_id": right[0]["id"],
+                         "label": "entail", "probabilities": {
+                             "entail": 1.0, "contradict": 0.0, "unknown": 0.0,
+                         }}]
+
+        with tempfile.TemporaryDirectory() as directory:
+            server = SemanticServer.__new__(SemanticServer)
+            server.root = Path(directory)
+            server.builder = Builder()
+            result = server.process({"id": "event-1"}, {
+                "requirements": [{"id": "existing", "description": "existing requirement"}]
+            })
+            self.assertEqual(server.builder.calls[0][0][0]["id"], "existing")
+            self.assertEqual(server.builder.calls[0][1][0]["id"], "new")
+            self.assertEqual(result["requirements"], [])
+            self.assertEqual(
+                result["provenance"]["semantically_suppressed_requirement_ids"], ["new"]
+            )
+
     def test_json_rpc_process_restarts_and_restores_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             server = Path(directory) / "server.py"

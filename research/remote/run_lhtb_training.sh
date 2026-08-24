@@ -48,7 +48,8 @@ export ROY_LHTB_SEMANTIC_ROOT="${run_root}/semantic"
 export ROY_LHTB_MODEL="${model}"
 export DEEPSEEK_MODEL_REVISION="${DEEPSEEK_MODEL_REVISION:-deepseek-v4-flash-api-alias}"
 export ROY_LHTB_ORGANIZATION_INTERVAL="${ROY_LHTB_ORGANIZATION_INTERVAL:-5}"
-export ROY_LHTB_EXPLORATION_MIN_NODES="${ROY_LHTB_EXPLORATION_MIN_NODES:-3}"
+# Capability-sampling target only; it is neither a resource ceiling nor a reward term.
+export ROY_LHTB_EXPLORATION_MIN_NODES="${ROY_LHTB_EXPLORATION_MIN_NODES:-6}"
 export ROY_LHTB_EXPLORATION_MIN_DEPTH="${ROY_LHTB_EXPLORATION_MIN_DEPTH:-2}"
 
 group_environment_args=(--environment-backend "${environment_backend}"

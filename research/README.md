@@ -73,6 +73,8 @@ Each trial gets a copied workspace and a distinct unprivileged UID. GPUHome sets
 
 OCI-backed native templates preserve two different identities: the pinned source-registry digest and the digest produced by the local OCI layout conversion. They are verified and recorded separately. Environment-invalid attempts such as an inactive actor are retained as audit records and retried by Harbor; they never receive a synthetic zero reward or enter actor/value updates. The fresh-sampling gate requires exactly eight valid rewards, distinct seeds, one matched initial fingerprint, complete process-state chains, nonzero reward variance, current compact-policy interface records and no more than 15 million aggregate input tokens per `G=8` group.
 
+The topology-rich sampling profile defaults to a six-node exploration target and presents 6–8 nodes as a proposer preference, not a utility term or hard maximum. While the target is unmet, every real open parent-local gap must remain represented by enough distinct legal `DERIVE` candidates (up to three per decision), and states with a shallow candidate interface are saved as `sampling_invalid` and resampled. No gap is synthesized to meet the target. At three or more active nodes the proposer must also expose a novel communication edge when one is available; duplicate active edges are rejected. Dependency edges are allowed only when a child genuinely requires an existing producer's `report:<nodeId>` artifact, and returning that report resolves the edge and wakes the consumer.
+
 GPUHome currently cannot reach Docker Hub directly. Native preparation therefore defaults to the `dockerproxy.net` transport mirror, which was verified to serve the exact configured source manifest digest. Set `ROY_LHTB_OCI_MIRROR` to override it. The mirror is never trusted by tag alone: provisioning pulls `repository@digest`, verifies the pinned source digest, selects only the explicit `linux/amd64` image when that source is a multi-architecture list, and then separately verifies the converted local OCI-layout digest. Runtime, templates and a resumable OCI blob cache default to the expanded `~/rivermind-data/lhtb-native` volume; failed conversion attempts remove task half-products but retain verified downloaded layers for the next attempt.
 
 Native task virtual environments default to the host's Python 3.12 and are included in the content-derived template digest. Set `ROY_LHTB_NATIVE_TASK_PYTHON` only when deliberately evaluating another compatible local interpreter; this is another reason native results are not byte-equivalent to the original Python 3.11 Docker images.
@@ -85,7 +87,7 @@ See [the implementation note](reports/lhtb-process-reward-implementation.md) for
 
 ## τ³ transfer compatibility (not primary training)
 
-The commands below preserve the earlier τ³ adapter and its historical exploration-envelope behavior for regression and transfer work. Its node/depth floors are not used by LHTB, are not part of the current theory, and must not be reported as the primary training method.
+The commands below preserve the earlier τ³ adapter and its historical exploration-envelope behavior for regression and transfer work. Its envelope is separate from LHTB's real-gap-only topology-rich sampling profile; neither is part of the task utility or a theoretical structural objective, and τ³ must not be reported as the primary training method.
 
 ```bash
 npm run research:test

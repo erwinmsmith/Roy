@@ -73,8 +73,17 @@ class SemanticServer:
             right = _semantic_entities(_objects(existing_state.get(entity_type)), text_field)
             if left and right:
                 try:
+                    # A requirement is redundant only when an existing requirement entails
+                    # the newly extracted one. Keep this direction explicit: a more specific
+                    # new requirement may entail an older broad requirement without being
+                    # covered by it.
+                    candidate_left, candidate_right = (
+                        (right, left) if entity_type == "requirements" else (left, right)
+                    )
                     relations.extend({**relation, "entity_type": entity_type}
-                                     for relation in self.builder.verify_candidates(left, right))
+                                     for relation in self.builder.verify_candidates(
+                                         candidate_left, candidate_right
+                                     ))
                 except Exception as error:
                     # Missing a relation is the conservative outcome of a transport/schema
                     # failure. Never fabricate an LLM label and never abort the rollout.
@@ -82,14 +91,29 @@ class SemanticServer:
                         "event_id": event.get("id"), "entity_type": entity_type,
                         "candidate_count": min(8, len(left) * len(right)),
                     }, error)
+        entailed_requirement_ids = {
+            str(relation["right_id"])
+            for relation in relations
+            if relation.get("entity_type") == "requirements"
+            and relation.get("label") == "entail"
+        }
+        requirements = [
+            value for value in _objects(extracted.get("requirements"))
+            if str(value.get("id")) not in entailed_requirement_ids
+        ]
         return {
             "event_id": event.get("id"),
-            "requirements": _objects(extracted.get("requirements")), "claims": claims,
+            "requirements": requirements, "claims": claims,
             "assumptions": _objects(extracted.get("assumptions")),
             "evidence": _objects(extracted.get("evidence")),
             "external_observations": _objects(extracted.get("external_observations")),
             "blind_spots": [str(value) for value in extracted.get("blind_spots", [])],
-            "relations": relations, "provenance": extracted.get("_provenance"),
+            "relations": relations, "provenance": {
+                **dict(extracted.get("_provenance") or {}),
+                "semantically_suppressed_requirement_ids": sorted(
+                    entailed_requirement_ids
+                ),
+            },
         }
 
     def _empty_update(self, event: Mapping[str, Any], error: Exception) -> Dict[str, Any]:

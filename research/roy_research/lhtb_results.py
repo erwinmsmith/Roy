@@ -80,6 +80,7 @@ def import_harbor_group(
             and final_output.get("status") == "policy_dead_end"
         ) or "policy_dead_end:" in exception_message
         environment_invalid = "environment_invalid:" in exception_message
+        sampling_invalid = "sampling_invalid:" in exception_message
         complete = bool(partial_candidates) and reward_available \
             and (exception is None or normal_deadline)
         if normal_deadline:
@@ -90,6 +91,8 @@ def import_harbor_group(
             termination_type = "completed_with_reward"
         elif environment_invalid:
             termination_type = "environment_invalid"
+        elif sampling_invalid:
+            termination_type = "sampling_invalid"
         else:
             termination_type = "environment_failure"
         record = {
@@ -110,9 +113,10 @@ def import_harbor_group(
             "process_states": snapshot.get("processStates", []),
             "terminal_reward": reward, "complete": complete,
             "environment_failure": termination_type in {
-                "environment_invalid", "environment_failure"
+                "environment_invalid", "sampling_invalid", "environment_failure"
             },
             "environment_invalid": environment_invalid,
+            "sampling_invalid": sampling_invalid,
             "accepted_for_training": complete,
             "termination_type": termination_type,
             "harbor_result": result, "harbor_result_path": str(result_path),

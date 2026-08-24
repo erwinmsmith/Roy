@@ -90,10 +90,17 @@ DERIVE must use an exact open requirement ID from organization.requirements and 
 "relevantReportIds":[],"externalAccess":{"allowed":true,"tools":["terminal"],
 "purpose":"..."},"expectedOutput":{"requiredInformation":"...",
 "outputType":"epistemic_report"},"terminationCondition":"..."}}.
-When independent unresolved requirements can be handled concurrently, include distinct legal
-DERIVE candidates. Do not force a node count and do not derive duplicate or non-refining work.
+When structuralExploration requests expansion and independent unresolved requirements exist,
+include up to three distinct legal DERIVE candidates, each using a different exact open gap ID.
+This is candidate coverage, not permission to invent work: never create a fake gap, duplicate an
+existing objective, or derive non-refining work. A requirement extracted from a child event belongs
+to that child unless its provenance explicitly identifies another active parent.
 CONNECT action is {"kind":"CONNECT","actorNodeId":"<actor>","connection":{"from":"<existing>",
-"to":"<different existing>","required":false}}. PRUNE uses targetNodeId for a non-root node.
+"to":"<different existing>","required":false}}. Once at least three nodes exist, include a novel
+CONNECT candidate when a real information handoff would help; never repeat an active edge.
+When a new child genuinely needs a report from an existing producer, childSpecification.dependencies
+may use {"producerNodeId":"<existing>","artifactId":"report:<existing>"}; never fabricate a
+dependency merely to make a DAG. PRUNE uses targetNodeId for a non-root node.
 RETURN action uses the property report (never epistemicReport), with this exact report shape:
 {"id":"...","nodeId":"<actor>","parentId":"...","depth":<actor-depth>,"localObjective":"...",
 "triggeringGapId":"...","conclusion":"...","reasoningSummary":"...","claims":[],
@@ -184,6 +191,15 @@ export function compactEpistemicWorkingState(
     status: value.status, parentNodeId: value.parentNodeId,
     description: compactText(value.description),
     requiredInformation: compactText(value.requiredInformation) }));
+  const openRequirements = snapshot.runtime.requirements.filter(value => value.status === 'open'
+    && activeNodes.some(node => node.id === value.parentNodeId));
+  const minimumNodes = Math.max(0, Number(
+    process.env.ROY_LHTB_EXPLORATION_MIN_NODES ?? 0
+  ));
+  const minimumDepth = Math.max(0, Number(
+    process.env.ROY_LHTB_EXPLORATION_MIN_DEPTH ?? 0
+  ));
+  const maximumDepthReached = Math.max(0, ...snapshot.runtime.nodes.map(node => node.depth));
   return {
     rootGoal: compactText(snapshot.instruction, PROPOSER_GOAL_TEXT_LIMIT),
     organizationMode: snapshot.organizationMode,
@@ -223,6 +239,18 @@ export function compactEpistemicWorkingState(
       activeSubtree: latest.activeSubtree,
       resourceState: latest.usage,
     } : undefined,
+    structuralExploration: {
+      currentNodeCount: snapshot.runtime.nodes.length,
+      currentMaximumDepth: maximumDepthReached,
+      minimumNodeTarget: minimumNodes,
+      preferredTopologyRange: minimumNodes > 0 ? [minimumNodes, Math.max(8, minimumNodes)] : null,
+      minimumDepthTarget: minimumDepth,
+      realOpenGapCount: openRequirements.length,
+      realOpenGapIds: openRequirements.map(value => value.id),
+      desiredAdditionalChildren: Math.min(3, Math.max(0,
+        minimumNodes - snapshot.runtime.nodes.length), openRequirements.length),
+      semantics: 'sampling capability target only; never synthesize gaps or add reward',
+    },
     projection: { recentRuntimeEventCount: PROPOSER_RECENT_EVENT_COUNT,
       eventTextLimit: PROPOSER_EVENT_TEXT_LIMIT, entityTextLimit: PROPOSER_ENTITY_TEXT_LIMIT,
       entityCount: PROPOSER_ENTITY_COUNT, immutableRawLedgerPreserved: true,
@@ -311,8 +339,14 @@ export class LHTBAutonomousController {
         ?? current.completion.usage?.completionTokens ?? 0,
       current.completion.model);
       const currentValidation = this.validateCandidates(current.value, session);
+      const structuralDeficits = this.structuralCandidateDeficits(snapshot,
+        currentValidation.candidates);
+      if (structuralDeficits.length > 0) {
+        currentValidation.dispositions.push({ index: -2, accepted: false,
+          reasons: structuralDeficits });
+      }
       await this.auditCandidateValidation(currentValidation);
-      if (currentValidation.candidates.length > 0) {
+      if (currentValidation.candidates.length > 0 && structuralDeficits.length === 0) {
         completion = current;
         validation = currentValidation;
         break;
@@ -321,6 +355,9 @@ export class LHTBAutonomousController {
         value => value.reasons
       ))];
       if (attempt === proposalAttempts) {
+        if (structuralDeficits.length > 0) {
+          throw new Error(`sampling_invalid:${structuralDeficits.join('; ')}`);
+        }
         if (reasons.length > 0 && reasons.every(reason => reason === 'inactive_actor')) {
           throw new Error('environment_invalid:inactive_actor');
         }
@@ -348,7 +385,7 @@ export class LHTBAutonomousController {
       const rejectedContext = JSON.stringify(rejectedCandidates).slice(0, 12_000);
       messages.splice(0, messages.length,
         { role: 'system', content: PROPOSER_PROMPT },
-        { role: 'user', content: `${JSON.stringify(requestState)}\nA prior candidate set was rejected by the runtime: ${reasons.join('; ')}. Rejected candidates and their exact reasons: ${rejectedContext}. Do not reproduce an unchanged rejected candidate. Return a concise, genuinely legal candidate set with a different command, cwd, or organization action.` }
+        { role: 'user', content: `${JSON.stringify(requestState)}\nA prior candidate set was rejected by the runtime or did not cover the requested structural sampling interface: ${reasons.join('; ')}. Rejected candidates and their exact reasons: ${rejectedContext}. Use the exact realOpenGapIds in structuralExploration when DERIVE coverage is requested. Do not reproduce an unchanged rejected candidate, invent a gap, or repeat an active CONNECT edge. Return a concise, genuinely legal candidate set.` }
       );
     }
     if (!completion || !validation) throw new Error('DeepSeek proposer did not return a completion');
@@ -479,6 +516,8 @@ export class LHTBAutonomousController {
     const allowedKinds = new Set(['DERIVE', 'ACQUIRE', 'CONNECT', 'EXECUTE', 'RETURN',
       'PRUNE', 'STOP']);
     const seenIds = new Set<string>();
+    const seenConnections = new Set(snapshot.runtime.communicationEdges
+      .filter(edge => edge.active).map(edge => `${edge.from}\u0000${edge.to}`));
     const candidates: ProposedCandidate[] = [];
     const dispositions: CandidateValidation['dispositions'] = [];
     response.candidates.forEach((raw, index) => {
@@ -524,6 +563,18 @@ export class LHTBAutonomousController {
         reasons.push('invalid_timeout');
       }
       const action = { ...actionValue, kind, actorNodeId } as OrganizationCandidate['action'];
+      let connectionKeyToAccept: string | undefined;
+      if (kind === 'CONNECT') {
+        const connection = actionValue.connection && typeof actionValue.connection === 'object'
+          ? actionValue.connection as Record<string, unknown> : undefined;
+        const from = typeof connection?.from === 'string' ? connection.from : '';
+        const to = typeof connection?.to === 'string' ? connection.to : '';
+        const connectionKey = `${from}\u0000${to}`;
+        if (from && to && seenConnections.has(connectionKey)) {
+          reasons.push('duplicate_active_connection');
+        }
+        if (from && to) connectionKeyToAccept = connectionKey;
+      }
       const candidate = { id, kind, actorNodeId, description, schedulerComplexity,
         action, command: commandValue?.trim(), cwd: cwdValue?.trim(), timeoutMs } as ProposedCandidate;
       if (reasons.length === 0 && kind !== 'ACQUIRE' && kind !== 'EXECUTE') {
@@ -537,9 +588,56 @@ export class LHTBAutonomousController {
       if (id) seenIds.add(id);
       const accepted = reasons.length === 0;
       dispositions.push({ index, id: id || undefined, accepted, reasons });
-      if (accepted) candidates.push(candidate);
+      if (accepted) {
+        candidates.push(candidate);
+        if (connectionKeyToAccept) seenConnections.add(connectionKeyToAccept);
+      }
     });
     return { candidates, dispositions };
+  }
+
+  private structuralCandidateDeficits(
+    snapshot: ReturnType<RoyLHTBSession['snapshot']>,
+    candidates: ProposedCandidate[]
+  ): string[] {
+    if (snapshot.organizationMode !== 'learned_information_realization') return [];
+    const minimumNodes = Math.max(0, Number(
+      process.env.ROY_LHTB_EXPLORATION_MIN_NODES ?? 0
+    ));
+    if (minimumNodes <= 0 || snapshot.runtime.nodes.length >= minimumNodes) return [];
+    const active = new Set(snapshot.runtime.nodes.filter(node =>
+      ['ready', 'running', 'waiting', 'completed'].includes(node.status)).map(node => node.id));
+    const openGapIds = new Set(snapshot.runtime.requirements.filter(requirement =>
+      requirement.status === 'open' && active.has(requirement.parentNodeId)
+    ).map(requirement => requirement.id));
+    const requiredDerives = Math.min(3, minimumNodes - snapshot.runtime.nodes.length,
+      openGapIds.size);
+    const offeredGapIds = new Set(candidates.filter(candidate => candidate.kind === 'DERIVE')
+      .map(candidate => candidate.action.childSpecification?.triggeringGapId)
+      .filter((gapId): gapId is string => typeof gapId === 'string'
+        && openGapIds.has(gapId)));
+    const deficits: string[] = [];
+    if (offeredGapIds.size < requiredDerives) {
+      deficits.push(`missing_real_gap_derive_candidates:${offeredGapIds.size}/${requiredDerives}`);
+    }
+    if (snapshot.runtime.nodes.length >= 3) {
+      const activeIds = [...active];
+      const existing = new Set(snapshot.runtime.communicationEdges.filter(edge => edge.active)
+        .map(edge => `${edge.from}\u0000${edge.to}`));
+      const hasAvailableConnection = activeIds.some(from => activeIds.some(to => from !== to
+        && !existing.has(`${from}\u0000${to}`)));
+      const offersNovelConnection = candidates.some(candidate => {
+        if (candidate.kind !== 'CONNECT') return false;
+        const connection = candidate.action.connection;
+        return Boolean(connection && connection.from !== connection.to
+          && active.has(connection.from) && active.has(connection.to)
+          && !existing.has(`${connection.from}\u0000${connection.to}`));
+      });
+      if (hasAvailableConnection && !offersNovelConnection) {
+        deficits.push('missing_novel_connect_candidate');
+      }
+    }
+    return deficits;
   }
 
   private policyState(snapshot: ReturnType<RoyLHTBSession['snapshot']>,
