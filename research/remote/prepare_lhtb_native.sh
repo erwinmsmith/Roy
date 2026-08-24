@@ -90,7 +90,7 @@ install_node_22() {
 }
 
 install_proot_runtime() {
-  local binary expected actual
+  local binary expected actual traversal
   binary="${proot_runtime}/bin/proot"
   expected="b7f2adf5a225000a164f4905aabefeebe11c4c1d5bedff5e1fe8866c48dd70d2"
   if [[ ! -x "${binary}" ]]; then
@@ -115,6 +115,15 @@ install_proot_runtime() {
     echo "unexpected PRoot runtime version" >&2
     return 3
   }
+  # Native trials run with a dedicated unprivileged UID/GID. Grant that group
+  # execute-only traversal through every parent of the data-backed runtime;
+  # directory listing and writes remain forbidden by the ACL.
+  traversal="$(realpath -m "${execution_base}")"
+  while [[ "${traversal}" != "/" ]]; do
+    [[ -d "${traversal}" ]] && setfacl -m "g:${native_task_gid}:--x" "${traversal}"
+    traversal="$(dirname "${traversal}")"
+  done
+  setfacl -m "g:${native_task_gid}:--x" /
 }
 
 check_environment() {

@@ -274,7 +274,8 @@ def native_preflight(runtime_root: Path, *, task_gid: int = 210000) -> Dict[str,
             "LHTB-native requires pinned PRoot v5.3.1-99a84175 with statx support"
         )
     result["proot_version"] = "v5.3.1-99a84175"
-    result["proot_executable"] = str(Path(shutil.which("proot") or "").resolve())
+    proot_executable = str(Path(shutil.which("proot") or "").resolve())
+    result["proot_executable"] = proot_executable
     mountpoints = (
         Path("/app"), Path("/tests"), Path("/solution"), Path("/logs"),
         Path("/opt/roy-native/venv"), Path("/opt/roy-native/bin"),
@@ -287,15 +288,15 @@ def native_preflight(runtime_root: Path, *, task_gid: int = 210000) -> Dict[str,
     result["proot_mountpoints"] = [str(value) for value in mountpoints]
     traversal = subprocess.run([
         "setpriv", "--reuid=229999", f"--regid={task_gid}", "--clear-groups",
-        "--no-new-privs", "/usr/bin/true",
+        "--no-new-privs", proot_executable, "--version",
     ], capture_output=True, text=True)
     if traversal.returncode != 0:
         raise RuntimeError(
-            "LHTB-native task GID cannot traverse the GPUHome host root; "
-            "run prepare_lhtb_native.sh prepare to install the execute-only ACL: "
+            "LHTB-native task GID cannot execute the pinned PRoot runtime; "
+            "run prepare_lhtb_native.sh prepare to install parent execute-only ACLs: "
             + traversal.stderr.strip()
         )
-    result["root_traversal_acl"] = "execute-only"
+    result["runtime_traversal_acl"] = "parent-execute-only"
     probe = runtime_root / ".write-probe"
     probe.write_text("ok", encoding="utf-8")
     probe.unlink()
