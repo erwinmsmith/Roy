@@ -215,6 +215,7 @@ def sample_organization_decision(
         torch.multinomial(values["candidate_probabilities"], 1, generator=generator).item()
     )
     candidate = values["candidates"][candidate_index]
+    selected_kind = str(candidate.get("kind"))
     joint_log_probability = (
         context["active_log_probs"][active_index]
         + values["candidate_log_probs"][candidate_index]
@@ -235,6 +236,12 @@ def sample_organization_decision(
             values["candidates"], values["candidate_probabilities"]
         ),
         "selected_action": str(candidate.get("kind")),
+        "masked_old_action_log_probability": float(
+            values["masked_outer_action_log_probabilities"][selected_kind].detach().cpu()
+        ),
+        "masked_old_candidate_conditional_log_probability": float(
+            values["masked_inner_candidate_log_probabilities"][candidate_index].detach().cpu()
+        ),
         "num_real_residual_gaps": int(policy_state.get("num_real_residual_gaps", 0)),
         "num_child_proposals": int(policy_state.get("num_child_proposals", 0)),
         "stop_legal_reason": str(policy_state.get("stop_legal_reason", "unspecified")),
@@ -373,17 +380,56 @@ def _candidate_distribution(
     temperature = float(policy_state.get("organization_temperature", 1.0))
     if temperature <= 0:
         raise ValueError("organization temperature must be positive during replay")
-    candidate_raw_log_probs = torch.log_softmax(candidate_logits / temperature, dim=-1)
-    masked_logits = candidate_logits.masked_fill(
-        ~legal_mask, torch.finfo(candidate_logits.dtype).min
+    kinds = [str(value["kind"]) for value in candidates]
+    candidate_raw_log_probs, raw_outer, raw_inner = _hierarchical_candidate_log_probs(
+        kinds, candidate_logits, actor_mask, temperature
     )
-    candidate_log_probs = torch.log_softmax(masked_logits / temperature, dim=-1)
+    candidate_log_probs, masked_outer, masked_inner = _hierarchical_candidate_log_probs(
+        kinds, candidate_logits, legal_mask, temperature
+    )
     return {
         "candidates": candidates,
         "candidate_raw_probabilities": candidate_raw_log_probs.exp(),
         "candidate_log_probs": candidate_log_probs,
         "candidate_probabilities": candidate_log_probs.exp(),
+        "raw_outer_action_log_probabilities": raw_outer,
+        "masked_outer_action_log_probabilities": masked_outer,
+        "raw_inner_candidate_log_probabilities": raw_inner,
+        "masked_inner_candidate_log_probabilities": masked_inner,
     }
+
+
+def _hierarchical_candidate_log_probs(
+    kinds: Sequence[str], logits: Tensor, mask: Tensor, temperature: float,
+) -> Tuple[Tensor, Dict[str, Tensor], Tensor]:
+    """Outer action then inner candidate; action mass is invariant to candidate count."""
+    scaled = logits / temperature
+    negative_infinity = torch.finfo(logits.dtype).min
+    outer_scores: List[Tensor] = []
+    represented_kinds: List[str] = []
+    inner = torch.full_like(logits, negative_infinity)
+    for kind in ORGANIZATION_ACTIONS:
+        indices = torch.tensor([
+            index for index, candidate_kind in enumerate(kinds)
+            if candidate_kind == kind and bool(mask[index])
+        ], dtype=torch.long, device=logits.device)
+        if indices.numel() == 0:
+            continue
+        values = scaled[indices]
+        # log-mean-exp prevents three DERIVE specifications from receiving three
+        # times the outer action mass of one EXECUTE candidate.
+        outer_scores.append(torch.logsumexp(values, dim=0) - math.log(indices.numel()))
+        represented_kinds.append(kind)
+        inner[indices] = torch.log_softmax(values, dim=0)
+    if not outer_scores:
+        raise ValueError("hierarchical organization policy has no legal action kind")
+    outer_values = torch.log_softmax(torch.stack(outer_scores), dim=0)
+    outer = {kind: value for kind, value in zip(represented_kinds, outer_values)}
+    joint = torch.full_like(logits, negative_infinity)
+    for index, kind in enumerate(kinds):
+        if kind in outer and bool(mask[index]):
+            joint[index] = outer[kind] + inner[index]
+    return joint, outer, inner
 
 
 def _action_probability_summary(

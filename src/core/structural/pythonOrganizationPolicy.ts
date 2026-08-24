@@ -44,6 +44,11 @@ export class PythonOrganizationPolicyClient {
       stateFingerprint: String(raw.state_fingerprint), activeNodeId: String(raw.active_node_id),
       candidateId: String(raw.candidate_id),
       maskedOldLogProbability: Number(raw.masked_old_log_probability),
+      maskedOldActionLogProbability: raw.masked_old_action_log_probability === undefined
+        ? undefined : Number(raw.masked_old_action_log_probability),
+      maskedOldCandidateConditionalLogProbability:
+        raw.masked_old_candidate_conditional_log_probability === undefined
+          ? undefined : Number(raw.masked_old_candidate_conditional_log_probability),
       envelopeId: String(raw.envelope_id), policyState: raw.policy_state,
       availableActions: Array.isArray(raw.available_actions)
         ? raw.available_actions.map(String) as OrganizationPolicyRecord['availableActions']

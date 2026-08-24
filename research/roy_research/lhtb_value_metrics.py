@@ -5,7 +5,11 @@ from typing import Any, Dict, Mapping, Sequence
 import numpy as np
 import torch
 
-from .model import FrozenTextEncoder, graph_tensors
+from .model import FrozenTextEncoder, epistemic_state_graph, graph_tensors
+from .lhtb_transitions import (
+    build_decision_transition_samples,
+    build_state_transition_samples,
+)
 from .value_model import EpistemicValueModel, process_credit
 
 
@@ -25,12 +29,7 @@ def value_metrics(records: Sequence[Mapping[str, Any]], checkpoint: str,
         for record in records:
             reward = float(record["terminal_reward"])
             for state in record["process_states"]:
-                nodes = [{"id": value.get("id"), "kind": "agent",
-                          "text": value.get("localObjective", ""),
-                          "timestamp": value.get("createdAt", 0),
-                          "status": value.get("status")}
-                         for value in state.get("nodes", [])]
-                graph = {"nodes": nodes, "edges": state.get("dagEdges", [])}
+                graph = epistemic_state_graph(state)
                 tensors = [value.to(device) for value in graph_tensors(graph, encoder)]
                 predictions.append(float(model(*tensors)))
                 targets.append(reward)
@@ -70,17 +69,24 @@ def annotate_value_traces(records: Sequence[Mapping[str, Any]], checkpoint: str,
             enriched["target_value_trace"] = target_predictions
             enriched["process_rewards"] = process_rewards[0]
             enriched["shaped_returns"] = returns[0]
+            metadata = {"trajectory_id": record.get("id"),
+                        "task_id": record.get("task_id"),
+                        "rollout_index": record.get("rollout_index")}
+            enriched["state_transitions"] = build_state_transition_samples(
+                states, target_predictions,
+                float(record.get("terminal_reward", record.get("reward"))), metadata
+            )
+            enriched["decision_transitions"] = build_decision_transition_samples(
+                states, list(record.get("policy_records", [])), target_predictions,
+                float(record.get("terminal_reward", record.get("reward"))), metadata
+            ) if indices else []
             result.append(enriched)
     return result
 
 
 def _predict_state(model: EpistemicValueModel, state: Mapping[str, Any],
                    encoder: FrozenTextEncoder, device: torch.device) -> float:
-    nodes = [{"id": value.get("id"), "kind": "agent",
-              "text": value.get("localObjective", ""),
-              "timestamp": value.get("createdAt", 0), "status": value.get("status")}
-             for value in state.get("nodes", [])]
-    graph = {"nodes": nodes, "edges": state.get("dagEdges", [])}
+    graph = epistemic_state_graph(state)
     tensors = [value.to(device) for value in graph_tensors(graph, encoder)]
     return float(model(*tensors))
 

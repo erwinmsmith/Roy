@@ -8,7 +8,11 @@ import torch
 from torch import Tensor
 
 from .lhtb import require_training_task
-from .model import FrozenTextEncoder, graph_tensors
+from .lhtb_transitions import (
+    build_decision_transition_samples,
+    build_state_transition_samples,
+)
+from .model import FrozenTextEncoder, epistemic_state_graph, graph_tensors
 from .organization_model import InformationRealizationPolicy
 from .organization_replay import replay_joint_log_probability
 from .value_model import (
@@ -22,7 +26,7 @@ from .value_model import (
 
 
 LHTB_GROUP_SIZE = 8
-LHTB_POLICY_INTERFACE_REVISION = "compact-epistemic-event-driven-v1"
+LHTB_POLICY_INTERFACE_REVISION = "compact-epistemic-event-driven-v2"
 LHTB_GROUP_INPUT_TOKEN_GATE = 15_000_000
 
 
@@ -77,11 +81,16 @@ class LHTBProcessGRPOTrainer:
         decision_states = [self._decision_states(states, list(value["policy_records"]))
                            for states, value in zip(state_sequences, records)]
 
-        # The target is frozen for this entire group. Actor credit follows decision
-        # states, while the critic learns from every immutable process state.
+        # The target is frozen for this entire group. Every adjacent M_t -> M_{t+1}
+        # transition is scored for audit; actor credit sums the same potential
+        # differences over event-driven decision spans.
         with torch.no_grad():
-            target_values = [[float(self._predict(self.target, state)) for state in states]
-                             for states in decision_states]
+            full_target_values = [[float(self._predict(self.target, state)) for state in states]
+                                  for states in state_sequences]
+        target_values = [self._values_for_states(states, values, selected)
+                         for states, values, selected in zip(
+                             state_sequences, full_target_values, decision_states
+                         )]
         process_rewards, returns = process_credit(target_values, rewards)
         advantages, return_mean, shaped_std = trajectory_weighted_advantages(returns)
 
@@ -122,6 +131,26 @@ class LHTBProcessGRPOTrainer:
         self.value_steps += 1
         update_ema(self.target, self.value, self.ema_decay)
 
+        transition_samples: List[Mapping[str, Any]] = []
+        for trajectory, states, values, reward in zip(
+            records, state_sequences, full_target_values, rewards
+        ):
+            metadata = {
+                "group_id": group_id, "trajectory_id": trajectory.get("id"),
+                "task_id": trajectory.get("task_id"),
+                "rollout_index": trajectory.get("rollout_index"),
+                "epoch": trajectory.get("epoch"), "split": trajectory.get("split"),
+                "policy_revision": trajectory.get("policy_revision"),
+                "target_value_revision": self.groups,
+            }
+            transition_samples.extend(build_state_transition_samples(
+                states, values, reward, metadata
+            ))
+            transition_samples.extend(build_decision_transition_samples(
+                states, list(trajectory["policy_records"]), values, reward, metadata
+            ))
+        transition_reward_summary = self._transition_reward_summary(transition_samples)
+
         self.groups += 1
         self.updated_group_ids.add(group_id)
         result: Dict[str, Any] = {
@@ -132,21 +161,16 @@ class LHTBProcessGRPOTrainer:
             "shaped_return_mean": return_mean, "shaped_return_std": shaped_std,
             "target_revision": self.groups - 1, "ema_decay": self.ema_decay,
             "process_rewards": process_rewards, "target_values": target_values,
+            "transition_reward_summary": transition_reward_summary,
         }
         self.history.append(result)
         self.save()
-        return result
+        return {**result, "transition_samples": transition_samples}
 
     def _predict(self, model: EpistemicValueModel, state: Mapping[str, Any]) -> Tensor:
         graph = state.get("event_graph")
         if not isinstance(graph, Mapping):
-            nodes = [{"id": value.get("id"), "kind": "agent",
-                      "text": value.get("localObjective", value.get("local_objective", "")),
-                      "timestamp": value.get("createdAt", value.get("created_at", 0)),
-                      "status": value.get("status")}
-                     for value in state.get("nodes", [])]
-            graph = {"nodes": nodes,
-                     "edges": state.get("dag_edges", state.get("dagEdges", []))}
+            graph = epistemic_state_graph(state)
         tensors = [value.to(self.device) for value in graph_tensors(dict(graph), self.encoder)]
         return model(*tensors)
 
@@ -161,6 +185,32 @@ class LHTBProcessGRPOTrainer:
             selected.append(by_fingerprint[fingerprint])
         selected.append(states[-1])
         return selected
+
+    @staticmethod
+    def _values_for_states(states: Sequence[Mapping[str, Any]], values: Sequence[float],
+                           selected: Sequence[Mapping[str, Any]]) -> List[float]:
+        by_fingerprint = {str(state.get("fingerprint")): value
+                          for state, value in zip(states, values)}
+        return [by_fingerprint[str(state.get("fingerprint"))] for state in selected]
+
+    @staticmethod
+    def _transition_reward_summary(samples: Sequence[Mapping[str, Any]]) -> Dict[str, int]:
+        topology = [value for value in samples
+                    if value.get("sample_type") == "state_transition"
+                    and value.get("topology_changed")]
+        return {
+            "all_state_transitions": sum(value.get("sample_type") == "state_transition"
+                                         for value in samples),
+            "decision_transitions": sum(value.get("sample_type") == "decision_transition"
+                                        for value in samples),
+            "topology_transitions": len(topology),
+            "positive_topology_rewards": sum(value.get("reward_sign") == "positive"
+                                             for value in topology),
+            "negative_topology_rewards": sum(value.get("reward_sign") == "negative"
+                                             for value in topology),
+            "zero_topology_rewards": sum(value.get("reward_sign") == "zero"
+                                         for value in topology),
+        }
 
     def _validate(self, records: Sequence[Mapping[str, Any]]) -> None:
         if len(records) != LHTB_GROUP_SIZE:
@@ -212,6 +262,25 @@ class LHTBProcessGRPOTrainer:
             if len(states) < len(policy) + 1:
                 raise ValueError("trajectory must save all decision states plus a terminal state")
             self._decision_states(states, policy)
+            transitions = value.get("state_transitions")
+            if not isinstance(transitions, Sequence) or len(transitions) != len(states) - 1:
+                raise ValueError("trajectory must save every adjacent M_t -> M_t+1 transition")
+            if any(abs(int(item.get("topology_delta", {}).get("node_count_delta", 0))) > 1
+                   for item in transitions if isinstance(item, Mapping)):
+                raise ValueError("topology must be derived one node at a time")
+        sampling_profiles = {
+            str(((list(value["policy_records"])[0].get("policy_state")
+                  or list(value["policy_records"])[0].get("policyState") or {})
+                 .get("sampling_profile") or {}).get("id"))
+            for value in records if list(value["policy_records"])
+        }
+        sampling_profiles.discard("None")
+        if len(sampling_profiles) < 3:
+            raise ValueError("G=8 must cover at least three topology sampling profiles")
+        terminal_node_counts = [len(list(value["process_states"])[-1].get("nodes", []))
+                                for value in records]
+        if max(terminal_node_counts) - min(terminal_node_counts) < 2:
+            raise ValueError("G=8 terminal topologies need simple-to-complex node variance")
         group_input_tokens = sum(int(
             (list(value["process_states"])[-1].get("usage") or {}).get("inputTokens", 0)
         ) for value in records)

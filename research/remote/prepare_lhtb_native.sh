@@ -418,10 +418,6 @@ roy_smoke() {
   export ROY_LHTB_MODEL="${roy_root}/research/output/lhtb/native/smoke-initial.pt"
   export ROY_LHTB_NATIVE_ROOT="${native_root}"
   export ROY_LHTB_ORGANIZATION_INTERVAL="${ROY_LHTB_ORGANIZATION_INTERVAL:-5}"
-  # Capability-sampling target only. The runtime still requires a real open gap for
-  # every DERIVE and does not add node-count reward or fabricate work.
-  export ROY_LHTB_EXPLORATION_MIN_NODES="${ROY_LHTB_EXPLORATION_MIN_NODES:-6}"
-  export ROY_LHTB_EXPLORATION_MIN_DEPTH="${ROY_LHTB_EXPLORATION_MIN_DEPTH:-2}"
   if [[ ! -f "${ROY_LHTB_MODEL}" ]]; then
     "${python_bin}" -m roy_research lhtb-init \
       --manifest "${roy_root}/research/config/lhtb_split.json" --model "${ROY_LHTB_MODEL}"

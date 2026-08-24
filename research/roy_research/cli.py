@@ -270,6 +270,7 @@ def parser() -> argparse.ArgumentParser:
     lhtb_update.add_argument("--trajectories", type=Path, required=True)
     lhtb_update.add_argument("--model", type=Path, required=True)
     lhtb_update.add_argument("--updates", type=Path, required=True)
+    lhtb_update.add_argument("--transition-samples", type=Path)
     lhtb_update.add_argument("--device", default="cpu")
     lhtb_update.add_argument("--resume", action="store_true")
 
@@ -435,6 +436,14 @@ def main(argv: List[str] | None = None) -> None:
             if group_id in trainer.updated_group_ids:
                 continue
             update = trainer.update_group(records)
+            transition_samples = list(update.pop("transition_samples", []))
+            transition_path = args.transition_samples or args.updates.with_name(
+                "transition-reward-samples.jsonl"
+            )
+            if transition_samples:
+                write_jsonl(transition_path, transition_samples,
+                            append=transition_path.exists())
+            update["transition_samples_path"] = str(transition_path)
             updates.append(update)
             write_jsonl(args.updates, [update], append=args.updates.exists())
         print(json.dumps({"new_updates": len(updates), **trainer.metadata()}))

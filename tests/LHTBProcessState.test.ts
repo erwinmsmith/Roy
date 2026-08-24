@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { GlobalEpistemicStateRecorder, LHTBAutonomousController,
-  RoyLHTBSession } from '../src/core/structural/index.js';
+  RoyLHTBSession, topologySamplingProfile } from '../src/core/structural/index.js';
 import { LLMJSONParseError } from '../src/core/llm/providers/openai.js';
 
 function baseInput(sequence: number, previousFingerprint?: string) {
@@ -18,6 +18,12 @@ function baseInput(sequence: number, previousFingerprint?: string) {
 }
 
 describe('LHTB process state', () => {
+  it('covers compact through connected topology profiles without changing utility', () => {
+    expect([0, 1, 2, 3].map(topologySamplingProfile).map(value => value.id))
+      .toEqual(['compact', 'branching', 'recursive', 'connected']);
+    expect(topologySamplingProfile(3).preferredNodeRange).toEqual([6, 8]);
+    expect(topologySamplingProfile(2).preferredMinimumDepth).toBe(2);
+  });
   it('round-trips an append-only fingerprint chain', () => {
     const recorder = new GlobalEpistemicStateRecorder();
     const first = recorder.append(baseInput(0));

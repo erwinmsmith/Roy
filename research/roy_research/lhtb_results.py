@@ -9,6 +9,7 @@ import numpy as np
 from copy import deepcopy
 
 from .process_state import canonical_fingerprint
+from .lhtb_transitions import build_state_transition_samples
 
 from .io import write_jsonl
 
@@ -95,8 +96,9 @@ def import_harbor_group(
             termination_type = "sampling_invalid"
         else:
             termination_type = "environment_failure"
+        process_states = snapshot.get("processStates", [])
         record = {
-            "schema_version": 1, "id": str(result.get("id", result_path.parent.name)),
+            "schema_version": 2, "id": str(result.get("id", result_path.parent.name)),
             "group_id": group_id, "benchmark": "lhtb", "task_id": task_id,
             "category": category, "split": split, "epoch": epoch,
             "arm": arm,
@@ -110,7 +112,8 @@ def import_harbor_group(
             "initial_snapshot_fingerprint": snapshot.get("initialSnapshotFingerprint"),
             "actions": _actions(snapshot), "policy_records": snapshot.get("policyRecords", []),
             "policy_interface_revision": _policy_interface_revision(snapshot),
-            "process_states": snapshot.get("processStates", []),
+            "process_states": process_states,
+            "state_transitions": build_state_transition_samples(process_states),
             "terminal_reward": reward, "complete": complete,
             "environment_failure": termination_type in {
                 "environment_invalid", "sampling_invalid", "environment_failure"
@@ -227,6 +230,9 @@ def validate_smoke(root: Path, task_ids: tuple[str, ...] = (
         fingerprints = set()
         seeds = set()
         state_counts = []
+        terminal_node_counts = []
+        sampling_profiles = set()
+        topology_transition_count = 0
         input_tokens = 0
         policy_diagnostics = True
         compact_interface = True
@@ -246,13 +252,33 @@ def validate_smoke(root: Path, task_ids: tuple[str, ...] = (
             if not states or any(not value.get("fingerprint") for value in states):
                 raise ValueError(f"smoke M_0...M_T is incomplete for {task_id}")
             state_counts.append(len(states))
+            transitions = build_state_transition_samples(states)
+            if len(transitions) != len(states) - 1:
+                raise ValueError(f"smoke transition chain is incomplete for {task_id}")
+            if any(abs(int(value["topology_delta"]["node_count_delta"])) > 1
+                   for value in transitions):
+                raise ValueError(f"smoke topology was not derived one node at a time for {task_id}")
+            topology_transition_count += sum(bool(value["topology_changed"])
+                                             for value in transitions)
+            terminal_node_counts.append(len(states[-1].get("nodes", [])))
             input_tokens += int((states[-1].get("usage") or {}).get("inputTokens", 0))
             records = list(snapshot.get("policyRecords", []))
+            sampling_profiles.update(
+                str(((value.get("policyState") or {}).get("sampling_profile") or {}).get("id"))
+                for value in records
+                if ((value.get("policyState") or {}).get("sampling_profile") or {}).get("id")
+            )
             policy_diagnostics = policy_diagnostics and bool(records) and all(
                 isinstance(value.get("rawProbabilities"), Mapping)
                 and isinstance(value.get("maskedProbabilities"), Mapping)
                 and value.get("selectedAction")
                 and math.isfinite(float(value.get("maskedOldLogProbability", float("nan"))))
+                and math.isfinite(float(value.get(
+                    "maskedOldActionLogProbability", float("nan")
+                )))
+                and math.isfinite(float(value.get(
+                    "maskedOldCandidateConditionalLogProbability", float("nan")
+                )))
                 and abs(sum(float(probability) for probability in
                             value["rawProbabilities"].values()) - 1.0) <= 1e-4
                 and abs(sum(float(probability) for probability in
@@ -261,7 +287,7 @@ def validate_smoke(root: Path, task_ids: tuple[str, ...] = (
             )
             compact_interface = compact_interface and all(
                 (value.get("policyState") or {}).get("interface_revision")
-                == "compact-epistemic-event-driven-v1"
+                == "compact-epistemic-event-driven-v2"
                 and "terminal_result_count" in (value.get("policyState") or {})
                 and "organization_action_count" in (value.get("policyState") or {})
                 for value in records
@@ -293,6 +319,10 @@ def validate_smoke(root: Path, task_ids: tuple[str, ...] = (
             raise ValueError(f"smoke raw terminal ledger is incomplete for {task_id}")
         if not derive_available or not derive_selected:
             raise ValueError(f"smoke did not preserve and sample DERIVE for {task_id}")
+        if len(sampling_profiles) < 3:
+            raise ValueError(f"smoke lacks simple-to-complex topology coverage for {task_id}")
+        if max(terminal_node_counts) - min(terminal_node_counts) < 2:
+            raise ValueError(f"smoke terminal topologies lack complexity variance for {task_id}")
         groups[task_id] = {"rewards": rewards, "state_counts": state_counts,
                            "reward_std": float(np.std(rewards)),
                            "input_tokens": input_tokens,
@@ -301,7 +331,11 @@ def validate_smoke(root: Path, task_ids: tuple[str, ...] = (
                            "compact_interface": True,
                            "raw_terminal_ledger": True,
                            "derive_available": True,
-                           "derive_selected": True}
+                           "derive_selected": True,
+                           "sampling_profiles": sorted(sampling_profiles),
+                           "terminal_node_counts": terminal_node_counts,
+                           "topology_transition_count": topology_transition_count,
+                           "stepwise_topology": True}
     if len(groups) != len(task_ids):
         raise ValueError(f"expected {len(task_ids)} complete smoke groups, found {len(groups)}")
     if not any(value["reward_std"] > 1e-8 for value in groups.values()):

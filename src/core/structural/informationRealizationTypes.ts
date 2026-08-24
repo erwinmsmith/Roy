@@ -177,6 +177,8 @@ export interface OrganizationPolicyRecord {
   activeNodeId: string;
   candidateId: string;
   maskedOldLogProbability: number;
+  maskedOldActionLogProbability?: number;
+  maskedOldCandidateConditionalLogProbability?: number;
   envelopeId: string;
   policyState?: unknown;
   availableActions?: OrganizationActionKind[];

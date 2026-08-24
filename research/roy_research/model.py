@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -185,3 +185,83 @@ def graph_tensors(graph: Dict[str, object], encoder: FrozenTextEncoder) -> Tuple
         for edge in valid
     ], dtype=torch.long)
     return embeddings, kinds, scalars, edge_index, edge_types
+
+
+def epistemic_state_graph(state: Mapping[str, Any]) -> Dict[str, object]:
+    """Project a full M_t into typed relational nodes without semantic heuristics."""
+    nodes: List[Dict[str, Any]] = []
+    edges: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add_node(identifier: Any, kind: str, text: Any, status: Any = None,
+                 timestamp: Any = 0, signal: float = 0.0) -> str | None:
+        if identifier is None:
+            return None
+        node_id = str(identifier)
+        if not node_id or node_id in seen:
+            return node_id if node_id else None
+        seen.add(node_id)
+        nodes.append({"id": node_id, "kind": kind, "text": str(text or ""),
+                      "status": status, "timestamp": timestamp,
+                      "attributes": {"signal": signal}})
+        return node_id
+
+    for value in state.get("nodes", []):
+        if isinstance(value, Mapping):
+            status = str(value.get("status", ""))
+            add_node(value.get("id"), "agent",
+                     value.get("localObjective", value.get("local_objective", "")),
+                     status, value.get("createdAt", value.get("created_at", 0)),
+                     1.0 if status in ("completed", "returned") else 0.0)
+    for value in state.get("requirements", []):
+        if not isinstance(value, Mapping):
+            continue
+        status = str(value.get("status", "open"))
+        node_id = add_node(value.get("id"), "subtask",
+                           value.get("description", value.get("requiredInformation", "")),
+                           status, signal=1.0 if status == "resolved" else 0.0)
+        parent = value.get("parentNodeId", value.get("parent_node_id"))
+        if node_id and parent is not None:
+            edges.append({"kind": "dependency", "from": str(parent), "to": node_id})
+    for value in state.get("claims", []):
+        if not isinstance(value, Mapping):
+            continue
+        status = str(value.get("status", "tentative"))
+        node_id = add_node(value.get("id"), "child_result", value.get("statement", ""),
+                           status, signal=1.0 if status == "supported" else 0.0)
+        origin = value.get("originNodeId", value.get("origin_node_id"))
+        if node_id and origin is not None:
+            edges.append({"kind": "produces", "from": str(origin), "to": node_id})
+    for index, value in enumerate(state.get("assumptions", [])):
+        if isinstance(value, Mapping):
+            status = str(value.get("status", "unverified"))
+            add_node(value.get("id", f"assumption-{index}"), "message",
+                     value.get("statement", ""), status,
+                     signal=1.0 if status == "verified" else 0.0)
+    for index, value in enumerate(state.get("evidence", [])):
+        if not isinstance(value, Mapping):
+            continue
+        node_id = add_node(value.get("id", f"evidence-{index}"), "artifact",
+                           value.get("content", ""), "observed", signal=1.0)
+        for claim_id in value.get("supports", []):
+            if node_id:
+                edges.append({"kind": "produces", "from": node_id, "to": str(claim_id)})
+    for index, value in enumerate(state.get(
+        "externalObservations", state.get("external_observations", [])
+    )):
+        if not isinstance(value, Mapping):
+            continue
+        node_id = add_node(value.get("id", f"observation-{index}"), "tool_result",
+                           value.get("observation", ""), "observed", signal=1.0)
+        for claim_id in value.get("supports", []):
+            if node_id:
+                edges.append({"kind": "produces", "from": node_id, "to": str(claim_id)})
+    for value in state.get("dagEdges", state.get("dag_edges", [])):
+        if isinstance(value, Mapping):
+            edges.append(dict(value))
+    for value in state.get("semanticRelations", state.get("semantic_relations", [])):
+        if isinstance(value, Mapping):
+            edges.append({"kind": "dependency",
+                          "from": str(value.get("leftId", value.get("left_id", ""))),
+                          "to": str(value.get("rightId", value.get("right_id", "")))})
+    return {"nodes": nodes, "edges": edges}

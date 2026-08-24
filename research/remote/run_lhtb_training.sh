@@ -11,6 +11,7 @@ schedule="${run_root}/schedule.json"
 model="${run_root}/checkpoints/current.pt"
 trajectories="${run_root}/train-trajectories.jsonl"
 updates="${run_root}/update-audit.jsonl"
+transition_samples="${run_root}/transition-reward-samples.jsonl"
 dev_trajectories="${run_root}/dev-trajectories.jsonl"
 dev_metrics="${run_root}/dev-metrics.jsonl"
 environment_backend="${ROY_LHTB_ENVIRONMENT_BACKEND:-docker}"
@@ -48,9 +49,6 @@ export ROY_LHTB_SEMANTIC_ROOT="${run_root}/semantic"
 export ROY_LHTB_MODEL="${model}"
 export DEEPSEEK_MODEL_REVISION="${DEEPSEEK_MODEL_REVISION:-deepseek-v4-flash-api-alias}"
 export ROY_LHTB_ORGANIZATION_INTERVAL="${ROY_LHTB_ORGANIZATION_INTERVAL:-5}"
-# Capability-sampling target only; it is neither a resource ceiling nor a reward term.
-export ROY_LHTB_EXPLORATION_MIN_NODES="${ROY_LHTB_EXPLORATION_MIN_NODES:-6}"
-export ROY_LHTB_EXPLORATION_MIN_DEPTH="${ROY_LHTB_EXPLORATION_MIN_DEPTH:-2}"
 
 group_environment_args=(--environment-backend "${environment_backend}"
   --max-retries "${ROY_LHTB_MAX_ENV_RETRIES:-8}")
@@ -201,7 +199,7 @@ PY
     --environment-backend "${environment_backend}"
   "${python_bin}" -m roy_research lhtb-update \
     --manifest "${manifest}" --trajectories "${trajectories}" --model "${model}" \
-    --updates "${updates}" --resume
+    --updates "${updates}" --transition-samples "${transition_samples}" --resume
 done
 if [[ "${current_epoch}" -ge 0 ]]; then run_dev_epoch "${current_epoch}"; fi
 }

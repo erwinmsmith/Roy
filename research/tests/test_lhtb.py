@@ -41,6 +41,11 @@ from roy_research.lhtb_experiment import (
     write_harbor_group_config,
 )
 from roy_research.lhtb_results import official_lhtb_reward
+from roy_research.lhtb_transitions import (
+    build_decision_transition_samples,
+    build_state_transition_samples,
+)
+from roy_research.model import epistemic_state_graph
 from roy_research.lhtb_training import (
     LHTB_POLICY_INTERFACE_REVISION,
     LHTBProcessGRPOTrainer,
@@ -56,7 +61,10 @@ from roy_research.lhtb_native import (
     resolve_native_task_source,
     tree_digest,
 )
-from roy_research.organization_replay import sample_organization_decision
+from roy_research.organization_replay import (
+    _hierarchical_candidate_log_probs,
+    sample_organization_decision,
+)
 
 
 class FakeEncoder:
@@ -555,6 +563,73 @@ for line in sys.stdin:
         self.assertGreater(deviation, 0)
         self.assertEqual([len(value) for value in advantages], [2, 1])
 
+    def test_topology_edits_save_adjacent_positive_and_negative_reward_samples(self) -> None:
+        states = [{
+            "sequence": 0, "fingerprint": "m0",
+            "nodes": [{"id": "root", "depth": 0, "status": "ready"}],
+            "dagEdges": [], "runtimeEvents": [],
+        }, {
+            "sequence": 1, "fingerprint": "m1",
+            "nodes": [{"id": "root", "depth": 0, "status": "ready"},
+                      {"id": "child", "parentId": "root", "depth": 1,
+                       "status": "ready"}],
+            "dagEdges": [{"kind": "derivation", "from": "root", "to": "child"}],
+            "runtimeEvents": [{"id": "derive", "kind": "organization_action",
+                               "attributes": {"action": {"kind": "DERIVE"}}}],
+        }, {
+            "sequence": 2, "fingerprint": "m2",
+            "nodes": [{"id": "root", "depth": 0, "status": "completed"},
+                      {"id": "child", "parentId": "root", "depth": 1,
+                       "status": "returned"}],
+            "dagEdges": [{"kind": "derivation", "from": "root", "to": "child"},
+                         {"kind": "communication", "from": "child", "to": "root"}],
+            "runtimeEvents": [{"id": "derive", "kind": "organization_action",
+                               "attributes": {"action": {"kind": "DERIVE"}}},
+                              {"id": "stop", "kind": "organization_action",
+                               "attributes": {"action": {"kind": "STOP"}}}],
+        }]
+        values = [0.5, 0.7, 0.4]
+        samples = build_state_transition_samples(states, values, 0.2)
+        self.assertEqual([value["reward_sign"] for value in samples],
+                         ["positive", "negative"])
+        self.assertEqual(samples[0]["topology_delta"]["node_count_delta"], 1)
+        self.assertEqual(samples[1]["topology_delta"]["edge_count_delta"], 1)
+        self.assertAlmostEqual(sum(value["process_reward"] for value in samples), -0.3)
+        decisions = build_decision_transition_samples(states, [{
+            "stateFingerprint": "m0", "selectedAction": "DERIVE", "candidateId": "derive",
+            "policyState": {"sampling_profile": {"id": "compact"}},
+        }, {
+            "stateFingerprint": "m1", "selectedAction": "STOP", "candidateId": "stop",
+            "policyState": {"sampling_profile": {"id": "compact"}},
+        }], values, 0.2)
+        self.assertEqual(len(decisions), 2)
+        self.assertEqual(decisions[0]["from_state_fingerprint"], "m0")
+        self.assertEqual(decisions[0]["to_state_fingerprint"], "m1")
+
+    def test_outer_action_probability_is_not_multiplied_by_derive_candidate_count(self) -> None:
+        joint, outer, inner = _hierarchical_candidate_log_probs(
+            ["DERIVE", "DERIVE", "DERIVE", "EXECUTE"], torch.zeros(4),
+            torch.ones(4, dtype=torch.bool), 1.0,
+        )
+        self.assertAlmostEqual(float(outer["DERIVE"].exp()), 0.5, places=6)
+        self.assertAlmostEqual(float(outer["EXECUTE"].exp()), 0.5, places=6)
+        self.assertAlmostEqual(float(joint[:3].exp().sum()), 0.5, places=6)
+        self.assertAlmostEqual(float(joint[3].exp()), 0.5, places=6)
+        self.assertAlmostEqual(float(inner[:3].exp().sum()), 1.0, places=6)
+
+    def test_value_graph_contains_epistemic_progress_as_well_as_agents(self) -> None:
+        graph = epistemic_state_graph({
+            "nodes": [{"id": "root", "localObjective": "solve", "status": "ready"}],
+            "requirements": [{"id": "gap", "description": "find evidence", "status": "open",
+                              "parentNodeId": "root"}],
+            "claims": [{"id": "claim", "statement": "answer", "status": "supported",
+                        "originNodeId": "root"}],
+            "evidence": [{"id": "evidence", "content": "proof", "supports": ["claim"]}],
+        })
+        self.assertEqual({value["id"] for value in graph["nodes"]},
+                         {"root", "gap", "claim", "evidence"})
+        self.assertIn({"kind": "dependency", "from": "root", "to": "gap"}, graph["edges"])
+
     def test_constant_value_is_terminal_grpo_and_value_updates_on_zero_variance(self) -> None:
         model = EpistemicValueModel(text_dim=4, hidden_dim=8, node_type_dim=2, layers=1)
         target = make_ema_target(model)
@@ -602,8 +677,13 @@ for line in sys.stdin:
             }
             records = []
             for rollout_index in range(8):
+                rollout_policy_state = {**policy_state, "sampling_profile": {
+                    "id": ("compact", "branching", "recursive", "connected")[
+                        rollout_index % 4
+                    ]
+                }}
                 _, policy_record = sample_organization_decision(
-                    trainer.actor, encoder, policy_state, device=torch.device("cpu")
+                    trainer.actor, encoder, rollout_policy_state, device=torch.device("cpu")
                 )
                 self.assertEqual(policy_record["selected_action"], "STOP")
                 self.assertAlmostEqual(
@@ -612,6 +692,27 @@ for line in sys.stdin:
                 self.assertAlmostEqual(
                     sum(policy_record["masked_probabilities"].values()), 1.0, places=6
                 )
+                states = [{"sequence": 0, "fingerprint": "m0", "nodes": [{"id": "root",
+                    "localObjective": "solve", "createdAt": 0, "status": "ready"}],
+                    "dagEdges": [], "runtimeEvents": []}]
+                for node_index in range(rollout_index % 3):
+                    prior_nodes = list(states[-1]["nodes"])
+                    child_id = f"child-{node_index}"
+                    states.append({"sequence": len(states),
+                        "fingerprint": f"m{len(states)}-{rollout_index}",
+                        "nodes": [*prior_nodes, {"id": child_id, "parentId": "root",
+                            "localObjective": "subtask", "createdAt": node_index + 1,
+                            "depth": 1, "status": "ready"}],
+                        "dagEdges": [*states[-1]["dagEdges"],
+                            {"kind": "derivation", "from": "root", "to": child_id}],
+                        "runtimeEvents": []})
+                terminal = dict(states[-1])
+                terminal["sequence"] = len(states)
+                terminal["fingerprint"] = f"terminal-{rollout_index}"
+                terminal["nodes"] = [{**node, "status": "completed"}
+                                     if node["id"] == "root" else node
+                                     for node in terminal["nodes"]]
+                states.append(terminal)
                 records.append({
                     "group_id": f"lhtb:0:{task_id}", "benchmark": "lhtb",
                     "task_id": task_id, "split": "train", "epoch": 0,
@@ -622,17 +723,14 @@ for line in sys.stdin:
                     "task_checksum": "checksum", "docker_digest": "sha256:image",
                     "runtime_config": {"timeout": 3600}, "policy_records": [policy_record],
                     "policy_interface_revision": LHTB_POLICY_INTERFACE_REVISION,
-                    "process_states": [
-                        {"fingerprint": "m0", "nodes": [{"id": "root",
-                            "localObjective": "solve", "createdAt": 0, "status": "ready"}],
-                         "dagEdges": []},
-                        {"fingerprint": "m1", "nodes": [{"id": "root",
-                            "localObjective": "solve", "createdAt": 0, "status": "completed"}],
-                         "dagEdges": []},
-                    ],
+                    "process_states": states,
+                    "state_transitions": build_state_transition_samples(states),
                 })
             update = trainer.update_group(records)
             self.assertFalse(update["actor_updated"])
+            self.assertGreater(update["transition_reward_summary"]["topology_transitions"], 0)
+            self.assertGreater(update["transition_reward_summary"]["negative_topology_rewards"], 0)
+            self.assertTrue(update["transition_samples"])
             self.assertEqual(trainer.value_steps, 1)
             restored = LHTBProcessGRPOTrainer(
                 checkpoint, manifest, encoder=encoder, resume=True

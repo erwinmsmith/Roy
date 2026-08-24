@@ -37,6 +37,27 @@ interface CandidateValidation {
   dispositions: Array<{ index: number; id?: string; accepted: boolean; reasons: string[] }>;
 }
 
+export interface TopologySamplingProfile {
+  id: 'compact' | 'branching' | 'recursive' | 'connected';
+  preferredNodeRange: [number, number];
+  preferredMinimumDepth: number;
+  focus: string;
+}
+
+export function topologySamplingProfile(organizationSeed: number): TopologySamplingProfile {
+  const profiles: TopologySamplingProfile[] = [
+    { id: 'compact', preferredNodeRange: [2, 3], preferredMinimumDepth: 1,
+      focus: 'small rooted structure; execute existing nodes before adding optional branches' },
+    { id: 'branching', preferredNodeRange: [3, 5], preferredMinimumDepth: 1,
+      focus: 'independent root-local branches with selective information handoff' },
+    { id: 'recursive', preferredNodeRange: [5, 7], preferredMinimumDepth: 2,
+      focus: 'execute a child, then refine a real child-local residual gap recursively' },
+    { id: 'connected', preferredNodeRange: [6, 8], preferredMinimumDepth: 2,
+      focus: 'richer derivation with novel communication and genuine report dependencies' },
+  ];
+  return profiles[Math.abs(Math.trunc(organizationSeed)) % profiles.length] ?? profiles[0];
+}
+
 export type ControllerResult =
   | { status: 'terminal_request'; request: { id: string; command: string; cwd?: string;
     timeoutMs: number; nodeId: string }; snapshot: ReturnType<RoyLHTBSession['snapshot']> }
@@ -101,6 +122,11 @@ CONNECT candidate when a real information handoff would help; never repeat an ac
 When a new child genuinely needs a report from an existing producer, childSpecification.dependencies
 may use {"producerNodeId":"<existing>","artifactId":"report:<existing>"}; never fabricate a
 dependency merely to make a DAG. PRUNE uses targetNodeId for a non-root node.
+The sampling profile is an intervention for coverage, never a quality label. Progress one legal
+organization action at a time. Once currentNodeCount reaches preferredTopologyRange[1], omit
+DERIVE unless an existing node cannot realize a task-critical open requirement; prioritize
+EXECUTE, ACQUIRE, RETURN, PRUNE, or a useful novel CONNECT. For a recursive profile, execute a
+child early enough to expose a real child-local residual gap instead of assigning every root gap.
 RETURN action uses the property report (never epistemicReport), with this exact report shape:
 {"id":"...","nodeId":"<actor>","parentId":"...","depth":<actor-depth>,"localObjective":"...",
 "triggeringGapId":"...","conclusion":"...","reasoningSummary":"...","claims":[],
@@ -193,12 +219,7 @@ export function compactEpistemicWorkingState(
     requiredInformation: compactText(value.requiredInformation) }));
   const openRequirements = snapshot.runtime.requirements.filter(value => value.status === 'open'
     && activeNodes.some(node => node.id === value.parentNodeId));
-  const minimumNodes = Math.max(0, Number(
-    process.env.ROY_LHTB_EXPLORATION_MIN_NODES ?? 0
-  ));
-  const minimumDepth = Math.max(0, Number(
-    process.env.ROY_LHTB_EXPLORATION_MIN_DEPTH ?? 0
-  ));
+  const profile = topologySamplingProfile(snapshot.organizationSeed);
   const maximumDepthReached = Math.max(0, ...snapshot.runtime.nodes.map(node => node.depth));
   return {
     rootGoal: compactText(snapshot.instruction, PROPOSER_GOAL_TEXT_LIMIT),
@@ -242,13 +263,15 @@ export function compactEpistemicWorkingState(
     structuralExploration: {
       currentNodeCount: snapshot.runtime.nodes.length,
       currentMaximumDepth: maximumDepthReached,
-      minimumNodeTarget: minimumNodes,
-      preferredTopologyRange: minimumNodes > 0 ? [minimumNodes, Math.max(8, minimumNodes)] : null,
-      minimumDepthTarget: minimumDepth,
+      samplingProfile: profile.id,
+      minimumNodeTarget: profile.preferredNodeRange[0],
+      preferredTopologyRange: profile.preferredNodeRange,
+      minimumDepthTarget: profile.preferredMinimumDepth,
+      focus: profile.focus,
       realOpenGapCount: openRequirements.length,
       realOpenGapIds: openRequirements.map(value => value.id),
       desiredAdditionalChildren: Math.min(3, Math.max(0,
-        minimumNodes - snapshot.runtime.nodes.length), openRequirements.length),
+        profile.preferredNodeRange[0] - snapshot.runtime.nodes.length), openRequirements.length),
       semantics: 'sampling capability target only; never synthesize gaps or add reward',
     },
     projection: { recentRuntimeEventCount: PROPOSER_RECENT_EVENT_COUNT,
@@ -605,9 +628,8 @@ export class LHTBAutonomousController {
     candidates: ProposedCandidate[]
   ): string[] {
     if (snapshot.organizationMode !== 'learned_information_realization') return [];
-    const minimumNodes = Math.max(0, Number(
-      process.env.ROY_LHTB_EXPLORATION_MIN_NODES ?? 0
-    ));
+    const profile = topologySamplingProfile(snapshot.organizationSeed);
+    const minimumNodes = profile.preferredNodeRange[0];
     if (minimumNodes <= 0) return [];
     const active = new Set(snapshot.runtime.nodes.filter(node =>
       ['ready', 'running', 'waiting', 'completed'].includes(node.status)).map(node => node.id));
@@ -624,7 +646,7 @@ export class LHTBAutonomousController {
     if (offeredGapIds.size < requiredDerives) {
       deficits.push(`missing_real_gap_derive_candidates:${offeredGapIds.size}/${requiredDerives}`);
     }
-    if (snapshot.runtime.nodes.length >= minimumNodes
+    if (profile.id === 'connected' && snapshot.runtime.nodes.length >= minimumNodes
       && snapshot.runtime.communicationEdges.every(edge => !edge.active)) {
       const activeIds = [...active];
       const existing = new Set(snapshot.runtime.communicationEdges.filter(edge => edge.active)
@@ -649,9 +671,33 @@ export class LHTBAutonomousController {
     candidates: ProposedCandidate[]): Record<string, unknown> {
     const activeNodes = snapshot.runtime.nodes
       .filter(node => ['ready', 'running', 'waiting', 'completed'].includes(node.status));
-    const nodes = snapshot.runtime.nodes.map(node => ({ id: node.id, kind: 'agent',
+    const latest = snapshot.processStates.at(-1);
+    const agentNodes = snapshot.runtime.nodes.map(node => ({ id: node.id, kind: 'agent',
       timestamp: node.createdAt, text: node.localObjective, status: node.status,
       attributes: { signal: node.status === 'returned' || node.status === 'completed' ? 1 : 0 } }));
+    const epistemicNodes = [
+      ...(latest?.requirements ?? []).map(value => ({ id: value.id, kind: 'subtask',
+        timestamp: 0, text: value.description, status: value.status,
+        attributes: { signal: value.status === 'resolved' ? 1 : 0 } })),
+      ...(latest?.claims ?? []).map(value => ({ id: value.id, kind: 'child_result',
+        timestamp: 0, text: value.statement, status: value.status,
+        attributes: { signal: value.status === 'supported' ? 1 : 0 } })),
+      ...(latest?.assumptions ?? []).map((value, index) => ({
+        id: String(value.id ?? `assumption-${index}`), kind: 'message', timestamp: 0,
+        text: String(value.statement ?? ''), status: String(value.status ?? 'unverified'),
+        attributes: { signal: value.status === 'verified' ? 1 : 0 } })),
+      ...(latest?.evidence ?? []).map(value => ({ id: value.id, kind: 'artifact',
+        timestamp: 0, text: value.content, status: 'observed', attributes: { signal: 1 } })),
+      ...(latest?.externalObservations ?? []).map(value => ({ id: value.id,
+        kind: 'tool_result', timestamp: 0, text: value.observation, status: 'observed',
+        attributes: { signal: 1 } })),
+    ];
+    const seenNodeIds = new Set<string>();
+    const nodes = [...agentNodes, ...epistemicNodes].filter(node => {
+      if (seenNodeIds.has(node.id)) return false;
+      seenNodeIds.add(node.id);
+      return true;
+    });
     const edges = [
       ...snapshot.runtime.derivationEdges.map((edge, index) => ({ id: `d-${index}`,
         kind: 'derivation', from: edge.parentId, to: edge.childId })),
@@ -659,14 +705,22 @@ export class LHTBAutonomousController {
         kind: 'dependency', from: edge.producerId, to: edge.consumerId })),
       ...snapshot.runtime.communicationEdges.map((edge, index) => ({ id: `c-${index}`,
         kind: 'communication', from: edge.from, to: edge.to })),
+      ...(latest?.requirements ?? []).map((value, index) => ({ id: `r-${index}`,
+        kind: 'dependency', from: value.parentNodeId, to: value.id })),
+      ...(latest?.claims ?? []).map((value, index) => ({ id: `cl-${index}`,
+        kind: 'produces', from: value.originNodeId, to: value.id })),
+      ...(latest?.evidence ?? []).flatMap((value, evidenceIndex) => value.supports.map(
+        (claimId, supportIndex) => ({ id: `e-${evidenceIndex}-${supportIndex}`,
+          kind: 'produces', from: value.id, to: claimId }))),
+      ...(latest?.externalObservations ?? []).flatMap((value, observationIndex) =>
+        value.supports.map((claimId, supportIndex) => ({
+          id: `o-${observationIndex}-${supportIndex}`, kind: 'produces',
+          from: value.id, to: claimId }))),
     ];
     const openRequirements = snapshot.runtime.requirements.filter(value => value.status === 'open');
-    const minimumNodes = Math.max(0, Number(
-      process.env.ROY_LHTB_EXPLORATION_MIN_NODES ?? 0
-    ));
-    const minimumDepth = Math.max(0, Number(
-      process.env.ROY_LHTB_EXPLORATION_MIN_DEPTH ?? 0
-    ));
+    const profile = topologySamplingProfile(snapshot.organizationSeed);
+    const minimumNodes = profile.preferredNodeRange[0];
+    const minimumDepth = profile.preferredMinimumDepth;
     const maximumDepthReached = Math.max(0, ...snapshot.runtime.nodes.map(node => node.depth));
     const explorationStopMasked = openRequirements.length > 0
       && (snapshot.runtime.nodes.length < minimumNodes || maximumDepthReached < minimumDepth);
@@ -677,9 +731,12 @@ export class LHTBAutonomousController {
       resolves_gap: candidate.kind === 'ACQUIRE' || candidate.kind === 'RETURN',
       depth_delta: candidate.kind === 'DERIVE' ? 1 : 0,
       legal: !(candidate.kind === 'STOP' && explorationStopMasked) }));
-    const events = snapshot.processStates.at(-1)?.runtimeEvents ?? [];
+    const events = latest?.runtimeEvents ?? [];
     return {
-      interface_revision: 'compact-epistemic-event-driven-v1',
+      interface_revision: 'compact-epistemic-event-driven-v2',
+      sampling_profile: { id: profile.id, preferred_node_range: profile.preferredNodeRange,
+        preferred_minimum_depth: profile.preferredMinimumDepth, focus: profile.focus,
+        reward_semantics: 'coverage intervention only; topology has no intrinsic reward' },
       state_fingerprint: snapshot.processStates.at(-1)?.fingerprint,
       event_graph: { nodes, edges },
       active_node_ids: activeNodes.map(node => node.id),

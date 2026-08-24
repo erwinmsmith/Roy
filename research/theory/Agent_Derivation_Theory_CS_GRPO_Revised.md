@@ -65,15 +65,16 @@ Every node returns a structured epistemic report containing concise reasoning su
 
 ## 4. One autonomous policy
 
-Roy learns one organization policy. At each organization decision it first selects an active node and then selects an open candidate conditioned on that node:
+Roy learns one organization policy. At each organization decision it selects an active node, an outer grammar action, and then an open payload conditioned on that action:
 
 ```text
 pi_theta(n, a, z | s)
   = pi_active(n | s)
-    pi_candidate(a, z | s, n).
+    pi_action(a | s, n)
+    pi_payload(z | s, n, a).
 ```
 
-Here `a` is one grammar action and `z` is its open payload, such as a proposed child specification, acquisition requirement, connection, report, or prune target. Candidate count and node count are variable. No fixed role ID, fixed child catalog, teacher trajectory, or teacher score is part of the model.
+Here `a` is one grammar action and `z` is its open payload, such as a proposed child specification, acquisition requirement, connection, report, or prune target. Outer action mass is computed independently of the number of payload candidates; multiple DERIVE specifications therefore compete only inside `pi_payload` and cannot multiply DERIVE's outer probability. Candidate count and node count are variable. No fixed role ID, fixed child catalog, teacher trajectory, or teacher score is part of the model.
 
 The policy encoder is a typed relational network over derivation, dependency, communication, tool-use, evidence and return edges. It scores all currently active nodes, then embeds and scores open candidates conditioned on the sampled node and the full graph representation. Training replay must reconstruct this same joint conditional probability exactly.
 
@@ -115,6 +116,8 @@ G_i,t = R_i - V_bar(M_i,t).
 ```
 
 Thus the process rewards telescope exactly to `R_i - V_bar(M_i,0)` and do not introduce another objective. Across all decisions in the group, mean and variance use step weight `1/T_i`; every trajectory therefore has total statistical weight one. The resulting single advantage enters the length-normalized clipped surrogate with exact old-policy ratios. Update order is actor, value, then EMA. The value head starts at constant `0.5`, so the first group preserves terminal-GRPO ordering. When final scores are equal, the value model still learns; the actor updates only if shaped returns have variance.
+
+The immutable dataset retains both adjacent event transitions and SMDP decision spans. Each adjacent sample contains the exact `M_t` and `M_t+1` fingerprints, one-step topology delta, target values and signed process reward. Decision credit is the telescoping sum over all adjacent transitions until the next organization decision. Sampling profiles may deliberately expose compact, branching, recursive and connected structures, but profile identity, node count and topology complexity never determine reward sign; only the final-score-trained frozen value potential does.
 
 There is no teacher, imitation, predefined role pool, staged objective, entropy bonus, cost penalty or weighted reward sum.
 
