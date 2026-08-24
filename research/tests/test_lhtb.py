@@ -339,6 +339,30 @@ for line in sys.stdin:
             audit = audit_native_tasks(lhtb, split_path, templates)
             self.assertEqual(audit["counts"], {"compatible": 1, "needs_provisioning": 45})
             self.assertEqual(native_environment_digest(audit, selected.task_id), "sha256:native")
+            (task_root / "environment" / "docker-compose.yaml").write_text(
+                "services:\n  game: {}\n"
+            )
+            (native_root / "native-manifest.json").write_text(json.dumps({
+                "schema_version": 1,
+                "lhtb_commit": LHTB_COMMIT,
+                "task_digest": tree_digest(task_root),
+                "environment_digest": "sha256:native-service",
+                "services": [{"name": "game"}],
+            }))
+            isolated = audit_native_tasks(lhtb, split_path, templates)
+            selected_isolated = next(
+                value for value in isolated["tasks"]
+                if value["task_id"] == selected.task_id
+            )
+            self.assertEqual(selected_isolated["status"], "incompatible")
+            degraded = audit_native_tasks(
+                lhtb, split_path, templates, allow_network_degraded=True
+            )
+            selected_degraded = next(
+                value for value in degraded["tasks"]
+                if value["task_id"] == selected.task_id
+            )
+            self.assertEqual(selected_degraded["status"], "degraded")
             missing = next(
                 value for value in records if value.task_id != selected.task_id
             )

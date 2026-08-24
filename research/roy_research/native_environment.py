@@ -6,8 +6,11 @@ import os
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -74,6 +77,7 @@ class NativeProcessEnvironment(BaseEnvironment):
         self._rootfs: Path | None = None
         self._manifest: Mapping[str, Any] | None = None
         self._process_groups: set[int] = set()
+        self._service_audit: list[dict[str, Any]] = []
         self._stopped_agent_pids: set[int] = set()
         self._protected_material_roots: set[str] = set()
         self._exec_index = 0
@@ -173,6 +177,7 @@ class NativeProcessEnvironment(BaseEnvironment):
             (self.session_root / "opt" / "roy-native" / "bin").mkdir(parents=True)
         await asyncio.to_thread(self._chown_session)
         await asyncio.to_thread(self._apply_path_permissions)
+        await asyncio.to_thread(self._start_services, template)
         audit = {
             "schema_version": 1,
             "backend": NATIVE_BACKEND_ID,
@@ -193,9 +198,117 @@ class NativeProcessEnvironment(BaseEnvironment):
             "rootfs": str(self._rootfs) if self._rootfs else None,
             "oci_image": manifest.get("oci_image"),
             "oci_digest": manifest.get("oci_digest"),
+            "services": self._service_audit,
         }
         audit_path = self.trial_paths.trial_dir / "native-environment.json"
         audit_path.write_text(json.dumps(audit, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    @staticmethod
+    def _allocate_loopback_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            return int(probe.getsockname()[1])
+
+    def _start_services(self, template: Path) -> None:
+        services = list((self._manifest or {}).get("services", []))
+        if not services:
+            return
+        agent_environment = dict((self._manifest or {}).get("environment", {}))
+        for value in services:
+            if not isinstance(value, Mapping):
+                raise ValueError("native service must be an object")
+            name = str(value.get("name") or "")
+            if not name or not all(character.isalnum() or character in "-_" for character in name):
+                raise ValueError(f"invalid native service name: {name!r}")
+            port = self._allocate_loopback_port()
+            substitutions = {
+                "template": str(template),
+                "port": str(port),
+            }
+            command = [
+                str(item).format_map(substitutions)
+                for item in value.get("command", [])
+            ]
+            if not command:
+                raise ValueError(f"native service {name} has no command")
+            working_directory = Path(
+                str(value.get("working_directory", "{template}"))
+                .format_map(substitutions)
+            ).resolve()
+            if not working_directory.is_relative_to(template.resolve()):
+                raise ValueError(f"native service {name} cwd escapes its template")
+            environment = {
+                "HOME": "/tmp",
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+                "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/games",
+                **{
+                    str(key): str(item).format_map(substitutions)
+                    for key, item in dict(value.get("environment", {})).items()
+                },
+            }
+            port_environment = str(value.get("port_environment") or "")
+            if port_environment:
+                environment[port_environment] = str(port)
+            agent_url_environment = str(value.get("agent_url_environment") or "")
+            if agent_url_environment:
+                agent_environment[agent_url_environment] = f"http://127.0.0.1:{port}"
+            log_root = self.trial_paths.trial_dir / "services"
+            log_root.mkdir(parents=True, exist_ok=True)
+            log_path = log_root / f"{name}.log"
+            with log_path.open("ab") as service_log:
+                process = subprocess.Popen(
+                    [
+                        "setpriv", f"--reuid={self._service_uid}",
+                        f"--regid={self.task_gid}", "--clear-groups",
+                        "--no-new-privs", "env", "-i",
+                        *[f"{key}={item}" for key, item in environment.items()],
+                        *command,
+                    ],
+                    cwd=working_directory,
+                    stdin=subprocess.DEVNULL,
+                    stdout=service_log,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            self._process_groups.add(process.pid)
+            health_path = str(value.get("health_path", "/"))
+            health_timeout = float(value.get("health_timeout_seconds", 60))
+            health_url = f"http://127.0.0.1:{port}{health_path}"
+            deadline = time.monotonic() + health_timeout
+            last_error = "service did not become healthy"
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    last_error = f"service exited with code {process.returncode}"
+                    break
+                try:
+                    with urllib.request.urlopen(health_url, timeout=2) as response:
+                        if 200 <= response.status < 300:
+                            self._service_audit.append({
+                                "name": name,
+                                "pid": process.pid,
+                                "port": port,
+                                "health_url": health_url,
+                            })
+                            break
+                except (OSError, urllib.error.URLError) as error:
+                    last_error = str(error)
+                time.sleep(0.25)
+            else:
+                pass
+            if not any(item["name"] == name for item in self._service_audit):
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                self._process_groups.discard(process.pid)
+                raise RuntimeError(
+                    f"native service {name} failed healthcheck: {last_error}; "
+                    f"see {log_path}"
+                )
+        updated_manifest = dict(self._manifest or {})
+        updated_manifest["environment"] = agent_environment
+        self._manifest = updated_manifest
 
     def _chown_session(self) -> None:
         assert self.session_root is not None

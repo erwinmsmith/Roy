@@ -47,6 +47,7 @@ install_system_dependencies() {
   ldconfig -p | grep 'libgfortran\.so' >/dev/null || packages+=(libgfortran5)
   ldconfig -p | grep 'liblapack\.so' >/dev/null || packages+=(liblapack3)
   ldconfig -p | grep 'libquadmath\.so' >/dev/null || packages+=(libquadmath0)
+  [[ -x /usr/games/stockfish ]] || packages+=(stockfish)
   if (( ${#packages[@]} )); then
     if [[ "${ROY_LHTB_APT_UPDATE:-true}" == "true" ]]; then
       apt-get update
@@ -56,6 +57,9 @@ install_system_dependencies() {
     done
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       "${packages[@]}"
+  fi
+  if [[ -x /usr/games/stockfish && ! -e /usr/local/bin/stockfish ]]; then
+    ln -s /usr/games/stockfish /usr/local/bin/stockfish
   fi
   if ! command -v uv >/dev/null; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \

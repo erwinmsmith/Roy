@@ -147,8 +147,11 @@ def audit_native_tasks(
         manifest_path = template_root / task_id / "native-manifest.json"
         native_manifest = _load_native_manifest(manifest_path)
         reasons: list[str] = []
-        if has_compose:
+        native_services = list((native_manifest or {}).get("services", []))
+        if has_compose and not native_services:
             reasons.append("docker_compose_requires_multiple_services")
+        elif has_compose:
+            reasons.append("service_network_isolation_unavailable_on_gpuhome_container")
         if str(environment.get("os", "linux")).lower() not in ("linux", "taskos.linux"):
             reasons.append("non_linux_task")
         if not allow_internet:
@@ -162,13 +165,14 @@ def audit_native_tasks(
 
         hard = {"docker_compose_requires_multiple_services", "non_linux_task"}
         stale = {"native_template_task_digest_mismatch", "native_template_lhtb_commit_mismatch"}
+        degraded_network = (not allow_internet or bool(native_services))
         if hard.intersection(reasons) or stale.intersection(reasons):
             status = "incompatible"
         elif native_manifest is None:
             status = "needs_provisioning"
-        elif not allow_internet and not allow_network_degraded:
+        elif degraded_network and not allow_network_degraded:
             status = "incompatible"
-        elif not allow_internet:
+        elif degraded_network:
             status = "degraded"
         else:
             status = "compatible"
@@ -405,6 +409,16 @@ def provision_native_task(
                 "uv", "pip", "install", "--python", str(venv / "bin" / "python"),
                 *dependencies,
             ], check=True)
+        service_dependencies = list(spec.get("service_python_dependencies", []))
+        if service_dependencies:
+            service_venv = target / "service-venv"
+            subprocess.run([
+                "uv", "venv", "--python", python_executable, str(service_venv),
+            ], check=True)
+            subprocess.run([
+                "uv", "pip", "install", "--python",
+                str(service_venv / "bin" / "python"), *service_dependencies,
+            ], check=True)
         for command in spec.get("build_commands", []):
             subprocess.run(
                 ["bash", "-euo", "pipefail", "-c", str(command)],
@@ -447,6 +461,7 @@ def provision_native_task(
             "rootfs": rootfs_relative,
             "bind_opt": bool(spec.get("bind_opt", False)),
             "service_commands": list(spec.get("service_commands", [])),
+            "services": list(spec.get("services", [])),
             "network_isolation": False,
             "official_leaderboard_comparable": False,
         }
