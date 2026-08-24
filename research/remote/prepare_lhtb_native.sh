@@ -12,7 +12,7 @@ proot_runtime="${execution_base}/tools/proot-v5.3.1-99a84175"
 python_bin="${roy_root}/research/.venv/bin/python"
 harbor_bin="${roy_root}/research/.venv/bin/harbor"
 native_task_python="${ROY_LHTB_NATIVE_TASK_PYTHON:-3.12}"
-export ROY_LHTB_OCI_MIRROR="${ROY_LHTB_OCI_MIRROR:-docker.1ms.run}"
+export ROY_LHTB_OCI_MIRROR="${ROY_LHTB_OCI_MIRROR:-dockerproxy.net}"
 native_task_gid=210000
 revision="84d7ba5ee34fae6c11f0d7cb8ed5faa73a9ece54"
 mode="${1:-check}"
@@ -91,6 +91,9 @@ install_node_22() {
 
 install_proot_runtime() {
   local binary expected actual traversal
+  mkdir -p "${proot_runtime}"
+  exec 9>"${proot_runtime}/.install.lock"
+  flock 9
   binary="${proot_runtime}/bin/proot"
   expected="b7f2adf5a225000a164f4905aabefeebe11c4c1d5bedff5e1fe8866c48dd70d2"
   if [[ ! -x "${binary}" ]]; then
@@ -124,10 +127,11 @@ install_proot_runtime() {
     traversal="$(dirname "${traversal}")"
   done
   setfacl -m "g:${native_task_gid}:--x" /
+  flock -u 9
 }
 
 check_environment() {
-  for command_name in git git-lfs node npm proot python3 setpriv skopeo tmux timeout umoci uv; do
+  for command_name in flock git git-lfs node npm proot python3 setpriv skopeo tmux timeout umoci uv; do
     command -v "${command_name}" >/dev/null || {
       echo "missing required command: ${command_name}" >&2
       exit 2
