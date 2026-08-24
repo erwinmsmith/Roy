@@ -6,6 +6,7 @@ import os
 import shlex
 import shutil
 import signal
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Mapping
@@ -187,6 +188,16 @@ class NativeProcessEnvironment(BaseEnvironment):
         # The Agent owns the trial root; the shared task GID gives the distinct
         # service/verifier UID traverse-only access to its protected descendants.
         self.session_root.chmod(0o710)
+        app_root = self.session_root / "app"
+        subprocess.run(
+            ["setfacl", "-R", "-m", f"u:{self._service_uid}:rwx", str(app_root)],
+            check=True,
+        )
+        for root, _, _ in os.walk(app_root):
+            subprocess.run(
+                ["setfacl", "-m", f"d:u:{self._service_uid}:rwx", root],
+                check=True,
+            )
 
     def _apply_path_permissions(self) -> None:
         for value in (self._manifest or {}).get("path_permissions", []):

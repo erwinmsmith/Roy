@@ -210,7 +210,7 @@ def native_environment_digest(audit: Mapping[str, Any], task_id: str) -> str:
 
 
 def native_preflight(runtime_root: Path, *, task_gid: int = 210000) -> Dict[str, Any]:
-    required = ("proot", "setpriv", "timeout", "cp", "getfacl")
+    required = ("proot", "setpriv", "timeout", "cp", "getfacl", "setfacl")
     missing = [name for name in required if shutil.which(name) is None]
     result = {
         "backend": NATIVE_BACKEND_ID,
@@ -229,6 +229,16 @@ def native_preflight(runtime_root: Path, *, task_gid: int = 210000) -> Dict[str,
         raise RuntimeError("LHTB-native requires x86_64 Linux")
     if missing:
         raise RuntimeError(f"LHTB-native is missing commands: {', '.join(missing)}")
+    mountpoints = (
+        Path("/app"), Path("/tests"), Path("/solution"), Path("/logs"),
+        Path("/opt/roy-native/venv"), Path("/opt/roy-native/bin"),
+    )
+    for mountpoint in mountpoints:
+        if mountpoint.exists() and not mountpoint.is_dir():
+            raise RuntimeError(f"native PRoot mountpoint is not a directory: {mountpoint}")
+        mountpoint.mkdir(parents=True, exist_ok=True)
+        mountpoint.chmod(0o755)
+    result["proot_mountpoints"] = [str(value) for value in mountpoints]
     traversal = subprocess.run([
         "setpriv", "--reuid=229999", f"--regid={task_gid}", "--clear-groups",
         "--no-new-privs", "/usr/bin/true",
