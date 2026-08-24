@@ -36,9 +36,21 @@
       "rootfs_copies": [{"source": "app", "target": "app"}],
       "working_directory": "/app"
     },
+    "apex-investment-banking-matter": {
+      "oci_image": "docker.io/zli12321/lhtb-apex-investment-banking-matter:20260729",
+      "oci_digest": "sha256:a3476fd80781716026e4e62cfae5dfb2b416b381f322122107a5c22bdb84922b",
+      "rootfs_copies": [{"source": "app", "target": "app"}],
+      "working_directory": "/app"
+    },
     "apex-law433-matter": {
       "oci_image": "docker.io/zli12321/lhtb-apex-law433-matter:20260615",
       "oci_digest": "sha256:ffc1e75103002a6643afa020a2813b0cf918bc2e824d4bd21c5a59e8cb1b35b2",
+      "rootfs_copies": [{"source": "app", "target": "app"}],
+      "working_directory": "/app"
+    },
+    "apex-management-consulting-matter": {
+      "oci_image": "docker.io/zli12321/lhtb-apex-management-consulting-matter:20260615",
+      "oci_digest": "sha256:a97d76adefcd4b127c2024724e44469c883f923922da285b4c101f05bb903a2d",
       "rootfs_copies": [{"source": "app", "target": "app"}],
       "working_directory": "/app"
     },
@@ -75,6 +87,12 @@
         "PYTHONPATH": "/app/src"
       }
     },
+    "commit0-multilib-tdd": {
+      "oci_image": "docker.io/zli12321/lhtb-commit0-multilib-tdd:20260615",
+      "oci_digest": "sha256:48106b2474c39b2cbcbbbade8d81e9290299a70b89977a2509c63c2e4996415b",
+      "rootfs_copies": [{"source": "app", "target": "app"}],
+      "working_directory": "/app"
+    },
     "document-table-layout-reconstruction": {
       "copies": [{"source": "project", "target": "app"}],
       "python_project": "project",
@@ -87,6 +105,12 @@
         "PYTHONPATH": "/app/src",
         "PYTHONUNBUFFERED": "1"
       }
+    },
+    "duckdb-optimizer-closure": {
+      "oci_image": "docker.io/zli12321/lhtb-duckdb-optimizer-closure:20260615",
+      "oci_digest": "sha256:2de9da8e4a2334fb381ce92053855dd2356c81f42b89241d61a0920e77740e93",
+      "rootfs_copies": [{"source": "app", "target": "app"}],
+      "working_directory": "/app"
     },
     "foldseek-paper-reproduction": {
       "copies": [{"source": "project", "target": "app"}],
@@ -117,6 +141,12 @@
         {"name": "dq-audit", "content": "#!/bin/sh\nexec python -m dq_audit.cli \"$@\"\n"}
       ]
     },
+    "langchain-version-migration": {
+      "oci_image": "docker.io/zli12321/lhtb-langchain-version-migration:20260615",
+      "oci_digest": "sha256:cf31f3848d622f3445e9644f5200bab766f0c7144467c5323d21d629185eb13c",
+      "rootfs_copies": [{"source": "app", "target": "app"}],
+      "working_directory": "/app"
+    },
     "gdal-proj-raster-regression": {
       "copies": [{"source": "project", "target": "app"}],
       "python_project": "project",
@@ -129,6 +159,18 @@
         "PYTHONPATH": "/app/src",
         "PYTHONUNBUFFERED": "1"
       }
+    },
+    "generals-bot-arena": {
+      "oci_image": "docker.io/zli12321/lhtb-generals-bot-arena:20260615",
+      "oci_digest": "sha256:49ac31d7c0afb5beac6dadccd095b5fae745f755d333739a1cc802ed420de421",
+      "rootfs_copies": [{"source": "app", "target": "app"}],
+      "working_directory": "/app"
+    },
+    "grammar-fuzz-coverage-hunt": {
+      "oci_image": "docker.io/zli12321/lhtb-grammar-fuzz-coverage-hunt:20260615",
+      "oci_digest": "sha256:74c0b4b497762e06f66944d19bec7b03dd3ab183fa48dec90a6f4ed1082e3e65",
+      "rootfs_copies": [{"source": "app", "target": "app"}],
+      "working_directory": "/app"
     },
     "materials-phase-diagram-audit": {
       "copies": [{"source": "project", "target": "app"}],
@@ -184,6 +226,18 @@
       "wrappers": [
         {"name": "try_poc", "content": "#!/bin/sh\nexec python3 /app/harness/try_poc_cli.py \"$@\"\n"}
       ]
+    },
+    "modflow6-groundwater-regression-audit": {
+      "oci_image": "docker.io/zli12321/lhtb-modflow6-groundwater-regression-audit:20260615",
+      "oci_digest": "sha256:2770bb62d78336308c58ee68010d77d2e5ac7b07ea865d211a13e978bbfc2f37",
+      "rootfs_copies": [{"source": "app", "target": "app"}],
+      "working_directory": "/app"
+    },
+    "nbody-accel-iterative": {
+      "oci_image": "docker.io/zli12321/lhtb-nbody-accel-iterative:20260615",
+      "oci_digest": "sha256:ab765c2c3a4964792f22956be8964675a6862626fb4b2ce8ba2132c18b4a2c6e",
+      "rootfs_copies": [{"source": "app", "target": "app"}],
+      "working_directory": "/app"
     },
     "satellite-flood-change-detection-audit": {
       "copies": [{"source": "project", "target": "app"}],
@@ -356,6 +410,26 @@
         "PATH": "/opt/roy-native/bin:/opt/roy-native/venv/bin:/usr/local/bin:/usr/bin:/bin",
         "PYTHONPATH": "/app:/app/src"
       }
+    },
+    "super-mario": {
+      "oci_image": "docker.io/zli12321/lhtb-super-mario:20260615",
+      "oci_digest": "sha256:897a85e3b250cecbc34cde2e01c9b6706073f55d3d72d9bb80421eea2af541d9",
+      "rootfs_copies": [
+        {"source": "app", "target": "app"},
+        {"source": "opt/mario", "target": "opt/mario"}
+      ],
+      "bind_opt": true,
+      "working_directory": "/app"
+    },
+    "tabular-data-feature-covshift": {
+      "oci_image": "docker.io/zhongzhi660/lhtb-tabular-data-feature-covshift:20260709",
+      "oci_digest": "sha256:575f59cfc668fb2254c9f87973998941794bec12e478eb45532b208798b288d1",
+      "rootfs_copies": [
+        {"source": "workspace", "target": "app"},
+        {"source": "opt/exp", "target": "opt/exp"}
+      ],
+      "bind_opt": true,
+      "working_directory": "/workspace"
     },
     "sudoku-recovery": {
       "oci_image": "docker.io/zhongzhi660/lhtb-sudoku-recovery:20260709",
