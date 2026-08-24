@@ -227,10 +227,17 @@ oracle_suite() {
   PYTHONPATH="${roy_root}/research" "${python_bin}" - \
     "${config}" "${suite_audit}" "${template_root}" "${native_root}" \
     "${jobs_root}" "${job_name}" "${overlay_root}" "${lhtb_root}" <<'PY'
-import json, pathlib, sys
+import json, os, pathlib, sys
 audit = json.load(open(sys.argv[2], encoding="utf-8"))
 tasks = [value["task_id"] for value in audit["tasks"]
          if value["status"] == "compatible"]
+requested = [value.strip() for value in
+             os.environ.get("ROY_LHTB_ORACLE_TASKS", "").split(",") if value.strip()]
+if requested:
+    unknown = sorted(set(requested) - set(tasks))
+    if unknown:
+        raise SystemExit(f"requested oracle tasks are not compatible: {unknown}")
+    tasks = requested
 if not tasks:
     raise SystemExit("oracle suite has no compatible native tasks")
 source_tasks = pathlib.Path(sys.argv[8]) / "tasks"
@@ -275,14 +282,14 @@ PY
   "${harbor_bin}" run -c "${config}" --yes
   cd "${roy_root}"
   PYTHONPATH="${roy_root}/research" "${python_bin}" - \
-    "${jobs_root}/${job_name}" "${suite_audit}" <<'PY'
+    "${jobs_root}/${job_name}" "${suite_audit}" "${config}" <<'PY'
 import json, pathlib, sys
 from roy_research.lhtb_results import official_lhtb_reward
 from roy_research.lhtb_native import normalize_native_task_id
 root = pathlib.Path(sys.argv[1])
 audit = json.load(open(sys.argv[2], encoding="utf-8"))
-expected = {value["task_id"] for value in audit["tasks"]
-            if value["status"] == "compatible"}
+config = json.load(open(sys.argv[3], encoding="utf-8"))
+expected = set(config["datasets"][0]["task_names"])
 results = {}
 for path in root.rglob("result.json"):
     value = json.load(open(path, encoding="utf-8"))
