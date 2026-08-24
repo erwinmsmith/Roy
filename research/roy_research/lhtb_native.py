@@ -229,6 +229,15 @@ def native_preflight(runtime_root: Path, *, task_gid: int = 210000) -> Dict[str,
         raise RuntimeError("LHTB-native requires x86_64 Linux")
     if missing:
         raise RuntimeError(f"LHTB-native is missing commands: {', '.join(missing)}")
+    proot_version = subprocess.run(
+        ["proot", "--version"], capture_output=True, text=True, check=True
+    ).stdout
+    if "v5.3.1-99a84175" not in proot_version:
+        raise RuntimeError(
+            "LHTB-native requires pinned PRoot v5.3.1-99a84175 with statx support"
+        )
+    result["proot_version"] = "v5.3.1-99a84175"
+    result["proot_executable"] = str(Path(shutil.which("proot") or "").resolve())
     mountpoints = (
         Path("/app"), Path("/tests"), Path("/solution"), Path("/logs"),
         Path("/opt/roy-native/venv"), Path("/opt/roy-native/bin"),

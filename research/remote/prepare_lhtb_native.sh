@@ -8,6 +8,7 @@ native_root="${ROY_LHTB_NATIVE_ROOT:-${execution_base}/runtime}"
 template_root="${ROY_LHTB_NATIVE_TEMPLATE_ROOT:-${execution_base}/templates}"
 audit_path="${ROY_LHTB_NATIVE_AUDIT:-${roy_root}/research/output/lhtb/native/audit.json}"
 node_runtime="${roy_root}/research/.runtime/node-v22"
+proot_runtime="${roy_root}/research/.runtime/proot-v5.3.1-99a84175"
 python_bin="${roy_root}/research/.venv/bin/python"
 harbor_bin="${roy_root}/research/.venv/bin/harbor"
 native_task_python="${ROY_LHTB_NATIVE_TASK_PYTHON:-3.12}"
@@ -79,6 +80,34 @@ install_node_22() {
   (cd "${download_dir}" && grep "  ${archive}$" "${checksums}" | sha256sum -c -)
   tar -xJf "${download_dir}/${archive}" -C "${node_runtime}" --strip-components=1
   export PATH="${node_runtime}/bin:${PATH}"
+}
+
+install_proot_runtime() {
+  local binary expected actual
+  binary="${proot_runtime}/bin/proot"
+  expected="b7f2adf5a225000a164f4905aabefeebe11c4c1d5bedff5e1fe8866c48dd70d2"
+  if [[ ! -x "${binary}" ]]; then
+    mkdir -p "$(dirname "${binary}")"
+    curl --fail --location --retry 3 \
+      https://proot.gitlab.io/proot/bin/proot -o "${binary}.download"
+    actual="$(sha256sum "${binary}.download" | awk '{print $1}')"
+    [[ "${actual}" == "${expected}" ]] || {
+      echo "downloaded PRoot checksum mismatch: ${actual}" >&2
+      return 3
+    }
+    chmod 755 "${binary}.download"
+    mv "${binary}.download" "${binary}"
+  fi
+  actual="$(sha256sum "${binary}" | awk '{print $1}')"
+  [[ "${actual}" == "${expected}" ]] || {
+    echo "installed PRoot checksum mismatch: ${actual}" >&2
+    return 3
+  }
+  export PATH="${proot_runtime}/bin:${PATH}"
+  "${binary}" --version | grep -q 'v5.3.1-99a84175' || {
+    echo "unexpected PRoot runtime version" >&2
+    return 3
+  }
 }
 
 check_environment() {
@@ -401,12 +430,12 @@ PY
 }
 
 case "${mode}" in
-  check) export PATH="${node_runtime}/bin:${PATH}"; check_environment ;;
-  prepare) install_system_dependencies; install_node_22; check_environment; prepare_checkout ;;
-  provision) install_node_22; check_environment; prepare_checkout; provision_smoke_tasks ;;
-  oracle-smoke) install_node_22; check_environment; prepare_checkout; provision_smoke_tasks; oracle_smoke ;;
-  oracle-suite) install_node_22; check_environment; prepare_checkout; oracle_suite ;;
-  roy-smoke) install_node_22; check_environment; prepare_checkout; provision_smoke_tasks; roy_smoke ;;
+  check) export PATH="${node_runtime}/bin:${proot_runtime}/bin:${PATH}"; check_environment ;;
+  prepare) install_system_dependencies; install_node_22; install_proot_runtime; check_environment; prepare_checkout ;;
+  provision) install_node_22; install_proot_runtime; check_environment; prepare_checkout; provision_smoke_tasks ;;
+  oracle-smoke) install_node_22; install_proot_runtime; check_environment; prepare_checkout; provision_smoke_tasks; oracle_smoke ;;
+  oracle-suite) install_node_22; install_proot_runtime; check_environment; prepare_checkout; oracle_suite ;;
+  roy-smoke) install_node_22; install_proot_runtime; check_environment; prepare_checkout; provision_smoke_tasks; roy_smoke ;;
   *) echo "usage: $0 [check|prepare|provision|oracle-smoke|oracle-suite|roy-smoke]" >&2; exit 2 ;;
 esac
 
