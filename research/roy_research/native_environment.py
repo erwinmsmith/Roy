@@ -58,6 +58,8 @@ class NativeProcessEnvironment(BaseEnvironment):
         self.session_root: Path | None = None
         self._manifest: Mapping[str, Any] | None = None
         self._process_groups: set[int] = set()
+        self._stopped_agent_pids: set[int] = set()
+        self._protected_material_active = False
         self._exec_index = 0
         super().__init__(*args, **kwargs)
 
@@ -245,13 +247,74 @@ class NativeProcessEnvironment(BaseEnvironment):
                 continue
             try:
                 status = (entry / "status").read_text(encoding="utf-8")
-                uid_line = next(line for line in status.splitlines() if line.startswith("Uid:"))
+                uid_line = next(
+                    line for line in status.splitlines() if line.startswith("Uid:")
+                )
                 effective_uid = int(uid_line.split()[2])
                 if effective_uid in (self._uid, self._service_uid):
                     os.kill(int(entry.name), requested_signal)
-            except (FileNotFoundError, ProcessLookupError, PermissionError, StopIteration,
-                    ValueError):
+            except (
+                FileNotFoundError,
+                ProcessLookupError,
+                PermissionError,
+                StopIteration,
+                ValueError,
+            ):
                 continue
+
+    @staticmethod
+    def _harbor_agent_tree_signal(command: str) -> signal.Signals | None:
+        """Recognize Harbor's pinned shared-verifier freeze/thaw command.
+
+        Running that command inside PRoot is unsafe because PRoot exposes the
+        host PID namespace. The script consequently discovers the outer Harbor
+        tmux session and can stop the PRoot process executing the script itself.
+        Native trials instead signal only processes owned by their dedicated
+        Agent UID from the host side.
+        """
+        required = ("/proc/[0-9]*", "tmux*)", 'case " $marked "', 'kill -')
+        if not all(marker in command for marker in required):
+            return None
+        if 'kill -STOP "$pid"' in command:
+            return signal.SIGSTOP
+        if 'kill -CONT "$pid"' in command:
+            return signal.SIGCONT
+        return None
+
+    def _signal_agent_uid_processes(self, requested_signal: signal.Signals) -> int:
+        if requested_signal == signal.SIGCONT:
+            targets = tuple(self._stopped_agent_pids)
+            self._stopped_agent_pids.clear()
+        else:
+            targets = tuple(self._uid_processes(self._uid))
+        signalled = 0
+        for pid in targets:
+            try:
+                os.kill(pid, requested_signal)
+                signalled += 1
+                if requested_signal == signal.SIGSTOP:
+                    self._stopped_agent_pids.add(pid)
+            except (ProcessLookupError, PermissionError):
+                continue
+        return signalled
+
+    @staticmethod
+    def _uid_processes(uid: int) -> list[int]:
+        own_pid = os.getpid()
+        matches: list[int] = []
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit() or int(entry.name) == own_pid:
+                continue
+            try:
+                status = (entry / "status").read_text(encoding="utf-8")
+                uid_line = next(
+                    line for line in status.splitlines() if line.startswith("Uid:")
+                )
+                if int(uid_line.split()[2]) == uid:
+                    matches.append(int(entry.name))
+            except (FileNotFoundError, PermissionError, StopIteration, ValueError):
+                continue
+        return matches
 
     def _mounted_path(self, path: str) -> Path:
         if not path.startswith("/"):
@@ -286,6 +349,12 @@ class NativeProcessEnvironment(BaseEnvironment):
         hidden = target_path == "/tests" or target_path.startswith("/tests/") \
             or target_path == "/solution" or target_path.startswith("/solution/")
         os.chown(destination, self._service_uid if hidden else self._uid, self.task_gid)
+        if hidden:
+            protected_root = "/tests" if target_path.startswith("/tests") else "/solution"
+            mounted_root = self._mounted_path(protected_root)
+            os.chown(mounted_root, self._service_uid, self.task_gid)
+            mounted_root.chmod(0o700)
+            self._protected_material_active = True
 
     async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
         destination = self._mounted_path(target_dir)
@@ -302,6 +371,28 @@ class NativeProcessEnvironment(BaseEnvironment):
         )
         if hidden:
             destination.chmod(0o700)
+            self._protected_material_active = True
+
+    async def reset_dirs(
+        self,
+        *,
+        remove_dirs: Any,
+        create_dirs: Any,
+        chmod_dirs: Any = None,
+    ) -> ExecResult:
+        result = await super().reset_dirs(
+            remove_dirs=remove_dirs,
+            create_dirs=create_dirs,
+            chmod_dirs=chmod_dirs,
+        )
+        protected = ("/tests", "/solution")
+        if result.return_code == 0 and any(
+            str(path) == root or str(path).startswith(root + "/")
+            for path in remove_dirs
+            for root in protected
+        ):
+            self._protected_material_active = False
+        return result
 
     def _chown_path(self, path: Path, uid: int | None = None) -> None:
         owner = self._uid if uid is None else uid
@@ -388,35 +479,57 @@ class NativeProcessEnvironment(BaseEnvironment):
             **(self._merge_env(env) or {}),
         }
         started = time.monotonic()
-        execution_uid = self._service_uid if user in ("root", "verifier", 0) else self._uid
-        process = await asyncio.create_subprocess_exec(
-            *self._command(command, cwd, merged, execution_uid),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-        )
-        self._process_groups.add(process.pid)
+        effective_user = self._resolve_user(user)
+        service_execution = effective_user in ("root", "verifier", 0)
+        # LHTB tasks omit both Agent and verifier users because Docker normally
+        # runs both as root. Protected material is uploaded immediately before
+        # oracle/verifier execution, which gives the native backend an explicit,
+        # auditable phase boundary even when default_user remains None.
+        if effective_user is None and self._protected_material_active:
+            service_execution = True
+        execution_uid = self._service_uid if service_execution else self._uid
+        tree_signal = self._harbor_agent_tree_signal(command)
         timed_out = False
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=timeout_sec
-            ) if timeout_sec else await process.communicate()
-        except asyncio.TimeoutError:
-            timed_out = True
+        if tree_signal is not None:
+            count = await asyncio.to_thread(
+                self._signal_agent_uid_processes, tree_signal
+            )
+            result = ExecResult(
+                stdout=(
+                    f"native host-side SIG{tree_signal.name.removeprefix('SIG')} "
+                    f"sent to {count} agent processes\n"
+                ),
+                stderr="",
+                return_code=0,
+            )
+        else:
+            process = await asyncio.create_subprocess_exec(
+                *self._command(command, cwd, merged, execution_uid),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+            self._process_groups.add(process.pid)
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            await process.wait()
-            stdout = b""
-            stderr = f"command timed out after {timeout_sec} seconds".encode()
-        finally:
-            self._process_groups.discard(process.pid)
-        result = ExecResult(
-            stdout=stdout.decode("utf-8", errors="replace"),
-            stderr=stderr.decode("utf-8", errors="replace"),
-            return_code=124 if timed_out else int(process.returncode or 0),
-        )
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(), timeout=timeout_sec
+                ) if timeout_sec else await process.communicate()
+            except asyncio.TimeoutError:
+                timed_out = True
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                await process.wait()
+                stdout = b""
+                stderr = f"command timed out after {timeout_sec} seconds".encode()
+            finally:
+                self._process_groups.discard(process.pid)
+            result = ExecResult(
+                stdout=stdout.decode("utf-8", errors="replace"),
+                stderr=stderr.decode("utf-8", errors="replace"),
+                return_code=124 if timed_out else int(process.returncode or 0),
+            )
         self._exec_index += 1
         audit = {
             "schema_version": 1,
@@ -425,6 +538,8 @@ class NativeProcessEnvironment(BaseEnvironment):
             "cwd": cwd,
             "timeout_sec": timeout_sec,
             "timed_out": timed_out,
+            "execution_role": "service" if service_execution else "agent",
+            "host_side_process_signal": tree_signal.name if tree_signal else None,
             "return_code": result.return_code,
             "stdout": result.stdout,
             "stderr": result.stderr,
