@@ -50,6 +50,10 @@ class NativeProcessEnvironment(BaseEnvironment):
         self.uid_base = int(uid_base)
         self.uid_slots = int(uid_slots)
         self.task_gid = int(task_gid)
+        proot_executable = shutil.which("proot")
+        if proot_executable is None:
+            raise RuntimeError("native environment requires PRoot")
+        self.proot_executable = str(Path(proot_executable).resolve())
         if self.uid_slots < 1:
             raise ValueError("uid_slots must be positive")
         self.allow_network_degraded = bool(allow_network_degraded)
@@ -168,6 +172,7 @@ class NativeProcessEnvironment(BaseEnvironment):
             "pid_namespace": False,
             "mount_namespace": False,
             "official_leaderboard_comparable": False,
+            "proot_executable": self.proot_executable,
         }
         audit_path = self.trial_paths.trial_dir / "native-environment.json"
         audit_path.write_text(json.dumps(audit, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -516,7 +521,7 @@ class NativeProcessEnvironment(BaseEnvironment):
             binds.append((template / "venv", "/opt/roy-native/venv"))
         if (template / "bin").exists():
             binds.append((template / "bin", "/opt/roy-native/bin"))
-        proot = ["proot", "-0", "-R", "/", "-w", working_directory]
+        proot = [self.proot_executable, "-0", "-R", "/", "-w", working_directory]
         for source, target in binds:
             proot.extend(["-b", f"{source}:{target}"])
         shell = (
