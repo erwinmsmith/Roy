@@ -59,7 +59,7 @@ class NativeProcessEnvironment(BaseEnvironment):
         self._manifest: Mapping[str, Any] | None = None
         self._process_groups: set[int] = set()
         self._stopped_agent_pids: set[int] = set()
-        self._protected_material_active = False
+        self._protected_material_roots: set[str] = set()
         self._exec_index = 0
         super().__init__(*args, **kwargs)
 
@@ -354,7 +354,7 @@ class NativeProcessEnvironment(BaseEnvironment):
             mounted_root = self._mounted_path(protected_root)
             os.chown(mounted_root, self._service_uid, self.task_gid)
             mounted_root.chmod(0o700)
-            self._protected_material_active = True
+            self._protected_material_roots.add(protected_root)
 
     async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
         destination = self._mounted_path(target_dir)
@@ -371,7 +371,8 @@ class NativeProcessEnvironment(BaseEnvironment):
         )
         if hidden:
             destination.chmod(0o700)
-            self._protected_material_active = True
+            protected_root = "/tests" if target_dir.startswith("/tests") else "/solution"
+            self._protected_material_roots.add(protected_root)
 
     async def reset_dirs(
         self,
@@ -380,19 +381,74 @@ class NativeProcessEnvironment(BaseEnvironment):
         create_dirs: Any,
         chmod_dirs: Any = None,
     ) -> ExecResult:
-        result = await super().reset_dirs(
-            remove_dirs=remove_dirs,
-            create_dirs=create_dirs,
-            chmod_dirs=chmod_dirs,
+        """Reset bind sources on the host instead of unlinking PRoot mountpoints."""
+        started = time.monotonic()
+        remove_values = [str(path) for path in remove_dirs]
+        create_values = [str(path) for path in create_dirs]
+        chmod_values = [str(path) for path in (chmod_dirs or [])]
+        await asyncio.to_thread(
+            self._reset_native_dirs,
+            remove_values,
+            create_values,
+            chmod_values,
         )
-        protected = ("/tests", "/solution")
-        if result.return_code == 0 and any(
-            str(path) == root or str(path).startswith(root + "/")
-            for path in remove_dirs
-            for root in protected
-        ):
-            self._protected_material_active = False
+        result = ExecResult(stdout="", stderr="", return_code=0)
+        self._append_exec_audit(
+            command=json.dumps({
+                "operation": "native_reset_dirs",
+                "remove": remove_values,
+                "create": create_values,
+                "chmod": chmod_values,
+            }, sort_keys=True),
+            cwd=None,
+            timeout_sec=None,
+            timed_out=False,
+            execution_role="service",
+            host_side_process_signal=None,
+            result=result,
+            started=started,
+        )
         return result
+
+    def _reset_native_dirs(
+        self,
+        remove_dirs: list[str],
+        create_dirs: list[str],
+        chmod_dirs: list[str],
+    ) -> None:
+        assert self.session_root is not None
+        protected = ("/tests", "/solution")
+        for virtual_path in remove_dirs:
+            target = self._mounted_path(virtual_path)
+            is_bind_root = target.parent == self.session_root
+            if target.is_symlink() or target.is_file():
+                target.unlink(missing_ok=True)
+            elif target.exists() and is_bind_root:
+                for child in target.iterdir():
+                    if child.is_dir() and not child.is_symlink():
+                        shutil.rmtree(child)
+                    else:
+                        child.unlink(missing_ok=True)
+            elif target.exists():
+                shutil.rmtree(target)
+            for root in protected:
+                if virtual_path == root or virtual_path.startswith(root + "/"):
+                    self._protected_material_roots.discard(root)
+        for virtual_path in create_dirs:
+            target = self._mounted_path(virtual_path)
+            target.mkdir(parents=True, exist_ok=True)
+            root = next(
+                (value for value in protected
+                 if virtual_path == value or virtual_path.startswith(value + "/")),
+                None,
+            )
+            self._chown_path(target, self._service_uid if root else self._uid)
+            if root:
+                self._mounted_path(root).chmod(0o700)
+        for virtual_path in chmod_dirs:
+            target = self._mounted_path(virtual_path)
+            if target.exists():
+                target.chmod(0o777)
 
     def _chown_path(self, path: Path, uid: int | None = None) -> None:
         owner = self._uid if uid is None else uid
@@ -485,7 +541,7 @@ class NativeProcessEnvironment(BaseEnvironment):
         # runs both as root. Protected material is uploaded immediately before
         # oracle/verifier execution, which gives the native backend an explicit,
         # auditable phase boundary even when default_user remains None.
-        if effective_user is None and self._protected_material_active:
+        if effective_user is None and self._protected_material_roots:
             service_execution = True
         execution_uid = self._service_uid if service_execution else self._uid
         tree_signal = self._harbor_agent_tree_signal(command)
@@ -507,6 +563,7 @@ class NativeProcessEnvironment(BaseEnvironment):
                 *self._command(command, cwd, merged, execution_uid),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                cwd="/",
                 start_new_session=True,
             )
             self._process_groups.add(process.pid)
@@ -530,6 +587,30 @@ class NativeProcessEnvironment(BaseEnvironment):
                 stderr=stderr.decode("utf-8", errors="replace"),
                 return_code=124 if timed_out else int(process.returncode or 0),
             )
+        self._append_exec_audit(
+            command=command,
+            cwd=cwd,
+            timeout_sec=timeout_sec,
+            timed_out=timed_out,
+            execution_role="service" if service_execution else "agent",
+            host_side_process_signal=tree_signal.name if tree_signal else None,
+            result=result,
+            started=started,
+        )
+        return result
+
+    def _append_exec_audit(
+        self,
+        *,
+        command: str,
+        cwd: str | None,
+        timeout_sec: int | None,
+        timed_out: bool,
+        execution_role: str,
+        host_side_process_signal: str | None,
+        result: ExecResult,
+        started: float,
+    ) -> None:
         self._exec_index += 1
         audit = {
             "schema_version": 1,
@@ -538,8 +619,8 @@ class NativeProcessEnvironment(BaseEnvironment):
             "cwd": cwd,
             "timeout_sec": timeout_sec,
             "timed_out": timed_out,
-            "execution_role": "service" if service_execution else "agent",
-            "host_side_process_signal": tree_signal.name if tree_signal else None,
+            "execution_role": execution_role,
+            "host_side_process_signal": host_side_process_signal,
             "return_code": result.return_code,
             "stdout": result.stdout,
             "stderr": result.stderr,
@@ -548,4 +629,3 @@ class NativeProcessEnvironment(BaseEnvironment):
         audit_path = self.trial_paths.trial_dir / "native-exec.jsonl"
         with audit_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(audit, sort_keys=True) + "\n")
-        return result
