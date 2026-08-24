@@ -326,6 +326,7 @@ def provision_native_task(
     task_id: str,
     *,
     python_executable: str = sys.executable,
+    minimum_free_fraction: float = 0.15,
 ) -> Mapping[str, Any]:
     specs = _load_provisioning_specs(specs_path)
     if task_id not in specs:
@@ -339,6 +340,12 @@ def provision_native_task(
         if manifest and manifest.get("task_digest") == tree_digest(task_root):
             return manifest
         raise RuntimeError(f"refusing to overwrite stale native template {target}")
+    template_root.mkdir(parents=True, exist_ok=True)
+    disk = shutil.disk_usage(template_root)
+    if disk.free / disk.total < minimum_free_fraction:
+        raise RuntimeError(
+            "refusing to provision another native task below the 15% free-disk floor"
+        )
     target.mkdir(parents=True)
     try:
         rootfs_relative: str | None = None

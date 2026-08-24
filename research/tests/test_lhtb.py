@@ -391,7 +391,8 @@ for line in sys.stdin:
                 }
             }}))
             result = provision_native_task(
-                root / "LHTB", root / "templates", specs, "fixture"
+                root / "LHTB", root / "templates", specs, "fixture",
+                minimum_free_fraction=0.0,
             )
             self.assertTrue(str(result["environment_digest"]).startswith("sha256:"))
             self.assertEqual(result["path_permissions"][0]["owner"], "service")
