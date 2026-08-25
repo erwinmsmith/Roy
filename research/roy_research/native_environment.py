@@ -22,6 +22,7 @@ from .lhtb_native import (
     load_task_native_manifest,
     native_task_id_from_harbor,
     native_preflight,
+    native_proot_launcher_environment,
     native_session_uids,
     resolve_native_task_source,
     tree_digest,
@@ -686,7 +687,11 @@ class NativeProcessEnvironment(BaseEnvironment):
             f"cd -- {shlex.quote(working_directory)} && "
             f"exec /bin/bash -c {shlex.quote(command)}"
         )
-        exported = [f"{key}={value}" for key, value in env.items()]
+        # PRoot resolves its temporary directory before guest bind mounts exist. Under
+        # setpriv the host default selected by PRoot is not reliably writable on
+        # GPUHome, so point it at the per-session directory already owned by this UID.
+        # This is launcher state, not a command-level environment workaround.
+        exported = native_proot_launcher_environment(env, self.session_root / "tmp")
         uid = self._uid if execution_uid is None else execution_uid
         return [
             "setpriv", f"--reuid={uid}", f"--regid={self.task_gid}",

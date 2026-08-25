@@ -55,6 +55,7 @@ from roy_research.lhtb_native import (
     audit_native_tasks,
     native_task_id_from_harbor,
     native_environment_digest,
+    native_proot_launcher_environment,
     native_session_uids,
     normalize_native_task_id,
     oci_repository_reference,
@@ -440,6 +441,16 @@ for line in sys.stdin:
             self.assertEqual(native_value["retry"]["max_retries"], 0)
             self.assertEqual(native_value["agents"][0]["kwargs"]["rpc_timeout"], 720)
             self.assertEqual(native_value["agents"][0]["kwargs"]["rollout_timeout_sec"], 3570)
+
+    def test_native_proot_uses_the_uid_owned_session_tmp_before_guest_mounts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            values = native_proot_launcher_environment({
+                "PATH": "/usr/bin:/bin", "PROOT_TMP_DIR": "/untrusted",
+            }, root / "tmp")
+            trusted = f"PROOT_TMP_DIR={root / 'tmp'}"
+            self.assertIn(trusted, values)
+            self.assertNotIn("PROOT_TMP_DIR=/untrusted", values)
 
     def test_native_audit_is_fail_closed_and_uses_environment_digest(self) -> None:
         self.assertEqual(

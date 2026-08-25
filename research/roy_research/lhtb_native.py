@@ -24,6 +24,16 @@ NATIVE_BACKEND_ID = "lhtb-native-process-v1"
 NATIVE_SOURCE_TASK_MARKER = ".roy-native-source-task"
 
 
+def native_proot_launcher_environment(
+    environment: Mapping[str, str], session_tmp: Path
+) -> list[str]:
+    """Build the scrubbed launcher env with a trusted host-side PRoot temp path."""
+    values = [f"{key}={value}" for key, value in environment.items()
+              if key != "PROOT_TMP_DIR"]
+    values.append(f"PROOT_TMP_DIR={session_tmp}")
+    return values
+
+
 def oci_repository_reference(image: str) -> str:
     """Remove a tag/digest without mistaking a registry port for an image tag."""
     without_digest = image.split("@", 1)[0]
