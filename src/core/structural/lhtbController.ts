@@ -58,6 +58,17 @@ export function topologySamplingProfile(organizationSeed: number): TopologySampl
   return profiles[Math.abs(Math.trunc(organizationSeed)) % profiles.length] ?? profiles[0];
 }
 
+export function resolveTopologySamplingProfile(
+  organizationSeed: number,
+  override = process.env.ROY_LHTB_TOPOLOGY_PROFILE
+): TopologySamplingProfile {
+  if (!override) return topologySamplingProfile(organizationSeed);
+  const ids: TopologySamplingProfile['id'][] = ['compact', 'branching', 'recursive', 'connected'];
+  const index = ids.indexOf(override as TopologySamplingProfile['id']);
+  if (index < 0) throw new Error(`Invalid ROY_LHTB_TOPOLOGY_PROFILE ${override}`);
+  return topologySamplingProfile(index);
+}
+
 interface SamplingPhase {
   id: 'expand_width' | 'seed_child_local_residual' | 'derive_child_local_residual' | 'stabilize';
   deepestActiveNodeIds: Set<string>;
@@ -70,7 +81,7 @@ export type TopologySamplingCandidate = Pick<OrganizationCandidate,
 function topologySamplingPhase(
   snapshot: ReturnType<RoyLHTBSession['snapshot']>
 ): SamplingPhase {
-  const profile = topologySamplingProfile(snapshot.organizationSeed);
+  const profile = resolveTopologySamplingProfile(snapshot.organizationSeed);
   const activeNodes = snapshot.runtime.nodes.filter(node =>
     ['ready', 'running', 'waiting', 'completed'].includes(node.status));
   const maximumDepth = Math.max(0, ...snapshot.runtime.nodes.map(node => node.depth));
@@ -113,7 +124,7 @@ export function topologySamplingCandidateLogitBias(
   snapshot: ReturnType<RoyLHTBSession['snapshot']>,
   candidate: TopologySamplingCandidate
 ): number {
-  const profile = topologySamplingProfile(snapshot.organizationSeed);
+  const profile = resolveTopologySamplingProfile(snapshot.organizationSeed);
   const phase = topologySamplingPhase(snapshot);
   const matchesPhase = topologySamplingCandidateMatchesPhase(snapshot, candidate);
   if (phase.id === 'stabilize') return candidate.kind === 'DERIVE' ? -8 : 0;
@@ -301,7 +312,7 @@ export function compactEpistemicWorkingState(
     requiredInformation: compactText(value.requiredInformation) }));
   const openRequirements = snapshot.runtime.requirements.filter(value => value.status === 'open'
     && activeNodes.some(node => node.id === value.parentNodeId));
-  const profile = topologySamplingProfile(snapshot.organizationSeed);
+  const profile = resolveTopologySamplingProfile(snapshot.organizationSeed);
   const maximumDepthReached = Math.max(0, ...snapshot.runtime.nodes.map(node => node.depth));
   return {
     rootGoal: compactText(snapshot.instruction, PROPOSER_GOAL_TEXT_LIMIT),
@@ -714,7 +725,7 @@ export class LHTBAutonomousController {
     candidates: ProposedCandidate[]
   ): string[] {
     if (snapshot.organizationMode !== 'learned_information_realization') return [];
-    const profile = topologySamplingProfile(snapshot.organizationSeed);
+    const profile = resolveTopologySamplingProfile(snapshot.organizationSeed);
     const minimumNodes = profile.preferredNodeRange[0];
     if (minimumNodes <= 0) return [];
     const active = new Set(snapshot.runtime.nodes.filter(node =>
@@ -813,7 +824,7 @@ export class LHTBAutonomousController {
           from: value.id, to: claimId }))),
     ];
     const openRequirements = snapshot.runtime.requirements.filter(value => value.status === 'open');
-    const profile = topologySamplingProfile(snapshot.organizationSeed);
+    const profile = resolveTopologySamplingProfile(snapshot.organizationSeed);
     const minimumNodes = profile.preferredNodeRange[0];
     const minimumDepth = profile.preferredMinimumDepth;
     const maximumDepthReached = Math.max(0, ...snapshot.runtime.nodes.map(node => node.depth));

@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { GlobalEpistemicStateRecorder, LHTBAutonomousController,
-  RoyLHTBSession, topologySamplingCandidateLogitBias,
+  resolveTopologySamplingProfile, RoyLHTBSession, topologySamplingCandidateLogitBias,
   topologySamplingProfile } from '../src/core/structural/index.js';
 import { LLMJSONParseError } from '../src/core/llm/providers/openai.js';
 
@@ -24,6 +24,8 @@ describe('LHTB process state', () => {
       .toEqual(['compact', 'branching', 'recursive', 'connected']);
     expect(topologySamplingProfile(3).preferredNodeRange).toEqual([6, 8]);
     expect(topologySamplingProfile(2).preferredMinimumDepth).toBe(2);
+    expect(resolveTopologySamplingProfile(0, 'recursive').preferredNodeRange).toEqual([5, 7]);
+    expect(() => resolveTopologySamplingProfile(0, 'invalid')).toThrow(/Invalid/);
   });
 
   it('turns a recursive profile into a real root to sub to subsub derivation', () => {
