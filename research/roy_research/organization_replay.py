@@ -305,6 +305,14 @@ def _policy_context(
     if temperature <= 0:
         raise ValueError("organization temperature must be positive during replay")
     active_logits = model.active_node_logits(active_states, graph_state, resources, active_mask)
+    active_bias = torch.tensor(
+        list(policy_state.get("active_node_sampling_logit_bias", [0.0] * len(active_node_ids))),
+        dtype=active_logits.dtype,
+        device=device,
+    )
+    if active_bias.shape != active_logits.shape:
+        raise ValueError("active-node sampling bias must match active-node logits")
+    active_logits = active_logits + active_bias
     active_log_probs = torch.log_softmax(active_logits / temperature, dim=-1)
 
     candidates = list(policy_state.get("candidates", []))
@@ -377,6 +385,12 @@ def _candidate_distribution(
         context["resources"],
         actor_mask,
     )
+    sampling_bias = torch.tensor(
+        [float(value.get("sampling_logit_bias", 0.0)) for value in candidates],
+        dtype=candidate_logits.dtype,
+        device=device,
+    )
+    candidate_logits = candidate_logits + sampling_bias
     temperature = float(policy_state.get("organization_temperature", 1.0))
     if temperature <= 0:
         raise ValueError("organization temperature must be positive during replay")

@@ -217,6 +217,20 @@ export class RoyLHTBSession {
     return this.recordState();
   }
 
+  finalizeAtRolloutDeadline(reason = 'training_rollout_deadline'): GlobalEpistemicState {
+    if (this.pendingTerminalRequest) {
+      this.events.push({ id: `deadline-terminal-${this.events.length}`, kind: 'failure',
+        at: Date.now(), nodeId: this.pendingTerminalRequest.nodeId,
+        command: this.pendingTerminalRequest.command,
+        attributes: { interruptedRequestId: this.pendingTerminalRequest.id,
+          termination: reason, environmentSideEffectsMayBePartial: true } });
+      this.pendingTerminalRequest = undefined;
+    }
+    this.events.push({ id: `deadline-${this.events.length}`, kind: 'verifier', at: Date.now(),
+      attributes: { termination: reason, next: 'official_final_verifier' } });
+    return this.recordState();
+  }
+
   resumeAfterVerifierRejection(feedback?: string): GlobalEpistemicState {
     const snapshot = this.runtime.snapshot();
     const material = {

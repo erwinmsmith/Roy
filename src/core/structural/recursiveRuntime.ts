@@ -189,6 +189,12 @@ export class RecursiveInformationRealizationRuntime {
     if (specification.nodeId === parent.id || this.nodes.has(specification.nodeId)) {
       throw new Error(`Duplicate child node ${specification.nodeId}`);
     }
+    const objectiveKey = specification.localObjective.trim().replace(/\s+/g, ' ').toLocaleLowerCase();
+    if (!objectiveKey) throw new Error('Child specification requires a local objective');
+    if ([...this.nodes.values()].some(node =>
+      node.localObjective.trim().replace(/\s+/g, ' ').toLocaleLowerCase() === objectiveKey)) {
+      throw new Error('Child specification duplicates an existing local objective');
+    }
     const refinement = specification.refinement;
     if (!refinement.narrowerThanParent || refinement.duplicatedByExistingNode) {
       throw new Error('Child specification fails strict refinement validation');

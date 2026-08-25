@@ -40,12 +40,13 @@ from roy_research.lhtb_experiment import (
     summarize_test,
     write_harbor_group_config,
 )
-from roy_research.lhtb_results import official_lhtb_reward
+from roy_research.lhtb_results import import_harbor_group, official_lhtb_reward
 from roy_research.lhtb_transitions import (
     build_decision_transition_samples,
     build_state_transition_samples,
 )
 from roy_research.model import epistemic_state_graph
+from roy_research.organization_model import InformationRealizationPolicy
 from roy_research.lhtb_training import (
     LHTB_POLICY_INTERFACE_REVISION,
     LHTBProcessGRPOTrainer,
@@ -272,6 +273,90 @@ for line in sys.stdin:
                 continuation.metadata["roy_trajectory_id"], context.metadata["roy_trajectory_id"]
             )
 
+    def test_harbor_agent_returns_normally_before_outer_timeout_for_final_verifier(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            server = Path(directory) / "deadline_server.py"
+            server.write_text("""import json, sys, time
+snapshot = {'processStates': [{'sequence': 0, 'usage': {}}],
+            'pendingTerminalRequest': {'id': 'pending'}}
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request['method']
+    if method == 'run':
+        result = {'status': 'continue', 'snapshot': snapshot}
+    elif method == 'advance':
+        time.sleep(0.25)
+        result = {'status': 'continue', 'snapshot': snapshot}
+    elif method == 'restore':
+        snapshot = request['params']['snapshot']
+        result = {'status': 'restored', 'snapshot': snapshot}
+    elif method == 'rollout_deadline':
+        snapshot = {**snapshot, 'pendingTerminalRequest': None,
+                    'processStates': [*snapshot['processStates'],
+                                      {'sequence': 1, 'usage': {},
+                                       'runtimeEvents': [{'kind': 'verifier'}]}]}
+        result = {'status': 'completed', 'snapshot': snapshot}
+    else:
+        result = {'status': 'completed', 'snapshot': snapshot}
+    print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
+""", encoding="utf-8")
+
+            class Environment:
+                environment_name = "fake-task"
+
+            agent = RoyHarborAgent(
+                logs_dir=Path(directory), model_name="deepseek/deepseek-v4-flash",
+                node_command=f"{sys.executable} -u {server}", rpc_timeout=1,
+                rollout_timeout_sec=0.08, track_file_changes=False,
+            )
+            context = SimpleNamespace(metadata=None)
+            try:
+                asyncio.run(agent.run("solve", Environment(), context))
+            finally:
+                agent.close()
+            self.assertEqual(context.metadata["termination_reason"], "rollout_deadline")
+            partial = json.loads(
+                (Path(directory) / "roy-partial-trajectory.json").read_text()
+            )
+            self.assertIsNone(partial["pendingTerminalRequest"])
+            self.assertEqual(len(partial["processStates"]), 2)
+
+    def test_internal_rollout_deadline_with_official_reward_is_trainable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trial = root / "trial"
+            agent_dir = trial / "agent"
+            agent_dir.mkdir(parents=True)
+            result = {
+                "id": "trial", "task_name": "task", "task_checksum": "checksum",
+                "started_at": "2026-08-25T00:00:00+00:00",
+                "finished_at": "2026-08-25T01:00:00+00:00",
+                "verifier_result": {"rewards": {"reward": 0.375}},
+                "exception_info": None,
+                "agent_result": {"metadata": {"termination_reason": "rollout_deadline"}},
+            }
+            (trial / "result.json").write_text(json.dumps(result))
+            snapshot = {
+                "organizationSeed": 1, "initialSnapshotFingerprint": "same",
+                "runtime": {}, "policyRecords": [],
+                "processStates": [{
+                    "sequence": 0, "fingerprint": "m0", "runtimeEvents": [],
+                    "nodes": [{"id": "root", "depth": 0, "status": "running"}],
+                    "dagEdges": [], "usage": {},
+                }],
+            }
+            (agent_dir / "roy-partial-trajectory.json").write_text(json.dumps(snapshot))
+            records = import_harbor_group(
+                root, root / "rollouts.jsonl", "group", "task", "category", "train",
+                0, 0, "native:digest", {"timeout": 3600}, expected=1,
+                environment_backend="native",
+            )
+            self.assertTrue(records[0]["complete"])
+            self.assertTrue(records[0]["accepted_for_training"])
+            self.assertEqual(records[0]["termination_type"], "timeout_with_reward")
+            self.assertEqual(records[0]["terminal_reward"], 0.375)
+            self.assertEqual(len(records[0]["process_states"]), 2)
+
     def test_harbor_agent_closes_rpc_process_after_failed_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             server = Path(directory) / "server.py"
@@ -329,6 +414,7 @@ for line in sys.stdin:
             value = json.loads(path.read_text())
             self.assertEqual(value["n_attempts"], 3)
             self.assertNotIn("override_timeout_sec", value["agents"][0])
+            self.assertNotIn("rollout_timeout_sec", value["agents"][0]["kwargs"])
 
             native = Path(directory) / "native.json"
             write_harbor_group_config(
@@ -353,6 +439,7 @@ for line in sys.stdin:
             )
             self.assertEqual(native_value["retry"]["max_retries"], 0)
             self.assertEqual(native_value["agents"][0]["kwargs"]["rpc_timeout"], 720)
+            self.assertEqual(native_value["agents"][0]["kwargs"]["rollout_timeout_sec"], 3570)
 
     def test_native_audit_is_fail_closed_and_uses_environment_digest(self) -> None:
         self.assertEqual(
@@ -616,6 +703,40 @@ for line in sys.stdin:
         self.assertAlmostEqual(float(joint[:3].exp().sum()), 0.5, places=6)
         self.assertAlmostEqual(float(joint[3].exp()), 0.5, places=6)
         self.assertAlmostEqual(float(inner[:3].exp().sum()), 1.0, places=6)
+
+    def test_topology_sampling_bias_is_soft_and_part_of_exact_old_policy(self) -> None:
+        model = InformationRealizationPolicy()
+        policy_state = {
+            "interface_revision": LHTB_POLICY_INTERFACE_REVISION,
+            "state_fingerprint": "m0",
+            "event_graph": {"nodes": [{"id": "root", "kind": "agent",
+                "timestamp": 0, "text": "solve", "status": "ready"}], "edges": []},
+            "active_node_ids": ["root"], "active_node_legal": [True],
+            "active_node_sampling_logit_bias": [0.0],
+            "candidates": [{"id": "derive", "kind": "DERIVE",
+                "actor_node_id": "root", "description": "derive another child",
+                "scheduler_complexity": 1, "legal": True, "sampling_logit_bias": -100.0},
+                {"id": "execute", "kind": "EXECUTE", "actor_node_id": "root",
+                 "description": "execute current plan", "scheduler_complexity": 1,
+                 "legal": True, "sampling_logit_bias": 0.0}],
+            "envelope": {"id": "open", "minimum_nodes": 0, "maximum_nodes": 1_000_000,
+                "minimum_depth": 0, "maximum_depth": 1_000_000, "mode": "expansive"},
+            "node_count": 8, "maximum_depth_reached": 2,
+            "unresolved_gap_exists": True, "unbounded_structure": True,
+            "resources": {"llm_calls_remaining_fraction": 1,
+                "tool_calls_remaining_fraction": 1, "nodes_remaining_fraction": 1,
+                "depth_remaining_fraction": 1, "decisions_remaining_fraction": 1},
+            "organization_temperature": 1,
+        }
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(3)
+        candidate, record = sample_organization_decision(
+            model, FakeEncoder384(), policy_state, generator=generator,
+            device=torch.device("cpu")
+        )
+        self.assertEqual(candidate["id"], "execute")
+        self.assertGreater(record["masked_probabilities"]["DERIVE"], 0.0)
+        self.assertLess(record["masked_probabilities"]["DERIVE"], 1e-30)
 
     def test_value_graph_contains_epistemic_progress_as_well_as_agents(self) -> None:
         graph = epistemic_state_graph({

@@ -26,7 +26,7 @@ from .value_model import (
 
 
 LHTB_GROUP_SIZE = 8
-LHTB_POLICY_INTERFACE_REVISION = "compact-epistemic-event-driven-v2"
+LHTB_POLICY_INTERFACE_REVISION = "compact-epistemic-event-driven-v3"
 LHTB_GROUP_INPUT_TOKEN_GATE = 15_000_000
 
 

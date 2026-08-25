@@ -19,6 +19,10 @@ class JSONRPCError(RuntimeError):
     pass
 
 
+class RolloutDeadlineReached(RuntimeError):
+    pass
+
+
 class PersistentNodeRPC:
     """Timeout-aware JSONL RPC client with one automatic restore after restart."""
 
@@ -46,7 +50,8 @@ class PersistentNodeRPC:
         assert self.process.stderr is not None
         threading.Thread(target=self._read_stderr, args=(self.process.stderr,), daemon=True).start()
 
-    def request(self, method: str, params: Mapping[str, Any], retry: bool = True) -> Mapping[str, Any]:
+    def request(self, method: str, params: Mapping[str, Any], retry: bool = True,
+                timeout: float | None = None) -> Mapping[str, Any]:
         self.start()
         self.next_id += 1
         request_id = self.next_id
@@ -56,7 +61,7 @@ class PersistentNodeRPC:
                 "jsonrpc": "2.0", "id": request_id, "method": method, "params": params,
             }) + "\n")
             self.process.stdin.flush()
-            deadline = time.monotonic() + self.timeout
+            deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -74,14 +79,15 @@ class PersistentNodeRPC:
             if not retry:
                 raise
             self.restart()
-            return self.request(method, params, retry=False)
+            return self.request(method, params, retry=False, timeout=timeout)
 
-    def restart(self) -> None:
+    def restart(self, timeout: float | None = None) -> None:
         self.close()
         self.responses = queue.Queue()
         self.start()
         if self.last_snapshot is not None:
-            self.request("restore", {"snapshot": self.last_snapshot}, retry=False)
+            self.request("restore", {"snapshot": self.last_snapshot}, retry=False,
+                         timeout=timeout)
 
     def close(self) -> None:
         if not self.process:
@@ -128,6 +134,7 @@ class RoyHarborAgent(BaseAgent):
 
     def __init__(self, *args: Any, node_command: str | None = None,
                  rpc_timeout: float = 120.0, track_file_changes: bool = True,
+                 rollout_timeout_sec: float | None = None,
                  extra_env: Mapping[str, str] | None = None,
                  **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -154,6 +161,7 @@ class RoyHarborAgent(BaseAgent):
         self._environment: Any | None = None
         self._trajectory_id: str | None = None
         self._continuation_count = 0
+        self.rollout_timeout_sec = rollout_timeout_sec
 
     @staticmethod
     def name() -> str:
@@ -167,6 +175,8 @@ class RoyHarborAgent(BaseAgent):
         self.rpc.start()
 
     async def run(self, instruction: str, environment: Any, context: Any) -> None:
+        deadline = (time.monotonic() + self.rollout_timeout_sec
+                    if self.rollout_timeout_sec is not None else None)
         try:
             trajectory_id = str(uuid.uuid4())
             self._environment = environment
@@ -177,7 +187,7 @@ class RoyHarborAgent(BaseAgent):
             session_seed = int(hashlib.sha256(
                 str(getattr(environment, "session_id", trajectory_id)).encode("utf-8")
             ).hexdigest()[:8], 16)
-            response = await asyncio.to_thread(self.rpc.request, "run", {
+            response = await self._rpc_before_deadline("run", {
                 "trajectoryId": trajectory_id,
                 "taskId": getattr(environment, "environment_name", "unknown"),
                 "instruction": instruction,
@@ -189,11 +199,15 @@ class RoyHarborAgent(BaseAgent):
                 "initialSnapshotFingerprint": self.agent_environment.get(
                     "ROY_LHTB_INITIAL_FINGERPRINT", ""
                 ),
-            })
+            }, deadline)
             self._save_partial()
-            await self._drive(response, environment)
+            await self._drive(response, environment, deadline)
             self._save_partial()
-            self._update_context(context, confirmed_complete=True)
+            self._update_context(context, termination_reason="confirmed_task_complete")
+        except RolloutDeadlineReached:
+            await self._finalize_rollout_deadline()
+            self._save_partial()
+            self._update_context(context, termination_reason="rollout_deadline")
         except BaseException:
             self._save_partial()
             self.close()
@@ -213,13 +227,13 @@ class RoyHarborAgent(BaseAgent):
             self._save_partial()
             await self._drive(response, self._environment)
             self._save_partial()
-            self._update_context(context, confirmed_complete=True)
+            self._update_context(context, termination_reason="confirmed_task_complete")
         except BaseException:
             self._save_partial()
             self.close()
             raise
 
-    def _update_context(self, context: Any, confirmed_complete: bool) -> None:
+    def _update_context(self, context: Any, termination_reason: str) -> None:
         context.metadata = {
             **(context.metadata or {}),
             "roy_trajectory_id": self._trajectory_id,
@@ -227,9 +241,7 @@ class RoyHarborAgent(BaseAgent):
             "roy_semantic_audit_root": str(self.semantic_root),
             "roy_runtime_audit_root": str(self.runtime_audit_root),
             "same_conversation_continuations": self._continuation_count,
-            "termination_reason": (
-                "confirmed_task_complete" if confirmed_complete else "agent_stopped"
-            ),
+            "termination_reason": termination_reason,
         }
         snapshot = self.rpc.last_snapshot
         if snapshot:
@@ -238,32 +250,96 @@ class RoyHarborAgent(BaseAgent):
             context.n_input_tokens = int(usage.get("inputTokens", 0))
             context.n_output_tokens = int(usage.get("outputTokens", 0))
 
-    async def _drive(self, response: Mapping[str, Any], environment: Any) -> None:
+    async def _drive(self, response: Mapping[str, Any], environment: Any,
+                     deadline: float | None = None) -> None:
         while response.get("status") in ("terminal_request", "continue"):
+            self._remaining(deadline)
             self._save_partial()
             if response.get("status") == "continue":
-                response = await asyncio.to_thread(self.rpc.request, "advance", {})
+                response = await self._rpc_before_deadline("advance", {}, deadline)
                 self._save_partial()
                 continue
             request = dict(response["request"])
             started = time.monotonic()
-            before_files = await self._file_snapshot(environment, request.get("cwd"))
-            result = await environment.exec(
-                str(request["command"]), cwd=request.get("cwd"),
-                timeout_sec=max(1, int(float(request.get("timeoutMs", 120000)) / 1000)),
+            before_files = await self._await_before_deadline(
+                self._file_snapshot(environment, request.get("cwd")), deadline
             )
-            after_files = await self._file_snapshot(environment, request.get("cwd"))
+            requested_timeout = max(
+                1, int(float(request.get("timeoutMs", 120000)) / 1000)
+            )
+            remaining = self._remaining(deadline)
+            command_timeout = requested_timeout if remaining is None else max(
+                1, min(requested_timeout, int(remaining))
+            )
+            result = await self._await_before_deadline(environment.exec(
+                str(request["command"]), cwd=request.get("cwd"),
+                timeout_sec=command_timeout,
+            ), deadline)
+            after_files = await self._await_before_deadline(
+                self._file_snapshot(environment, request.get("cwd")), deadline
+            )
             file_changes = sorted(
                 path for path in set(before_files).union(after_files)
                 if before_files.get(path) != after_files.get(path)
             )
-            response = await asyncio.to_thread(self.rpc.request, "resume", {"result": {
+            response = await self._rpc_before_deadline("resume", {"result": {
                 "requestId": request["id"], "exitCode": result.return_code,
                 "stdout": result.stdout or "", "stderr": result.stderr or "",
                 "durationMs": int((time.monotonic() - started) * 1000),
                 "fileChanges": file_changes,
-            }})
+            }}, deadline)
             self._save_partial()
+
+    def _remaining(self, deadline: float | None) -> float | None:
+        if deadline is None:
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RolloutDeadlineReached("Roy reached its rollout deadline")
+        return remaining
+
+    async def _rpc_before_deadline(
+        self, method: str, params: Mapping[str, Any], deadline: float | None
+    ) -> Mapping[str, Any]:
+        remaining = self._remaining(deadline)
+        if remaining is None:
+            return await asyncio.to_thread(self.rpc.request, method, params)
+        request_timeout = max(0.01, min(self.rpc.timeout, remaining))
+        retry = remaining > (2 * self.rpc.timeout + 10)
+        try:
+            return await asyncio.to_thread(
+                self.rpc.request, method, params, retry, request_timeout
+            )
+        except (TimeoutError, queue.Empty) as exc:
+            if deadline - time.monotonic() <= 0.1:
+                raise RolloutDeadlineReached(
+                    f"Roy reached its rollout deadline during {method}"
+                ) from exc
+            raise
+
+    async def _await_before_deadline(self, awaitable: Any,
+                                     deadline: float | None) -> Any:
+        remaining = self._remaining(deadline)
+        if remaining is None:
+            return await awaitable
+        try:
+            return await asyncio.wait_for(awaitable, timeout=remaining)
+        except asyncio.TimeoutError as exc:
+            raise RolloutDeadlineReached("Roy reached its rollout deadline") from exc
+
+    async def _finalize_rollout_deadline(self) -> None:
+        if self.rpc.last_snapshot is None:
+            return
+        try:
+            await asyncio.to_thread(self.rpc.restart, 10.0)
+            await asyncio.to_thread(
+                self.rpc.request, "rollout_deadline",
+                {"reason": "training_rollout_deadline"}, False, 10.0,
+            )
+        except BaseException:
+            # The last append-only snapshot is still retained and saved below. Harbor must
+            # return normally so its official verifier can score the partial environment.
+            self.rpc.close()
 
     def _save_partial(self) -> None:
         snapshot = self.rpc.last_snapshot

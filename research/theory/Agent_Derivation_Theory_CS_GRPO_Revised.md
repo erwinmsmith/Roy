@@ -87,6 +87,8 @@ pi_theta(a | s) = softmax(mask(logits_theta(s), A_legal(s))).
 
 The same mask semantics are reconstructed during replay. Runtime usage is absent from terminal utility, process credit, advantage and the GRPO loss. The implementation does not assign theoretical costs such as `DERIVE = 2`.
 
+Simple-to-complex topology coverage is implemented as a randomized behavior-policy intervention, not as an additional legality condition or reward. The selected profile contributes recorded node and candidate logit biases: shallow profiles reduce further root expansion near their sampled range, while recursive profiles favor acting at the deepest node and then deriving only from a genuine child-local residual. Valid actions remain in the support of the policy. These biases are included in the stored exact old-policy probability and reconstructed during replay.
+
 ## 5. LHTB state and semantic construction
 
 LHTB is the primary training environment. After every organization decision and every terminal/tool result Roy appends an immutable global epistemic state `M_t`. It contains requirements, claims, assumptions, evidence, external observations, semantic relations, blind spots, dependencies, organization nodes, DAG edges, active subtree, commands, exit codes, file changes, failures, tokens and wall time. Programmatically known events are recorded directly.

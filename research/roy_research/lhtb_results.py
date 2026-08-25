@@ -71,7 +71,11 @@ def import_harbor_group(
         timeout_types = {"TimeoutError", "AgentTimeoutError", "AgentTimeout"}
         exception_type = str((exception or {}).get("exception_type", ""))
         exception_message = str((exception or {}).get("exception_message", ""))
-        normal_deadline = reward_available and exception_type in timeout_types
+        agent_metadata = _agent_metadata(result)
+        internal_deadline = agent_metadata.get("termination_reason") == "rollout_deadline"
+        normal_deadline = reward_available and (
+            exception_type in timeout_types or internal_deadline
+        )
         if normal_deadline and snapshot:
             snapshot = _deadline_terminal_snapshot(snapshot, reward)
         final_output = (snapshot.get("runtime") or {}).get("finalOutput") \
@@ -125,8 +129,8 @@ def import_harbor_group(
             "harbor_result": result, "harbor_result_path": str(result_path),
             "wall_time_seconds": wall_seconds,
             "tokens": _token_total(result),
-            "semantic_audit_path": _agent_metadata(result).get("roy_semantic_audit_root"),
-            "runtime_audit_path": _agent_metadata(result).get("roy_runtime_audit_root"),
+            "semantic_audit_path": agent_metadata.get("roy_semantic_audit_root"),
+            "runtime_audit_path": agent_metadata.get("roy_runtime_audit_root"),
         }
         records.append(record)
     if len(records) != expected:
@@ -231,6 +235,7 @@ def validate_smoke(root: Path, task_ids: tuple[str, ...] = (
         seeds = set()
         state_counts = []
         terminal_node_counts = []
+        terminal_depths = []
         sampling_profiles = set()
         topology_transition_count = 0
         input_tokens = 0
@@ -261,8 +266,31 @@ def validate_smoke(root: Path, task_ids: tuple[str, ...] = (
             topology_transition_count += sum(bool(value["topology_changed"])
                                              for value in transitions)
             terminal_node_counts.append(len(states[-1].get("nodes", [])))
+            terminal_depths.append(max(
+                (int(node.get("depth", 0)) for node in states[-1].get("nodes", [])),
+                default=0,
+            ))
             input_tokens += int((states[-1].get("usage") or {}).get("inputTokens", 0))
             records = list(snapshot.get("policyRecords", []))
+            trajectory_profiles = {
+                str(((record.get("policyState") or {}).get("sampling_profile") or {}).get("id"))
+                for record in records
+                if ((record.get("policyState") or {}).get("sampling_profile") or {}).get("id")
+            }
+            if len(trajectory_profiles) != 1:
+                raise ValueError(f"smoke trajectory has ambiguous sampling profile for {task_id}")
+            trajectory_profile = next(iter(trajectory_profiles))
+            preferred_upper = {"compact": 3, "branching": 5,
+                               "recursive": 7, "connected": 8}[trajectory_profile]
+            if terminal_node_counts[-1] > preferred_upper:
+                raise ValueError(
+                    f"smoke {trajectory_profile} topology exceeded its sampling range "
+                    f"for {task_id}: {terminal_node_counts[-1]} > {preferred_upper}"
+                )
+            if trajectory_profile in {"recursive", "connected"} and terminal_depths[-1] < 2:
+                raise ValueError(
+                    f"smoke {trajectory_profile} topology did not derive subsub for {task_id}"
+                )
             sampling_profiles.update(
                 str(((value.get("policyState") or {}).get("sampling_profile") or {}).get("id"))
                 for value in records
@@ -287,7 +315,7 @@ def validate_smoke(root: Path, task_ids: tuple[str, ...] = (
             )
             compact_interface = compact_interface and all(
                 (value.get("policyState") or {}).get("interface_revision")
-                == "compact-epistemic-event-driven-v2"
+                == "compact-epistemic-event-driven-v3"
                 and "terminal_result_count" in (value.get("policyState") or {})
                 and "organization_action_count" in (value.get("policyState") or {})
                 for value in records
@@ -334,6 +362,7 @@ def validate_smoke(root: Path, task_ids: tuple[str, ...] = (
                            "derive_selected": True,
                            "sampling_profiles": sorted(sampling_profiles),
                            "terminal_node_counts": terminal_node_counts,
+                           "terminal_depths": terminal_depths,
                            "topology_transition_count": topology_transition_count,
                            "stepwise_topology": True}
     if len(groups) != len(task_ids):

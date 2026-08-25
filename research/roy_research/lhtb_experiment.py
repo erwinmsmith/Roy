@@ -17,6 +17,7 @@ import numpy as np
 TRAIN_EPOCHS = 4
 GROUP_SIZE = 8
 MAX_ROLLOUT_SECONDS = 60 * 60
+ROLLOUT_FINALIZATION_MARGIN_SECONDS = 30
 CONCURRENCY = 4
 MAX_RESPONSE_TOKENS = 32768
 SOLVE_THRESHOLD = 0.95
@@ -232,6 +233,9 @@ def write_harbor_group_config(
     }
     if not official_timeout:
         value["agents"][0]["override_timeout_sec"] = MAX_ROLLOUT_SECONDS
+        value["agents"][0]["kwargs"]["rollout_timeout_sec"] = (
+            MAX_ROLLOUT_SECONDS - ROLLOUT_FINALIZATION_MARGIN_SECONDS
+        )
     write_json(path, value)
 
 

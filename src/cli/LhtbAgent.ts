@@ -63,6 +63,11 @@ async function dispatch(request: Request): Promise<unknown> {
     controller ??= new LHTBAutonomousController();
     return controller.advance(session, organizationSeed++);
   }
+  if (request.method === 'rollout_deadline') {
+    session.finalizeAtRolloutDeadline(String(params.reason ?? 'training_rollout_deadline'));
+    return { status: 'completed', terminationReason: 'rollout_deadline',
+      snapshot: session.snapshot() };
+  }
   if (request.method === 'snapshot') return session.snapshot();
   if (request.method === 'shutdown') {
     controller?.close();

@@ -58,6 +58,84 @@ export function topologySamplingProfile(organizationSeed: number): TopologySampl
   return profiles[Math.abs(Math.trunc(organizationSeed)) % profiles.length] ?? profiles[0];
 }
 
+interface SamplingPhase {
+  id: 'expand_width' | 'seed_child_local_residual' | 'derive_child_local_residual' | 'stabilize';
+  deepestActiveNodeIds: Set<string>;
+  childLocalOpenGapIds: Set<string>;
+}
+
+export type TopologySamplingCandidate = Pick<OrganizationCandidate,
+  'kind' | 'actorNodeId' | 'action'>;
+
+function topologySamplingPhase(
+  snapshot: ReturnType<RoyLHTBSession['snapshot']>
+): SamplingPhase {
+  const profile = topologySamplingProfile(snapshot.organizationSeed);
+  const activeNodes = snapshot.runtime.nodes.filter(node =>
+    ['ready', 'running', 'waiting', 'completed'].includes(node.status));
+  const maximumDepth = Math.max(0, ...snapshot.runtime.nodes.map(node => node.depth));
+  const deepestActiveNodeIds = new Set(activeNodes.filter(node => node.depth === maximumDepth)
+    .map(node => node.id));
+  const childLocalOpenGapIds = new Set(snapshot.runtime.requirements.filter(requirement =>
+    requirement.status === 'open' && deepestActiveNodeIds.has(requirement.parentNodeId)
+    && requirement.parentNodeId !== snapshot.runtime.rootId).map(requirement => requirement.id));
+  if (maximumDepth < profile.preferredMinimumDepth && snapshot.runtime.nodes.length > 1) {
+    return { id: childLocalOpenGapIds.size > 0
+      ? 'derive_child_local_residual' : 'seed_child_local_residual',
+    deepestActiveNodeIds, childLocalOpenGapIds };
+  }
+  if (snapshot.runtime.nodes.length >= profile.preferredNodeRange[1]) {
+    return { id: 'stabilize', deepestActiveNodeIds, childLocalOpenGapIds };
+  }
+  return { id: 'expand_width', deepestActiveNodeIds, childLocalOpenGapIds };
+}
+
+function topologySamplingCandidateMatchesPhase(
+  snapshot: ReturnType<RoyLHTBSession['snapshot']>,
+  candidate: TopologySamplingCandidate
+): boolean {
+  const phase = topologySamplingPhase(snapshot);
+  if (phase.id === 'stabilize') return candidate.kind !== 'DERIVE';
+  if (phase.id === 'seed_child_local_residual') {
+    return phase.deepestActiveNodeIds.has(candidate.actorNodeId)
+      && (candidate.kind === 'ACQUIRE' || candidate.kind === 'EXECUTE');
+  }
+  if (phase.id === 'derive_child_local_residual') {
+    const gapId = candidate.action.childSpecification?.triggeringGapId;
+    return candidate.kind === 'DERIVE'
+      && phase.deepestActiveNodeIds.has(candidate.actorNodeId)
+      && typeof gapId === 'string' && phase.childLocalOpenGapIds.has(gapId);
+  }
+  return true;
+}
+
+export function topologySamplingCandidateLogitBias(
+  snapshot: ReturnType<RoyLHTBSession['snapshot']>,
+  candidate: TopologySamplingCandidate
+): number {
+  const profile = topologySamplingProfile(snapshot.organizationSeed);
+  const phase = topologySamplingPhase(snapshot);
+  const matchesPhase = topologySamplingCandidateMatchesPhase(snapshot, candidate);
+  if (phase.id === 'stabilize') return candidate.kind === 'DERIVE' ? -8 : 0;
+  if (phase.id === 'seed_child_local_residual') {
+    if (matchesPhase) return 4;
+    return candidate.kind === 'DERIVE' ? -8 : -2;
+  }
+  if (phase.id === 'derive_child_local_residual') return matchesPhase ? 4 : -4;
+  if (candidate.kind === 'DERIVE'
+    && snapshot.runtime.nodes.length < profile.preferredNodeRange[0]) return 2;
+  return 0;
+}
+
+function topologySamplingActiveNodeLogitBias(
+  snapshot: ReturnType<RoyLHTBSession['snapshot']>, nodeId: string
+): number {
+  const phase = topologySamplingPhase(snapshot);
+  if (phase.id !== 'seed_child_local_residual'
+    && phase.id !== 'derive_child_local_residual') return 0;
+  return phase.deepestActiveNodeIds.has(nodeId) ? 4 : -4;
+}
+
 export type ControllerResult =
   | { status: 'terminal_request'; request: { id: string; command: string; cwd?: string;
     timeoutMs: number; nodeId: string }; snapshot: ReturnType<RoyLHTBSession['snapshot']> }
@@ -124,9 +202,13 @@ may use {"producerNodeId":"<existing>","artifactId":"report:<existing>"}; never 
 dependency merely to make a DAG. PRUNE uses targetNodeId for a non-root node.
 The sampling profile is an intervention for coverage, never a quality label. Progress one legal
 organization action at a time. Once currentNodeCount reaches preferredTopologyRange[1], omit
-DERIVE unless an existing node cannot realize a task-critical open requirement; prioritize
-EXECUTE, ACQUIRE, RETURN, PRUNE, or a useful novel CONNECT. For a recursive profile, execute a
-child early enough to expose a real child-local residual gap instead of assigning every root gap.
+DERIVE and stabilize the current organization with EXECUTE, ACQUIRE, RETURN, PRUNE, or a useful
+novel CONNECT. This is a profile-conditioned sampling intervention, not a resource cost or reward.
+For recursive and connected profiles, once the first child exists and currentMaximumDepth is below
+minimumDepthTarget, do not keep assigning root gaps. Follow requiredNextStructuralPhase exactly:
+run ACQUIRE/EXECUTE on one of deepestActiveNodeIds until it exposes a real child-local residual,
+then DERIVE from that child using one of childLocalOpenGapIds. This produces root -> sub -> subsub
+one action at a time. Never relabel a root requirement as child-local merely to satisfy depth.
 RETURN action uses the property report (never epistemicReport), with this exact report shape:
 {"id":"...","nodeId":"<actor>","parentId":"...","depth":<actor-depth>,"localObjective":"...",
 "triggeringGapId":"...","conclusion":"...","reasoningSummary":"...","claims":[],
@@ -272,6 +354,10 @@ export function compactEpistemicWorkingState(
       realOpenGapIds: openRequirements.map(value => value.id),
       desiredAdditionalChildren: Math.min(3, Math.max(0,
         profile.preferredNodeRange[0] - snapshot.runtime.nodes.length), openRequirements.length),
+      preferredMaximumNodes: profile.preferredNodeRange[1],
+      requiredNextStructuralPhase: topologySamplingPhase(snapshot).id,
+      deepestActiveNodeIds: [...topologySamplingPhase(snapshot).deepestActiveNodeIds],
+      childLocalOpenGapIds: [...topologySamplingPhase(snapshot).childLocalOpenGapIds],
       semantics: 'sampling capability target only; never synthesize gaps or add reward',
     },
     projection: { recentRuntimeEventCount: PROPOSER_RECENT_EVENT_COUNT,
@@ -636,6 +722,15 @@ export class LHTBAutonomousController {
     const openGapIds = new Set(snapshot.runtime.requirements.filter(requirement =>
       requirement.status === 'open' && active.has(requirement.parentNodeId)
     ).map(requirement => requirement.id));
+    const phase = topologySamplingPhase(snapshot);
+    if (phase.id === 'seed_child_local_residual') {
+      return candidates.some(candidate => topologySamplingCandidateMatchesPhase(snapshot, candidate))
+        ? [] : ['missing_deepest_child_progress_candidate'];
+    }
+    if (phase.id === 'derive_child_local_residual') {
+      return candidates.some(candidate => topologySamplingCandidateMatchesPhase(snapshot, candidate))
+        ? [] : ['missing_child_local_recursive_derive_candidate'];
+    }
     const requiredDerives = snapshot.runtime.nodes.length < minimumNodes
       ? Math.min(3, minimumNodes - snapshot.runtime.nodes.length, openGapIds.size) : 0;
     const offeredGapIds = new Set(candidates.filter(candidate => candidate.kind === 'DERIVE')
@@ -730,10 +825,11 @@ export class LHTBAutonomousController {
       external_access: candidate.kind === 'ACQUIRE',
       resolves_gap: candidate.kind === 'ACQUIRE' || candidate.kind === 'RETURN',
       depth_delta: candidate.kind === 'DERIVE' ? 1 : 0,
+      sampling_logit_bias: topologySamplingCandidateLogitBias(snapshot, candidate),
       legal: !(candidate.kind === 'STOP' && explorationStopMasked) }));
     const events = latest?.runtimeEvents ?? [];
     return {
-      interface_revision: 'compact-epistemic-event-driven-v2',
+      interface_revision: 'compact-epistemic-event-driven-v3',
       sampling_profile: { id: profile.id, preferred_node_range: profile.preferredNodeRange,
         preferred_minimum_depth: profile.preferredMinimumDepth, focus: profile.focus,
         reward_semantics: 'coverage intervention only; topology has no intrinsic reward' },
@@ -743,6 +839,8 @@ export class LHTBAutonomousController {
       active_node_legal: activeNodes.map(node => candidates.some(
         candidate => candidate.actorNodeId === node.id
       )),
+      active_node_sampling_logit_bias: activeNodes.map(node =>
+        topologySamplingActiveNodeLogitBias(snapshot, node.id)),
       candidates: policyCandidates,
       envelope: { id: 'lhtb-open', minimum_nodes: minimumNodes, maximum_nodes: 1_000_000,
         minimum_depth: minimumDepth, maximum_depth: 1_000_000, mode: 'expansive' },
@@ -753,6 +851,7 @@ export class LHTBAutonomousController {
       num_real_residual_gaps: openRequirements.length,
       num_child_proposals: candidates.filter(candidate => candidate.kind === 'DERIVE').length,
       available_actions: [...new Set(candidates.map(candidate => candidate.kind))],
+      topology_sampling_phase: topologySamplingPhase(snapshot).id,
       exploration_stop_masked: explorationStopMasked,
       stop_legal_reason: explorationStopMasked
         ? 'masked_during_early_exploration_with_real_open_residual_gap'

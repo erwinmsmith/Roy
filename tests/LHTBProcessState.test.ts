@@ -3,7 +3,8 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { GlobalEpistemicStateRecorder, LHTBAutonomousController,
-  RoyLHTBSession, topologySamplingProfile } from '../src/core/structural/index.js';
+  RoyLHTBSession, topologySamplingCandidateLogitBias,
+  topologySamplingProfile } from '../src/core/structural/index.js';
 import { LLMJSONParseError } from '../src/core/llm/providers/openai.js';
 
 function baseInput(sequence: number, previousFingerprint?: string) {
@@ -23,6 +24,98 @@ describe('LHTB process state', () => {
       .toEqual(['compact', 'branching', 'recursive', 'connected']);
     expect(topologySamplingProfile(3).preferredNodeRange).toEqual([6, 8]);
     expect(topologySamplingProfile(2).preferredMinimumDepth).toBe(2);
+  });
+
+  it('turns a recursive profile into a real root to sub to subsub derivation', () => {
+    const session = new RoyLHTBSession('recursive', 'task', 'implement and verify', 'commit',
+      'learned_information_realization', 'same', 2);
+    session.applySemanticUpdate({ event_id: 'task-instruction', requirements: [{
+      id: 'root-a', description: 'implement one bounded component', requiredInformation: 'code',
+      likelyMechanism: 'conversion',
+    }, {
+      id: 'root-b', description: 'verify another bounded component', requiredInformation: 'test',
+      likelyMechanism: 'conversion',
+    }], claims: [], assumptions: [], evidence: [], external_observations: [], blind_spots: [],
+    relations: [] });
+    const childSpecification = {
+      id: 'spec-child', nodeId: 'child', parentId: 'root', depth: 1,
+      parentGoal: 'implement and verify', triggeringGapId: 'root-a',
+      localObjective: 'Implement one bounded component.', refinement: {
+        parentScope: 'implement and verify', childScope: 'implement one component',
+        triggeringRequirementId: 'root-a', narrowerThanParent: true,
+        newInformationNeeded: 'repository details', executableEndCondition: 'component test passes',
+        duplicatedByExistingNode: false,
+      }, requiredClaims: [], requiredEvidence: [], relevantReportIds: [],
+      externalAccess: { allowed: true, tools: ['terminal'], purpose: 'inspect and implement' },
+      expectedOutput: { requiredInformation: 'tested component', outputType: 'epistemic_report' as const },
+      terminationCondition: 'return tested component',
+    };
+    session.applyOrganizationAction({ kind: 'DERIVE', actorNodeId: 'root', childSpecification });
+    const shallow = session.snapshot();
+    expect(topologySamplingCandidateLogitBias(shallow, {
+      kind: 'EXECUTE', actorNodeId: 'child', action: { kind: 'EXECUTE', actorNodeId: 'child' },
+    })).toBe(4);
+    expect(topologySamplingCandidateLogitBias(shallow, {
+      kind: 'DERIVE', actorNodeId: 'root', action: { kind: 'DERIVE', actorNodeId: 'root',
+        childSpecification: { ...childSpecification, id: 'spec-root-b', nodeId: 'root-b-worker',
+          triggeringGapId: 'root-b', refinement: { ...childSpecification.refinement,
+            triggeringRequirementId: 'root-b' } } },
+    })).toBe(-8);
+
+    session.requestTerminal({ id: 'inspect-child', command: 'pytest -q', timeoutMs: 1000,
+      nodeId: 'child', organizationActionKind: 'EXECUTE' });
+    session.acceptTerminalResult({ requestId: 'inspect-child', exitCode: 1, stdout: '',
+      stderr: 'a concrete child-local failure', durationMs: 1 });
+    session.applySemanticUpdate({ event_id: 'result-inspect-child', requirements: [{
+      id: 'child-gap', description: 'repair the child-local failure', requiredInformation: 'fix',
+      likelyMechanism: 'conversion',
+    }], claims: [], assumptions: [], evidence: [], external_observations: [], blind_spots: [],
+    relations: [] });
+    const grandchildSpecification = {
+      ...childSpecification, id: 'spec-grandchild', nodeId: 'grandchild', parentId: 'child',
+      depth: 2, parentGoal: childSpecification.localObjective, triggeringGapId: 'child-gap',
+      localObjective: 'Repair and verify the isolated child-local failure.',
+      refinement: { ...childSpecification.refinement,
+        parentScope: childSpecification.localObjective, childScope: 'repair isolated failure',
+        triggeringRequirementId: 'child-gap' },
+    };
+    expect(topologySamplingCandidateLogitBias(session.snapshot(), {
+      kind: 'DERIVE', actorNodeId: 'child', action: { kind: 'DERIVE', actorNodeId: 'child',
+        childSpecification: grandchildSpecification },
+    })).toBe(4);
+    session.applyOrganizationAction({ kind: 'DERIVE', actorNodeId: 'child',
+      childSpecification: grandchildSpecification });
+    expect(session.snapshot().runtime.derivationEdges).toEqual([
+      { parentId: 'root', childId: 'child' },
+      { parentId: 'child', childId: 'grandchild' },
+    ]);
+    expect(Math.max(...session.snapshot().runtime.nodes.map(node => node.depth))).toBe(2);
+    const capped = session.snapshot();
+    while (capped.runtime.nodes.length < 7) {
+      const index = capped.runtime.nodes.length;
+      capped.runtime.nodes.push({ ...capped.runtime.nodes[0]!, id: `extra-${index}`,
+        parentId: 'root', depth: 1, localObjective: `extra objective ${index}` });
+    }
+    expect(topologySamplingCandidateLogitBias(capped, {
+      kind: 'DERIVE', actorNodeId: 'grandchild', action: { kind: 'DERIVE',
+        actorNodeId: 'grandchild', childSpecification: { ...grandchildSpecification,
+          id: 'too-wide', nodeId: 'too-wide', parentId: 'grandchild', depth: 3 } },
+    })).toBe(-8);
+  });
+
+  it('finalizes a pending terminal request at the rollout deadline', () => {
+    const session = new RoyLHTBSession('deadline', 'task', 'solve it', 'commit');
+    session.requestTerminal({ id: 'long-command', command: 'run-long-task', timeoutMs: 60_000,
+      nodeId: 'root', organizationActionKind: 'EXECUTE' });
+    const before = session.snapshot().processStates.length;
+    session.finalizeAtRolloutDeadline();
+    const snapshot = session.snapshot();
+    expect(snapshot.pendingTerminalRequest).toBeUndefined();
+    expect(snapshot.processStates).toHaveLength(before + 1);
+    expect(snapshot.processStates.at(-1)?.runtimeEvents.slice(-2).map(event => event.kind))
+      .toEqual(['failure', 'verifier']);
+    expect(snapshot.processStates.at(-1)?.runtimeEvents.at(-1)?.attributes?.next)
+      .toBe('official_final_verifier');
   });
   it('round-trips an append-only fingerprint chain', () => {
     const recorder = new GlobalEpistemicStateRecorder();
