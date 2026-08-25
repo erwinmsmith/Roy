@@ -479,8 +479,15 @@ export class LHTBAutonomousController {
         value => value.reasons
       ))];
       if (attempt === proposalAttempts) {
-        if (structuralDeficits.length > 0) {
-          throw new Error(`sampling_invalid:${structuralDeficits.join('; ')}`);
+        if (currentValidation.candidates.length > 0 && structuralDeficits.length > 0) {
+          // Topology profiles are sampling interventions, not hard resource or
+          // validity constraints.  Give the proposer its configured repair
+          // attempts, then preserve any genuinely legal continuation instead
+          // of discarding the whole trajectory merely because the final
+          // candidate interface did not cover the preferred topology.
+          completion = current;
+          validation = currentValidation;
+          break;
         }
         if (reasons.length > 0 && reasons.every(reason => reason === 'inactive_actor')) {
           throw new Error('environment_invalid:inactive_actor');

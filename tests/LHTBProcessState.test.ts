@@ -378,11 +378,11 @@ describe('LHTB process state', () => {
     }
   });
 
-  it('rejects a shallow learned candidate interface while a real derivation gap exists', async () => {
+  it('keeps a legal continuation when topology coverage remains incomplete after repair', async () => {
     const priorAttempts = process.env.ROY_LHTB_PROPOSAL_ATTEMPTS;
-    const priorMinimum = process.env.ROY_LHTB_EXPLORATION_MIN_NODES;
+    const priorProfile = process.env.ROY_LHTB_TOPOLOGY_PROFILE;
     process.env.ROY_LHTB_PROPOSAL_ATTEMPTS = '2';
-    process.env.ROY_LHTB_EXPLORATION_MIN_NODES = '6';
+    process.env.ROY_LHTB_TOPOLOGY_PROFILE = 'connected';
     const session = new RoyLHTBSession('shallow-interface', 'task', 'solve it', 'commit',
       'learned_information_realization');
     const semantic = { async processEvent(event: { id: string }) {
@@ -399,18 +399,30 @@ describe('LHTB process state', () => {
         promptTokens: 1, completionTokens: 1, totalTokens: 2,
       } } };
     } };
-    const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false });
+    const learnedPolicy = { async select(_state: Record<string, unknown>, candidates: Array<{
+      id: string; actorNodeId: string; kind: string;
+    }>) {
+      const candidate = candidates[0];
+      return { candidate, record: { stateFingerprint: 'state', activeNodeId: candidate.actorNodeId,
+        candidateId: candidate.id, maskedOldLogProbability: 0, envelopeId: 'connected' } };
+    }, close() {} };
+    const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false,
+      learnedPolicy: learnedPolicy as never });
     try {
-      await expect(controller.advance(session, 1)).rejects
-        .toThrow('sampling_invalid:missing_real_gap_derive_candidates:0/1');
+      const result = await controller.advance(session, 1);
+      expect(result.status).toBe('terminal_request');
+      if (result.status === 'terminal_request') {
+        expect(result.request.command).toBe('pwd');
+        expect(result.request.nodeId).toBe('root');
+      }
       expect(calls).toBe(2);
       expect(session.snapshot().runtime.stopped).toBe(false);
     } finally {
       controller.close();
       if (priorAttempts === undefined) delete process.env.ROY_LHTB_PROPOSAL_ATTEMPTS;
       else process.env.ROY_LHTB_PROPOSAL_ATTEMPTS = priorAttempts;
-      if (priorMinimum === undefined) delete process.env.ROY_LHTB_EXPLORATION_MIN_NODES;
-      else process.env.ROY_LHTB_EXPLORATION_MIN_NODES = priorMinimum;
+      if (priorProfile === undefined) delete process.env.ROY_LHTB_TOPOLOGY_PROFILE;
+      else process.env.ROY_LHTB_TOPOLOGY_PROFILE = priorProfile;
     }
   });
 
