@@ -12,7 +12,9 @@ function baseInput(sequence: number, previousFingerprint?: string) {
     trajectoryId: 'trajectory', taskId: 'task', sequence,
     requirements: [], claims: [], assumptions: [], evidence: [], externalObservations: [],
     semanticRelations: [], blindSpots: [], dependencies: [], nodes: [], dagEdges: [],
-    activeSubtree: [], runtimeEvents: [],
+    activeSubtree: [], runtimeEvents: [], runtimeEventRange: {
+      start: 0, endExclusive: 0, total: 0,
+    },
     usage: { inputTokens: 0, outputTokens: 0, wallTimeMs: 0 },
     environmentRevision: 'lhtb-pinned', previousFingerprint,
   };
@@ -140,6 +142,31 @@ describe('LHTB process state', () => {
     expect(snapshot.processStates.at(-1)?.runtimeEvents.at(-1)?.exitCode).toBe(0);
     const restored = RoyLHTBSession.restore(snapshot);
     expect(restored.snapshot().runtime.fingerprint).toBe(snapshot.runtime.fingerprint);
+  });
+
+  it('stores one complete event ledger with bounded per-state projections', () => {
+    const session = new RoyLHTBSession('bounded-ledger', 'task', 'solve it', 'commit');
+    for (let index = 0; index < 120; index += 1) {
+      session.requestTerminal({ id: `command-${index}`, command: `inspect-${index}`,
+        timeoutMs: 1000, nodeId: 'root' });
+      session.acceptTerminalResult({ requestId: `command-${index}`, exitCode: 0,
+        stdout: `${index}:${'x'.repeat(20_000)}`, stderr: '', durationMs: 1 });
+    }
+    const snapshot = session.snapshot();
+    expect(snapshot.runtimeEvents).toHaveLength(241);
+    expect(Math.max(...snapshot.processStates.map(state => state.runtimeEvents.length))).toBe(24);
+    expect(snapshot.processStates.at(-1)?.runtimeEventRange).toEqual({
+      start: 217, endExclusive: 241, total: 241,
+    });
+    expect(JSON.stringify(snapshot).length).toBeLessThan(15_000_000);
+    const searchSnapshot = RoyLHTBSession.compactForSearch(snapshot);
+    expect(searchSnapshot.processStates).toHaveLength(1);
+    expect(searchSnapshot.runtimeEvents).toHaveLength(24);
+    expect(JSON.stringify(searchSnapshot).length).toBeLessThan(1_000_000);
+    const restored = RoyLHTBSession.restore(snapshot).snapshot();
+    expect(restored.runtimeEvents).toEqual(snapshot.runtimeEvents);
+    expect(restored.processStates.at(-1)?.fingerprint)
+      .toBe(snapshot.processStates.at(-1)?.fingerprint);
   });
 
   it('makes direct a true single root agent in the same runtime', () => {
@@ -738,10 +765,13 @@ describe('LHTB process state', () => {
       await controller.advance(session, 1);
       expect(proposerInput).toContain('proposer projection omitted');
       expect(proposerInput.length).toBeLessThan(30_000);
-      const rawEvent = session.snapshot().processStates
+      const snapshot = session.snapshot();
+      const rawEvent = snapshot.runtimeEvents?.find(event => event.id === 'result-large');
+      expect(rawEvent?.output).toBe(longOutput);
+      const projectedEvent = snapshot.processStates
         .flatMap(state => state.runtimeEvents)
         .find(event => event.id === 'result-large');
-      expect(rawEvent?.output).toBe(longOutput);
+      expect(projectedEvent?.output?.length).toBeLessThan(longOutput.length);
     } finally {
       controller.close();
     }

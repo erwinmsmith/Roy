@@ -121,6 +121,7 @@ def import_harbor_group(
             "runtime_config": dict(runtime_config),
             "initial_snapshot_fingerprint": snapshot.get("initialSnapshotFingerprint"),
             "actions": _actions(snapshot), "policy_records": snapshot.get("policyRecords", []),
+            "runtime_events": snapshot.get("runtimeEvents", []),
             "policy_interface_revision": _policy_interface_revision(snapshot),
             "process_states": process_states,
             "state_transitions": build_state_transition_samples(process_states),
@@ -256,15 +257,24 @@ def _deadline_terminal_snapshot(snapshot: Mapping[str, Any], reward: float) -> M
     previous = str(terminal.get("fingerprint"))
     terminal["sequence"] = int(terminal.get("sequence", len(states) - 1)) + 1
     terminal["previousFingerprint"] = previous
-    terminal["runtimeEvents"] = [*terminal.get("runtimeEvents", []), {
+    terminal_event = {
         "id": f"deadline-{terminal['sequence']}", "kind": "verifier",
         "at": 0, "attributes": {"officialFinalReward": reward,
                                   "termination": "training_deadline"},
-    }]
+    }
+    terminal["runtimeEvents"] = [*terminal.get("runtimeEvents", [])[-23:], terminal_event]
+    previous_range = terminal.get("runtimeEventRange") or {}
+    previous_total = int(previous_range.get("total", len(value.get("runtimeEvents", []))))
+    terminal["runtimeEventRange"] = {
+        "start": max(0, previous_total + 1 - 24),
+        "endExclusive": previous_total + 1,
+        "total": previous_total + 1,
+    }
     terminal.pop("fingerprint", None)
     terminal["fingerprint"] = canonical_fingerprint(terminal)
     states.append(terminal)
     value["processStates"] = states
+    value["runtimeEvents"] = [*value.get("runtimeEvents", []), terminal_event]
     return value
 
 

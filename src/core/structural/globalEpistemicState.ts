@@ -2,7 +2,7 @@ import { stableStructuralFingerprint } from './graphs.js';
 import type { EpistemicClaim, EpistemicEvidence, ExternalObservation,
   InformationRealizationNode, ResidualRequirement } from './informationRealizationTypes.js';
 
-export const GLOBAL_EPISTEMIC_STATE_SCHEMA_VERSION = 1 as const;
+export const GLOBAL_EPISTEMIC_STATE_SCHEMA_VERSION = 2 as const;
 
 export interface SemanticRelation {
   leftId: string;
@@ -46,7 +46,9 @@ export interface GlobalEpistemicState {
   nodes: InformationRealizationNode[];
   dagEdges: Array<Record<string, unknown>>;
   activeSubtree: string[];
+  /** Bounded local event projection. The complete immutable ledger lives on the session snapshot. */
   runtimeEvents: RuntimeProcessEvent[];
+  runtimeEventRange?: { start: number; endExclusive: number; total: number };
   usage: { inputTokens: number; outputTokens: number; wallTimeMs: number };
   environmentRevision: string;
   previousFingerprint?: string;

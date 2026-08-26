@@ -14,7 +14,7 @@ ORGANIZATION_ACTIONS = (
     "STOP",
 )
 
-LHTB_POLICY_INTERFACE_REVISION = "compact-epistemic-event-driven-v4"
+LHTB_POLICY_INTERFACE_REVISION = "bounded-epistemic-event-ledger-20260827"
 
 
 @dataclass(frozen=True)

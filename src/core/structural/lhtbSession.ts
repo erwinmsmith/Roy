@@ -8,7 +8,7 @@ import type { SemanticUpdate } from './pythonSemanticState.js';
 import type { EpistemicClaim, EpistemicEvidence, ExternalObservation } from './informationRealizationTypes.js';
 
 export interface LHTBSessionSnapshot {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   trajectoryId: string;
   taskId: string;
   instruction: string;
@@ -17,6 +17,10 @@ export interface LHTBSessionSnapshot {
   initialSnapshotFingerprint: string;
   organizationSeed: number;
   runtime: RecursiveRuntimeSnapshot;
+  /** Complete append-only event ledger, stored once rather than copied into every M_t. */
+  runtimeEvents?: RuntimeProcessEvent[];
+  /** Monotonic event sequence, retained when MCTS uses only a recent ledger projection. */
+  runtimeEventCount?: number;
   processStates: GlobalEpistemicState[];
   policyRecords: OrganizationPolicyRecord[];
   processedSemanticEventIds: string[];
@@ -51,9 +55,12 @@ export interface TerminalResult {
 }
 
 export class RoyLHTBSession {
+  private static readonly STATE_EVENT_WINDOW = 24;
   private runtime: RecursiveInformationRealizationRuntime;
   private recorder = new GlobalEpistemicStateRecorder();
   private events: RuntimeProcessEvent[] = [];
+  private eventSequence = 0;
+  private wallTimeMs = 0;
   private policyRecords: OrganizationPolicyRecord[] = [];
   private usage = { inputTokens: 0, outputTokens: 0 };
   private processedSemanticEventIds = new Set<string>();
@@ -80,6 +87,7 @@ export class RoyLHTBSession {
     this.events.push({ id: 'task-instruction', kind: 'task_instruction', at: Date.now(),
       nodeId: 'root', output: instruction,
       attributes: { source: 'benchmark_instruction', semanticallyExtractable: true } });
+    this.eventSequence = 1;
     this.recordState();
   }
 
@@ -89,7 +97,9 @@ export class RoyLHTBSession {
       snapshot.initialSnapshotFingerprint, snapshot.organizationSeed);
     session.runtime = RecursiveInformationRealizationRuntime.restore(snapshot.runtime);
     session.recorder.restore(snapshot.processStates);
-    session.events = structuredClone(snapshot.processStates.at(-1)?.runtimeEvents ?? []);
+    session.events = structuredClone(snapshot.runtimeEvents
+      ?? RoyLHTBSession.reconstructLegacyEventLedger(snapshot.processStates));
+    session.eventSequence = snapshot.runtimeEventCount ?? session.events.length;
     session.policyRecords = structuredClone(snapshot.policyRecords ?? []);
     session.processedSemanticEventIds = new Set(snapshot.processedSemanticEventIds ?? []);
     const overlay = snapshot.semanticOverlay;
@@ -102,6 +112,7 @@ export class RoyLHTBSession {
     session.semanticBlindSpots = structuredClone(overlay?.blindSpots ?? []);
     const usage = snapshot.processStates.at(-1)?.usage;
     session.usage = { inputTokens: usage?.inputTokens ?? 0, outputTokens: usage?.outputTokens ?? 0 };
+    session.wallTimeMs = usage?.wallTimeMs ?? 0;
     session.pendingTerminalRequest = structuredClone(snapshot.pendingTerminalRequest);
     return session;
   }
@@ -113,9 +124,10 @@ export class RoyLHTBSession {
     }
     this.runtime.apply(action);
     this.events.push({
-      id: `action-${this.events.length}`, kind: 'organization_action', at: Date.now(),
+      id: `action-${this.eventSequence}`, kind: 'organization_action', at: Date.now(),
       nodeId: action.actorNodeId, attributes: { action: structuredClone(action) },
     });
+    this.eventSequence += 1;
     return this.recordState();
   }
 
@@ -126,8 +138,9 @@ export class RoyLHTBSession {
   recordModelUsage(inputTokens: number, outputTokens: number, model?: string): void {
     this.usage.inputTokens += inputTokens;
     this.usage.outputTokens += outputTokens;
-    this.events.push({ id: `usage-${this.events.length}`, kind: 'usage', at: Date.now(),
+    this.events.push({ id: `usage-${this.eventSequence}`, kind: 'usage', at: Date.now(),
       attributes: { inputTokens, outputTokens, model } });
+    this.eventSequence += 1;
   }
 
   unprocessedSemanticEvents(): RuntimeProcessEvent[] {
@@ -202,6 +215,7 @@ export class RoyLHTBSession {
     this.events.push({ id: `terminal-${request.id}`, kind: 'terminal_command', at: Date.now(),
       nodeId: request.nodeId, command: request.command, cwd: request.cwd,
       timeoutMs: request.timeoutMs });
+    this.eventSequence += 1;
     return this.recordState();
   }
 
@@ -213,21 +227,25 @@ export class RoyLHTBSession {
       nodeId: this.pendingTerminalRequest.nodeId, exitCode: result.exitCode,
       output: `${result.stdout}${result.stderr}`,
       attributes: { durationMs: result.durationMs, fileChanges: result.fileChanges ?? [] } });
+    this.eventSequence += 1;
+    this.wallTimeMs += result.durationMs;
     this.pendingTerminalRequest = undefined;
     return this.recordState();
   }
 
   finalizeAtRolloutDeadline(reason = 'training_rollout_deadline'): GlobalEpistemicState {
     if (this.pendingTerminalRequest) {
-      this.events.push({ id: `deadline-terminal-${this.events.length}`, kind: 'failure',
+      this.events.push({ id: `deadline-terminal-${this.eventSequence}`, kind: 'failure',
         at: Date.now(), nodeId: this.pendingTerminalRequest.nodeId,
         command: this.pendingTerminalRequest.command,
         attributes: { interruptedRequestId: this.pendingTerminalRequest.id,
           termination: reason, environmentSideEffectsMayBePartial: true } });
+      this.eventSequence += 1;
       this.pendingTerminalRequest = undefined;
     }
-    this.events.push({ id: `deadline-${this.events.length}`, kind: 'verifier', at: Date.now(),
+    this.events.push({ id: `deadline-${this.eventSequence}`, kind: 'verifier', at: Date.now(),
       attributes: { termination: reason, next: 'official_final_verifier' } });
+    this.eventSequence += 1;
     return this.recordState();
   }
 
@@ -246,18 +264,21 @@ export class RoyLHTBSession {
       ...withoutFingerprint,
       fingerprint: stableStructuralFingerprint(withoutFingerprint),
     } as RecursiveRuntimeSnapshot);
-    this.events.push({ id: `verifier-${this.events.length}`, kind: 'verifier', at: Date.now(),
+    this.events.push({ id: `verifier-${this.eventSequence}`, kind: 'verifier', at: Date.now(),
       attributes: { result: 'rejected', continuation: 'same_session', feedback } });
+    this.eventSequence += 1;
     return this.recordState();
   }
 
   snapshot(): LHTBSessionSnapshot {
-    return { schemaVersion: 1, trajectoryId: this.trajectoryId, taskId: this.taskId,
+    return { schemaVersion: 2, trajectoryId: this.trajectoryId, taskId: this.taskId,
       instruction: this.instruction, environmentRevision: this.environmentRevision,
       organizationMode: this.organizationMode,
       initialSnapshotFingerprint: this.initialSnapshotFingerprint,
       organizationSeed: this.organizationSeed,
-      runtime: this.runtime.snapshot(), processStates: this.recorder.snapshot(),
+      runtime: this.runtime.snapshot(), runtimeEvents: structuredClone(this.events),
+      runtimeEventCount: this.eventSequence,
+      processStates: this.recorder.snapshot(),
       policyRecords: structuredClone(this.policyRecords),
       processedSemanticEventIds: [...this.processedSemanticEventIds],
       semanticOverlay: { requirements: structuredClone(this.semanticRequirements),
@@ -296,12 +317,72 @@ export class RoyLHTBSession {
       ],
       activeSubtree: snapshot.nodes.filter(node => ['ready', 'running', 'waiting'].includes(node.status))
         .map(node => node.id),
-      runtimeEvents: this.events,
+      runtimeEvents: this.events.slice(-RoyLHTBSession.STATE_EVENT_WINDOW)
+        .map(event => RoyLHTBSession.compactStateEvent(event)),
+      runtimeEventRange: {
+        start: Math.max(0, this.eventSequence
+          - Math.min(this.events.length, RoyLHTBSession.STATE_EVENT_WINDOW)),
+        endExclusive: this.eventSequence, total: this.eventSequence,
+      },
       usage: { inputTokens: this.usage.inputTokens, outputTokens: this.usage.outputTokens,
-        wallTimeMs: this.events.reduce((total, event) => total
-          + Number(event.attributes?.durationMs ?? 0), 0) },
+        wallTimeMs: this.wallTimeMs },
       environmentRevision: this.environmentRevision,
       previousFingerprint: previous?.fingerprint,
     });
+  }
+
+  private static compactStateEvent(event: RuntimeProcessEvent): RuntimeProcessEvent {
+    const compactText = (value: string | undefined, maximum: number): string | undefined => {
+      if (value === undefined || value.length <= maximum) return value;
+      const side = Math.floor((maximum - 32) / 2);
+      return `${value.slice(0, side)}\n[...event text omitted...]\n${value.slice(-side)}`;
+    };
+    const attributes = event.attributes ? structuredClone(event.attributes) : undefined;
+    if (attributes && Array.isArray(attributes.fileChanges)) {
+      attributes.fileChanges = attributes.fileChanges.slice(0, 256);
+    }
+    if (attributes && typeof attributes.feedback === 'string') {
+      attributes.feedback = compactText(attributes.feedback, 2_000);
+    }
+    return { ...structuredClone(event), command: compactText(event.command, 2_000),
+      output: compactText(event.output, 2_000), attributes };
+  }
+
+  private static reconstructLegacyEventLedger(
+    states: GlobalEpistemicState[]
+  ): RuntimeProcessEvent[] {
+    const byId = new Map<string, RuntimeProcessEvent>();
+    for (const state of states) {
+      for (const event of state.runtimeEvents ?? []) byId.set(event.id, structuredClone(event));
+    }
+    return [...byId.values()];
+  }
+
+  static compactForSearch(snapshot: LHTBSessionSnapshot): LHTBSessionSnapshot {
+    const latest = snapshot.processStates.at(-1);
+    if (!latest) return structuredClone(snapshot);
+    const eventCount = snapshot.runtimeEventCount
+      ?? snapshot.runtimeEvents?.length ?? latest.runtimeEventRange?.total
+      ?? latest.runtimeEvents.length;
+    const rawEvents = (snapshot.runtimeEvents ?? latest.runtimeEvents)
+      .slice(-RoyLHTBSession.STATE_EVENT_WINDOW);
+    const projectedEvents = rawEvents.map(event => RoyLHTBSession.compactStateEvent(event));
+    const latestMaterial = Object.fromEntries(Object.entries(structuredClone(latest))
+      .filter(([key]) => key !== 'fingerprint')) as Omit<GlobalEpistemicState, 'fingerprint'>;
+    const material = { ...latestMaterial, sequence: 0, previousFingerprint: undefined,
+      runtimeEvents: projectedEvents, runtimeEventRange: {
+        start: Math.max(0, eventCount - projectedEvents.length),
+        endExclusive: eventCount, total: eventCount,
+      } };
+    const compactState = { ...material, fingerprint: stableStructuralFingerprint(material) };
+    return { schemaVersion: 2, trajectoryId: snapshot.trajectoryId, taskId: snapshot.taskId,
+      instruction: snapshot.instruction, environmentRevision: snapshot.environmentRevision,
+      organizationMode: snapshot.organizationMode,
+      initialSnapshotFingerprint: snapshot.initialSnapshotFingerprint,
+      organizationSeed: snapshot.organizationSeed, runtime: structuredClone(snapshot.runtime),
+      runtimeEvents: structuredClone(rawEvents), runtimeEventCount: eventCount,
+      processStates: [compactState], policyRecords: [], processedSemanticEventIds: [],
+      semanticOverlay: structuredClone(snapshot.semanticOverlay),
+      pendingTerminalRequest: structuredClone(snapshot.pendingTerminalRequest) };
   }
 }

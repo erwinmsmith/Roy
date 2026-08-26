@@ -320,7 +320,7 @@ export function compactEpistemicWorkingState(
   snapshot: ReturnType<RoyLHTBSession['snapshot']>
 ): Record<string, unknown> {
   const latest = snapshot.processStates.at(-1);
-  const recentRuntimeEvents = (latest?.runtimeEvents ?? [])
+  const recentRuntimeEvents = (snapshot.runtimeEvents ?? latest?.runtimeEvents ?? [])
     .slice(-PROPOSER_RECENT_EVENT_COUNT)
     .map(event => compactEvent(event as unknown as Record<string, unknown>));
   const activeNodes = snapshot.runtime.nodes.filter(node =>
@@ -609,7 +609,8 @@ export class LHTBAutonomousController {
     const cpuCT = Math.max(0, Number(process.env.ROY_LHTB_MCTS_CPUCT ?? 1.5));
     const temperature = Math.max(1e-6,
       Number(process.env.ROY_LHTB_MCTS_TEMPERATURE ?? 1));
-    const result = await searchOrganizationMCTS({ rootState: snapshot, candidates,
+    const result = await searchOrganizationMCTS({
+      rootState: RoyLHTBSession.compactForSearch(snapshot), candidates,
       simulations, maximumDepth, cpuCT, temperature, seed,
       expand: async (state, remaining) => this.expandMCTSNode(state, remaining) });
     const selected = result.candidate;
@@ -720,7 +721,7 @@ export class LHTBAutonomousController {
     const previous = snapshot.policyRecords.at(-1)?.policyState;
     if (!previous || typeof previous !== 'object') return true;
     const policyState = previous as Record<string, unknown>;
-    const events = snapshot.processStates.at(-1)?.runtimeEvents ?? [];
+    const events = snapshot.runtimeEvents ?? snapshot.processStates.at(-1)?.runtimeEvents ?? [];
     const priorTerminalCount = Number(policyState.terminal_result_count ?? 0);
     const terminalResults = events.filter(event => event.kind === 'terminal_result');
     const newTerminalResults = terminalResults.slice(priorTerminalCount);
@@ -752,7 +753,7 @@ export class LHTBAutonomousController {
 
   private localContinuationCandidate(snapshot: ReturnType<RoyLHTBSession['snapshot']>,
     candidates: ProposedCandidate[], preferredId: string): ProposedCandidate | undefined {
-    const events = snapshot.processStates.at(-1)?.runtimeEvents ?? [];
+    const events = snapshot.runtimeEvents ?? snapshot.processStates.at(-1)?.runtimeEvents ?? [];
     const actorId = [...events].reverse().find(event =>
       event.kind === 'terminal_result' || event.kind === 'terminal_command')?.nodeId;
     const local = candidates.filter(candidate =>
@@ -771,7 +772,8 @@ export class LHTBAutonomousController {
       .filter(node => ['ready', 'running', 'waiting', 'completed'].includes(node.status))
       .map(node => node.id));
     const direct = snapshot.organizationMode === 'single_agent_direct';
-    const runtimeEvents = snapshot.processStates.at(-1)?.runtimeEvents ?? [];
+    const runtimeEvents = snapshot.runtimeEvents
+      ?? snapshot.processStates.at(-1)?.runtimeEvents ?? [];
     let lastFailedCommand: { command?: string; cwd?: string } | undefined;
     for (let index = runtimeEvents.length - 1; index >= 0; index -= 1) {
       const event = runtimeEvents[index];
@@ -1033,7 +1035,8 @@ export class LHTBAutonomousController {
     const activeNodes = snapshot.runtime.nodes
       .filter(node => ['ready', 'running', 'waiting', 'completed'].includes(node.status));
     const latest = snapshot.processStates.at(-1);
-    const events = latest?.runtimeEvents ?? [];
+    const events = snapshot.runtimeEvents ?? latest?.runtimeEvents ?? [];
+    const projectedEvents = (latest?.runtimeEvents ?? events).slice(-24);
     const agentNodes = snapshot.runtime.nodes.map(node => ({ id: node.id, kind: 'agent',
       timestamp: node.createdAt, text: node.localObjective, status: node.status,
       attributes: { signal: node.status === 'returned' || node.status === 'completed' ? 1 : 0 } }));
@@ -1057,7 +1060,7 @@ export class LHTBAutonomousController {
         kind: 'message', timestamp: 0, text: value, status: 'open',
         attributes: { signal: -1 } })),
     ];
-    const runtimeNodes = events.map((event, index) => {
+    const runtimeNodes = projectedEvents.map((event, index) => {
       const action = event.attributes?.action as Record<string, unknown> | undefined;
       const text = [event.kind, action?.kind, event.command, projectText(event.output)]
         .filter(value => value !== undefined && value !== '').join(' ');
@@ -1118,7 +1121,7 @@ export class LHTBAutonomousController {
           id: `o-${observationIndex}-${supportIndex}`, kind: 'produces',
           from: value.id, to: claimId }))),
       ...runtimeNodes.flatMap((value, index) => {
-        const event = events[index];
+        const event = projectedEvents[index];
         const values: Array<{ id: string; kind: string; from: string; to: string }> = [];
         if (event?.nodeId) values.push({ id: `runtime-owner-${index}`,
           kind: ['terminal_command', 'terminal_result'].includes(event.kind)
@@ -1148,7 +1151,7 @@ export class LHTBAutonomousController {
       legal: !(candidate.kind === 'STOP' && explorationStopMasked
         && hasExplorationAlternative) }));
     return {
-      interface_revision: 'compact-epistemic-event-driven-v4',
+      interface_revision: 'bounded-epistemic-event-ledger-20260827',
       sampling_profile: { id: profile.id, preferred_node_range: profile.preferredNodeRange,
         preferred_minimum_depth: profile.preferredMinimumDepth, focus: profile.focus,
         reward_semantics: 'coverage intervention only; topology has no intrinsic reward' },
