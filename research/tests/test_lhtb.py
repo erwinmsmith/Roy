@@ -833,6 +833,7 @@ for line in sys.stdin:
         transitions = build_state_transition_samples(states, [0.4, 0.6], 0.7)
         result = sample_audit([{"id": "one", "rollout_index": 0, "organization_seed": 1,
             "terminal_reward": 0.7, "process_states": states, "state_transitions": transitions,
+            "shaped_returns": [0.3],
             "policy_records": [{"behaviorPolicy": "mcts_puct", "selectedAction": "DERIVE",
                 "policyState": {"sampling_profile": {"id": "recursive"}},
                 "selectedProcessReward": 0.2,
@@ -843,6 +844,8 @@ for line in sys.stdin:
         self.assertTrue(result["all_mcts_traces_complete"])
         self.assertEqual(result["trajectories"][0]["terminal_node_count"], 2)
         self.assertEqual(result["trajectories"][0]["process_reward_signs"]["positive"], 1)
+        self.assertTrue(result["value_training_available"])
+        self.assertFalse(result["actor_dense_signal_available"])
 
     def test_zero_variance_group_updates_value_and_full_checkpoint_restores(self) -> None:
         manifest = [value.to_dict() for value in build_lhtb_split()]

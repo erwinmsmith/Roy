@@ -157,6 +157,7 @@ def sample_audit(records: List[Mapping[str, Any]]) -> Dict[str, Any]:
         policy = list(record.get("policy_records", []))
         terminal = states[-1] if states else {}
         rewards = [value.get("process_reward") for value in transitions]
+        shaped_returns = [float(value) for value in record.get("shaped_returns", [])]
         mcts_records = [value for value in policy if isinstance(value, Mapping)
                         and value.get("behaviorPolicy", value.get("behavior_policy")) == "mcts_puct"]
         profiles = sorted({str(((value.get("policyState", value.get("policy_state")) or {})
@@ -188,6 +189,7 @@ def sample_audit(records: List[Mapping[str, Any]]) -> Dict[str, Any]:
                 for value in transitions
             ],
             "process_rewards": rewards,
+            "shaped_returns": shaped_returns,
             "process_reward_complete": bool(transitions)
                 and all(value is not None for value in rewards),
             "process_reward_signs": {
@@ -210,6 +212,8 @@ def sample_audit(records: List[Mapping[str, Any]]) -> Dict[str, Any]:
         })
     terminal_rewards = [float(value["official_terminal_reward"]) for value in trajectories
                         if value["official_terminal_reward"] is not None]
+    shaped_returns = [value for trajectory in trajectories
+                      for value in trajectory["shaped_returns"]]
     node_counts = [int(value["terminal_node_count"]) for value in trajectories]
     profile_set = sorted({profile for value in trajectories for profile in value["sampling_profiles"]})
     return {
@@ -223,6 +227,11 @@ def sample_audit(records: List[Mapping[str, Any]]) -> Dict[str, Any]:
                                          for value in trajectories),
         "all_mcts_traces_complete": all(value["mcts_trace_complete"]
                                         for value in trajectories),
+        "value_training_available": len(terminal_rewards) == len(trajectories)
+            and len(trajectories) > 0,
+        "actor_dense_signal_available": len(shaped_returns) > 1
+            and float(np.std(shaped_returns)) > 1e-8,
+        "shaped_return_std": float(np.std(shaped_returns)) if shaped_returns else None,
         "preconditions_for_training": len(trajectories) == 8
             and all(value["complete"] and not value["environment_failure"]
                     for value in trajectories)
@@ -232,7 +241,7 @@ def sample_audit(records: List[Mapping[str, Any]]) -> Dict[str, Any]:
             and all(value["transition_chain_complete"] for value in trajectories)
             and all(value["process_reward_complete"] for value in trajectories)
             and all(value["mcts_trace_complete"] for value in trajectories)
-            and len(terminal_rewards) == 8 and float(np.std(terminal_rewards)) > 1e-8,
+            and len(terminal_rewards) == 8,
         "trajectories": trajectories,
     }
 
