@@ -19,6 +19,7 @@ from .organization_model import InformationRealizationPolicy
 from .organization_replay import replay_joint_log_probability
 from .value_model import (
     EpistemicValueModel,
+    LHTB_VALUE_MODEL_REVISION,
     equal_trajectory_value_loss,
     make_ema_target,
     process_credit,
@@ -331,6 +332,7 @@ class LHTBProcessGRPOTrainer:
         return {
             "method": "learned_information_realization", "benchmark": "lhtb",
             "objective": "official_terminal_reward_with_ema_delta_value_credit",
+            "value_model_revision": LHTB_VALUE_MODEL_REVISION,
             "groups": self.groups, "actor_steps": self.actor_steps,
             "value_steps": self.value_steps, "ema_decay": self.ema_decay,
             "updated_group_ids": sorted(self.updated_group_ids), "history": self.history,

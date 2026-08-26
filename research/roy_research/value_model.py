@@ -10,6 +10,9 @@ from torch.nn import functional as F
 from .model import EDGE_KINDS, NODE_KINDS, RelationalMessagePassing, TEXT_DIMENSION
 
 
+LHTB_VALUE_MODEL_REVISION = "relational-attention-mean-max-v2"
+
+
 class EpistemicValueModel(nn.Module):
     """Independent relational critic; only the frozen text encoder is shared."""
 

@@ -415,7 +415,7 @@ roy_smoke() {
   export ROY_LHTB_SEMANTIC_COMMAND="${python_bin} -m roy_research.semantic_server"
   export ROY_LHTB_SEMANTIC_ROOT="${smoke_root}/semantic"
   export ROY_LHTB_POLICY_COMMAND="${python_bin} -m roy_research.lhtb_policy_server"
-  export ROY_LHTB_MODEL="${roy_root}/research/output/lhtb/native/smoke-initial.pt"
+  export ROY_LHTB_MODEL="${roy_root}/research/output/lhtb/native/smoke-mcts-v4-initial.pt"
   export ROY_LHTB_NATIVE_ROOT="${native_root}"
   export ROY_LHTB_MCTS_ENABLED="${ROY_LHTB_MCTS_ENABLED:-true}"
   export ROY_LHTB_MCTS_SIMULATIONS="${ROY_LHTB_MCTS_SIMULATIONS:-16}"

@@ -14,7 +14,7 @@ from .organization_replay import (
     organization_candidate_distribution,
     sample_organization_decision,
 )
-from .value_model import EpistemicValueModel
+from .value_model import EpistemicValueModel, LHTB_VALUE_MODEL_REVISION
 
 
 class LHTBPolicyServer:
@@ -23,6 +23,13 @@ class LHTBPolicyServer:
         if not checkpoint:
             raise RuntimeError("ROY_LHTB_MODEL is required; learned mode has no heuristic fallback")
         payload = torch.load(Path(checkpoint), map_location="cpu", weights_only=False)
+        checkpoint_revision = payload.get("metadata", {}).get("value_model_revision")
+        if checkpoint_revision != LHTB_VALUE_MODEL_REVISION:
+            raise ValueError(
+                "LHTB value checkpoint is incompatible: expected "
+                f"{LHTB_VALUE_MODEL_REVISION}, found {checkpoint_revision or 'legacy'}; "
+                "initialize a fresh checkpoint and keep the legacy file for audit"
+            )
         self.model = InformationRealizationPolicy()
         state = payload.get("actor_state_dict", payload.get("state_dict"))
         if not isinstance(state, dict):
