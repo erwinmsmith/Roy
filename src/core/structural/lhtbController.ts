@@ -207,6 +207,8 @@ DERIVE must use an exact open requirement ID from organization.requirements and 
 "outputType":"epistemic_report"},"terminationCondition":"...",
 "reuseReview":{"searchedNodeIds":["<every spawned agent id>"],
 "decision":"spawn_distinct","reason":"why no existing spawned agent can perform this gap"}}}.
+Keep child specifications concise. Never copy rootGoal or the full task instruction into parentGoal,
+parentScope, childScope, or reason. Keep each descriptive child field below 1000 characters.
 Before every DERIVE, semantically inspect every entry in spawnedAgentLibrary. Do not use lexical
 overlap, keywords, regexes, or an embedding threshold as the final reuse decision. If an active
 existing agent can satisfy the requirement, do not DERIVE. Reuse it with:
@@ -268,6 +270,85 @@ const SEMANTIC_RECALL_ENTITY_COUNT = 32;
 const PROPOSER_COMMAND_LIMIT = 50_000;
 const PROPOSER_RESPONSE_MAX_TOKENS = 32_768;
 
+/**
+ * Repair only JSON delimiter structure. This never invents fields, values, actions, or semantics;
+ * the repaired object must still pass the normal candidate and Runtime legality checks.
+ */
+export function repairProposalJSONStructure(content: string): Record<string, unknown> | undefined {
+  try {
+    const parsed = JSON.parse(content) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown> : undefined;
+  } catch {
+    // Continue with a delimiter-only repair.
+  }
+  const stack: Array<'{' | '['> = [];
+  let repaired = '';
+  let inString = false;
+  let escaped = false;
+  const nextNonWhitespace = (start: number): string | undefined => {
+    for (let index = start; index < content.length; index += 1) {
+      if (!/\s/.test(content[index])) return content[index];
+    }
+    return undefined;
+  };
+  for (let index = 0; index < content.length; index += 1) {
+    const character = content[index];
+    if (inString) {
+      repaired += character;
+      if (escaped) escaped = false;
+      else if (character === '\\') escaped = true;
+      else if (character === '"') inString = false;
+      continue;
+    }
+    if (character === '"') {
+      inString = true;
+      repaired += character;
+      continue;
+    }
+    if (character === '{' || character === '[') {
+      stack.push(character);
+      repaired += character;
+      continue;
+    }
+    if (character === '}' || character === ']') {
+      const expected = character === '}' ? '{' : '[';
+      if (stack.at(-1) === expected) {
+        stack.pop();
+        repaired += character;
+      } else if (character === ']' && stack.includes('[')) {
+        while (stack.at(-1) === '{') {
+          stack.pop();
+          repaired += '}';
+        }
+        if (stack.at(-1) === '[') {
+          stack.pop();
+          repaired += ']';
+        }
+      }
+      continue;
+    }
+    if (character === ',' && nextNonWhitespace(index + 1) === '{'
+      && stack.at(-1) === '{' && stack.includes('[')) {
+      while (stack.at(-1) === '{') {
+        stack.pop();
+        repaired += '}';
+      }
+    }
+    repaired += character;
+  }
+  if (inString) return undefined;
+  while (stack.length) repaired += stack.pop() === '{' ? '}' : ']';
+  try {
+    const parsed = JSON.parse(repaired) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+    const value = parsed as Record<string, unknown>;
+    return Array.isArray(value.candidates) ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function projectText(value: unknown): unknown {
   if (typeof value !== 'string' || value.length <= PROPOSER_EVENT_TEXT_LIMIT) return value;
   const half = PROPOSER_EVENT_TEXT_LIMIT / 2;
@@ -279,6 +360,14 @@ function compactText(value: unknown, limit = PROPOSER_ENTITY_TEXT_LIMIT): unknow
   if (typeof value !== 'string' || value.length <= limit) return value;
   const retained = Math.floor(limit / 2);
   return `${value.slice(0, retained)}\n...[compact state ref omitted ${value.length - 2 * retained} characters]...\n${value.slice(-retained)}`;
+}
+
+function compactChildSpecification(value: unknown): unknown {
+  if (typeof value === 'string') return compactText(value, 1_000);
+  if (Array.isArray(value)) return value.map(compactChildSpecification);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+    .map(([key, child]) => [key, compactChildSpecification(child)]));
 }
 
 function compactEntities(values: unknown[], textFields: string[]): unknown[] {
@@ -482,14 +571,20 @@ export class LHTBAutonomousController {
           ?? error.completion.usage?.completionTokens ?? 0,
         error.completion.model);
         await this.auditProposalFailure(requestState, error, attempt);
-        if (attempt === proposalAttempts) {
-          throw new Error('sampling_invalid:proposal_json_malformed', { cause: error });
+        const repaired = repairProposalJSONStructure(error.completion.content);
+        if (repaired) {
+          current = { value: repaired as unknown as ProposalResponse,
+            completion: error.completion };
+        } else {
+          if (attempt === proposalAttempts) {
+            throw new Error('sampling_invalid:proposal_json_malformed', { cause: error });
+          }
+          messages.splice(0, messages.length,
+            { role: 'system', content: PROPOSER_PROMPT },
+            { role: 'user', content: `${JSON.stringify(requestState)}\nA prior independent attempt was malformed or truncated. Return one concise, complete JSON object only. Keep commands below ${PROPOSER_COMMAND_LIMIT} characters, do not inline whole source files or use a large here-document, and prefer a short incremental command or an existing script.` }
+          );
+          continue;
         }
-        messages.splice(0, messages.length,
-          { role: 'system', content: PROPOSER_PROMPT },
-          { role: 'user', content: `${JSON.stringify(requestState)}\nA prior independent attempt was malformed or truncated. Return one concise, complete JSON object only. Keep commands below ${PROPOSER_COMMAND_LIMIT} characters, do not inline whole source files or use a large here-document, and prefer a short incremental command or an existing script.` }
-        );
-        continue;
       }
       await this.auditProposal(requestState, current);
       session.recordModelUsage(current.completion.usage?.inputTokens
@@ -872,6 +967,9 @@ export class LHTBAutonomousController {
       const schedulerComplexity = Number(raw?.schedulerComplexity);
       const actionValue = raw?.action && typeof raw.action === 'object'
         ? raw.action as Record<string, unknown> : {};
+      if (kind === 'DERIVE' && actionValue.childSpecification) {
+        actionValue.childSpecification = compactChildSpecification(actionValue.childSpecification);
+      }
       const explicitActionKind = typeof actionValue.kind === 'string' ? actionValue.kind
         : typeof actionValue.type === 'string' ? actionValue.type : undefined;
       const explicitActionActor = typeof actionValue.actorNodeId === 'string'

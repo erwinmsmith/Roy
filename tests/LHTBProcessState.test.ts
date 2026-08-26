@@ -3,7 +3,8 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { GlobalEpistemicStateRecorder, LHTBAutonomousController,
-  resolveTopologySamplingProfile, RoyLHTBSession, topologySamplingCandidateLogitBias,
+  repairProposalJSONStructure, resolveTopologySamplingProfile, RoyLHTBSession,
+  topologySamplingCandidateLogitBias,
   topologySamplingProfile } from '../src/core/structural/index.js';
 import { LLMJSONParseError } from '../src/core/llm/providers/openai.js';
 
@@ -21,6 +22,17 @@ function baseInput(sequence: number, previousFingerprint?: string) {
 }
 
 describe('LHTB process state', () => {
+  it('mechanically repairs extra, missing, and trailing JSON delimiters', () => {
+    const extra = '{"preferred_candidate_id":"a","candidates":[{"id":"a",'
+      + '"action":{"kind":"STOP"}}},{"id":"b","action":{"kind":"STOP"}}}]}';
+    expect(repairProposalJSONStructure(extra)?.candidates).toHaveLength(2);
+    const missing = '{"preferred_candidate_id":"a","candidates":[{"id":"a",'
+      + '"action":{"kind":"STOP"},{"id":"b","action":{"kind":"STOP"}}';
+    expect(repairProposalJSONStructure(missing)?.candidates).toHaveLength(2);
+    expect(repairProposalJSONStructure('{"candidates":[{"id":"unfinished'))
+      .toBeUndefined();
+  });
+
   it('covers compact through connected topology profiles without changing utility', () => {
     expect([0, 1, 2, 3].map(topologySamplingProfile).map(value => value.id))
       .toEqual(['compact', 'branching', 'recursive', 'connected']);
