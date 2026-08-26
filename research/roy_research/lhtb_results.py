@@ -209,7 +209,10 @@ def validate_smoke(root: Path, task_ids: tuple[str, ...] = (
     for path in root.rglob("result.json"):
         value = json.loads(path.read_text(encoding="utf-8"))
         agent = value.get("agent_info") or {}
-        task_name = normalize_native_task_id(str(value.get("task_name", "")))
+        raw_task_name = value.get("task_name")
+        if not isinstance(raw_task_name, str) or not raw_task_name:
+            continue
+        task_name = normalize_native_task_id(raw_task_name)
         if (agent.get("name") == "roy-lhtb-agent"
                 and task_name in task_ids):
             by_task.setdefault(task_name, []).append((path, value))
