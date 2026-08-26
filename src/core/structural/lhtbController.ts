@@ -185,7 +185,8 @@ Every candidate must have this exact outer shape:
 Allowed kinds are DERIVE, ACQUIRE, CONNECT, EXECUTE, RETURN, PRUNE, STOP.
 For ACQUIRE and EXECUTE, command, optional cwd and timeoutMs are outer candidate fields, while
 action contains only kind and actorNodeId. ACQUIRE inspects external state. EXECUTE changes the
-workspace or runs verification. Examples:
+workspace or runs verification. Keep every command under 8000 characters. Prefer short incremental
+edits or an existing script over embedding an entire source file in one JSON response. Examples:
 {"id":"inspect","kind":"ACQUIRE","actorNodeId":"root","description":"Inspect files",
  "schedulerComplexity":1,"command":"find . -maxdepth 2 -type f","timeoutMs":120000,
  "action":{"kind":"ACQUIRE","actorNodeId":"root"}}.
@@ -264,6 +265,7 @@ const PROPOSER_ENTITY_TEXT_LIMIT = 600;
 const PROPOSER_ENTITY_COUNT = 16;
 const PROPOSER_GOAL_TEXT_LIMIT = 6_000;
 const SEMANTIC_RECALL_ENTITY_COUNT = 32;
+const PROPOSER_COMMAND_LIMIT = 8_000;
 
 function projectText(value: unknown): unknown {
   if (typeof value !== 'string' || value.length <= PROPOSER_EVENT_TEXT_LIMIT) return value;
@@ -671,6 +673,9 @@ export class LHTBAutonomousController {
         let terminal = false;
         if (candidate.kind === 'ACQUIRE' || candidate.kind === 'EXECUTE') {
           if (!candidate.command?.trim()) continue;
+          const activeActor = snapshot.runtime.nodes.some(node => node.id === candidate.actorNodeId
+            && ['ready', 'running', 'waiting', 'completed'].includes(node.status));
+          if (!activeActor) continue;
           probe.requestTerminal({ id: `mcts-${snapshot.processStates.length}-${candidate.id}`,
             command: candidate.command, cwd: candidate.cwd,
             timeoutMs: candidate.timeoutMs ?? 120_000, nodeId: candidate.actorNodeId,
@@ -905,6 +910,9 @@ export class LHTBAutonomousController {
       }
       if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
         reasons.push('invalid_timeout');
+      }
+      if (typeof commandValue === 'string' && commandValue.length > PROPOSER_COMMAND_LIMIT) {
+        reasons.push(`command_too_large:${commandValue.length}/${PROPOSER_COMMAND_LIMIT}`);
       }
       const action = { ...actionValue, kind, actorNodeId } as OrganizationCandidate['action'];
       if (kind === 'DERIVE' && spawnedAgentIds.length > 0) {
