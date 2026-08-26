@@ -10,6 +10,7 @@ from copy import deepcopy
 
 from .process_state import canonical_fingerprint
 from .lhtb_transitions import build_state_transition_samples
+from .lhtb_native import normalize_native_task_id
 
 from .io import write_jsonl
 
@@ -208,9 +209,10 @@ def validate_smoke(root: Path, task_ids: tuple[str, ...] = (
     for path in root.rglob("result.json"):
         value = json.loads(path.read_text(encoding="utf-8"))
         agent = value.get("agent_info") or {}
+        task_name = normalize_native_task_id(str(value.get("task_name", "")))
         if (agent.get("name") == "roy-lhtb-agent"
-                and str(value.get("task_name")) in task_ids):
-            by_task.setdefault(str(value["task_name"]), []).append((path, value))
+                and task_name in task_ids):
+            by_task.setdefault(task_name, []).append((path, value))
     groups = {}
     for task_id, values in by_task.items():
         valid = []
