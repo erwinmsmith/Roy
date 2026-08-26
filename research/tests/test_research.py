@@ -25,7 +25,7 @@ from roy_research.policy_server import PolicyServer
 from roy_research.schema import require_schema
 from roy_research.token_ledger import PersistentTokenLedger
 from roy_research.training import evaluate_groups, train_groups
-from roy_research.io import write_jsonl
+from roy_research.io import read_jsonl, write_jsonl
 from roy_research.live_controlled import (
     ENVIRONMENT_REVISION_V2,
     build_live_problem,
@@ -53,6 +53,16 @@ class GRPOTests(unittest.TestCase):
         )
         self.assertAlmostEqual(result.action_values["BRANCH"], 0.6)
         self.assertGreater(result.branch_advantages["b"], result.branch_advantages["a"])
+
+
+class IOTests(unittest.TestCase):
+    def test_gzip_jsonl_round_trip_and_append(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trajectories.jsonl.gz"
+            self.assertEqual(write_jsonl(path, [{"id": 1}, {"id": 2}]), 2)
+            self.assertEqual(path.read_bytes()[:2], b"\x1f\x8b")
+            self.assertEqual(write_jsonl(path, [{"id": 3}], append=True), 1)
+            self.assertEqual(list(read_jsonl(path)), [{"id": 1}, {"id": 2}, {"id": 3}])
 
 
 class ControlledTests(unittest.TestCase):
