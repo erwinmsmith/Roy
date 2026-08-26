@@ -201,13 +201,47 @@ PY
   cd "${roy_root}"
 
   environment_digest="$(resolve_digest "${task_id}")"
-  "${python_bin}" -m roy_research lhtb-import-group \
-    --job-dir "${job_dir}" --output "${trajectories}" --group-id "${group_id}" \
-    --task-id "${task_id}" --category "${category}" --split train --epoch "${epoch}" \
-    --policy-revision "${policy_revision}" --environment-digest "${environment_digest}" \
-    --environment-backend "${environment_backend}" --model "${model}"
+  group_trajectories="${job_dir}/imported-group.jsonl"
+  group_audit="${job_dir}/sample-audit.json"
+  if [[ ! -f "${group_trajectories}" ]]; then
+    "${python_bin}" -m roy_research lhtb-import-group \
+      --job-dir "${job_dir}" --output "${group_trajectories}" --group-id "${group_id}" \
+      --task-id "${task_id}" --category "${category}" --split train --epoch "${epoch}" \
+      --policy-revision "${policy_revision}" --environment-digest "${environment_digest}" \
+      --environment-backend "${environment_backend}" --model "${model}"
+  fi
+  "${python_bin}" -m roy_research lhtb-sample-audit \
+    --trajectories "${group_trajectories}" --output "${group_audit}"
+  "${python_bin}" - "${group_audit}" <<'PY'
+import json, sys
+audit = json.load(open(sys.argv[1], encoding="utf-8"))
+required = ("preconditions_for_training", "value_training_available",
+            "all_transition_chains_complete", "all_step_rewards_complete",
+            "all_mcts_traces_complete")
+failed = [key for key in required if not audit.get(key)]
+if failed:
+    raise SystemExit(f"G=8 sample audit rejected training group: {failed}")
+print(json.dumps({key: audit.get(key) for key in (
+    "trajectory_count", "official_reward_std", "sampling_profiles",
+    "terminal_node_span", "shaped_return_std", "actor_dense_signal_available",
+    *required,
+)}))
+PY
+  "${python_bin}" - "${group_trajectories}" "${trajectories}" "${group_id}" <<'PY'
+import json, pathlib, sys
+source, destination, group_id = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
+existing = set()
+if destination.exists():
+    existing = {str(json.loads(line).get("group_id"))
+                for line in destination.read_text(encoding="utf-8").splitlines()
+                if line.strip()}
+if group_id not in existing:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("a", encoding="utf-8") as stream:
+        stream.write(source.read_text(encoding="utf-8"))
+PY
   "${python_bin}" -m roy_research lhtb-update \
-    --manifest "${manifest}" --trajectories "${trajectories}" --model "${model}" \
+    --manifest "${manifest}" --trajectories "${group_trajectories}" --model "${model}" \
     --updates "${updates}" --transition-samples "${transition_samples}" --resume
 done
 if [[ "${current_epoch}" -ge 0 ]]; then run_dev_epoch "${current_epoch}"; fi
