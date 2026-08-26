@@ -11,6 +11,7 @@ from copy import deepcopy
 from .process_state import canonical_fingerprint
 from .lhtb_transitions import build_state_transition_samples
 from .lhtb_native import normalize_native_task_id
+from .organization import LHTB_POLICY_INTERFACE_REVISION
 
 from .io import write_jsonl
 
@@ -320,7 +321,7 @@ def validate_smoke(root: Path, task_ids: tuple[str, ...] = (
             )
             compact_interface = compact_interface and all(
                 (value.get("policyState") or {}).get("interface_revision")
-                == "compact-epistemic-event-driven-v3"
+                == LHTB_POLICY_INTERFACE_REVISION
                 and "terminal_result_count" in (value.get("policyState") or {})
                 and "organization_action_count" in (value.get("policyState") or {})
                 for value in records

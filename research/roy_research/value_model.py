@@ -21,9 +21,19 @@ class EpistemicValueModel(nn.Module):
         self.layers = nn.ModuleList(
             RelationalMessagePassing(hidden_dim, len(EDGE_KINDS)) for _ in range(layers)
         )
-        self.value_head = nn.Linear(hidden_dim, 1)
-        nn.init.zeros_(self.value_head.weight)
-        nn.init.zeros_(self.value_head.bias)
+        self.pool_gate = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+        self.value_head = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, 1),
+        )
+        nn.init.zeros_(self.value_head[-1].weight)
+        nn.init.zeros_(self.value_head[-1].bias)
 
     def forward(self, text: Tensor, kinds: Tensor, scalars: Tensor,
                 edges: Tensor, edge_types: Tensor) -> Tensor:
@@ -32,9 +42,16 @@ class EpistemicValueModel(nn.Module):
         )))
         for layer in self.layers:
             states = layer(states, edges, edge_types)
-        pooled = states.mean(dim=0) if states.shape[0] else torch.zeros(
-            self.input_projection.out_features, dtype=text.dtype, device=text.device
-        )
+        if states.shape[0]:
+            attention = torch.softmax(self.pool_gate(states).squeeze(-1), dim=0)
+            attentive = torch.sum(states * attention.unsqueeze(-1), dim=0)
+            pooled = torch.cat([attentive, states.mean(dim=0), states.max(dim=0).values])
+        else:
+            pooled = torch.zeros(
+                self.input_projection.out_features * 3,
+                dtype=text.dtype,
+                device=text.device,
+            )
         return torch.sigmoid(self.value_head(pooled)).squeeze(-1)
 
 

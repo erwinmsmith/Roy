@@ -113,9 +113,12 @@ function topologySamplingCandidateMatchesPhase(
   }
   if (phase.id === 'derive_child_local_residual') {
     const gapId = candidate.action.childSpecification?.triggeringGapId;
-    return candidate.kind === 'DERIVE'
-      && phase.deepestActiveNodeIds.has(candidate.actorNodeId)
-      && typeof gapId === 'string' && phase.childLocalOpenGapIds.has(gapId);
+    const reuseGapId = candidate.action.requirementId;
+    return phase.deepestActiveNodeIds.has(candidate.actorNodeId)
+      && ((candidate.kind === 'DERIVE'
+        && typeof gapId === 'string' && phase.childLocalOpenGapIds.has(gapId))
+        || (candidate.kind === 'CONNECT'
+          && typeof reuseGapId === 'string' && phase.childLocalOpenGapIds.has(reuseGapId)));
   }
   return true;
 }
@@ -199,7 +202,22 @@ DERIVE must use an exact open requirement ID from organization.requirements and 
 "duplicatedByExistingNode":false},"requiredClaims":[],"requiredEvidence":[],
 "relevantReportIds":[],"externalAccess":{"allowed":true,"tools":["terminal"],
 "purpose":"..."},"expectedOutput":{"requiredInformation":"...",
-"outputType":"epistemic_report"},"terminationCondition":"..."}}.
+"outputType":"epistemic_report"},"terminationCondition":"...",
+"reuseReview":{"searchedNodeIds":["<every spawned agent id>"],
+"decision":"spawn_distinct","reason":"why no existing spawned agent can perform this gap"}}}.
+Before every DERIVE, semantically inspect every entry in spawnedAgentLibrary. Do not use lexical
+overlap, keywords, regexes, or an embedding threshold as the final reuse decision. If an active
+existing agent can satisfy the requirement, do not DERIVE. Reuse it with:
+{"kind":"CONNECT","actorNodeId":"<requirement owner>","requirementId":"<open requirement>",
+"connection":{"from":"<requirement owner>","to":"<existing agent>","required":true},
+"reuseReview":{"searchedNodeIds":["<every spawned agent id>"],"decision":"reuse_existing",
+"reusableNodeId":"<existing agent>","reason":"semantic capability match"}}.
+Creating a semantically equivalent agent is legal only for genuine concurrent load that one agent
+cannot handle. In that case DERIVE must set reuseReview.decision="spawn_for_load", identify the
+existing reusableNodeId, and include loadJustification with numeric parallelWorkUnits greater than
+availableCapacity, every concrete parallelRequirementId, and a concrete reason. The list must
+include the proposed triggering gap and an unresolved requirement already occupying the existing
+agent. Topology coverage alone is never load justification.
 When structuralExploration requests expansion and independent unresolved requirements exist,
 include up to three distinct legal DERIVE candidates, each using a different exact open gap ID.
 This is candidate coverage, not permission to invent work: never create a fake gap, duplicate an
@@ -305,9 +323,11 @@ export function compactEpistemicWorkingState(
     ['ready', 'running', 'waiting', 'completed'].includes(node.status));
   const compactNodes = activeNodes.map(node => ({ id: node.id, parentId: node.parentId,
     depth: node.depth, status: node.status, triggeringGapId: node.triggeringGapId,
+    assignedRequirementIds: node.assignedRequirementIds ?? [],
     objective: compactText(node.localObjective) }));
   const requirements = snapshot.runtime.requirements.map(value => ({ id: value.id,
     status: value.status, parentNodeId: value.parentNodeId,
+    assignedNodeId: value.assignedNodeId,
     description: compactText(value.description),
     requiredInformation: compactText(value.requiredInformation) }));
   const openRequirements = snapshot.runtime.requirements.filter(value => value.status === 'open'
@@ -324,6 +344,14 @@ export function compactEpistemicWorkingState(
         active => active.id === node.id)).map(node => ({ id: node.id, status: node.status,
         reportId: node.reportId })),
       requirements,
+      spawnedAgentLibrary: snapshot.runtime.nodes.filter(node => node.id !== snapshot.runtime.rootId)
+        .map(node => ({ id: node.id, objective: compactText(node.localObjective),
+          status: node.status, depth: node.depth,
+          reusable: !['returned', 'pruned', 'failed'].includes(node.status),
+          assignedRequirementIds: node.assignedRequirementIds ?? [],
+          triggeringGapId: node.triggeringGapId,
+          tools: node.specification?.externalAccess.tools ?? [],
+          expectedOutput: node.specification?.expectedOutput.requiredInformation })),
       deriveEdges: snapshot.runtime.derivationEdges,
       dependencies: snapshot.runtime.dependencyEdges,
       communications: snapshot.runtime.communicationEdges,
@@ -649,6 +677,72 @@ export class LHTBAutonomousController {
     const seenIds = new Set<string>();
     const seenConnections = new Set(snapshot.runtime.communicationEdges
       .filter(edge => edge.active).map(edge => `${edge.from}\u0000${edge.to}`));
+    const spawnedAgentIds = snapshot.runtime.nodes
+      .filter(node => node.id !== snapshot.runtime.rootId).map(node => node.id);
+    const reusableAgentIds = new Set(snapshot.runtime.nodes.filter(node =>
+      node.id !== snapshot.runtime.rootId
+      && !['returned', 'pruned', 'failed'].includes(node.status)).map(node => node.id));
+    const validateReuseReview = (
+      value: unknown,
+      decisions: Array<'reuse_existing' | 'spawn_distinct' | 'spawn_for_load'>,
+      expectedNodeId?: string,
+    ): string[] => {
+      if (!value || typeof value !== 'object') return ['missing_agent_reuse_review'];
+      const review = value as Record<string, unknown>;
+      const searched = Array.isArray(review.searchedNodeIds)
+        ? new Set(review.searchedNodeIds.map(String)) : new Set<string>();
+      const reasons = spawnedAgentIds.filter(id => !searched.has(id))
+        .map(id => `agent_reuse_search_omitted:${id}`);
+      const decision = String(review.decision ?? '');
+      if (!decisions.includes(decision as typeof decisions[number])) {
+        reasons.push('invalid_agent_reuse_decision');
+      }
+      if (typeof review.reason !== 'string' || !review.reason.trim()) {
+        reasons.push('missing_agent_reuse_reason');
+      }
+      const reusableNodeId = typeof review.reusableNodeId === 'string'
+        ? review.reusableNodeId : undefined;
+      if (decision === 'reuse_existing' || decision === 'spawn_for_load') {
+        if (!reusableNodeId || !reusableAgentIds.has(reusableNodeId)) {
+          reasons.push('agent_reuse_target_is_not_active');
+        }
+        if (expectedNodeId && reusableNodeId !== expectedNodeId) {
+          reasons.push('agent_reuse_target_mismatch');
+        }
+      }
+      if (decision === 'spawn_distinct' && reusableNodeId) {
+        reasons.push('spawn_distinct_cannot_name_reusable_node');
+      }
+      if (decision === 'spawn_for_load') {
+        const load = review.loadJustification;
+        const record = load && typeof load === 'object' ? load as Record<string, unknown> : {};
+        const units = Number(record.parallelWorkUnits);
+        const capacity = Number(record.availableCapacity);
+        if (!Number.isFinite(units) || !Number.isFinite(capacity)
+          || capacity < 1 || units <= capacity) {
+          reasons.push('invalid_agent_load_justification');
+        }
+        const requirementIds = Array.isArray(record.parallelRequirementIds)
+          ? [...new Set(record.parallelRequirementIds.map(String))] : [];
+        if (requirementIds.length !== units) {
+          reasons.push('agent_load_requirement_count_mismatch');
+        }
+        const target = snapshot.runtime.nodes.find(node => node.id === reusableNodeId);
+        const occupiedIds = new Set([
+          target?.triggeringGapId,
+          ...(target?.assignedRequirementIds ?? []),
+        ].filter((id): id is string => typeof id === 'string').filter(id =>
+          snapshot.runtime.requirements.some(requirement => requirement.id === id
+            && ['open', 'assigned'].includes(requirement.status))));
+        if (!requirementIds.some(id => occupiedIds.has(id))) {
+          reasons.push('agent_load_target_has_no_parallel_occupied_requirement');
+        }
+        if (typeof record.reason !== 'string' || !record.reason.trim()) {
+          reasons.push('missing_agent_load_reason');
+        }
+      }
+      return reasons;
+    };
     const candidates: ProposedCandidate[] = [];
     const dispositions: CandidateValidation['dispositions'] = [];
     response.candidates.forEach((raw, index) => {
@@ -694,6 +788,24 @@ export class LHTBAutonomousController {
         reasons.push('invalid_timeout');
       }
       const action = { ...actionValue, kind, actorNodeId } as OrganizationCandidate['action'];
+      if (kind === 'DERIVE' && spawnedAgentIds.length > 0) {
+        const specification = actionValue.childSpecification
+          && typeof actionValue.childSpecification === 'object'
+          ? actionValue.childSpecification as Record<string, unknown> : {};
+        reasons.push(...validateReuseReview(specification.reuseReview,
+          ['spawn_distinct', 'spawn_for_load']));
+        const review = specification.reuseReview as Record<string, unknown> | undefined;
+        const load = review?.loadJustification as Record<string, unknown> | undefined;
+        if (review?.decision === 'spawn_for_load') {
+          const requirementIds = Array.isArray(load?.parallelRequirementIds)
+            ? load.parallelRequirementIds.map(String) : [];
+          const triggeringGapId = typeof specification.triggeringGapId === 'string'
+            ? specification.triggeringGapId : '';
+          if (!triggeringGapId || !requirementIds.includes(triggeringGapId)) {
+            reasons.push('agent_load_omits_triggering_requirement');
+          }
+        }
+      }
       let connectionKeyToAccept: string | undefined;
       if (kind === 'CONNECT') {
         const connection = actionValue.connection && typeof actionValue.connection === 'object'
@@ -701,8 +813,22 @@ export class LHTBAutonomousController {
         const from = typeof connection?.from === 'string' ? connection.from : '';
         const to = typeof connection?.to === 'string' ? connection.to : '';
         const connectionKey = `${from}\u0000${to}`;
-        if (from && to && seenConnections.has(connectionKey)) {
+        const reuseRequirementId = typeof actionValue.requirementId === 'string'
+          ? actionValue.requirementId : undefined;
+        if (from && to && seenConnections.has(connectionKey) && !reuseRequirementId) {
           reasons.push('duplicate_active_connection');
+        }
+        if (reuseRequirementId) {
+          reasons.push(...validateReuseReview(actionValue.reuseReview,
+            ['reuse_existing'], to));
+          const requirement = snapshot.runtime.requirements.find(value =>
+            value.id === reuseRequirementId);
+          if (!requirement || requirement.status !== 'open') {
+            reasons.push('agent_reuse_requirement_is_not_open');
+          } else if (requirement.parentNodeId !== actorNodeId || from !== actorNodeId) {
+            reasons.push('agent_reuse_requirement_owner_mismatch');
+          }
+          if (connection?.required !== true) reasons.push('agent_reuse_connection_not_required');
         }
         if (from && to) connectionKeyToAccept = connectionKey;
       }
@@ -749,15 +875,18 @@ export class LHTBAutonomousController {
       return candidates.some(candidate => topologySamplingCandidateMatchesPhase(snapshot, candidate))
         ? [] : ['missing_child_local_recursive_derive_candidate'];
     }
-    const requiredDerives = snapshot.runtime.nodes.length < minimumNodes
+    const requiredAssignments = snapshot.runtime.nodes.length < minimumNodes
       ? Math.min(3, minimumNodes - snapshot.runtime.nodes.length, openGapIds.size) : 0;
-    const offeredGapIds = new Set(candidates.filter(candidate => candidate.kind === 'DERIVE')
-      .map(candidate => candidate.action.childSpecification?.triggeringGapId)
+    const offeredGapIds = new Set(candidates.filter(candidate => candidate.kind === 'DERIVE'
+      || (candidate.kind === 'CONNECT' && candidate.action.requirementId))
+      .map(candidate => candidate.kind === 'DERIVE'
+        ? candidate.action.childSpecification?.triggeringGapId
+        : candidate.action.requirementId)
       .filter((gapId): gapId is string => typeof gapId === 'string'
         && openGapIds.has(gapId)));
     const deficits: string[] = [];
-    if (offeredGapIds.size < requiredDerives) {
-      deficits.push(`missing_real_gap_derive_candidates:${offeredGapIds.size}/${requiredDerives}`);
+    if (offeredGapIds.size < requiredAssignments) {
+      deficits.push(`missing_real_gap_assignment_candidates:${offeredGapIds.size}/${requiredAssignments}`);
     }
     if (profile.id === 'connected' && snapshot.runtime.nodes.length >= minimumNodes
       && snapshot.runtime.communicationEdges.every(edge => !edge.active)) {
@@ -785,6 +914,7 @@ export class LHTBAutonomousController {
     const activeNodes = snapshot.runtime.nodes
       .filter(node => ['ready', 'running', 'waiting', 'completed'].includes(node.status));
     const latest = snapshot.processStates.at(-1);
+    const events = latest?.runtimeEvents ?? [];
     const agentNodes = snapshot.runtime.nodes.map(node => ({ id: node.id, kind: 'agent',
       timestamp: node.createdAt, text: node.localObjective, status: node.status,
       attributes: { signal: node.status === 'returned' || node.status === 'completed' ? 1 : 0 } }));
@@ -804,9 +934,48 @@ export class LHTBAutonomousController {
       ...(latest?.externalObservations ?? []).map(value => ({ id: value.id,
         kind: 'tool_result', timestamp: 0, text: value.observation, status: 'observed',
         attributes: { signal: 1 } })),
+      ...(latest?.blindSpots ?? []).map((value, index) => ({ id: `blind-spot:${index}`,
+        kind: 'message', timestamp: 0, text: value, status: 'open',
+        attributes: { signal: -1 } })),
+    ];
+    const runtimeNodes = events.map((event, index) => {
+      const action = event.attributes?.action as Record<string, unknown> | undefined;
+      const text = [event.kind, action?.kind, event.command, projectText(event.output)]
+        .filter(value => value !== undefined && value !== '').join(' ');
+      const failed = event.kind === 'failure'
+        || (event.kind === 'terminal_result' && (event.exitCode ?? 0) !== 0);
+      const kind = event.kind === 'terminal_command' ? 'tool_call'
+        : ['terminal_result', 'failure', 'verifier'].includes(event.kind) ? 'tool_result'
+          : event.kind === 'file_change' ? 'artifact'
+            : event.kind === 'usage' ? 'resource'
+              : event.kind === 'task_instruction' ? 'subtask' : 'message';
+      return { id: `runtime:${event.id ?? index}`, kind, timestamp: event.at,
+        text, status: failed ? 'failed' : 'observed',
+        attributes: { signal: failed ? -1
+          : ['terminal_result', 'file_change', 'verifier'].includes(event.kind) ? 1 : 0 } };
+    });
+    const usage = latest?.usage ?? { inputTokens: 0, outputTokens: 0, wallTimeMs: 0 };
+    const metricValues: Record<string, number> = {
+      node_count: snapshot.runtime.nodes.length,
+      edge_count: snapshot.runtime.derivationEdges.length + snapshot.runtime.dependencyEdges.length
+        + snapshot.runtime.communicationEdges.length,
+      maximum_depth: Math.max(0, ...snapshot.runtime.nodes.map(node => node.depth)),
+      active_node_count: activeNodes.length,
+      blind_spot_count: latest?.blindSpots.length ?? 0,
+      input_tokens: usage.inputTokens,
+      output_tokens: usage.outputTokens,
+      wall_time_ms: usage.wallTimeMs,
+    };
+    const stateNodes = [
+      { id: 'state:active-subtree', kind: 'resource', timestamp: 0,
+        text: `active subtree ${(latest?.activeSubtree ?? []).join(' ')}`, status: 'observed',
+        attributes: { signal: Math.log1p(latest?.activeSubtree.length ?? 0) } },
+      ...Object.entries(metricValues).map(([name, value]) => ({ id: `metric:${name}`,
+        kind: 'resource', timestamp: 0, text: `${name} ${value}`, status: 'observed',
+        attributes: { signal: Math.log1p(Math.max(0, value)) } })),
     ];
     const seenNodeIds = new Set<string>();
-    const nodes = [...agentNodes, ...epistemicNodes].filter(node => {
+    const nodes = [...agentNodes, ...epistemicNodes, ...runtimeNodes, ...stateNodes].filter(node => {
       if (seenNodeIds.has(node.id)) return false;
       seenNodeIds.add(node.id);
       return true;
@@ -829,6 +998,18 @@ export class LHTBAutonomousController {
         value.supports.map((claimId, supportIndex) => ({
           id: `o-${observationIndex}-${supportIndex}`, kind: 'produces',
           from: value.id, to: claimId }))),
+      ...runtimeNodes.flatMap((value, index) => {
+        const event = events[index];
+        const values: Array<{ id: string; kind: string; from: string; to: string }> = [];
+        if (event?.nodeId) values.push({ id: `runtime-owner-${index}`,
+          kind: ['terminal_command', 'terminal_result'].includes(event.kind)
+            ? 'tool_use' : 'produces', from: event.nodeId, to: value.id });
+        if (index > 0) values.push({ id: `runtime-temporal-${index}`,
+          kind: 'temporal', from: runtimeNodes[index - 1].id, to: value.id });
+        return values;
+      }),
+      ...(latest?.activeSubtree ?? []).map((nodeId, index) => ({ id: `active-${index}`,
+        kind: 'consumes', from: nodeId, to: 'state:active-subtree' })),
     ];
     const openRequirements = snapshot.runtime.requirements.filter(value => value.status === 'open');
     const profile = resolveTopologySamplingProfile(snapshot.organizationSeed);
@@ -845,9 +1026,8 @@ export class LHTBAutonomousController {
       depth_delta: candidate.kind === 'DERIVE' ? 1 : 0,
       sampling_logit_bias: topologySamplingCandidateLogitBias(snapshot, candidate),
       legal: !(candidate.kind === 'STOP' && explorationStopMasked) }));
-    const events = latest?.runtimeEvents ?? [];
     return {
-      interface_revision: 'compact-epistemic-event-driven-v3',
+      interface_revision: 'compact-epistemic-event-driven-v4',
       sampling_profile: { id: profile.id, preferred_node_range: profile.preferredNodeRange,
         preferred_minimum_depth: profile.preferredMinimumDepth, focus: profile.focus,
         reward_semantics: 'coverage intervention only; topology has no intrinsic reward' },

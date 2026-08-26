@@ -315,6 +315,76 @@ describe('LHTB process state', () => {
     controller.close();
   });
 
+  it('searches the spawned-agent library and reuses a compatible node before deriving', async () => {
+    const session = new RoyLHTBSession('reuse', 'task', 'implement and verify', 'commit',
+      'roy_runtime_heuristic');
+    session.applySemanticUpdate({ event_id: 'task-instruction', requirements: [{
+      id: 'first-gap', description: 'inspect the first validation failure',
+      requiredInformation: 'first diagnosis', likelyMechanism: 'acquisition',
+    }, {
+      id: 'second-gap', description: 'inspect a second validation failure',
+      requiredInformation: 'second diagnosis', likelyMechanism: 'acquisition',
+    }], claims: [], assumptions: [], evidence: [], external_observations: [], blind_spots: [],
+    relations: [] });
+    const childSpecification = {
+      id: 'spec-validator', nodeId: 'validator', parentId: 'root', depth: 1,
+      parentGoal: 'implement and verify', triggeringGapId: 'first-gap',
+      localObjective: 'Inspect one validation failure and return a concrete diagnosis.',
+      refinement: { parentScope: 'implement and verify', childScope: 'inspect one failure',
+        triggeringRequirementId: 'first-gap', narrowerThanParent: true,
+        newInformationNeeded: 'validation output', executableEndCondition: 'diagnosis is recorded',
+        duplicatedByExistingNode: false },
+      requiredClaims: [], requiredEvidence: [], relevantReportIds: [],
+      externalAccess: { allowed: true, tools: ['terminal'], purpose: 'run validation' },
+      expectedOutput: { requiredInformation: 'diagnosis', outputType: 'epistemic_report' as const },
+      terminationCondition: 'return the diagnosis',
+    };
+    session.applyOrganizationAction({ kind: 'DERIVE', actorNodeId: 'root', childSpecification });
+    const semantic = { async processEvent(event: { id: string }) {
+      return { event_id: event.id, requirements: [], claims: [], assumptions: [], evidence: [],
+        external_observations: [], blind_spots: [], relations: [] };
+    }, close() {} };
+    let calls = 0;
+    const provider = { isConfigured: () => true, async completeJSONWithUsage() {
+      calls += 1;
+      const candidate = calls === 1 ? {
+        id: 'duplicate-validator', kind: 'DERIVE', actorNodeId: 'root',
+        description: 'Create another validator', schedulerComplexity: 2,
+        action: { kind: 'DERIVE', actorNodeId: 'root', childSpecification: {
+          ...childSpecification, id: 'spec-validator-copy', nodeId: 'validator-copy',
+          triggeringGapId: 'second-gap',
+          refinement: { ...childSpecification.refinement,
+            triggeringRequirementId: 'second-gap' },
+        } },
+      } : {
+        id: 'reuse-validator', kind: 'CONNECT', actorNodeId: 'root',
+        description: 'Assign the second diagnosis to the existing validator',
+        schedulerComplexity: 1,
+        action: { kind: 'CONNECT', actorNodeId: 'root', requirementId: 'second-gap',
+          connection: { from: 'root', to: 'validator', required: true },
+          reuseReview: { searchedNodeIds: ['validator'], decision: 'reuse_existing',
+            reusableNodeId: 'validator',
+            reason: 'the existing validator already has the required diagnostic capability' } },
+      };
+      return { value: { preferred_candidate_id: candidate.id, candidates: [candidate] },
+        completion: { content: '{}', model: 'mock', usage: {
+          promptTokens: 1, completionTokens: 1, totalTokens: 2,
+        } } };
+    } };
+    const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false });
+    const result = await controller.advance(session, 1);
+    expect(result.status).toBe('continue');
+    expect(calls).toBe(2);
+    const snapshot = session.snapshot();
+    expect(snapshot.runtime.nodes.map(value => value.id)).toEqual(['root', 'validator']);
+    expect(snapshot.runtime.requirements.find(value => value.id === 'second-gap'))
+      .toMatchObject({ status: 'assigned', assignedNodeId: 'validator' });
+    expect(snapshot.runtime.communicationEdges).toContainEqual({
+      from: 'root', to: 'validator', required: true, active: true,
+    });
+    controller.close();
+  });
+
   it('assigns a semantic requirement to the child that produced its terminal event', () => {
     const session = new RoyLHTBSession('semantic-child', 'task', 'implement and verify', 'commit',
       'roy_runtime_heuristic');

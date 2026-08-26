@@ -23,6 +23,20 @@ export interface ResidualRequirement {
   possibleExternalAccess?: string[];
   status: 'open' | 'assigned' | 'resolved' | 'rejected';
   parentNodeId: string;
+  assignedNodeId?: string;
+}
+
+export interface AgentReuseReview {
+  searchedNodeIds: string[];
+  decision: 'reuse_existing' | 'spawn_distinct' | 'spawn_for_load';
+  reusableNodeId?: string;
+  reason: string;
+  loadJustification?: {
+    parallelWorkUnits: number;
+    availableCapacity: number;
+    parallelRequirementIds: string[];
+    reason: string;
+  };
 }
 
 export interface RefinementCheck {
@@ -62,6 +76,7 @@ export interface OpenAgentSpecification {
   };
   terminationCondition: string;
   expectedResourceCost?: number;
+  reuseReview?: AgentReuseReview;
 }
 
 export interface EpistemicClaim {
@@ -138,6 +153,7 @@ export interface InformationRealizationNode {
   status: 'ready' | 'running' | 'waiting' | 'completed' | 'returned' | 'pruned' | 'failed';
   specification?: OpenAgentSpecification;
   reportId?: string;
+  assignedRequirementIds?: string[];
   createdAt: number;
   updatedAt: number;
 }
@@ -149,6 +165,7 @@ export interface OrganizationAction {
   requirementId?: string;
   observation?: ExternalObservation;
   connection?: { from: string; to: string; required: boolean };
+  reuseReview?: AgentReuseReview;
   report?: EpistemicReport;
   targetNodeId?: string;
   finalOutput?: unknown;

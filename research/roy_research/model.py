@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import math
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
@@ -33,17 +35,28 @@ class FrozenTextEncoder:
             device=resolved,
             local_files_only=local_only,
         )
+        self._cache: Dict[str, Tensor] = {}
 
     def encode(self, texts: Sequence[str]) -> Tensor:
         if not texts:
             return torch.zeros((0, TEXT_DIMENSION), dtype=torch.float32)
-        values = self.model.encode(
-            list(texts),
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-            show_progress_bar=False,
-        )
-        return torch.from_numpy(np.asarray(values, dtype=np.float32))
+        keys = [hashlib.sha256(value.encode("utf-8")).hexdigest() for value in texts]
+        missing: Dict[str, str] = {}
+        for key, value in zip(keys, texts):
+            if key not in self._cache:
+                missing[key] = value
+        if missing:
+            missing_keys = list(missing)
+            values = self.model.encode(
+                [missing[key] for key in missing_keys],
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+            )
+            encoded = torch.from_numpy(np.asarray(values, dtype=np.float32))
+            for key, value in zip(missing_keys, encoded):
+                self._cache[key] = value.detach().cpu()
+        return torch.stack([self._cache[key] for key in keys])
 
 
 class RelationalMessagePassing(nn.Module):
@@ -256,6 +269,96 @@ def epistemic_state_graph(state: Mapping[str, Any]) -> Dict[str, object]:
         for claim_id in value.get("supports", []):
             if node_id:
                 edges.append({"kind": "produces", "from": node_id, "to": str(claim_id)})
+    for index, value in enumerate(state.get("blindSpots", state.get("blind_spots", []))):
+        text = value.get("description", value.get("statement", "")) \
+            if isinstance(value, Mapping) else value
+        add_node(f"blind-spot:{index}", "message", text, "open", signal=-1.0)
+
+    runtime_node_ids: List[str] = []
+    runtime_kind_map = {
+        "task_instruction": "subtask",
+        "organization_action": "message",
+        "terminal_command": "tool_call",
+        "terminal_result": "tool_result",
+        "file_change": "artifact",
+        "failure": "tool_result",
+        "usage": "resource",
+        "verifier": "tool_result",
+    }
+    for index, value in enumerate(state.get("runtimeEvents", state.get("runtime_events", []))):
+        if not isinstance(value, Mapping):
+            continue
+        event_kind = str(value.get("kind", "message"))
+        attributes = value.get("attributes", {})
+        attributes = attributes if isinstance(attributes, Mapping) else {}
+        action = attributes.get("action", {})
+        action = action if isinstance(action, Mapping) else {}
+        text_parts = [
+            event_kind,
+            str(action.get("kind", "")),
+            str(value.get("command", "")),
+            str(value.get("output", "")),
+        ]
+        event_text = " ".join(part for part in text_parts if part)
+        if len(event_text) > 2_000:
+            event_text = event_text[:1_000] + " [event text omitted] " + event_text[-1_000:]
+        failed = event_kind == "failure" or (
+            event_kind == "terminal_result" and int(value.get("exitCode", value.get("exit_code", 0)) or 0) != 0
+        )
+        event_id = add_node(
+            f"runtime:{value.get('id', index)}",
+            runtime_kind_map.get(event_kind, "message"),
+            event_text,
+            "failed" if failed else "observed",
+            value.get("at", 0),
+            -1.0 if failed else 1.0 if event_kind in {"terminal_result", "file_change", "verifier"} else 0.0,
+        )
+        if event_id is None:
+            continue
+        runtime_node_ids.append(event_id)
+        actor_id = value.get("nodeId", value.get("node_id"))
+        if actor_id is not None:
+            edges.append({
+                "kind": "tool_use" if event_kind in {"terminal_command", "terminal_result"}
+                else "produces",
+                "from": str(actor_id),
+                "to": event_id,
+            })
+    for before, after in zip(runtime_node_ids, runtime_node_ids[1:]):
+        edges.append({"kind": "temporal", "from": before, "to": after})
+
+    active_ids = [str(value) for value in state.get(
+        "activeSubtree", state.get("active_subtree", [])
+    )]
+    active_summary = add_node(
+        "state:active-subtree", "resource", "active subtree " + " ".join(active_ids),
+        "observed", signal=math.log1p(len(active_ids)),
+    )
+    if active_summary:
+        for node_id in active_ids:
+            edges.append({"kind": "consumes", "from": node_id, "to": active_summary})
+
+    usage = state.get("usage", {})
+    usage = usage if isinstance(usage, Mapping) else {}
+    state_nodes = [value for value in state.get("nodes", []) if isinstance(value, Mapping)]
+    dag_edges = [value for value in state.get(
+        "dagEdges", state.get("dag_edges", [])
+    ) if isinstance(value, Mapping)]
+    metrics = {
+        "node_count": len(state_nodes),
+        "edge_count": len(dag_edges),
+        "maximum_depth": max((int(value.get("depth", 0)) for value in state_nodes), default=0),
+        "active_node_count": len(active_ids),
+        "blind_spot_count": len(state.get("blindSpots", state.get("blind_spots", []))),
+        "input_tokens": float(usage.get("inputTokens", usage.get("input_tokens", 0)) or 0),
+        "output_tokens": float(usage.get("outputTokens", usage.get("output_tokens", 0)) or 0),
+        "wall_time_ms": float(usage.get("wallTimeMs", usage.get("wall_time_ms", 0)) or 0),
+    }
+    for name, value in metrics.items():
+        add_node(
+            f"metric:{name}", "resource", f"{name} {value}", "observed",
+            signal=math.log1p(max(0.0, float(value))),
+        )
     for value in state.get("dagEdges", state.get("dag_edges", [])):
         if isinstance(value, Mapping):
             edges.append(dict(value))

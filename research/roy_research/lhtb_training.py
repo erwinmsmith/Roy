@@ -13,6 +13,7 @@ from .lhtb_transitions import (
     build_state_transition_samples,
 )
 from .model import FrozenTextEncoder, epistemic_state_graph, graph_tensors
+from .organization import LHTB_POLICY_INTERFACE_REVISION
 from .organization_model import InformationRealizationPolicy
 from .organization_replay import replay_joint_log_probability
 from .value_model import (
@@ -26,7 +27,6 @@ from .value_model import (
 
 
 LHTB_GROUP_SIZE = 8
-LHTB_POLICY_INTERFACE_REVISION = "compact-epistemic-event-driven-v3"
 LHTB_GROUP_INPUT_TOKEN_GATE = 15_000_000
 
 

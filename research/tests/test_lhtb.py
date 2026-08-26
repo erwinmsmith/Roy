@@ -757,10 +757,27 @@ for line in sys.stdin:
             "claims": [{"id": "claim", "statement": "answer", "status": "supported",
                         "originNodeId": "root"}],
             "evidence": [{"id": "evidence", "content": "proof", "supports": ["claim"]}],
+            "blindSpots": ["the failure mode is still unknown"],
+            "activeSubtree": ["root"],
+            "runtimeEvents": [
+                {"id": "inspect", "kind": "terminal_command", "nodeId": "root",
+                 "command": "pytest -q", "at": 1},
+                {"id": "result", "kind": "terminal_result", "nodeId": "root",
+                 "exitCode": 1, "output": "one assertion failed", "at": 2},
+            ],
+            "usage": {"inputTokens": 120, "outputTokens": 30, "wallTimeMs": 2000},
         })
-        self.assertEqual({value["id"] for value in graph["nodes"]},
-                         {"root", "gap", "claim", "evidence"})
+        node_ids = {value["id"] for value in graph["nodes"]}
+        self.assertTrue({"root", "gap", "claim", "evidence"}.issubset(node_ids))
+        self.assertTrue({"blind-spot:0", "runtime:inspect", "runtime:result",
+                         "state:active-subtree", "metric:input_tokens",
+                         "metric:wall_time_ms"}.issubset(node_ids))
         self.assertIn({"kind": "dependency", "from": "root", "to": "gap"}, graph["edges"])
+        self.assertIn({"kind": "temporal", "from": "runtime:inspect",
+                       "to": "runtime:result"}, graph["edges"])
+
+        model = EpistemicValueModel(text_dim=4, hidden_dim=8, node_type_dim=2, layers=1)
+        self.assertEqual(model.value_head[0].in_features, 24)
 
     def test_constant_value_is_terminal_grpo_and_value_updates_on_zero_variance(self) -> None:
         model = EpistemicValueModel(text_dim=4, hidden_dim=8, node_type_dim=2, layers=1)

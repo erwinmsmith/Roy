@@ -92,7 +92,7 @@ export class RecursiveInformationRealizationRuntime {
         this.acquire(actor, action.observation, at);
         break;
       case 'CONNECT':
-        this.connect(action.connection);
+        this.connect(action);
         break;
       case 'EXECUTE':
         actor.status = 'running';
@@ -191,13 +191,19 @@ export class RecursiveInformationRealizationRuntime {
     }
     const objectiveKey = specification.localObjective.trim().replace(/\s+/g, ' ').toLocaleLowerCase();
     if (!objectiveKey) throw new Error('Child specification requires a local objective');
-    if ([...this.nodes.values()].some(node =>
-      node.localObjective.trim().replace(/\s+/g, ' ').toLocaleLowerCase() === objectiveKey)) {
+    const duplicateObjective = [...this.nodes.values()].find(node =>
+      node.localObjective.trim().replace(/\s+/g, ' ').toLocaleLowerCase() === objectiveKey);
+    const loadBalancingDuplicate = this.validLoadBalancingReview(specification, duplicateObjective?.id);
+    if (duplicateObjective && !loadBalancingDuplicate) {
       throw new Error('Child specification duplicates an existing local objective');
     }
     const refinement = specification.refinement;
-    if (!refinement.narrowerThanParent || refinement.duplicatedByExistingNode) {
+    if (!refinement.narrowerThanParent
+      || (refinement.duplicatedByExistingNode && !loadBalancingDuplicate)) {
       throw new Error('Child specification fails strict refinement validation');
+    }
+    if (specification.reuseReview?.decision === 'reuse_existing') {
+      throw new Error('DERIVE cannot create a node after selecting reuse_existing');
     }
     if (refinement.triggeringRequirementId !== specification.triggeringGapId) {
       throw new Error('Refinement must reference the triggering residual requirement');
@@ -235,11 +241,30 @@ export class RecursiveInformationRealizationRuntime {
     actor.updatedAt = at;
   }
 
-  private connect(connection: OrganizationAction['connection']): void {
+  private connect(action: OrganizationAction): void {
+    const connection = action.connection;
     if (!connection) throw new Error('CONNECT requires endpoints');
-    this.requireNode(connection.from);
-    this.requireNode(connection.to);
+    const source = this.requireNode(connection.from);
+    const target = this.requireNode(connection.to);
     if (connection.from === connection.to) throw new Error('Communication self-edges are not allowed');
+    if (action.requirementId) {
+      const requirement = this.requirements.get(action.requirementId);
+      if (!requirement || requirement.status !== 'open') {
+        throw new Error(`Reuse requirement ${action.requirementId} is not open`);
+      }
+      if (source.id !== action.actorNodeId || requirement.parentNodeId !== source.id) {
+        throw new Error('Reuse connection must originate from the requirement owner');
+      }
+      if (!connection.required) throw new Error('Agent reuse connections must be required');
+      if (['returned', 'pruned', 'failed'].includes(target.status)) {
+        throw new Error(`Cannot reuse inactive node ${target.id}`);
+      }
+      requirement.status = 'assigned';
+      requirement.assignedNodeId = target.id;
+      target.assignedRequirementIds = [...new Set([
+        ...(target.assignedRequirementIds ?? []), requirement.id,
+      ])];
+    }
     if (!this.communicationEdges.some(edge => edge.from === connection.from
       && edge.to === connection.to && edge.active)) {
       this.communicationEdges.push({ ...connection, active: true });
@@ -286,6 +311,15 @@ export class RecursiveInformationRealizationRuntime {
       const requirement = this.requirements.get(actor.triggeringGapId);
       if (requirement) requirement.status = 'resolved';
     }
+    const assigned = [...this.requirements.values()].filter(requirement =>
+      requirement.assignedNodeId === actor.id && requirement.status === 'assigned');
+    const explicitlyResolved = new Set(report.coverage.resolved);
+    for (const requirement of assigned) {
+      if (explicitlyResolved.has(requirement.id)
+        || (assigned.length === 1 && report.resolvedParentGap)) {
+        requirement.status = 'resolved';
+      }
+    }
   }
 
   private prune(nodeId: string | undefined, at: number): void {
@@ -320,6 +354,36 @@ export class RecursiveInformationRealizationRuntime {
 
   private hasUnresolvedRequiredDependency(): boolean {
     return this.dependencyEdges.some(edge => !edge.resolved);
+  }
+
+  private validLoadBalancingReview(
+    specification: OpenAgentSpecification,
+    duplicateNodeId?: string,
+  ): boolean {
+    const review = specification.reuseReview;
+    const load = review?.loadJustification;
+    const reusable = typeof review?.reusableNodeId === 'string'
+      ? this.nodes.get(review.reusableNodeId) : undefined;
+    const requirementIds = new Set(load?.parallelRequirementIds ?? []);
+    const occupiedIds = [reusable?.triggeringGapId, ...(reusable?.assignedRequirementIds ?? [])]
+      .filter((id): id is string => typeof id === 'string')
+      .filter(id => {
+        const requirement = this.requirements.get(id);
+        return requirement?.status === 'open' || requirement?.status === 'assigned';
+      });
+    return review?.decision === 'spawn_for_load'
+      && typeof review.reusableNodeId === 'string'
+      && Boolean(reusable)
+      && (!duplicateNodeId || review.reusableNodeId === duplicateNodeId)
+      && Boolean(review.reason.trim())
+      && Boolean(load?.reason.trim())
+      && Number.isFinite(load?.parallelWorkUnits)
+      && Number.isFinite(load?.availableCapacity)
+      && Number(load?.parallelWorkUnits) > Number(load?.availableCapacity)
+      && Number(load?.availableCapacity) >= 1
+      && requirementIds.size === Number(load?.parallelWorkUnits)
+      && requirementIds.has(specification.triggeringGapId)
+      && occupiedIds.some(id => requirementIds.has(id));
   }
 
   private dependencyReachable(from: string, target: string): boolean {

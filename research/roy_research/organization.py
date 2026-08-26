@@ -14,6 +14,8 @@ ORGANIZATION_ACTIONS = (
     "STOP",
 )
 
+LHTB_POLICY_INTERFACE_REVISION = "compact-epistemic-event-driven-v4"
+
 
 @dataclass(frozen=True)
 class ExplorationEnvelope:

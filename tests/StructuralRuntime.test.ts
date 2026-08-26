@@ -263,6 +263,55 @@ describe('recursive information realization runtime', () => {
     })).toThrow(/fingerprint/);
   });
 
+  it('reuses a spawned agent through a required connection and assigns the open gap', () => {
+    const runtime = new RecursiveInformationRealizationRuntime('root', 'answer task', 1);
+    runtime.apply({ kind: 'EXECUTE', actorNodeId: 'root', report: report('root', 'gap-1') }, 2);
+    runtime.apply({ kind: 'DERIVE', actorNodeId: 'root', childSpecification: specification() }, 3);
+    runtime.ingestRequirement({ id: 'gap-2', description: 'obtain a second source',
+      whyItMatters: 'the same evidence capability can handle it', likelyMechanism: 'acquisition',
+      requiredInformation: 'second primary source', status: 'open', parentNodeId: 'root' });
+    runtime.apply({ kind: 'CONNECT', actorNodeId: 'root', requirementId: 'gap-2',
+      connection: { from: 'root', to: 'child', required: true },
+      reuseReview: { searchedNodeIds: ['child'], decision: 'reuse_existing',
+        reusableNodeId: 'child', reason: 'the existing evidence agent has the required capability' } }, 4);
+    let snapshot = runtime.snapshot();
+    expect(snapshot.nodes).toHaveLength(2);
+    expect(snapshot.requirements.find(value => value.id === 'gap-2'))
+      .toMatchObject({ status: 'assigned', assignedNodeId: 'child' });
+    expect(snapshot.nodes.find(value => value.id === 'child')?.assignedRequirementIds)
+      .toContain('gap-2');
+    const reusedReport = { ...report('child'), coverage: {
+      resolved: ['gap-2'], unresolved: [], notExamined: [],
+    } };
+    runtime.apply({ kind: 'RETURN', actorNodeId: 'child', report: reusedReport }, 5);
+    snapshot = runtime.snapshot();
+    expect(snapshot.requirements.find(value => value.id === 'gap-2')?.status).toBe('resolved');
+  });
+
+  it('permits an equivalent spawned agent only with concrete load-balancing evidence', () => {
+    const runtime = new RecursiveInformationRealizationRuntime('root', 'answer task', 1);
+    runtime.apply({ kind: 'EXECUTE', actorNodeId: 'root', report: report('root', 'gap-1') }, 2);
+    runtime.apply({ kind: 'DERIVE', actorNodeId: 'root', childSpecification: specification() }, 3);
+    runtime.ingestRequirement({ id: 'gap-2', description: 'process a concurrent evidence shard',
+      whyItMatters: 'two independent shards must run concurrently', likelyMechanism: 'acquisition',
+      requiredInformation: 'second shard', status: 'open', parentNodeId: 'root' });
+    const unreviewed = { ...specification(), id: 'spec-child-copy', nodeId: 'child-copy',
+      triggeringGapId: 'gap-2', refinement: { ...specification().refinement,
+        triggeringRequirementId: 'gap-2' } };
+    expect(() => runtime.apply({ kind: 'DERIVE', actorNodeId: 'root',
+      childSpecification: unreviewed }, 4)).toThrow(/duplicates an existing local objective/);
+    const duplicate = { ...specification(), id: 'spec-child-load', nodeId: 'child-load',
+      triggeringGapId: 'gap-2', refinement: { ...specification().refinement,
+        triggeringRequirementId: 'gap-2', duplicatedByExistingNode: true },
+      reuseReview: { searchedNodeIds: ['child'], decision: 'spawn_for_load' as const,
+        reusableNodeId: 'child', reason: 'the capability matches but one worker is saturated',
+        loadJustification: { parallelWorkUnits: 2, availableCapacity: 1,
+          parallelRequirementIds: ['gap-1', 'gap-2'],
+          reason: 'two independent shards must execute concurrently' } } };
+    runtime.apply({ kind: 'DERIVE', actorNodeId: 'root', childSpecification: duplicate }, 5);
+    expect(runtime.snapshot().nodes.map(value => value.id)).toContain('child-load');
+  });
+
   it('keeps dependency and communication graphs distinct and wakes consumers', () => {
     const runtime = new RecursiveInformationRealizationRuntime('root', 'answer task', 1);
     runtime.apply({ kind: 'EXECUTE', actorNodeId: 'root', report: report('root', 'gap-1') }, 2);
