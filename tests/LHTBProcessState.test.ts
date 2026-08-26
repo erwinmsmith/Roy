@@ -540,7 +540,7 @@ describe('LHTB process state', () => {
     }
   });
 
-  it('ends repeated malformed proposal JSON as an audited non-training dead end', async () => {
+  it('classifies repeated malformed proposal JSON as an audited sampling failure', async () => {
     const priorAttempts = process.env.ROY_LHTB_PROPOSAL_ATTEMPTS;
     process.env.ROY_LHTB_PROPOSAL_ATTEMPTS = '2';
     const auditRoot = await mkdtemp(path.join(tmpdir(), 'roy-lhtb-malformed-dead-end-'));
@@ -560,17 +560,22 @@ describe('LHTB process state', () => {
     } };
     const controller = new LHTBAutonomousController({ provider, semantic, auditRoot });
     try {
-      const result = await controller.advance(session, 1);
-      expect(result.status).toBe('completed');
+      await expect(controller.advance(session, 1))
+        .rejects.toThrow('sampling_invalid:proposal_json_malformed');
       expect(calls).toBe(2);
-      expect(session.snapshot().runtime.finalOutput).toMatchObject({
-        status: 'policy_dead_end', reasons: ['proposal_json_malformed'],
-      });
-      expect(session.snapshot().processStates.at(-1)?.usage).toMatchObject({
-        inputTokens: 4, outputTokens: 6,
-      });
-      expect((await readFile(path.join(auditRoot, 'proposal-failures.jsonl'), 'utf8'))
-        .trim().split('\n')).toHaveLength(2);
+      expect(session.snapshot().runtime.stopped).toBe(false);
+      expect(session.snapshot().runtime.finalOutput).toBeUndefined();
+      // The task semantic extraction is a legitimate state transition; the
+      // rejected proposal itself must not fabricate an organization transition.
+      expect(session.snapshot().processStates).toHaveLength(2);
+      expect(session.snapshot().policyRecords).toHaveLength(0);
+      const failures = (await readFile(path.join(auditRoot, 'proposal-failures.jsonl'), 'utf8'))
+        .trim().split('\n').map(line => JSON.parse(line) as {
+          usage: { promptTokens: number; completionTokens: number };
+        });
+      expect(failures).toHaveLength(2);
+      expect(failures.reduce((total, failure) => total + failure.usage.promptTokens, 0)).toBe(4);
+      expect(failures.reduce((total, failure) => total + failure.usage.completionTokens, 0)).toBe(6);
     } finally {
       controller.close();
       await rm(auditRoot, { recursive: true, force: true });

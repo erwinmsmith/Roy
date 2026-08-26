@@ -185,7 +185,7 @@ Every candidate must have this exact outer shape:
 Allowed kinds are DERIVE, ACQUIRE, CONNECT, EXECUTE, RETURN, PRUNE, STOP.
 For ACQUIRE and EXECUTE, command, optional cwd and timeoutMs are outer candidate fields, while
 action contains only kind and actorNodeId. ACQUIRE inspects external state. EXECUTE changes the
-workspace or runs verification. Keep every command under 8000 characters. Prefer short incremental
+workspace or runs verification. Keep every command under 50000 characters. Prefer short incremental
 edits or an existing script over embedding an entire source file in one JSON response. Examples:
 {"id":"inspect","kind":"ACQUIRE","actorNodeId":"root","description":"Inspect files",
  "schedulerComplexity":1,"command":"find . -maxdepth 2 -type f","timeoutMs":120000,
@@ -265,8 +265,8 @@ const PROPOSER_ENTITY_TEXT_LIMIT = 600;
 const PROPOSER_ENTITY_COUNT = 16;
 const PROPOSER_GOAL_TEXT_LIMIT = 6_000;
 const SEMANTIC_RECALL_ENTITY_COUNT = 32;
-const PROPOSER_COMMAND_LIMIT = 8_000;
-const PROPOSER_RESPONSE_MAX_TOKENS = 16_384;
+const PROPOSER_COMMAND_LIMIT = 50_000;
+const PROPOSER_RESPONSE_MAX_TOKENS = 32_768;
 
 function projectText(value: unknown): unknown {
   if (typeof value !== 'string' || value.length <= PROPOSER_EVENT_TEXT_LIMIT) return value;
@@ -483,10 +483,6 @@ export class LHTBAutonomousController {
         error.completion.model);
         await this.auditProposalFailure(requestState, error, attempt);
         if (attempt === proposalAttempts) {
-          const deadEnd = this.completePolicyDeadEnd(session, snapshot,
-            ['proposal_json_malformed'],
-            'The proposer repeatedly returned an incomplete JSON action interface.');
-          if (deadEnd) return deadEnd;
           throw new Error('sampling_invalid:proposal_json_malformed', { cause: error });
         }
         messages.splice(0, messages.length,
@@ -531,10 +527,7 @@ export class LHTBAutonomousController {
         if (reasons.length > 0 && reasons.every(reason => reason === 'inactive_actor')) {
           throw new Error('environment_invalid:inactive_actor');
         }
-        const deadEnd = this.completePolicyDeadEnd(session, snapshot, reasons,
-          'The current policy produced no legal continuation.');
-        if (deadEnd) return deadEnd;
-        throw new Error(`policy_dead_end:no_legal_candidates:${reasons.join('; ')}`);
+        throw new Error(`sampling_invalid:no_legal_candidates:${reasons.join('; ')}`);
       }
       const rejectedCandidates = currentValidation.dispositions
         .filter(value => !value.accepted && value.index >= 0)
@@ -605,26 +598,6 @@ export class LHTBAutonomousController {
 
   private mctsEnabled(): boolean {
     return process.env.ROY_LHTB_MCTS_ENABLED === 'true';
-  }
-
-  private completePolicyDeadEnd(
-    session: RoyLHTBSession,
-    snapshot: ReturnType<RoyLHTBSession['snapshot']>,
-    reasons: string[],
-    message: string,
-  ): ControllerResult | undefined {
-    const root = snapshot.runtime.nodes.find(node => node.id === snapshot.runtime.rootId
-      && !['returned', 'pruned', 'failed'].includes(node.status));
-    if (!root) return undefined;
-    try {
-      session.applyOrganizationAction({ kind: 'STOP', actorNodeId: root.id,
-        finalOutput: { status: 'policy_dead_end', reasons, message } });
-      return { status: 'completed', snapshot: session.snapshot() };
-    } catch {
-      // Required unresolved dependencies make STOP illegal. The caller records a
-      // sampling failure without fabricating a valid terminal transition.
-      return undefined;
-    }
   }
 
   private async selectWithMCTS(
