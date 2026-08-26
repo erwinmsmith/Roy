@@ -44,6 +44,14 @@ export ROY_LHTB_SEMANTIC_COMMAND="${python_bin} -m roy_research.semantic_server"
 export ROY_LHTB_SEMANTIC_ROOT="${run_root}/semantic-test"
 export ROY_LHTB_MODEL="${selected_model}"
 export DEEPSEEK_MODEL_REVISION="${DEEPSEEK_MODEL_REVISION:-deepseek-v4-flash-api-alias}"
+export ROY_LHTB_MCTS_ENABLED="${ROY_LHTB_MCTS_ENABLED:-true}"
+export ROY_LHTB_MCTS_SIMULATIONS="${ROY_LHTB_MCTS_SIMULATIONS:-24}"
+export ROY_LHTB_MCTS_MAX_DEPTH="${ROY_LHTB_MCTS_MAX_DEPTH:-3}"
+export ROY_LHTB_MCTS_CPUCT="${ROY_LHTB_MCTS_CPUCT:-1.5}"
+export ROY_LHTB_MCTS_TEMPERATURE="${ROY_LHTB_MCTS_TEMPERATURE:-1}"
+if [[ "${ROY_LHTB_MCTS_ENABLED}" == "true" ]]; then
+  export ROY_LHTB_ORGANIZATION_INTERVAL=1
+fi
 
 group_environment_args=(--environment-backend "${environment_backend}")
 if [[ "${environment_backend}" == "native" ]]; then

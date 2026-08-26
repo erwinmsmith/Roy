@@ -48,7 +48,16 @@ export ROY_LHTB_SEMANTIC_COMMAND="${python_bin} -m roy_research.semantic_server"
 export ROY_LHTB_SEMANTIC_ROOT="${run_root}/semantic"
 export ROY_LHTB_MODEL="${model}"
 export DEEPSEEK_MODEL_REVISION="${DEEPSEEK_MODEL_REVISION:-deepseek-v4-flash-api-alias}"
-export ROY_LHTB_ORGANIZATION_INTERVAL="${ROY_LHTB_ORGANIZATION_INTERVAL:-5}"
+export ROY_LHTB_MCTS_ENABLED="${ROY_LHTB_MCTS_ENABLED:-true}"
+export ROY_LHTB_MCTS_SIMULATIONS="${ROY_LHTB_MCTS_SIMULATIONS:-24}"
+export ROY_LHTB_MCTS_MAX_DEPTH="${ROY_LHTB_MCTS_MAX_DEPTH:-3}"
+export ROY_LHTB_MCTS_CPUCT="${ROY_LHTB_MCTS_CPUCT:-1.5}"
+export ROY_LHTB_MCTS_TEMPERATURE="${ROY_LHTB_MCTS_TEMPERATURE:-1}"
+if [[ "${ROY_LHTB_MCTS_ENABLED}" == "true" ]]; then
+  export ROY_LHTB_ORGANIZATION_INTERVAL=1
+else
+  export ROY_LHTB_ORGANIZATION_INTERVAL="${ROY_LHTB_ORGANIZATION_INTERVAL:-5}"
+fi
 
 group_environment_args=(--environment-backend "${environment_backend}"
   --max-retries "${ROY_LHTB_MAX_ENV_RETRIES:-8}")
@@ -129,7 +138,7 @@ PY
       --output "${dev_trajectories}" --group-id "${group_id}" --task-id "${task_id}" \
       --category "${category}" --split dev --epoch "${dev_epoch}" \
       --policy-revision "${revision}" --environment-digest "${digest}" \
-      --environment-backend "${environment_backend}" --expected 1
+      --environment-backend "${environment_backend}" --expected 1 --model "${model}"
   done < <("${python_bin}" - "${manifest}" <<'PY'
 import json, sys
 for value in json.load(open(sys.argv[1], encoding="utf-8"))["tasks"]:
@@ -196,7 +205,7 @@ PY
     --job-dir "${job_dir}" --output "${trajectories}" --group-id "${group_id}" \
     --task-id "${task_id}" --category "${category}" --split train --epoch "${epoch}" \
     --policy-revision "${policy_revision}" --environment-digest "${environment_digest}" \
-    --environment-backend "${environment_backend}"
+    --environment-backend "${environment_backend}" --model "${model}"
   "${python_bin}" -m roy_research lhtb-update \
     --manifest "${manifest}" --trajectories "${trajectories}" --model "${model}" \
     --updates "${updates}" --transition-samples "${transition_samples}" --resume

@@ -121,6 +121,8 @@ Thus the process rewards telescope exactly to `R_i - V_bar(M_i,0)` and do not in
 
 The immutable dataset retains both adjacent event transitions and SMDP decision spans. Each adjacent sample contains the exact `M_t` and `M_t+1` fingerprints, one-step topology delta, target values and signed process reward. Decision credit is the telescoping sum over all adjacent transitions until the next organization decision. Sampling profiles may deliberately expose compact, branching, recursive and connected structures, but profile identity, node count and topology complexity never determine reward sign; only the final-score-trained frozen value potential does.
 
+During collection, PUCT may use the actor as a prior and the same frozen potential as its search score. For an edge from state `M` to a searched leaf `M'`, backup is `V_bar(M') - V_bar(M)`; with discount one this is exactly the telescoping sum of the intervening process rewards. Root visit frequencies, rather than actor priors, are then the behavior distribution and are recorded exactly for the GRPO importance ratio. Search therefore changes exploration, not the objective. External tool actions are treated as leaves whenever their side effects cannot be cloned; claims about MCTS coverage are restricted to the cloneable organization-state candidate space.
+
 There is no teacher, imitation, predefined role pool, staged objective, entropy bonus, cost penalty or weighted reward sum.
 
 ## 7. LHTB protocol and evaluation

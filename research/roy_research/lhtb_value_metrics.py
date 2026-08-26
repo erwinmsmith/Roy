@@ -23,6 +23,7 @@ def value_metrics(records: Sequence[Mapping[str, Any]], checkpoint: str,
     model.load_state_dict(payload["value_state_dict"])
     model.eval()
     encoder = FrozenTextEncoder(device=device_name, local_only=True)
+    target_revision = int(payload.get("metadata", {}).get("groups", 0))
     predictions = []
     targets = []
     with torch.no_grad():
@@ -67,11 +68,13 @@ def annotate_value_traces(records: Sequence[Mapping[str, Any]], checkpoint: str,
             enriched = dict(record)
             enriched["value_trace"] = value_predictions
             enriched["target_value_trace"] = target_predictions
+            enriched["target_value_revision"] = target_revision
             enriched["process_rewards"] = process_rewards[0]
             enriched["shaped_returns"] = returns[0]
             metadata = {"trajectory_id": record.get("id"),
                         "task_id": record.get("task_id"),
-                        "rollout_index": record.get("rollout_index")}
+                        "rollout_index": record.get("rollout_index"),
+                        "target_value_revision": target_revision}
             enriched["state_transitions"] = build_state_transition_samples(
                 states, target_predictions,
                 float(record.get("terminal_reward", record.get("reward"))), metadata

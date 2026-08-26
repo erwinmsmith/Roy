@@ -25,7 +25,7 @@ from .tau3_runner import evaluate_tau3_against_direct, train_tau3_on_policy
 from .lhtb import build_lhtb_split, verify_lhtb_checkout, write_lhtb_manifest, load_lhtb_manifest
 from .lhtb_experiment import build_training_schedule, disk_preflight, select_dev_checkpoint, summarize_test, write_json, write_harbor_group_config, write_lhtb_svg
 from .lhtb_training import LHTBProcessGRPOTrainer
-from .lhtb_results import import_harbor_group, validate_smoke
+from .lhtb_results import import_harbor_group, sample_audit, validate_smoke
 from .lhtb_value_metrics import value_metrics, annotate_value_traces
 from .lhtb_native import (
     native_environment_digest,
@@ -297,6 +297,9 @@ def parser() -> argparse.ArgumentParser:
     lhtb_import.add_argument("--environment-backend", choices=("docker", "native"),
                              default="docker")
     lhtb_import.add_argument("--expected", type=int, default=8)
+    lhtb_import.add_argument("--model", type=Path,
+                             help="Actor/value checkpoint used to score every M_t transition")
+    lhtb_import.add_argument("--device", default="cpu")
     lhtb_import.add_argument("--arm", choices=("single_agent_direct", "roy_runtime_heuristic",
                                                "learned_information_realization"),
                              default="learned_information_realization")
@@ -336,6 +339,11 @@ def parser() -> argparse.ArgumentParser:
     lhtb_smoke_validate.add_argument("--output", type=Path, required=True)
     lhtb_smoke_validate.add_argument("--task-id", action="append")
     lhtb_smoke_validate.add_argument("--max-input-tokens", type=int, default=15_000_000)
+    lhtb_sample_audit = commands.add_parser(
+        "lhtb-sample-audit", help="Audit topology, MCTS and per-step reward in imported samples"
+    )
+    lhtb_sample_audit.add_argument("--trajectories", type=Path, required=True)
+    lhtb_sample_audit.add_argument("--output", type=Path, required=True)
     return root
 
 
@@ -465,6 +473,8 @@ def main(argv: List[str] | None = None) -> None:
             expected=args.expected,
             arm=args.arm,
             environment_backend=args.environment_backend,
+            value_checkpoint=args.model,
+            device_name=args.device,
         )
         print(json.dumps({"imported": len(records), "output": str(args.output)}))
     elif args.command == "lhtb-group-config":
@@ -489,6 +499,10 @@ def main(argv: List[str] | None = None) -> None:
             "opensees-seismic-structural-regression-audit",
         )
         result = validate_smoke(args.jobs_dir, task_ids, args.max_input_tokens)
+        write_json(args.output, result)
+        print(json.dumps(result))
+    elif args.command == "lhtb-sample-audit":
+        result = sample_audit(list(read_jsonl(args.trajectories)))
         write_json(args.output, result)
         print(json.dumps(result))
     elif args.command == "raise-ledger-limit":

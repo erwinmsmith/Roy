@@ -40,7 +40,7 @@ from roy_research.lhtb_experiment import (
     summarize_test,
     write_harbor_group_config,
 )
-from roy_research.lhtb_results import import_harbor_group, official_lhtb_reward
+from roy_research.lhtb_results import import_harbor_group, official_lhtb_reward, sample_audit
 from roy_research.lhtb_transitions import (
     build_decision_transition_samples,
     build_state_transition_samples,
@@ -65,6 +65,7 @@ from roy_research.lhtb_native import (
 )
 from roy_research.organization_replay import (
     _hierarchical_candidate_log_probs,
+    organization_candidate_distribution,
     sample_organization_decision,
 )
 
@@ -749,6 +750,13 @@ for line in sys.stdin:
         self.assertGreater(record["masked_probabilities"]["DERIVE"], 0.0)
         self.assertLess(record["masked_probabilities"]["DERIVE"], 1e-30)
 
+        distribution = organization_candidate_distribution(
+            model, FakeEncoder384(), policy_state, device=torch.device("cpu")
+        )
+        self.assertAlmostEqual(sum(distribution["candidate_priors"].values()), 1.0, places=6)
+        self.assertAlmostEqual(sum(distribution["action_priors"].values()), 1.0, places=6)
+        self.assertGreater(distribution["candidate_priors"]["execute"], 1 - 1e-6)
+
     def test_value_graph_contains_epistemic_progress_as_well_as_agents(self) -> None:
         graph = epistemic_state_graph({
             "nodes": [{"id": "root", "localObjective": "solve", "status": "ready"}],
@@ -799,6 +807,42 @@ for line in sys.stdin:
         before = [value.clone() for value in target.parameters()]
         update_ema(target, model, 0.99)
         self.assertEqual(len(before), len(list(target.parameters())))
+
+    def test_mcts_behavior_probability_is_exact_and_revision_locked(self) -> None:
+        record = {
+            "behaviorPolicy": "mcts_puct", "candidateId": "derive",
+            "mctsBehaviorProbabilities": {"derive": 0.75, "execute": 0.25},
+            "mctsVisitCounts": {"derive": 18, "execute": 6},
+            "maskedOldLogProbability": float(torch.log(torch.tensor(0.75))),
+            "targetValueRevision": 2,
+            "mctsSearchTrace": [{"phase": "selection"}, {"phase": "backup"}],
+        }
+        LHTBProcessGRPOTrainer._validate_mcts_behavior(record, 2)
+        with self.assertRaisesRegex(ValueError, "stale target-value"):
+            LHTBProcessGRPOTrainer._validate_mcts_behavior(record, 3)
+        invalid = {**record, "maskedOldLogProbability": 0.0}
+        with self.assertRaisesRegex(ValueError, "exact old-policy"):
+            LHTBProcessGRPOTrainer._validate_mcts_behavior(invalid, 2)
+
+    def test_sample_audit_exposes_step_rewards_topology_and_mcts(self) -> None:
+        states = [{"sequence": 0, "fingerprint": "m0", "nodes": [{"id": "root",
+            "depth": 0}], "dagEdges": [], "runtimeEvents": []},
+            {"sequence": 1, "fingerprint": "m1", "nodes": [{"id": "root", "depth": 0},
+                {"id": "child", "depth": 1}], "dagEdges": [{"kind": "derivation",
+                    "from": "root", "to": "child"}], "runtimeEvents": []}]
+        transitions = build_state_transition_samples(states, [0.4, 0.6], 0.7)
+        result = sample_audit([{"id": "one", "rollout_index": 0, "organization_seed": 1,
+            "terminal_reward": 0.7, "process_states": states, "state_transitions": transitions,
+            "policy_records": [{"behaviorPolicy": "mcts_puct", "selectedAction": "DERIVE",
+                "policyState": {"sampling_profile": {"id": "recursive"}},
+                "selectedProcessReward": 0.2,
+                "mctsSearchTrace": [{"phase": "selection"}, {"phase": "backup"}]}],
+            "complete": True, "environment_failure": False, "tokens": 10,
+            "wall_time_seconds": 1}])
+        self.assertTrue(result["all_step_rewards_complete"])
+        self.assertTrue(result["all_mcts_traces_complete"])
+        self.assertEqual(result["trajectories"][0]["terminal_node_count"], 2)
+        self.assertEqual(result["trajectories"][0]["process_reward_signs"]["positive"], 1)
 
     def test_zero_variance_group_updates_value_and_full_checkpoint_restores(self) -> None:
         manifest = [value.to_dict() for value in build_lhtb_split()]

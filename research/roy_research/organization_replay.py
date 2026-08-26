@@ -252,6 +252,66 @@ def sample_organization_decision(
     return dict(candidate), record
 
 
+def organization_candidate_distribution(
+    model: InformationRealizationPolicy,
+    encoder: FrozenTextEncoder,
+    policy_state: Mapping[str, Any],
+    device: torch.device | None = None,
+) -> Dict[str, Any]:
+    """Return the exact actor prior over open candidates without sampling.
+
+    Candidate probability marginalizes the hierarchical active-node choice.  The
+    per-candidate active-node decomposition is retained so an external search
+    policy can record the actor path it used while storing its own exact behavior
+    probability for GRPO importance sampling.
+    """
+
+    resolved_device = device or next(model.parameters()).device
+    context = _policy_context(model, encoder, policy_state, resolved_device)
+    candidates = list(policy_state.get("candidates", []))
+    candidate_ids = [str(value["id"]) for value in candidates]
+    if len(set(candidate_ids)) != len(candidate_ids):
+        raise ValueError("organization candidate ids must be unique")
+    probabilities = torch.zeros(len(candidates), device=resolved_device)
+    paths: List[Dict[str, Any]] = []
+    for active_index, active_id in enumerate(context["active_node_ids"]):
+        if not bool(context["active_probabilities"][active_index] > 0):
+            continue
+        try:
+            values = _candidate_distribution(
+                model, policy_state, context, active_id, resolved_device
+            )
+        except ValueError as error:
+            if "has no legal organization candidates" in str(error):
+                continue
+            raise
+        active_probability = context["active_probabilities"][active_index]
+        for candidate_index, candidate_probability in enumerate(
+            values["candidate_probabilities"]
+        ):
+            joint = active_probability * candidate_probability
+            if not bool(joint > 0):
+                continue
+            probabilities[candidate_index] += joint
+            paths.append({
+                "candidate_id": candidate_ids[candidate_index],
+                "active_node_id": active_id,
+                "probability": float(joint.detach().cpu()),
+            })
+    total = probabilities.sum()
+    if not bool(total > 0):
+        raise ValueError("organization policy has no positive candidate prior")
+    probabilities = probabilities / total
+    return {
+        "candidate_priors": {
+            candidate_id: float(probability.detach().cpu())
+            for candidate_id, probability in zip(candidate_ids, probabilities)
+        },
+        "actor_paths": paths,
+        "action_priors": _action_probability_summary(candidates, probabilities),
+    }
+
+
 def replay_joint_log_probability(
     model: InformationRealizationPolicy,
     encoder: FrozenTextEncoder,

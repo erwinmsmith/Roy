@@ -2,7 +2,8 @@ import { DeepSeekProvider, LLMJSONParseError } from '../llm/providers/openai.js'
 import type { OrganizationCandidate,
   OrganizationPolicyRecord } from './informationRealizationTypes.js';
 import { PythonOrganizationPolicyClient } from './pythonOrganizationPolicy.js';
-import type { RoyLHTBSession } from './lhtbSession.js';
+import { RoyLHTBSession } from './lhtbSession.js';
+import { searchOrganizationMCTS } from './mctsOrganizationSearch.js';
 import { PythonSemanticStateClient } from './pythonSemanticState.js';
 import type { LLMJSONCompletionResult, LLMMessage, LLMCompletionOptions } from '../llm/types.js';
 import { appendFile, mkdir } from 'node:fs/promises';
@@ -552,12 +553,13 @@ export class LHTBAutonomousController {
     let selected: ProposedCandidate;
     let policyRecord: OrganizationPolicyRecord | undefined;
     if (snapshot.organizationMode === 'learned_information_realization'
-      && this.shouldInvokeOrganizationPolicy(snapshot)) {
+      && (this.mctsEnabled() || this.shouldInvokeOrganizationPolicy(snapshot))) {
       if (!this.learnedPolicy) {
         throw new Error('Learned mode requires ROY_LHTB_POLICY_COMMAND and has no heuristic fallback');
       }
-      const policyState = this.policyState(snapshot, candidates);
-      const decision = await this.learnedPolicy.select(policyState, candidates, seed);
+      const decision = this.mctsEnabled()
+        ? await this.selectWithMCTS(snapshot, candidates, seed)
+        : await this.learnedPolicy.select(this.policyState(snapshot, candidates), candidates, seed);
       selected = decision.candidate as ProposedCandidate;
       policyRecord = decision.record;
     } else if (snapshot.organizationMode === 'learned_information_realization') {
@@ -598,6 +600,123 @@ export class LHTBAutonomousController {
   close(): void {
     this.learnedPolicy?.close();
     this.semantic.close();
+  }
+
+  private mctsEnabled(): boolean {
+    return process.env.ROY_LHTB_MCTS_ENABLED === 'true';
+  }
+
+  private async selectWithMCTS(
+    snapshot: ReturnType<RoyLHTBSession['snapshot']>, candidates: ProposedCandidate[], seed: number
+  ): Promise<{ candidate: ProposedCandidate; record: OrganizationPolicyRecord }> {
+    if (!this.learnedPolicy) throw new Error('MCTS requires the learned policy sidecar');
+    const simulations = Math.max(1, Number(process.env.ROY_LHTB_MCTS_SIMULATIONS ?? 24));
+    const maximumDepth = Math.max(1, Number(process.env.ROY_LHTB_MCTS_MAX_DEPTH ?? 3));
+    const cpuCT = Math.max(0, Number(process.env.ROY_LHTB_MCTS_CPUCT ?? 1.5));
+    const temperature = Math.max(1e-6,
+      Number(process.env.ROY_LHTB_MCTS_TEMPERATURE ?? 1));
+    const result = await searchOrganizationMCTS({ rootState: snapshot, candidates,
+      simulations, maximumDepth, cpuCT, temperature, seed,
+      expand: async (state, remaining) => this.expandMCTSNode(state, remaining) });
+    const selected = result.candidate;
+    const rootPolicyState = this.policyState(snapshot, candidates);
+    const behaviorProbability = result.behaviorProbabilities[selected.id];
+    if (!(behaviorProbability > 0)) throw new Error('MCTS selected zero-probability action');
+    const actionProbability = Object.entries(result.behaviorProbabilities)
+      .filter(([candidateId]) => candidates.find(value => value.id === candidateId)?.kind
+        === selected.kind)
+      .reduce((sum, [, value]) => sum + value, 0);
+    const actorActionProbabilities = this.actionProbabilitySummary(candidates, result.actorPriors);
+    const behaviorActionProbabilities = this.actionProbabilitySummary(
+      candidates, result.behaviorProbabilities
+    );
+    return { candidate: selected, record: {
+      stateFingerprint: String(rootPolicyState.state_fingerprint ?? ''),
+      activeNodeId: selected.actorNodeId, candidateId: selected.id,
+      maskedOldLogProbability: Math.log(behaviorProbability),
+      maskedOldActionLogProbability: Math.log(actionProbability),
+      maskedOldCandidateConditionalLogProbability:
+        Math.log(behaviorProbability / actionProbability),
+      envelopeId: String((rootPolicyState.envelope as Record<string, unknown>).id),
+      policyState: rootPolicyState,
+      availableActions: [...new Set(candidates.map(value => value.kind))],
+      rawProbabilities: actorActionProbabilities,
+      maskedProbabilities: behaviorActionProbabilities,
+      selectedAction: selected.kind,
+      numRealResidualGaps: Number(rootPolicyState.num_real_residual_gaps ?? 0),
+      numChildProposals: Number(rootPolicyState.num_child_proposals ?? 0),
+      stopLegalReason: String(rootPolicyState.stop_legal_reason ?? ''),
+      explorationStopMasked: Boolean(rootPolicyState.exploration_stop_masked),
+      behaviorPolicy: 'mcts_puct', actorCandidatePriors: result.actorPriors,
+      mctsVisitCounts: result.visitCounts,
+      mctsBehaviorProbabilities: result.behaviorProbabilities,
+      mctsSimulations: simulations, mctsMaximumDepth: maximumDepth, mctsCpuCT: cpuCT,
+      rootTargetValue: result.rootTargetValue,
+      selectedChildTargetValue: result.selectedChildTargetValue,
+      selectedProcessReward: result.selectedProcessReward,
+      targetValueRevision: result.targetRevision,
+      mctsSearchTrace: result.trace,
+    } };
+  }
+
+  private async expandMCTSNode(
+    snapshot: ReturnType<RoyLHTBSession['snapshot']>, candidates: ProposedCandidate[]
+  ) {
+    if (!this.learnedPolicy) throw new Error('MCTS requires the learned policy sidecar');
+    const valid: Array<{ candidate: ProposedCandidate;
+      state: ReturnType<RoyLHTBSession['snapshot']>; terminal: boolean }> = [];
+    for (const candidate of candidates) {
+      try {
+        const probe = RoyLHTBSession.restore(snapshot);
+        let terminal = false;
+        if (candidate.kind === 'ACQUIRE' || candidate.kind === 'EXECUTE') {
+          if (!candidate.command?.trim()) continue;
+          probe.requestTerminal({ id: `mcts-${snapshot.processStates.length}-${candidate.id}`,
+            command: candidate.command, cwd: candidate.cwd,
+            timeoutMs: candidate.timeoutMs ?? 120_000, nodeId: candidate.actorNodeId,
+            organizationActionKind: candidate.kind });
+          terminal = true;
+        } else {
+          probe.applyOrganizationAction(candidate.action);
+          terminal = probe.snapshot().runtime.stopped;
+        }
+        valid.push({ candidate, state: probe.snapshot(), terminal });
+      } catch {
+        // A candidate may be legal at the root but become invalid after an
+        // earlier hypothetical intervention. It simply leaves this search node.
+      }
+    }
+    const currentPolicyState = this.policyState(snapshot,
+      valid.length ? valid.map(value => value.candidate) : candidates);
+    if (!valid.length) {
+      const graph = currentPolicyState.event_graph as Record<string, unknown>;
+      const current = await this.learnedPolicy.targetValue(graph);
+      return { targetValue: current.targetValue, targetRevision: current.targetRevision,
+        actorPriors: {}, children: [] };
+    }
+    const analysis = await this.learnedPolicy.analyze(currentPolicyState);
+    const children = await Promise.all(valid.map(async value => {
+      const childCandidates = candidates.filter(candidate => candidate.id !== value.candidate.id);
+      const childPolicyState = this.policyState(value.state,
+        childCandidates.length ? childCandidates : [value.candidate]);
+      const childValue = await this.learnedPolicy!.targetValue(
+        childPolicyState.event_graph as Record<string, unknown>
+      );
+      return { ...value, prior: analysis.candidatePriors[value.candidate.id] ?? 0,
+        targetValue: childValue.targetValue };
+    }));
+    return { targetValue: analysis.targetValue, targetRevision: analysis.targetRevision,
+      actorPriors: analysis.candidatePriors, children };
+  }
+
+  private actionProbabilitySummary(candidates: ProposedCandidate[],
+    probabilities: Record<string, number>): OrganizationPolicyRecord['rawProbabilities'] {
+    const result: Record<string, number> = { DERIVE: 0, ACQUIRE: 0, CONNECT: 0, EXECUTE: 0,
+      RETURN: 0, PRUNE: 0, STOP: 0 };
+    for (const candidate of candidates) {
+      result[candidate.kind] = (result[candidate.kind] ?? 0) + (probabilities[candidate.id] ?? 0);
+    }
+    return result as OrganizationPolicyRecord['rawProbabilities'];
   }
 
   private shouldInvokeOrganizationPolicy(snapshot: ReturnType<RoyLHTBSession['snapshot']>): boolean {

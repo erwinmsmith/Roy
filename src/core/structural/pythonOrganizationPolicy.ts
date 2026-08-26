@@ -7,6 +7,11 @@ interface OrganizationResponse {
   id: string;
   candidate_id?: string;
   policy_record?: Record<string, unknown>;
+  target_value?: number;
+  target_revision?: number;
+  candidate_priors?: Record<string, number>;
+  action_priors?: Record<string, number>;
+  actor_paths?: Array<Record<string, unknown>>;
   error?: string;
 }
 
@@ -64,10 +69,50 @@ export class PythonOrganizationPolicyClient {
     } };
   }
 
+  async analyze(policyState: Record<string, unknown>): Promise<{
+    targetValue: number; targetRevision: number; candidatePriors: Record<string, number>;
+    actionPriors: Record<string, number>; actorPaths: Array<Record<string, unknown>>;
+  }> {
+    const response = await this.request({ operation: 'analyze', policy_state: policyState });
+    if (response.error || response.target_value === undefined || !response.candidate_priors) {
+      throw new Error(response.error ?? 'Learned organization policy returned no analysis');
+    }
+    return { targetValue: Number(response.target_value),
+      targetRevision: Number(response.target_revision ?? 0),
+      candidatePriors: response.candidate_priors,
+      actionPriors: response.action_priors ?? {}, actorPaths: response.actor_paths ?? [] };
+  }
+
+  async targetValue(eventGraph: Record<string, unknown>): Promise<{
+    targetValue: number; targetRevision: number;
+  }> {
+    const response = await this.request({ operation: 'value', event_graph: eventGraph });
+    if (response.error || response.target_value === undefined) {
+      throw new Error(response.error ?? 'Learned organization policy returned no target value');
+    }
+    return { targetValue: Number(response.target_value),
+      targetRevision: Number(response.target_revision ?? 0) };
+  }
+
   close(): void {
     const child = this.process;
     this.process = undefined;
     if (child && !child.killed) child.kill('SIGTERM');
+  }
+
+  private async request(payload: Record<string, unknown>): Promise<OrganizationResponse> {
+    const child = this.ensureProcess();
+    const id = randomUUID();
+    return new Promise<OrganizationResponse>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`Python organization policy timed out after ${this.timeoutMs}ms`));
+        this.close();
+      }, this.timeoutMs);
+      timer.unref?.();
+      this.pending.set(id, { resolve, reject, timer });
+      child.stdin.write(`${JSON.stringify({ id, ...payload })}\n`);
+    });
   }
 
   private ensureProcess(): ChildProcessWithoutNullStreams {

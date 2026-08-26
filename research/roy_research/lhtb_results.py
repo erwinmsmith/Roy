@@ -12,6 +12,7 @@ from .process_state import canonical_fingerprint
 from .lhtb_transitions import build_state_transition_samples
 from .lhtb_native import normalize_native_task_id
 from .organization import LHTB_POLICY_INTERFACE_REVISION
+from .lhtb_value_metrics import annotate_value_traces
 
 from .io import write_jsonl
 
@@ -39,6 +40,8 @@ def import_harbor_group(
     runtime_config: Mapping[str, Any], expected: int = 8,
     arm: str = "learned_information_realization",
     environment_backend: str = "docker",
+    value_checkpoint: Path | None = None,
+    device_name: str = "cpu",
 ) -> List[Dict[str, Any]]:
     result_paths = []
     for candidate in sorted(job_dir.rglob("result.json")):
@@ -137,8 +140,101 @@ def import_harbor_group(
         records.append(record)
     if len(records) != expected:
         raise ValueError(f"expected {expected} Harbor results, found {len(records)}")
+    if value_checkpoint is not None:
+        records = [dict(value) for value in annotate_value_traces(
+            records, str(value_checkpoint), device_name
+        )]
     write_jsonl(output, records, append=output.exists())
     return records
+
+
+def sample_audit(records: List[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Summarize topology, MCTS and dense-credit completeness without updating models."""
+    trajectories = []
+    for record in records:
+        states = list(record.get("process_states", []))
+        transitions = list(record.get("state_transitions", []))
+        policy = list(record.get("policy_records", []))
+        terminal = states[-1] if states else {}
+        rewards = [value.get("process_reward") for value in transitions]
+        mcts_records = [value for value in policy if isinstance(value, Mapping)
+                        and value.get("behaviorPolicy", value.get("behavior_policy")) == "mcts_puct"]
+        profiles = sorted({str(((value.get("policyState", value.get("policy_state")) or {})
+                                .get("sampling_profile") or {}).get("id"))
+                           for value in policy if isinstance(value, Mapping)})
+        profiles = [value for value in profiles if value != "None"]
+        trajectories.append({
+            "id": record.get("id"), "rollout_index": record.get("rollout_index"),
+            "organization_seed": record.get("organization_seed"),
+            "official_terminal_reward": record.get("terminal_reward"),
+            "sampling_profiles": profiles,
+            "state_count": len(states), "decision_count": len(policy),
+            "terminal_node_count": len(terminal.get("nodes", [])),
+            "terminal_maximum_depth": max(
+                (int(value.get("depth", 0)) for value in terminal.get("nodes", [])), default=0
+            ),
+            "derive_count": sum(value.get("selectedAction", value.get("selected_action"))
+                                == "DERIVE" for value in policy if isinstance(value, Mapping)),
+            "connect_count": sum(value.get("selectedAction", value.get("selected_action"))
+                                 == "CONNECT" for value in policy if isinstance(value, Mapping)),
+            "dependency_edge_count": sum(value.get("kind") == "dependency"
+                                         for value in terminal.get("dagEdges", [])),
+            "communication_edge_count": sum(value.get("kind") == "communication"
+                                             for value in terminal.get("dagEdges", [])),
+            "transition_chain_complete": bool(states)
+                and len(transitions) == max(0, len(states) - 1),
+            "step_node_deltas": [
+                int((value.get("topology_delta") or {}).get("node_count_delta", 0))
+                for value in transitions
+            ],
+            "process_rewards": rewards,
+            "process_reward_complete": bool(transitions)
+                and all(value is not None for value in rewards),
+            "process_reward_signs": {
+                sign: sum(value.get("reward_sign") == sign for value in transitions)
+                for sign in ("positive", "zero", "negative")
+            },
+            "mcts_decision_count": len(mcts_records),
+            "mcts_selected_process_rewards": [
+                value.get("selectedProcessReward", value.get("selected_process_reward"))
+                for value in mcts_records
+            ],
+            "mcts_trace_complete": len(mcts_records) == len(policy) and all(
+                any(item.get("phase") == "backup" for item in
+                    value.get("mctsSearchTrace", value.get("mcts_search_trace", [])))
+                for value in mcts_records
+            ),
+            "tokens": record.get("tokens"), "wall_time_seconds": record.get("wall_time_seconds"),
+            "complete": bool(record.get("complete")),
+            "environment_failure": bool(record.get("environment_failure")),
+        })
+    terminal_rewards = [float(value["official_terminal_reward"]) for value in trajectories
+                        if value["official_terminal_reward"] is not None]
+    node_counts = [int(value["terminal_node_count"]) for value in trajectories]
+    profile_set = sorted({profile for value in trajectories for profile in value["sampling_profiles"]})
+    return {
+        "trajectory_count": len(trajectories),
+        "official_reward_std": float(np.std(terminal_rewards)) if terminal_rewards else None,
+        "sampling_profiles": profile_set,
+        "terminal_node_span": max(node_counts) - min(node_counts) if node_counts else None,
+        "all_transition_chains_complete": all(value["transition_chain_complete"]
+                                               for value in trajectories),
+        "all_step_rewards_complete": all(value["process_reward_complete"]
+                                         for value in trajectories),
+        "all_mcts_traces_complete": all(value["mcts_trace_complete"]
+                                        for value in trajectories),
+        "preconditions_for_training": len(trajectories) == 8
+            and all(value["complete"] and not value["environment_failure"]
+                    for value in trajectories)
+            and len({value["organization_seed"] for value in trajectories}) == 8
+            and len(profile_set) >= 3
+            and bool(node_counts) and max(node_counts) - min(node_counts) >= 2
+            and all(value["transition_chain_complete"] for value in trajectories)
+            and all(value["process_reward_complete"] for value in trajectories)
+            and all(value["mcts_trace_complete"] for value in trajectories)
+            and len(terminal_rewards) == 8 and float(np.std(terminal_rewards)) > 1e-8,
+        "trajectories": trajectories,
+    }
 
 
 def _deadline_terminal_snapshot(snapshot: Mapping[str, Any], reward: float) -> Mapping[str, Any]:

@@ -417,7 +417,16 @@ roy_smoke() {
   export ROY_LHTB_POLICY_COMMAND="${python_bin} -m roy_research.lhtb_policy_server"
   export ROY_LHTB_MODEL="${roy_root}/research/output/lhtb/native/smoke-initial.pt"
   export ROY_LHTB_NATIVE_ROOT="${native_root}"
-  export ROY_LHTB_ORGANIZATION_INTERVAL="${ROY_LHTB_ORGANIZATION_INTERVAL:-5}"
+  export ROY_LHTB_MCTS_ENABLED="${ROY_LHTB_MCTS_ENABLED:-true}"
+  export ROY_LHTB_MCTS_SIMULATIONS="${ROY_LHTB_MCTS_SIMULATIONS:-16}"
+  export ROY_LHTB_MCTS_MAX_DEPTH="${ROY_LHTB_MCTS_MAX_DEPTH:-3}"
+  export ROY_LHTB_MCTS_CPUCT="${ROY_LHTB_MCTS_CPUCT:-1.5}"
+  export ROY_LHTB_MCTS_TEMPERATURE="${ROY_LHTB_MCTS_TEMPERATURE:-1}"
+  if [[ "${ROY_LHTB_MCTS_ENABLED}" == "true" ]]; then
+    export ROY_LHTB_ORGANIZATION_INTERVAL=1
+  else
+    export ROY_LHTB_ORGANIZATION_INTERVAL="${ROY_LHTB_ORGANIZATION_INTERVAL:-5}"
+  fi
   if [[ ! -f "${ROY_LHTB_MODEL}" ]]; then
     "${python_bin}" -m roy_research lhtb-init \
       --manifest "${roy_root}/research/config/lhtb_split.json" --model "${ROY_LHTB_MODEL}"

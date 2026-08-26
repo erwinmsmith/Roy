@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence
 
@@ -268,6 +269,12 @@ class LHTBProcessGRPOTrainer:
             if any(abs(int(item.get("topology_delta", {}).get("node_count_delta", 0))) > 1
                    for item in transitions if isinstance(item, Mapping)):
                 raise ValueError("topology must be derived one node at a time")
+            for record in policy:
+                if not isinstance(record, Mapping):
+                    raise ValueError("policy records must be mappings")
+                behavior_kind = record.get("behavior_policy", record.get("behaviorPolicy"))
+                if behavior_kind == "mcts_puct":
+                    self._validate_mcts_behavior(record, int(value["policy_revision"]))
         sampling_profiles = {
             str(((list(value["policy_records"])[0].get("policy_state")
                   or list(value["policy_records"])[0].get("policyState") or {})
@@ -289,6 +296,36 @@ class LHTBProcessGRPOTrainer:
                 f"LHTB group exceeds compact-state input-token gate: "
                 f"{group_input_tokens} > {LHTB_GROUP_INPUT_TOKEN_GATE}"
             )
+
+    @staticmethod
+    def _validate_mcts_behavior(record: Mapping[str, Any], policy_revision: int) -> None:
+        probabilities = record.get(
+            "mcts_behavior_probabilities", record.get("mctsBehaviorProbabilities")
+        )
+        visits = record.get("mcts_visit_counts", record.get("mctsVisitCounts"))
+        trace = record.get("mcts_search_trace", record.get("mctsSearchTrace"))
+        selected = str(record.get("candidate_id", record.get("candidateId", "")))
+        if not isinstance(probabilities, Mapping) or not isinstance(visits, Mapping):
+            raise ValueError("MCTS policy record is missing behavior probabilities or visits")
+        values = {str(key): float(value) for key, value in probabilities.items()}
+        if selected not in values or values[selected] <= 0:
+            raise ValueError("MCTS selected candidate has no positive behavior probability")
+        if abs(sum(values.values()) - 1.0) > 1e-6:
+            raise ValueError("MCTS behavior probabilities must sum to one")
+        old_log = float(record.get(
+            "masked_old_log_probability", record.get("maskedOldLogProbability")
+        ))
+        if abs(math.log(values[selected]) - old_log) > 1e-6:
+            raise ValueError("MCTS exact old-policy log probability does not match visits")
+        if sum(int(value) for value in visits.values()) <= 0:
+            raise ValueError("MCTS visit ledger is empty")
+        if int(record.get("target_value_revision",
+                          record.get("targetValueRevision", -1))) != policy_revision:
+            raise ValueError("MCTS search used a stale target-value revision")
+        if not isinstance(trace, Sequence) or not any(
+            isinstance(value, Mapping) and value.get("phase") == "backup" for value in trace
+        ):
+            raise ValueError("MCTS search trace has no PUCT backup")
 
     def metadata(self) -> Dict[str, Any]:
         return {

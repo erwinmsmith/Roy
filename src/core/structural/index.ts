@@ -12,4 +12,5 @@ export * from './globalEpistemicState.js';
 export * from './lhtbSession.js';
 export * from './pythonOrganizationPolicy.js';
 export * from './lhtbController.js';
+export * from './mctsOrganizationSearch.js';
 export * from './pythonSemanticState.js';

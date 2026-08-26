@@ -206,6 +206,18 @@ export interface OrganizationPolicyRecord {
   numChildProposals?: number;
   stopLegalReason?: string;
   explorationStopMasked?: boolean;
+  behaviorPolicy?: 'actor' | 'mcts_puct';
+  actorCandidatePriors?: Record<string, number>;
+  mctsVisitCounts?: Record<string, number>;
+  mctsBehaviorProbabilities?: Record<string, number>;
+  mctsSimulations?: number;
+  mctsMaximumDepth?: number;
+  mctsCpuCT?: number;
+  rootTargetValue?: number;
+  selectedChildTargetValue?: number;
+  selectedProcessReward?: number;
+  targetValueRevision?: number;
+  mctsSearchTrace?: Array<Record<string, unknown>>;
 }
 
 export interface OrganizationRuntimeBudget {
