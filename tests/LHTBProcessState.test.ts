@@ -540,6 +540,166 @@ describe('LHTB process state', () => {
     }
   });
 
+  it('ends repeated malformed proposal JSON as an audited non-training dead end', async () => {
+    const priorAttempts = process.env.ROY_LHTB_PROPOSAL_ATTEMPTS;
+    process.env.ROY_LHTB_PROPOSAL_ATTEMPTS = '2';
+    const auditRoot = await mkdtemp(path.join(tmpdir(), 'roy-lhtb-malformed-dead-end-'));
+    const session = new RoyLHTBSession('malformed-dead-end', 'task', 'finish', 'commit',
+      'roy_runtime_heuristic');
+    const semantic = { async processEvent(event: { id: string }) {
+      return { event_id: event.id, requirements: [], claims: [], assumptions: [], evidence: [],
+        external_observations: [], blind_spots: [], relations: [] };
+    }, close() {} };
+    let calls = 0;
+    const provider = { isConfigured: () => true, async completeJSONWithUsage() {
+      calls += 1;
+      throw new LLMJSONParseError('truncated proposal', {
+        content: '{"candidates":[{"command":"unfinished', model: 'mock',
+        usage: { promptTokens: 2, completionTokens: 3, totalTokens: 5 },
+      });
+    } };
+    const controller = new LHTBAutonomousController({ provider, semantic, auditRoot });
+    try {
+      const result = await controller.advance(session, 1);
+      expect(result.status).toBe('completed');
+      expect(calls).toBe(2);
+      expect(session.snapshot().runtime.finalOutput).toMatchObject({
+        status: 'policy_dead_end', reasons: ['proposal_json_malformed'],
+      });
+      expect(session.snapshot().processStates.at(-1)?.usage).toMatchObject({
+        inputTokens: 4, outputTokens: 6,
+      });
+      expect((await readFile(path.join(auditRoot, 'proposal-failures.jsonl'), 'utf8'))
+        .trim().split('\n')).toHaveLength(2);
+    } finally {
+      controller.close();
+      await rm(auditRoot, { recursive: true, force: true });
+      if (priorAttempts === undefined) delete process.env.ROY_LHTB_PROPOSAL_ATTEMPTS;
+      else process.env.ROY_LHTB_PROPOSAL_ATTEMPTS = priorAttempts;
+    }
+  });
+
+  it('keeps STOP legal when it is the only usable early-exploration candidate', async () => {
+    const priorAttempts = process.env.ROY_LHTB_PROPOSAL_ATTEMPTS;
+    const priorProfile = process.env.ROY_LHTB_TOPOLOGY_PROFILE;
+    process.env.ROY_LHTB_PROPOSAL_ATTEMPTS = '1';
+    process.env.ROY_LHTB_TOPOLOGY_PROFILE = 'connected';
+    const session = new RoyLHTBSession('stop-only', 'task', 'finish', 'commit',
+      'learned_information_realization');
+    const semantic = { async processEvent(event: { id: string }) {
+      return { event_id: event.id, requirements: [], claims: [], assumptions: [], evidence: [],
+        external_observations: [], blind_spots: [], relations: [] };
+    }, close() {} };
+    const stop = { id: 'stop', kind: 'STOP', actorNodeId: 'root', description: 'finish',
+      schedulerComplexity: 0, action: { kind: 'STOP', actorNodeId: 'root', finalOutput: 'done' } };
+    const provider = { isConfigured: () => true, async completeJSONWithUsage() {
+      return { value: { preferred_candidate_id: 'stop', candidates: [stop] },
+        completion: { content: '{}', model: 'mock', usage: {
+          promptTokens: 1, completionTokens: 1, totalTokens: 2,
+        } } };
+    } };
+    let observedState: Record<string, unknown> | undefined;
+    const learnedPolicy = { async select(policyState: Record<string, unknown>) {
+      observedState = policyState;
+      return { candidate: stop, record: { stateFingerprint: 'state', activeNodeId: 'root',
+        candidateId: 'stop', maskedOldLogProbability: 0, envelopeId: 'connected' } };
+    }, close() {} };
+    const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false,
+      learnedPolicy: learnedPolicy as never });
+    try {
+      const result = await controller.advance(session, 1);
+      expect(result.status).toBe('completed');
+      expect(observedState?.exploration_stop_masked).toBe(true);
+      expect(observedState?.active_node_legal).toEqual([true]);
+      expect((observedState?.candidates as Array<Record<string, unknown>>)[0]?.legal).toBe(true);
+    } finally {
+      controller.close();
+      if (priorAttempts === undefined) delete process.env.ROY_LHTB_PROPOSAL_ATTEMPTS;
+      else process.env.ROY_LHTB_PROPOSAL_ATTEMPTS = priorAttempts;
+      if (priorProfile === undefined) delete process.env.ROY_LHTB_TOPOLOGY_PROFILE;
+      else process.env.ROY_LHTB_TOPOLOGY_PROFILE = priorProfile;
+    }
+  });
+
+  it('drops terminal candidates whose actor returned inside an MCTS branch', async () => {
+    const priorMCTS = process.env.ROY_LHTB_MCTS_ENABLED;
+    const priorSimulations = process.env.ROY_LHTB_MCTS_SIMULATIONS;
+    const priorDepth = process.env.ROY_LHTB_MCTS_MAX_DEPTH;
+    const priorProfile = process.env.ROY_LHTB_TOPOLOGY_PROFILE;
+    process.env.ROY_LHTB_MCTS_ENABLED = 'true';
+    process.env.ROY_LHTB_MCTS_SIMULATIONS = '4';
+    process.env.ROY_LHTB_MCTS_MAX_DEPTH = '2';
+    process.env.ROY_LHTB_TOPOLOGY_PROFILE = 'compact';
+    const session = new RoyLHTBSession('mcts-returned-actor', 'task', 'finish', 'commit',
+      'learned_information_realization');
+    const childSpecification = {
+      id: 'spec-worker', nodeId: 'worker', parentId: 'root', depth: 1,
+      parentGoal: 'finish', triggeringGapId: 'root-task-requirement',
+      localObjective: 'Inspect and report one bounded result.', refinement: {
+        parentScope: 'finish', childScope: 'inspect one result',
+        triggeringRequirementId: 'root-task-requirement', narrowerThanParent: true,
+        newInformationNeeded: 'inspection result', executableEndCondition: 'report is returned',
+        duplicatedByExistingNode: false,
+      }, requiredClaims: [], requiredEvidence: [], relevantReportIds: [],
+      externalAccess: { allowed: true, tools: ['terminal'], purpose: 'inspect' },
+      expectedOutput: { requiredInformation: 'inspection result',
+        outputType: 'epistemic_report' as const }, terminationCondition: 'return the report',
+    };
+    session.applyOrganizationAction({ kind: 'DERIVE', actorNodeId: 'root', childSpecification });
+    const report = { id: 'worker-report', nodeId: 'worker', parentId: 'root', depth: 1,
+      localObjective: childSpecification.localObjective,
+      triggeringGapId: 'root-task-requirement', conclusion: 'inspection completed',
+      reasoningSummary: 'bounded result recorded', claims: [], evidence: [],
+      externalObservations: [], assumptions: [], uncertainty: { confidence: 0.8,
+        uncertainAbout: [], confidenceBasis: 'inspection' }, conflicts: [],
+      coverage: { resolved: ['root-task-requirement'], unresolved: [], notExamined: [] },
+      blindSpots: [], residualRequirements: [], proposedChildren: [], resolvedParentGap: true,
+      informationToPropagate: [],
+    };
+    const candidates = [{ id: 'return-worker', kind: 'RETURN', actorNodeId: 'worker',
+      description: 'return the completed report', schedulerComplexity: 0,
+      action: { kind: 'RETURN', actorNodeId: 'worker', report } },
+    { id: 'execute-worker', kind: 'EXECUTE', actorNodeId: 'worker',
+      description: 'run one more check', schedulerComplexity: 1, command: 'true',
+      action: { kind: 'EXECUTE', actorNodeId: 'worker' } }];
+    const semantic = { async processEvent(event: { id: string }) {
+      return { event_id: event.id, requirements: [], claims: [], assumptions: [], evidence: [],
+        external_observations: [], blind_spots: [], relations: [] };
+    }, close() {} };
+    const provider = { isConfigured: () => true, async completeJSONWithUsage() {
+      return { value: { preferred_candidate_id: 'return-worker', candidates },
+        completion: { content: '{}', model: 'mock', usage: {
+          promptTokens: 1, completionTokens: 1, totalTokens: 2,
+        } } };
+    } };
+    let analyses = 0;
+    const learnedPolicy = { async analyze(policyState: Record<string, unknown>) {
+      analyses += 1;
+      expect((policyState.active_node_legal as boolean[]).some(Boolean)).toBe(true);
+      const values = policyState.candidates as Array<Record<string, unknown>>;
+      return { targetValue: 0.5, targetRevision: 0,
+        candidatePriors: Object.fromEntries(values.map(value => [String(value.id), 1])),
+        actionPriors: {}, actorPaths: [] };
+    }, async targetValue() { return { targetValue: 0.5, targetRevision: 0 }; }, close() {} };
+    const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false,
+      learnedPolicy: learnedPolicy as never });
+    try {
+      const result = await controller.advance(session, 7);
+      expect(['continue', 'terminal_request']).toContain(result.status);
+      expect(analyses).toBeGreaterThan(0);
+    } finally {
+      controller.close();
+      if (priorMCTS === undefined) delete process.env.ROY_LHTB_MCTS_ENABLED;
+      else process.env.ROY_LHTB_MCTS_ENABLED = priorMCTS;
+      if (priorSimulations === undefined) delete process.env.ROY_LHTB_MCTS_SIMULATIONS;
+      else process.env.ROY_LHTB_MCTS_SIMULATIONS = priorSimulations;
+      if (priorDepth === undefined) delete process.env.ROY_LHTB_MCTS_MAX_DEPTH;
+      else process.env.ROY_LHTB_MCTS_MAX_DEPTH = priorDepth;
+      if (priorProfile === undefined) delete process.env.ROY_LHTB_TOPOLOGY_PROFILE;
+      else process.env.ROY_LHTB_TOPOLOGY_PROFILE = priorProfile;
+    }
+  });
+
   it('projects cumulative terminal text for the proposer without mutating M_t', async () => {
     const session = new RoyLHTBSession('projection', 'task', 'finish', 'commit',
       'roy_runtime_heuristic');

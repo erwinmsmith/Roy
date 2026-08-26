@@ -92,7 +92,8 @@ def import_harbor_group(
         environment_invalid = "environment_invalid:" in exception_message
         sampling_invalid = "sampling_invalid:" in exception_message
         complete = bool(partial_candidates) and reward_available \
-            and (exception is None or normal_deadline)
+            and (exception is None or normal_deadline) \
+            and not policy_dead_end and not environment_invalid and not sampling_invalid
         if normal_deadline:
             termination_type = "timeout_with_reward"
         elif policy_dead_end and reward_available:

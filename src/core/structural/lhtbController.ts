@@ -266,6 +266,7 @@ const PROPOSER_ENTITY_COUNT = 16;
 const PROPOSER_GOAL_TEXT_LIMIT = 6_000;
 const SEMANTIC_RECALL_ENTITY_COUNT = 32;
 const PROPOSER_COMMAND_LIMIT = 8_000;
+const PROPOSER_RESPONSE_MAX_TOKENS = 16_384;
 
 function projectText(value: unknown): unknown {
   if (typeof value !== 'string' || value.length <= PROPOSER_EVENT_TEXT_LIMIT) return value;
@@ -471,7 +472,8 @@ export class LHTBAutonomousController {
       let current: LLMJSONCompletionResult<ProposalResponse>;
       try {
         current = await this.provider.completeJSONWithUsage<ProposalResponse>(messages,
-          { temperature: 0, maxTokens: 32_768, thinking: { type: 'disabled' } });
+          { temperature: 0, maxTokens: PROPOSER_RESPONSE_MAX_TOKENS,
+            thinking: { type: 'disabled' } });
       } catch (error) {
         if (!(error instanceof LLMJSONParseError)) throw error;
         session.recordModelUsage(error.completion.usage?.inputTokens
@@ -480,10 +482,16 @@ export class LHTBAutonomousController {
           ?? error.completion.usage?.completionTokens ?? 0,
         error.completion.model);
         await this.auditProposalFailure(requestState, error, attempt);
-        if (attempt === proposalAttempts) throw error;
+        if (attempt === proposalAttempts) {
+          const deadEnd = this.completePolicyDeadEnd(session, snapshot,
+            ['proposal_json_malformed'],
+            'The proposer repeatedly returned an incomplete JSON action interface.');
+          if (deadEnd) return deadEnd;
+          throw new Error('sampling_invalid:proposal_json_malformed', { cause: error });
+        }
         messages.splice(0, messages.length,
           { role: 'system', content: PROPOSER_PROMPT },
-          { role: 'user', content: `${JSON.stringify(requestState)}\nA prior independent attempt was malformed. Return one concise, complete JSON object only.` }
+          { role: 'user', content: `${JSON.stringify(requestState)}\nA prior independent attempt was malformed or truncated. Return one concise, complete JSON object only. Keep commands below ${PROPOSER_COMMAND_LIMIT} characters, do not inline whole source files or use a large here-document, and prefer a short incremental command or an existing script.` }
         );
         continue;
       }
@@ -523,19 +531,9 @@ export class LHTBAutonomousController {
         if (reasons.length > 0 && reasons.every(reason => reason === 'inactive_actor')) {
           throw new Error('environment_invalid:inactive_actor');
         }
-        const root = snapshot.runtime.nodes.find(node => node.id === snapshot.runtime.rootId
-          && !['returned', 'pruned', 'failed'].includes(node.status));
-        if (root) {
-          try {
-            session.applyOrganizationAction({ kind: 'STOP', actorNodeId: root.id,
-              finalOutput: { status: 'policy_dead_end', reasons,
-                message: 'The current policy produced no legal continuation.' } });
-            return { status: 'completed', snapshot: session.snapshot() };
-          } catch {
-            // A required unresolved dependency can make STOP illegal. Preserve the
-            // trajectory for audit rather than misclassifying it as environment-invalid.
-          }
-        }
+        const deadEnd = this.completePolicyDeadEnd(session, snapshot, reasons,
+          'The current policy produced no legal continuation.');
+        if (deadEnd) return deadEnd;
         throw new Error(`policy_dead_end:no_legal_candidates:${reasons.join('; ')}`);
       }
       const rejectedCandidates = currentValidation.dispositions
@@ -582,7 +580,6 @@ export class LHTBAutonomousController {
       selected = candidates.find(value => value.id === completion.value.preferred_candidate_id)
         ?? candidates[0];
     }
-    if (policyRecord) session.recordPolicyDecision(policyRecord);
     if (selected.kind === 'ACQUIRE' || selected.kind === 'EXECUTE') {
       if (!selected.command?.trim()) {
         throw new Error(`${selected.kind} candidate requires a terminal command`);
@@ -591,9 +588,11 @@ export class LHTBAutonomousController {
         command: selected.command, cwd: selected.cwd, timeoutMs: selected.timeoutMs ?? 120_000,
         nodeId: selected.actorNodeId, organizationActionKind: selected.kind };
       session.requestTerminal(request);
+      if (policyRecord) session.recordPolicyDecision(policyRecord);
       return { status: 'terminal_request', request, snapshot: session.snapshot() };
     }
     session.applyOrganizationAction(selected.action);
+    if (policyRecord) session.recordPolicyDecision(policyRecord);
     const result = session.snapshot();
     return result.runtime.stopped ? { status: 'completed', snapshot: result }
       : { status: 'continue', snapshot: result };
@@ -606,6 +605,26 @@ export class LHTBAutonomousController {
 
   private mctsEnabled(): boolean {
     return process.env.ROY_LHTB_MCTS_ENABLED === 'true';
+  }
+
+  private completePolicyDeadEnd(
+    session: RoyLHTBSession,
+    snapshot: ReturnType<RoyLHTBSession['snapshot']>,
+    reasons: string[],
+    message: string,
+  ): ControllerResult | undefined {
+    const root = snapshot.runtime.nodes.find(node => node.id === snapshot.runtime.rootId
+      && !['returned', 'pruned', 'failed'].includes(node.status));
+    if (!root) return undefined;
+    try {
+      session.applyOrganizationAction({ kind: 'STOP', actorNodeId: root.id,
+        finalOutput: { status: 'policy_dead_end', reasons, message } });
+      return { status: 'completed', snapshot: session.snapshot() };
+    } catch {
+      // Required unresolved dependencies make STOP illegal. The caller records a
+      // sampling failure without fabricating a valid terminal transition.
+      return undefined;
+    }
   }
 
   private async selectWithMCTS(
@@ -1145,6 +1164,7 @@ export class LHTBAutonomousController {
     const maximumDepthReached = Math.max(0, ...snapshot.runtime.nodes.map(node => node.depth));
     const explorationStopMasked = openRequirements.length > 0
       && (snapshot.runtime.nodes.length < minimumNodes || maximumDepthReached < minimumDepth);
+    const hasExplorationAlternative = candidates.some(candidate => candidate.kind !== 'STOP');
     const policyCandidates = candidates.map(candidate => ({ id: candidate.id, kind: candidate.kind,
       actor_node_id: candidate.actorNodeId, description: candidate.description,
       scheduler_complexity: candidate.schedulerComplexity,
@@ -1152,7 +1172,8 @@ export class LHTBAutonomousController {
       resolves_gap: candidate.kind === 'ACQUIRE' || candidate.kind === 'RETURN',
       depth_delta: candidate.kind === 'DERIVE' ? 1 : 0,
       sampling_logit_bias: topologySamplingCandidateLogitBias(snapshot, candidate),
-      legal: !(candidate.kind === 'STOP' && explorationStopMasked) }));
+      legal: !(candidate.kind === 'STOP' && explorationStopMasked
+        && hasExplorationAlternative) }));
     return {
       interface_revision: 'compact-epistemic-event-driven-v4',
       sampling_profile: { id: profile.id, preferred_node_range: profile.preferredNodeRange,
@@ -1161,8 +1182,8 @@ export class LHTBAutonomousController {
       state_fingerprint: snapshot.processStates.at(-1)?.fingerprint,
       event_graph: { nodes, edges },
       active_node_ids: activeNodes.map(node => node.id),
-      active_node_legal: activeNodes.map(node => candidates.some(
-        candidate => candidate.actorNodeId === node.id
+      active_node_legal: activeNodes.map(node => policyCandidates.some(
+        candidate => candidate.actor_node_id === node.id && candidate.legal
       )),
       active_node_sampling_logit_bias: activeNodes.map(node =>
         topologySamplingActiveNodeLogitBias(snapshot, node.id)),
@@ -1205,7 +1226,7 @@ export class LHTBAutonomousController {
     await appendFile(path.join(root, 'organization-proposals.jsonl'), `${JSON.stringify({
       schemaVersion: 1, provider: 'deepseek', model: completion.completion.model,
       configuredRevision: process.env.DEEPSEEK_MODEL_REVISION ?? 'api-alias-unversioned',
-      temperature: 0, maxTokens: 32_768, request,
+      temperature: 0, maxTokens: PROPOSER_RESPONSE_MAX_TOKENS, request,
       response: completion.value, usage: completion.completion.usage,
     })}\n`, 'utf8');
   }
@@ -1230,7 +1251,7 @@ export class LHTBAutonomousController {
     await appendFile(path.join(root, 'proposal-failures.jsonl'), `${JSON.stringify({
       schemaVersion: 1, provider: 'deepseek', model: error.completion.model,
       configuredRevision: process.env.DEEPSEEK_MODEL_REVISION ?? 'api-alias-unversioned',
-      temperature: 0, maxTokens: 32_768, attempt, request,
+      temperature: 0, maxTokens: PROPOSER_RESPONSE_MAX_TOKENS, attempt, request,
       responseContent: error.completion.content, usage: error.completion.usage,
       error: error.message,
     })}\n`, 'utf8');

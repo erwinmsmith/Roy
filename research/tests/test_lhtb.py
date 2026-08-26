@@ -359,6 +359,43 @@ for line in sys.stdin:
             self.assertEqual(records[0]["terminal_reward"], 0.375)
             self.assertEqual(len(records[0]["process_states"]), 2)
 
+    def test_clean_policy_dead_end_with_reward_is_not_trainable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trial = root / "trial"
+            agent_dir = trial / "agent"
+            agent_dir.mkdir(parents=True)
+            result = {
+                "id": "trial", "task_name": "task", "task_checksum": "checksum",
+                "started_at": "2026-08-25T00:00:00+00:00",
+                "finished_at": "2026-08-25T00:01:00+00:00",
+                "verifier_result": {"rewards": {"reward": 0.25}},
+                "exception_info": None,
+                "agent_result": {"metadata": {}},
+            }
+            (trial / "result.json").write_text(json.dumps(result))
+            snapshot = {
+                "organizationSeed": 1, "initialSnapshotFingerprint": "same",
+                "runtime": {"finalOutput": {"status": "policy_dead_end",
+                    "reasons": ["proposal_json_malformed"]}},
+                "policyRecords": [],
+                "processStates": [{
+                    "sequence": 0, "fingerprint": "m0", "runtimeEvents": [],
+                    "nodes": [{"id": "root", "depth": 0, "status": "completed"}],
+                    "dagEdges": [], "usage": {},
+                }],
+            }
+            (agent_dir / "roy-partial-trajectory.json").write_text(json.dumps(snapshot))
+            records = import_harbor_group(
+                root, root / "rollouts.jsonl", "group", "task", "category", "train",
+                0, 0, "native:digest", {"timeout": 3600}, expected=1,
+                environment_backend="native",
+            )
+            self.assertFalse(records[0]["complete"])
+            self.assertFalse(records[0]["accepted_for_training"])
+            self.assertFalse(records[0]["environment_failure"])
+            self.assertEqual(records[0]["termination_type"], "policy_dead_end")
+
     def test_harbor_agent_closes_rpc_process_after_failed_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             server = Path(directory) / "server.py"
