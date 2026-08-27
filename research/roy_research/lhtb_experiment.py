@@ -219,17 +219,18 @@ def write_harbor_group_config(
         raise ValueError("Harbor max_retries cannot be negative")
     def agent_config(profile: str | None = None) -> Dict[str, Any]:
         kwargs: Dict[str, Any] = {"rpc_timeout": 720}
+        agent_env = {"ROY_LHTB_ARM": arm,
+                     "ROY_LHTB_ENVIRONMENT_BACKEND": environment_backend,
+                     "ROY_LHTB_INITIAL_FINGERPRINT": initial_fingerprint,
+                     "ROY_LHTB_ORGANIZATION_SEED": str(organization_seed),
+                     "HB_CONTINUE_MODE": "same_conversation"}
         if profile is not None:
-            kwargs["extra_env"] = {"ROY_LHTB_TOPOLOGY_PROFILE": profile}
+            agent_env["ROY_LHTB_TOPOLOGY_PROFILE"] = profile
         return {
             "import_path": "roy_research.harbor_agent:RoyHarborAgent",
             "model_name": "deepseek/deepseek-v4-flash",
             "kwargs": kwargs,
-            "env": {"ROY_LHTB_ARM": arm,
-                    "ROY_LHTB_ENVIRONMENT_BACKEND": environment_backend,
-                    "ROY_LHTB_INITIAL_FINGERPRINT": initial_fingerprint,
-                    "ROY_LHTB_ORGANIZATION_SEED": str(organization_seed),
-                    "HB_CONTINUE_MODE": "same_conversation"},
+            "env": agent_env,
         }
     if arm == "learned_information_realization":
         agents = [agent_config(TOPOLOGY_PROFILE_SEQUENCE[

@@ -465,7 +465,7 @@ for line in sys.stdin:
             self.assertEqual(learned_value["n_attempts"], 1)
             self.assertEqual(len(learned_value["agents"]), 8)
             self.assertEqual([
-                agent["kwargs"]["extra_env"]["ROY_LHTB_TOPOLOGY_PROFILE"]
+                agent["env"]["ROY_LHTB_TOPOLOGY_PROFILE"]
                 for agent in learned_value["agents"]
             ], ["single", "compact", "branching", "recursive", "connected",
                 "single", "recursive", "connected"])
