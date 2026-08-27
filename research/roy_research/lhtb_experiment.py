@@ -20,7 +20,7 @@ TOPOLOGY_PROFILE_SEQUENCE = (
     "single", "compact", "branching", "recursive", "connected",
     "single", "recursive", "connected",
 )
-MAX_ROLLOUT_SECONDS = 60 * 60
+MAX_ROLLOUT_SECONDS = 6 * 60 * 60
 ROLLOUT_FINALIZATION_MARGIN_SECONDS = 30
 CONCURRENCY = 4
 MAX_RESPONSE_TOKENS = 32768

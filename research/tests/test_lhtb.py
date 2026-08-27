@@ -493,7 +493,8 @@ for line in sys.stdin:
             )
             self.assertEqual(native_value["retry"]["max_retries"], 0)
             self.assertEqual(native_value["agents"][0]["kwargs"]["rpc_timeout"], 720)
-            self.assertEqual(native_value["agents"][0]["kwargs"]["rollout_timeout_sec"], 3570)
+            self.assertEqual(native_value["agents"][0]["override_timeout_sec"], 21_600)
+            self.assertEqual(native_value["agents"][0]["kwargs"]["rollout_timeout_sec"], 21_570)
 
     def test_native_proot_uses_the_uid_owned_session_tmp_before_guest_mounts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -116,7 +116,7 @@ PY
     local group_id="dev:${dev_epoch}:${task_id}"
     local task_tree initial_fingerprint job_dir config_path digest revision seed
     task_tree="$(git -C "${lhtb_root}" rev-parse "HEAD:tasks/${task_id}")"
-    initial_fingerprint="$(printf '%s' "${group_id}:${task_tree}:3600:32768" | shasum -a 256 | awk '{print $1}')"
+    initial_fingerprint="$(printf '%s' "${group_id}:${task_tree}:21600:32768" | shasum -a 256 | awk '{print $1}')"
     seed="$((16#$(printf '%s' "${group_id}" | shasum -a 256 | cut -c1-8)))"
     revision="$("${python_bin}" - "${model}" <<'PY'
 import sys, torch
@@ -187,7 +187,7 @@ print(torch.load(sys.argv[1], map_location="cpu", weights_only=False)["metadata"
 PY
 )"
   task_tree="$(git -C "${lhtb_root}" rev-parse "HEAD:tasks/${task_id}")"
-  initial_fingerprint="$(printf '%s' "${group_id}:${task_tree}:3600:32768" | shasum -a 256 | awk '{print $1}')"
+  initial_fingerprint="$(printf '%s' "${group_id}:${task_tree}:21600:32768" | shasum -a 256 | awk '{print $1}')"
   job_dir="${run_root}/jobs/${epoch}-${task_id}"
   config_path="${run_root}/configs/${epoch}-${task_id}.json"
   mkdir -p "${job_dir}"

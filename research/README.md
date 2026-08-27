@@ -25,7 +25,7 @@ PYTHONPATH=research python3 -m roy_research lhtb-update \
   --updates research/output/lhtb/update-audit.jsonl --resume
 ```
 
-The formal schedule is four epochs over all 30 train tasks, `G=8`, for 960 rollouts. Every group uses fresh matched environments with the same task checksum, immutable environment digest, initial fingerprint and runtime config. Each rollout has a 60-minute training deadline, concurrency is four, and one DeepSeek response is capped at 32,768 tokens. Native runs reserve the final 30 seconds for append-only deadline finalization, return normally to Harbor, and then invoke the official verifier on the partial environment. These are execution settings, not reward terms and not forced node/depth limits.
+The formal schedule is four epochs over all 30 train tasks, `G=8`, for 960 rollouts. Every group uses fresh matched environments with the same task checksum, immutable environment digest, initial fingerprint and runtime config. Each rollout has a six-hour training deadline, concurrency is four, and one DeepSeek response is capped at 32,768 tokens. Native runs reserve the final 30 seconds for append-only deadline finalization, return normally to Harbor, and then invoke the official verifier on the partial environment. These are execution settings, not reward terms and not forced node/depth limits.
 
 Each organization action and terminal result appends an immutable `GlobalEpistemicState` `M_t`. Frozen DeepSeek prompts separately extract entities and verify `entail / contradict / unknown`; pinned MiniLM only recalls top-eight candidate pairs. All requests, responses, cache keys and model revisions are retained. No benchmark keyword field, lexical rule, regex, frequency score or embedding threshold labels meaning.
 

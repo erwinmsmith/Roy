@@ -129,7 +129,7 @@ There is no teacher, imitation, predefined role pool, staged objective, entropy 
 
 The benchmark is `zli12321/LHTB` pinned with its bundled Harbor to commit `84d7ba5ee34fae6c11f0d7cb8ed5faa73a9ece54`. Its 46 tasks follow the pinned README's eight-category taxonomy. Within each category, fixed SHA-256 ordering selects one dev task and one test task; the remaining tasks form the 30-task train split. The checked manifest is `30 train / 8 dev / 8 test`, and the trainer rejects dev or test task IDs.
 
-Formal training uses four epochs, eight trajectories per train task and 960 rollouts total. Each training rollout may run for up to 60 minutes, with concurrency four and a DeepSeek response ceiling of 32,768 tokens. These execution settings do not add structural reward or force an agent count. At each epoch boundary, learned Roy runs once on every dev task. Checkpoint selection maximizes dev mean reward, breaking ties by lower value MAE, fewer tokens and earlier epoch.
+Formal training uses four epochs, eight trajectories per train task and 960 rollouts total. Each training rollout may run for up to six hours, with concurrency four and a DeepSeek response ceiling of 32,768 tokens. These execution settings do not add structural reward or force an agent count. At each epoch boundary, learned Roy runs once on every dev task. Checkpoint selection maximizes dev mean reward, breaking ties by lower value MAE, fewer tokens and earlier epoch.
 
 The selected checkpoint is tested once, with three repetitions, against:
 
@@ -143,7 +143,7 @@ Report mean reward, success rate at `R >= 0.95`, paired bootstrap 95% confidence
 
 - Every actor/value update consumes exactly eight complete current-policy train trajectories.
 - Runtime crashes, environment-invalid attempts, environment failures and incomplete trajectories are preserved for audit but excluded from actor and value updates. Environment-invalid attempts are resampled rather than assigned reward zero.
-- A normal 60-minute training deadline triggers the official verifier; its partial score is a valid terminal label.
+- A normal six-hour training deadline triggers the official verifier; its partial score is a valid terminal label.
 - Every trajectory preserves `M_0...M_T`, runtime events, semantic audits, raw and masked action probabilities, selected actions, exact old log-probabilities, real-gap diagnostics, task checksum, source and converted environment digests, backend capabilities, model revisions and final Harbor result.
 - Actor, value, EMA, both optimizers and updated group IDs are restored together; a group ID can be optimized only once.
 - Dev selects checkpoints but never updates them. Test runs only after selection and never updates weights.

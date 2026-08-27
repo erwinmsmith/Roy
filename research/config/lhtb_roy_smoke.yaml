@@ -12,7 +12,7 @@ environment:
 agents:
   - import_path: roy_research.harbor_agent:RoyHarborAgent
     model_name: deepseek/deepseek-v4-flash
-    override_timeout_sec: 3600
+    override_timeout_sec: 21600
     env:
       ROY_LHTB_ARM: learned_information_realization
       ROY_LHTB_INITIAL_FINGERPRINT: smoke-matched-initial-state

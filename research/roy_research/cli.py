@@ -468,7 +468,7 @@ def main(argv: List[str] | None = None) -> None:
         records = import_harbor_group(
             args.job_dir, args.output, args.group_id, args.task_id, args.category,
             args.split, args.epoch, args.policy_revision, environment_digest,
-            {"maximum_rollout_seconds": 3600, "max_response_tokens": 32768,
+            {"maximum_rollout_seconds": 21600, "max_response_tokens": 32768,
              "concurrency": 4},
             expected=args.expected,
             arm=args.arm,
