@@ -207,6 +207,10 @@ DERIVE must use an exact open requirement ID from organization.requirements and 
 "outputType":"epistemic_report"},"terminationCondition":"...",
 "reuseReview":{"searchedNodeIds":["<every spawned agent id>"],
 "decision":"spawn_distinct","reason":"why no existing spawned agent can perform this gap"}}}.
+For DERIVE, the selected requirement's parentNodeId is its owner: candidate actorNodeId,
+action.actorNodeId, childSpecification.parentId, and refinement parent scope must all remain under
+that owner. Never assign a root-owned gap to a child merely because the child's objective is
+semantically related. structuralExploration.realOpenGaps is the authoritative gap-to-owner map.
 Keep child specifications concise. Never copy rootGoal or the full task instruction into parentGoal,
 parentScope, childScope, or reason. Keep each descriptive child field below 1000 characters.
 Before every DERIVE, semantically inspect every entry in spawnedAgentLibrary. Do not use lexical
@@ -484,6 +488,9 @@ export function compactEpistemicWorkingState(
       focus: profile.focus,
       realOpenGapCount: openRequirements.length,
       realOpenGapIds: openRequirements.map(value => value.id),
+      realOpenGaps: openRequirements.map(value => ({ id: value.id,
+        parentNodeId: value.parentNodeId, description: compactText(value.description),
+        requiredInformation: compactText(value.requiredInformation) })),
       desiredAdditionalChildren: Math.min(3, Math.max(0,
         profile.preferredNodeRange[0] - snapshot.runtime.nodes.length), openRequirements.length),
       preferredMaximumNodes: profile.preferredNodeRange[1],
@@ -497,6 +504,55 @@ export function compactEpistemicWorkingState(
       entityCount: PROPOSER_ENTITY_COUNT, immutableRawLedgerPreserved: true,
       retrieval: 'Use raw-event/report/observation references only when more detail is needed' },
   };
+}
+
+function compactProposalRepairRequest(
+  requestState: Record<string, unknown>,
+  reasons: string[],
+  rejectedCandidates: Array<{ candidate: RawProposedCandidate; reasons: string[] }>
+): string {
+  const organization = requestState.organization && typeof requestState.organization === 'object'
+    ? requestState.organization as Record<string, unknown> : {};
+  const exploration = requestState.structuralExploration
+    && typeof requestState.structuralExploration === 'object'
+    ? requestState.structuralExploration as Record<string, unknown> : {};
+  const epistemic = requestState.compactEpistemicState
+    && typeof requestState.compactEpistemicState === 'object'
+    ? requestState.compactEpistemicState as Record<string, unknown> : {};
+  return JSON.stringify({
+    repairProtocol: 'legal-candidate-interface-v2',
+    instruction: [
+      'Return a fresh concise candidate set that passes this exact legal interface.',
+      'For DERIVE, use one realOpenGaps entry and set candidate actorNodeId, action.actorNodeId, and childSpecification.parentId to that entry parentNodeId.',
+      'Do not reproduce an unchanged rejected candidate, move a gap to a semantically related child, invent a gap, or repeat an active CONNECT edge.',
+      'The sampling profile requests coverage but is not a reward or permission to fabricate work.',
+    ],
+    rejectionReasons: reasons,
+    rejectedCandidates,
+    taskGoal: requestState.rootGoal,
+    organizationMode: requestState.organizationMode,
+    legalInterface: {
+      rootId: organization.rootId,
+      activeNodes: organization.activeNodes,
+      spawnedAgentLibrary: organization.spawnedAgentLibrary,
+      realOpenGaps: exploration.realOpenGaps,
+      requiredNextStructuralPhase: exploration.requiredNextStructuralPhase,
+      deepestActiveNodeIds: exploration.deepestActiveNodeIds,
+      childLocalOpenGapIds: exploration.childLocalOpenGapIds,
+      desiredAdditionalChildren: exploration.desiredAdditionalChildren,
+      preferredTopologyRange: exploration.preferredTopologyRange,
+      dependencies: organization.dependencies,
+      communications: organization.communications,
+    },
+    recentContext: {
+      unresolvedRequirements: epistemic.unresolvedRequirements,
+      unresolvedAssumptions: epistemic.unresolvedAssumptions,
+      unresolvedConflicts: epistemic.unresolvedConflicts,
+      blindSpots: epistemic.blindSpots,
+      recentStateDelta: epistemic.recentStateDelta,
+      activeSubtree: epistemic.activeSubtree,
+    },
+  });
 }
 
 export class LHTBAutonomousController {
@@ -554,7 +610,7 @@ export class LHTBAutonomousController {
       { role: 'system', content: PROPOSER_PROMPT },
       { role: 'user', content: JSON.stringify(requestState) },
     ];
-    const proposalAttempts = Math.max(1, Number(process.env.ROY_LHTB_PROPOSAL_ATTEMPTS ?? 3));
+    const proposalAttempts = Math.max(1, Number(process.env.ROY_LHTB_PROPOSAL_ATTEMPTS ?? 5));
     let completion: LLMJSONCompletionResult<ProposalResponse> | undefined;
     let validation: CandidateValidation | undefined;
     for (let attempt = 1; attempt <= proposalAttempts; attempt += 1) {
@@ -630,10 +686,11 @@ export class LHTBAutonomousController {
           candidate: current.value.candidates[value.index],
           reasons: value.reasons,
         }));
-      const rejectedContext = JSON.stringify(rejectedCandidates).slice(0, 12_000);
+      const repairRequest = compactProposalRepairRequest(requestState, reasons,
+        rejectedCandidates);
       messages.splice(0, messages.length,
         { role: 'system', content: PROPOSER_PROMPT },
-        { role: 'user', content: `${JSON.stringify(requestState)}\nA prior candidate set was rejected by the runtime or did not cover the requested structural sampling interface: ${reasons.join('; ')}. Rejected candidates and their exact reasons: ${rejectedContext}. Use the exact realOpenGapIds in structuralExploration when DERIVE coverage is requested. Do not reproduce an unchanged rejected candidate, invent a gap, or repeat an active CONNECT edge. Return a concise, genuinely legal candidate set.` }
+        { role: 'user', content: repairRequest }
       );
     }
     if (!completion || !validation) throw new Error('DeepSeek proposer did not return a completion');
@@ -1007,6 +1064,22 @@ export class LHTBAutonomousController {
         reasons.push(`command_too_large:${commandValue.length}/${PROPOSER_COMMAND_LIMIT}`);
       }
       const action = { ...actionValue, kind, actorNodeId } as OrganizationCandidate['action'];
+      if (kind === 'DERIVE') {
+        const specification = actionValue.childSpecification
+          && typeof actionValue.childSpecification === 'object'
+          ? actionValue.childSpecification as Record<string, unknown> : {};
+        const triggeringGapId = typeof specification.triggeringGapId === 'string'
+          ? specification.triggeringGapId : '';
+        const requirement = snapshot.runtime.requirements.find(value =>
+          value.id === triggeringGapId);
+        if (requirement?.status === 'open' && requirement.parentNodeId !== actorNodeId) {
+          reasons.push(`derive_requirement_owner_mismatch:${triggeringGapId}:expected=${requirement.parentNodeId}`);
+        }
+        if (typeof specification.parentId === 'string'
+          && specification.parentId !== actorNodeId) {
+          reasons.push('derive_parent_actor_mismatch');
+        }
+      }
       if (kind === 'DERIVE' && spawnedAgentIds.length > 0) {
         const specification = actionValue.childSpecification
           && typeof actionValue.childSpecification === 'object'

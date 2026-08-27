@@ -789,6 +789,94 @@ describe('LHTB process state', () => {
     }
   });
 
+  it('repairs a DERIVE proposal with the authoritative gap-owner interface', async () => {
+    const session = new RoyLHTBSession('gap-owner-repair', 'task',
+      'inspect two independent failures', 'commit', 'roy_runtime_heuristic');
+    session.applySemanticUpdate({ event_id: 'task-instruction', requirements: [{
+      id: 'child-gap', description: 'inspect the first failure',
+      requiredInformation: 'first diagnosis', likelyMechanism: 'acquisition',
+    }, {
+      id: 'root-gap', description: 'inspect the independent second failure',
+      requiredInformation: 'second diagnosis', likelyMechanism: 'acquisition',
+    }], claims: [], assumptions: [], evidence: [], external_observations: [], blind_spots: [],
+    relations: [] });
+    const firstChild = {
+      id: 'spec-worker', nodeId: 'worker', parentId: 'root', depth: 1,
+      parentGoal: 'inspect two independent failures', triggeringGapId: 'child-gap',
+      localObjective: 'Inspect only the first failure and report its diagnosis.',
+      refinement: { parentScope: 'inspect two failures', childScope: 'inspect first failure',
+        triggeringRequirementId: 'child-gap', narrowerThanParent: true,
+        newInformationNeeded: 'first failure output',
+        executableEndCondition: 'first diagnosis is recorded', duplicatedByExistingNode: false },
+      requiredClaims: [], requiredEvidence: [], relevantReportIds: [],
+      externalAccess: { allowed: true, tools: ['terminal'], purpose: 'inspect first failure' },
+      expectedOutput: { requiredInformation: 'first diagnosis',
+        outputType: 'epistemic_report' as const },
+      terminationCondition: 'return the first diagnosis',
+    };
+    session.applyOrganizationAction({ kind: 'DERIVE', actorNodeId: 'root',
+      childSpecification: firstChild });
+    const wrongOwnerChild = {
+      ...firstChild, id: 'spec-wrong-owner', nodeId: 'wrong-owner', parentId: 'worker', depth: 2,
+      parentGoal: firstChild.localObjective, triggeringGapId: 'root-gap',
+      localObjective: 'Inspect the independent second failure.',
+      refinement: { ...firstChild.refinement, parentScope: firstChild.localObjective,
+        childScope: 'inspect second failure', triggeringRequirementId: 'root-gap',
+        newInformationNeeded: 'second failure output' },
+      expectedOutput: { requiredInformation: 'second diagnosis',
+        outputType: 'epistemic_report' as const },
+      reuseReview: { searchedNodeIds: ['worker'], decision: 'spawn_distinct',
+        reason: 'the proposed worker is incorrectly assumed to own the second gap' },
+    };
+    const semantic = { async processEvent(event: { id: string }) {
+      return { event_id: event.id, requirements: [], claims: [], assumptions: [], evidence: [],
+        external_observations: [], blind_spots: [], relations: [] };
+    }, close() {} };
+    let calls = 0;
+    const requests: Array<Array<{ role: string; content: string }>> = [];
+    const provider = { isConfigured: () => true, async completeJSONWithUsage(messages: Array<{
+      role: string; content: string;
+    }>) {
+      requests.push(messages);
+      calls += 1;
+      const candidate = calls === 1 ? {
+        id: 'wrong-owner', kind: 'DERIVE', actorNodeId: 'worker',
+        description: 'Incorrectly assign a root gap to the child', schedulerComplexity: 2,
+        action: { kind: 'DERIVE', actorNodeId: 'worker',
+          childSpecification: wrongOwnerChild },
+      } : {
+        id: 'inspect-root-gap', kind: 'ACQUIRE', actorNodeId: 'root',
+        description: 'Inspect the second failure at its owning root', schedulerComplexity: 1,
+        command: 'printf second-failure', action: { kind: 'ACQUIRE', actorNodeId: 'root' },
+      };
+      return { value: { preferred_candidate_id: candidate.id, candidates: [candidate] },
+        completion: { content: JSON.stringify({ candidates: [candidate] }), model: 'mock',
+          usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } } };
+    } };
+    const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false });
+    try {
+      const result = await controller.advance(session, 1);
+      expect(result.status).toBe('terminal_request');
+      expect(calls).toBe(2);
+      const repair = JSON.parse(requests[1]?.at(-1)?.content ?? '{}') as {
+        repairProtocol: string;
+        instruction: string[];
+        legalInterface: { realOpenGaps: Array<{ id: string; parentNodeId: string }> };
+        rejectionReasons: string[];
+      };
+      expect(repair.repairProtocol).toBe('legal-candidate-interface-v2');
+      expect(repair.legalInterface.realOpenGaps).toContainEqual({
+        id: 'root-gap', parentNodeId: 'root', description: 'inspect the independent second failure',
+        requiredInformation: 'second diagnosis',
+      });
+      expect(repair.instruction.join(' ')).toContain('actorNodeId');
+      expect(repair.rejectionReasons.some(reason =>
+        reason.startsWith('derive_requirement_owner_mismatch:root-gap:expected=root'))).toBe(true);
+    } finally {
+      controller.close();
+    }
+  });
+
   it('rejects an unchanged failed command and requests a legal replacement', async () => {
     const auditRoot = await mkdtemp(path.join(tmpdir(), 'roy-lhtb-command-repair-'));
     const session = new RoyLHTBSession('command-repair', 'task', 'finish', 'commit',
