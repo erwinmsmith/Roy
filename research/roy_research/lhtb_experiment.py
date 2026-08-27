@@ -16,10 +16,6 @@ import numpy as np
 
 TRAIN_EPOCHS = 4
 GROUP_SIZE = 8
-TOPOLOGY_PROFILE_SEQUENCE = (
-    "single", "compact", "branching", "recursive", "connected",
-    "single", "recursive", "connected",
-)
 MAX_ROLLOUT_SECONDS = 6 * 60 * 60
 ROLLOUT_FINALIZATION_MARGIN_SECONDS = 30
 CONCURRENCY = 4
@@ -217,15 +213,13 @@ def write_harbor_group_config(
         raise ValueError(f"unknown LHTB environment backend {environment_backend}")
     if max_retries < 0:
         raise ValueError("Harbor max_retries cannot be negative")
-    def agent_config(profile: str | None = None) -> Dict[str, Any]:
+    def agent_config() -> Dict[str, Any]:
         kwargs: Dict[str, Any] = {"rpc_timeout": 720}
         agent_env = {"ROY_LHTB_ARM": arm,
                      "ROY_LHTB_ENVIRONMENT_BACKEND": environment_backend,
                      "ROY_LHTB_INITIAL_FINGERPRINT": initial_fingerprint,
                      "ROY_LHTB_ORGANIZATION_SEED": str(organization_seed),
                      "HB_CONTINUE_MODE": "same_conversation"}
-        if profile is not None:
-            agent_env["ROY_LHTB_TOPOLOGY_PROFILE"] = profile
         return {
             "import_path": "roy_research.harbor_agent:RoyHarborAgent",
             "model_name": "deepseek/deepseek-v4-flash",
@@ -233,9 +227,10 @@ def write_harbor_group_config(
             "env": agent_env,
         }
     if arm == "learned_information_realization":
-        agents = [agent_config(TOPOLOGY_PROFILE_SEQUENCE[
-            index % len(TOPOLOGY_PROFILE_SEQUENCE)
-        ]) for index in range(attempts)]
+        # Every rollout uses the same unconstrained MCTS interface. Distinct
+        # organization seeds produce different on-policy searches; topology is
+        # observed after the rollout and is never assigned as an input profile.
+        agents = [agent_config() for _ in range(attempts)]
         harbor_attempts = 1
     else:
         agents = [agent_config()]

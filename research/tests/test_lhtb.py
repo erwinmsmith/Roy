@@ -464,11 +464,10 @@ for line in sys.stdin:
             learned_value = json.loads(learned.read_text())
             self.assertEqual(learned_value["n_attempts"], 1)
             self.assertEqual(len(learned_value["agents"]), 8)
-            self.assertEqual([
-                agent["env"]["ROY_LHTB_TOPOLOGY_PROFILE"]
+            self.assertTrue(all(
+                "ROY_LHTB_TOPOLOGY_PROFILE" not in agent["env"]
                 for agent in learned_value["agents"]
-            ], ["single", "compact", "branching", "recursive", "connected",
-                "single", "recursive", "connected"])
+            ))
 
             native = Path(directory) / "native.json"
             write_harbor_group_config(
@@ -909,6 +908,7 @@ for line in sys.stdin:
             trainer = LHTBProcessGRPOTrainer(checkpoint, manifest, encoder=encoder)
             policy_state = {
                 "interface_revision": LHTB_POLICY_INTERFACE_REVISION,
+                "topology_search": {"mode": "mcts_unconstrained"},
                 "state_fingerprint": "m0",
                 "event_graph": {"nodes": [{"id": "root", "kind": "agent",
                     "timestamp": 0, "text": "solve", "status": "ready"}], "edges": []},
@@ -926,10 +926,7 @@ for line in sys.stdin:
             }
             records = []
             for rollout_index in range(8):
-                rollout_policy_state = {**policy_state, "sampling_profile": {
-                    "id": ("single", "compact", "branching", "recursive", "connected",
-                           "single", "recursive", "connected")[rollout_index]
-                }}
+                rollout_policy_state = dict(policy_state)
                 _, policy_record = sample_organization_decision(
                     trainer.actor, encoder, rollout_policy_state, device=torch.device("cpu")
                 )

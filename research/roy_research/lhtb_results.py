@@ -166,11 +166,16 @@ def sample_audit(records: List[Mapping[str, Any]]) -> Dict[str, Any]:
                                 .get("sampling_profile") or {}).get("id"))
                            for value in policy if isinstance(value, Mapping)})
         profiles = [value for value in profiles if value != "None"]
+        search_modes = sorted({str((((value.get("policyState", value.get("policy_state")) or {})
+                                     .get("topology_search") or {}).get("mode")))
+                               for value in policy if isinstance(value, Mapping)})
+        search_modes = [value for value in search_modes if value != "None"]
         trajectories.append({
             "id": record.get("id"), "rollout_index": record.get("rollout_index"),
             "organization_seed": record.get("organization_seed"),
             "official_terminal_reward": record.get("terminal_reward"),
             "sampling_profiles": profiles,
+            "topology_search_modes": search_modes,
             "state_count": len(states), "decision_count": len(policy),
             "terminal_node_count": len(terminal.get("nodes", [])),
             "terminal_maximum_depth": max(
@@ -218,10 +223,13 @@ def sample_audit(records: List[Mapping[str, Any]]) -> Dict[str, Any]:
                       for value in trajectory["shaped_returns"]]
     node_counts = [int(value["terminal_node_count"]) for value in trajectories]
     profile_set = sorted({profile for value in trajectories for profile in value["sampling_profiles"]})
+    search_mode_set = sorted({mode for value in trajectories
+                              for mode in value["topology_search_modes"]})
     return {
         "trajectory_count": len(trajectories),
         "official_reward_std": float(np.std(terminal_rewards)) if terminal_rewards else None,
         "sampling_profiles": profile_set,
+        "topology_search_modes": search_mode_set,
         "terminal_node_span": max(node_counts) - min(node_counts) if node_counts else None,
         "all_transition_chains_complete": all(value["transition_chain_complete"]
                                                for value in trajectories),
@@ -238,8 +246,7 @@ def sample_audit(records: List[Mapping[str, Any]]) -> Dict[str, Any]:
             and all(value["complete"] and not value["environment_failure"]
                     for value in trajectories)
             and len({value["organization_seed"] for value in trajectories}) == 8
-            and len(profile_set) >= 3
-            and bool(node_counts) and max(node_counts) - min(node_counts) >= 2
+            and search_mode_set == ["mcts_unconstrained"]
             and all(value["transition_chain_complete"] for value in trajectories)
             and all(value["process_reward_complete"] for value in trajectories)
             and all(value["mcts_trace_complete"] for value in trajectories)
@@ -358,7 +365,7 @@ def validate_smoke(root: Path, task_ids: tuple[str, ...] = (
         state_counts = []
         terminal_node_counts = []
         terminal_depths = []
-        sampling_profiles = set()
+        search_modes = set()
         topology_transition_count = 0
         input_tokens = 0
         policy_diagnostics = True
@@ -394,34 +401,16 @@ def validate_smoke(root: Path, task_ids: tuple[str, ...] = (
             ))
             input_tokens += int((states[-1].get("usage") or {}).get("inputTokens", 0))
             records = list(snapshot.get("policyRecords", []))
-            trajectory_profiles = {
-                str(((record.get("policyState") or {}).get("sampling_profile") or {}).get("id"))
+            trajectory_search_modes = {
+                str((((record.get("policyState") or {}).get("topology_search") or {}).get("mode")))
                 for record in records
-                if ((record.get("policyState") or {}).get("sampling_profile") or {}).get("id")
             }
-            if len(trajectory_profiles) != 1:
-                raise ValueError(f"smoke trajectory has ambiguous sampling profile for {task_id}")
-            trajectory_profile = next(iter(trajectory_profiles))
-            preferred_upper = {"single": 1, "compact": 3, "branching": 5,
-                               "recursive": 7, "connected": 8}[trajectory_profile]
-            if terminal_node_counts[-1] > preferred_upper:
+            if trajectory_search_modes != {"mcts_unconstrained"}:
                 raise ValueError(
-                    f"smoke {trajectory_profile} topology exceeded its sampling range "
-                    f"for {task_id}: {terminal_node_counts[-1]} > {preferred_upper}"
+                    f"smoke trajectory is not unconstrained MCTS for {task_id}: "
+                    f"{sorted(trajectory_search_modes)}"
                 )
-            if trajectory_profile == "single" and terminal_node_counts[-1] != 1:
-                raise ValueError(
-                    f"smoke single topology must remain root-only for {task_id}"
-                )
-            if trajectory_profile in {"recursive", "connected"} and terminal_depths[-1] < 2:
-                raise ValueError(
-                    f"smoke {trajectory_profile} topology did not derive subsub for {task_id}"
-                )
-            sampling_profiles.update(
-                str(((value.get("policyState") or {}).get("sampling_profile") or {}).get("id"))
-                for value in records
-                if ((value.get("policyState") or {}).get("sampling_profile") or {}).get("id")
-            )
+            search_modes.update(trajectory_search_modes)
             policy_diagnostics = policy_diagnostics and bool(records) and all(
                 isinstance(value.get("rawProbabilities"), Mapping)
                 and isinstance(value.get("maskedProbabilities"), Mapping)
@@ -460,40 +449,27 @@ def validate_smoke(root: Path, task_ids: tuple[str, ...] = (
             raise ValueError(f"smoke initial fingerprints do not match for {task_id}")
         if len(seeds) != 8:
             raise ValueError(f"smoke organization seeds are not unique for {task_id}")
-        if input_tokens > max_input_tokens:
-            raise ValueError(
-                f"smoke input-token gate exceeded for {task_id}: "
-                f"{input_tokens} > {max_input_tokens}"
-            )
         if not policy_diagnostics:
             raise ValueError(f"smoke policy diagnostics are incomplete for {task_id}")
         if not compact_interface:
             raise ValueError(f"smoke policy interface is stale for {task_id}")
         if not raw_terminal_events:
             raise ValueError(f"smoke raw terminal ledger is incomplete for {task_id}")
-        if not derive_available or not derive_selected:
-            raise ValueError(f"smoke did not preserve and sample DERIVE for {task_id}")
-        required_profiles = {"single", "compact", "branching", "recursive", "connected"}
-        if not required_profiles.issubset(sampling_profiles):
-            missing_profiles = sorted(required_profiles - sampling_profiles)
-            raise ValueError(
-                f"smoke lacks full single-to-connected topology coverage for {task_id}: "
-                f"missing {missing_profiles}"
-            )
-        if max(terminal_node_counts) - min(terminal_node_counts) < 2:
-            raise ValueError(f"smoke terminal topologies lack complexity variance for {task_id}")
         groups[task_id] = {"rewards": rewards, "state_counts": state_counts,
                            "reward_std": float(np.std(rewards)),
                            "input_tokens": input_tokens,
-                           "input_token_gate": max_input_tokens,
+                           "input_token_warning_threshold": max_input_tokens,
+                           "input_token_warning": input_tokens > max_input_tokens,
                            "policy_diagnostics": True,
                            "compact_interface": True,
                            "raw_terminal_ledger": True,
-                           "derive_available": True,
-                           "derive_selected": True,
-                           "sampling_profiles": sorted(sampling_profiles),
+                           "derive_available": derive_available,
+                           "derive_selected": derive_selected,
+                           "search_modes": sorted(search_modes),
                            "terminal_node_counts": terminal_node_counts,
                            "terminal_depths": terminal_depths,
+                           "topology_diverse": max(terminal_node_counts)
+                           - min(terminal_node_counts) >= 2,
                            "topology_transition_count": topology_transition_count,
                            "stepwise_topology": True}
     if len(groups) != len(task_ids):

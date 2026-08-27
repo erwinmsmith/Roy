@@ -43,6 +43,18 @@ describe('LHTB process state', () => {
     expect(() => resolveTopologySamplingProfile(0, 'invalid')).toThrow(/Invalid/);
   });
 
+  it('leaves formal topology unconstrained when no diagnostic profile is set', () => {
+    const priorProfile = process.env.ROY_LHTB_TOPOLOGY_PROFILE;
+    delete process.env.ROY_LHTB_TOPOLOGY_PROFILE;
+    const session = new RoyLHTBSession('unconstrained', 'task', 'inspect and solve', 'commit',
+      'learned_information_realization', 'same', 0);
+    expect(topologySamplingCandidateLogitBias(session.snapshot(), {
+      kind: 'DERIVE', actorNodeId: 'root', action: { kind: 'DERIVE', actorNodeId: 'root' },
+    })).toBe(0);
+    if (priorProfile === undefined) delete process.env.ROY_LHTB_TOPOLOGY_PROFILE;
+    else process.env.ROY_LHTB_TOPOLOGY_PROFILE = priorProfile;
+  });
+
   it('masks topology-changing candidates in the learned single-agent profile', async () => {
     const priorProfile = process.env.ROY_LHTB_TOPOLOGY_PROFILE;
     process.env.ROY_LHTB_TOPOLOGY_PROFILE = 'single';
@@ -101,6 +113,8 @@ describe('LHTB process state', () => {
   });
 
   it('turns a recursive profile into a real root to sub to subsub derivation', () => {
+    const priorProfile = process.env.ROY_LHTB_TOPOLOGY_PROFILE;
+    process.env.ROY_LHTB_TOPOLOGY_PROFILE = 'recursive';
     const session = new RoyLHTBSession('recursive', 'task', 'implement and verify', 'commit',
       'learned_information_realization', 'same', 3);
     session.applySemanticUpdate({ event_id: 'task-instruction', requirements: [{
@@ -175,6 +189,33 @@ describe('LHTB process state', () => {
         actorNodeId: 'grandchild', childSpecification: { ...grandchildSpecification,
           id: 'too-wide', nodeId: 'too-wide', parentId: 'grandchild', depth: 3 } },
     })).toBe(-8);
+    if (priorProfile === undefined) delete process.env.ROY_LHTB_TOPOLOGY_PROFILE;
+    else process.env.ROY_LHTB_TOPOLOGY_PROFILE = priorProfile;
+  });
+
+  it('keeps full semantic audit data once while bounding every value-state projection', () => {
+    const session = new RoyLHTBSession('bounded-state', 'task', 'solve', 'commit');
+    for (let index = 0; index < 320; index += 1) {
+      session.applySemanticUpdate({ event_id: `semantic-${index}`, requirements: [], claims: [{
+        id: `claim-${index}`, statement: `claim ${index}`, status: 'tentative', originNodeId: 'root',
+      }], assumptions: [], evidence: [{ id: `evidence-${index}`, content: `evidence ${index}`,
+        supports: [`claim-${index}`], contradicts: [], provenance: 'mock' }],
+      external_observations: [], blind_spots: [`blind-${index}`], relations: [{
+        left_id: `evidence-${index}`, right_id: `claim-${index}`, label: 'entail',
+        probabilities: { entail: 1, contradict: 0, unknown: 0 },
+        provenance: { model: 'mock', model_revision: 'fixed', cache_key: `key-${index}` },
+      }] });
+    }
+    const snapshot = session.snapshot();
+    const latest = snapshot.processStates.at(-1)!;
+    expect(snapshot.semanticOverlay.claims).toHaveLength(320);
+    expect(snapshot.semanticOverlay.evidence).toHaveLength(320);
+    expect(snapshot.semanticOverlay.relations).toHaveLength(320);
+    expect(latest.claims).toHaveLength(96);
+    expect(latest.evidence).toHaveLength(96);
+    expect(latest.semanticRelations.length).toBeLessThanOrEqual(256);
+    expect(latest.blindSpots).toHaveLength(96);
+    expect(snapshot.processStates).toHaveLength(321);
   });
 
   it('finalizes a pending terminal request at the rollout deadline', () => {
@@ -789,6 +830,58 @@ describe('LHTB process state', () => {
       const result = await controller.advance(session, 7);
       expect(['continue', 'terminal_request']).toContain(result.status);
       expect(analyses).toBeGreaterThan(0);
+    } finally {
+      controller.close();
+      if (priorMCTS === undefined) delete process.env.ROY_LHTB_MCTS_ENABLED;
+      else process.env.ROY_LHTB_MCTS_ENABLED = priorMCTS;
+      if (priorSimulations === undefined) delete process.env.ROY_LHTB_MCTS_SIMULATIONS;
+      else process.env.ROY_LHTB_MCTS_SIMULATIONS = priorSimulations;
+      if (priorDepth === undefined) delete process.env.ROY_LHTB_MCTS_MAX_DEPTH;
+      else process.env.ROY_LHTB_MCTS_MAX_DEPTH = priorDepth;
+      if (priorProfile === undefined) delete process.env.ROY_LHTB_TOPOLOGY_PROFILE;
+      else process.env.ROY_LHTB_TOPOLOGY_PROFILE = priorProfile;
+    }
+  });
+
+  it('gives unconstrained MCTS a legal STOP branch when the proposer omits it', async () => {
+    const priorMCTS = process.env.ROY_LHTB_MCTS_ENABLED;
+    const priorSimulations = process.env.ROY_LHTB_MCTS_SIMULATIONS;
+    const priorDepth = process.env.ROY_LHTB_MCTS_MAX_DEPTH;
+    const priorProfile = process.env.ROY_LHTB_TOPOLOGY_PROFILE;
+    process.env.ROY_LHTB_MCTS_ENABLED = 'true';
+    process.env.ROY_LHTB_MCTS_SIMULATIONS = '4';
+    process.env.ROY_LHTB_MCTS_MAX_DEPTH = '2';
+    delete process.env.ROY_LHTB_TOPOLOGY_PROFILE;
+    const session = new RoyLHTBSession('mcts-stop-support', 'task', 'finish', 'commit',
+      'learned_information_realization');
+    const semantic = { async processEvent(event: { id: string }) {
+      return { event_id: event.id, requirements: [], claims: [], assumptions: [], evidence: [],
+        external_observations: [], blind_spots: [], relations: [] };
+    }, close() {} };
+    const provider = { isConfigured: () => true, async completeJSONWithUsage() {
+      return { value: { preferred_candidate_id: 'inspect', candidates: [{
+        id: 'inspect', kind: 'ACQUIRE', actorNodeId: 'root', description: 'inspect',
+        schedulerComplexity: 1, command: 'pwd', action: { kind: 'ACQUIRE', actorNodeId: 'root' },
+      }] }, completion: { content: '{}', model: 'mock', usage: {
+        promptTokens: 1, completionTokens: 1, totalTokens: 2,
+      } } };
+    } };
+    const learnedPolicy = { async analyze(policyState: Record<string, unknown>) {
+      const values = policyState.candidates as Array<Record<string, unknown>>;
+      expect((policyState.topology_search as Record<string, unknown>).mode)
+        .toBe('mcts_unconstrained');
+      expect(values.map(value => value.id)).toContain('stop-official-verifier');
+      return { targetValue: 0.5, targetRevision: 0,
+        candidatePriors: Object.fromEntries(values.map(value => [String(value.id),
+          value.id === 'stop-official-verifier' ? 100 : 1])), actionPriors: {}, actorPaths: [] };
+    }, async targetValue() { return { targetValue: 0.5, targetRevision: 0 }; }, close() {} };
+    const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false,
+      learnedPolicy: learnedPolicy as never });
+    try {
+      const result = await controller.advance(session, 1);
+      expect(result.status).toBe('completed');
+      expect(session.snapshot().policyRecords.at(-1)?.candidateId)
+        .toBe('stop-official-verifier');
     } finally {
       controller.close();
       if (priorMCTS === undefined) delete process.env.ROY_LHTB_MCTS_ENABLED;

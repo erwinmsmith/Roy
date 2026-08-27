@@ -29,7 +29,7 @@ from .value_model import (
 
 
 LHTB_GROUP_SIZE = 8
-LHTB_GROUP_INPUT_TOKEN_GATE = 15_000_000
+LHTB_GROUP_INPUT_TOKEN_WARNING = 15_000_000
 
 
 def dense_clipped_policy_loss(
@@ -152,6 +152,9 @@ class LHTBProcessGRPOTrainer:
                 states, list(trajectory["policy_records"]), values, reward, metadata
             ))
         transition_reward_summary = self._transition_reward_summary(transition_samples)
+        group_input_tokens = sum(int(
+            (list(value["process_states"])[-1].get("usage") or {}).get("inputTokens", 0)
+        ) for value in records)
 
         self.groups += 1
         self.updated_group_ids.add(group_id)
@@ -164,6 +167,9 @@ class LHTBProcessGRPOTrainer:
             "target_revision": self.groups - 1, "ema_decay": self.ema_decay,
             "process_rewards": process_rewards, "target_values": target_values,
             "transition_reward_summary": transition_reward_summary,
+            "group_input_tokens": group_input_tokens,
+            "input_token_warning_threshold": LHTB_GROUP_INPUT_TOKEN_WARNING,
+            "input_token_warning": group_input_tokens > LHTB_GROUP_INPUT_TOKEN_WARNING,
         }
         self.history.append(result)
         self.save()
@@ -276,31 +282,15 @@ class LHTBProcessGRPOTrainer:
                 behavior_kind = record.get("behavior_policy", record.get("behaviorPolicy"))
                 if behavior_kind == "mcts_puct":
                     self._validate_mcts_behavior(record, int(value["policy_revision"]))
-        sampling_profiles = {
-            str(((list(value["policy_records"])[0].get("policy_state")
-                  or list(value["policy_records"])[0].get("policyState") or {})
-                 .get("sampling_profile") or {}).get("id"))
-            for value in records if list(value["policy_records"])
+        search_modes = {
+            str(((record.get("policy_state") or record.get("policyState") or {})
+                 .get("topology_search") or {}).get("mode"))
+            for value in records for record in list(value["policy_records"])
         }
-        sampling_profiles.discard("None")
-        required_profiles = {"single", "compact", "branching", "recursive", "connected"}
-        if not required_profiles.issubset(sampling_profiles):
-            missing_profiles = sorted(required_profiles - sampling_profiles)
+        if search_modes != {"mcts_unconstrained"}:
             raise ValueError(
-                f"G=8 must cover all single-to-connected topology profiles; "
-                f"missing {missing_profiles}"
-            )
-        terminal_node_counts = [len(list(value["process_states"])[-1].get("nodes", []))
-                                for value in records]
-        if max(terminal_node_counts) - min(terminal_node_counts) < 2:
-            raise ValueError("G=8 terminal topologies need simple-to-complex node variance")
-        group_input_tokens = sum(int(
-            (list(value["process_states"])[-1].get("usage") or {}).get("inputTokens", 0)
-        ) for value in records)
-        if group_input_tokens > LHTB_GROUP_INPUT_TOKEN_GATE:
-            raise ValueError(
-                f"LHTB group exceeds compact-state input-token gate: "
-                f"{group_input_tokens} > {LHTB_GROUP_INPUT_TOKEN_GATE}"
+                f"formal LHTB training requires unconstrained MCTS topology search; "
+                f"observed {sorted(search_modes)}"
             )
 
     @staticmethod

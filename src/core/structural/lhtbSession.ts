@@ -56,6 +56,11 @@ export interface TerminalResult {
 
 export class RoyLHTBSession {
   private static readonly STATE_EVENT_WINDOW = 24;
+  private static readonly STATE_REQUIREMENT_LIMIT = 128;
+  private static readonly STATE_ENTITY_LIMIT = 96;
+  private static readonly STATE_RELATION_LIMIT = 256;
+  private static readonly STATE_BLIND_SPOT_LIMIT = 96;
+  private static readonly STATE_ENTITY_TEXT_LIMIT = 2_000;
   private runtime: RecursiveInformationRealizationRuntime;
   private recorder = new GlobalEpistemicStateRecorder();
   private events: RuntimeProcessEvent[] = [];
@@ -295,16 +300,48 @@ export class RoyLHTBSession {
     const snapshot = this.runtime.snapshot();
     const reports = snapshot.reports;
     const previous = this.recorder.latest();
+    const requirements = RoyLHTBSession.projectRequirements(snapshot.requirements);
+    const claims = RoyLHTBSession.projectEntities(
+      [...reports.flatMap(report => report.claims), ...this.semanticClaims], 'id', value => ({
+        ...value, statement: RoyLHTBSession.compactEntityText(value.statement),
+      })
+    );
+    const assumptions = RoyLHTBSession.projectEntities(
+      [...reports.flatMap(report => report.assumptions), ...this.semanticAssumptions], 'id', value => ({
+        ...value, statement: typeof value.statement === 'string'
+          ? RoyLHTBSession.compactEntityText(value.statement) : value.statement,
+      })
+    );
+    const evidence = RoyLHTBSession.projectEntities(
+      [...reports.flatMap(report => report.evidence), ...this.semanticEvidence], 'id', value => ({
+        ...value, content: RoyLHTBSession.compactEntityText(value.content),
+      })
+    );
+    const externalObservations = RoyLHTBSession.projectEntities(
+      [...snapshot.observations, ...this.semanticObservations], 'id', value => ({
+        ...value,
+        queryOrAction: RoyLHTBSession.compactEntityText(value.queryOrAction),
+        observation: RoyLHTBSession.compactEntityText(value.observation),
+      })
+    );
+    const projectedEntityIds = new Set([
+      ...requirements.map(value => value.id), ...claims.map(value => value.id),
+      ...evidence.map(value => value.id), ...externalObservations.map(value => value.id),
+      ...assumptions.map(value => String(value.id ?? '')),
+    ]);
+    const semanticRelations = this.semanticRelations.filter(value =>
+      projectedEntityIds.has(value.leftId) || projectedEntityIds.has(value.rightId)
+    ).slice(-RoyLHTBSession.STATE_RELATION_LIMIT);
+    const blindSpots = RoyLHTBSession.uniqueRecent(
+      [...reports.flatMap(report => report.blindSpots), ...this.semanticBlindSpots]
+        .map(value => RoyLHTBSession.compactEntityText(value)),
+      RoyLHTBSession.STATE_BLIND_SPOT_LIMIT,
+    );
     return this.recorder.append({
       trajectoryId: this.trajectoryId, taskId: this.taskId,
       sequence: previous ? previous.sequence + 1 : 0,
-      requirements: snapshot.requirements,
-      claims: [...reports.flatMap(report => report.claims), ...this.semanticClaims],
-      assumptions: [...reports.flatMap(report => report.assumptions), ...this.semanticAssumptions],
-      evidence: [...reports.flatMap(report => report.evidence), ...this.semanticEvidence],
-      externalObservations: [...snapshot.observations, ...this.semanticObservations],
-      semanticRelations: this.semanticRelations,
-      blindSpots: [...reports.flatMap(report => report.blindSpots), ...this.semanticBlindSpots],
+      requirements, claims, assumptions, evidence, externalObservations, semanticRelations,
+      blindSpots,
       dependencies: snapshot.dependencyEdges,
       nodes: snapshot.nodes,
       dagEdges: [
@@ -329,6 +366,54 @@ export class RoyLHTBSession {
       environmentRevision: this.environmentRevision,
       previousFingerprint: previous?.fingerprint,
     });
+  }
+
+  private static compactEntityText(value: string): string {
+    if (value.length <= RoyLHTBSession.STATE_ENTITY_TEXT_LIMIT) return value;
+    const side = Math.floor((RoyLHTBSession.STATE_ENTITY_TEXT_LIMIT - 36) / 2);
+    return `${value.slice(0, side)}\n[...state projection omitted...]\n${value.slice(-side)}`;
+  }
+
+  private static uniqueRecent(values: string[], limit: number): string[] {
+    const seen = new Set<string>();
+    const result: string[] = [];
+    for (let index = values.length - 1; index >= 0 && result.length < limit; index -= 1) {
+      const value = values[index];
+      if (seen.has(value)) continue;
+      seen.add(value);
+      result.push(value);
+    }
+    return result.reverse();
+  }
+
+  private static projectEntities<T extends object>(
+    values: T[], key: keyof T, project: (value: T) => T
+  ): T[] {
+    const seen = new Set<string>();
+    const result: T[] = [];
+    for (let index = values.length - 1;
+      index >= 0 && result.length < RoyLHTBSession.STATE_ENTITY_LIMIT; index -= 1) {
+      const value = values[index];
+      const id = String(value[key] ?? `index:${index}`);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      result.push(project(structuredClone(value)));
+    }
+    return result.reverse();
+  }
+
+  private static projectRequirements(
+    values: GlobalEpistemicState['requirements']
+  ): GlobalEpistemicState['requirements'] {
+    const open = values.filter(value => value.status === 'open' || value.status === 'assigned');
+    const remaining = Math.max(0, RoyLHTBSession.STATE_REQUIREMENT_LIMIT - open.length);
+    const selected = [...(remaining > 0 ? values.filter(value => value.status !== 'open'
+      && value.status !== 'assigned').slice(-remaining) : []), ...open];
+    return selected.map(value => ({ ...structuredClone(value),
+      description: RoyLHTBSession.compactEntityText(value.description),
+      whyItMatters: RoyLHTBSession.compactEntityText(value.whyItMatters),
+      requiredInformation: RoyLHTBSession.compactEntityText(value.requiredInformation),
+    }));
   }
 
   private static compactStateEvent(event: RuntimeProcessEvent): RuntimeProcessEvent {

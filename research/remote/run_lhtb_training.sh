@@ -222,7 +222,7 @@ failed = [key for key in required if not audit.get(key)]
 if failed:
     raise SystemExit(f"G=8 sample audit rejected training group: {failed}")
 print(json.dumps({key: audit.get(key) for key in (
-    "trajectory_count", "official_reward_std", "sampling_profiles",
+    "trajectory_count", "official_reward_std", "topology_search_modes",
     "terminal_node_span", "shaped_return_std", "actor_dense_signal_available",
     *required,
 )}))

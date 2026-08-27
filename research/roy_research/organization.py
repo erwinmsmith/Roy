@@ -14,7 +14,7 @@ ORGANIZATION_ACTIONS = (
     "STOP",
 )
 
-LHTB_POLICY_INTERFACE_REVISION = "single-agent-topology-profile-20260827"
+LHTB_POLICY_INTERFACE_REVISION = "unconstrained-mcts-topology-20260827"
 
 
 @dataclass(frozen=True)

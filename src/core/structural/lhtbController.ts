@@ -74,8 +74,21 @@ export function resolveTopologySamplingProfile(
   return topologySamplingProfile(index);
 }
 
+/**
+ * Topology profiles are retained only for explicit controlled diagnostics.
+ * Formal learned-policy sampling leaves this unset so node count, depth and
+ * graph connectivity are outcomes of MCTS rather than seed-conditioned inputs.
+ */
+export function activeTopologySamplingProfile(
+  organizationSeed: number,
+  override = process.env.ROY_LHTB_TOPOLOGY_PROFILE
+): TopologySamplingProfile | undefined {
+  return override ? resolveTopologySamplingProfile(organizationSeed, override) : undefined;
+}
+
 interface SamplingPhase {
-  id: 'expand_width' | 'seed_child_local_residual' | 'derive_child_local_residual' | 'stabilize';
+  id: 'unconstrained' | 'expand_width' | 'seed_child_local_residual'
+    | 'derive_child_local_residual' | 'stabilize';
   deepestActiveNodeIds: Set<string>;
   childLocalOpenGapIds: Set<string>;
 }
@@ -86,7 +99,7 @@ export type TopologySamplingCandidate = Pick<OrganizationCandidate,
 function topologySamplingPhase(
   snapshot: ReturnType<RoyLHTBSession['snapshot']>
 ): SamplingPhase {
-  const profile = resolveTopologySamplingProfile(snapshot.organizationSeed);
+  const profile = activeTopologySamplingProfile(snapshot.organizationSeed);
   const activeNodes = snapshot.runtime.nodes.filter(node =>
     ['ready', 'running', 'waiting', 'completed'].includes(node.status));
   const maximumDepth = Math.max(0, ...snapshot.runtime.nodes.map(node => node.depth));
@@ -95,6 +108,7 @@ function topologySamplingPhase(
   const childLocalOpenGapIds = new Set(snapshot.runtime.requirements.filter(requirement =>
     requirement.status === 'open' && deepestActiveNodeIds.has(requirement.parentNodeId)
     && requirement.parentNodeId !== snapshot.runtime.rootId).map(requirement => requirement.id));
+  if (!profile) return { id: 'unconstrained', deepestActiveNodeIds, childLocalOpenGapIds };
   if (maximumDepth < profile.preferredMinimumDepth && snapshot.runtime.nodes.length > 1) {
     return { id: childLocalOpenGapIds.size > 0
       ? 'derive_child_local_residual' : 'seed_child_local_residual',
@@ -111,6 +125,7 @@ function topologySamplingCandidateMatchesPhase(
   candidate: TopologySamplingCandidate
 ): boolean {
   const phase = topologySamplingPhase(snapshot);
+  if (phase.id === 'unconstrained') return true;
   if (phase.id === 'stabilize') return candidate.kind !== 'DERIVE';
   if (phase.id === 'seed_child_local_residual') {
     return phase.deepestActiveNodeIds.has(candidate.actorNodeId)
@@ -132,7 +147,8 @@ export function topologySamplingCandidateLogitBias(
   snapshot: ReturnType<RoyLHTBSession['snapshot']>,
   candidate: TopologySamplingCandidate
 ): number {
-  const profile = resolveTopologySamplingProfile(snapshot.organizationSeed);
+  const profile = activeTopologySamplingProfile(snapshot.organizationSeed);
+  if (!profile) return 0;
   const phase = topologySamplingPhase(snapshot);
   const matchesPhase = topologySamplingCandidateMatchesPhase(snapshot, candidate);
   if (phase.id === 'stabilize') return candidate.kind === 'DERIVE' ? -8 : 0;
@@ -149,6 +165,7 @@ export function topologySamplingCandidateLogitBias(
 function topologySamplingActiveNodeLogitBias(
   snapshot: ReturnType<RoyLHTBSession['snapshot']>, nodeId: string
 ): number {
+  if (!activeTopologySamplingProfile(snapshot.organizationSeed)) return 0;
   const phase = topologySamplingPhase(snapshot);
   if (phase.id !== 'seed_child_local_residual'
     && phase.id !== 'derive_child_local_residual') return 0;
@@ -230,10 +247,11 @@ existing reusableNodeId, and include loadJustification with numeric parallelWork
 availableCapacity, every concrete parallelRequirementId, and a concrete reason. The list must
 include the proposed triggering gap and an unresolved requirement already occupying the existing
 agent. Topology coverage alone is never load justification.
-When structuralExploration requests expansion and independent unresolved requirements exist,
-include up to three distinct legal DERIVE candidates, each using a different exact open gap ID.
-This is candidate coverage, not permission to invent work: never create a fake gap, duplicate an
-existing node ID or objective, reuse an assigned gap, or derive non-refining work. A requirement extracted from a child event belongs
+When independent unresolved requirements exist, include useful legal DERIVE candidates alongside
+non-structural alternatives so MCTS can compare whether expansion improves predicted task value.
+Never target a node count or depth. This is candidate support, not permission to invent work:
+never create a fake gap, duplicate an existing node ID or objective, reuse an assigned gap, or
+derive non-refining work. A requirement extracted from a child event belongs
 to that child unless its provenance explicitly identifies another active parent.
 CONNECT action is {"kind":"CONNECT","actorNodeId":"<actor>","connection":{"from":"<existing>",
 "to":"<different existing>","required":false}}. Once at least three nodes exist, include a novel
@@ -241,18 +259,11 @@ CONNECT candidate when a real information handoff would help; never repeat an ac
 When a new child genuinely needs a report from an existing producer, childSpecification.dependencies
 may use {"producerNodeId":"<existing>","artifactId":"report:<existing>"}; never fabricate a
 dependency merely to make a DAG. PRUNE uses targetNodeId for a non-root node.
-The sampling profile is an intervention for coverage, never a quality label. Progress one legal
-organization action at a time. Once currentNodeCount reaches preferredTopologyRange[1], omit
-DERIVE and stabilize the current organization with EXECUTE, ACQUIRE, RETURN, PRUNE, or a useful
-novel CONNECT. This is a profile-conditioned sampling intervention, not a resource cost or reward.
-When samplingProfile is single, keep exactly the root node: omit DERIVE, CONNECT and PRUNE, and
-propose only useful root-local ACQUIRE, EXECUTE, RETURN or STOP candidates. This root-only action
-mask is recorded as an experimental topology intervention; it is not a resource penalty or reward.
-For recursive and connected profiles, once the first child exists and currentMaximumDepth is below
-minimumDepthTarget, do not keep assigning root gaps. Follow requiredNextStructuralPhase exactly:
-run ACQUIRE/EXECUTE on one of deepestActiveNodeIds until it exposes a real child-local residual,
-then DERIVE from that child using one of childLocalOpenGapIds. This produces root -> sub -> subsub
-one action at a time. Never relabel a root requirement as child-local merely to satisfy depth.
+Formal sampling uses unconstrained MCTS: node count, derivation depth and graph connectivity must be
+outcomes of search. Do not use a requested topology size, minimum depth, profile identity or
+complexity target. Progress one legal organization action at a time. A diagnostic profile may be
+present only in explicitly controlled tests; it is never terminal utility or a semantic reason to
+derive. Never relabel a root requirement as child-local to manufacture recursive depth.
 RETURN action uses the property report (never epistemicReport), with this exact report shape:
 {"id":"...","nodeId":"<actor>","parentId":"...","depth":<actor-depth>,"localObjective":"...",
 "triggeringGapId":"...","conclusion":"...","reasoningSummary":"...","claims":[],
@@ -266,9 +277,12 @@ Cover every active node that has a semantically useful next action; candidate ac
 that node's exact ID. A node with no proposed candidate cannot be selected by the policy.
 Never repeat an unchanged terminal command immediately after it failed without file changes;
 propose a command that diagnoses or repairs the observed failure.
-When the requested artifacts exist and the task's own end-to-end command succeeds, include a
-legal RETURN candidate for a child or STOP candidate for root alongside any optional extra check;
-record remaining uncertainty instead of creating an endless verification loop.
+Always leave root STOP in the candidate support when required report dependencies permit it; the
+runtime also supplies a deterministic STOP candidate if it is omitted. Stopping early is legal and
+may receive a poor official verifier score. When requested artifacts exist and the task's own
+end-to-end command succeeds, prefer a legal RETURN for a child or STOP for root alongside at most
+one materially useful repair or verification action; record remaining uncertainty instead of
+creating an endless verification loop.
 Propose only semantically useful actions. Do not expose hidden reasoning, benchmark grader data,
 keyword fields or reward. The preferred candidate is your best next organization decision.`;
 
@@ -436,7 +450,7 @@ export function compactEpistemicWorkingState(
     requiredInformation: compactText(value.requiredInformation) }));
   const openRequirements = snapshot.runtime.requirements.filter(value => value.status === 'open'
     && activeNodes.some(node => node.id === value.parentNodeId));
-  const profile = resolveTopologySamplingProfile(snapshot.organizationSeed);
+  const profile = activeTopologySamplingProfile(snapshot.organizationSeed);
   const maximumDepthReached = Math.max(0, ...snapshot.runtime.nodes.map(node => node.depth));
   return {
     rootGoal: compactText(snapshot.instruction, PROPOSER_GOAL_TEXT_LIMIT),
@@ -486,25 +500,28 @@ export function compactEpistemicWorkingState(
       resourceState: latest.usage,
     } : undefined,
     structuralExploration: {
+      searchMode: profile ? 'profile_conditioned_diagnostic' : 'mcts_unconstrained',
       currentNodeCount: snapshot.runtime.nodes.length,
       currentMaximumDepth: maximumDepthReached,
-      samplingProfile: profile.id,
-      minimumNodeTarget: profile.preferredNodeRange[0],
-      preferredTopologyRange: profile.preferredNodeRange,
-      minimumDepthTarget: profile.preferredMinimumDepth,
-      focus: profile.focus,
+      samplingProfile: profile?.id,
+      minimumNodeTarget: profile?.preferredNodeRange[0] ?? 0,
+      preferredTopologyRange: profile?.preferredNodeRange,
+      minimumDepthTarget: profile?.preferredMinimumDepth ?? 0,
+      focus: profile?.focus ?? 'choose topology only by MCTS backed-up task value',
       realOpenGapCount: openRequirements.length,
       realOpenGapIds: openRequirements.map(value => value.id),
       realOpenGaps: openRequirements.map(value => ({ id: value.id,
         parentNodeId: value.parentNodeId, description: compactText(value.description),
         requiredInformation: compactText(value.requiredInformation) })),
-      desiredAdditionalChildren: Math.min(3, Math.max(0,
-        profile.preferredNodeRange[0] - snapshot.runtime.nodes.length), openRequirements.length),
-      preferredMaximumNodes: profile.preferredNodeRange[1],
+      desiredAdditionalChildren: profile ? Math.min(3, Math.max(0,
+        profile.preferredNodeRange[0] - snapshot.runtime.nodes.length), openRequirements.length) : 0,
+      preferredMaximumNodes: profile?.preferredNodeRange[1],
       requiredNextStructuralPhase: topologySamplingPhase(snapshot).id,
       deepestActiveNodeIds: [...topologySamplingPhase(snapshot).deepestActiveNodeIds],
       childLocalOpenGapIds: [...topologySamplingPhase(snapshot).childLocalOpenGapIds],
-      semantics: 'sampling capability target only; never synthesize gaps or add reward',
+      semantics: profile
+        ? 'explicit diagnostic intervention only; never synthesize gaps or add reward'
+        : 'unconstrained MCTS; topology is a search outcome',
     },
     projection: { recentRuntimeEventCount: PROPOSER_RECENT_EVENT_COUNT,
       eventTextLimit: PROPOSER_EVENT_TEXT_LIMIT, entityTextLimit: PROPOSER_ENTITY_TEXT_LIMIT,
@@ -532,7 +549,7 @@ function compactProposalRepairRequest(
       'Return a fresh concise candidate set that passes this exact legal interface.',
       'For DERIVE, use one realOpenGaps entry and set candidate actorNodeId, action.actorNodeId, and childSpecification.parentId to that entry parentNodeId.',
       'Do not reproduce an unchanged rejected candidate, move a gap to a semantically related child, invent a gap, or repeat an active CONNECT edge.',
-      'The sampling profile requests coverage but is not a reward or permission to fabricate work.',
+      'Topology is selected by MCTS; do not target a node count or depth or fabricate work.',
     ],
     rejectionReasons: reasons,
     rejectedCandidates,
@@ -543,6 +560,7 @@ function compactProposalRepairRequest(
       activeNodes: organization.activeNodes,
       spawnedAgentLibrary: organization.spawnedAgentLibrary,
       realOpenGaps: exploration.realOpenGaps,
+      searchMode: exploration.searchMode,
       samplingProfile: exploration.samplingProfile,
       requiredNextStructuralPhase: exploration.requiredNextStructuralPhase,
       deepestActiveNodeIds: exploration.deepestActiveNodeIds,
@@ -657,6 +675,7 @@ export class LHTBAutonomousController {
         ?? current.completion.usage?.completionTokens ?? 0,
       current.completion.model);
       const currentValidation = this.validateCandidates(current.value, session);
+      this.ensureMCTSTerminationCandidate(snapshot, currentValidation);
       const structuralDeficits = this.structuralCandidateDeficits(snapshot,
         currentValidation.candidates);
       if (structuralDeficits.length > 0) {
@@ -922,6 +941,32 @@ export class LHTBAutonomousController {
     return local.find(candidate => candidate.id === preferredId) ?? local[0];
   }
 
+  private ensureMCTSTerminationCandidate(
+    snapshot: ReturnType<RoyLHTBSession['snapshot']>, validation: CandidateValidation
+  ): void {
+    if (!this.mctsEnabled() || snapshot.organizationMode !== 'learned_information_realization'
+      || validation.candidates.some(candidate => candidate.kind === 'STOP')) return;
+    const root = snapshot.runtime.nodes.find(node => node.id === snapshot.runtime.rootId);
+    if (!root || !['ready', 'running', 'waiting', 'completed'].includes(root.status)) return;
+    const candidate: ProposedCandidate = {
+      id: 'stop-official-verifier', kind: 'STOP', actorNodeId: snapshot.runtime.rootId,
+      description: 'Stop the organization and submit the current environment to the official verifier',
+      schedulerComplexity: 1,
+      action: { kind: 'STOP', actorNodeId: snapshot.runtime.rootId,
+        finalOutput: { status: 'submitted_to_official_verifier',
+          stateFingerprint: snapshot.processStates.at(-1)?.fingerprint } },
+    };
+    try {
+      const probe = RecursiveInformationRealizationRuntime.restore(snapshot.runtime);
+      probe.apply(candidate.action, Date.now());
+    } catch {
+      return;
+    }
+    validation.candidates.push(candidate);
+    validation.dispositions.push({ index: -3, id: candidate.id, accepted: true,
+      reasons: ['system_mcts_termination_support'] });
+  }
+
   private validateCandidates(response: ProposalResponse, session: RoyLHTBSession): CandidateValidation {
     if (!Array.isArray(response.candidates) || response.candidates.length === 0) {
       return { candidates: [], dispositions: [{ index: -1, accepted: false,
@@ -933,7 +978,7 @@ export class LHTBAutonomousController {
       .map(node => node.id));
     const direct = snapshot.organizationMode === 'single_agent_direct';
     const singleProfile = snapshot.organizationMode === 'learned_information_realization'
-      && resolveTopologySamplingProfile(snapshot.organizationSeed).id === 'single';
+      && activeTopologySamplingProfile(snapshot.organizationSeed)?.id === 'single';
     const runtimeEvents = snapshot.runtimeEvents
       ?? snapshot.processStates.at(-1)?.runtimeEvents ?? [];
     let lastFailedCommand: { command?: string; cwd?: string } | undefined;
@@ -1163,7 +1208,8 @@ export class LHTBAutonomousController {
     candidates: ProposedCandidate[]
   ): string[] {
     if (snapshot.organizationMode !== 'learned_information_realization') return [];
-    const profile = resolveTopologySamplingProfile(snapshot.organizationSeed);
+    const profile = activeTopologySamplingProfile(snapshot.organizationSeed);
+    if (!profile) return [];
     const minimumNodes = profile.preferredNodeRange[0];
     if (minimumNodes <= 0) return [];
     const active = new Set(snapshot.runtime.nodes.filter(node =>
@@ -1318,9 +1364,9 @@ export class LHTBAutonomousController {
         kind: 'consumes', from: nodeId, to: 'state:active-subtree' })),
     ];
     const openRequirements = snapshot.runtime.requirements.filter(value => value.status === 'open');
-    const profile = resolveTopologySamplingProfile(snapshot.organizationSeed);
-    const minimumNodes = profile.preferredNodeRange[0];
-    const minimumDepth = profile.preferredMinimumDepth;
+    const profile = activeTopologySamplingProfile(snapshot.organizationSeed);
+    const minimumNodes = profile?.preferredNodeRange[0] ?? 0;
+    const minimumDepth = profile?.preferredMinimumDepth ?? 0;
     const maximumDepthReached = Math.max(0, ...snapshot.runtime.nodes.map(node => node.depth));
     const explorationStopMasked = openRequirements.length > 0
       && (snapshot.runtime.nodes.length < minimumNodes || maximumDepthReached < minimumDepth);
@@ -1335,10 +1381,14 @@ export class LHTBAutonomousController {
       legal: !(candidate.kind === 'STOP' && explorationStopMasked
         && hasExplorationAlternative) }));
     return {
-      interface_revision: 'single-agent-topology-profile-20260827',
-      sampling_profile: { id: profile.id, preferred_node_range: profile.preferredNodeRange,
+      interface_revision: 'unconstrained-mcts-topology-20260827',
+      topology_search: { mode: profile ? 'profile_conditioned_diagnostic' : 'mcts_unconstrained',
+        profile_id: profile?.id,
+        reward_semantics: 'official terminal task utility only; topology has no intrinsic reward' },
+      sampling_profile: profile ? { id: profile.id,
+        preferred_node_range: profile.preferredNodeRange,
         preferred_minimum_depth: profile.preferredMinimumDepth, focus: profile.focus,
-        reward_semantics: 'coverage intervention only; topology has no intrinsic reward' },
+        reward_semantics: 'explicit diagnostic intervention only' } : undefined,
       state_fingerprint: snapshot.processStates.at(-1)?.fingerprint,
       event_graph: { nodes, edges },
       active_node_ids: activeNodes.map(node => node.id),
