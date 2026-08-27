@@ -33,18 +33,76 @@ describe('LHTB process state', () => {
       .toBeUndefined();
   });
 
-  it('covers compact through connected topology profiles without changing utility', () => {
-    expect([0, 1, 2, 3].map(topologySamplingProfile).map(value => value.id))
-      .toEqual(['compact', 'branching', 'recursive', 'connected']);
-    expect(topologySamplingProfile(3).preferredNodeRange).toEqual([6, 8]);
-    expect(topologySamplingProfile(2).preferredMinimumDepth).toBe(2);
+  it('covers single-agent through connected topology profiles without changing utility', () => {
+    expect([0, 1, 2, 3, 4].map(topologySamplingProfile).map(value => value.id))
+      .toEqual(['single', 'compact', 'branching', 'recursive', 'connected']);
+    expect(topologySamplingProfile(0).preferredNodeRange).toEqual([1, 1]);
+    expect(topologySamplingProfile(4).preferredNodeRange).toEqual([6, 8]);
+    expect(topologySamplingProfile(3).preferredMinimumDepth).toBe(2);
     expect(resolveTopologySamplingProfile(0, 'recursive').preferredNodeRange).toEqual([5, 7]);
     expect(() => resolveTopologySamplingProfile(0, 'invalid')).toThrow(/Invalid/);
   });
 
+  it('masks topology-changing candidates in the learned single-agent profile', async () => {
+    const priorProfile = process.env.ROY_LHTB_TOPOLOGY_PROFILE;
+    process.env.ROY_LHTB_TOPOLOGY_PROFILE = 'single';
+    const session = new RoyLHTBSession('single-profile', 'task', 'inspect and solve', 'commit',
+      'learned_information_realization');
+    const childSpecification = {
+      id: 'spec-worker', nodeId: 'worker', parentId: 'root', depth: 1,
+      parentGoal: 'inspect and solve', triggeringGapId: 'root-task-requirement',
+      localObjective: 'Inspect one part.', refinement: {
+        parentScope: 'inspect and solve', childScope: 'inspect one part',
+        triggeringRequirementId: 'root-task-requirement', narrowerThanParent: true,
+        newInformationNeeded: 'one result', executableEndCondition: 'result recorded',
+        duplicatedByExistingNode: false,
+      }, requiredClaims: [], requiredEvidence: [], relevantReportIds: [],
+      externalAccess: { allowed: true, tools: ['terminal'], purpose: 'inspect' },
+      expectedOutput: { requiredInformation: 'one result',
+        outputType: 'epistemic_report' as const }, terminationCondition: 'return result',
+    };
+    const candidates = [{ id: 'derive', kind: 'DERIVE', actorNodeId: 'root',
+      description: 'derive a worker', schedulerComplexity: 1,
+      action: { kind: 'DERIVE', actorNodeId: 'root', childSpecification } },
+    { id: 'inspect', kind: 'ACQUIRE', actorNodeId: 'root', description: 'inspect locally',
+      schedulerComplexity: 1, command: 'pwd',
+      action: { kind: 'ACQUIRE', actorNodeId: 'root' } }];
+    const provider = { isConfigured: () => true, async completeJSONWithUsage() {
+      return { value: { preferred_candidate_id: 'derive', candidates },
+        completion: { content: '{}', model: 'mock', usage: {
+          promptTokens: 1, completionTokens: 1, totalTokens: 2,
+        } } };
+    } };
+    const semantic = { async processEvent(event: { id: string }) {
+      return { event_id: event.id, requirements: [], claims: [], assumptions: [], evidence: [],
+        external_observations: [], blind_spots: [], relations: [] };
+    }, close() {} };
+    let policyCandidates: Array<Record<string, unknown>> = [];
+    const learnedPolicy = { async select(policyState: Record<string, unknown>, values: Array<
+      Record<string, unknown>>) {
+      policyCandidates = values;
+      return { candidate: values[0], record: { stateFingerprint: 'state',
+        activeNodeId: 'root', candidateId: String(values[0]?.id),
+        maskedOldLogProbability: 0, envelopeId: 'single' } };
+    }, close() {} };
+    const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false,
+      learnedPolicy: learnedPolicy as never });
+    try {
+      const result = await controller.advance(session, 1);
+      expect(result.status).toBe('terminal_request');
+      expect(policyCandidates.map(value => value.kind)).toEqual(['ACQUIRE']);
+      expect(session.snapshot().runtime.nodes).toHaveLength(1);
+      expect(session.snapshot().runtime.derivationEdges).toHaveLength(0);
+    } finally {
+      controller.close();
+      if (priorProfile === undefined) delete process.env.ROY_LHTB_TOPOLOGY_PROFILE;
+      else process.env.ROY_LHTB_TOPOLOGY_PROFILE = priorProfile;
+    }
+  });
+
   it('turns a recursive profile into a real root to sub to subsub derivation', () => {
     const session = new RoyLHTBSession('recursive', 'task', 'implement and verify', 'commit',
-      'learned_information_realization', 'same', 2);
+      'learned_information_realization', 'same', 3);
     session.applySemanticUpdate({ event_id: 'task-instruction', requirements: [{
       id: 'root-a', description: 'implement one bounded component', requiredInformation: 'code',
       likelyMechanism: 'conversion',

@@ -16,6 +16,10 @@ import numpy as np
 
 TRAIN_EPOCHS = 4
 GROUP_SIZE = 8
+TOPOLOGY_PROFILE_SEQUENCE = (
+    "single", "compact", "branching", "recursive", "connected",
+    "single", "recursive", "connected",
+)
 MAX_ROLLOUT_SECONDS = 60 * 60
 ROLLOUT_FINALIZATION_MARGIN_SECONDS = 30
 CONCURRENCY = 4
@@ -213,29 +217,43 @@ def write_harbor_group_config(
         raise ValueError(f"unknown LHTB environment backend {environment_backend}")
     if max_retries < 0:
         raise ValueError("Harbor max_retries cannot be negative")
-    value = {
-        "job_name": f"roy-{task_id}-{organization_seed}",
-        "jobs_dir": str(jobs_dir), "n_attempts": attempts,
-        "n_concurrent_trials": min(CONCURRENCY, attempts), "timeout_multiplier": 1.0,
-        "retry": {"max_retries": max_retries},
-        "environment": environment,
-        "agents": [{
+    def agent_config(profile: str | None = None) -> Dict[str, Any]:
+        kwargs: Dict[str, Any] = {"rpc_timeout": 720}
+        if profile is not None:
+            kwargs["extra_env"] = {"ROY_LHTB_TOPOLOGY_PROFILE": profile}
+        return {
             "import_path": "roy_research.harbor_agent:RoyHarborAgent",
             "model_name": "deepseek/deepseek-v4-flash",
-            "kwargs": {"rpc_timeout": 720},
+            "kwargs": kwargs,
             "env": {"ROY_LHTB_ARM": arm,
                     "ROY_LHTB_ENVIRONMENT_BACKEND": environment_backend,
                     "ROY_LHTB_INITIAL_FINGERPRINT": initial_fingerprint,
                     "ROY_LHTB_ORGANIZATION_SEED": str(organization_seed),
                     "HB_CONTINUE_MODE": "same_conversation"},
-        }],
+        }
+    if arm == "learned_information_realization":
+        agents = [agent_config(TOPOLOGY_PROFILE_SEQUENCE[
+            index % len(TOPOLOGY_PROFILE_SEQUENCE)
+        ]) for index in range(attempts)]
+        harbor_attempts = 1
+    else:
+        agents = [agent_config()]
+        harbor_attempts = attempts
+    value = {
+        "job_name": f"roy-{task_id}-{organization_seed}",
+        "jobs_dir": str(jobs_dir), "n_attempts": harbor_attempts,
+        "n_concurrent_trials": min(CONCURRENCY, attempts), "timeout_multiplier": 1.0,
+        "retry": {"max_retries": max_retries},
+        "environment": environment,
+        "agents": agents,
         "datasets": [{"path": "./tasks", "task_names": [task_id]}],
     }
     if not official_timeout:
-        value["agents"][0]["override_timeout_sec"] = MAX_ROLLOUT_SECONDS
-        value["agents"][0]["kwargs"]["rollout_timeout_sec"] = (
-            MAX_ROLLOUT_SECONDS - ROLLOUT_FINALIZATION_MARGIN_SECONDS
-        )
+        for agent in value["agents"]:
+            agent["override_timeout_sec"] = MAX_ROLLOUT_SECONDS
+            agent["kwargs"]["rollout_timeout_sec"] = (
+                MAX_ROLLOUT_SECONDS - ROLLOUT_FINALIZATION_MARGIN_SECONDS
+            )
     write_json(path, value)
 
 

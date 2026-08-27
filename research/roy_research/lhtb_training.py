@@ -283,8 +283,13 @@ class LHTBProcessGRPOTrainer:
             for value in records if list(value["policy_records"])
         }
         sampling_profiles.discard("None")
-        if len(sampling_profiles) < 3:
-            raise ValueError("G=8 must cover at least three topology sampling profiles")
+        required_profiles = {"single", "compact", "branching", "recursive", "connected"}
+        if not required_profiles.issubset(sampling_profiles):
+            missing_profiles = sorted(required_profiles - sampling_profiles)
+            raise ValueError(
+                f"G=8 must cover all single-to-connected topology profiles; "
+                f"missing {missing_profiles}"
+            )
         terminal_node_counts = [len(list(value["process_states"])[-1].get("nodes", []))
                                 for value in records]
         if max(terminal_node_counts) - min(terminal_node_counts) < 2:

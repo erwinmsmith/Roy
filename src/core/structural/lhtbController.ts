@@ -39,7 +39,7 @@ interface CandidateValidation {
 }
 
 export interface TopologySamplingProfile {
-  id: 'compact' | 'branching' | 'recursive' | 'connected';
+  id: 'single' | 'compact' | 'branching' | 'recursive' | 'connected';
   preferredNodeRange: [number, number];
   preferredMinimumDepth: number;
   focus: string;
@@ -47,6 +47,8 @@ export interface TopologySamplingProfile {
 
 export function topologySamplingProfile(organizationSeed: number): TopologySamplingProfile {
   const profiles: TopologySamplingProfile[] = [
+    { id: 'single', preferredNodeRange: [1, 1], preferredMinimumDepth: 0,
+      focus: 'single root agent only; solve or stop without derivation or communication' },
     { id: 'compact', preferredNodeRange: [2, 3], preferredMinimumDepth: 1,
       focus: 'small rooted structure; execute existing nodes before adding optional branches' },
     { id: 'branching', preferredNodeRange: [3, 5], preferredMinimumDepth: 1,
@@ -64,7 +66,9 @@ export function resolveTopologySamplingProfile(
   override = process.env.ROY_LHTB_TOPOLOGY_PROFILE
 ): TopologySamplingProfile {
   if (!override) return topologySamplingProfile(organizationSeed);
-  const ids: TopologySamplingProfile['id'][] = ['compact', 'branching', 'recursive', 'connected'];
+  const ids: TopologySamplingProfile['id'][] = [
+    'single', 'compact', 'branching', 'recursive', 'connected',
+  ];
   const index = ids.indexOf(override as TopologySamplingProfile['id']);
   if (index < 0) throw new Error(`Invalid ROY_LHTB_TOPOLOGY_PROFILE ${override}`);
   return topologySamplingProfile(index);
@@ -241,6 +245,9 @@ The sampling profile is an intervention for coverage, never a quality label. Pro
 organization action at a time. Once currentNodeCount reaches preferredTopologyRange[1], omit
 DERIVE and stabilize the current organization with EXECUTE, ACQUIRE, RETURN, PRUNE, or a useful
 novel CONNECT. This is a profile-conditioned sampling intervention, not a resource cost or reward.
+When samplingProfile is single, keep exactly the root node: omit DERIVE, CONNECT and PRUNE, and
+propose only useful root-local ACQUIRE, EXECUTE, RETURN or STOP candidates. This root-only action
+mask is recorded as an experimental topology intervention; it is not a resource penalty or reward.
 For recursive and connected profiles, once the first child exists and currentMaximumDepth is below
 minimumDepthTarget, do not keep assigning root gaps. Follow requiredNextStructuralPhase exactly:
 run ACQUIRE/EXECUTE on one of deepestActiveNodeIds until it exposes a real child-local residual,
@@ -536,6 +543,7 @@ function compactProposalRepairRequest(
       activeNodes: organization.activeNodes,
       spawnedAgentLibrary: organization.spawnedAgentLibrary,
       realOpenGaps: exploration.realOpenGaps,
+      samplingProfile: exploration.samplingProfile,
       requiredNextStructuralPhase: exploration.requiredNextStructuralPhase,
       deepestActiveNodeIds: exploration.deepestActiveNodeIds,
       childLocalOpenGapIds: exploration.childLocalOpenGapIds,
@@ -924,6 +932,8 @@ export class LHTBAutonomousController {
       .filter(node => ['ready', 'running', 'waiting', 'completed'].includes(node.status))
       .map(node => node.id));
     const direct = snapshot.organizationMode === 'single_agent_direct';
+    const singleProfile = snapshot.organizationMode === 'learned_information_realization'
+      && resolveTopologySamplingProfile(snapshot.organizationSeed).id === 'single';
     const runtimeEvents = snapshot.runtimeEvents
       ?? snapshot.processStates.at(-1)?.runtimeEvents ?? [];
     let lastFailedCommand: { command?: string; cwd?: string } | undefined;
@@ -1044,6 +1054,9 @@ export class LHTBAutonomousController {
       const directLegal = !direct || (actorNodeId === 'root'
         && ['ACQUIRE', 'EXECUTE', 'RETURN', 'STOP'].includes(kind));
       if (!directLegal) reasons.push('direct_mode_forbids_action');
+      const singleProfileLegal = !singleProfile || (actorNodeId === snapshot.runtime.rootId
+        && !['DERIVE', 'CONNECT', 'PRUNE'].includes(kind));
+      if (!singleProfileLegal) reasons.push('single_agent_profile_forbids_topology_change');
       const commandValue = typeof raw?.command === 'string' ? raw.command
         : typeof actionValue.command === 'string' ? actionValue.command : undefined;
       const cwdValue = typeof raw?.cwd === 'string' ? raw.cwd
@@ -1322,7 +1335,7 @@ export class LHTBAutonomousController {
       legal: !(candidate.kind === 'STOP' && explorationStopMasked
         && hasExplorationAlternative) }));
     return {
-      interface_revision: 'bounded-epistemic-event-ledger-20260827',
+      interface_revision: 'single-agent-topology-profile-20260827',
       sampling_profile: { id: profile.id, preferred_node_range: profile.preferredNodeRange,
         preferred_minimum_depth: profile.preferredMinimumDepth, focus: profile.focus,
         reward_semantics: 'coverage intervention only; topology has no intrinsic reward' },

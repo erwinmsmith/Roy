@@ -455,6 +455,21 @@ for line in sys.stdin:
             self.assertNotIn("override_timeout_sec", value["agents"][0])
             self.assertNotIn("rollout_timeout_sec", value["agents"][0]["kwargs"])
 
+            learned = Path(directory) / "learned.json"
+            write_harbor_group_config(
+                learned, "task", Path(directory) / "jobs",
+                "learned_information_realization", "fingerprint", 1,
+                attempts=8, official_timeout=True,
+            )
+            learned_value = json.loads(learned.read_text())
+            self.assertEqual(learned_value["n_attempts"], 1)
+            self.assertEqual(len(learned_value["agents"]), 8)
+            self.assertEqual([
+                agent["kwargs"]["extra_env"]["ROY_LHTB_TOPOLOGY_PROFILE"]
+                for agent in learned_value["agents"]
+            ], ["single", "compact", "branching", "recursive", "connected",
+                "single", "recursive", "connected"])
+
             native = Path(directory) / "native.json"
             write_harbor_group_config(
                 native, "task", Path(directory) / "jobs", "single_agent_direct",
@@ -911,9 +926,8 @@ for line in sys.stdin:
             records = []
             for rollout_index in range(8):
                 rollout_policy_state = {**policy_state, "sampling_profile": {
-                    "id": ("compact", "branching", "recursive", "connected")[
-                        rollout_index % 4
-                    ]
+                    "id": ("single", "compact", "branching", "recursive", "connected",
+                           "single", "recursive", "connected")[rollout_index]
                 }}
                 _, policy_record = sample_organization_decision(
                     trainer.actor, encoder, rollout_policy_state, device=torch.device("cpu")

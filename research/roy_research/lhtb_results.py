@@ -402,12 +402,16 @@ def validate_smoke(root: Path, task_ids: tuple[str, ...] = (
             if len(trajectory_profiles) != 1:
                 raise ValueError(f"smoke trajectory has ambiguous sampling profile for {task_id}")
             trajectory_profile = next(iter(trajectory_profiles))
-            preferred_upper = {"compact": 3, "branching": 5,
+            preferred_upper = {"single": 1, "compact": 3, "branching": 5,
                                "recursive": 7, "connected": 8}[trajectory_profile]
             if terminal_node_counts[-1] > preferred_upper:
                 raise ValueError(
                     f"smoke {trajectory_profile} topology exceeded its sampling range "
                     f"for {task_id}: {terminal_node_counts[-1]} > {preferred_upper}"
+                )
+            if trajectory_profile == "single" and terminal_node_counts[-1] != 1:
+                raise ValueError(
+                    f"smoke single topology must remain root-only for {task_id}"
                 )
             if trajectory_profile in {"recursive", "connected"} and terminal_depths[-1] < 2:
                 raise ValueError(
@@ -469,8 +473,13 @@ def validate_smoke(root: Path, task_ids: tuple[str, ...] = (
             raise ValueError(f"smoke raw terminal ledger is incomplete for {task_id}")
         if not derive_available or not derive_selected:
             raise ValueError(f"smoke did not preserve and sample DERIVE for {task_id}")
-        if len(sampling_profiles) < 3:
-            raise ValueError(f"smoke lacks simple-to-complex topology coverage for {task_id}")
+        required_profiles = {"single", "compact", "branching", "recursive", "connected"}
+        if not required_profiles.issubset(sampling_profiles):
+            missing_profiles = sorted(required_profiles - sampling_profiles)
+            raise ValueError(
+                f"smoke lacks full single-to-connected topology coverage for {task_id}: "
+                f"missing {missing_profiles}"
+            )
         if max(terminal_node_counts) - min(terminal_node_counts) < 2:
             raise ValueError(f"smoke terminal topologies lack complexity variance for {task_id}")
         groups[task_id] = {"rewards": rewards, "state_counts": state_counts,
