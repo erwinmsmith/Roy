@@ -67,6 +67,12 @@ class LHTBPolicyServer:
         cached = self.analysis_cache.get(key)
         if cached is not None:
             return dict(cached)
+        self.encoder.precache([
+            *_event_graph_texts(graph),
+            *(str(candidate.get("description") or candidate.get("kind") or "")
+              for candidate in policy_state.get("candidates", [])
+              if isinstance(candidate, dict)),
+        ])
         target_value = self._target_value(graph)
         with torch.no_grad():
             distribution = organization_candidate_distribution(
@@ -100,6 +106,11 @@ class LHTBPolicyServer:
                 missing_by_key[key] = graph
         if missing_by_key:
             missing_keys = list(missing_by_key)
+            self.encoder.precache(
+                text
+                for key in missing_keys
+                for text in _event_graph_texts(missing_by_key[key])
+            )
             tensors = [graph_tensors(missing_by_key[key], self.encoder)
                        for key in missing_keys]
             with torch.no_grad():
@@ -149,6 +160,14 @@ def _stable_digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
     ).encode("utf-8")).hexdigest()
+
+
+def _event_graph_texts(event_graph: Dict[str, Any]) -> List[str]:
+    return [
+        str(node.get("text") or node.get("label") or node.get("id") or "")
+        for node in event_graph.get("nodes", [])
+        if isinstance(node, dict)
+    ]
 
 
 def main() -> None:

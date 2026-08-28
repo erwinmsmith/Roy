@@ -952,6 +952,13 @@ for line in sys.stdin:
         self.assertEqual(len(server.value_cache.values), 2)
 
     def test_policy_value_batch_deduplicates_and_preserves_order(self) -> None:
+        class RecordingEncoder(FakeEncoder384):
+            def __init__(self):
+                self.precache_batches = []
+
+            def precache(self, texts):
+                self.precache_batches.append(list(texts))
+
         class CountingBatchTarget:
             def __init__(self):
                 self.batch_sizes = []
@@ -964,7 +971,7 @@ for line in sys.stdin:
         server = LHTBPolicyServer.__new__(LHTBPolicyServer)
         server.target = CountingBatchTarget()
         server.target_revision = 3
-        server.encoder = FakeEncoder384()
+        server.encoder = RecordingEncoder()
         server.value_cache = _LRUCache(8)
         first = {"nodes": [{"id": "root", "kind": "agent", "text": "solve"}],
                  "edges": []}
@@ -972,6 +979,8 @@ for line in sys.stdin:
                   "edges": []}
         result = server.values([first, second, {"edges": [], "nodes": first["nodes"]}])
         self.assertEqual(server.target.batch_sizes, [2])
+        self.assertEqual(len(server.encoder.precache_batches), 1)
+        self.assertEqual(set(server.encoder.precache_batches[0]), {"solve", "verify"})
         self.assertEqual(result["target_revision"], 3)
         self.assertEqual(len(result["target_values"]), 3)
         self.assertAlmostEqual(result["target_values"][0], 0.2, places=6)
