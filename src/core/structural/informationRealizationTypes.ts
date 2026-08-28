@@ -2,7 +2,7 @@ import type { ResourceEnvelope } from './types.js';
 
 export const INFORMATION_REALIZATION_SCHEMA_VERSION = 3 as const;
 export const LHTB_POLICY_INTERFACE_REVISION =
-  'dynamic-agent-mcts-return-schema-policy-20260829' as const;
+  'dynamic-agent-mcts-normalized-return-policy-20260829' as const;
 
 export type OrganizationActionKind =
   | 'DERIVE'

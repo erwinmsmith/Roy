@@ -1107,6 +1107,12 @@ describe('LHTB process state', () => {
         stderr: '', durationMs: 1 });
       const accepted = harness.validateCandidates(response, session);
       expect(accepted.candidates.map(value => value.id)).toContain('return-worker');
+      const malformedResidual = structuredClone(response);
+      malformedResidual.candidates[0].action.report.residualRequirements = [{} as never];
+      const normalized = harness.validateCandidates(malformedResidual, session);
+      expect(normalized.candidates).toHaveLength(1);
+      expect((normalized.candidates[0] as unknown as { action: { report: {
+        residualRequirements: unknown[] } } }).action.report.residualRequirements).toEqual([]);
       expect(harness.structuralCandidateDeficits(session.snapshot(), []))
         .not.toContain('missing_external_child_progress_candidate:worker');
       expect(harness.structuralCandidateDeficits(session.snapshot(), []))

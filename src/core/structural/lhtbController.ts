@@ -340,7 +340,11 @@ RETURN action uses the property report (never epistemicReport), with this exact 
 "unresolved":[],"notExamined":[]},"blindSpots":[],"residualRequirements":[],
 "proposedChildren":[],"resolvedParentGap":false,"informationToPropagate":[]}.
 Claims, evidence, observations, assumptions, conflicts, residual requirements and proposed children
-must use their typed runtime schemas when non-empty. STOP is root-only and uses finalOutput.
+must use their typed runtime schemas when non-empty. Use an empty array instead of a placeholder,
+partial object, null, or undefined item. In particular, residualRequirements should normally be [];
+every non-empty entry requires id, description, whyItMatters, likelyMechanism,
+requiredInformation, status, and parentNodeId equal to the returning actor. STOP is root-only and
+uses finalOutput.
 Every candidate actorNodeId must equal organization.schedulerContextNode. Other active nodes are
 visible only for dependency and CONNECT/reuse decisions; never propose a turn for them.
 Never repeat an unchanged terminal command immediately after it failed without file changes;
@@ -681,6 +685,35 @@ export function compactProposalRepairRequest(
       activeSubtree: epistemic.activeSubtree,
     },
   });
+}
+
+function normalizeReturnReportCollections(
+  action: Record<string, unknown>, actorNodeId: string
+): void {
+  const value = action.report;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+  const report = value as Record<string, unknown>;
+  for (const field of ['claims', 'evidence', 'externalObservations', 'assumptions', 'conflicts',
+    'blindSpots', 'residualRequirements', 'proposedChildren', 'informationToPropagate']) {
+    if (!Array.isArray(report[field])) report[field] = [];
+  }
+  const mechanisms = new Set(['acquisition', 'representation', 'conversion', 'mixed']);
+  const statuses = new Set(['open', 'assigned', 'resolved', 'rejected']);
+  report.residualRequirements = (report.residualRequirements as unknown[]).filter(item => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
+    const residual = item as Record<string, unknown>;
+    return ['id', 'description', 'whyItMatters', 'requiredInformation'].every(field =>
+      typeof residual[field] === 'string' && String(residual[field]).trim().length > 0)
+      && residual.parentNodeId === actorNodeId
+      && mechanisms.has(String(residual.likelyMechanism))
+      && statuses.has(String(residual.status));
+  });
+  const coverage = report.coverage && typeof report.coverage === 'object'
+    && !Array.isArray(report.coverage) ? report.coverage as Record<string, unknown> : {};
+  for (const field of ['resolved', 'unresolved', 'notExamined']) {
+    if (!Array.isArray(coverage[field])) coverage[field] = [];
+  }
+  report.coverage = coverage;
 }
 
 export class LHTBAutonomousController {
@@ -1368,6 +1401,7 @@ export class LHTBAutonomousController {
       if (kind === 'DERIVE' && actionValue.childSpecification) {
         actionValue.childSpecification = compactChildSpecification(actionValue.childSpecification);
       }
+      if (kind === 'RETURN') normalizeReturnReportCollections(actionValue, actorNodeId);
       const explicitActionKind = typeof actionValue.kind === 'string' ? actionValue.kind
         : typeof actionValue.type === 'string' ? actionValue.type : undefined;
       const explicitActionActor = typeof actionValue.actorNodeId === 'string'
