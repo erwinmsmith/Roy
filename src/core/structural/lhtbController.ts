@@ -105,7 +105,20 @@ export function scheduledOrganizationContextNode(
     && SCHEDULER_RUNNABLE_STATUSES.has(nodes.get(id)?.status ?? '');
   const events = snapshot.runtimeEvents ?? snapshot.processStates.at(-1)?.runtimeEvents ?? [];
   for (const event of [...events].reverse()) {
-    if (event.kind === 'terminal_result' || event.kind === 'terminal_command') {
+    if (event.kind === 'terminal_result') {
+      const actor = typeof event.nodeId === 'string' ? nodes.get(event.nodeId) : undefined;
+      const parentId = actor?.parentId;
+      const parentHasUnassignedLocalWork = runnable(parentId)
+        && snapshot.runtime.requirements.some(requirement =>
+          requirement.parentNodeId === parentId && requirement.status === 'open');
+      // A child gets at least one local action after DERIVE.  Once that action
+      // produces an observation, a parent with other unassigned work gets one
+      // turn to reuse/connect the live child or derive a distinct worker.
+      if (parentHasUnassignedLocalWork && parentId) return parentId;
+      if (runnable(event.nodeId)) return event.nodeId;
+      continue;
+    }
+    if (event.kind === 'terminal_command') {
       if (runnable(event.nodeId)) return event.nodeId;
       continue;
     }
@@ -113,13 +126,14 @@ export function scheduledOrganizationContextNode(
     const action = event.attributes?.action as Record<string, unknown> | undefined;
     if (!action) continue;
     if (action.kind === 'DERIVE') {
-      const actorId = action.actorNodeId;
-      const actorHasUnassignedLocalWork = runnable(actorId)
-        && snapshot.runtime.requirements.some(requirement => requirement.parentNodeId === actorId
-          && requirement.status === 'open');
-      if (actorHasUnassignedLocalWork) return actorId;
       const child = action.childSpecification as Record<string, unknown> | undefined;
       if (runnable(child?.nodeId)) return child.nodeId;
+      // A derivation transfers execution ownership to the newly created child.
+      // The parent may still own other open requirements, but it must wait for
+      // this child to act or return before another parent-local decision.  This
+      // makes every root -> child -> grandchild transition an observed,
+      // node-local policy decision rather than a batch of inert spawn records.
+      if (runnable(action.actorNodeId)) return action.actorNodeId;
     }
     if (action.kind === 'RETURN') {
       const actor = typeof action.actorNodeId === 'string' ? nodes.get(action.actorNodeId) : undefined;

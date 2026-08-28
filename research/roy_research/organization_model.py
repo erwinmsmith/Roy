@@ -11,7 +11,7 @@ from .model import EDGE_KINDS, NODE_KINDS, RelationalMessagePassing, TEXT_DIMENS
 from .organization import ORGANIZATION_ACTIONS
 
 
-LHTB_ACTOR_MODEL_REVISION = "scheduler-context-structural-policy-20260828"
+LHTB_ACTOR_MODEL_REVISION = "scheduler-context-relational-attention-policy-20260829"
 
 
 class InformationRealizationPolicy(nn.Module):
@@ -39,6 +39,10 @@ class InformationRealizationPolicy(nn.Module):
         self.layers = nn.ModuleList(
             RelationalMessagePassing(hidden_dim, len(EDGE_KINDS)) for _ in range(layers)
         )
+        self.graph_attention = nn.Linear(hidden_dim, 1)
+        self.graph_projection = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim), nn.GELU(), nn.LayerNorm(hidden_dim)
+        )
         self.resource_projection = nn.Sequential(
             nn.Linear(resource_dim, 64), nn.GELU(), nn.LayerNorm(64)
         )
@@ -63,12 +67,21 @@ class InformationRealizationPolicy(nn.Module):
         states = F.gelu(self.input_projection(states))
         for layer in self.layers:
             states = layer(states, edge_index, edge_types)
-        pooled = states.mean(dim=0) if states.shape[0] else torch.zeros(
-            self.input_projection.out_features,
-            device=states.device,
-            dtype=states.dtype,
-        )
+        pooled = self._pool_graph(states)
         return states, pooled
+
+    def _pool_graph(self, states: Tensor) -> Tensor:
+        if not states.shape[0]:
+            return torch.zeros(
+                self.input_projection.out_features,
+                device=states.device,
+                dtype=states.dtype,
+            )
+        attention = torch.softmax(self.graph_attention(states).squeeze(-1), dim=0)
+        attended = (states * attention.unsqueeze(-1)).sum(dim=0)
+        return self.graph_projection(torch.cat(
+            [attended, states.mean(dim=0), states.max(dim=0).values], dim=-1
+        ))
 
     def encode_graph_batch(
         self,
@@ -103,7 +116,7 @@ class InformationRealizationPolicy(nn.Module):
         for layer in self.layers:
             states = layer(states, edges, edge_types)
         chunks = states.split(counts)
-        return [(chunk, chunk.mean(dim=0)) for chunk in chunks]
+        return [(chunk, self._pool_graph(chunk)) for chunk in chunks]
 
     def candidate_logits(
         self,

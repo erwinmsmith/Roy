@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { GlobalEpistemicStateRecorder, LHTBAutonomousController,
   compactProposalRepairRequest, repairProposalJSONStructure, resolveTopologySamplingProfile,
-  RoyLHTBSession,
+  RoyLHTBSession, scheduledOrganizationContextNode,
   topologySamplingCandidateLogitBias,
   topologySamplingProfile } from '../src/core/structural/index.js';
 import { LLMJSONParseError } from '../src/core/llm/providers/openai.js';
@@ -151,6 +151,7 @@ describe('LHTB process state', () => {
     };
     session.applyOrganizationAction({ kind: 'DERIVE', actorNodeId: 'root', childSpecification });
     const shallow = session.snapshot();
+    expect(scheduledOrganizationContextNode(shallow)).toBe('child');
     expect(topologySamplingCandidateLogitBias(shallow, {
       kind: 'EXECUTE', actorNodeId: 'child', action: { kind: 'EXECUTE', actorNodeId: 'child' },
     })).toBe(4);
@@ -184,6 +185,7 @@ describe('LHTB process state', () => {
     })).toBe(4);
     session.applyOrganizationAction({ kind: 'DERIVE', actorNodeId: 'child',
       childSpecification: grandchildSpecification });
+    expect(scheduledOrganizationContextNode(session.snapshot())).toBe('grandchild');
     expect(session.snapshot().runtime.derivationEdges).toEqual([
       { parentId: 'root', childId: 'child' },
       { parentId: 'child', childId: 'grandchild' },
@@ -491,6 +493,12 @@ describe('LHTB process state', () => {
       terminationCondition: 'return the diagnosis',
     };
     session.applyOrganizationAction({ kind: 'DERIVE', actorNodeId: 'root', childSpecification });
+    expect(scheduledOrganizationContextNode(session.snapshot())).toBe('validator');
+    session.requestTerminal({ id: 'validator-inspection', command: 'true', timeoutMs: 1000,
+      nodeId: 'validator', organizationActionKind: 'ACQUIRE' });
+    session.acceptTerminalResult({ requestId: 'validator-inspection', exitCode: 0,
+      stdout: 'first diagnosis', stderr: '', durationMs: 1 });
+    expect(scheduledOrganizationContextNode(session.snapshot())).toBe('root');
     const semantic = { async processEvent(event: { id: string }) {
       return { event_id: event.id, requirements: [], claims: [], assumptions: [], evidence: [],
         external_observations: [], blind_spots: [], relations: [] };
@@ -1073,6 +1081,11 @@ describe('LHTB process state', () => {
     };
     session.applyOrganizationAction({ kind: 'DERIVE', actorNodeId: 'root',
       childSpecification: firstChild });
+    session.requestTerminal({ id: 'worker-inspection', command: 'true', timeoutMs: 1000,
+      nodeId: 'worker', organizationActionKind: 'ACQUIRE' });
+    session.acceptTerminalResult({ requestId: 'worker-inspection', exitCode: 0,
+      stdout: 'first diagnosis', stderr: '', durationMs: 1 });
+    expect(scheduledOrganizationContextNode(session.snapshot())).toBe('root');
     const wrongOwnerChild = {
       ...firstChild, id: 'spec-wrong-owner', nodeId: 'wrong-owner', parentId: 'worker', depth: 2,
       parentGoal: firstChild.localObjective, triggeringGapId: 'root-gap',

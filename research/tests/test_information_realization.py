@@ -48,6 +48,19 @@ from roy_research.tau3_agent import (
 
 
 class InformationRealizationTests(unittest.TestCase):
+    def test_actor_uses_relational_attention_mean_max_graph_pooling(self) -> None:
+        model = InformationRealizationPolicy()
+        self.assertTrue(hasattr(model, "graph_attention"))
+        self.assertTrue(hasattr(model, "graph_projection"))
+        states = torch.tensor([
+            [1.0] * 256,
+            [0.0] * 256,
+            [-1.0] * 256,
+        ])
+        pooled = model._pool_graph(states)
+        self.assertEqual(tuple(pooled.shape), (256,))
+        self.assertTrue(torch.isfinite(pooled).all())
+
     def test_one_shared_envelope_controls_group_without_reward(self) -> None:
         envelope = training_envelope(0, 4)
         validate_exploration_group((envelope,) * 8)
