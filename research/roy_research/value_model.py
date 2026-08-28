@@ -40,22 +40,65 @@ class EpistemicValueModel(nn.Module):
 
     def forward(self, text: Tensor, kinds: Tensor, scalars: Tensor,
                 edges: Tensor, edge_types: Tensor) -> Tensor:
+        return self.forward_batch([(text, kinds, scalars, edges, edge_types)])[0]
+
+    def forward_batch(
+        self,
+        graphs: Sequence[Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]],
+    ) -> Tensor:
+        """Evaluate independent variable-size graphs in one disjoint GNN pass."""
+        if not graphs:
+            return torch.zeros(0, dtype=torch.float32,
+                               device=self.value_head[-1].weight.device)
+        counts = [int(graph[0].shape[0]) for graph in graphs]
+        if any(count <= 0 for count in counts):
+            return torch.stack([self._forward_single(*graph) for graph in graphs])
+        text = torch.cat([graph[0] for graph in graphs], dim=0)
+        kinds = torch.cat([graph[1] for graph in graphs], dim=0)
+        scalars = torch.cat([graph[2] for graph in graphs], dim=0)
+        edge_parts = []
+        edge_type_parts = []
+        offset = 0
+        for graph, count in zip(graphs, counts):
+            if graph[3].numel():
+                edge_parts.append(graph[3] + offset)
+                edge_type_parts.append(graph[4])
+            offset += count
+        edges = torch.cat(edge_parts, dim=1) if edge_parts else torch.zeros(
+            (2, 0), dtype=torch.long, device=text.device
+        )
+        edge_types = torch.cat(edge_type_parts) if edge_type_parts else torch.zeros(
+            0, dtype=torch.long, device=text.device
+        )
         states = F.gelu(self.input_projection(torch.cat(
             [text, self.node_types(kinds.long()), scalars], dim=-1
         )))
         for layer in self.layers:
             states = layer(states, edges, edge_types)
+        pooled = [self._pool(chunk) for chunk in states.split(counts)]
+        return torch.sigmoid(self.value_head(torch.stack(pooled))).squeeze(-1)
+
+    def _forward_single(self, text: Tensor, kinds: Tensor, scalars: Tensor,
+                        edges: Tensor, edge_types: Tensor) -> Tensor:
+        states = F.gelu(self.input_projection(torch.cat(
+            [text, self.node_types(kinds.long()), scalars], dim=-1
+        )))
+        for layer in self.layers:
+            states = layer(states, edges, edge_types)
+        return torch.sigmoid(self.value_head(self._pool(states))).squeeze(-1)
+
+    def _pool(self, states: Tensor) -> Tensor:
         if states.shape[0]:
             attention = torch.softmax(self.pool_gate(states).squeeze(-1), dim=0)
             attentive = torch.sum(states * attention.unsqueeze(-1), dim=0)
-            pooled = torch.cat([attentive, states.mean(dim=0), states.max(dim=0).values])
-        else:
-            pooled = torch.zeros(
-                self.input_projection.out_features * 3,
-                dtype=text.dtype,
-                device=text.device,
-            )
-        return torch.sigmoid(self.value_head(pooled)).squeeze(-1)
+            return torch.cat([
+                attentive, states.mean(dim=0), states.max(dim=0).values
+            ])
+        return torch.zeros(
+            self.input_projection.out_features * 3,
+            dtype=self.value_head[-1].weight.dtype,
+            device=self.value_head[-1].weight.device,
+        )
 
 
 def make_ema_target(model: EpistemicValueModel) -> EpistemicValueModel:

@@ -70,6 +70,41 @@ class InformationRealizationPolicy(nn.Module):
         )
         return states, pooled
 
+    def encode_graph_batch(
+        self,
+        graphs: Sequence[Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]],
+    ) -> Sequence[Tuple[Tensor, Tensor]]:
+        """Encode independent variable-size graphs as one disjoint graph."""
+        if not graphs:
+            return []
+        counts = [int(graph[0].shape[0]) for graph in graphs]
+        if any(count <= 0 for count in counts):
+            return [self.encode_graph(*graph) for graph in graphs]
+        text = torch.cat([graph[0] for graph in graphs], dim=0)
+        kinds = torch.cat([graph[1] for graph in graphs], dim=0)
+        scalars = torch.cat([graph[2] for graph in graphs], dim=0)
+        edge_parts = []
+        edge_type_parts = []
+        offset = 0
+        for graph, count in zip(graphs, counts):
+            if graph[3].numel():
+                edge_parts.append(graph[3] + offset)
+                edge_type_parts.append(graph[4])
+            offset += count
+        edges = torch.cat(edge_parts, dim=1) if edge_parts else torch.zeros(
+            (2, 0), dtype=torch.long, device=text.device
+        )
+        edge_types = torch.cat(edge_type_parts) if edge_type_parts else torch.zeros(
+            0, dtype=torch.long, device=text.device
+        )
+        states = F.gelu(self.input_projection(torch.cat(
+            [text, self.node_types(kinds.long()), scalars], dim=-1
+        )))
+        for layer in self.layers:
+            states = layer(states, edges, edge_types)
+        chunks = states.split(counts)
+        return [(chunk, chunk.mean(dim=0)) for chunk in chunks]
+
     def active_node_logits(
         self,
         node_states: Tensor,

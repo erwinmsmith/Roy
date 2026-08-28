@@ -68,6 +68,8 @@ from roy_research.lhtb_native import (
 from roy_research.organization_replay import (
     _hierarchical_candidate_log_probs,
     organization_candidate_distribution,
+    replay_joint_log_probabilities,
+    replay_joint_log_probability,
     sample_organization_decision,
 )
 
@@ -829,6 +831,13 @@ for line in sys.stdin:
         self.assertAlmostEqual(sum(distribution["candidate_priors"].values()), 1.0, places=6)
         self.assertAlmostEqual(sum(distribution["action_priors"].values()), 1.0, places=6)
         self.assertGreater(distribution["candidate_priors"]["execute"], 1 - 1e-6)
+        single = replay_joint_log_probability(
+            model, FakeEncoder384(), record, torch.device("cpu")
+        )
+        batched = replay_joint_log_probabilities(
+            model, FakeEncoder384(), [record, record], torch.device("cpu")
+        )
+        self.assertTrue(torch.allclose(batched, single.repeat(2), atol=1e-6))
 
     def test_value_graph_contains_epistemic_progress_as_well_as_agents(self) -> None:
         graph = epistemic_state_graph({
@@ -869,6 +878,17 @@ for line in sys.stdin:
         edges = torch.zeros((2, 0), dtype=torch.long)
         edge_types = torch.zeros(0, dtype=torch.long)
         self.assertEqual(float(model(text, kinds, scalars, edges, edge_types).detach()), 0.5)
+        batched_values = model.forward_batch([
+            (text, kinds, scalars, edges, edge_types),
+            (text.repeat(2, 1), kinds.repeat(2), scalars.repeat(2, 1),
+             torch.tensor([[0], [1]]), torch.zeros(1, dtype=torch.long)),
+        ])
+        individual_values = torch.stack([
+            model(text, kinds, scalars, edges, edge_types),
+            model(text.repeat(2, 1), kinds.repeat(2), scalars.repeat(2, 1),
+                  torch.tensor([[0], [1]]), torch.zeros(1, dtype=torch.long)),
+        ])
+        self.assertTrue(torch.allclose(batched_values, individual_values, atol=1e-6))
         _, returns = process_credit([[0.5, 0.5], [0.5, 0.5]], [0.2, 0.8])
         advantages, _, _ = trajectory_weighted_advantages(returns)
         self.assertLess(float(advantages[0][0]), float(advantages[1][0]))

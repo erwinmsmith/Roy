@@ -17,7 +17,7 @@ from .lhtb_transitions import (
 from .model import FrozenTextEncoder, epistemic_state_graph, graph_tensors
 from .organization import LHTB_POLICY_INTERFACE_REVISION
 from .organization_model import InformationRealizationPolicy
-from .organization_replay import replay_joint_log_probability
+from .organization_replay import replay_joint_log_probabilities
 from .value_model import (
     EpistemicValueModel,
     LHTB_VALUE_MODEL_REVISION,
@@ -92,7 +92,12 @@ class LHTBProcessGRPOTrainer:
         with torch.no_grad():
             full_target_values = [
                 [target_constant] * len(states) if target_constant is not None
-                else [float(self._predict(self.target, state)) for state in states]
+                else [
+                    float(value) for start in range(0, len(states), 32)
+                    for value in self._predict_batch(
+                        self.target, states[start:start + 32]
+                    ).detach().cpu()
+                ]
                 for states in state_sequences
             ]
         target_values = [self._values_for_states(states, values, selected)
@@ -111,21 +116,27 @@ class LHTBProcessGRPOTrainer:
                 policy_records = list(trajectory["policy_records"])
                 if len(policy_records) != len(step_advantages):
                     raise ValueError("policy decisions must align with process credit")
-                current = torch.stack([
-                    replay_joint_log_probability(self.actor, self.encoder, record, self.device)
-                    for record in policy_records
-                ])
                 behavior = torch.tensor(
                     [float(record.get("masked_old_log_probability",
                                       record.get("maskedOldLogProbability")))
                      for record in policy_records],
                     dtype=torch.float32, device=self.device,
                 )
-                trajectory_loss = dense_clipped_policy_loss(
-                    [current], [behavior], [step_advantages]
-                ) / len(records)
-                trajectory_loss.backward()
-                actor_loss_value += float(trajectory_loss.detach().cpu())
+                step_advantages = step_advantages.to(self.device)
+                for start in range(0, len(policy_records), 16):
+                    stop = start + 16
+                    current = replay_joint_log_probabilities(
+                        self.actor, self.encoder, policy_records[start:stop], self.device
+                    )
+                    old = behavior[start:stop]
+                    advantage = step_advantages[start:stop].to(dtype=current.dtype)
+                    ratio = torch.exp(current - old.detach())
+                    clipped = torch.clamp(ratio, 0.8, 1.2)
+                    loss = -torch.minimum(
+                        ratio * advantage, clipped * advantage
+                    ).sum() / (len(records) * len(policy_records))
+                    loss.backward()
+                    actor_loss_value += float(loss.detach().cpu())
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
             self.actor_optimizer.step()
             self.actor_steps += 1
@@ -135,18 +146,12 @@ class LHTBProcessGRPOTrainer:
         value_microbatch = 16
         for states, reward in zip(state_sequences, rewards):
             scale = 1.0 / (len(records) * len(states))
-            target = torch.tensor(reward, dtype=torch.float32, device=self.device)
-            pending: List[Tensor] = []
-            for state in states:
-                pending.append(F.huber_loss(self._predict(self.value, state), target,
-                                            reduction="sum"))
-                if len(pending) == value_microbatch:
-                    loss = torch.stack(pending).sum() * scale
-                    loss.backward()
-                    value_loss_value += float(loss.detach().cpu())
-                    pending = []
-            if pending:
-                loss = torch.stack(pending).sum() * scale
+            for start in range(0, len(states), value_microbatch):
+                predictions = self._predict_batch(
+                    self.value, states[start:start + value_microbatch]
+                )
+                target = torch.full_like(predictions, reward)
+                loss = F.huber_loss(predictions, target, reduction="sum") * scale
                 loss.backward()
                 value_loss_value += float(loss.detach().cpu())
         torch.nn.utils.clip_grad_norm_(self.value.parameters(), 1.0)
@@ -202,6 +207,19 @@ class LHTBProcessGRPOTrainer:
             graph = epistemic_state_graph(state)
         tensors = [value.to(self.device) for value in graph_tensors(dict(graph), self.encoder)]
         return model(*tensors)
+
+    def _predict_batch(
+        self, model: EpistemicValueModel, states: Sequence[Mapping[str, Any]]
+    ) -> Tensor:
+        graphs = []
+        for state in states:
+            graph = state.get("event_graph")
+            if not isinstance(graph, Mapping):
+                graph = epistemic_state_graph(state)
+            graphs.append(tuple(
+                value.to(self.device) for value in graph_tensors(dict(graph), self.encoder)
+            ))
+        return model.forward_batch(graphs)
 
     def _precache_group_text(self, records: Sequence[Mapping[str, Any]]) -> None:
         """Batch frozen text encoding for all actor and critic replay inputs."""

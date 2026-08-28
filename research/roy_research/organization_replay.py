@@ -337,6 +337,56 @@ def replay_joint_log_probability(
     )
 
 
+def replay_joint_log_probabilities(
+    model: InformationRealizationPolicy,
+    encoder: FrozenTextEncoder,
+    records: Sequence[Mapping[str, Any]],
+    device: torch.device,
+) -> Tensor:
+    """Exact replay for a microbatch using one disjoint-graph actor pass."""
+    if not records:
+        return torch.zeros(0, dtype=torch.float32, device=device)
+    policy_states = []
+    graph_inputs = []
+    for record in records:
+        policy_state = record.get("policy_state", record.get("policyState"))
+        if not isinstance(policy_state, Mapping):
+            raise ValueError("policy record is missing policy_state")
+        graph = policy_state.get("event_graph")
+        if not isinstance(graph, Mapping):
+            raise ValueError("organization policy state is missing event_graph")
+        policy_states.append(policy_state)
+        graph_inputs.append(tuple(
+            value.to(device) for value in graph_tensors(dict(graph), encoder)
+        ))
+    encoded = model.encode_graph_batch(graph_inputs)
+    results = []
+    for record, policy_state, (node_states, graph_state) in zip(
+        records, policy_states, encoded
+    ):
+        context = _policy_context_from_encoding(
+            model, encoder, policy_state, device, node_states, graph_state
+        )
+        try:
+            active_id = str(record.get("active_node_id", record.get("activeNodeId")))
+            active_index = context["active_node_ids"].index(active_id)
+            values = _candidate_distribution(
+                model, policy_state, context, active_id, device
+            )
+            candidate_index = [str(value["id"]) for value in values["candidates"]].index(
+                str(record.get("candidate_id", record.get("candidateId")))
+            )
+        except ValueError as error:
+            raise ValueError(
+                "recorded organization choice is not available during replay"
+            ) from error
+        results.append(
+            context["active_log_probs"][active_index]
+            + values["candidate_log_probs"][candidate_index]
+        )
+    return torch.stack(results)
+
+
 def _policy_context(
     model: InformationRealizationPolicy,
     encoder: FrozenTextEncoder,
@@ -348,6 +398,22 @@ def _policy_context(
         raise ValueError("organization policy state is missing event_graph")
     tensors = tuple(value.to(device) for value in graph_tensors(dict(graph), encoder))
     node_states, graph_state = model.encode_graph(*tensors)
+    return _policy_context_from_encoding(
+        model, encoder, policy_state, device, node_states, graph_state
+    )
+
+
+def _policy_context_from_encoding(
+    model: InformationRealizationPolicy,
+    encoder: FrozenTextEncoder,
+    policy_state: Mapping[str, Any],
+    device: torch.device,
+    node_states: Tensor,
+    graph_state: Tensor,
+) -> Dict[str, Any]:
+    graph = policy_state.get("event_graph")
+    if not isinstance(graph, Mapping):
+        raise ValueError("organization policy state is missing event_graph")
     graph_nodes = list(graph.get("nodes", []))
     node_index = {str(value["id"]): index for index, value in enumerate(graph_nodes)}
     active_node_ids = [str(value) for value in policy_state.get("active_node_ids", [])]
