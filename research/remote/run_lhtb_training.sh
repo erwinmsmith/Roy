@@ -24,6 +24,12 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "${script_dir}/load_roy_env.sh"
 load_deepseek_api_key "${roy_root}"
 
+export ROY_LHTB_TORCH_THREADS="${ROY_LHTB_TORCH_THREADS:-4}"
+export ROY_LHTB_TORCH_INTEROP_THREADS="${ROY_LHTB_TORCH_INTEROP_THREADS:-1}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-${ROY_LHTB_TORCH_THREADS}}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-${ROY_LHTB_TORCH_THREADS}}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-${ROY_LHTB_TORCH_THREADS}}"
+
 [[ -n "${DEEPSEEK_API_KEY:-}" ]] || { echo "DEEPSEEK_API_KEY is required" >&2; exit 4; }
 [[ -x "${python_bin}" && -x "${harbor_bin}" ]] || {
   if [[ "${environment_backend}" == "native" ]]; then

@@ -6,6 +6,10 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Mapping
 
+from .torch_runtime import configure_torch_runtime
+
+configure_torch_runtime()
+
 from .model import FrozenTextEncoder
 from .process_state import FrozenDeepSeekSemanticClient, SemanticStateBuilder
 from .providers import DeepSeekClient

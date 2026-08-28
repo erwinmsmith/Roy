@@ -27,6 +27,7 @@ from roy_research.process_state import (
     _semantic_payload_projection,
 )
 from roy_research.semantic_server import SemanticServer
+from roy_research.torch_runtime import configure_torch_runtime
 from roy_research.value_model import (
     EpistemicValueModel,
     equal_trajectory_value_loss,
@@ -112,6 +113,12 @@ class FakeSemanticClient:
 
 
 class LHTBProtocolTests(unittest.TestCase):
+    def test_torch_sidecar_thread_configuration_is_bounded_and_idempotent(self) -> None:
+        first = configure_torch_runtime()
+        second = configure_torch_runtime()
+        self.assertEqual(first, second)
+        self.assertEqual(first, {"threads": 4, "interop_threads": 1})
+
     def test_oci_repository_reference_removes_tag_but_preserves_registry_port(self) -> None:
         self.assertEqual(
             oci_repository_reference("mirror.example:5000/team/image:revision"),

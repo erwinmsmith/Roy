@@ -10,6 +10,12 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "${script_dir}/load_roy_env.sh"
 load_deepseek_api_key "${roy_root}"
 
+export ROY_LHTB_TORCH_THREADS="${ROY_LHTB_TORCH_THREADS:-4}"
+export ROY_LHTB_TORCH_INTEROP_THREADS="${ROY_LHTB_TORCH_INTEROP_THREADS:-1}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-${ROY_LHTB_TORCH_THREADS}}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-${ROY_LHTB_TORCH_THREADS}}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-${ROY_LHTB_TORCH_THREADS}}"
+
 for command_name in docker git git-lfs node python3 uv; do
   command -v "${command_name}" >/dev/null || {
     echo "missing required command: ${command_name}" >&2

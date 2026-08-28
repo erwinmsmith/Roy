@@ -8,6 +8,10 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List
 
+from .torch_runtime import configure_torch_runtime
+
+configure_torch_runtime()
+
 import torch
 
 from .model import FrozenTextEncoder, graph_tensors
