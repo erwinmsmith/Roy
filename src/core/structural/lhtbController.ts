@@ -622,7 +622,7 @@ export function compactProposalRepairRequest(
     reason.startsWith('missing_child_return_candidate:'))
     .map(reason => reason.slice('missing_child_return_candidate:'.length));
   return JSON.stringify({
-    repairProtocol: 'legal-candidate-interface-v2',
+    repairProtocol: 'legal-candidate-interface-v3',
     instruction: [
       'Return a fresh concise candidate set that passes this exact legal interface.',
       'For DERIVE, use one realOpenGaps entry and set candidate actorNodeId, action.actorNodeId, and childSpecification.parentId to that entry parentNodeId.',
@@ -649,6 +649,26 @@ export function compactProposalRepairRequest(
       preferredTopologyRange: exploration.preferredTopologyRange,
       requiredExternalChildProgressNodeIds,
       requiredChildReturnNodeIds,
+      returnCandidateSchema: {
+        id: '<unique-return-candidate-id>', kind: 'RETURN',
+        actorNodeId: '<requiredChildReturnNodeId>',
+        description: '<concise evidence-grounded handoff>', schedulerComplexity: 1,
+        action: { kind: 'RETURN', actorNodeId: '<same requiredChildReturnNodeId>',
+          report: {
+            id: '<unique-report-id>', nodeId: '<same requiredChildReturnNodeId>',
+            parentId: '<activeNodes parentId>', depth: '<activeNodes depth>',
+            localObjective: '<activeNodes objective>',
+            triggeringGapId: '<activeNodes triggeringGapId>',
+            conclusion: '<conclusion grounded in observed terminal results>',
+            reasoningSummary: '<concise summary>', claims: [], evidence: [],
+            externalObservations: [], assumptions: [],
+            uncertainty: { confidence: 0.5, uncertainAbout: [],
+              confidenceBasis: '<observed evidence basis>' },
+            conflicts: [], coverage: { resolved: [], unresolved: [], notExamined: [] },
+            blindSpots: [], residualRequirements: [], proposedChildren: [],
+            resolvedParentGap: false, informationToPropagate: [],
+          } },
+      },
       dependencies: organization.dependencies,
       communications: organization.communications,
     },

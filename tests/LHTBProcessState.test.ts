@@ -41,6 +41,10 @@ describe('LHTB process state', () => {
       'missing_child_return_candidate:worker'], []));
     expect(payload.legalInterface.requiredExternalChildProgressNodeIds).toEqual(['worker']);
     expect(payload.legalInterface.requiredChildReturnNodeIds).toEqual(['worker']);
+    expect(payload.legalInterface.returnCandidateSchema.action.report.nodeId)
+      .toBe('<same requiredChildReturnNodeId>');
+    expect(payload.legalInterface.returnCandidateSchema.action.report)
+      .toHaveProperty('informationToPropagate');
     expect(payload.instruction.join(' ')).toContain('ACQUIRE or EXECUTE');
     expect(payload.instruction.join(' ')).toContain('evidence-grounded report');
   });
@@ -1242,7 +1246,7 @@ describe('LHTB process state', () => {
         legalInterface: { realOpenGaps: Array<{ id: string; parentNodeId: string }> };
         rejectionReasons: string[];
       };
-      expect(repair.repairProtocol).toBe('legal-candidate-interface-v2');
+      expect(repair.repairProtocol).toBe('legal-candidate-interface-v3');
       expect(repair.legalInterface.realOpenGaps).toContainEqual({
         id: 'root-gap', parentNodeId: 'root', description: 'inspect the independent second failure',
         requiredInformation: 'second diagnosis',
