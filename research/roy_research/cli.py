@@ -272,6 +272,10 @@ def parser() -> argparse.ArgumentParser:
     lhtb_update.add_argument("--updates", type=Path, required=True)
     lhtb_update.add_argument("--transition-samples", type=Path)
     lhtb_update.add_argument("--device", default="cpu")
+    lhtb_update.add_argument(
+        "--value-state-samples", type=int, default=256,
+        help="Uniform value states per trajectory; 0 evaluates every state",
+    )
     lhtb_update.add_argument("--resume", action="store_true")
 
     lhtb_init = commands.add_parser(
@@ -432,7 +436,8 @@ def main(argv: List[str] | None = None) -> None:
     elif args.command == "lhtb-update":
         manifest = load_lhtb_manifest(args.manifest)
         trainer = LHTBProcessGRPOTrainer(
-            args.model, manifest, device_name=args.device, resume=args.resume
+            args.model, manifest, device_name=args.device, resume=args.resume,
+            value_state_sample_limit=args.value_state_samples or None,
         )
         grouped: Dict[str, List[Dict[str, Any]]] = {}
         for record in read_jsonl(args.trajectories):

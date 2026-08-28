@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import sys
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict
 
@@ -45,6 +47,9 @@ class LHTBPolicyServer:
         self.target_revision = int(payload.get("metadata", {}).get("groups", 0))
         self.encoder = FrozenTextEncoder(device="cpu", local_only=True)
         self.generator = torch.Generator(device="cpu")
+        cache_size = max(1, int(os.environ.get("ROY_LHTB_VALUE_CACHE_SIZE", "4096")))
+        self.value_cache = _LRUCache(cache_size)
+        self.analysis_cache = _LRUCache(cache_size)
 
     def decide(self, policy_state: Dict[str, Any], seed: int) -> Dict[str, Any]:
         self.generator.manual_seed(seed)
@@ -58,23 +63,62 @@ class LHTBPolicyServer:
         graph = policy_state.get("event_graph")
         if not isinstance(graph, dict):
             raise ValueError("organization policy state is missing event_graph")
+        key = _stable_digest(policy_state)
+        cached = self.analysis_cache.get(key)
+        if cached is not None:
+            return dict(cached)
+        target_value = self._target_value(graph)
         with torch.no_grad():
-            tensors = graph_tensors(graph, self.encoder)
-            target_value = float(self.target(*tensors))
             distribution = organization_candidate_distribution(
                 self.model, self.encoder, policy_state, torch.device("cpu")
             )
-        return {
+        result = {
             "target_value": target_value,
             "target_revision": self.target_revision,
             **distribution,
         }
+        self.analysis_cache.put(key, result)
+        return result
 
     def value(self, event_graph: Dict[str, Any]) -> Dict[str, Any]:
+        target_value = self._target_value(event_graph)
+        return {"target_value": target_value, "target_revision": self.target_revision}
+
+    def _target_value(self, event_graph: Dict[str, Any]) -> float:
+        key = _stable_digest(event_graph)
+        cached = self.value_cache.get(key)
+        if cached is not None:
+            return float(cached)
         with torch.no_grad():
             tensors = graph_tensors(event_graph, self.encoder)
             target_value = float(self.target(*tensors))
-        return {"target_value": target_value, "target_revision": self.target_revision}
+        self.value_cache.put(key, target_value)
+        return target_value
+
+
+class _LRUCache:
+    def __init__(self, maximum_size: int) -> None:
+        self.maximum_size = maximum_size
+        self.values: OrderedDict[str, Any] = OrderedDict()
+
+    def get(self, key: str) -> Any | None:
+        if key not in self.values:
+            return None
+        value = self.values.pop(key)
+        self.values[key] = value
+        return value
+
+    def put(self, key: str, value: Any) -> None:
+        self.values.pop(key, None)
+        self.values[key] = value
+        while len(self.values) > self.maximum_size:
+            self.values.popitem(last=False)
+
+
+def _stable_digest(value: Any) -> str:
+    return hashlib.sha256(json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")).hexdigest()
 
 
 def main() -> None:

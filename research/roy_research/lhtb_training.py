@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence
@@ -57,9 +58,12 @@ class LHTBProcessGRPOTrainer:
                  learning_rate: float = 1e-4, value_learning_rate: float = 1e-4,
                  ema_decay: float = 0.99, device_name: str = "cpu", seed: int = 20260820,
                  encoder: Any | None = None, resume: bool = False,
-                 actor_microbatch: int = 64, value_microbatch: int = 64) -> None:
+                 actor_microbatch: int = 64, value_microbatch: int = 64,
+                 value_state_sample_limit: int | None = 256) -> None:
         if actor_microbatch <= 0 or value_microbatch <= 0:
             raise ValueError("LHTB microbatch sizes must be positive")
+        if value_state_sample_limit is not None and value_state_sample_limit <= 0:
+            raise ValueError("LHTB value state sample limit must be positive or None")
         torch.manual_seed(seed)
         self.checkpoint = checkpoint
         self.manifest = list(manifest)
@@ -73,6 +77,7 @@ class LHTBProcessGRPOTrainer:
         self.ema_decay = ema_decay
         self.actor_microbatch = actor_microbatch
         self.value_microbatch = value_microbatch
+        self.value_state_sample_limit = value_state_sample_limit
         self.groups = 0
         self.actor_steps = 0
         self.value_steps = 0
@@ -148,11 +153,23 @@ class LHTBProcessGRPOTrainer:
 
         self.value_optimizer.zero_grad(set_to_none=True)
         value_loss_value = 0.0
-        for states, reward in zip(state_sequences, rewards):
-            scale = 1.0 / (len(records) * len(states))
-            for start in range(0, len(states), self.value_microbatch):
+        value_sampling = []
+        for trajectory_index, (states, reward) in enumerate(zip(state_sequences, rewards)):
+            selected_indices = self._value_state_indices(
+                len(states), group_id, trajectory_index
+            )
+            selected_states = [states[index] for index in selected_indices]
+            value_sampling.append({
+                "trajectory_id": records[trajectory_index].get("id"),
+                "total_states": len(states), "sampled_states": len(selected_states),
+                "sampled_indices": selected_indices,
+            })
+            # A uniform sample mean is an unbiased estimator of the original
+            # per-trajectory mean. Every trajectory still has total weight 1/G.
+            scale = 1.0 / (len(records) * len(selected_states))
+            for start in range(0, len(selected_states), self.value_microbatch):
                 predictions = self._predict_batch(
-                    self.value, states[start:start + self.value_microbatch]
+                    self.value, selected_states[start:start + self.value_microbatch]
                 )
                 target = torch.full_like(predictions, reward)
                 loss = F.huber_loss(predictions, target, reduction="sum") * scale
@@ -197,6 +214,13 @@ class LHTBProcessGRPOTrainer:
             "target_revision": self.groups - 1, "ema_decay": self.ema_decay,
             "process_rewards": process_rewards, "target_values": target_values,
             "transition_reward_summary": transition_reward_summary,
+            "value_state_sampling": {
+                "estimator": "uniform_without_replacement_equal_trajectory_unbiased",
+                "sample_limit": self.value_state_sample_limit,
+                "total_states": sum(value["total_states"] for value in value_sampling),
+                "sampled_states": sum(value["sampled_states"] for value in value_sampling),
+                "trajectories": value_sampling,
+            },
             "group_input_tokens": group_input_tokens,
             "input_token_warning_threshold": LHTB_GROUP_INPUT_TOKEN_WARNING,
             "input_token_warning": group_input_tokens > LHTB_GROUP_INPUT_TOKEN_WARNING,
@@ -204,6 +228,23 @@ class LHTBProcessGRPOTrainer:
         self.history.append(result)
         self.save()
         return {**result, "transition_samples": transition_samples}
+
+    def _value_state_indices(
+        self, state_count: int, group_id: str, trajectory_index: int
+    ) -> List[int]:
+        if state_count <= 0:
+            raise ValueError("value training requires at least one process state")
+        limit = self.value_state_sample_limit
+        if limit is None or state_count <= limit:
+            return list(range(state_count))
+        digest = hashlib.sha256(
+            f"{group_id}:{self.groups}:{trajectory_index}".encode("utf-8")
+        ).digest()
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(int.from_bytes(digest[:8], "big") % (2 ** 63 - 1))
+        return sorted(torch.randperm(
+            state_count, generator=generator
+        )[:limit].tolist())
 
     def _predict(self, model: EpistemicValueModel, state: Mapping[str, Any]) -> Tensor:
         graph = state.get("event_graph")

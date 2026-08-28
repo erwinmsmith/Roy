@@ -42,7 +42,8 @@ from roy_research.lhtb_experiment import (
     write_harbor_group_config,
 )
 from roy_research.lhtb_results import import_harbor_group, official_lhtb_reward, sample_audit
-from roy_research.lhtb_value_metrics import annotate_value_traces
+from roy_research.lhtb_value_metrics import annotate_value_traces, _predict_states
+from roy_research.lhtb_policy_server import LHTBPolicyServer, _LRUCache
 from roy_research.lhtb_transitions import (
     build_decision_transition_samples,
     build_state_transition_samples,
@@ -90,6 +91,9 @@ class FakeEncoder384:
         if len(texts):
             values[:, 0] = 1
         return values
+
+    def precache(self, _texts):
+        return None
 
 
 class FakeSemanticClient:
@@ -900,6 +904,64 @@ for line in sys.stdin:
         before = [value.clone() for value in target.parameters()]
         update_ema(target, model, 0.99)
         self.assertEqual(len(before), len(list(target.parameters())))
+
+    def test_value_inference_batches_and_reuses_identical_state_graphs(self) -> None:
+        model = EpistemicValueModel()
+        calls = []
+        original = model.forward_batch
+
+        def recording(graphs):
+            calls.append(len(graphs))
+            return original(graphs)
+
+        model.forward_batch = recording
+        first = {"nodes": [{"id": "root", "kind": "agent", "text": "solve"}],
+                 "edges": []}
+        second = {"nodes": [{"id": "root", "kind": "agent", "text": "solve"},
+                              {"id": "child", "kind": "agent", "text": "verify"}],
+                  "edges": [{"kind": "derivation", "from": "root", "to": "child"}]}
+        values = _predict_states(model, [
+            {"event_graph": first}, {"event_graph": dict(first)},
+            {"event_graph": second},
+        ], FakeEncoder384(), torch.device("cpu"))
+        self.assertEqual(calls, [2])
+        self.assertEqual(values, [0.5, 0.5, 0.5])
+
+    def test_policy_value_cache_is_canonical_and_bounded(self) -> None:
+        class CountingTarget:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, *_tensors):
+                self.calls += 1
+                return torch.tensor(0.61)
+
+        server = LHTBPolicyServer.__new__(LHTBPolicyServer)
+        server.target = CountingTarget()
+        server.target_revision = 1
+        server.encoder = FakeEncoder384()
+        server.value_cache = _LRUCache(2)
+        graph = {"nodes": [{"id": "root", "kind": "agent", "text": "solve"}],
+                 "edges": []}
+        self.assertAlmostEqual(server.value(graph)["target_value"], 0.61, places=6)
+        self.assertAlmostEqual(server.value({"edges": [], "nodes": graph["nodes"]})[
+            "target_value"], 0.61, places=6)
+        self.assertEqual(server.target.calls, 1)
+        server.value({"nodes": [{"id": "a", "kind": "agent"}], "edges": []})
+        server.value({"nodes": [{"id": "b", "kind": "agent"}], "edges": []})
+        self.assertEqual(len(server.value_cache.values), 2)
+
+    def test_value_state_minibatch_is_deterministic_and_equal_weight(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            trainer = LHTBProcessGRPOTrainer(
+                Path(directory) / "model.pt", [], encoder=FakeEncoder384(),
+                value_state_sample_limit=3,
+            )
+            first = trainer._value_state_indices(10, "group", 0)
+            self.assertEqual(first, trainer._value_state_indices(10, "group", 0))
+            self.assertEqual(len(first), 3)
+            self.assertEqual(len(set(first)), 3)
+            self.assertEqual(trainer._value_state_indices(3, "group", 0), [0, 1, 2])
 
     def test_value_trace_annotation_uses_checkpoint_target_revision(self) -> None:
         model = EpistemicValueModel()
