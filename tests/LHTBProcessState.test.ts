@@ -764,8 +764,11 @@ describe('LHTB process state', () => {
     }, close() {} };
     const stop = { id: 'stop', kind: 'STOP', actorNodeId: 'root', description: 'finish',
       schedulerComplexity: 0, action: { kind: 'STOP', actorNodeId: 'root', finalOutput: 'done' } };
+    const rootReturn = { id: 'root-return', kind: 'RETURN', actorNodeId: 'root',
+      description: 'incorrect root return', schedulerComplexity: 0,
+      action: { kind: 'RETURN', actorNodeId: 'root', report: {} } };
     const provider = { isConfigured: () => true, async completeJSONWithUsage() {
-      return { value: { preferred_candidate_id: 'stop', candidates: [stop] },
+      return { value: { preferred_candidate_id: 'stop', candidates: [rootReturn, stop] },
         completion: { content: '{}', model: 'mock', usage: {
           promptTokens: 1, completionTokens: 1, totalTokens: 2,
         } } };
@@ -783,6 +786,8 @@ describe('LHTB process state', () => {
       expect(result.status).toBe('completed');
       expect(observedState?.exploration_stop_masked).toBe(true);
       expect(observedState?.context_node_id).toBe('root');
+      expect((observedState?.candidates as Array<Record<string, unknown>>)
+        .map(candidate => candidate.kind)).toEqual(['STOP']);
       expect((observedState?.candidates as Array<Record<string, unknown>>)[0]?.legal).toBe(true);
     } finally {
       controller.close();

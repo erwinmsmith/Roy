@@ -332,7 +332,8 @@ outcomes of search. Do not use a requested topology size, minimum depth, profile
 complexity target. Progress one legal organization action at a time. A diagnostic profile may be
 present only in explicitly controlled tests; it is never terminal utility or a semantic reason to
 derive. Never relabel a root requirement as child-local to manufacture recursive depth.
-RETURN action uses the property report (never epistemicReport), with this exact report shape:
+RETURN is child-only and transfers a report to its parent; root must use STOP. RETURN action uses
+the property report (never epistemicReport), with this exact report shape:
 {"id":"...","nodeId":"<actor>","parentId":"...","depth":<actor-depth>,"localObjective":"...",
 "triggeringGapId":"...","conclusion":"...","reasoningSummary":"...","claims":[],
 "evidence":[],"externalObservations":[],"assumptions":[],"uncertainty":{"confidence":0.5,
@@ -1422,6 +1423,9 @@ export class LHTBAutonomousController {
       const directLegal = !direct || (actorNodeId === 'root'
         && ['ACQUIRE', 'EXECUTE', 'RETURN', 'STOP'].includes(kind));
       if (!directLegal) reasons.push('direct_mode_forbids_action');
+      if (kind === 'RETURN' && actorNodeId === snapshot.runtime.rootId) {
+        reasons.push('root_must_stop_not_return');
+      }
       const singleProfileLegal = !singleProfile || (actorNodeId === snapshot.runtime.rootId
         && !['DERIVE', 'CONNECT', 'PRUNE'].includes(kind));
       if (!singleProfileLegal) reasons.push('single_agent_profile_forbids_topology_change');
