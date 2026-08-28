@@ -37,9 +37,12 @@ describe('LHTB process state', () => {
   it('names every externally executable child in candidate repair requests', () => {
     const payload = JSON.parse(compactProposalRepairRequest({ organization: {
       rootId: 'root', activeNodes: [{ id: 'worker' }],
-    } }, ['missing_external_child_progress_candidate:worker'], []));
+    } }, ['missing_external_child_progress_candidate:worker',
+      'missing_child_return_candidate:worker'], []));
     expect(payload.legalInterface.requiredExternalChildProgressNodeIds).toEqual(['worker']);
+    expect(payload.legalInterface.requiredChildReturnNodeIds).toEqual(['worker']);
     expect(payload.instruction.join(' ')).toContain('ACQUIRE or EXECUTE');
+    expect(payload.instruction.join(' ')).toContain('evidence-grounded report');
   });
 
   it('covers single-agent through connected topology profiles without changing utility', () => {
@@ -1102,6 +1105,10 @@ describe('LHTB process state', () => {
       expect(accepted.candidates.map(value => value.id)).toContain('return-worker');
       expect(harness.structuralCandidateDeficits(session.snapshot(), []))
         .not.toContain('missing_external_child_progress_candidate:worker');
+      expect(harness.structuralCandidateDeficits(session.snapshot(), []))
+        .toContain('missing_child_return_candidate:worker');
+      expect(harness.structuralCandidateDeficits(session.snapshot(), accepted.candidates))
+        .not.toContain('missing_child_return_candidate:worker');
     } finally {
       controller.close();
       if (priorAttempts === undefined) delete process.env.ROY_LHTB_PROPOSAL_ATTEMPTS;

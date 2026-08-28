@@ -348,9 +348,11 @@ propose a command that diagnoses or repairs the observed failure.
 Always leave root STOP in the candidate support when required report dependencies permit it; the
 runtime also supplies a deterministic STOP candidate if it is omitted. Stopping early is legal and
 may receive a poor official verifier score. When requested artifacts exist and the task's own
-end-to-end command succeeds, prefer a legal RETURN for a child or STOP for root alongside at most
+end-to-end command succeeds, include a legal RETURN for a child or STOP for root alongside at most
 one materially useful repair or verification action; record remaining uncertainty instead of
-creating an endless verification loop.
+creating an endless verification loop. More generally, after any successful local terminal result,
+a non-root actor must include one legal RETURN candidate with its evidence-grounded report. This
+only supplies the option: the policy and MCTS still decide whether to return or continue.
 Propose only semantically useful actions. Do not expose hidden reasoning, benchmark grader data,
 keyword fields or reward. The preferred candidate is your best next organization decision.`;
 
@@ -616,6 +618,9 @@ export function compactProposalRepairRequest(
   const requiredExternalChildProgressNodeIds = reasons.filter(reason =>
     reason.startsWith('missing_external_child_progress_candidate:'))
     .map(reason => reason.slice('missing_external_child_progress_candidate:'.length));
+  const requiredChildReturnNodeIds = reasons.filter(reason =>
+    reason.startsWith('missing_child_return_candidate:'))
+    .map(reason => reason.slice('missing_child_return_candidate:'.length));
   return JSON.stringify({
     repairProtocol: 'legal-candidate-interface-v2',
     instruction: [
@@ -624,6 +629,7 @@ export function compactProposalRepairRequest(
       'Do not reproduce an unchanged rejected candidate, move a gap to a semantically related child, invent a gap, or repeat an active CONNECT edge.',
       'Topology is selected by MCTS; do not target a node count or depth or fabricate work.',
       'For every requiredExternalChildProgressNodeId, include at least one ACQUIRE or EXECUTE candidate whose actorNodeId is that exact node. A RETURN is not a substitute.',
+      'For every requiredChildReturnNodeId, include one legal RETURN candidate with an evidence-grounded report for that exact node. Other useful actions may remain as alternatives.',
     ],
     rejectionReasons: reasons,
     rejectedCandidates,
@@ -642,6 +648,7 @@ export function compactProposalRepairRequest(
       desiredAdditionalChildren: exploration.desiredAdditionalChildren,
       preferredTopologyRange: exploration.preferredTopologyRange,
       requiredExternalChildProgressNodeIds,
+      requiredChildReturnNodeIds,
       dependencies: organization.dependencies,
       communications: organization.communications,
     },
@@ -768,7 +775,8 @@ export class LHTBAutonomousController {
       ))];
       if (attempt === proposalAttempts) {
         const hasHardProgressDeficit = structuralDeficits.some(reason =>
-          reason.startsWith('missing_external_child_progress_candidate:'));
+          reason.startsWith('missing_external_child_progress_candidate:')
+          || reason.startsWith('missing_child_return_candidate:'));
         if (currentValidation.candidates.length > 0 && structuralDeficits.length > 0
           && !hasHardProgressDeficit) {
           // Topology profiles are sampling interventions, not hard resource or
@@ -1058,7 +1066,8 @@ export class LHTBAutonomousController {
         contextNodeId: scheduledOrganizationContextNode(snapshot),
       });
       const hardDeficit = structuralDeficits.some(reason =>
-        reason.startsWith('missing_external_child_progress_candidate:'));
+        reason.startsWith('missing_external_child_progress_candidate:')
+        || reason.startsWith('missing_child_return_candidate:'));
       if (validation.candidates.length > 0 && !hardDeficit) {
         return { candidates: validation.candidates, calls, inputTokens, outputTokens,
           models: [...models], attempts: attempt };
@@ -1494,6 +1503,13 @@ export class LHTBAutonomousController {
     const deficits = needsExternalProgress && !candidates.some(candidate =>
       candidate.actorNodeId === contextNodeId && ['ACQUIRE', 'EXECUTE'].includes(candidate.kind))
       ? [`missing_external_child_progress_candidate:${contextNodeId}`] : [];
+    const hasSuccessfulLocalResult = contextNode?.id !== snapshot.runtime.rootId
+      && events.some(event => event.kind === 'terminal_result' && event.nodeId === contextNodeId
+        && (event.exitCode ?? 0) === 0);
+    if (hasSuccessfulLocalResult && !candidates.some(candidate =>
+      candidate.actorNodeId === contextNodeId && candidate.kind === 'RETURN')) {
+      deficits.push(`missing_child_return_candidate:${contextNodeId}`);
+    }
     const profile = activeTopologySamplingProfile(snapshot.organizationSeed);
     if (!profile) return deficits;
     const minimumNodes = profile.preferredNodeRange[0];
