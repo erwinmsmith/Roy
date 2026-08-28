@@ -78,6 +78,7 @@ class LHTBProcessGRPOTrainer:
 
     def update_group(self, records: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         self._validate(records)
+        self._precache_group_text(records)
         group_id = str(records[0]["group_id"])
         rewards = [float(value["terminal_reward"]) for value in records]
         state_sequences = [list(value["process_states"]) for value in records]
@@ -201,6 +202,36 @@ class LHTBProcessGRPOTrainer:
             graph = epistemic_state_graph(state)
         tensors = [value.to(self.device) for value in graph_tensors(dict(graph), self.encoder)]
         return model(*tensors)
+
+    def _precache_group_text(self, records: Sequence[Mapping[str, Any]]) -> None:
+        """Batch frozen text encoding for all actor and critic replay inputs."""
+        precache = getattr(self.encoder, "precache", None)
+        if not callable(precache):
+            return
+
+        def texts() -> Any:
+            for trajectory in records:
+                for state in trajectory.get("process_states", []):
+                    graph = state.get("event_graph") if isinstance(state, Mapping) else None
+                    if not isinstance(graph, Mapping):
+                        graph = epistemic_state_graph(state)
+                    for node in graph.get("nodes", []):
+                        if isinstance(node, Mapping):
+                            yield str(node.get("text") or node.get("kind") or "")
+                for record in trajectory.get("policy_records", []):
+                    policy_state = record.get("policy_state", record.get("policyState"))
+                    if not isinstance(policy_state, Mapping):
+                        continue
+                    graph = policy_state.get("event_graph")
+                    if isinstance(graph, Mapping):
+                        for node in graph.get("nodes", []):
+                            if isinstance(node, Mapping):
+                                yield str(node.get("text") or node.get("kind") or "")
+                    for candidate in policy_state.get("candidates", []):
+                        if isinstance(candidate, Mapping):
+                            yield str(candidate.get("description") or candidate.get("kind") or "")
+
+        precache(texts())
 
     def _decision_states(self, states: Sequence[Mapping[str, Any]],
                          policy_records: Sequence[Mapping[str, Any]]) -> List[Mapping[str, Any]]:

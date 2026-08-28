@@ -58,6 +58,27 @@ class FrozenTextEncoder:
                 self._cache[key] = value.detach().cpu()
         return torch.stack([self._cache[key] for key in keys])
 
+    def precache(self, texts: Iterable[str], batch_size: int = 512) -> None:
+        """Encode unique uncached texts in bounded batches before graph replay.
+
+        Training replays thousands of closely related graph snapshots.  Calling
+        SentenceTransformer once per snapshot leaves most CPU time in many tiny
+        encoder invocations even though the embeddings themselves are frozen.
+        Prewarming the same in-memory cache changes neither model inputs nor
+        gradients; it only batches the deterministic frozen-encoder work.
+        """
+        if batch_size <= 0:
+            raise ValueError("text encoder precache batch_size must be positive")
+        pending: Dict[str, str] = {}
+        for value in texts:
+            text = str(value)
+            key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            if key not in self._cache:
+                pending.setdefault(key, text)
+        values = list(pending.values())
+        for start in range(0, len(values), batch_size):
+            self.encode(values[start:start + batch_size])
+
 
 class RelationalMessagePassing(nn.Module):
     def __init__(self, hidden_dim: int, relation_count: int) -> None:

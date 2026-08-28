@@ -110,6 +110,26 @@ class ControlledTests(unittest.TestCase):
 
 
 class ModelTests(unittest.TestCase):
+    def test_frozen_encoder_precache_deduplicates_and_batches(self) -> None:
+        class RecordingModel:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def encode(self, texts, **_kwargs):
+                self.calls.append(list(texts))
+                return torch.arange(
+                    len(texts) * TEXT_DIMENSION, dtype=torch.float32
+                ).reshape(len(texts), TEXT_DIMENSION).numpy()
+
+        encoder = FrozenTextEncoder.__new__(FrozenTextEncoder)
+        encoder.model = RecordingModel()
+        encoder._cache = {}
+        encoder.precache(["a", "b", "a", "c"], batch_size=2)
+        self.assertEqual(encoder.model.calls, [["a", "b"], ["c"]])
+        encoder.precache(["a", "c"], batch_size=1)
+        self.assertEqual(encoder.model.calls, [["a", "b"], ["c"]])
+        self.assertEqual(tuple(encoder.encode(["c", "a"]).shape), (2, TEXT_DIMENSION))
+
     def test_pinned_encoder_output_dimension(self) -> None:
         encoder = FrozenTextEncoder(device="cpu", local_only=True)
         encoded = encoder.encode(["structural decision", "dependency evidence"])
