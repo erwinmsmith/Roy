@@ -1,6 +1,8 @@
 import type { ResourceEnvelope } from './types.js';
 
-export const INFORMATION_REALIZATION_SCHEMA_VERSION = 2 as const;
+export const INFORMATION_REALIZATION_SCHEMA_VERSION = 3 as const;
+export const LHTB_POLICY_INTERFACE_REVISION =
+  'scheduler-context-structural-policy-20260828' as const;
 
 export type OrganizationActionKind =
   | 'DERIVE'
@@ -57,6 +59,7 @@ export interface OpenAgentSpecification {
   parentGoal: string;
   triggeringGapId: string;
   localObjective: string;
+  realizationMode: 'acquire_external' | 'organize_knowledge';
   refinement: RefinementCheck;
   requiredClaims: string[];
   requiredEvidence: string[];
@@ -191,7 +194,8 @@ export interface ExplorationEnvelope {
 
 export interface OrganizationPolicyRecord {
   stateFingerprint: string;
-  activeNodeId: string;
+  /** Runtime-scheduled node observed by the policy; this is not a sampled action. */
+  contextNodeId: string;
   candidateId: string;
   maskedOldLogProbability: number;
   maskedOldActionLogProbability?: number;
@@ -202,6 +206,8 @@ export interface OrganizationPolicyRecord {
   rawProbabilities?: Partial<Record<OrganizationActionKind, number>>;
   maskedProbabilities?: Partial<Record<OrganizationActionKind, number>>;
   selectedAction?: OrganizationActionKind;
+  selectedSpawnMode?: OpenAgentSpecification['realizationMode'];
+  spawnModeProbabilities?: Partial<Record<OpenAgentSpecification['realizationMode'], number>>;
   numRealResidualGaps?: number;
   numChildProposals?: number;
   stopLegalReason?: string;
@@ -218,6 +224,27 @@ export interface OrganizationPolicyRecord {
   selectedProcessReward?: number;
   targetValueRevision?: number;
   mctsSearchTrace?: Array<Record<string, unknown>>;
+  /** All counterfactual structural edges expanded during sampling. */
+  mctsSearchSamples?: Array<{
+    sampleType: 'mcts_structural_edge';
+    stateFingerprint: string;
+    childStateFingerprint: string;
+    contextNodeId: string;
+    candidateId: string;
+    policyStateFingerprint: string;
+    oldActorLogProbability: number;
+    actorPrior: number;
+    visits: number;
+    searchBehaviorProbability: number;
+    parentTargetValue: number;
+    childTargetValue: number;
+    immediateProcessReward: number;
+    backedUpAdvantage: number;
+    targetValueRevision: number;
+    rewardSource: 'frozen_value_bootstrap';
+  }>;
+  /** Deduplicated policy states referenced by mctsSearchSamples. */
+  mctsSearchStates?: Record<string, Record<string, unknown>>;
 }
 
 export interface OrganizationRuntimeBudget {

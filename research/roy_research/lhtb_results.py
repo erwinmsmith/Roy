@@ -162,6 +162,10 @@ def sample_audit(records: List[Mapping[str, Any]]) -> Dict[str, Any]:
         shaped_returns = [float(value) for value in record.get("shaped_returns", [])]
         mcts_records = [value for value in policy if isinstance(value, Mapping)
                         and value.get("behaviorPolicy", value.get("behavior_policy")) == "mcts_puct"]
+        search_samples = [sample for value in mcts_records
+                          for sample in value.get(
+                              "mctsSearchSamples", value.get("mcts_search_samples", [])
+                          ) if isinstance(sample, Mapping)]
         profiles = sorted({str(((value.get("policyState", value.get("policy_state")) or {})
                                 .get("sampling_profile") or {}).get("id"))
                            for value in policy if isinstance(value, Mapping)})
@@ -213,6 +217,20 @@ def sample_audit(records: List[Mapping[str, Any]]) -> Dict[str, Any]:
                     value.get("mctsSearchTrace", value.get("mcts_search_trace", [])))
                 for value in mcts_records
             ),
+            "mcts_search_sample_count": len(search_samples),
+            "mcts_search_samples_complete": len(mcts_records) == len(policy)
+                and all(value.get("mctsSearchSamples", value.get("mcts_search_samples"))
+                        for value in mcts_records),
+            "mcts_search_reward_signs": {
+                sign: sum((float(value.get(
+                    "backedUpAdvantage", value.get("backed_up_advantage", 0.0)
+                )) > 1e-8 if sign == "positive" else float(value.get(
+                    "backedUpAdvantage", value.get("backed_up_advantage", 0.0)
+                )) < -1e-8 if sign == "negative" else abs(float(value.get(
+                    "backedUpAdvantage", value.get("backed_up_advantage", 0.0)
+                ))) <= 1e-8) for value in search_samples)
+                for sign in ("positive", "zero", "negative")
+            },
             "tokens": record.get("tokens"), "wall_time_seconds": record.get("wall_time_seconds"),
             "complete": bool(record.get("complete")),
             "environment_failure": bool(record.get("environment_failure")),
@@ -225,6 +243,13 @@ def sample_audit(records: List[Mapping[str, Any]]) -> Dict[str, Any]:
     profile_set = sorted({profile for value in trajectories for profile in value["sampling_profiles"]})
     search_mode_set = sorted({mode for value in trajectories
                               for mode in value["topology_search_modes"]})
+    search_advantages = [float(sample.get(
+        "backedUpAdvantage", sample.get("backed_up_advantage", 0.0)
+    )) for record in records for policy_record in record.get("policy_records", [])
+        if isinstance(policy_record, Mapping)
+        for sample in policy_record.get(
+            "mctsSearchSamples", policy_record.get("mcts_search_samples", [])
+        ) if isinstance(sample, Mapping)]
     return {
         "trajectory_count": len(trajectories),
         "official_reward_std": float(np.std(terminal_rewards)) if terminal_rewards else None,
@@ -237,10 +262,16 @@ def sample_audit(records: List[Mapping[str, Any]]) -> Dict[str, Any]:
                                          for value in trajectories),
         "all_mcts_traces_complete": all(value["mcts_trace_complete"]
                                         for value in trajectories),
+        "all_mcts_search_samples_complete": all(value["mcts_search_samples_complete"]
+                                                 for value in trajectories),
+        "mcts_search_sample_count": len(search_advantages),
+        "mcts_search_advantage_std": float(np.std(search_advantages))
+            if search_advantages else None,
         "value_training_available": len(terminal_rewards) == len(trajectories)
             and len(trajectories) > 0,
-        "actor_dense_signal_available": len(shaped_returns) > 1
-            and float(np.std(shaped_returns)) > 1e-8,
+        "actor_dense_signal_available": (len(shaped_returns) > 1
+            and float(np.std(shaped_returns)) > 1e-8)
+            or (len(search_advantages) > 1 and float(np.std(search_advantages)) > 1e-8),
         "shaped_return_std": float(np.std(shaped_returns)) if shaped_returns else None,
         "preconditions_for_training": len(trajectories) == 8
             and all(value["complete"] and not value["environment_failure"]
@@ -250,6 +281,7 @@ def sample_audit(records: List[Mapping[str, Any]]) -> Dict[str, Any]:
             and all(value["transition_chain_complete"] for value in trajectories)
             and all(value["process_reward_complete"] for value in trajectories)
             and all(value["mcts_trace_complete"] for value in trajectories)
+            and all(value["mcts_search_samples_complete"] for value in trajectories)
             and len(terminal_rewards) == 8,
         "trajectories": trajectories,
     }

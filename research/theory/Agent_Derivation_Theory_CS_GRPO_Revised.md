@@ -1,6 +1,6 @@
 # Roy Information Realization and Autonomous Organization GRPO
 
-Status: canonical research specification for the `exp` branch (2026-08-20).
+Status: canonical research specification for the `exp` branch (2026-08-29).
 
 This document is the normative bridge from MIA to Roy's recursive organization policy. It replaces the earlier staged structural-learning formulation. The implementation must not introduce predefined agent roles, teacher systems, imitation learning, or a weighted sum of objectives.
 
@@ -65,18 +65,17 @@ Every node returns a structured epistemic report containing concise reasoning su
 
 ## 4. One autonomous policy
 
-Roy learns one organization policy. At each organization decision it selects an active node, an outer grammar action, and then an open payload conditioned on that action:
+Roy learns one organization policy. A deterministic dependency/event-locality scheduler first supplies the current execution owner `n_t`; this observed context is not an RL action. The policy selects an outer grammar action and then an open payload conditioned on that action:
 
 ```text
-pi_theta(n, a, z | s)
-  = pi_active(n | s)
-    pi_action(a | s, n)
-    pi_payload(z | s, n, a).
+pi_theta(a, z | s, n_t)
+  = pi_action(a | s, n_t)
+    pi_payload(z | s, n_t, a).
 ```
 
-Here `a` is one grammar action and `z` is its open payload, such as a proposed child specification, acquisition requirement, connection, report, or prune target. Outer action mass is computed independently of the number of payload candidates; multiple DERIVE specifications therefore compete only inside `pi_payload` and cannot multiply DERIVE's outer probability. Candidate count and node count are variable. No fixed role ID, fixed child catalog, teacher trajectory, or teacher score is part of the model.
+Here `a` is one grammar action and `z` is its open payload, such as a proposed child specification, acquisition requirement, connection, report, or prune target. A `DERIVE` payload explicitly identifies whether the new child realizes information by `acquire_external` or `organize_knowledge`; the specification remains open rather than selecting from a role catalog. Outer action mass is computed independently of the number of payload candidates; multiple DERIVE specifications therefore compete only inside `pi_payload` and cannot multiply DERIVE's outer probability. Candidate count and node count are variable. No fixed role ID, fixed child catalog, teacher trajectory, or teacher score is part of the model.
 
-The policy encoder is a typed relational network over derivation, dependency, communication, tool-use, evidence and return edges. It scores all currently active nodes, then embeds and scores open candidates conditioned on the sampled node and the full graph representation. Training replay must reconstruct this same joint conditional probability exactly.
+The policy encoder is a typed relational network over derivation, dependency, communication, tool-use, evidence and return edges. It embeds the scheduler-supplied context node and scores only legal open candidates owned by that node against the full graph representation. Other nodes remain visible for dependency, reuse and connection payloads, but the actor never routes execution to them. Training replay reconstructs this conditional probability exactly.
 
 Environment and graph validity are enforced before sampling by the action mask:
 
@@ -121,7 +120,7 @@ Thus the process rewards telescope exactly to `R_i - V_bar(M_i,0)` and do not in
 
 The immutable dataset retains both adjacent event transitions and SMDP decision spans. Each adjacent sample contains the exact `M_t` and `M_t+1` fingerprints, one-step topology delta, target values and signed process reward. Decision credit is the telescoping sum over all adjacent transitions until the next organization decision. The full raw runtime and semantic audit ledgers are stored once; each fingerprinted `M_t` contains a deterministic bounded relational projection with active requirements, recent typed entities, blind spots, usage and immutable ledger references. This representation prevents quadratic serialization without changing reward. Node count and topology complexity never determine reward sign; only the final-score-trained frozen value potential does.
 
-During collection, PUCT may use the actor as a prior and the same frozen potential as its search score. For an edge from state `M` to a searched leaf `M'`, backup is `V_bar(M') - V_bar(M)`; with discount one this is exactly the telescoping sum of the intervening process rewards. Root visit frequencies, rather than actor priors, are then the behavior distribution and are recorded exactly for the GRPO importance ratio. Search therefore changes exploration, not the objective. External tool actions are treated as leaves whenever their side effects cannot be cloned; claims about MCTS coverage are restricted to the cloneable organization-state candidate space.
+During collection, PUCT may use the actor as a prior and the same frozen potential as its search score. For an edge from state `M` to a searched leaf `M'`, backup is `V_bar(M') - V_bar(M)`; with discount one this is exactly the telescoping sum of the intervening process rewards. Every expanded sibling edge—not only the ultimately executed edge—is persisted with its deduplicated policy state, context node, conditional structural payload, actor prior, visits, target revision, backed-up utility and signed potential difference. The actually executed edge is later anchored by its official-verifier return; unexecuted edges remain explicitly labelled frozen-value bootstrap and are never represented as official rewards. These saved local counterfactual groups provide positive, negative and zero policy samples for replay. MCTS runs only while collecting data: optimizer updates read the saved samples and never invoke search. Search therefore changes exploration and supplies counterfactual estimates without introducing another task objective. External tool actions are treated as leaves whenever their side effects cannot be cloned; claims about MCTS coverage are restricted to the cloneable organization-state candidate space.
 
 There is no teacher, imitation, predefined role pool, staged objective, entropy bonus, cost penalty or weighted reward sum.
 

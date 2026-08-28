@@ -191,6 +191,13 @@ export class RecursiveInformationRealizationRuntime {
     }
     const objectiveKey = specification.localObjective.trim().replace(/\s+/g, ' ').toLocaleLowerCase();
     if (!objectiveKey) throw new Error('Child specification requires a local objective');
+    if (!['acquire_external', 'organize_knowledge'].includes(specification.realizationMode)) {
+      throw new Error('Child specification requires an explicit realization mode');
+    }
+    if (specification.realizationMode === 'acquire_external'
+      && specification.externalAccess.allowed !== true) {
+      throw new Error('External acquisition children require external access');
+    }
     const duplicateObjective = [...this.nodes.values()].find(node =>
       node.localObjective.trim().replace(/\s+/g, ' ').toLocaleLowerCase() === objectiveKey);
     const loadBalancingDuplicate = this.validLoadBalancingReview(specification, duplicateObjective?.id);

@@ -377,7 +377,6 @@ class InformationRealizationTests(unittest.TestCase):
             node_embeddings, node_types, scalar_features, edge_index, edge_types
         )
         resources = torch.zeros(5)
-        active = model.active_node_logits(states, graph, resources, torch.ones(4, dtype=torch.bool))
         candidates = model.candidate_logits(
             graph,
             states[0],
@@ -387,7 +386,6 @@ class InformationRealizationTests(unittest.TestCase):
             resources,
             torch.ones(11, dtype=torch.bool),
         )
-        self.assertEqual(tuple(active.shape), (4,))
         self.assertEqual(tuple(candidates.shape), (11,))
 
     def test_sample_and_replay_use_the_same_joint_conditional_policy(self) -> None:
@@ -409,12 +407,12 @@ class InformationRealizationTests(unittest.TestCase):
                 ],
                 "edges": [{"from": "root", "to": "child", "kind": "derivation"}],
             },
-            "active_node_ids": ["root", "child"],
-            "active_node_legal": [True, True],
+            "context_node_id": "root",
             "candidates": [
                 {
                     "id": "execute",
                     "kind": "EXECUTE",
+                    "actor_node_id": "root",
                     "description": "reason locally",
                     "legal": True,
                     "scheduler_complexity": 1.0,
@@ -422,6 +420,7 @@ class InformationRealizationTests(unittest.TestCase):
                 {
                     "id": "derive",
                     "kind": "DERIVE",
+                    "actor_node_id": "root",
                     "description": "resolve the remaining evidence gap",
                     "legal": True,
                     "scheduler_complexity": 3.0,
@@ -450,6 +449,8 @@ class InformationRealizationTests(unittest.TestCase):
         )
         self.assertNotIn("behavior_log_probability", record)
         self.assertNotIn("exploration_alpha", record)
+        self.assertEqual(record["context_node_id"], "root")
+        self.assertNotIn("active_node_id", record)
 
     def test_single_objective_group_advantage_and_loss(self) -> None:
         records = [

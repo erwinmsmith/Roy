@@ -72,6 +72,7 @@ describe('LHTB process state', () => {
     const childSpecification = {
       id: 'spec-worker', nodeId: 'worker', parentId: 'root', depth: 1,
       parentGoal: 'inspect and solve', triggeringGapId: 'root-task-requirement',
+      realizationMode: 'acquire_external' as const,
       localObjective: 'Inspect one part.', refinement: {
         parentScope: 'inspect and solve', childScope: 'inspect one part',
         triggeringRequirementId: 'root-task-requirement', narrowerThanParent: true,
@@ -103,7 +104,7 @@ describe('LHTB process state', () => {
       Record<string, unknown>>) {
       policyCandidates = values;
       return { candidate: values[0], record: { stateFingerprint: 'state',
-        activeNodeId: 'root', candidateId: String(values[0]?.id),
+        contextNodeId: 'root', candidateId: String(values[0]?.id),
         maskedOldLogProbability: 0, envelopeId: 'single' } };
     }, close() {} };
     const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false,
@@ -137,6 +138,7 @@ describe('LHTB process state', () => {
     const childSpecification = {
       id: 'spec-child', nodeId: 'child', parentId: 'root', depth: 1,
       parentGoal: 'implement and verify', triggeringGapId: 'root-a',
+      realizationMode: 'acquire_external' as const,
       localObjective: 'Implement one bounded component.', refinement: {
         parentScope: 'implement and verify', childScope: 'implement one component',
         triggeringRequirementId: 'root-a', narrowerThanParent: true,
@@ -433,6 +435,7 @@ describe('LHTB process state', () => {
     const childSpecification = {
       id: 'spec-worker', nodeId: 'worker', parentId: 'root', depth: 1,
       parentGoal: 'implement and verify', triggeringGapId: 'root-task-requirement',
+      realizationMode: 'acquire_external' as const,
       localObjective: 'Implement the bounded code change and report verification evidence.',
       refinement: { parentScope: 'implement and verify', childScope: 'implement code change',
         triggeringRequirementId: 'root-task-requirement', narrowerThanParent: true,
@@ -476,6 +479,7 @@ describe('LHTB process state', () => {
     const childSpecification = {
       id: 'spec-validator', nodeId: 'validator', parentId: 'root', depth: 1,
       parentGoal: 'implement and verify', triggeringGapId: 'first-gap',
+      realizationMode: 'acquire_external' as const,
       localObjective: 'Inspect one validation failure and return a concrete diagnosis.',
       refinement: { parentScope: 'implement and verify', childScope: 'inspect one failure',
         triggeringRequirementId: 'first-gap', narrowerThanParent: true,
@@ -539,6 +543,7 @@ describe('LHTB process state', () => {
       childSpecification: {
         id: 'spec-child', nodeId: 'child', parentId: 'root', depth: 1,
         parentGoal: 'implement and verify', triggeringGapId: 'root-task-requirement',
+        realizationMode: 'acquire_external' as const,
         localObjective: 'verify one bounded behavior', refinement: {
           parentScope: 'implement and verify', childScope: 'verify one bounded behavior',
           triggeringRequirementId: 'root-task-requirement', narrowerThanParent: true,
@@ -620,7 +625,7 @@ describe('LHTB process state', () => {
       id: string; actorNodeId: string; kind: string;
     }>) {
       const candidate = candidates[0];
-      return { candidate, record: { stateFingerprint: 'state', activeNodeId: candidate.actorNodeId,
+      return { candidate, record: { stateFingerprint: 'state', contextNodeId: candidate.actorNodeId,
         candidateId: candidate.id, maskedOldLogProbability: 0, envelopeId: 'connected' } };
     }, close() {} };
     const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false,
@@ -753,7 +758,7 @@ describe('LHTB process state', () => {
     let observedState: Record<string, unknown> | undefined;
     const learnedPolicy = { async select(policyState: Record<string, unknown>) {
       observedState = policyState;
-      return { candidate: stop, record: { stateFingerprint: 'state', activeNodeId: 'root',
+      return { candidate: stop, record: { stateFingerprint: 'state', contextNodeId: 'root',
         candidateId: 'stop', maskedOldLogProbability: 0, envelopeId: 'connected' } };
     }, close() {} };
     const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false,
@@ -762,7 +767,7 @@ describe('LHTB process state', () => {
       const result = await controller.advance(session, 1);
       expect(result.status).toBe('completed');
       expect(observedState?.exploration_stop_masked).toBe(true);
-      expect(observedState?.active_node_legal).toEqual([true]);
+      expect(observedState?.context_node_id).toBe('root');
       expect((observedState?.candidates as Array<Record<string, unknown>>)[0]?.legal).toBe(true);
     } finally {
       controller.close();
@@ -787,6 +792,7 @@ describe('LHTB process state', () => {
     const childSpecification = {
       id: 'spec-worker', nodeId: 'worker', parentId: 'root', depth: 1,
       parentGoal: 'finish', triggeringGapId: 'root-task-requirement',
+      realizationMode: 'acquire_external' as const,
       localObjective: 'Inspect and report one bounded result.', refinement: {
         parentScope: 'finish', childScope: 'inspect one result',
         triggeringRequirementId: 'root-task-requirement', narrowerThanParent: true,
@@ -825,9 +831,10 @@ describe('LHTB process state', () => {
         } } };
     } };
     let analyses = 0;
+    const analyzedContexts: string[] = [];
     const learnedPolicy = { async analyze(policyState: Record<string, unknown>) {
       analyses += 1;
-      expect((policyState.active_node_legal as boolean[]).some(Boolean)).toBe(true);
+      analyzedContexts.push(String(policyState.context_node_id));
       const values = policyState.candidates as Array<Record<string, unknown>>;
       return { targetValue: 0.5, targetRevision: 0,
         candidatePriors: Object.fromEntries(values.map(value => [String(value.id), 1])),
@@ -842,6 +849,7 @@ describe('LHTB process state', () => {
       const result = await controller.advance(session, 7);
       expect(['continue', 'terminal_request']).toContain(result.status);
       expect(analyses).toBeGreaterThan(0);
+      expect(analyzedContexts).toContain('worker');
     } finally {
       controller.close();
       if (priorMCTS === undefined) delete process.env.ROY_LHTB_MCTS_ENABLED;
@@ -916,6 +924,7 @@ describe('LHTB process state', () => {
     const childSpecification = {
       id: 'spec-worker', nodeId: 'worker', parentId: 'root', depth: 1,
       parentGoal: 'finish', triggeringGapId: 'root-task-requirement',
+      realizationMode: 'acquire_external' as const,
       localObjective: 'Inspect and verify the workspace.', refinement: {
         parentScope: 'finish', childScope: 'inspect and verify the workspace',
         triggeringRequirementId: 'root-task-requirement', narrowerThanParent: true,
@@ -1050,6 +1059,7 @@ describe('LHTB process state', () => {
     const firstChild = {
       id: 'spec-worker', nodeId: 'worker', parentId: 'root', depth: 1,
       parentGoal: 'inspect two independent failures', triggeringGapId: 'child-gap',
+      realizationMode: 'acquire_external' as const,
       localObjective: 'Inspect only the first failure and report its diagnosis.',
       refinement: { parentScope: 'inspect two failures', childScope: 'inspect first failure',
         triggeringRequirementId: 'child-gap', narrowerThanParent: true,

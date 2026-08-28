@@ -11,8 +11,9 @@ from typing import Any, Dict, List
 import torch
 
 from .model import FrozenTextEncoder, graph_tensors
-from .organization_model import InformationRealizationPolicy
+from .organization_model import InformationRealizationPolicy, LHTB_ACTOR_MODEL_REVISION
 from .organization_replay import (
+    _candidate_text,
     organization_candidate_distribution,
     sample_organization_decision,
 )
@@ -31,6 +32,13 @@ class LHTBPolicyServer:
                 "LHTB value checkpoint is incompatible: expected "
                 f"{LHTB_VALUE_MODEL_REVISION}, found {checkpoint_revision or 'legacy'}; "
                 "initialize a fresh checkpoint and keep the legacy file for audit"
+            )
+        actor_revision = payload.get("metadata", {}).get("actor_model_revision")
+        if actor_revision != LHTB_ACTOR_MODEL_REVISION:
+            raise ValueError(
+                "LHTB actor checkpoint is incompatible: expected "
+                f"{LHTB_ACTOR_MODEL_REVISION}, found "
+                f"{actor_revision or 'legacy-active-node-routing'}; initialize a fresh checkpoint"
             )
         self.model = InformationRealizationPolicy()
         state = payload.get("actor_state_dict", payload.get("state_dict"))
@@ -69,7 +77,7 @@ class LHTBPolicyServer:
             return dict(cached)
         self.encoder.precache([
             *_event_graph_texts(graph),
-            *(str(candidate.get("description") or candidate.get("kind") or "")
+            *(_candidate_text(candidate)
               for candidate in policy_state.get("candidates", [])
               if isinstance(candidate, dict)),
         ])

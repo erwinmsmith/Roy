@@ -11,13 +11,16 @@ from .model import EDGE_KINDS, NODE_KINDS, RelationalMessagePassing, TEXT_DIMENS
 from .organization import ORGANIZATION_ACTIONS
 
 
-class InformationRealizationPolicy(nn.Module):
-    """Joint active-node and open organization-candidate policy.
+LHTB_ACTOR_MODEL_REVISION = "scheduler-context-structural-policy-20260828"
 
-    Agent specifications are not selected from predefined roles. An executing
-    node emits residual requirements and open child proposals as part of its
-    epistemic report. This policy embeds those current proposals and chooses
-    among them jointly with the fixed organization grammar.
+
+class InformationRealizationPolicy(nn.Module):
+    """Structural action policy for a scheduler-selected context node.
+
+    The Runtime scheduler supplies the node that currently owns execution.  It
+    is observed context, never a learned routing action.  The policy chooses an
+    outer organization action and, conditionally, its open child specification
+    or connection payload from the candidates generated for that one node.
     """
 
     def __init__(
@@ -38,9 +41,6 @@ class InformationRealizationPolicy(nn.Module):
         )
         self.resource_projection = nn.Sequential(
             nn.Linear(resource_dim, 64), nn.GELU(), nn.LayerNorm(64)
-        )
-        self.active_node_head = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + 64, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 1)
         )
         self.candidate_head = nn.Sequential(
             nn.Linear(hidden_dim * 2 + text_dim + action_type_dim + 64 + 4, hidden_dim),
@@ -105,27 +105,10 @@ class InformationRealizationPolicy(nn.Module):
         chunks = states.split(counts)
         return [(chunk, chunk.mean(dim=0)) for chunk in chunks]
 
-    def active_node_logits(
-        self,
-        node_states: Tensor,
-        graph_state: Tensor,
-        resources: Tensor,
-        active_mask: Tensor,
-    ) -> Tensor:
-        if node_states.shape[0] == 0:
-            raise ValueError("organization policy requires at least one active-node candidate")
-        resource_state = self.resource_projection(resources.float())
-        repeated_graph = graph_state.unsqueeze(0).expand(node_states.shape[0], -1)
-        repeated_resources = resource_state.unsqueeze(0).expand(node_states.shape[0], -1)
-        logits = self.active_node_head(
-            torch.cat([node_states, repeated_graph, repeated_resources], dim=-1)
-        ).squeeze(-1)
-        return _masked_logits(logits, active_mask)
-
     def candidate_logits(
         self,
         graph_state: Tensor,
-        active_node_state: Tensor,
+        context_node_state: Tensor,
         candidate_embeddings: Tensor,
         candidate_action_types: Tensor,
         candidate_features: Tensor,
@@ -139,7 +122,7 @@ class InformationRealizationPolicy(nn.Module):
         values = torch.cat(
             [
                 graph_state.unsqueeze(0).expand(count, -1),
-                active_node_state.unsqueeze(0).expand(count, -1),
+                context_node_state.unsqueeze(0).expand(count, -1),
                 candidate_embeddings,
                 self.action_types(candidate_action_types.long()),
                 resource_state.unsqueeze(0).expand(count, -1),

@@ -247,7 +247,7 @@ def register_tau3_organization_agent(
                 state.policy_records.append(record)
                 action_record = {
                     "kind": candidate["kind"],
-                    "actor_node_id": record["active_node_id"],
+                    "actor_node_id": record["context_node_id"],
                     "candidate_id": candidate["id"],
                     "description": candidate.get("description"),
                 }
@@ -264,7 +264,7 @@ def register_tau3_organization_agent(
                     "task_id": state.task_id,
                     "decision": state.decision_count + 1,
                     "kind": candidate["kind"],
-                    "actor_node_id": record["active_node_id"],
+                    "actor_node_id": record["context_node_id"],
                     "candidate_id": candidate["id"],
                     "tool_name": candidate.get("tool_name"),
                     "nodes": len(state.nodes),
@@ -798,26 +798,23 @@ def register_tau3_organization_agent(
                 for value in state.communication_edges
             ]
             active_ids = sorted({str(value["actor_node_id"]) for value in candidates})
-            unresolved_gap_exists = self._has_actionable_residual_gap(candidates)
+            node_depth = {str(value["id"]): int(value["depth"]) for value in state.nodes}
+            context_node_id = max(active_ids, key=lambda value: (node_depth.get(value, 0), value))
+            context_candidates = [value for value in candidates
+                                  if str(value["actor_node_id"]) == context_node_id]
+            unresolved_gap_exists = self._has_actionable_residual_gap(context_candidates)
             envelope_legal = envelope_legal_actions(
-                candidates,
+                context_candidates,
                 config.envelope(),
                 len(state.nodes),
                 max(int(value["depth"]) for value in state.nodes),
                 unresolved_gap_exists,
             )
-            active_legal = [
-                any(
-                    legal and str(candidate["actor_node_id"]) == actor_id
-                    for candidate, legal in zip(candidates, envelope_legal)
-                )
-                for actor_id in active_ids
-            ]
             resources = self._resource_fractions(state)
             fingerprint_payload = {
                 "nodes": nodes,
                 "edges": edges,
-                "candidate_ids": [str(value["id"]) for value in candidates],
+                "candidate_ids": [str(value["id"]) for value in context_candidates],
                 "candidate_legal": envelope_legal,
                 "resources": resources,
                 "envelope": config.envelope().to_dict(),
@@ -825,9 +822,8 @@ def register_tau3_organization_agent(
             return {
                 "state_fingerprint": _stable_json_hash(fingerprint_payload),
                 "event_graph": {"nodes": nodes, "edges": edges},
-                "active_node_ids": active_ids,
-                "active_node_legal": active_legal,
-                "candidates": candidates,
+                "context_node_id": context_node_id,
+                "candidates": context_candidates,
                 "resources": resources,
                 "node_count": len(state.nodes),
                 "maximum_depth_reached": max(int(value["depth"]) for value in state.nodes),

@@ -17,8 +17,8 @@ from .lhtb_transitions import (
 )
 from .model import FrozenTextEncoder, epistemic_state_graph, graph_tensors
 from .organization import LHTB_POLICY_INTERFACE_REVISION
-from .organization_model import InformationRealizationPolicy
-from .organization_replay import replay_joint_log_probabilities
+from .organization_model import InformationRealizationPolicy, LHTB_ACTOR_MODEL_REVISION
+from .organization_replay import _candidate_text, replay_joint_log_probabilities
 from .value_model import (
     EpistemicValueModel,
     LHTB_VALUE_MODEL_REVISION,
@@ -117,36 +117,48 @@ class LHTBProcessGRPOTrainer:
         process_rewards, returns = process_credit(target_values, rewards)
         advantages, return_mean, shaped_std = trajectory_weighted_advantages(returns)
 
-        actor_updated = shaped_std > 1e-8
+        actor_updated = False
         actor_loss_value: float | None = None
-        if actor_updated:
-            self.actor_optimizer.zero_grad(set_to_none=True)
-            actor_loss_value = 0.0
-            for trajectory, step_advantages in zip(records, advantages):
-                policy_records = list(trajectory["policy_records"])
-                if len(policy_records) != len(step_advantages):
-                    raise ValueError("policy decisions must align with process credit")
-                behavior = torch.tensor(
-                    [float(record.get("masked_old_log_probability",
-                                      record.get("maskedOldLogProbability")))
-                     for record in policy_records],
-                    dtype=torch.float32, device=self.device,
+        actor_trajectory_losses: List[Tensor] = []
+        search_training_summary = {
+            "states": 0, "edges": 0, "positive": 0, "negative": 0, "zero": 0,
+            "official_selected_edge_overrides": 0,
+        }
+        for trajectory, raw_returns, step_advantages in zip(records, returns, advantages):
+            policy_records = list(trajectory["policy_records"])
+            if len(policy_records) != len(step_advantages):
+                raise ValueError("policy decisions must align with process credit")
+            decision_losses: List[Tensor] = []
+            for record, actual_return, actual_advantage in zip(
+                policy_records, raw_returns, step_advantages.tolist()
+            ):
+                local_losses = self._saved_search_policy_losses(
+                    record, float(actual_return), search_training_summary
                 )
-                step_advantages = step_advantages.to(self.device)
-                for start in range(0, len(policy_records), self.actor_microbatch):
-                    stop = start + self.actor_microbatch
-                    current = replay_joint_log_probabilities(
-                        self.actor, self.encoder, policy_records[start:stop], self.device
-                    )
-                    old = behavior[start:stop]
-                    advantage = step_advantages[start:stop].to(dtype=current.dtype)
-                    ratio = torch.exp(current - old.detach())
-                    clipped = torch.clamp(ratio, 0.8, 1.2)
-                    loss = -torch.minimum(
-                        ratio * advantage, clipped * advantage
-                    ).sum() / (len(records) * len(policy_records))
-                    loss.backward()
-                    actor_loss_value += float(loss.detach().cpu())
+                if local_losses:
+                    decision_losses.append(torch.stack(local_losses).mean())
+                    continue
+                if abs(float(actual_advantage)) <= 1e-8:
+                    continue
+                current = replay_joint_log_probabilities(
+                    self.actor, self.encoder, [record], self.device
+                )[0]
+                old = torch.tensor(float(record.get(
+                    "masked_old_log_probability", record.get("maskedOldLogProbability")
+                )), dtype=current.dtype, device=self.device)
+                advantage = torch.tensor(float(actual_advantage), dtype=current.dtype,
+                                         device=self.device)
+                ratio = torch.exp(current - old.detach())
+                clipped = torch.clamp(ratio, 0.8, 1.2)
+                decision_losses.append(-torch.minimum(ratio * advantage, clipped * advantage))
+            if decision_losses:
+                actor_trajectory_losses.append(torch.stack(decision_losses).mean())
+        if actor_trajectory_losses:
+            actor_updated = True
+            self.actor_optimizer.zero_grad(set_to_none=True)
+            loss = torch.stack(actor_trajectory_losses).mean()
+            loss.backward()
+            actor_loss_value = float(loss.detach().cpu())
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
             self.actor_optimizer.step()
             self.actor_steps += 1
@@ -207,8 +219,10 @@ class LHTBProcessGRPOTrainer:
         self.updated_group_ids.add(group_id)
         result: Dict[str, Any] = {
             "group_id": group_id, "actor_updated": actor_updated,
-            "actor_skip_reason": None if actor_updated else "zero_shaped_return_variance",
+            "actor_skip_reason": None if actor_updated
+            else "zero_real_and_saved_search_advantage_variance",
             "actor_loss": actor_loss_value, "value_loss": value_loss_value,
+            "mcts_saved_search_training": search_training_summary,
             "terminal_reward_std": float(torch.tensor(rewards).std(unbiased=False)),
             "shaped_return_mean": return_mean, "shaped_return_std": shaped_std,
             "target_revision": self.groups - 1, "ema_decay": self.ema_decay,
@@ -228,6 +242,88 @@ class LHTBProcessGRPOTrainer:
         self.history.append(result)
         self.save()
         return {**result, "transition_samples": transition_samples}
+
+    def _saved_search_policy_losses(
+        self, record: Mapping[str, Any], actual_return: float,
+        summary: Dict[str, int],
+    ) -> List[Tensor]:
+        """Replay MCTS edges saved by the sampler; never execute search here."""
+        behavior_kind = record.get("behavior_policy", record.get("behaviorPolicy"))
+        if behavior_kind != "mcts_puct":
+            return []
+        raw_samples = record.get("mcts_search_samples", record.get("mctsSearchSamples"))
+        if not isinstance(raw_samples, Sequence) or not raw_samples:
+            raise ValueError("MCTS sampling record has no saved structural-edge samples")
+        search_states = record.get("mcts_search_states", record.get("mctsSearchStates"))
+        if not isinstance(search_states, Mapping) or not search_states:
+            raise ValueError("MCTS sampling record has no deduplicated search states")
+        grouped: Dict[tuple[str, int], List[Mapping[str, Any]]] = {}
+        for sample in raw_samples:
+            if not isinstance(sample, Mapping):
+                raise ValueError("invalid saved MCTS structural-edge sample")
+            state = str(sample.get("state_fingerprint", sample.get("stateFingerprint", "")))
+            revision = int(sample.get(
+                "target_value_revision", sample.get("targetValueRevision", -1)
+            ))
+            grouped.setdefault((state, revision), []).append(sample)
+        selected_state = str(record.get("state_fingerprint", record.get("stateFingerprint", "")))
+        selected_candidate = str(record.get("candidate_id", record.get("candidateId", "")))
+        losses: List[Tensor] = []
+        for (state_fingerprint, _revision), samples in grouped.items():
+            priors = torch.tensor([
+                float(value.get("actor_prior", value.get("actorPrior", 0.0)))
+                for value in samples
+            ], dtype=torch.float32, device=self.device)
+            if bool((priors <= 0).any()) or not bool(torch.isfinite(priors).all()):
+                raise ValueError("saved MCTS actor priors must be finite and positive")
+            priors = priors / priors.sum()
+            action_values = []
+            replay_records = []
+            old_logs = []
+            for sample in samples:
+                candidate_id = str(sample.get("candidate_id", sample.get("candidateId", "")))
+                value = float(sample.get(
+                    "backed_up_advantage", sample.get("backedUpAdvantage", 0.0)
+                ))
+                if state_fingerprint == selected_state and candidate_id == selected_candidate:
+                    value = actual_return
+                    summary["official_selected_edge_overrides"] += 1
+                action_values.append(value)
+                policy_state_fingerprint = str(sample.get(
+                    "policy_state_fingerprint", sample.get("policyStateFingerprint", "")
+                ))
+                policy_state = search_states.get(policy_state_fingerprint)
+                if not isinstance(policy_state, Mapping):
+                    raise ValueError("saved MCTS edge references a missing search policy state")
+                context_node = sample.get("context_node_id", sample.get("contextNodeId"))
+                replay_records.append({
+                    "policy_state": policy_state, "context_node_id": context_node,
+                    "candidate_id": candidate_id,
+                })
+                old_logs.append(float(sample.get(
+                    "old_actor_log_probability", sample.get("oldActorLogProbability")
+                )))
+            values = torch.tensor(action_values, dtype=torch.float32, device=self.device)
+            mean = (values * priors).sum()
+            variance = ((values - mean).square() * priors).sum()
+            deviation = torch.sqrt(variance)
+            summary["states"] += 1
+            summary["edges"] += len(samples)
+            summary["positive"] += sum(value > 1e-8 for value in action_values)
+            summary["negative"] += sum(value < -1e-8 for value in action_values)
+            summary["zero"] += sum(abs(value) <= 1e-8 for value in action_values)
+            if float(deviation.detach().cpu()) <= 1e-8:
+                continue
+            advantages = (values - mean) / (deviation + 1e-8)
+            current = replay_joint_log_probabilities(
+                self.actor, self.encoder, replay_records, self.device
+            )
+            old = torch.tensor(old_logs, dtype=current.dtype, device=self.device)
+            ratio = torch.exp(current - old.detach())
+            clipped = torch.clamp(ratio, 0.8, 1.2)
+            objective = torch.minimum(ratio * advantages, clipped * advantages)
+            losses.append(-(objective * priors).sum())
+        return losses
 
     def _value_state_indices(
         self, state_count: int, group_id: str, trajectory_index: int
@@ -292,7 +388,7 @@ class LHTBProcessGRPOTrainer:
                                 yield str(node.get("text") or node.get("kind") or "")
                     for candidate in policy_state.get("candidates", []):
                         if isinstance(candidate, Mapping):
-                            yield str(candidate.get("description") or candidate.get("kind") or "")
+                            yield _candidate_text(candidate)
 
         precache(texts())
 
@@ -393,27 +489,24 @@ class LHTBProcessGRPOTrainer:
             for record in policy:
                 if not isinstance(record, Mapping):
                     raise ValueError("policy records must be mappings")
+                old_log = float(record.get(
+                    "masked_old_log_probability", record.get("maskedOldLogProbability")
+                ))
+                if not math.isfinite(old_log):
+                    raise ValueError("policy record requires a finite saved behavior log-probability")
                 behavior_kind = record.get("behavior_policy", record.get("behaviorPolicy"))
                 if behavior_kind == "mcts_puct":
-                    self._validate_mcts_behavior(record, int(value["policy_revision"]))
-        search_modes = {
-            str(((record.get("policy_state") or record.get("policyState") or {})
-                 .get("topology_search") or {}).get("mode"))
-            for value in records for record in list(value["policy_records"])
-        }
-        if search_modes != {"mcts_unconstrained"}:
-            raise ValueError(
-                f"formal LHTB training requires unconstrained MCTS topology search; "
-                f"observed {sorted(search_modes)}"
-            )
+                    self._validate_saved_search_samples(record, int(value["policy_revision"]))
 
     @staticmethod
-    def _validate_mcts_behavior(record: Mapping[str, Any], policy_revision: int) -> None:
+    def _validate_saved_search_samples(record: Mapping[str, Any], policy_revision: int) -> None:
+        """Validate sampler output only; this method never runs or imports MCTS."""
         probabilities = record.get(
             "mcts_behavior_probabilities", record.get("mctsBehaviorProbabilities")
         )
         visits = record.get("mcts_visit_counts", record.get("mctsVisitCounts"))
-        trace = record.get("mcts_search_trace", record.get("mctsSearchTrace"))
+        samples = record.get("mcts_search_samples", record.get("mctsSearchSamples"))
+        search_states = record.get("mcts_search_states", record.get("mctsSearchStates"))
         selected = str(record.get("candidate_id", record.get("candidateId", "")))
         if not isinstance(probabilities, Mapping) or not isinstance(visits, Mapping):
             raise ValueError("MCTS policy record is missing behavior probabilities or visits")
@@ -432,15 +525,32 @@ class LHTBProcessGRPOTrainer:
         if int(record.get("target_value_revision",
                           record.get("targetValueRevision", -1))) != policy_revision:
             raise ValueError("MCTS search used a stale target-value revision")
-        if not isinstance(trace, Sequence) or not any(
-            isinstance(value, Mapping) and value.get("phase") == "backup" for value in trace
-        ):
-            raise ValueError("MCTS search trace has no PUCT backup")
+        if not isinstance(samples, Sequence) or not samples:
+            raise ValueError("MCTS sampler saved no structural-edge training samples")
+        if not isinstance(search_states, Mapping) or not search_states:
+            raise ValueError("MCTS sampler saved no deduplicated policy-state table")
+        for sample in samples:
+            if not isinstance(sample, Mapping):
+                raise ValueError("invalid MCTS structural-edge training sample")
+            if sample.get("reward_source", sample.get("rewardSource")) != "frozen_value_bootstrap":
+                raise ValueError("counterfactual MCTS edges must identify frozen value bootstrap")
+            sample_revision = int(sample.get(
+                "target_value_revision", sample.get("targetValueRevision", -1)
+            ))
+            if sample_revision != policy_revision:
+                raise ValueError("saved MCTS edge used a stale target-value revision")
+            state_ref = str(sample.get(
+                "policy_state_fingerprint", sample.get("policyStateFingerprint", "")
+            ))
+            if state_ref not in search_states or not isinstance(search_states[state_ref], Mapping):
+                raise ValueError("saved MCTS edge is missing replayable policy state")
 
     def metadata(self) -> Dict[str, Any]:
         return {
             "method": "learned_information_realization", "benchmark": "lhtb",
             "objective": "official_terminal_reward_with_ema_delta_value_credit",
+            "actor_model_revision": LHTB_ACTOR_MODEL_REVISION,
+            "search_role": "sampling_only_saved_edges_replayed_without_search",
             "value_model_revision": LHTB_VALUE_MODEL_REVISION,
             "groups": self.groups, "actor_steps": self.actor_steps,
             "value_steps": self.value_steps, "ema_decay": self.ema_decay,
@@ -460,6 +570,13 @@ class LHTBProcessGRPOTrainer:
 
     def _restore(self) -> None:
         payload = torch.load(self.checkpoint, map_location=self.device, weights_only=False)
+        actor_revision = payload.get("metadata", {}).get("actor_model_revision")
+        if actor_revision != LHTB_ACTOR_MODEL_REVISION:
+            raise ValueError(
+                "LHTB actor checkpoint is incompatible: expected "
+                f"{LHTB_ACTOR_MODEL_REVISION}, found {actor_revision or 'legacy-active-node-routing'}; "
+                "initialize a fresh structural-policy checkpoint"
+            )
         self.actor.load_state_dict(payload["actor_state_dict"])
         self.value.load_state_dict(payload["value_state_dict"])
         self.target.load_state_dict(payload["target_state_dict"])

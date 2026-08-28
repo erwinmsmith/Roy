@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import tempfile
 import unittest
 import sys
@@ -802,8 +803,7 @@ for line in sys.stdin:
             "state_fingerprint": "m0",
             "event_graph": {"nodes": [{"id": "root", "kind": "agent",
                 "timestamp": 0, "text": "solve", "status": "ready"}], "edges": []},
-            "active_node_ids": ["root"], "active_node_legal": [True],
-            "active_node_sampling_logit_bias": [0.0],
+            "context_node_id": "root",
             "candidates": [{"id": "derive", "kind": "DERIVE",
                 "actor_node_id": "root", "description": "derive another child",
                 "scheduler_complexity": 1, "legal": True, "sampling_logit_bias": -100.0},
@@ -1029,6 +1029,16 @@ for line in sys.stdin:
             self.assertEqual(enriched["state_transitions"], [])
 
     def test_mcts_behavior_probability_is_exact_and_revision_locked(self) -> None:
+        search_sample = {
+            "stateFingerprint": "m0", "childStateFingerprint": "m1",
+            "contextNodeId": "root", "candidateId": "derive",
+            "policyStateFingerprint": "m0",
+            "oldActorLogProbability": float(torch.log(torch.tensor(0.75))),
+            "actorPrior": 0.75, "visits": 18, "searchBehaviorProbability": 0.75,
+            "parentTargetValue": 0.4, "childTargetValue": 0.6,
+            "immediateProcessReward": 0.2, "backedUpAdvantage": 0.2,
+            "targetValueRevision": 2, "rewardSource": "frozen_value_bootstrap",
+        }
         record = {
             "behaviorPolicy": "mcts_puct", "candidateId": "derive",
             "mctsBehaviorProbabilities": {"derive": 0.75, "execute": 0.25},
@@ -1036,13 +1046,15 @@ for line in sys.stdin:
             "maskedOldLogProbability": float(torch.log(torch.tensor(0.75))),
             "targetValueRevision": 2,
             "mctsSearchTrace": [{"phase": "selection"}, {"phase": "backup"}],
+            "mctsSearchSamples": [search_sample],
+            "mctsSearchStates": {"m0": {"context_node_id": "root"}},
         }
-        LHTBProcessGRPOTrainer._validate_mcts_behavior(record, 2)
+        LHTBProcessGRPOTrainer._validate_saved_search_samples(record, 2)
         with self.assertRaisesRegex(ValueError, "stale target-value"):
-            LHTBProcessGRPOTrainer._validate_mcts_behavior(record, 3)
+            LHTBProcessGRPOTrainer._validate_saved_search_samples(record, 3)
         invalid = {**record, "maskedOldLogProbability": 0.0}
         with self.assertRaisesRegex(ValueError, "exact old-policy"):
-            LHTBProcessGRPOTrainer._validate_mcts_behavior(invalid, 2)
+            LHTBProcessGRPOTrainer._validate_saved_search_samples(invalid, 2)
 
     def test_sample_audit_exposes_step_rewards_topology_and_mcts(self) -> None:
         states = [{"sequence": 0, "fingerprint": "m0", "nodes": [{"id": "root",
@@ -1080,7 +1092,7 @@ for line in sys.stdin:
                 "state_fingerprint": "m0",
                 "event_graph": {"nodes": [{"id": "root", "kind": "agent",
                     "timestamp": 0, "text": "solve", "status": "ready"}], "edges": []},
-                "active_node_ids": ["root"], "active_node_legal": [True],
+                "context_node_id": "root",
                 "candidates": [{"id": "stop", "kind": "STOP", "actor_node_id": "root",
                     "description": "finish", "scheduler_complexity": 0, "legal": True}],
                 "envelope": {"id": "open", "minimum_nodes": 0, "maximum_nodes": 100,
@@ -1151,6 +1163,64 @@ for line in sys.stdin:
             self.assertEqual(restored.groups, 1)
             self.assertEqual(restored.value_steps, 1)
             self.assertEqual(restored.actor_steps, 0)
+
+    def test_trainer_replays_all_saved_mcts_edges_without_running_search(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            trainer = LHTBProcessGRPOTrainer(
+                Path(directory) / "model.pt", [], encoder=FakeEncoder384()
+            )
+            policy_state = {
+                "interface_revision": LHTB_POLICY_INTERFACE_REVISION,
+                "state_fingerprint": "m0", "context_node_id": "root",
+                "event_graph": {"nodes": [{"id": "root", "kind": "agent",
+                    "timestamp": 0, "text": "solve", "status": "ready"}], "edges": []},
+                "candidates": [
+                    {"id": "acquire", "kind": "DERIVE", "actor_node_id": "root",
+                     "description": "spawn external evidence child", "legal": True,
+                     "scheduler_complexity": 1, "external_access": True},
+                    {"id": "organize", "kind": "DERIVE", "actor_node_id": "root",
+                     "description": "spawn knowledge organization child", "legal": True,
+                     "scheduler_complexity": 1},
+                ],
+                "envelope": {"id": "open", "minimum_nodes": 0, "maximum_nodes": 100,
+                    "minimum_depth": 0, "maximum_depth": 100, "mode": "expansive"},
+                "node_count": 1, "maximum_depth_reached": 0,
+                "unresolved_gap_exists": True, "unbounded_structure": True,
+                "resources": {"llm_calls_remaining_fraction": 1,
+                    "tool_calls_remaining_fraction": 1, "nodes_remaining_fraction": 1,
+                    "depth_remaining_fraction": 1, "decisions_remaining_fraction": 1},
+                "organization_temperature": 1,
+            }
+            distribution = organization_candidate_distribution(
+                trainer.actor, trainer.encoder, policy_state, device=torch.device("cpu")
+            )["candidate_priors"]
+            samples = []
+            for candidate_id, backed_up in (("acquire", 0.3), ("organize", -0.2)):
+                prior = float(distribution[candidate_id])
+                samples.append({
+                    "stateFingerprint": "m0", "childStateFingerprint": f"{candidate_id}-m1",
+                    "contextNodeId": "root", "candidateId": candidate_id,
+                    "policyStateFingerprint": "m0",
+                    "oldActorLogProbability": math.log(prior),
+                    "actorPrior": prior, "visits": 1, "searchBehaviorProbability": 0.5,
+                    "parentTargetValue": 0.5, "childTargetValue": 0.5 + backed_up,
+                    "immediateProcessReward": backed_up, "backedUpAdvantage": backed_up,
+                    "targetValueRevision": 0, "rewardSource": "frozen_value_bootstrap",
+                })
+            summary = {"states": 0, "edges": 0, "positive": 0, "negative": 0,
+                       "zero": 0, "official_selected_edge_overrides": 0}
+            losses = trainer._saved_search_policy_losses({
+                "behaviorPolicy": "mcts_puct", "stateFingerprint": "m0",
+                "candidateId": "acquire", "mctsSearchSamples": samples,
+                "mctsSearchStates": {"m0": policy_state},
+            }, actual_return=0.8, summary=summary)
+            self.assertEqual(len(losses), 1)
+            self.assertEqual(summary["edges"], 2)
+            self.assertEqual(summary["positive"], 1)
+            self.assertEqual(summary["negative"], 1)
+            self.assertEqual(summary["official_selected_edge_overrides"], 1)
+            losses[0].backward()
+            self.assertTrue(any(parameter.grad is not None for parameter in trainer.actor.parameters()))
 
     def test_lhtb_microbatch_sizes_must_be_positive(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

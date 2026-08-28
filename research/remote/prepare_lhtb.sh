@@ -84,7 +84,7 @@ roy_smoke() {
   export ROY_LHTB_SEMANTIC_COMMAND="${roy_root}/research/.venv/bin/python -m roy_research.semantic_server"
   export ROY_LHTB_SEMANTIC_ROOT="${roy_root}/research/output/lhtb/semantic-smoke"
   export ROY_LHTB_POLICY_COMMAND="${roy_root}/research/.venv/bin/python -m roy_research.lhtb_policy_server"
-  export ROY_LHTB_MODEL="${roy_root}/research/output/lhtb/smoke-initial.pt"
+  export ROY_LHTB_MODEL="${roy_root}/research/output/lhtb/scheduler-structural-initial.pt"
   if [[ ! -f "${ROY_LHTB_MODEL}" ]]; then
     "${roy_root}/research/.venv/bin/python" -m roy_research lhtb-init \
       --manifest "${roy_root}/research/output/lhtb/manifest.json" --model "${ROY_LHTB_MODEL}"

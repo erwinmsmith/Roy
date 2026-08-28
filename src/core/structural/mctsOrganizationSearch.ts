@@ -15,6 +15,7 @@ export interface MCTSExpansion<State, Candidate extends MCTSCandidateLike> {
   targetValue: number;
   targetRevision: number;
   actorPriors: Record<string, number>;
+  policyState: Record<string, unknown>;
   children: Array<MCTSExpandedChild<State, Candidate>>;
 }
 
@@ -26,6 +27,7 @@ interface SearchNode<State, Candidate extends MCTSCandidateLike> {
   targetValue?: number;
   targetRevision?: number;
   actorPriors?: Record<string, number>;
+  policyState?: Record<string, unknown>;
   visits: number;
   edges?: Array<SearchEdge<State, Candidate>>;
 }
@@ -48,6 +50,8 @@ export interface MCTSSearchResult<Candidate extends MCTSCandidateLike> {
   visitCounts: Record<string, number>;
   behaviorProbabilities: Record<string, number>;
   trace: Array<Record<string, unknown>>;
+  searchSamples: Array<Record<string, unknown>>;
+  searchStates: Record<string, Record<string, unknown>>;
 }
 
 export async function searchOrganizationMCTS<State, Candidate extends MCTSCandidateLike>(options: {
@@ -83,6 +87,7 @@ export async function searchOrganizationMCTS<State, Candidate extends MCTSCandid
   const behavior = probabilities.map(value => value / normalizedTotal);
   const selectedIndex = sampleIndex(behavior, options.seed);
   const selected = root.edges[selectedIndex];
+  const collected = collectSearchSamples(root);
   return {
     candidate: selected.candidate,
     rootTargetValue: root.targetValue,
@@ -92,7 +97,7 @@ export async function searchOrganizationMCTS<State, Candidate extends MCTSCandid
     actorPriors: root.actorPriors ?? {}, visitCounts,
     behaviorProbabilities: Object.fromEntries(
       root.edges.map((edge, index) => [edge.candidate.id, behavior[index]])
-    ), trace,
+    ), trace, searchSamples: collected.samples, searchStates: collected.states,
   };
 }
 
@@ -106,6 +111,7 @@ async function ensureExpanded<State, Candidate extends MCTSCandidateLike>(
   node.targetValue = expansion.targetValue;
   node.targetRevision = expansion.targetRevision;
   node.actorPriors = expansion.actorPriors;
+  node.policyState = expansion.policyState;
   const priorTotal = expansion.children.reduce((sum, child) => sum + Math.max(0, child.prior), 0);
   if (expansion.children.length && priorTotal <= 0) {
     throw new Error('MCTS expansion has no positive actor prior');
@@ -122,6 +128,44 @@ async function ensureExpanded<State, Candidate extends MCTSCandidateLike>(
       prior: edge.prior, childTargetValue: edge.child.targetValue,
       immediateProcessReward: (edge.child.targetValue ?? node.targetValue ?? 0)
         - (node.targetValue ?? 0), terminal: edge.child.terminal })) });
+}
+
+function collectSearchSamples<State, Candidate extends MCTSCandidateLike>(
+  root: SearchNode<State, Candidate>
+): { samples: Array<Record<string, unknown>>; states: Record<string, Record<string, unknown>> } {
+  const samples: Array<Record<string, unknown>> = [];
+  const states: Record<string, Record<string, unknown>> = {};
+  const visit = (node: SearchNode<State, Candidate>): void => {
+    if (!node.edges?.length || !node.policyState || node.targetValue === undefined) return;
+    const totalVisits = node.edges.reduce((sum, edge) => sum + edge.visits, 0);
+    const stateFingerprint = String(node.policyState.state_fingerprint ?? '');
+    if (!stateFingerprint) throw new Error('MCTS policy state has no fingerprint');
+    states[stateFingerprint] = node.policyState;
+    const contextNodeId = String(node.policyState.context_node_id ?? '');
+    for (const edge of node.edges) {
+      const childTarget = edge.child.targetValue ?? node.targetValue;
+      const backedUp = edge.visits > 0 ? edge.valueSum / edge.visits
+        : childTarget - node.targetValue;
+      samples.push({
+        sampleType: 'mcts_structural_edge', stateFingerprint,
+        childStateFingerprint: String((edge.child.state as Record<string, unknown>)
+          ?.processStates && ((edge.child.state as Record<string, unknown>).processStates as
+            Array<Record<string, unknown>>).at(-1)?.fingerprint || ''),
+        contextNodeId, candidateId: edge.candidate.id,
+        policyStateFingerprint: stateFingerprint,
+        oldActorLogProbability: Math.log(edge.prior), actorPrior: edge.prior,
+        visits: edge.visits,
+        searchBehaviorProbability: totalVisits > 0 ? edge.visits / totalVisits : 0,
+        parentTargetValue: node.targetValue, childTargetValue: childTarget,
+        immediateProcessReward: childTarget - node.targetValue,
+        backedUpAdvantage: backedUp, targetValueRevision: node.targetRevision ?? 0,
+        rewardSource: 'frozen_value_bootstrap',
+      });
+      visit(edge.child);
+    }
+  };
+  visit(root);
+  return { samples, states };
 }
 
 async function simulate<State, Candidate extends MCTSCandidateLike>(

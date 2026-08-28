@@ -1,4 +1,5 @@
 import { DeepSeekProvider, LLMJSONParseError } from '../llm/providers/openai.js';
+import { LHTB_POLICY_INTERFACE_REVISION } from './informationRealizationTypes.js';
 import type { OrganizationCandidate,
   OrganizationPolicyRecord } from './informationRealizationTypes.js';
 import { PythonOrganizationPolicyClient } from './pythonOrganizationPolicy.js';
@@ -93,6 +94,52 @@ interface SamplingPhase {
   childLocalOpenGapIds: Set<string>;
 }
 
+const SCHEDULER_RUNNABLE_STATUSES = new Set(['ready', 'running', 'completed']);
+
+/** Deterministic execution ownership; never part of the learned action. */
+export function scheduledOrganizationContextNode(
+  snapshot: ReturnType<RoyLHTBSession['snapshot']>
+): string {
+  const nodes = new Map(snapshot.runtime.nodes.map(node => [node.id, node]));
+  const runnable = (id: unknown): id is string => typeof id === 'string'
+    && SCHEDULER_RUNNABLE_STATUSES.has(nodes.get(id)?.status ?? '');
+  const events = snapshot.runtimeEvents ?? snapshot.processStates.at(-1)?.runtimeEvents ?? [];
+  for (const event of [...events].reverse()) {
+    if (event.kind === 'terminal_result' || event.kind === 'terminal_command') {
+      if (runnable(event.nodeId)) return event.nodeId;
+      continue;
+    }
+    if (event.kind !== 'organization_action') continue;
+    const action = event.attributes?.action as Record<string, unknown> | undefined;
+    if (!action) continue;
+    if (action.kind === 'DERIVE') {
+      const actorId = action.actorNodeId;
+      const actorHasUnassignedLocalWork = runnable(actorId)
+        && snapshot.runtime.requirements.some(requirement => requirement.parentNodeId === actorId
+          && requirement.status === 'open');
+      if (actorHasUnassignedLocalWork) return actorId;
+      const child = action.childSpecification as Record<string, unknown> | undefined;
+      if (runnable(child?.nodeId)) return child.nodeId;
+    }
+    if (action.kind === 'RETURN') {
+      const actor = typeof action.actorNodeId === 'string' ? nodes.get(action.actorNodeId) : undefined;
+      if (runnable(actor?.parentId)) return actor.parentId;
+    }
+    if (action.kind === 'CONNECT' && action.requirementId) {
+      const connection = action.connection as Record<string, unknown> | undefined;
+      if (runnable(connection?.to)) return connection.to;
+    }
+    if (runnable(action.actorNodeId)) return action.actorNodeId;
+  }
+  const ready = snapshot.runtime.nodes.filter(node => SCHEDULER_RUNNABLE_STATUSES.has(node.status));
+  if (!ready.length) throw new Error('environment_invalid:no_scheduler_runnable_node');
+  return [...ready].sort((left, right) => {
+    const running = Number(right.status === 'running') - Number(left.status === 'running');
+    return running || right.updatedAt - left.updatedAt || right.depth - left.depth
+      || left.id.localeCompare(right.id);
+  })[0].id;
+}
+
 export type TopologySamplingCandidate = Pick<OrganizationCandidate,
   'kind' | 'actorNodeId' | 'action'>;
 
@@ -162,16 +209,6 @@ export function topologySamplingCandidateLogitBias(
   return 0;
 }
 
-function topologySamplingActiveNodeLogitBias(
-  snapshot: ReturnType<RoyLHTBSession['snapshot']>, nodeId: string
-): number {
-  if (!activeTopologySamplingProfile(snapshot.organizationSeed)) return 0;
-  const phase = topologySamplingPhase(snapshot);
-  if (phase.id !== 'seed_child_local_residual'
-    && phase.id !== 'derive_child_local_residual') return 0;
-  return phase.deepestActiveNodeIds.has(nodeId) ? 4 : -4;
-}
-
 export type ControllerResult =
   | { status: 'terminal_request'; request: { id: string; command: string; cwd?: string;
     timeoutMs: number; nodeId: string }; snapshot: ReturnType<RoyLHTBSession['snapshot']> }
@@ -204,6 +241,9 @@ Every candidate must have this exact outer shape:
 {"id": string, "kind": string, "actorNodeId": string, "description": string,
  "schedulerComplexity": number, "action": object}.
 Allowed kinds are DERIVE, ACQUIRE, CONNECT, EXECUTE, RETURN, PRUNE, STOP.
+The Runtime deterministically supplies organization.schedulerContextNode. Generate candidates only
+for that exact node. actorNodeId is observed execution context, never a routing choice. ACQUIRE and
+EXECUTE are local actions by that node; DERIVE is the only action that spawns a new child.
 For ACQUIRE and EXECUTE, command, optional cwd and timeoutMs are outer candidate fields, while
 action contains only kind and actorNodeId. ACQUIRE inspects external state. EXECUTE changes the
 workspace or runs verification. Keep every command under 50000 characters. Prefer short incremental
@@ -219,6 +259,7 @@ DERIVE must use an exact open requirement ID from organization.requirements and 
 {"kind":"DERIVE","actorNodeId":"<parent>","childSpecification":{"id":"<spec-id>",
 "nodeId":"<new-agent-id>","parentId":"<parent>","depth":<parent-depth+1>,
 "parentGoal":"<parent objective>","triggeringGapId":"<open requirement id>",
+"realizationMode":"acquire_external|organize_knowledge",
 "localObjective":"<strictly narrower executable objective>","refinement":{"parentScope":"...",
 "childScope":"...","triggeringRequirementId":"<same requirement id>",
 "narrowerThanParent":true,"newInformationNeeded":"...","executableEndCondition":"...",
@@ -232,6 +273,10 @@ For DERIVE, the selected requirement's parentNodeId is its owner: candidate acto
 action.actorNodeId, childSpecification.parentId, and refinement parent scope must all remain under
 that owner. Never assign a root-owned gap to a child merely because the child's objective is
 semantically related. structuralExploration.realOpenGaps is the authoritative gap-to-owner map.
+Use realizationMode=acquire_external when the child is spawned to obtain missing external evidence,
+and realizationMode=organize_knowledge when it is spawned to reason over, verify, or integrate
+information already available to Roy. This conditional child type is selected by the policy as part
+of the open DERIVE specification; do not encode it as an Agent routing decision.
 Keep child specifications concise. Never copy rootGoal or the full task instruction into parentGoal,
 parentScope, childScope, or reason. Keep each descriptive child field below 1000 characters.
 Before every DERIVE, semantically inspect every entry in spawnedAgentLibrary. Do not use lexical
@@ -273,8 +318,8 @@ RETURN action uses the property report (never epistemicReport), with this exact 
 "proposedChildren":[],"resolvedParentGap":false,"informationToPropagate":[]}.
 Claims, evidence, observations, assumptions, conflicts, residual requirements and proposed children
 must use their typed runtime schemas when non-empty. STOP is root-only and uses finalOutput.
-Cover every active node that has a semantically useful next action; candidate actorNodeId must be
-that node's exact ID. A node with no proposed candidate cannot be selected by the policy.
+Every candidate actorNodeId must equal organization.schedulerContextNode. Other active nodes are
+visible only for dependency and CONNECT/reuse decisions; never propose a turn for them.
 Never repeat an unchanged terminal command immediately after it failed without file changes;
 propose a command that diagnoses or repairs the observed failure.
 Always leave root STOP in the candidate support when required report dependencies permit it; the
@@ -452,11 +497,13 @@ export function compactEpistemicWorkingState(
     && activeNodes.some(node => node.id === value.parentNodeId));
   const profile = activeTopologySamplingProfile(snapshot.organizationSeed);
   const maximumDepthReached = Math.max(0, ...snapshot.runtime.nodes.map(node => node.depth));
+  const schedulerContextNode = scheduledOrganizationContextNode(snapshot);
   return {
     rootGoal: compactText(snapshot.instruction, PROPOSER_GOAL_TEXT_LIMIT),
     organizationMode: snapshot.organizationMode,
     organization: {
       rootId: snapshot.runtime.rootId, stopped: snapshot.runtime.stopped,
+      schedulerContextNode,
       activeNodes: compactNodes,
       archivedNodeRefs: snapshot.runtime.nodes.filter(node => !activeNodes.some(
         active => active.id === node.id)).map(node => ({ id: node.id, status: node.status,
@@ -814,7 +861,7 @@ export class LHTBAutonomousController {
     );
     return { candidate: selected, record: {
       stateFingerprint: String(rootPolicyState.state_fingerprint ?? ''),
-      activeNodeId: selected.actorNodeId, candidateId: selected.id,
+      contextNodeId: String(rootPolicyState.context_node_id), candidateId: selected.id,
       maskedOldLogProbability: Math.log(behaviorProbability),
       maskedOldActionLogProbability: Math.log(actionProbability),
       maskedOldCandidateConditionalLogProbability:
@@ -825,6 +872,12 @@ export class LHTBAutonomousController {
       rawProbabilities: actorActionProbabilities,
       maskedProbabilities: behaviorActionProbabilities,
       selectedAction: selected.kind,
+      selectedSpawnMode: selected.action.childSpecification?.realizationMode,
+      spawnModeProbabilities: Object.fromEntries(['acquire_external', 'organize_knowledge'].map(
+        mode => [mode, candidates.filter(candidate =>
+          candidate.action.childSpecification?.realizationMode === mode)
+          .reduce((sum, candidate) => sum + (result.behaviorProbabilities[candidate.id] ?? 0), 0)]
+      )) as OrganizationPolicyRecord['spawnModeProbabilities'],
       numRealResidualGaps: Number(rootPolicyState.num_real_residual_gaps ?? 0),
       numChildProposals: Number(rootPolicyState.num_child_proposals ?? 0),
       stopLegalReason: String(rootPolicyState.stop_legal_reason ?? ''),
@@ -838,6 +891,8 @@ export class LHTBAutonomousController {
       selectedProcessReward: result.selectedProcessReward,
       targetValueRevision: result.targetRevision,
       mctsSearchTrace: result.trace,
+      mctsSearchSamples: result.searchSamples as OrganizationPolicyRecord['mctsSearchSamples'],
+      mctsSearchStates: result.searchStates,
     } };
   }
 
@@ -845,9 +900,11 @@ export class LHTBAutonomousController {
     snapshot: ReturnType<RoyLHTBSession['snapshot']>, candidates: ProposedCandidate[]
   ) {
     if (!this.learnedPolicy) throw new Error('MCTS requires the learned policy sidecar');
+    const contextNodeId = scheduledOrganizationContextNode(snapshot);
+    const localCandidates = candidates.filter(candidate => candidate.actorNodeId === contextNodeId);
     const valid: Array<{ candidate: ProposedCandidate;
       state: ReturnType<RoyLHTBSession['snapshot']>; terminal: boolean }> = [];
-    for (const candidate of candidates) {
+    for (const candidate of localCandidates) {
       try {
         const probe = RoyLHTBSession.restore(snapshot);
         let terminal = false;
@@ -872,18 +929,20 @@ export class LHTBAutonomousController {
       }
     }
     const currentPolicyState = this.policyState(snapshot,
-      valid.length ? valid.map(value => value.candidate) : candidates);
+      valid.length ? valid.map(value => value.candidate) : localCandidates);
     if (!valid.length) {
       const graph = currentPolicyState.event_graph as Record<string, unknown>;
       const current = await this.learnedPolicy.targetValue(graph);
       return { targetValue: current.targetValue, targetRevision: current.targetRevision,
-        actorPriors: {}, children: [] };
+        actorPriors: {}, policyState: currentPolicyState, children: [] };
     }
     const analysis = await this.learnedPolicy.analyze(currentPolicyState);
     const childPolicyStates = valid.map(value => {
-      const childCandidates = candidates.filter(candidate => candidate.id !== value.candidate.id);
+      const childContextNodeId = scheduledOrganizationContextNode(value.state);
+      const childCandidates = candidates.filter(candidate => candidate.id !== value.candidate.id
+        && candidate.actorNodeId === childContextNodeId);
       return this.policyState(value.state,
-        childCandidates.length ? childCandidates : [value.candidate]);
+        childCandidates);
     });
     const childValues = await this.learnedPolicy.targetValues(childPolicyStates.map(value =>
       value.event_graph as Record<string, unknown>));
@@ -895,7 +954,7 @@ export class LHTBAutonomousController {
         targetValue: childValues.targetValues[index] };
     });
     return { targetValue: analysis.targetValue, targetRevision: analysis.targetRevision,
-      actorPriors: analysis.candidatePriors, children };
+      actorPriors: analysis.candidatePriors, policyState: currentPolicyState, children };
   }
 
   private actionProbabilitySummary(candidates: ProposedCandidate[],
@@ -958,6 +1017,7 @@ export class LHTBAutonomousController {
   ): void {
     if (!this.mctsEnabled() || snapshot.organizationMode !== 'learned_information_realization'
       || validation.candidates.some(candidate => candidate.kind === 'STOP')) return;
+    if (scheduledOrganizationContextNode(snapshot) !== snapshot.runtime.rootId) return;
     const root = snapshot.runtime.nodes.find(node => node.id === snapshot.runtime.rootId);
     if (!root || !['ready', 'running', 'waiting', 'completed'].includes(root.status)) return;
     const candidate: ProposedCandidate = {
@@ -985,6 +1045,7 @@ export class LHTBAutonomousController {
         reasons: ['response_has_no_candidates'] }] };
     }
     const snapshot = session.snapshot();
+    const contextNodeId = scheduledOrganizationContextNode(snapshot);
     const active = new Set(snapshot.runtime.nodes
       .filter(node => ['ready', 'running', 'waiting', 'completed'].includes(node.status))
       .map(node => node.id));
@@ -1102,6 +1163,9 @@ export class LHTBAutonomousController {
       else if (seenIds.has(id)) reasons.push('duplicate_id');
       if (!allowedKinds.has(kind)) reasons.push('invalid_kind');
       if (!actorNodeId || !active.has(actorNodeId)) reasons.push('inactive_actor');
+      else if (actorNodeId !== contextNodeId) reasons.push(
+        `actor_is_not_scheduler_context:${actorNodeId}:expected=${contextNodeId}`
+      );
       if (!description) reasons.push('missing_description');
       if (!Number.isFinite(schedulerComplexity)) reasons.push('invalid_scheduler_complexity');
       if (explicitActionKind && explicitActionKind !== kind) reasons.push('action_kind_mismatch');
@@ -1151,6 +1215,14 @@ export class LHTBAutonomousController {
           ? specification.triggeringGapId : '';
         const requirement = snapshot.runtime.requirements.find(value =>
           value.id === triggeringGapId);
+        const realizationMode = String(specification.realizationMode ?? '');
+        if (!['acquire_external', 'organize_knowledge'].includes(realizationMode)) {
+          reasons.push('derive_missing_or_invalid_realization_mode');
+        }
+        const externalAccess = specification.externalAccess as Record<string, unknown> | undefined;
+        if (realizationMode === 'acquire_external' && externalAccess?.allowed !== true) {
+          reasons.push('external_acquisition_child_requires_external_access');
+        }
         if (requirement?.status === 'open' && requirement.parentNodeId !== actorNodeId) {
           reasons.push(`derive_requirement_owner_mismatch:${triggeringGapId}:expected=${requirement.parentNodeId}`);
         }
@@ -1230,13 +1302,14 @@ export class LHTBAutonomousController {
   ): string[] {
     if (snapshot.organizationMode !== 'learned_information_realization') return [];
     const events = snapshot.runtimeEvents ?? snapshot.processStates.at(-1)?.runtimeEvents ?? [];
-    const externallyExecutableChildren = snapshot.runtime.nodes.filter(node =>
-      node.id !== snapshot.runtime.rootId && ['ready', 'running'].includes(node.status)
-      && node.specification?.externalAccess.allowed === true
-      && !events.some(event => event.kind === 'terminal_result' && event.nodeId === node.id));
-    const deficits = externallyExecutableChildren.filter(node => !candidates.some(candidate =>
-      candidate.actorNodeId === node.id && ['ACQUIRE', 'EXECUTE'].includes(candidate.kind)))
-      .map(node => `missing_external_child_progress_candidate:${node.id}`);
+    const contextNodeId = scheduledOrganizationContextNode(snapshot);
+    const contextNode = snapshot.runtime.nodes.find(node => node.id === contextNodeId);
+    const needsExternalProgress = contextNode?.id !== snapshot.runtime.rootId
+      && contextNode?.specification?.realizationMode === 'acquire_external'
+      && !events.some(event => event.kind === 'terminal_result' && event.nodeId === contextNodeId);
+    const deficits = needsExternalProgress && !candidates.some(candidate =>
+      candidate.actorNodeId === contextNodeId && ['ACQUIRE', 'EXECUTE'].includes(candidate.kind))
+      ? [`missing_external_child_progress_candidate:${contextNodeId}`] : [];
     const profile = activeTopologySamplingProfile(snapshot.organizationSeed);
     if (!profile) return deficits;
     const minimumNodes = profile.preferredNodeRange[0];
@@ -1290,6 +1363,8 @@ export class LHTBAutonomousController {
 
   private policyState(snapshot: ReturnType<RoyLHTBSession['snapshot']>,
     candidates: ProposedCandidate[]): Record<string, unknown> {
+    const contextNodeId = scheduledOrganizationContextNode(snapshot);
+    const contextCandidates = candidates.filter(candidate => candidate.actorNodeId === contextNodeId);
     const activeNodes = snapshot.runtime.nodes
       .filter(node => ['ready', 'running', 'waiting', 'completed'].includes(node.status));
     const latest = snapshot.processStates.at(-1);
@@ -1398,18 +1473,27 @@ export class LHTBAutonomousController {
     const maximumDepthReached = Math.max(0, ...snapshot.runtime.nodes.map(node => node.depth));
     const explorationStopMasked = openRequirements.length > 0
       && (snapshot.runtime.nodes.length < minimumNodes || maximumDepthReached < minimumDepth);
-    const hasExplorationAlternative = candidates.some(candidate => candidate.kind !== 'STOP');
-    const policyCandidates = candidates.map(candidate => ({ id: candidate.id, kind: candidate.kind,
+    const hasExplorationAlternative = contextCandidates.some(candidate => candidate.kind !== 'STOP');
+    const policyCandidates = contextCandidates.map(candidate => ({ id: candidate.id, kind: candidate.kind,
       actor_node_id: candidate.actorNodeId, description: candidate.description,
       scheduler_complexity: candidate.schedulerComplexity,
-      external_access: candidate.kind === 'ACQUIRE',
+      realization_mode: candidate.action.childSpecification?.realizationMode,
+      conditional_payload: candidate.kind === 'DERIVE' ? {
+        realization_mode: candidate.action.childSpecification?.realizationMode,
+        local_objective: candidate.action.childSpecification?.localObjective,
+        required_information:
+          candidate.action.childSpecification?.expectedOutput.requiredInformation,
+        triggering_gap_id: candidate.action.childSpecification?.triggeringGapId,
+      } : candidate.kind === 'CONNECT' ? candidate.action.connection : undefined,
+      external_access: candidate.kind === 'ACQUIRE'
+        || candidate.action.childSpecification?.realizationMode === 'acquire_external',
       resolves_gap: candidate.kind === 'ACQUIRE' || candidate.kind === 'RETURN',
       depth_delta: candidate.kind === 'DERIVE' ? 1 : 0,
       sampling_logit_bias: topologySamplingCandidateLogitBias(snapshot, candidate),
       legal: !(candidate.kind === 'STOP' && explorationStopMasked
         && hasExplorationAlternative) }));
     return {
-      interface_revision: 'unconstrained-mcts-topology-20260827',
+      interface_revision: LHTB_POLICY_INTERFACE_REVISION,
       topology_search: { mode: profile ? 'profile_conditioned_diagnostic' : 'mcts_unconstrained',
         profile_id: profile?.id,
         reward_semantics: 'official terminal task utility only; topology has no intrinsic reward' },
@@ -1419,12 +1503,8 @@ export class LHTBAutonomousController {
         reward_semantics: 'explicit diagnostic intervention only' } : undefined,
       state_fingerprint: snapshot.processStates.at(-1)?.fingerprint,
       event_graph: { nodes, edges },
-      active_node_ids: activeNodes.map(node => node.id),
-      active_node_legal: activeNodes.map(node => policyCandidates.some(
-        candidate => candidate.actor_node_id === node.id && candidate.legal
-      )),
-      active_node_sampling_logit_bias: activeNodes.map(node =>
-        topologySamplingActiveNodeLogitBias(snapshot, node.id)),
+      context_node_id: contextNodeId,
+      scheduler: { kind: 'deterministic_dependency_event_locality', learned: false },
       candidates: policyCandidates,
       envelope: { id: 'lhtb-open', minimum_nodes: minimumNodes, maximum_nodes: 1_000_000,
         minimum_depth: minimumDepth, maximum_depth: 1_000_000, mode: 'expansive' },
@@ -1433,8 +1513,8 @@ export class LHTBAutonomousController {
       unresolved_gap_exists: openRequirements.length > 0,
       unresolved_requirement_ids: openRequirements.map(value => value.id),
       num_real_residual_gaps: openRequirements.length,
-      num_child_proposals: candidates.filter(candidate => candidate.kind === 'DERIVE').length,
-      available_actions: [...new Set(candidates.map(candidate => candidate.kind))],
+      num_child_proposals: contextCandidates.filter(candidate => candidate.kind === 'DERIVE').length,
+      available_actions: [...new Set(contextCandidates.map(candidate => candidate.kind))],
       topology_sampling_phase: topologySamplingPhase(snapshot).id,
       exploration_stop_masked: explorationStopMasked,
       stop_legal_reason: explorationStopMasked

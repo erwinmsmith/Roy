@@ -227,6 +227,7 @@ describe('recursive information realization runtime', () => {
   const specification = (): OpenAgentSpecification => ({
     id: 'spec-child', nodeId: 'child', parentId: 'root', depth: 1,
     parentGoal: 'answer task', triggeringGapId: 'gap-1',
+    realizationMode: 'acquire_external',
     localObjective: 'obtain the primary evidence for the claim',
     refinement: {
       parentScope: 'answer task', childScope: 'obtain one primary source',

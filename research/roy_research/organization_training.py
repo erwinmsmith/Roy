@@ -48,7 +48,7 @@ def single_objective_organization_grpo_loss(
 ) -> Tensor:
     """Clipped on-policy objective with no teacher or auxiliary objective.
 
-    Each sequence entry contains the joint active-node/action log-probabilities
+    Each sequence entry contains scheduler-context structural-action log-probabilities
     for one complete trajectory. Length normalization prevents deeper sampled
     organizations from receiving a mechanically larger gradient solely because
     they contain more organization decisions.

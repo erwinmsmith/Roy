@@ -15,6 +15,8 @@ describe('organization MCTS', () => {
       simulations: 64, maximumDepth: 2, cpuCT: 1.5, temperature: 1, seed: 7,
       expand: async (state, remaining) => ({ targetValue: state, targetRevision: 3,
         actorPriors: Object.fromEntries(remaining.map(value => [value.id, value.prior])),
+        policyState: { state_fingerprint: `state-${state}`, context_node_id: 'root',
+          candidates: remaining },
         children: remaining.map(candidate => ({ candidate, state: state + candidate.delta,
           prior: candidate.prior, targetValue: state + candidate.delta, terminal: true })) }) });
     expect(result.visitCounts['useful-derive']).toBeGreaterThan(
@@ -28,6 +30,11 @@ describe('organization MCTS', () => {
     expect(result.trace.some(value => value.phase === 'selection')).toBe(true);
     expect(result.trace.some(value => value.phase === 'backup')).toBe(true);
     expect(result.rootTargetValue).toBeCloseTo(0.4);
+    expect(result.searchSamples).toHaveLength(3);
+    expect(result.searchSamples.map(value => Math.sign(Number(value.immediateProcessReward))))
+      .toEqual(expect.arrayContaining([-1, 0, 1]));
+    expect(result.searchSamples.every(value =>
+      value.rewardSource === 'frozen_value_bootstrap')).toBe(true);
   });
 
   it('does not invent a dense score when the target value is constant', async () => {
@@ -35,6 +42,8 @@ describe('organization MCTS', () => {
       simulations: 64, maximumDepth: 2, cpuCT: 1.5, temperature: 1, seed: 9,
       expand: async (state, remaining) => ({ targetValue: state, targetRevision: 0,
         actorPriors: Object.fromEntries(remaining.map(value => [value.id, value.prior])),
+        policyState: { state_fingerprint: `state-${state}`, context_node_id: 'root',
+          candidates: remaining },
         children: remaining.map(candidate => ({ candidate, state,
           prior: candidate.prior, targetValue: state, terminal: true })) }) });
     expect(result.visitCounts['neutral-execute']).toBeGreaterThan(

@@ -206,23 +206,16 @@ def sample_organization_decision(
 
     resolved_device = device or next(model.parameters()).device
     context = _policy_context(model, encoder, policy_state, resolved_device)
-    active_index = int(
-        torch.multinomial(context["active_probabilities"], 1, generator=generator).item()
-    )
-    active_id = context["active_node_ids"][active_index]
-    values = _candidate_distribution(model, policy_state, context, active_id, resolved_device)
+    values = _candidate_distribution(model, policy_state, context, resolved_device)
     candidate_index = int(
         torch.multinomial(values["candidate_probabilities"], 1, generator=generator).item()
     )
     candidate = values["candidates"][candidate_index]
     selected_kind = str(candidate.get("kind"))
-    joint_log_probability = (
-        context["active_log_probs"][active_index]
-        + values["candidate_log_probs"][candidate_index]
-    )
+    joint_log_probability = values["candidate_log_probs"][candidate_index]
     record = {
         "state_fingerprint": str(policy_state.get("state_fingerprint") or ""),
-        "active_node_id": active_id,
+        "context_node_id": context["context_node_id"],
         "candidate_id": str(candidate["id"]),
         "masked_old_log_probability": float(joint_log_probability.detach().cpu()),
         "envelope_id": str(policy_state["envelope"]["id"]),
@@ -236,6 +229,10 @@ def sample_organization_decision(
             values["candidates"], values["candidate_probabilities"]
         ),
         "selected_action": str(candidate.get("kind")),
+        "selected_spawn_mode": candidate.get("realization_mode"),
+        "spawn_mode_probabilities": _spawn_mode_probability_summary(
+            values["candidates"], values["candidate_probabilities"]
+        ),
         "masked_old_action_log_probability": float(
             values["masked_outer_action_log_probabilities"][selected_kind].detach().cpu()
         ),
@@ -258,13 +255,7 @@ def organization_candidate_distribution(
     policy_state: Mapping[str, Any],
     device: torch.device | None = None,
 ) -> Dict[str, Any]:
-    """Return the exact actor prior over open candidates without sampling.
-
-    Candidate probability marginalizes the hierarchical active-node choice.  The
-    per-candidate active-node decomposition is retained so an external search
-    policy can record the actor path it used while storing its own exact behavior
-    probability for GRPO importance sampling.
-    """
+    """Return the actor prior for structural choices at one scheduled node."""
 
     resolved_device = device or next(model.parameters()).device
     context = _policy_context(model, encoder, policy_state, resolved_device)
@@ -272,36 +263,14 @@ def organization_candidate_distribution(
     candidate_ids = [str(value["id"]) for value in candidates]
     if len(set(candidate_ids)) != len(candidate_ids):
         raise ValueError("organization candidate ids must be unique")
-    probabilities = torch.zeros(len(candidates), device=resolved_device)
-    paths: List[Dict[str, Any]] = []
-    for active_index, active_id in enumerate(context["active_node_ids"]):
-        if not bool(context["active_probabilities"][active_index] > 0):
-            continue
-        try:
-            values = _candidate_distribution(
-                model, policy_state, context, active_id, resolved_device
-            )
-        except ValueError as error:
-            if "has no legal organization candidates" in str(error):
-                continue
-            raise
-        active_probability = context["active_probabilities"][active_index]
-        for candidate_index, candidate_probability in enumerate(
-            values["candidate_probabilities"]
-        ):
-            joint = active_probability * candidate_probability
-            if not bool(joint > 0):
-                continue
-            probabilities[candidate_index] += joint
-            paths.append({
-                "candidate_id": candidate_ids[candidate_index],
-                "active_node_id": active_id,
-                "probability": float(joint.detach().cpu()),
-            })
-    total = probabilities.sum()
-    if not bool(total > 0):
-        raise ValueError("organization policy has no positive candidate prior")
-    probabilities = probabilities / total
+    values = _candidate_distribution(model, policy_state, context, resolved_device)
+    probabilities = values["candidate_probabilities"]
+    paths = [{
+        "candidate_id": candidate_id,
+        "context_node_id": context["context_node_id"],
+        "probability": float(probability.detach().cpu()),
+    } for candidate_id, probability in zip(candidate_ids, probabilities)
+        if bool(probability > 0)]
     return {
         "candidate_priors": {
             candidate_id: float(probability.detach().cpu())
@@ -323,18 +292,16 @@ def replay_joint_log_probability(
         raise ValueError("policy record is missing policy_state")
     context = _policy_context(model, encoder, policy_state, device)
     try:
-        active_id = str(record.get("active_node_id", record.get("activeNodeId")))
-        active_index = context["active_node_ids"].index(active_id)
-        values = _candidate_distribution(model, policy_state, context, active_id, device)
+        context_id = str(record.get("context_node_id", record.get("contextNodeId")))
+        if context_id != context["context_node_id"]:
+            raise ValueError("recorded context node differs from scheduler context")
+        values = _candidate_distribution(model, policy_state, context, device)
         candidate_index = [str(value["id"]) for value in values["candidates"]].index(
             str(record.get("candidate_id", record.get("candidateId")))
         )
     except ValueError as error:
         raise ValueError("recorded organization choice is not available during replay") from error
-    return (
-        context["active_log_probs"][active_index]
-        + values["candidate_log_probs"][candidate_index]
-    )
+    return values["candidate_log_probs"][candidate_index]
 
 
 def replay_joint_log_probabilities(
@@ -368,11 +335,10 @@ def replay_joint_log_probabilities(
             model, encoder, policy_state, device, node_states, graph_state
         )
         try:
-            active_id = str(record.get("active_node_id", record.get("activeNodeId")))
-            active_index = context["active_node_ids"].index(active_id)
-            values = _candidate_distribution(
-                model, policy_state, context, active_id, device
-            )
+            context_id = str(record.get("context_node_id", record.get("contextNodeId")))
+            if context_id != context["context_node_id"]:
+                raise ValueError("recorded context node differs from scheduler context")
+            values = _candidate_distribution(model, policy_state, context, device)
             candidate_index = [str(value["id"]) for value in values["candidates"]].index(
                 str(record.get("candidate_id", record.get("candidateId")))
             )
@@ -380,10 +346,7 @@ def replay_joint_log_probabilities(
             raise ValueError(
                 "recorded organization choice is not available during replay"
             ) from error
-        results.append(
-            context["active_log_probs"][active_index]
-            + values["candidate_log_probs"][candidate_index]
-        )
+        results.append(values["candidate_log_probs"][candidate_index])
     return torch.stack(results)
 
 
@@ -416,44 +379,25 @@ def _policy_context_from_encoding(
         raise ValueError("organization policy state is missing event_graph")
     graph_nodes = list(graph.get("nodes", []))
     node_index = {str(value["id"]): index for index, value in enumerate(graph_nodes)}
-    active_node_ids = [str(value) for value in policy_state.get("active_node_ids", [])]
-    if not active_node_ids or any(value not in node_index for value in active_node_ids):
-        raise ValueError("active-node candidates must reference event graph nodes")
-    active_indices = torch.tensor([node_index[value] for value in active_node_ids], device=device)
-    active_states = node_states[active_indices]
-    active_mask = torch.tensor(
-        list(policy_state.get("active_node_legal", [True] * len(active_node_ids))),
-        dtype=torch.bool,
-        device=device,
-    )
+    context_node_id = str(policy_state.get("context_node_id") or "")
+    if not context_node_id or context_node_id not in node_index:
+        raise ValueError("scheduler context node must reference an event graph node")
     resources = _organization_resource_tensor(dict(policy_state.get("resources", {})), device)
     temperature = float(policy_state.get("organization_temperature", 1.0))
     if temperature <= 0:
         raise ValueError("organization temperature must be positive during replay")
-    active_logits = model.active_node_logits(active_states, graph_state, resources, active_mask)
-    active_bias = torch.tensor(
-        list(policy_state.get("active_node_sampling_logit_bias", [0.0] * len(active_node_ids))),
-        dtype=active_logits.dtype,
-        device=device,
-    )
-    if active_bias.shape != active_logits.shape:
-        raise ValueError("active-node sampling bias must match active-node logits")
-    active_logits = active_logits + active_bias
-    active_log_probs = torch.log_softmax(active_logits / temperature, dim=-1)
-
     candidates = list(policy_state.get("candidates", []))
     if not candidates:
         raise ValueError("organization policy state contains no candidates")
-    candidate_embeddings = encoder.encode([
-        str(value.get("description") or value.get("kind") or "") for value in candidates
-    ]).to(device)
+    if any(str(value.get("actor_node_id") or "") != context_node_id for value in candidates):
+        raise ValueError("all organization candidates must belong to the scheduler context node")
+    candidate_embeddings = encoder.encode([_candidate_text(value) for value in candidates]).to(device)
     return {
         "node_states": node_states,
         "graph_state": graph_state,
         "node_index": node_index,
-        "active_node_ids": active_node_ids,
-        "active_log_probs": active_log_probs,
-        "active_probabilities": active_log_probs.exp(),
+        "context_node_id": context_node_id,
+        "context_node_state": node_states[node_index[context_node_id]],
         "candidate_embeddings": candidate_embeddings,
         "resources": resources,
     }
@@ -463,12 +407,10 @@ def _candidate_distribution(
     model: InformationRealizationPolicy,
     policy_state: Mapping[str, Any],
     context: Mapping[str, Any],
-    actor_node_id: str,
     device: torch.device,
 ) -> Dict[str, Any]:
     node_index = context["node_index"]
-    if actor_node_id not in node_index:
-        raise ValueError("candidate actor node is absent from event graph")
+    context_node_id = str(context["context_node_id"])
     candidates = list(policy_state.get("candidates", []))
     if not candidates:
         raise ValueError("organization policy state contains no candidates")
@@ -483,20 +425,11 @@ def _candidate_distribution(
             int(policy_state.get("maximum_depth_reached", 0)),
             bool(policy_state.get("unresolved_gap_exists", False)),
         )
-    actor_values = [
-        not value.get("actor_node_id")
-        or str(value.get("actor_node_id")) == actor_node_id
-        for value in candidates
-    ]
-    legal_values = [
-        legal and (
-            not value.get("actor_node_id")
-            or str(value.get("actor_node_id")) == actor_node_id
-        )
-        for value, legal in zip(candidates, legal_values)
-    ]
+    actor_values = [str(value.get("actor_node_id") or "") == context_node_id
+                    for value in candidates]
+    legal_values = [legal and actor for legal, actor in zip(legal_values, actor_values)]
     if not any(legal_values):
-        raise ValueError(f"active node {actor_node_id} has no legal organization candidates")
+        raise ValueError(f"context node {context_node_id} has no legal organization candidates")
     legal_mask = torch.tensor(legal_values, dtype=torch.bool, device=device)
     actor_mask = torch.tensor(actor_values, dtype=torch.bool, device=device)
     candidate_features = torch.tensor(
@@ -504,7 +437,7 @@ def _candidate_distribution(
     )
     candidate_logits = model.candidate_logits(
         context["graph_state"],
-        context["node_states"][node_index[actor_node_id]],
+        context["context_node_state"],
         context["candidate_embeddings"],
         action_type_indices([str(value["kind"]) for value in candidates], device),
         candidate_features,
@@ -583,6 +516,17 @@ def _action_probability_summary(
     return result
 
 
+def _spawn_mode_probability_summary(
+    candidates: Sequence[Mapping[str, Any]], probabilities: Tensor
+) -> Dict[str, float]:
+    result = {"acquire_external": 0.0, "organize_knowledge": 0.0}
+    for candidate, probability in zip(candidates, probabilities.detach().cpu()):
+        mode = str(candidate.get("realization_mode") or "")
+        if mode in result:
+            result[mode] += float(probability)
+    return result
+
+
 def _candidate_features(value: Mapping[str, Any]) -> List[float]:
     return [
         math.log1p(max(0.0, float(value.get("scheduler_complexity", 0.0)))),
@@ -590,6 +534,17 @@ def _candidate_features(value: Mapping[str, Any]) -> List[float]:
         float(bool(value.get("resolves_gap", False))),
         float(value.get("depth_delta", 0.0)),
     ]
+
+
+def _candidate_text(value: Mapping[str, Any]) -> str:
+    payload = value.get("conditional_payload")
+    serialized = json.dumps(payload, sort_keys=True, ensure_ascii=False) if payload else ""
+    return " | ".join(filter(None, [
+        str(value.get("kind") or ""),
+        str(value.get("realization_mode") or ""),
+        str(value.get("description") or ""),
+        serialized,
+    ]))
 
 
 def _organization_resource_tensor(resources: Mapping[str, Any], device: torch.device) -> Tensor:

@@ -47,7 +47,7 @@ export class PythonOrganizationPolicyClient {
     if (!candidate) throw new Error('Learned policy selected an unavailable open candidate');
     const raw = response.policy_record;
     return { candidate, record: {
-      stateFingerprint: String(raw.state_fingerprint), activeNodeId: String(raw.active_node_id),
+      stateFingerprint: String(raw.state_fingerprint), contextNodeId: String(raw.context_node_id),
       candidateId: String(raw.candidate_id),
       maskedOldLogProbability: Number(raw.masked_old_log_probability),
       maskedOldActionLogProbability: raw.masked_old_action_log_probability === undefined
@@ -63,6 +63,9 @@ export class PythonOrganizationPolicyClient {
       maskedProbabilities: raw.masked_probabilities as
         OrganizationPolicyRecord['maskedProbabilities'],
       selectedAction: raw.selected_action as OrganizationPolicyRecord['selectedAction'],
+      selectedSpawnMode: raw.selected_spawn_mode as OrganizationPolicyRecord['selectedSpawnMode'],
+      spawnModeProbabilities: raw.spawn_mode_probabilities as
+        OrganizationPolicyRecord['spawnModeProbabilities'],
       numRealResidualGaps: Number(raw.num_real_residual_gaps ?? 0),
       numChildProposals: Number(raw.num_child_proposals ?? 0),
       stopLegalReason: String(raw.stop_legal_reason ?? ''),
