@@ -1114,6 +1114,15 @@ export class LHTBAutonomousController {
       const timeoutMs = timeoutValue === undefined ? undefined : Number(timeoutValue);
       if (kind === 'ACQUIRE' && !commandValue?.trim()) reasons.push('acquire_missing_command');
       if (kind === 'EXECUTE' && !commandValue?.trim()) reasons.push('execute_missing_command');
+      if (kind === 'RETURN' && actorNodeId !== snapshot.runtime.rootId) {
+        const actor = snapshot.runtime.nodes.find(node => node.id === actorNodeId);
+        const requiresExternalWork = actor?.specification?.externalAccess.allowed === true;
+        const hasLocalTerminalResult = runtimeEvents.some(event =>
+          event.kind === 'terminal_result' && event.nodeId === actorNodeId);
+        if (requiresExternalWork && !hasLocalTerminalResult) {
+          reasons.push('external_child_return_without_local_terminal_result');
+        }
+      }
       if ((kind === 'ACQUIRE' || kind === 'EXECUTE') && commandValue?.trim()
         && commandValue.trim() === lastFailedCommand?.command?.trim()
         && (cwdValue?.trim() ?? '') === (lastFailedCommand.cwd?.trim() ?? '')) {
@@ -1212,10 +1221,18 @@ export class LHTBAutonomousController {
     candidates: ProposedCandidate[]
   ): string[] {
     if (snapshot.organizationMode !== 'learned_information_realization') return [];
+    const events = snapshot.runtimeEvents ?? snapshot.processStates.at(-1)?.runtimeEvents ?? [];
+    const externallyExecutableChildren = snapshot.runtime.nodes.filter(node =>
+      node.id !== snapshot.runtime.rootId && ['ready', 'running'].includes(node.status)
+      && node.specification?.externalAccess.allowed === true
+      && !events.some(event => event.kind === 'terminal_result' && event.nodeId === node.id));
+    const deficits = externallyExecutableChildren.filter(node => !candidates.some(candidate =>
+      candidate.actorNodeId === node.id && ['ACQUIRE', 'EXECUTE'].includes(candidate.kind)))
+      .map(node => `missing_external_child_progress_candidate:${node.id}`);
     const profile = activeTopologySamplingProfile(snapshot.organizationSeed);
-    if (!profile) return [];
+    if (!profile) return deficits;
     const minimumNodes = profile.preferredNodeRange[0];
-    if (minimumNodes <= 0) return [];
+    if (minimumNodes <= 0) return deficits;
     const active = new Set(snapshot.runtime.nodes.filter(node =>
       ['ready', 'running', 'waiting', 'completed'].includes(node.status)).map(node => node.id));
     const openGapIds = new Set(snapshot.runtime.requirements.filter(requirement =>
@@ -1224,11 +1241,11 @@ export class LHTBAutonomousController {
     const phase = topologySamplingPhase(snapshot);
     if (phase.id === 'seed_child_local_residual') {
       return candidates.some(candidate => topologySamplingCandidateMatchesPhase(snapshot, candidate))
-        ? [] : ['missing_deepest_child_progress_candidate'];
+        ? deficits : [...deficits, 'missing_deepest_child_progress_candidate'];
     }
     if (phase.id === 'derive_child_local_residual') {
       return candidates.some(candidate => topologySamplingCandidateMatchesPhase(snapshot, candidate))
-        ? [] : ['missing_child_local_recursive_derive_candidate'];
+        ? deficits : [...deficits, 'missing_child_local_recursive_derive_candidate'];
     }
     const requiredAssignments = snapshot.runtime.nodes.length < minimumNodes
       ? Math.min(3, minimumNodes - snapshot.runtime.nodes.length, openGapIds.size) : 0;
@@ -1239,7 +1256,6 @@ export class LHTBAutonomousController {
         : candidate.action.requirementId)
       .filter((gapId): gapId is string => typeof gapId === 'string'
         && openGapIds.has(gapId)));
-    const deficits: string[] = [];
     if (offeredGapIds.size < requiredAssignments) {
       deficits.push(`missing_real_gap_assignment_candidates:${offeredGapIds.size}/${requiredAssignments}`);
     }

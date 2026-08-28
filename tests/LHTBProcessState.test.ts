@@ -901,6 +901,74 @@ describe('LHTB process state', () => {
     }
   });
 
+  it('requires externally executable children to produce a local terminal result before return', () => {
+    const session = new RoyLHTBSession('external-child-return', 'task', 'finish', 'commit',
+      'learned_information_realization');
+    const childSpecification = {
+      id: 'spec-worker', nodeId: 'worker', parentId: 'root', depth: 1,
+      parentGoal: 'finish', triggeringGapId: 'root-task-requirement',
+      localObjective: 'Inspect and verify the workspace.', refinement: {
+        parentScope: 'finish', childScope: 'inspect and verify the workspace',
+        triggeringRequirementId: 'root-task-requirement', narrowerThanParent: true,
+        newInformationNeeded: 'verified workspace state',
+        executableEndCondition: 'a terminal check has completed', duplicatedByExistingNode: false,
+      }, requiredClaims: [], requiredEvidence: [], relevantReportIds: [],
+      externalAccess: { allowed: true, tools: ['terminal'], purpose: 'run the check' },
+      expectedOutput: { requiredInformation: 'verified result',
+        outputType: 'epistemic_report' as const }, terminationCondition: 'return verified result',
+    };
+    session.applyOrganizationAction({ kind: 'DERIVE', actorNodeId: 'root', childSpecification });
+    const report = { id: 'worker-report', nodeId: 'worker', parentId: 'root', depth: 1,
+      localObjective: childSpecification.localObjective,
+      triggeringGapId: 'root-task-requirement', conclusion: 'verification complete',
+      reasoningSummary: 'the workspace was checked', claims: [], evidence: [],
+      externalObservations: [], assumptions: [], uncertainty: { confidence: 0.8,
+        uncertainAbout: [], confidenceBasis: 'terminal check' }, conflicts: [],
+      coverage: { resolved: [], unresolved: ['root-task-requirement'], notExamined: [] },
+      blindSpots: [], residualRequirements: [], proposedChildren: [], resolvedParentGap: false,
+      informationToPropagate: [],
+    };
+    const response = { preferred_candidate_id: 'return-worker', candidates: [{
+      id: 'return-worker', kind: 'RETURN', actorNodeId: 'worker',
+      description: 'return verified result', schedulerComplexity: 1,
+      action: { kind: 'RETURN', actorNodeId: 'worker', report },
+    }] };
+    const semantic = { async processEvent() { return { event_id: 'none', requirements: [],
+      claims: [], assumptions: [], evidence: [], external_observations: [], blind_spots: [],
+      relations: [] }; }, close() {} };
+    const provider = { isConfigured: () => true, async completeJSONWithUsage() {
+      throw new Error('not used');
+    } };
+    const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false });
+    type Harness = {
+      validateCandidates(value: unknown, current: RoyLHTBSession): {
+        candidates: Array<{ id: string }>;
+        dispositions: Array<{ reasons: string[] }>;
+      };
+      structuralCandidateDeficits(snapshot: ReturnType<RoyLHTBSession['snapshot']>,
+        candidates: Array<{ kind: string; actorNodeId: string }>): string[];
+    };
+    const harness = controller as unknown as Harness;
+    try {
+      const rejected = harness.validateCandidates(response, session);
+      expect(rejected.candidates).toHaveLength(0);
+      expect(rejected.dispositions[0].reasons)
+        .toContain('external_child_return_without_local_terminal_result');
+      expect(harness.structuralCandidateDeficits(session.snapshot(), []))
+        .toContain('missing_external_child_progress_candidate:worker');
+      session.requestTerminal({ id: 'worker-check', command: 'true', timeoutMs: 1000,
+        nodeId: 'worker', organizationActionKind: 'EXECUTE' });
+      session.acceptTerminalResult({ requestId: 'worker-check', exitCode: 0, stdout: '',
+        stderr: '', durationMs: 1 });
+      const accepted = harness.validateCandidates(response, session);
+      expect(accepted.candidates.map(value => value.id)).toContain('return-worker');
+      expect(harness.structuralCandidateDeficits(session.snapshot(), []))
+        .not.toContain('missing_external_child_progress_candidate:worker');
+    } finally {
+      controller.close();
+    }
+  });
+
   it('projects cumulative terminal text for the proposer without mutating M_t', async () => {
     const session = new RoyLHTBSession('projection', 'task', 'finish', 'commit',
       'roy_runtime_heuristic');
