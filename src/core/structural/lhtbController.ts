@@ -872,16 +872,20 @@ export class LHTBAutonomousController {
         actorPriors: {}, children: [] };
     }
     const analysis = await this.learnedPolicy.analyze(currentPolicyState);
-    const children = await Promise.all(valid.map(async value => {
+    const childPolicyStates = valid.map(value => {
       const childCandidates = candidates.filter(candidate => candidate.id !== value.candidate.id);
-      const childPolicyState = this.policyState(value.state,
+      return this.policyState(value.state,
         childCandidates.length ? childCandidates : [value.candidate]);
-      const childValue = await this.learnedPolicy!.targetValue(
-        childPolicyState.event_graph as Record<string, unknown>
-      );
+    });
+    const childValues = await this.learnedPolicy.targetValues(childPolicyStates.map(value =>
+      value.event_graph as Record<string, unknown>));
+    if (childValues.targetRevision !== analysis.targetRevision) {
+      throw new Error('MCTS expansion mixed target-value revisions');
+    }
+    const children = valid.map((value, index) => {
       return { ...value, prior: analysis.candidatePriors[value.candidate.id] ?? 0,
-        targetValue: childValue.targetValue };
-    }));
+        targetValue: childValues.targetValues[index] };
+    });
     return { targetValue: analysis.targetValue, targetRevision: analysis.targetRevision,
       actorPriors: analysis.candidatePriors, children };
   }

@@ -6,7 +6,7 @@ import os
 import sys
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import torch
 
@@ -84,6 +84,36 @@ class LHTBPolicyServer:
         target_value = self._target_value(event_graph)
         return {"target_value": target_value, "target_revision": self.target_revision}
 
+    def values(self, event_graphs: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not isinstance(event_graphs, list) or not all(
+            isinstance(graph, dict) for graph in event_graphs
+        ):
+            raise ValueError("event_graphs must be a list of graph objects")
+        keys = [_stable_digest(graph) for graph in event_graphs]
+        results: List[float | None] = [None] * len(event_graphs)
+        missing_by_key: Dict[str, Dict[str, Any]] = {}
+        for index, (key, graph) in enumerate(zip(keys, event_graphs)):
+            cached = self.value_cache.get(key)
+            if cached is not None:
+                results[index] = float(cached)
+            elif key not in missing_by_key:
+                missing_by_key[key] = graph
+        if missing_by_key:
+            missing_keys = list(missing_by_key)
+            tensors = [graph_tensors(missing_by_key[key], self.encoder)
+                       for key in missing_keys]
+            with torch.no_grad():
+                predictions = self.target.forward_batch(tensors).detach().cpu().tolist()
+            for key, prediction in zip(missing_keys, predictions):
+                self.value_cache.put(key, float(prediction))
+        for index, key in enumerate(keys):
+            if results[index] is None:
+                cached = self.value_cache.get(key)
+                if cached is None:
+                    raise RuntimeError("batched target value was not cached")
+                results[index] = float(cached)
+        return {"target_values": results, "target_revision": self.target_revision}
+
     def _target_value(self, event_graph: Dict[str, Any]) -> float:
         key = _stable_digest(event_graph)
         cached = self.value_cache.get(key)
@@ -132,6 +162,8 @@ def main() -> None:
                 result = server.analyze(request["policy_state"])
             elif operation == "value":
                 result = server.value(request["event_graph"])
+            elif operation == "values":
+                result = server.values(request["event_graphs"])
             elif operation == "select":
                 result = server.decide(request["policy_state"], int(request["seed"]))
             else:

@@ -951,6 +951,37 @@ for line in sys.stdin:
         server.value({"nodes": [{"id": "b", "kind": "agent"}], "edges": []})
         self.assertEqual(len(server.value_cache.values), 2)
 
+    def test_policy_value_batch_deduplicates_and_preserves_order(self) -> None:
+        class CountingBatchTarget:
+            def __init__(self):
+                self.batch_sizes = []
+
+            def forward_batch(self, tensors):
+                self.batch_sizes.append(len(tensors))
+                return torch.tensor([0.2 + 0.1 * index
+                                     for index in range(len(tensors))])
+
+        server = LHTBPolicyServer.__new__(LHTBPolicyServer)
+        server.target = CountingBatchTarget()
+        server.target_revision = 3
+        server.encoder = FakeEncoder384()
+        server.value_cache = _LRUCache(8)
+        first = {"nodes": [{"id": "root", "kind": "agent", "text": "solve"}],
+                 "edges": []}
+        second = {"nodes": [{"id": "child", "kind": "agent", "text": "verify"}],
+                  "edges": []}
+        result = server.values([first, second, {"edges": [], "nodes": first["nodes"]}])
+        self.assertEqual(server.target.batch_sizes, [2])
+        self.assertEqual(result["target_revision"], 3)
+        self.assertEqual(len(result["target_values"]), 3)
+        self.assertAlmostEqual(result["target_values"][0], 0.2, places=6)
+        self.assertAlmostEqual(result["target_values"][1], 0.3, places=6)
+        self.assertAlmostEqual(result["target_values"][2], 0.2, places=6)
+        cached = server.values([second, first])
+        self.assertEqual(server.target.batch_sizes, [2])
+        self.assertAlmostEqual(cached["target_values"][0], 0.3, places=6)
+        self.assertAlmostEqual(cached["target_values"][1], 0.2, places=6)
+
     def test_value_state_minibatch_is_deterministic_and_equal_weight(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             trainer = LHTBProcessGRPOTrainer(

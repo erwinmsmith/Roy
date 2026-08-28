@@ -823,7 +823,10 @@ describe('LHTB process state', () => {
       return { targetValue: 0.5, targetRevision: 0,
         candidatePriors: Object.fromEntries(values.map(value => [String(value.id), 1])),
         actionPriors: {}, actorPaths: [] };
-    }, async targetValue() { return { targetValue: 0.5, targetRevision: 0 }; }, close() {} };
+    }, async targetValue() { return { targetValue: 0.5, targetRevision: 0 }; },
+    async targetValues(graphs: Array<Record<string, unknown>>) {
+      return { targetValues: graphs.map(() => 0.5), targetRevision: 0 };
+    }, close() {} };
     const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false,
       learnedPolicy: learnedPolicy as never });
     try {
@@ -874,7 +877,10 @@ describe('LHTB process state', () => {
       return { targetValue: 0.5, targetRevision: 0,
         candidatePriors: Object.fromEntries(values.map(value => [String(value.id),
           value.id === 'stop-official-verifier' ? 100 : 1])), actionPriors: {}, actorPaths: [] };
-    }, async targetValue() { return { targetValue: 0.5, targetRevision: 0 }; }, close() {} };
+    }, async targetValue() { return { targetValue: 0.5, targetRevision: 0 }; },
+    async targetValues(graphs: Array<Record<string, unknown>>) {
+      return { targetValues: graphs.map(() => 0.5), targetRevision: 0 };
+    }, close() {} };
     const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false,
       learnedPolicy: learnedPolicy as never });
     try {

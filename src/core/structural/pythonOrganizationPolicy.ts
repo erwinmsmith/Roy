@@ -12,6 +12,7 @@ interface OrganizationResponse {
   candidate_priors?: Record<string, number>;
   action_priors?: Record<string, number>;
   actor_paths?: Array<Record<string, unknown>>;
+  target_values?: number[];
   error?: string;
 }
 
@@ -91,6 +92,19 @@ export class PythonOrganizationPolicyClient {
       throw new Error(response.error ?? 'Learned organization policy returned no target value');
     }
     return { targetValue: Number(response.target_value),
+      targetRevision: Number(response.target_revision ?? 0) };
+  }
+
+  async targetValues(eventGraphs: Record<string, unknown>[]): Promise<{
+    targetValues: number[]; targetRevision: number;
+  }> {
+    if (eventGraphs.length === 0) return { targetValues: [], targetRevision: 0 };
+    const response = await this.request({ operation: 'values', event_graphs: eventGraphs });
+    if (response.error || !Array.isArray(response.target_values)
+      || response.target_values.length !== eventGraphs.length) {
+      throw new Error(response.error ?? 'Learned organization policy returned invalid target values');
+    }
+    return { targetValues: response.target_values.map(Number),
       targetRevision: Number(response.target_revision ?? 0) };
   }
 
