@@ -163,7 +163,7 @@ class RoyHarborAgent(BaseAgent):
         self._continuation_count = 0
         self.rollout_timeout_sec = rollout_timeout_sec
         self.partial_save_interval_sec = max(0.0, float(child_environment.get(
-            "ROY_LHTB_PARTIAL_SAVE_INTERVAL_SEC", "300"
+            "ROY_LHTB_PARTIAL_SAVE_INTERVAL_SEC", "30"
         )))
         self._last_partial_save = 0.0
 
