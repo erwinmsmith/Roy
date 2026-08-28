@@ -880,7 +880,8 @@ for line in sys.stdin:
                     "dagEdges": [], "runtimeEvents": [],
                 }],
             }
-            with patch("roy_research.lhtb_value_metrics._predict_state", return_value=0.5):
+            with patch("roy_research.lhtb_value_metrics._predict_state",
+                       side_effect=AssertionError("constant critic must use the fast path")):
                 enriched = list(annotate_value_traces([record], str(checkpoint)))[0]
             self.assertEqual(enriched["target_value_revision"], 7)
             self.assertEqual(enriched["target_value_trace"], [0.5])

@@ -22,17 +22,19 @@ def value_metrics(records: Sequence[Mapping[str, Any]], checkpoint: str,
     model = EpistemicValueModel().to(device)
     model.load_state_dict(payload["value_state_dict"])
     model.eval()
-    encoder = FrozenTextEncoder(device=device_name, local_only=True)
-    target_revision = int(payload.get("metadata", {}).get("groups", 0))
+    constant = _constant_value_output(model)
+    encoder = None if constant is not None else FrozenTextEncoder(
+        device=device_name, local_only=True
+    )
     predictions = []
     targets = []
     with torch.no_grad():
         for record in records:
             reward = float(record["terminal_reward"])
             for state in record["process_states"]:
-                graph = epistemic_state_graph(state)
-                tensors = [value.to(device) for value in graph_tensors(graph, encoder)]
-                predictions.append(float(model(*tensors)))
+                predictions.append(constant if constant is not None else _predict_state(
+                    model, state, encoder, device
+                ))
                 targets.append(reward)
     prediction = np.asarray(predictions)
     target = np.asarray(targets)
@@ -52,13 +54,18 @@ def annotate_value_traces(records: Sequence[Mapping[str, Any]], checkpoint: str,
     value.load_state_dict(payload["value_state_dict"])
     target.load_state_dict(payload["target_state_dict"])
     value.eval(); target.eval()
-    encoder = FrozenTextEncoder(device=device_name, local_only=True)
+    value_constant = _constant_value_output(value)
+    target_constant = _constant_value_output(target)
+    encoder = None if value_constant is not None and target_constant is not None \
+        else FrozenTextEncoder(device=device_name, local_only=True)
     result = []
     with torch.no_grad():
         for record in records:
             states = list(record.get("process_states", []))
-            value_predictions = [_predict_state(value, state, encoder, device) for state in states]
-            target_predictions = [_predict_state(target, state, encoder, device) for state in states]
+            value_predictions = [value_constant] * len(states) if value_constant is not None \
+                else [_predict_state(value, state, encoder, device) for state in states]
+            target_predictions = [target_constant] * len(states) if target_constant is not None \
+                else [_predict_state(target, state, encoder, device) for state in states]
             by_fingerprint = {str(state.get("fingerprint")): index for index, state in enumerate(states)}
             indices = [by_fingerprint[str(item.get("state_fingerprint",
                        item.get("stateFingerprint")))] for item in record.get("policy_records", [])]
@@ -89,10 +96,24 @@ def annotate_value_traces(records: Sequence[Mapping[str, Any]], checkpoint: str,
 
 
 def _predict_state(model: EpistemicValueModel, state: Mapping[str, Any],
-                   encoder: FrozenTextEncoder, device: torch.device) -> float:
+                   encoder: FrozenTextEncoder | None, device: torch.device) -> float:
+    if encoder is None:
+        raise ValueError("non-constant value prediction requires a text encoder")
     graph = epistemic_state_graph(state)
     tensors = [value.to(device) for value in graph_tensors(graph, encoder)]
     return float(model(*tensors))
+
+
+def _constant_value_output(model: EpistemicValueModel) -> float | None:
+    """Return the exact output when the final value head ignores its input."""
+    final = model.value_head[-1]
+    weight = getattr(final, "weight", None)
+    bias = getattr(final, "bias", None)
+    if weight is None or bias is None or bias.numel() != 1:
+        return None
+    if int(torch.count_nonzero(weight.detach()).item()) != 0:
+        return None
+    return float(torch.sigmoid(bias.detach()).item())
 
 
 def _spearman(left: np.ndarray, right: np.ndarray) -> float:
