@@ -65,6 +65,18 @@ def make_ema_target(model: EpistemicValueModel) -> EpistemicValueModel:
     return target
 
 
+def constant_value_output(model: EpistemicValueModel) -> float | None:
+    """Return the exact scalar output when the final value layer ignores its input."""
+    final = model.value_head[-1]
+    weight = getattr(final, "weight", None)
+    bias = getattr(final, "bias", None)
+    if weight is None or bias is None or bias.numel() != 1:
+        return None
+    if int(torch.count_nonzero(weight.detach()).item()) != 0:
+        return None
+    return float(torch.sigmoid(bias.detach()).item())
+
+
 @torch.no_grad()
 def update_ema(target: nn.Module, source: nn.Module, decay: float = 0.99) -> None:
     for target_value, source_value in zip(target.parameters(), source.parameters()):

@@ -10,7 +10,7 @@ from .lhtb_transitions import (
     build_decision_transition_samples,
     build_state_transition_samples,
 )
-from .value_model import EpistemicValueModel, process_credit
+from .value_model import EpistemicValueModel, constant_value_output, process_credit
 
 
 def value_metrics(records: Sequence[Mapping[str, Any]], checkpoint: str,
@@ -22,7 +22,7 @@ def value_metrics(records: Sequence[Mapping[str, Any]], checkpoint: str,
     model = EpistemicValueModel().to(device)
     model.load_state_dict(payload["value_state_dict"])
     model.eval()
-    constant = _constant_value_output(model)
+    constant = constant_value_output(model)
     encoder = None if constant is not None else FrozenTextEncoder(
         device=device_name, local_only=True
     )
@@ -54,8 +54,8 @@ def annotate_value_traces(records: Sequence[Mapping[str, Any]], checkpoint: str,
     value.load_state_dict(payload["value_state_dict"])
     target.load_state_dict(payload["target_state_dict"])
     value.eval(); target.eval()
-    value_constant = _constant_value_output(value)
-    target_constant = _constant_value_output(target)
+    value_constant = constant_value_output(value)
+    target_constant = constant_value_output(target)
     encoder = None if value_constant is not None and target_constant is not None \
         else FrozenTextEncoder(device=device_name, local_only=True)
     result = []
@@ -102,18 +102,6 @@ def _predict_state(model: EpistemicValueModel, state: Mapping[str, Any],
     graph = epistemic_state_graph(state)
     tensors = [value.to(device) for value in graph_tensors(graph, encoder)]
     return float(model(*tensors))
-
-
-def _constant_value_output(model: EpistemicValueModel) -> float | None:
-    """Return the exact output when the final value head ignores its input."""
-    final = model.value_head[-1]
-    weight = getattr(final, "weight", None)
-    bias = getattr(final, "bias", None)
-    if weight is None or bias is None or bias.numel() != 1:
-        return None
-    if int(torch.count_nonzero(weight.detach()).item()) != 0:
-        return None
-    return float(torch.sigmoid(bias.detach()).item())
 
 
 def _spearman(left: np.ndarray, right: np.ndarray) -> float:
