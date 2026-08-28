@@ -7,6 +7,7 @@ import sys
 import asyncio
 from types import SimpleNamespace
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
@@ -41,6 +42,7 @@ from roy_research.lhtb_experiment import (
     write_harbor_group_config,
 )
 from roy_research.lhtb_results import import_harbor_group, official_lhtb_reward, sample_audit
+from roy_research.lhtb_value_metrics import annotate_value_traces
 from roy_research.lhtb_transitions import (
     build_decision_transition_samples,
     build_state_transition_samples,
@@ -859,6 +861,30 @@ for line in sys.stdin:
         before = [value.clone() for value in target.parameters()]
         update_ema(target, model, 0.99)
         self.assertEqual(len(before), len(list(target.parameters())))
+
+    def test_value_trace_annotation_uses_checkpoint_target_revision(self) -> None:
+        model = EpistemicValueModel()
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "model.pt"
+            torch.save({
+                "value_state_dict": model.state_dict(),
+                "target_state_dict": model.state_dict(),
+                "metadata": {"groups": 7},
+            }, checkpoint)
+            record = {
+                "id": "trajectory", "task_id": "task", "rollout_index": 0,
+                "terminal_reward": 0.7, "policy_records": [],
+                "process_states": [{
+                    "sequence": 0, "fingerprint": "m0",
+                    "nodes": [{"id": "root", "depth": 0}],
+                    "dagEdges": [], "runtimeEvents": [],
+                }],
+            }
+            with patch("roy_research.lhtb_value_metrics._predict_state", return_value=0.5):
+                enriched = list(annotate_value_traces([record], str(checkpoint)))[0]
+            self.assertEqual(enriched["target_value_revision"], 7)
+            self.assertEqual(enriched["target_value_trace"], [0.5])
+            self.assertEqual(enriched["state_transitions"], [])
 
     def test_mcts_behavior_probability_is_exact_and_revision_locked(self) -> None:
         record = {
