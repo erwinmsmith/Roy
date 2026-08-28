@@ -56,7 +56,10 @@ class LHTBProcessGRPOTrainer:
     def __init__(self, checkpoint: Path, manifest: Sequence[Mapping[str, object]],
                  learning_rate: float = 1e-4, value_learning_rate: float = 1e-4,
                  ema_decay: float = 0.99, device_name: str = "cpu", seed: int = 20260820,
-                 encoder: Any | None = None, resume: bool = False) -> None:
+                 encoder: Any | None = None, resume: bool = False,
+                 actor_microbatch: int = 64, value_microbatch: int = 64) -> None:
+        if actor_microbatch <= 0 or value_microbatch <= 0:
+            raise ValueError("LHTB microbatch sizes must be positive")
         torch.manual_seed(seed)
         self.checkpoint = checkpoint
         self.manifest = list(manifest)
@@ -68,6 +71,8 @@ class LHTBProcessGRPOTrainer:
         self.actor_optimizer = torch.optim.AdamW(self.actor.parameters(), lr=learning_rate)
         self.value_optimizer = torch.optim.AdamW(self.value.parameters(), lr=value_learning_rate)
         self.ema_decay = ema_decay
+        self.actor_microbatch = actor_microbatch
+        self.value_microbatch = value_microbatch
         self.groups = 0
         self.actor_steps = 0
         self.value_steps = 0
@@ -123,8 +128,8 @@ class LHTBProcessGRPOTrainer:
                     dtype=torch.float32, device=self.device,
                 )
                 step_advantages = step_advantages.to(self.device)
-                for start in range(0, len(policy_records), 16):
-                    stop = start + 16
+                for start in range(0, len(policy_records), self.actor_microbatch):
+                    stop = start + self.actor_microbatch
                     current = replay_joint_log_probabilities(
                         self.actor, self.encoder, policy_records[start:stop], self.device
                     )
@@ -143,12 +148,11 @@ class LHTBProcessGRPOTrainer:
 
         self.value_optimizer.zero_grad(set_to_none=True)
         value_loss_value = 0.0
-        value_microbatch = 16
         for states, reward in zip(state_sequences, rewards):
             scale = 1.0 / (len(records) * len(states))
-            for start in range(0, len(states), value_microbatch):
+            for start in range(0, len(states), self.value_microbatch):
                 predictions = self._predict_batch(
-                    self.value, states[start:start + value_microbatch]
+                    self.value, states[start:start + self.value_microbatch]
                 )
                 target = torch.full_like(predictions, reward)
                 loss = F.huber_loss(predictions, target, reduction="sum") * scale

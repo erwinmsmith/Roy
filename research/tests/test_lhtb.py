@@ -1050,6 +1050,14 @@ for line in sys.stdin:
             self.assertEqual(restored.value_steps, 1)
             self.assertEqual(restored.actor_steps, 0)
 
+    def test_lhtb_microbatch_sizes_must_be_positive(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "microbatch sizes must be positive"):
+                LHTBProcessGRPOTrainer(
+                    Path(directory) / "model.pt", [], encoder=FakeEncoder384(),
+                    actor_microbatch=0,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
