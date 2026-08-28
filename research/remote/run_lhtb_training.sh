@@ -59,6 +59,8 @@ export ROY_LHTB_MCTS_SIMULATIONS="${ROY_LHTB_MCTS_SIMULATIONS:-24}"
 export ROY_LHTB_MCTS_MAX_DEPTH="${ROY_LHTB_MCTS_MAX_DEPTH:-3}"
 export ROY_LHTB_MCTS_CPUCT="${ROY_LHTB_MCTS_CPUCT:-1.5}"
 export ROY_LHTB_MCTS_TEMPERATURE="${ROY_LHTB_MCTS_TEMPERATURE:-1}"
+export ROY_LHTB_MCTS_AGENT_EXPANSIONS="${ROY_LHTB_MCTS_AGENT_EXPANSIONS:-4}"
+export ROY_LHTB_MCTS_PROPOSAL_ATTEMPTS="${ROY_LHTB_MCTS_PROPOSAL_ATTEMPTS:-2}"
 if [[ "${ROY_LHTB_MCTS_ENABLED}" == "true" ]]; then
   export ROY_LHTB_ORGANIZATION_INTERVAL=1
 else
@@ -122,7 +124,7 @@ PY
     local group_id="dev:${dev_epoch}:${task_id}"
     local task_tree initial_fingerprint job_dir config_path digest revision seed
     task_tree="$(git -C "${lhtb_root}" rev-parse "HEAD:tasks/${task_id}")"
-    initial_fingerprint="$(printf '%s' "${group_id}:${task_tree}:21600:32768" | shasum -a 256 | awk '{print $1}')"
+    initial_fingerprint="$(printf '%s' "${group_id}:${task_tree}:21600:32768:${ROY_LHTB_MCTS_ENABLED}:${ROY_LHTB_MCTS_SIMULATIONS}:${ROY_LHTB_MCTS_MAX_DEPTH}:${ROY_LHTB_MCTS_AGENT_EXPANSIONS}:${ROY_LHTB_MCTS_PROPOSAL_ATTEMPTS}" | shasum -a 256 | awk '{print $1}')"
     seed="$((16#$(printf '%s' "${group_id}" | shasum -a 256 | cut -c1-8)))"
     revision="$("${python_bin}" - "${model}" <<'PY'
 import sys, torch
@@ -193,7 +195,7 @@ print(torch.load(sys.argv[1], map_location="cpu", weights_only=False)["metadata"
 PY
 )"
   task_tree="$(git -C "${lhtb_root}" rev-parse "HEAD:tasks/${task_id}")"
-  initial_fingerprint="$(printf '%s' "${group_id}:${task_tree}:21600:32768" | shasum -a 256 | awk '{print $1}')"
+  initial_fingerprint="$(printf '%s' "${group_id}:${task_tree}:21600:32768:${ROY_LHTB_MCTS_ENABLED}:${ROY_LHTB_MCTS_SIMULATIONS}:${ROY_LHTB_MCTS_MAX_DEPTH}:${ROY_LHTB_MCTS_AGENT_EXPANSIONS}:${ROY_LHTB_MCTS_PROPOSAL_ATTEMPTS}" | shasum -a 256 | awk '{print $1}')"
   job_dir="${run_root}/jobs/${epoch}-${task_id}"
   config_path="${run_root}/configs/${epoch}-${task_id}.json"
   mkdir -p "${job_dir}"
@@ -223,7 +225,7 @@ import json, sys
 audit = json.load(open(sys.argv[1], encoding="utf-8"))
 required = ("preconditions_for_training", "value_training_available",
             "all_transition_chains_complete", "all_step_rewards_complete",
-            "all_mcts_traces_complete")
+            "all_mcts_traces_complete", "all_dynamic_agent_expansions_complete")
 failed = [key for key in required if not audit.get(key)]
 if failed:
     raise SystemExit(f"G=8 sample audit rejected training group: {failed}")

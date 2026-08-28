@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -20,7 +21,7 @@ from .reporting import write_utility_svg
 from .schema import TraceRecord
 from .token_ledger import PersistentTokenLedger
 from .tau3 import build_tau3_manifest, manifest_summary, verify_tau3_root
-from .organization import RuntimeBudget
+from .organization import LHTB_POLICY_INTERFACE_REVISION, RuntimeBudget
 from .tau3_runner import evaluate_tau3_against_direct, train_tau3_on_policy
 from .lhtb import build_lhtb_split, verify_lhtb_checkout, write_lhtb_manifest, load_lhtb_manifest
 from .lhtb_experiment import build_training_schedule, disk_preflight, select_dev_checkpoint, summarize_test, write_json, write_harbor_group_config, write_lhtb_svg
@@ -470,11 +471,29 @@ def main(argv: List[str] | None = None) -> None:
         environment_digest = args.environment_digest or args.docker_digest
         if not environment_digest:
             raise ValueError("an immutable environment digest is required")
+        mcts_enabled = args.arm == "learned_information_realization" \
+            and os.environ.get("ROY_LHTB_MCTS_ENABLED", "false").lower() == "true"
         records = import_harbor_group(
             args.job_dir, args.output, args.group_id, args.task_id, args.category,
             args.split, args.epoch, args.policy_revision, environment_digest,
             {"maximum_rollout_seconds": 21600, "max_response_tokens": 32768,
-             "concurrency": 4},
+             "concurrency": 4, "organization_policy": args.arm,
+             "policy_interface_revision": LHTB_POLICY_INTERFACE_REVISION,
+             "mcts_enabled": mcts_enabled,
+             "mcts_simulations": int(os.environ.get("ROY_LHTB_MCTS_SIMULATIONS", "24"))
+                 if mcts_enabled else 0,
+             "mcts_maximum_depth": int(os.environ.get("ROY_LHTB_MCTS_MAX_DEPTH", "3"))
+                 if mcts_enabled else 0,
+             "mcts_cpuct": float(os.environ.get("ROY_LHTB_MCTS_CPUCT", "1.5"))
+                 if mcts_enabled else 0.0,
+             "mcts_temperature": float(os.environ.get("ROY_LHTB_MCTS_TEMPERATURE", "1"))
+                 if mcts_enabled else 0.0,
+             "mcts_agent_expansions": int(os.environ.get(
+                 "ROY_LHTB_MCTS_AGENT_EXPANSIONS", "4"
+             )) if mcts_enabled else 0,
+             "mcts_proposal_attempts": int(os.environ.get(
+                 "ROY_LHTB_MCTS_PROPOSAL_ATTEMPTS", "2"
+             )) if mcts_enabled else 0},
             expected=args.expected,
             arm=args.arm,
             environment_backend=args.environment_backend,

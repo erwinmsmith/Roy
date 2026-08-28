@@ -926,6 +926,107 @@ describe('LHTB process state', () => {
     }
   });
 
+  it('uses the agent proposer to generate fresh directions inside hypothetical MCTS states',
+    async () => {
+      const prior = {
+        enabled: process.env.ROY_LHTB_MCTS_ENABLED,
+        simulations: process.env.ROY_LHTB_MCTS_SIMULATIONS,
+        depth: process.env.ROY_LHTB_MCTS_MAX_DEPTH,
+        expansions: process.env.ROY_LHTB_MCTS_AGENT_EXPANSIONS,
+        attempts: process.env.ROY_LHTB_MCTS_PROPOSAL_ATTEMPTS,
+      };
+      process.env.ROY_LHTB_MCTS_ENABLED = 'true';
+      process.env.ROY_LHTB_MCTS_SIMULATIONS = '8';
+      process.env.ROY_LHTB_MCTS_MAX_DEPTH = '2';
+      process.env.ROY_LHTB_MCTS_AGENT_EXPANSIONS = '2';
+      process.env.ROY_LHTB_MCTS_PROPOSAL_ATTEMPTS = '1';
+      const session = new RoyLHTBSession('dynamic-mcts', 'task', 'finish', 'commit',
+        'learned_information_realization');
+      const childSpecification = {
+        id: 'spec-worker', nodeId: 'worker', parentId: 'root', depth: 1,
+        parentGoal: 'finish', triggeringGapId: 'root-task-requirement',
+        realizationMode: 'acquire_external' as const,
+        localObjective: 'Inspect the environment and return verified evidence.', refinement: {
+          parentScope: 'finish', childScope: 'inspect the environment',
+          triggeringRequirementId: 'root-task-requirement', narrowerThanParent: true,
+          newInformationNeeded: 'environment evidence',
+          executableEndCondition: 'one terminal inspection completes',
+          duplicatedByExistingNode: false,
+        }, requiredClaims: [], requiredEvidence: [], relevantReportIds: [],
+        externalAccess: { allowed: true, tools: ['terminal'], purpose: 'inspect' },
+        expectedOutput: { requiredInformation: 'verified evidence',
+          outputType: 'epistemic_report' as const },
+        terminationCondition: 'return after inspection',
+      };
+      let calls = 0;
+      const observedContexts: string[] = [];
+      const provider = { isConfigured: () => true, async completeJSONWithUsage(messages: Array<{
+        role: string; content: string;
+      }>) {
+        calls += 1;
+        const request = JSON.parse(messages.at(-1)?.content ?? '{}') as Record<string, unknown>;
+        const organization = request.organization as Record<string, unknown> | undefined;
+        const active = organization?.activeNodes as Array<Record<string, unknown>> | undefined;
+        const context = String((request.mctsSearchExpansion as Record<string, unknown> | undefined)
+          ?.contextNodeId ?? active?.[0]?.id ?? 'root');
+        observedContexts.push(context);
+        const candidate = request.mctsSearchExpansion ? {
+          id: 'child-execute', kind: 'EXECUTE', actorNodeId: 'worker',
+          description: 'inspect from the child context', schedulerComplexity: 1,
+          command: 'true', action: { kind: 'EXECUTE', actorNodeId: 'worker' },
+        } : {
+          id: 'derive-worker', kind: 'DERIVE', actorNodeId: 'root',
+          description: 'derive an inspecting child', schedulerComplexity: 1,
+          action: { kind: 'DERIVE', actorNodeId: 'root', childSpecification },
+        };
+        return { value: { preferred_candidate_id: candidate.id, candidates: [candidate] },
+          completion: { content: '{}', model: 'mock-deepseek', usage: {
+            promptTokens: 3, completionTokens: 2, totalTokens: 5,
+          } } };
+      } };
+      const semantic = { async processEvent(event: { id: string }) {
+        return { event_id: event.id, requirements: [], claims: [], assumptions: [], evidence: [],
+          external_observations: [], blind_spots: [], relations: [] };
+      }, close() {} };
+      const learnedPolicy = { async analyze(policyState: Record<string, unknown>) {
+        const values = policyState.candidates as Array<Record<string, unknown>>;
+        return { targetValue: 0.5, targetRevision: 0,
+          candidatePriors: Object.fromEntries(values.map(value => [String(value.id),
+            value.id === 'stop-official-verifier' ? 0.001 : 1])),
+          actionPriors: {}, actorPaths: [] };
+      }, async targetValue() { return { targetValue: 0.5, targetRevision: 0 }; },
+      async targetValues(graphs: Array<Record<string, unknown>>) {
+        return { targetValues: graphs.map(() => 0.5), targetRevision: 0 };
+      }, close() {} };
+      const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false,
+        learnedPolicy: learnedPolicy as never });
+      try {
+        const result = await controller.advance(session, 17);
+        expect(result.status).toBe('continue');
+        const record = session.snapshot().policyRecords.at(-1)!;
+        expect(calls).toBeGreaterThan(1);
+        expect(observedContexts).toContain('worker');
+        expect(record.mctsAgentExpansionCount).toBeGreaterThan(0);
+        expect(record.mctsAgentProposalCalls).toBeGreaterThan(0);
+        expect(record.mctsSearchSamples?.map(value => value.candidateId))
+          .toContain('child-execute');
+        expect(record.mctsSearchTrace?.some(value =>
+          value.proposalSource === 'dynamic_agent_search_expansion')).toBe(true);
+      } finally {
+        controller.close();
+        for (const [name, value] of Object.entries({
+          ROY_LHTB_MCTS_ENABLED: prior.enabled,
+          ROY_LHTB_MCTS_SIMULATIONS: prior.simulations,
+          ROY_LHTB_MCTS_MAX_DEPTH: prior.depth,
+          ROY_LHTB_MCTS_AGENT_EXPANSIONS: prior.expansions,
+          ROY_LHTB_MCTS_PROPOSAL_ATTEMPTS: prior.attempts,
+        })) {
+          if (value === undefined) delete process.env[name];
+          else process.env[name] = value;
+        }
+      }
+    });
+
   it('requires externally executable children to produce a local terminal result before return', async () => {
     const session = new RoyLHTBSession('external-child-return', 'task', 'finish', 'commit',
       'learned_information_realization');

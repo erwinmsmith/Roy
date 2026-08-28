@@ -49,6 +49,8 @@ export ROY_LHTB_MCTS_SIMULATIONS="${ROY_LHTB_MCTS_SIMULATIONS:-24}"
 export ROY_LHTB_MCTS_MAX_DEPTH="${ROY_LHTB_MCTS_MAX_DEPTH:-3}"
 export ROY_LHTB_MCTS_CPUCT="${ROY_LHTB_MCTS_CPUCT:-1.5}"
 export ROY_LHTB_MCTS_TEMPERATURE="${ROY_LHTB_MCTS_TEMPERATURE:-1}"
+export ROY_LHTB_MCTS_AGENT_EXPANSIONS="${ROY_LHTB_MCTS_AGENT_EXPANSIONS:-4}"
+export ROY_LHTB_MCTS_PROPOSAL_ATTEMPTS="${ROY_LHTB_MCTS_PROPOSAL_ATTEMPTS:-2}"
 if [[ "${ROY_LHTB_MCTS_ENABLED}" == "true" ]]; then
   export ROY_LHTB_ORGANIZATION_INTERVAL=1
 fi
@@ -65,7 +67,7 @@ fi
 
 while IFS=$'\t' read -r task_id category; do
   task_tree="$(git -C "${lhtb_root}" rev-parse "HEAD:tasks/${task_id}")"
-  initial_fingerprint="$(printf '%s' "test:${task_tree}:official-timeout" | shasum -a 256 | awk '{print $1}')"
+  initial_fingerprint="$(printf '%s' "test:${task_tree}:official-timeout:${ROY_LHTB_MCTS_ENABLED}:${ROY_LHTB_MCTS_SIMULATIONS}:${ROY_LHTB_MCTS_MAX_DEPTH}:${ROY_LHTB_MCTS_AGENT_EXPANSIONS}:${ROY_LHTB_MCTS_PROPOSAL_ATTEMPTS}" | shasum -a 256 | awk '{print $1}')"
   seed="$((16#$(printf '%s' "test:${task_id}" | shasum -a 256 | cut -c1-8)))"
   for arm in single_agent_direct roy_runtime_heuristic learned_information_realization; do
     if [[ -f "${results}" ]] && "${python_bin}" - "${results}" "${task_id}" "${arm}" <<'PY'

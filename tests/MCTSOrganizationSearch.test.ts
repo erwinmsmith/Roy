@@ -51,4 +51,46 @@ describe('organization MCTS', () => {
     );
     expect(result.selectedProcessReward).toBe(0);
   });
+
+  it('asks the agent expansion callback for fresh node-local directions at child states',
+    async () => {
+      type DynamicState = { id: string; value: number; context: string };
+      const rootCandidates: Candidate[] = [
+        { id: 'derive-worker', kind: 'DERIVE', delta: 0, prior: 1 },
+      ];
+      const expanded: Array<{ depth: number; context: string; offered: string[] }> = [];
+      const result = await searchOrganizationMCTS<DynamicState, Candidate>({
+        rootState: { id: 'root-state', value: 0.4, context: 'root' },
+        candidates: rootCandidates, simulations: 8, maximumDepth: 2,
+        cpuCT: 1.5, temperature: 1, seed: 4,
+        expand: async (state, offered, depth) => {
+          const directions = depth === 0 ? offered : [
+            { id: 'child-acquire', kind: 'ACQUIRE', delta: 0.3, prior: 0.7 },
+            { id: 'child-return', kind: 'RETURN', delta: -0.1, prior: 0.3 },
+          ];
+          expanded.push({ depth, context: state.context,
+            offered: directions.map(value => value.id) });
+          return {
+            targetValue: state.value, targetRevision: 1,
+            actorPriors: Object.fromEntries(directions.map(value => [value.id, value.prior])),
+            policyState: { state_fingerprint: state.id,
+              context_node_id: state.context, candidates: directions },
+            expansionMetadata: { proposalSource: depth === 0
+              ? 'real_step_agent_proposal' : 'dynamic_agent_search_expansion' },
+            children: directions.map(candidate => ({ candidate,
+              state: { id: `${state.id}:${candidate.id}`, value: state.value + candidate.delta,
+                context: depth === 0 ? 'worker' : state.context },
+              prior: candidate.prior, targetValue: state.value + candidate.delta,
+              terminal: depth > 0 })),
+          };
+        },
+      });
+      expect(expanded).toContainEqual({ depth: 1, context: 'worker',
+        offered: ['child-acquire', 'child-return'] });
+      expect(result.searchSamples.map(value => value.candidateId))
+        .toEqual(expect.arrayContaining(['derive-worker', 'child-acquire', 'child-return']));
+      expect(result.searchSamples.filter(value => value.contextNodeId === 'worker')).toHaveLength(2);
+      expect(result.trace.some(value =>
+        value.proposalSource === 'dynamic_agent_search_expansion')).toBe(true);
+    });
 });

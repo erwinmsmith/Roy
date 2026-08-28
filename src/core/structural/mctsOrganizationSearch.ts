@@ -17,6 +17,7 @@ export interface MCTSExpansion<State, Candidate extends MCTSCandidateLike> {
   actorPriors: Record<string, number>;
   policyState: Record<string, unknown>;
   children: Array<MCTSExpandedChild<State, Candidate>>;
+  expansionMetadata?: Record<string, unknown>;
 }
 
 interface SearchNode<State, Candidate extends MCTSCandidateLike> {
@@ -57,7 +58,8 @@ export interface MCTSSearchResult<Candidate extends MCTSCandidateLike> {
 export async function searchOrganizationMCTS<State, Candidate extends MCTSCandidateLike>(options: {
   rootState: State;
   candidates: Candidate[];
-  expand: (state: State, candidates: Candidate[]) => Promise<MCTSExpansion<State, Candidate>>;
+  expand: (state: State, candidates: Candidate[], depth: number) =>
+    Promise<MCTSExpansion<State, Candidate>>;
   simulations: number;
   maximumDepth: number;
   cpuCT: number;
@@ -103,11 +105,12 @@ export async function searchOrganizationMCTS<State, Candidate extends MCTSCandid
 
 async function ensureExpanded<State, Candidate extends MCTSCandidateLike>(
   node: SearchNode<State, Candidate>,
-  expand: (state: State, candidates: Candidate[]) => Promise<MCTSExpansion<State, Candidate>>,
+  expand: (state: State, candidates: Candidate[], depth: number) =>
+    Promise<MCTSExpansion<State, Candidate>>,
   trace: Array<Record<string, unknown>>
 ): Promise<void> {
   if (node.edges || node.terminal) return;
-  const expansion = await expand(node.state, node.remaining);
+  const expansion = await expand(node.state, node.remaining, node.depth);
   node.targetValue = expansion.targetValue;
   node.targetRevision = expansion.targetRevision;
   node.actorPriors = expansion.actorPriors;
@@ -123,7 +126,7 @@ async function ensureExpanded<State, Candidate extends MCTSCandidateLike>(
       depth: node.depth + 1, terminal: child.terminal,
       targetValue: child.targetValue, targetRevision: expansion.targetRevision, visits: 0 } }));
   trace.push({ phase: 'expansion', depth: node.depth, targetValue: node.targetValue,
-    targetRevision: node.targetRevision,
+    targetRevision: node.targetRevision, ...(expansion.expansionMetadata ?? {}),
     candidates: node.edges.map(edge => ({ candidateId: edge.candidate.id,
       prior: edge.prior, childTargetValue: edge.child.targetValue,
       immediateProcessReward: (edge.child.targetValue ?? node.targetValue ?? 0)
@@ -171,11 +174,12 @@ function collectSearchSamples<State, Candidate extends MCTSCandidateLike>(
 async function simulate<State, Candidate extends MCTSCandidateLike>(
   node: SearchNode<State, Candidate>,
   options: {
-    expand: (state: State, candidates: Candidate[]) => Promise<MCTSExpansion<State, Candidate>>;
+    expand: (state: State, candidates: Candidate[], depth: number) =>
+      Promise<MCTSExpansion<State, Candidate>>;
     maximumDepth: number; cpuCT: number;
   }, trace: Array<Record<string, unknown>>, simulation: number
 ): Promise<number> {
-  if (node.terminal || node.depth >= options.maximumDepth || node.remaining.length === 0) {
+  if (node.terminal || node.depth >= options.maximumDepth) {
     node.visits += 1;
     return node.targetValue ?? 0;
   }

@@ -472,6 +472,8 @@ class LHTBProcessGRPOTrainer:
         }
         if len(environment_values) != 1 or environment_values == {"null"}:
             raise ValueError("counterfactual trajectories must share environment_digest")
+        dynamic_agent_expansions = 0
+        mcts_decisions = 0
         for value in records:
             states = value.get("process_states")
             policy = value.get("policy_records")
@@ -496,10 +498,17 @@ class LHTBProcessGRPOTrainer:
                     raise ValueError("policy record requires a finite saved behavior log-probability")
                 behavior_kind = record.get("behavior_policy", record.get("behaviorPolicy"))
                 if behavior_kind == "mcts_puct":
-                    self._validate_saved_search_samples(record, int(value["policy_revision"]))
+                    mcts_decisions += 1
+                    dynamic_agent_expansions += self._validate_saved_search_samples(
+                        record, int(value["policy_revision"])
+                    )
+        if mcts_decisions > 0 and dynamic_agent_expansions <= 0:
+            raise ValueError(
+                "G=8 sampling must include at least one agent-generated hypothetical MCTS expansion"
+            )
 
     @staticmethod
-    def _validate_saved_search_samples(record: Mapping[str, Any], policy_revision: int) -> None:
+    def _validate_saved_search_samples(record: Mapping[str, Any], policy_revision: int) -> int:
         """Validate sampler output only; this method never runs or imports MCTS."""
         probabilities = record.get(
             "mcts_behavior_probabilities", record.get("mctsBehaviorProbabilities")
@@ -529,6 +538,46 @@ class LHTBProcessGRPOTrainer:
             raise ValueError("MCTS sampler saved no structural-edge training samples")
         if not isinstance(search_states, Mapping) or not search_states:
             raise ValueError("MCTS sampler saved no deduplicated policy-state table")
+        expansion_limit = int(record.get(
+            "mcts_agent_expansion_limit", record.get("mctsAgentExpansionLimit", -1)
+        ))
+        expansion_count = int(record.get(
+            "mcts_agent_expansion_count", record.get("mctsAgentExpansionCount", -1)
+        ))
+        expansion_attempt_count = int(record.get(
+            "mcts_agent_expansion_attempt_count",
+            record.get("mctsAgentExpansionAttemptCount", -1)
+        ))
+        failed_expansion_count = int(record.get(
+            "mcts_agent_failed_expansion_count",
+            record.get("mctsAgentFailedExpansionCount", -1)
+        ))
+        proposal_calls = int(record.get(
+            "mcts_agent_proposal_calls", record.get("mctsAgentProposalCalls", -1)
+        ))
+        if (expansion_limit < 0 or expansion_attempt_count < 0
+                or expansion_attempt_count > expansion_limit
+                or expansion_count < 0 or expansion_count > expansion_attempt_count
+                or failed_expansion_count != expansion_attempt_count - expansion_count):
+            raise ValueError("MCTS record has an invalid dynamic agent-expansion ledger")
+        trace = record.get("mcts_search_trace", record.get("mctsSearchTrace", []))
+        if not isinstance(trace, Sequence):
+            raise ValueError("MCTS record has no search trace")
+        failed_expansions = [value for value in trace if isinstance(value, Mapping)
+                             and value.get("proposalSource")
+                             == "dynamic_agent_search_expansion_failed"]
+        if len(failed_expansions) != failed_expansion_count:
+            raise ValueError("MCTS failed expansion count does not match its search trace")
+        dynamic_expansions = [value for value in trace if isinstance(value, Mapping)
+                              and value.get("proposalSource")
+                              == "dynamic_agent_search_expansion"]
+        if len(dynamic_expansions) != expansion_count:
+            raise ValueError("MCTS dynamic expansion count does not match its search trace")
+        if expansion_count > 0 and proposal_calls < expansion_count:
+            raise ValueError("MCTS dynamic expansions are missing Agent proposal calls")
+        if any(int(value.get("proposedCandidateCount", 0)) <= 0
+               for value in dynamic_expansions):
+            raise ValueError("MCTS Agent expansion generated no legal direction")
         for sample in samples:
             if not isinstance(sample, Mapping):
                 raise ValueError("invalid MCTS structural-edge training sample")
@@ -544,6 +593,14 @@ class LHTBProcessGRPOTrainer:
             ))
             if state_ref not in search_states or not isinstance(search_states[state_ref], Mapping):
                 raise ValueError("saved MCTS edge is missing replayable policy state")
+        dynamic_states = [value for value in search_states.values()
+                          if isinstance(value, Mapping)
+                          and isinstance(value.get("search_expansion"), Mapping)
+                          and value["search_expansion"].get("proposalSource")
+                          == "dynamic_agent_search_expansion"]
+        if len(dynamic_states) != expansion_count:
+            raise ValueError("saved search states omit an Agent-generated expansion")
+        return expansion_count
 
     def metadata(self) -> Dict[str, Any]:
         return {

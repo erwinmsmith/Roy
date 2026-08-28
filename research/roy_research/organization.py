@@ -14,7 +14,7 @@ ORGANIZATION_ACTIONS = (
     "STOP",
 )
 
-LHTB_POLICY_INTERFACE_REVISION = "scheduler-context-structural-policy-20260828"
+LHTB_POLICY_INTERFACE_REVISION = "dynamic-agent-mcts-structural-policy-20260829"
 
 
 @dataclass(frozen=True)

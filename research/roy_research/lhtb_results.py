@@ -166,6 +166,32 @@ def sample_audit(records: List[Mapping[str, Any]]) -> Dict[str, Any]:
                           for sample in value.get(
                               "mctsSearchSamples", value.get("mcts_search_samples", [])
                           ) if isinstance(sample, Mapping)]
+        dynamic_agent_expansion_count = sum(int(value.get(
+            "mctsAgentExpansionCount", value.get("mcts_agent_expansion_count", -1)
+        )) for value in mcts_records)
+        dynamic_agent_expansion_attempt_count = sum(int(value.get(
+            "mctsAgentExpansionAttemptCount",
+            value.get("mcts_agent_expansion_attempt_count", -1)
+        )) for value in mcts_records)
+        dynamic_agent_failed_expansion_count = sum(int(value.get(
+            "mctsAgentFailedExpansionCount",
+            value.get("mcts_agent_failed_expansion_count", -1)
+        )) for value in mcts_records)
+        dynamic_agent_proposal_calls = sum(int(value.get(
+            "mctsAgentProposalCalls", value.get("mcts_agent_proposal_calls", -1)
+        )) for value in mcts_records)
+        dynamic_trace_count = sum(
+            item.get("proposalSource") == "dynamic_agent_search_expansion"
+            for value in mcts_records
+            for item in value.get("mctsSearchTrace", value.get("mcts_search_trace", []))
+            if isinstance(item, Mapping)
+        )
+        failed_dynamic_trace_count = sum(
+            item.get("proposalSource") == "dynamic_agent_search_expansion_failed"
+            for value in mcts_records
+            for item in value.get("mctsSearchTrace", value.get("mcts_search_trace", []))
+            if isinstance(item, Mapping)
+        )
         profiles = sorted({str(((value.get("policyState", value.get("policy_state")) or {})
                                 .get("sampling_profile") or {}).get("id"))
                            for value in policy if isinstance(value, Mapping)})
@@ -218,6 +244,17 @@ def sample_audit(records: List[Mapping[str, Any]]) -> Dict[str, Any]:
                 for value in mcts_records
             ),
             "mcts_search_sample_count": len(search_samples),
+            "dynamic_agent_expansion_count": dynamic_agent_expansion_count,
+            "dynamic_agent_expansion_attempt_count": dynamic_agent_expansion_attempt_count,
+            "dynamic_agent_failed_expansion_count": dynamic_agent_failed_expansion_count,
+            "dynamic_agent_proposal_calls": dynamic_agent_proposal_calls,
+            "dynamic_agent_expansions_complete": dynamic_agent_expansion_count >= 0
+                and dynamic_agent_expansion_attempt_count >= dynamic_agent_expansion_count
+                and dynamic_agent_failed_expansion_count
+                    == dynamic_agent_expansion_attempt_count - dynamic_agent_expansion_count
+                and dynamic_trace_count == dynamic_agent_expansion_count
+                and dynamic_agent_proposal_calls >= dynamic_agent_expansion_count
+                and failed_dynamic_trace_count == dynamic_agent_failed_expansion_count,
             "mcts_search_samples_complete": len(mcts_records) == len(policy)
                 and all(value.get("mctsSearchSamples", value.get("mcts_search_samples"))
                         for value in mcts_records),
@@ -264,6 +301,21 @@ def sample_audit(records: List[Mapping[str, Any]]) -> Dict[str, Any]:
                                         for value in trajectories),
         "all_mcts_search_samples_complete": all(value["mcts_search_samples_complete"]
                                                  for value in trajectories),
+        "all_dynamic_agent_expansions_complete": all(
+            value["dynamic_agent_expansions_complete"] for value in trajectories
+        ) and sum(value["dynamic_agent_expansion_count"] for value in trajectories) > 0,
+        "dynamic_agent_expansion_count": sum(
+            value["dynamic_agent_expansion_count"] for value in trajectories
+        ),
+        "dynamic_agent_expansion_attempt_count": sum(
+            value["dynamic_agent_expansion_attempt_count"] for value in trajectories
+        ),
+        "dynamic_agent_failed_expansion_count": sum(
+            value["dynamic_agent_failed_expansion_count"] for value in trajectories
+        ),
+        "dynamic_agent_proposal_calls": sum(
+            value["dynamic_agent_proposal_calls"] for value in trajectories
+        ),
         "mcts_search_sample_count": len(search_advantages),
         "mcts_search_advantage_std": float(np.std(search_advantages))
             if search_advantages else None,
@@ -282,6 +334,8 @@ def sample_audit(records: List[Mapping[str, Any]]) -> Dict[str, Any]:
             and all(value["process_reward_complete"] for value in trajectories)
             and all(value["mcts_trace_complete"] for value in trajectories)
             and all(value["mcts_search_samples_complete"] for value in trajectories)
+            and all(value["dynamic_agent_expansions_complete"] for value in trajectories)
+            and sum(value["dynamic_agent_expansion_count"] for value in trajectories) > 0
             and len(terminal_rewards) == 8,
         "trajectories": trajectories,
     }

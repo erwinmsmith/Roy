@@ -39,6 +39,15 @@ interface CandidateValidation {
   dispositions: Array<{ index: number; id?: string; accepted: boolean; reasons: string[] }>;
 }
 
+interface MCTSAgentProposalResult {
+  candidates: ProposedCandidate[];
+  calls: number;
+  inputTokens: number;
+  outputTokens: number;
+  models: string[];
+  attempts: number;
+}
+
 export interface TopologySamplingProfile {
   id: 'single' | 'compact' | 'branching' | 'recursive' | 'connected';
   preferredNodeRange: [number, number];
@@ -799,7 +808,7 @@ export class LHTBAutonomousController {
         throw new Error('Learned mode requires ROY_LHTB_POLICY_COMMAND and has no heuristic fallback');
       }
       const decision = this.mctsEnabled()
-        ? await this.selectWithMCTS(snapshot, candidates, seed)
+        ? await this.selectWithMCTS(snapshot, candidates, seed, session)
         : await this.learnedPolicy.select(this.policyState(snapshot, candidates), candidates, seed);
       selected = decision.candidate as ProposedCandidate;
       policyRecord = decision.record;
@@ -849,7 +858,8 @@ export class LHTBAutonomousController {
   }
 
   private async selectWithMCTS(
-    snapshot: ReturnType<RoyLHTBSession['snapshot']>, candidates: ProposedCandidate[], seed: number
+    snapshot: ReturnType<RoyLHTBSession['snapshot']>, candidates: ProposedCandidate[], seed: number,
+    session: RoyLHTBSession,
   ): Promise<{ candidate: ProposedCandidate; record: OrganizationPolicyRecord }> {
     if (!this.learnedPolicy) throw new Error('MCTS requires the learned policy sidecar');
     const simulations = Math.max(1, Number(process.env.ROY_LHTB_MCTS_SIMULATIONS ?? 24));
@@ -857,10 +867,61 @@ export class LHTBAutonomousController {
     const cpuCT = Math.max(0, Number(process.env.ROY_LHTB_MCTS_CPUCT ?? 1.5));
     const temperature = Math.max(1e-6,
       Number(process.env.ROY_LHTB_MCTS_TEMPERATURE ?? 1));
+    const agentExpansionLimit = Math.max(0, Math.trunc(Number(
+      process.env.ROY_LHTB_MCTS_AGENT_EXPANSIONS ?? Math.min(simulations, 4)
+    )));
+    let agentExpansionAttemptCount = 0;
+    let agentExpansionCount = 0;
+    let proposalCalls = 0;
+    let proposalInputTokens = 0;
+    let proposalOutputTokens = 0;
+    const proposalModels = new Set<string>();
     const result = await searchOrganizationMCTS({
       rootState: RoyLHTBSession.compactForSearch(snapshot), candidates,
       simulations, maximumDepth, cpuCT, temperature, seed,
-      expand: async (state, remaining) => this.expandMCTSNode(state, remaining) });
+      expand: async (state, remaining, depth) => {
+        if (depth === 0) {
+          return this.expandMCTSNode(state, remaining, {
+            proposalSource: 'real_step_agent_proposal', agentGenerated: true, depth,
+          });
+        }
+        if (agentExpansionAttemptCount >= agentExpansionLimit) {
+          return this.expandMCTSNode(state, [], {
+            proposalSource: 'agent_expansion_budget_leaf', agentGenerated: false, depth,
+            agentExpansionLimit,
+          });
+        }
+        const expansionIndex = agentExpansionAttemptCount;
+        agentExpansionAttemptCount += 1;
+        try {
+          const proposal = await this.proposeMCTSCandidates(state, depth, expansionIndex);
+          proposalCalls += proposal.calls;
+          proposalInputTokens += proposal.inputTokens;
+          proposalOutputTokens += proposal.outputTokens;
+          proposal.models.forEach(model => proposalModels.add(model));
+          agentExpansionCount += 1;
+          return this.expandMCTSNode(state, proposal.candidates, {
+            proposalSource: 'dynamic_agent_search_expansion', agentGenerated: true, depth,
+            expansionIndex, proposalAttempts: proposal.attempts,
+            proposedCandidateCount: proposal.candidates.length,
+          });
+        } catch (error) {
+          const failedUsage = error as Partial<MCTSAgentProposalResult>;
+          proposalCalls += Number(failedUsage.calls ?? 0);
+          proposalInputTokens += Number(failedUsage.inputTokens ?? 0);
+          proposalOutputTokens += Number(failedUsage.outputTokens ?? 0);
+          failedUsage.models?.forEach(model => proposalModels.add(model));
+          return this.expandMCTSNode(state, [], {
+            proposalSource: 'dynamic_agent_search_expansion_failed', agentGenerated: true,
+            depth, expansionIndex,
+            proposalError: error instanceof Error ? error.message : String(error),
+          });
+        }
+      } });
+    if (proposalCalls > 0) {
+      session.recordModelUsage(proposalInputTokens, proposalOutputTokens,
+        [...proposalModels].join(',') || 'deepseek-mcts-proposer');
+    }
     const selected = result.candidate;
     const rootPolicyState = this.policyState(snapshot, candidates);
     const behaviorProbability = result.behaviorProbabilities[selected.id];
@@ -900,6 +961,13 @@ export class LHTBAutonomousController {
       mctsVisitCounts: result.visitCounts,
       mctsBehaviorProbabilities: result.behaviorProbabilities,
       mctsSimulations: simulations, mctsMaximumDepth: maximumDepth, mctsCpuCT: cpuCT,
+      mctsAgentExpansionLimit: agentExpansionLimit,
+      mctsAgentExpansionAttemptCount: agentExpansionAttemptCount,
+      mctsAgentExpansionCount: agentExpansionCount,
+      mctsAgentFailedExpansionCount: agentExpansionAttemptCount - agentExpansionCount,
+      mctsAgentProposalCalls: proposalCalls,
+      mctsAgentProposalInputTokens: proposalInputTokens,
+      mctsAgentProposalOutputTokens: proposalOutputTokens,
       rootTargetValue: result.rootTargetValue,
       selectedChildTargetValue: result.selectedChildTargetValue,
       selectedProcessReward: result.selectedProcessReward,
@@ -910,8 +978,108 @@ export class LHTBAutonomousController {
     } };
   }
 
+  private async proposeMCTSCandidates(
+    snapshot: ReturnType<RoyLHTBSession['snapshot']>, depth: number, expansionIndex: number
+  ): Promise<MCTSAgentProposalResult> {
+    const requestState = {
+      ...compactEpistemicWorkingState(snapshot),
+      mctsSearchExpansion: {
+        mode: 'dynamic_agent_candidate_generation', depth, expansionIndex,
+        stateFingerprint: snapshot.processStates.at(-1)?.fingerprint,
+        contextNodeId: scheduledOrganizationContextNode(snapshot),
+        instruction: 'Generate fresh legal directions for this hypothetical search state.',
+      },
+    };
+    const messages: LLMMessage[] = [
+      { role: 'system', content: PROPOSER_PROMPT },
+      { role: 'user', content: JSON.stringify(requestState) },
+    ];
+    const maximumAttempts = Math.max(1, Math.trunc(Number(
+      process.env.ROY_LHTB_MCTS_PROPOSAL_ATTEMPTS ?? 2
+    )));
+    let calls = 0;
+    let inputTokens = 0;
+    let outputTokens = 0;
+    const models = new Set<string>();
+    const fail = (message: string, cause?: unknown): Error & MCTSAgentProposalResult =>
+      Object.assign(new Error(message, cause === undefined ? undefined : { cause }), {
+        candidates: [], calls, inputTokens, outputTokens, models: [...models],
+        attempts: maximumAttempts,
+      });
+    const account = (completion: LLMJSONCompletionResult<ProposalResponse>['completion']): void => {
+      calls += 1;
+      inputTokens += completion.usage?.inputTokens ?? completion.usage?.promptTokens ?? 0;
+      outputTokens += completion.usage?.outputTokens ?? completion.usage?.completionTokens ?? 0;
+      models.add(completion.model ?? 'deepseek-mcts-proposer');
+    };
+    for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
+      let current: LLMJSONCompletionResult<ProposalResponse>;
+      let completionAccounted = false;
+      try {
+        current = await this.provider.completeJSONWithUsage<ProposalResponse>(messages,
+          { temperature: 0, maxTokens: PROPOSER_RESPONSE_MAX_TOKENS,
+            thinking: { type: 'disabled' } });
+      } catch (error) {
+        if (!(error instanceof LLMJSONParseError)) {
+          throw fail(error instanceof Error ? error.message : String(error), error);
+        }
+        account(error.completion as LLMJSONCompletionResult<ProposalResponse>['completion']);
+        completionAccounted = true;
+        await this.auditProposalFailure(requestState, error, attempt);
+        const repaired = repairProposalJSONStructure(error.completion.content);
+        if (repaired) {
+          current = { value: repaired as unknown as ProposalResponse,
+            completion: error.completion };
+        } else {
+          if (attempt === maximumAttempts) {
+            throw fail('mcts_agent_expansion_json_malformed', error);
+          }
+          messages.splice(0, messages.length,
+            { role: 'system', content: PROPOSER_PROMPT },
+            { role: 'user', content: `${JSON.stringify(requestState)}\nThe previous search-expansion response was malformed. Return one concise complete JSON object with fresh legal directions for this exact context node.` }
+          );
+          continue;
+        }
+      }
+      if (!completionAccounted) account(current.completion);
+      await this.auditProposal(requestState, current);
+      const probe = RoyLHTBSession.restore(snapshot);
+      const validation = this.validateCandidates(current.value, probe);
+      this.ensureMCTSTerminationCandidate(snapshot, validation);
+      const structuralDeficits = this.structuralCandidateDeficits(snapshot,
+        validation.candidates);
+      if (structuralDeficits.length > 0) {
+        validation.dispositions.push({ index: -2, accepted: false,
+          reasons: structuralDeficits });
+      }
+      await this.auditCandidateValidation(validation, {
+        mode: 'dynamic_agent_candidate_generation', depth, expansionIndex, attempt,
+        stateFingerprint: snapshot.processStates.at(-1)?.fingerprint,
+        contextNodeId: scheduledOrganizationContextNode(snapshot),
+      });
+      const hardDeficit = structuralDeficits.some(reason =>
+        reason.startsWith('missing_external_child_progress_candidate:'));
+      if (validation.candidates.length > 0 && !hardDeficit) {
+        return { candidates: validation.candidates, calls, inputTokens, outputTokens,
+          models: [...models], attempts: attempt };
+      }
+      if (attempt < maximumAttempts) {
+        const reasons = [...new Set(validation.dispositions.flatMap(value => value.reasons))];
+        const rejected = validation.dispositions.filter(value => !value.accepted && value.index >= 0)
+          .map(value => ({ candidate: current.value.candidates[value.index],
+            reasons: value.reasons }));
+        messages.splice(0, messages.length,
+          { role: 'system', content: PROPOSER_PROMPT },
+          { role: 'user', content: compactProposalRepairRequest(requestState, reasons, rejected) }
+        );
+      }
+    }
+    throw fail('mcts_agent_expansion_has_no_legal_candidates');
+  }
+
   private async expandMCTSNode(
-    snapshot: ReturnType<RoyLHTBSession['snapshot']>, candidates: ProposedCandidate[]
+    snapshot: ReturnType<RoyLHTBSession['snapshot']>, candidates: ProposedCandidate[],
+    expansionMetadata: Record<string, unknown> = {},
   ) {
     if (!this.learnedPolicy) throw new Error('MCTS requires the learned policy sidecar');
     const contextNodeId = scheduledOrganizationContextNode(snapshot);
@@ -944,11 +1112,12 @@ export class LHTBAutonomousController {
     }
     const currentPolicyState = this.policyState(snapshot,
       valid.length ? valid.map(value => value.candidate) : localCandidates);
+    currentPolicyState.search_expansion = expansionMetadata;
     if (!valid.length) {
       const graph = currentPolicyState.event_graph as Record<string, unknown>;
       const current = await this.learnedPolicy.targetValue(graph);
       return { targetValue: current.targetValue, targetRevision: current.targetRevision,
-        actorPriors: {}, policyState: currentPolicyState, children: [] };
+        actorPriors: {}, policyState: currentPolicyState, children: [], expansionMetadata };
     }
     const analysis = await this.learnedPolicy.analyze(currentPolicyState);
     const childPolicyStates = valid.map(value => {
@@ -968,7 +1137,8 @@ export class LHTBAutonomousController {
         targetValue: childValues.targetValues[index] };
     });
     return { targetValue: analysis.targetValue, targetRevision: analysis.targetRevision,
-      actorPriors: analysis.candidatePriors, policyState: currentPolicyState, children };
+      actorPriors: analysis.candidatePriors, policyState: currentPolicyState, children,
+      expansionMetadata };
   }
 
   private actionProbabilitySummary(candidates: ProposedCandidate[],
@@ -1563,13 +1733,15 @@ export class LHTBAutonomousController {
     })}\n`, 'utf8');
   }
 
-  private async auditCandidateValidation(validation: CandidateValidation): Promise<void> {
+  private async auditCandidateValidation(validation: CandidateValidation,
+    searchExpansion?: Record<string, unknown>): Promise<void> {
     const root = this.auditRoot;
     if (!root && this.provider.constructor.name !== 'DeepSeekProvider') return;
     if (!root) throw new Error('ROY_LHTB_AUDIT_ROOT is required');
     await mkdir(root, { recursive: true });
     await appendFile(path.join(root, 'candidate-validation.jsonl'), `${JSON.stringify({
       schemaVersion: 1,
+      searchExpansion,
       acceptedCandidateIds: validation.candidates.map(value => value.id),
       dispositions: validation.dispositions,
     })}\n`, 'utf8');

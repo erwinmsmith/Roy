@@ -1052,9 +1052,17 @@ for line in sys.stdin:
             "mctsVisitCounts": {"derive": 18, "execute": 6},
             "maskedOldLogProbability": float(torch.log(torch.tensor(0.75))),
             "targetValueRevision": 2,
-            "mctsSearchTrace": [{"phase": "selection"}, {"phase": "backup"}],
+            "mctsAgentExpansionLimit": 1, "mctsAgentExpansionAttemptCount": 1,
+            "mctsAgentExpansionCount": 1, "mctsAgentFailedExpansionCount": 0,
+            "mctsAgentProposalCalls": 1,
+            "mctsSearchTrace": [{"phase": "expansion",
+                "proposalSource": "dynamic_agent_search_expansion",
+                "proposedCandidateCount": 1},
+                {"phase": "selection"}, {"phase": "backup"}],
             "mctsSearchSamples": [search_sample],
-            "mctsSearchStates": {"m0": {"context_node_id": "root"}},
+            "mctsSearchStates": {"m0": {"context_node_id": "root",
+                "search_expansion": {
+                    "proposalSource": "dynamic_agent_search_expansion"}}},
         }
         LHTBProcessGRPOTrainer._validate_saved_search_samples(record, 2)
         with self.assertRaisesRegex(ValueError, "stale target-value"):

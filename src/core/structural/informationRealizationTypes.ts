@@ -2,7 +2,7 @@ import type { ResourceEnvelope } from './types.js';
 
 export const INFORMATION_REALIZATION_SCHEMA_VERSION = 3 as const;
 export const LHTB_POLICY_INTERFACE_REVISION =
-  'scheduler-context-structural-policy-20260828' as const;
+  'dynamic-agent-mcts-structural-policy-20260829' as const;
 
 export type OrganizationActionKind =
   | 'DERIVE'
@@ -219,6 +219,14 @@ export interface OrganizationPolicyRecord {
   mctsSimulations?: number;
   mctsMaximumDepth?: number;
   mctsCpuCT?: number;
+  /** Agent-generated hypothetical-state expansions performed only during collection. */
+  mctsAgentExpansionLimit?: number;
+  mctsAgentExpansionAttemptCount?: number;
+  mctsAgentExpansionCount?: number;
+  mctsAgentFailedExpansionCount?: number;
+  mctsAgentProposalCalls?: number;
+  mctsAgentProposalInputTokens?: number;
+  mctsAgentProposalOutputTokens?: number;
   rootTargetValue?: number;
   selectedChildTargetValue?: number;
   selectedProcessReward?: number;
