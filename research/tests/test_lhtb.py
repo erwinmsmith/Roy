@@ -325,6 +325,25 @@ for line in sys.stdin:
             self.assertIsNone(partial["pendingTerminalRequest"])
             self.assertEqual(len(partial["processStates"]), 2)
 
+    def test_partial_snapshot_writes_are_throttled_but_forced_at_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent = RoyHarborAgent(
+                logs_dir=Path(directory), model_name="mock",
+                node_command=f"{sys.executable} -c 'pass'", track_file_changes=False,
+                extra_env={"ROY_LHTB_PARTIAL_SAVE_INTERVAL_SEC": "300"},
+            )
+            agent.rpc.last_snapshot = {"processStates": [{"sequence": 0}]}
+            with patch("roy_research.harbor_agent.time.monotonic",
+                       side_effect=[10.0, 11.0, 12.0]):
+                agent._save_partial()
+                agent.rpc.last_snapshot = {"processStates": [{"sequence": 1}]}
+                agent._save_partial()
+                saved = json.loads(agent.partial_path.read_text())
+                self.assertEqual(saved["processStates"][0]["sequence"], 0)
+                agent._save_partial(force=True)
+            saved = json.loads(agent.partial_path.read_text())
+            self.assertEqual(saved["processStates"][0]["sequence"], 1)
+
     def test_internal_rollout_deadline_with_official_reward_is_trainable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

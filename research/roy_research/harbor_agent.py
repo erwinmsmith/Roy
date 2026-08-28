@@ -162,6 +162,10 @@ class RoyHarborAgent(BaseAgent):
         self._trajectory_id: str | None = None
         self._continuation_count = 0
         self.rollout_timeout_sec = rollout_timeout_sec
+        self.partial_save_interval_sec = max(0.0, float(child_environment.get(
+            "ROY_LHTB_PARTIAL_SAVE_INTERVAL_SEC", "300"
+        )))
+        self._last_partial_save = 0.0
 
     @staticmethod
     def name() -> str:
@@ -202,14 +206,14 @@ class RoyHarborAgent(BaseAgent):
             }, deadline)
             self._save_partial()
             await self._drive(response, environment, deadline)
-            self._save_partial()
+            self._save_partial(force=True)
             self._update_context(context, termination_reason="confirmed_task_complete")
         except RolloutDeadlineReached:
             await self._finalize_rollout_deadline()
-            self._save_partial()
+            self._save_partial(force=True)
             self._update_context(context, termination_reason="rollout_deadline")
         except BaseException:
-            self._save_partial()
+            self._save_partial(force=True)
             self.close()
             raise
 
@@ -226,10 +230,10 @@ class RoyHarborAgent(BaseAgent):
             })
             self._save_partial()
             await self._drive(response, self._environment)
-            self._save_partial()
+            self._save_partial(force=True)
             self._update_context(context, termination_reason="confirmed_task_complete")
         except BaseException:
-            self._save_partial()
+            self._save_partial(force=True)
             self.close()
             raise
 
@@ -341,14 +345,20 @@ class RoyHarborAgent(BaseAgent):
             # return normally so its official verifier can score the partial environment.
             self.rpc.close()
 
-    def _save_partial(self) -> None:
+    def _save_partial(self, force: bool = False) -> None:
         snapshot = self.rpc.last_snapshot
         if snapshot is None:
             return
+        now = time.monotonic()
+        if not force and self._last_partial_save > 0 \
+                and now - self._last_partial_save < self.partial_save_interval_sec:
+            return
         self.partial_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.partial_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(snapshot, indent=2) + "\n", encoding="utf-8")
+        temporary.write_text(json.dumps(snapshot, ensure_ascii=False,
+                                        separators=(",", ":")) + "\n", encoding="utf-8")
         os.replace(temporary, self.partial_path)
+        self._last_partial_save = now
 
     async def _file_snapshot(self, environment: Any, cwd: str | None) -> Dict[str, str]:
         if not self.track_file_changes:
