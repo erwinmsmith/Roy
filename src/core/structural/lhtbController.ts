@@ -530,7 +530,7 @@ export function compactEpistemicWorkingState(
   };
 }
 
-function compactProposalRepairRequest(
+export function compactProposalRepairRequest(
   requestState: Record<string, unknown>,
   reasons: string[],
   rejectedCandidates: Array<{ candidate: RawProposedCandidate; reasons: string[] }>
@@ -543,6 +543,9 @@ function compactProposalRepairRequest(
   const epistemic = requestState.compactEpistemicState
     && typeof requestState.compactEpistemicState === 'object'
     ? requestState.compactEpistemicState as Record<string, unknown> : {};
+  const requiredExternalChildProgressNodeIds = reasons.filter(reason =>
+    reason.startsWith('missing_external_child_progress_candidate:'))
+    .map(reason => reason.slice('missing_external_child_progress_candidate:'.length));
   return JSON.stringify({
     repairProtocol: 'legal-candidate-interface-v2',
     instruction: [
@@ -550,6 +553,7 @@ function compactProposalRepairRequest(
       'For DERIVE, use one realOpenGaps entry and set candidate actorNodeId, action.actorNodeId, and childSpecification.parentId to that entry parentNodeId.',
       'Do not reproduce an unchanged rejected candidate, move a gap to a semantically related child, invent a gap, or repeat an active CONNECT edge.',
       'Topology is selected by MCTS; do not target a node count or depth or fabricate work.',
+      'For every requiredExternalChildProgressNodeId, include at least one ACQUIRE or EXECUTE candidate whose actorNodeId is that exact node. A RETURN is not a substitute.',
     ],
     rejectionReasons: reasons,
     rejectedCandidates,
@@ -567,6 +571,7 @@ function compactProposalRepairRequest(
       childLocalOpenGapIds: exploration.childLocalOpenGapIds,
       desiredAdditionalChildren: exploration.desiredAdditionalChildren,
       preferredTopologyRange: exploration.preferredTopologyRange,
+      requiredExternalChildProgressNodeIds,
       dependencies: organization.dependencies,
       communications: organization.communications,
     },
@@ -692,7 +697,10 @@ export class LHTBAutonomousController {
         value => value.reasons
       ))];
       if (attempt === proposalAttempts) {
-        if (currentValidation.candidates.length > 0 && structuralDeficits.length > 0) {
+        const hasHardProgressDeficit = structuralDeficits.some(reason =>
+          reason.startsWith('missing_external_child_progress_candidate:'));
+        if (currentValidation.candidates.length > 0 && structuralDeficits.length > 0
+          && !hasHardProgressDeficit) {
           // Topology profiles are sampling interventions, not hard resource or
           // validity constraints.  Give the proposer its configured repair
           // attempts, then preserve any genuinely legal continuation instead

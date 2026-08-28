@@ -3,7 +3,8 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { GlobalEpistemicStateRecorder, LHTBAutonomousController,
-  repairProposalJSONStructure, resolveTopologySamplingProfile, RoyLHTBSession,
+  compactProposalRepairRequest, repairProposalJSONStructure, resolveTopologySamplingProfile,
+  RoyLHTBSession,
   topologySamplingCandidateLogitBias,
   topologySamplingProfile } from '../src/core/structural/index.js';
 import { LLMJSONParseError } from '../src/core/llm/providers/openai.js';
@@ -31,6 +32,14 @@ describe('LHTB process state', () => {
     expect(repairProposalJSONStructure(missing)?.candidates).toHaveLength(2);
     expect(repairProposalJSONStructure('{"candidates":[{"id":"unfinished'))
       .toBeUndefined();
+  });
+
+  it('names every externally executable child in candidate repair requests', () => {
+    const payload = JSON.parse(compactProposalRepairRequest({ organization: {
+      rootId: 'root', activeNodes: [{ id: 'worker' }],
+    } }, ['missing_external_child_progress_candidate:worker'], []));
+    expect(payload.legalInterface.requiredExternalChildProgressNodeIds).toEqual(['worker']);
+    expect(payload.instruction.join(' ')).toContain('ACQUIRE or EXECUTE');
   });
 
   it('covers single-agent through connected topology profiles without changing utility', () => {
@@ -901,7 +910,7 @@ describe('LHTB process state', () => {
     }
   });
 
-  it('requires externally executable children to produce a local terminal result before return', () => {
+  it('requires externally executable children to produce a local terminal result before return', async () => {
     const session = new RoyLHTBSession('external-child-return', 'task', 'finish', 'commit',
       'learned_information_realization');
     const childSpecification = {
@@ -933,11 +942,18 @@ describe('LHTB process state', () => {
       description: 'return verified result', schedulerComplexity: 1,
       action: { kind: 'RETURN', actorNodeId: 'worker', report },
     }] };
+    const blockedResponse = { ...response, candidates: [...response.candidates, {
+      id: 'stop-root', kind: 'STOP', actorNodeId: 'root', description: 'submit partial work',
+      schedulerComplexity: 0, action: { kind: 'STOP', actorNodeId: 'root',
+        finalOutput: 'partial' },
+    }] };
     const semantic = { async processEvent() { return { event_id: 'none', requirements: [],
       claims: [], assumptions: [], evidence: [], external_observations: [], blind_spots: [],
       relations: [] }; }, close() {} };
     const provider = { isConfigured: () => true, async completeJSONWithUsage() {
-      throw new Error('not used');
+      return { value: blockedResponse, completion: { content: '{}', model: 'mock', usage: {
+        promptTokens: 1, completionTokens: 1, totalTokens: 2,
+      } } };
     } };
     const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false });
     type Harness = {
@@ -949,6 +965,7 @@ describe('LHTB process state', () => {
         candidates: Array<{ kind: string; actorNodeId: string }>): string[];
     };
     const harness = controller as unknown as Harness;
+    const priorAttempts = process.env.ROY_LHTB_PROPOSAL_ATTEMPTS;
     try {
       const rejected = harness.validateCandidates(response, session);
       expect(rejected.candidates).toHaveLength(0);
@@ -956,6 +973,9 @@ describe('LHTB process state', () => {
         .toContain('external_child_return_without_local_terminal_result');
       expect(harness.structuralCandidateDeficits(session.snapshot(), []))
         .toContain('missing_external_child_progress_candidate:worker');
+      process.env.ROY_LHTB_PROPOSAL_ATTEMPTS = '2';
+      await expect(controller.advance(session, 1))
+        .rejects.toThrow(/missing_external_child_progress_candidate:worker/);
       session.requestTerminal({ id: 'worker-check', command: 'true', timeoutMs: 1000,
         nodeId: 'worker', organizationActionKind: 'EXECUTE' });
       session.acceptTerminalResult({ requestId: 'worker-check', exitCode: 0, stdout: '',
@@ -966,6 +986,8 @@ describe('LHTB process state', () => {
         .not.toContain('missing_external_child_progress_candidate:worker');
     } finally {
       controller.close();
+      if (priorAttempts === undefined) delete process.env.ROY_LHTB_PROPOSAL_ATTEMPTS;
+      else process.env.ROY_LHTB_PROPOSAL_ATTEMPTS = priorAttempts;
     }
   });
 
