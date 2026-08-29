@@ -79,8 +79,10 @@ research/remote/prepare_lhtb.sh prepare
 research/remote/prepare_lhtb.sh oracle-smoke
 research/remote/prepare_lhtb.sh roy-smoke
 
-# Formal on-policy training, per-epoch dev selection, then frozen three-arm test.
-research/remote/run_lhtb_training.sh
+# Formal node-wise Delta-V training. The terminal-score trajectory runner is
+# retained separately as an explicit baseline.
+research/remote/run_lhtb_nodewise_training.sh
+research/remote/run_lhtb_training.sh  # terminal-GRPO baseline only
 research/remote/run_lhtb_test.sh
 ```
 

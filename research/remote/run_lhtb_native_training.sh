@@ -20,4 +20,4 @@ export ROY_LHTB_NATIVE_TEMPLATE_ROOT="${ROY_LHTB_NATIVE_TEMPLATE_ROOT:-${executi
 export ROY_LHTB_NATIVE_AUDIT="${ROY_LHTB_NATIVE_AUDIT:-${roy_root}/research/output/lhtb/native/audit.json}"
 export ROY_LHTB_RUN_ROOT="${ROY_LHTB_RUN_ROOT:-${roy_root}/research/output/lhtb/native/formal}"
 
-exec "${roy_root}/research/remote/run_lhtb_training.sh"
+exec "${roy_root}/research/remote/run_lhtb_nodewise_training.sh"
