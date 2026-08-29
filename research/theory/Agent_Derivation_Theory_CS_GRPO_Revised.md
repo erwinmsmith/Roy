@@ -110,31 +110,42 @@ Coverage, assumption closure, conflicts and blind spots are structural inputs to
 
 The immutable ledger and the policy input are intentionally distinct. The ledger retains every event and full text needed for audit or later retrieval. The proposer and actor receive a bounded working projection containing active structure, unresolved gaps, selected epistemic entities, recent event deltas and immutable references back to the raw ledger. This projection is not a lossy replacement for `M_t`. Organization-policy decisions are event-driven: they occur initially and when a real state change exposes a gap, failure, file mutation, contradiction, completed node, structural transition or a bounded accumulation of terminal results. Local execution may continue between organization decisions.
 
-## 6. On-policy groups and terminal-reward GRPO
+## 6. Forced-finalize state value and node-wise GRPO
 
-Training samples fresh complete trajectories from the current masked policy. Each LHTB task and epoch produces `G=8` trajectories from eight fresh matched execution environments with the same task checksum, immutable environment digest, initial-state fingerprint, environment configuration and actor revision. Only organization sampling seeds differ. The official protocol realizes these environments as fresh Docker containers. A native portability backend may be used only as a separately labeled experimental condition and does not imply Docker-equivalent isolation. Every decision stores its exact masked old-policy joint log-probability.
-
-The sole reward is the official LHTB final score `R_i` in `[0,1]`. For a matched group, GRPO computes one trajectory-level normalized advantage:
+The main structural-training estimator is one bounded task-value function `V_psi(S)`. It predicts the official LHTB value obtainable when Roy is frozen at state `S`, all further structural actions are disabled, and one fixed frozen `A_0` finalizer must submit using only information already represented in that state. Its supervised target is obtained by cloning the same complete Runtime/environment checkpoint, running `K` independent finalize-now probes and averaging their official LHTB verifier scores:
 
 ```text
-A_i = (R_i - mean_j R_j) / (std_j R_j + epsilon).
+V_MC(S) = (1/K) sum_k U_LHTB(A_0(S); seed_k).
 ```
 
-Every sampled node decision in trajectory `i` receives the same `A_i`; the loss normalizes by that trajectory's number of organization decisions:
+Every label records the state fingerprint, task checksum, environment digest, fixed-finalizer revision, seeds, complete requests/results and official verifier provenance. A deterministic finalizer permits `K=1`; stochastic finalization should begin with `K=3`. A native checkpoint is eligible only when the task workspace and relevant service state can be cloned or deterministically replayed. Otherwise the state is marked non-clonable and cannot produce a value label.
+
+`V_psi` is an independent typed relational model over the same auditable state graph. It is trained with Huber loss against `V_MC`; RMSE, Spearman correlation and within-task pairwise ranking accuracy are reported. Epistemic features such as belief, uncertainty, reliability, evidence coverage and blind spots are inputs, never reward terms. This `V` is an operational estimator of realized task value, not a direct estimator of linguistic mutual information and not an extra term added to the official task objective.
+
+At a real decision checkpoint `S_t` for node `i`, Roy samples `G=8` structural actions directly from the current masked actor. The complete checkpoint is cloned eight times. Each sampled action is executed to the next meaningful SMDP control boundary: one Worker phase or external observation for `CONTINUE`/derivation, report integration for `RETURN`, actual branch removal for `PRUNE`, or official verification for `FINISH`. Merely creating an idle child is not a completed macro-action. All outcomes share the same task, base fingerprint, context node, actor revision, frozen value revision, Runtime configuration and environment digest; only the actor sampling seed and selected macro-action outcome differ.
+
+The single derived process reward is:
 
 ```text
-L_actor = -(1/G) sum_i (1/T_i) sum_t
-  min(rho_i,t A_i, clip(rho_i,t, 1-epsilon, 1+epsilon) A_i),
-rho_i,t = pi_theta(a_i,t | M_i,t, n_i,t) / pi_old(a_i,t | M_i,t, n_i,t).
+r_t,g = V_psi(S_t+1,g) - V_psi(S_t).
+A_t,g = (r_t,g - mean_h r_t,h) / (std_h r_t,h + epsilon).
 ```
 
-The exact masked old-policy probability is saved at collection time and reconstructed during replay. There is no learned value model, EMA target, search backup, intermediate shaped reward, topology bonus or synthetic per-step `R`. When all eight official scores are equal, the group has no preference signal and the actor update is skipped.
+The value model is frozen throughout the group. The Controller update uses the exact saved masked probability:
 
-The immutable dataset still retains every adjacent `M_t -> M_t+1` transition and SMDP decision span for audit. Each record contains fingerprints, the acting node, node-local context, legal candidates, selected action and exact topology delta, but these fields are not rewards. The full raw runtime and semantic ledgers are stored once; each fingerprinted `M_t` contains a deterministic bounded relational projection with active requirements, recent typed entities, blind spots, usage and immutable ledger references. Node count and topology complexity do not enter `R_i` or the advantage.
+```text
+rho_t,g = pi_theta(a_t,g | M_t, L_i,t, H_i)
+          / pi_old(a_t,g | M_t, L_i,t, H_i)
+L_actor = -(1/G) sum_g min(
+  rho_t,g A_t,g,
+  clip(rho_t,g, 1-epsilon, 1+epsilon) A_t,g).
+```
 
-Collection is ordinary current-policy rollout. Runtime first constructs a payload-free six-action mask from hard graph, lifecycle, dependency and environment legality only; Worker preference cannot add or remove an otherwise legal Controller action. The actor samples one category directly from that mask. Only then does the frozen Worker observe the selected category and generate its concrete semantic payload, which the Runtime validates and executes. Hypothetical sibling states are neither rolled out nor assigned rewards. Different organization seeds across the matched group provide exploration, while later groups are sampled from the newly updated actor.
+This is same-state node-wise GRPO, not MCTS: there is no tree policy, PUCT, value backup, look-ahead action selection or search at inference. The cloned siblings are training counterfactuals and are never used to choose the live inference action. At inference, each actual node invokes the shared Controller exactly once at each control boundary and directly executes the sampled category without consulting `V_psi`.
 
-There is no teacher, imitation, predefined role pool, staged objective, entropy bonus, cost penalty or weighted reward sum.
+The previous complete-trajectory terminal-reward GRPO remains a named baseline. It computes one relative advantage from eight official final scores and assigns it to every node decision in a trajectory. It must not be mixed with node-wise records or presented as the derived process-credit algorithm. Since `sum_t Delta V_t` telescopes, collapsing node-wise increments back into one trajectory scalar would remove the intended credit-assignment benefit.
+
+`V_psi` is periodically refreshed from newly sampled on-policy states, but never inside an actor group. Dev/test snapshots never train either model. Final benchmark evaluation ignores `V_psi` and reports only the independent official LHTB verifier score, preventing self-reward circularity. There is no teacher, imitation, predefined role pool, MCTS, entropy bonus, cost penalty, topology bonus or weighted reward sum.
 
 ## 7. LHTB protocol and evaluation
 
@@ -152,13 +163,13 @@ Report mean reward, success rate at `R >= 0.95`, paired bootstrap 95% confidence
 
 ## 8. Training and recovery invariants
 
-- Every actor update consumes exactly eight complete current-policy train trajectories.
-- Runtime crashes, environment-invalid attempts, environment failures and incomplete trajectories are preserved for audit but excluded from actor updates. Environment-invalid attempts are resampled rather than assigned reward zero.
-- A normal six-hour training deadline triggers the official verifier; its partial score is a valid terminal label.
-- Every trajectory preserves `M_0...M_T`, runtime events, semantic audits, raw and masked action probabilities, selected actions, exact old log-probabilities, real-gap diagnostics, task checksum, source and converted environment digests, backend capabilities, model revisions and final Harbor result.
-- Actor, its optimizer and updated group IDs are restored together; a group ID can be optimized only once.
+- Every node-wise actor update consumes exactly eight complete macro-action outcomes cloned from one current-policy train checkpoint. The terminal-GRPO baseline consumes eight complete trajectories and uses a separate updater/schema.
+- Runtime crashes, environment-invalid attempts, failed checkpoint clones, environment failures and incomplete macro-actions are preserved for audit but excluded from actor/value updates. They are never assigned reward zero.
+- A forced-finalize target is legal only when every probe reaches the original official LHTB verifier. A normal six-hour full-trajectory deadline score is not automatically a label for an earlier state.
+- Every macro group preserves the shared base state, eight successor states, Runtime/environment clone provenance, semantic audits, action probabilities, exact old log-probability, task checksum, environment digest, actor revision, frozen value revision and meaningful control-boundary type.
+- Actor/value models, both optimizers, revisions, consumed label IDs and updated group IDs are restored together. A label or group ID can be optimized only once.
 - Dev selects checkpoints but never updates them. Test runs only after selection and never updates weights.
-- Neither the local Docker protocol nor the native portability backend invents a timed process reward. Adjacent state transitions are audit records; the official final verifier score is the only GRPO reward.
+- No backend invents a process score. `Delta V` is computed only from a value model supervised by frozen-finalize official-verifier labels. Ordinary adjacent transitions without that frozen revision remain audit-only.
 
 ## 9. Limits
 

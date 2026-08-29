@@ -26,7 +26,10 @@ from .tau3_runner import evaluate_tau3_against_direct, train_tau3_on_policy
 from .lhtb import build_lhtb_split, verify_lhtb_checkout, write_lhtb_manifest, load_lhtb_manifest
 from .lhtb_experiment import build_training_schedule, disk_preflight, select_dev_checkpoint, summarize_test, write_json, write_harbor_group_config, write_lhtb_svg
 from .lhtb_training import LHTBProcessGRPOTrainer
-from .lhtb_results import import_harbor_group, sample_audit, validate_smoke
+from .lhtb_nodewise import LHTBNodeWiseDeltaVTrainer, build_forced_finalize_label
+from .lhtb_results import (
+    import_harbor_group, official_lhtb_reward, sample_audit, validate_smoke,
+)
 from .lhtb_native import (
     native_environment_digest,
     native_preflight,
@@ -281,6 +284,61 @@ def parser() -> argparse.ArgumentParser:
     lhtb_init.add_argument("--model", type=Path, required=True)
     lhtb_init.add_argument("--device", default="cpu")
 
+    lhtb_nodewise_init = commands.add_parser(
+        "lhtb-nodewise-init",
+        help="Initialize the forced-finalize Delta-V node-wise actor/value model",
+    )
+    lhtb_nodewise_init.add_argument("--manifest", type=Path, required=True)
+    lhtb_nodewise_init.add_argument("--model", type=Path, required=True)
+    lhtb_nodewise_init.add_argument("--device", default="cpu")
+
+    lhtb_finalize_label = commands.add_parser(
+        "lhtb-finalize-label",
+        help="Record official forced-finalize verifier probes as one V(S) label",
+    )
+    lhtb_finalize_label.add_argument("--state", type=Path, required=True)
+    lhtb_finalize_label.add_argument("--output", type=Path, required=True)
+    lhtb_finalize_label.add_argument("--label-id", required=True)
+    lhtb_finalize_label.add_argument("--task-id", required=True)
+    lhtb_finalize_label.add_argument("--split", choices=("train", "dev", "test"), required=True)
+    lhtb_finalize_label.add_argument("--checkpoint-id", required=True)
+    lhtb_finalize_label.add_argument("--finalizer-revision", required=True)
+    lhtb_finalize_label.add_argument("--task-checksum", required=True)
+    lhtb_finalize_label.add_argument("--environment-digest", required=True)
+    lhtb_finalize_label.add_argument(
+        "--clone-mode", choices=("full_clone", "deterministic_replay"), required=True
+    )
+    lhtb_finalize_label.add_argument("--clone-audit-id", required=True)
+    lhtb_finalize_label.add_argument(
+        "--harbor-result", type=Path, action="append", required=True,
+        help="Official forced-finalize Harbor result.json; repeat for K probes",
+    )
+    lhtb_finalize_label.add_argument("--sample-seed", type=int, action="append")
+
+    lhtb_value_update = commands.add_parser(
+        "lhtb-value-update",
+        help="Fit V(S) only from official frozen-finalize labels",
+    )
+    lhtb_value_update.add_argument("--manifest", type=Path, required=True)
+    lhtb_value_update.add_argument("--labels", type=Path, required=True)
+    lhtb_value_update.add_argument("--model", type=Path, required=True)
+    lhtb_value_update.add_argument("--updates", type=Path, required=True)
+    lhtb_value_update.add_argument("--epochs", type=int, default=4)
+    lhtb_value_update.add_argument("--batch-size", type=int, default=32)
+    lhtb_value_update.add_argument("--device", default="cpu")
+    lhtb_value_update.add_argument("--resume", action="store_true")
+
+    lhtb_node_update = commands.add_parser(
+        "lhtb-node-update",
+        help="Apply same-state macro-action Delta-V node-wise GRPO without MCTS",
+    )
+    lhtb_node_update.add_argument("--manifest", type=Path, required=True)
+    lhtb_node_update.add_argument("--groups", type=Path, required=True)
+    lhtb_node_update.add_argument("--model", type=Path, required=True)
+    lhtb_node_update.add_argument("--updates", type=Path, required=True)
+    lhtb_node_update.add_argument("--device", default="cpu")
+    lhtb_node_update.add_argument("--resume", action="store_true")
+
     lhtb_import = commands.add_parser(
         "lhtb-import-group", help="Import one Harbor G=8 job into append-only trajectories"
     )
@@ -456,6 +514,67 @@ def main(argv: List[str] | None = None) -> None:
         )
         trainer.save()
         print(json.dumps({"model": str(args.model), **trainer.metadata()}))
+    elif args.command == "lhtb-nodewise-init":
+        trainer = LHTBNodeWiseDeltaVTrainer(
+            args.model, load_lhtb_manifest(args.manifest), device_name=args.device
+        )
+        trainer.save()
+        print(json.dumps({"model": str(args.model), **trainer.metadata()}))
+    elif args.command == "lhtb-finalize-label":
+        state = json.loads(args.state.read_text(encoding="utf-8"))
+        harbor_results = [json.loads(path.read_text(encoding="utf-8"))
+                          for path in args.harbor_result]
+        scores = [official_lhtb_reward(value) for value in harbor_results]
+        verifier_provenance = [{
+            "harbor_result_path": str(path.resolve()),
+            "harbor_result_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        } for path in args.harbor_result]
+        label = build_forced_finalize_label(
+            label_id=args.label_id, task_id=args.task_id, split=args.split,
+            process_state=state, scores=scores,
+            finalizer_revision=args.finalizer_revision,
+            task_checksum=args.task_checksum,
+            environment_digest=args.environment_digest,
+            checkpoint_id=args.checkpoint_id,
+            clone_provenance={
+                "mode": args.clone_mode,
+                "complete": True,
+                "source_state_fingerprint": str(state.get("fingerprint", "")),
+                "source_environment_digest": args.environment_digest,
+                "clone_audit_id": args.clone_audit_id,
+            },
+            verifier_provenance=verifier_provenance,
+            sample_seeds=args.sample_seed,
+        )
+        write_jsonl(args.output, [label], append=args.output.exists())
+        print(json.dumps({"output": str(args.output), "label_id": args.label_id,
+                          "value_target": label["value_target"], "k": label["k"]}))
+    elif args.command == "lhtb-value-update":
+        trainer = LHTBNodeWiseDeltaVTrainer(
+            args.model, load_lhtb_manifest(args.manifest), device_name=args.device,
+            resume=args.resume,
+        )
+        update = trainer.update_value(
+            list(read_jsonl(args.labels)), epochs=args.epochs, batch_size=args.batch_size
+        )
+        write_jsonl(args.updates, [update], append=args.updates.exists())
+        print(json.dumps(update))
+    elif args.command == "lhtb-node-update":
+        trainer = LHTBNodeWiseDeltaVTrainer(
+            args.model, load_lhtb_manifest(args.manifest), device_name=args.device,
+            resume=args.resume,
+        )
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for record in read_jsonl(args.groups):
+            grouped.setdefault(str(record.get("group_id", "")), []).append(record)
+        updates = []
+        for group_id, records in grouped.items():
+            if group_id in trainer.updated_macro_group_ids:
+                continue
+            update = trainer.update_macro_group(records)
+            write_jsonl(args.updates, [update], append=args.updates.exists())
+            updates.append(update)
+        print(json.dumps({"new_updates": len(updates), **trainer.metadata()}))
     elif args.command == "lhtb-import-group":
         environment_digest = args.environment_digest or args.docker_digest
         if not environment_digest:

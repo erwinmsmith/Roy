@@ -1,8 +1,10 @@
 # Roy information-realization research
 
-This directory contains the canonical theory, recursive epistemic runtime, autonomous node-level organization policy, LHTB/Harbor adapter, terminal-reward GRPO code and τ³ transfer integration. Generated trajectories, model weights, embedding caches, Docker images and benchmark assets are intentionally ignored by Git.
+This directory contains the canonical theory, recursive epistemic runtime, autonomous node-level organization policy, LHTB/Harbor adapter, forced-finalize state-value/node-wise GRPO experiment, terminal-reward baseline and τ³ transfer integration. Generated trajectories, model weights, embedding caches, Docker images and benchmark assets are intentionally ignored by Git.
 
-The current method uses one shared six-action node-level Controller, a frozen semantic Worker, direct on-policy sampling and one reward: the official LHTB final verifier score. The Controller is invoked separately whenever root, child or deeper descendant owns execution; each invocation consumes that node's local context/ancestry plus the current global `M_t` graph. It chooses only `CONTINUE / DERIVE_INFO / DERIVE_ORG / PRUNE / RETURN / FINISH`. It never chooses commands, child descriptions, reports, connection/reuse targets or prune targets. There is no MCTS/look-ahead rollout, critic, EMA, teacher, predefined role catalog, imitation warm start, weighted objective sum, keyword scoring, node/depth target or token penalty.
+The current method uses one shared six-action node-level Controller and a frozen semantic Worker. The Controller is invoked separately whenever root, child or deeper descendant owns execution; each invocation consumes that node's local context/ancestry plus the current global `M_t` graph. It chooses only `CONTINUE / DERIVE_INFO / DERIVE_ORG / PRUNE / RETURN / FINISH`. It never chooses commands, child descriptions, reports, connection/reuse targets or prune targets.
+
+Structural training compares `G=8` macro-actions cloned from the same node checkpoint. An independently trained `V_psi(S)` is supervised only by a fixed finalize-now readout scored by the official LHTB verifier. One frozen value revision supplies `Delta V = V_psi(S_next) - V_psi(S)` for the complete group, followed by group-relative clipped actor learning. This is counterfactual training data, not MCTS: inference directly samples one action per real node and does not use the value model or sibling outcomes. The earlier complete-trajectory terminal-score updater remains available as an explicit baseline and never shares groups with the node-wise updater.
 
 ## Primary LHTB workflow
 
@@ -16,8 +18,36 @@ PYTHONPATH=research python3 -m roy_research lhtb-schedule \
   --manifest research/output/lhtb/manifest.json \
   --output research/output/lhtb/schedule.json
 
-# Apply one freshly sampled current-policy G=8 group at a time. This updates
-# only the node-level actor and refuses a repeated group optimizer step.
+# Initialize the main node-wise actor/value checkpoint.
+PYTHONPATH=research python3 -m roy_research lhtb-nodewise-init \
+  --manifest research/output/lhtb/manifest.json \
+  --model research/output/lhtb/checkpoints/nodewise-current.pt
+
+# Record each snapshot's K official frozen-finalize probes as V(S) labels,
+# then update only the value estimator.
+PYTHONPATH=research python3 -m roy_research lhtb-finalize-label \
+  --state research/output/lhtb/probes/state.json \
+  --output research/output/lhtb/value-labels.jsonl \
+  --label-id TASK:CHECKPOINT --task-id TASK --split train \
+  --checkpoint-id CHECKPOINT --finalizer-revision frozen-a0 \
+  --task-checksum TASK_SHA --environment-digest sha256:ENV \
+  --clone-mode full_clone --clone-audit-id CLONE_AUDIT \
+  --harbor-result /path/to/forced-finalize/result.json
+
+PYTHONPATH=research python3 -m roy_research lhtb-value-update \
+  --manifest research/output/lhtb/manifest.json \
+  --labels research/output/lhtb/value-labels.jsonl \
+  --model research/output/lhtb/checkpoints/nodewise-current.pt \
+  --updates research/output/lhtb/value-update-audit.jsonl --resume
+
+# Apply one same-state G=8 macro-action group using one frozen value revision.
+PYTHONPATH=research python3 -m roy_research lhtb-node-update \
+  --manifest research/output/lhtb/manifest.json \
+  --groups research/output/lhtb/node-macro-groups.jsonl \
+  --model research/output/lhtb/checkpoints/nodewise-current.pt \
+  --updates research/output/lhtb/node-update-audit.jsonl --resume
+
+# Terminal-reward completion-level GRPO baseline only.
 PYTHONPATH=research python3 -m roy_research lhtb-update \
   --manifest research/output/lhtb/manifest.json \
   --trajectories research/output/lhtb/train-trajectories.jsonl \
@@ -31,7 +61,9 @@ Each organization action and terminal result appends an immutable `GlobalEpistem
 
 The append-only ledger remains complete. On every organization decision, the actor receives the acting node's local objective, parent/depth/status, assigned requirements, open child specification, tool access, termination condition and recent node-local events, together with a typed relational projection of the complete current `M_t` organization/epistemic graph. The same shared actor parameters are used separately for every node. Every sampled decision records the exact node context, candidates, raw and masked probabilities, selected action and exact old log-probability.
 
-For each matched G=8 group, GRPO normalizes the eight official final scores. Every node decision in one trajectory receives that trajectory's normalized terminal advantage, and the clipped loss is normalized by trajectory length. Adjacent `M_t -> M_t+1` records preserve topology evolution for audit but carry no synthetic process reward. Equal terminal scores contain no preference signal, so the actor update is skipped.
+For the main node-wise algorithm, each G=8 group shares one exact node checkpoint and reaches eight meaningful macro-action boundaries. The frozen value revision scores the base and successors, and GRPO normalizes the eight `Delta V` values. Forced-finalize labels retain every official score and finalizer seed. RMSE, Spearman and within-task pairwise ranking accuracy are required value diagnostics. Ordinary adjacent `M_t -> M_t+1` transitions without a forced-finalize-trained value revision remain audit-only.
+
+For the terminal baseline, GRPO instead normalizes eight official full-trajectory final scores and assigns one trajectory advantage to all decisions. Equal terminal scores skip that baseline actor update. Baseline and node-wise JSONL/checkpoints are deliberately incompatible.
 
 Use a dedicated x86_64 Docker VM (16 vCPU, 64 GB RAM, at least 200 GB and preferably 300 GB SSD):
 
@@ -75,11 +107,11 @@ OCI-backed native templates preserve two different identities: the pinned source
 
 Every formal rollout directly samples from the current Controller with a distinct organization seed. Runtime first builds a payload-free six-way mask from hard legality only; frozen-Worker preference cannot suppress a legal action. After the Controller samples, the frozen Worker receives that category and materializes the command, child specification, report, reuse/connection or prune target. The Worker receives no node-count, depth or topology label. A legal root `FINISH` option permits genuine single-node trajectories; repeated real `DERIVE_INFO` and `DERIVE_ORG` choices produce branching and recursion one child at a time, while Worker/Runtime reuse and communication preserve DAG structure. `ROY_LHTB_TOPOLOGY_PROFILE` remains diagnostic-only and is rejected by the trainer. Every derivation consumes a real parent-local gap, duplicate objectives/communication edges are rejected, and producer dependencies refer to genuine artifacts.
 
-Training saves every adjacent `M_t -> M_t+1` record and decision span to `transition-audit-samples.jsonl`, including topology snapshots, exact node/edge/status deltas, acting node and selected action. These are structural audit samples, not separately rewarded transitions. The only reward field propagated with them is the trajectory's official final `R` provenance.
+Training saves every adjacent `M_t -> M_t+1` record and decision span, including topology snapshots, exact node/edge/status deltas, acting node and selected action. Ordinary transitions are structural audit samples. A transition becomes a node-wise reward sample only when it belongs to a same-base macro group and records the frozen forced-finalize value revision used to compute `Delta V`.
 
-No MCTS or counterfactual rollout occurs during collection, update or inference. The actor samples one real action for the current node, the Runtime executes it, records the resulting state, and later invokes the same actor for whichever node now owns execution. Organization seeds provide stochastic exploration across the matched group. Use `lhtb-sample-audit` to verify exact node contexts, direct-actor behavior probabilities, topology transitions, terminal labels and G=8 readiness without an optimizer update.
+No MCTS occurs during collection, update or inference. Main training does create eight one-macro-action counterfactuals from a clonable checkpoint, solely to form a same-state GRPO group; it never searches deeper, backs up values or selects the live action. Inference samples and executes one real action, then later invokes the same actor for whichever node owns execution. The terminal baseline instead uses eight complete current-policy trajectories. The two protocols use separate schemas and update commands.
 
-The actor uses relational message passing plus attention/mean/max graph pooling and a separately indexed representation for the acting node. Legacy routing, value-shaped and MCTS checkpoints remain audit-only and fail closed; native smoke initializes a fresh `scheduler-node-grpo-initial.pt` actor.
+The actor uses relational message passing plus attention/mean/max graph pooling and a separately indexed representation for the acting node. The independent value estimator uses a typed relational graph and is absent from inference. Legacy MCTS/routing checkpoints and the old trajectory-shaped value checkpoints remain audit-only; node-wise training initializes a fresh `lhtb-nodewise-init` checkpoint.
 
 Sample audit separates protocol trainability from optimization signal. `preconditions_for_training` requires eight complete matched direct-actor trajectories; `actor_terminal_signal_available` means official final scores have nonzero within-group variance. A legal zero-variance group is saved but correctly skips the actor update.
 
