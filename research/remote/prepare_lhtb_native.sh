@@ -421,7 +421,7 @@ roy_smoke() {
   export ROY_LHTB_SEMANTIC_COMMAND="${python_bin} -m roy_research.semantic_server"
   export ROY_LHTB_SEMANTIC_ROOT="${smoke_root}/semantic"
   export ROY_LHTB_POLICY_COMMAND="${python_bin} -m roy_research.lhtb_policy_server"
-  export ROY_LHTB_MODEL="${roy_root}/research/output/lhtb/native/scheduler-node-grpo-initial.pt"
+  export ROY_LHTB_MODEL="${ROY_LHTB_MODEL:-${roy_root}/research/output/lhtb/native/scheduler-node-grpo-initial.pt}"
   export ROY_LHTB_NATIVE_ROOT="${native_root}"
   export ROY_LHTB_MCTS_ENABLED=false
   export ROY_LHTB_ORGANIZATION_INTERVAL=1
