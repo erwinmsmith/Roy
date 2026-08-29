@@ -28,6 +28,7 @@ interface RawProposedCandidate {
   cwd?: unknown;
   timeoutMs?: unknown;
   action?: unknown;
+  report?: unknown;
 }
 
 interface ProposalResponse {
@@ -1555,6 +1556,13 @@ export class LHTBAutonomousController {
         ? raw.action as Record<string, unknown> : {};
       if (kind === 'DERIVE' && actionValue.childSpecification) {
         actionValue.childSpecification = compactChildSpecification(actionValue.childSpecification);
+      }
+      if (kind === 'RETURN' && !actionValue.report && raw?.report
+        && typeof raw.report === 'object' && !Array.isArray(raw.report)) {
+        // Some JSON providers preserve the documented report shape but place
+        // it beside action. Normalize that unambiguous representation before
+        // Runtime legality checks; the learned Controller never sees payloads.
+        actionValue.report = raw.report;
       }
       if (kind === 'RETURN') normalizeReturnReportCollections(actionValue, actorNodeId);
       const explicitActionKind = typeof actionValue.kind === 'string' ? actionValue.kind

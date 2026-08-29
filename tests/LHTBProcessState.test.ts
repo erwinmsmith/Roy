@@ -1153,6 +1153,13 @@ describe('LHTB process state', () => {
         stderr: '', durationMs: 1 });
       const accepted = harness.validateCandidates(response, session);
       expect(accepted.candidates.map(value => value.id)).toContain('return-worker');
+      const providerShaped = structuredClone(response) as unknown as { candidates: Array<{
+        report?: typeof report; action: { report?: typeof report } }> };
+      providerShaped.candidates[0].report = report;
+      delete providerShaped.candidates[0].action.report;
+      const normalizedProviderShape = harness.validateCandidates(providerShaped, session);
+      expect(normalizedProviderShape.candidates.map(value => value.id))
+        .toContain('return-worker');
       const malformedResidual = structuredClone(response);
       malformedResidual.candidates[0].action.report.residualRequirements = [{} as never];
       const normalized = harness.validateCandidates(malformedResidual, session);
