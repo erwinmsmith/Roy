@@ -19,6 +19,9 @@ model="${run_root}/checkpoints/current.pt"
 native_runtime_root="${ROY_LHTB_NATIVE_ROOT:-${HOME}/rivermind-data/lhtb-native/runtime}"
 native_template_root="${ROY_LHTB_NATIVE_TEMPLATE_ROOT:-${HOME}/rivermind-data/lhtb-native/templates}"
 native_audit="${ROY_LHTB_NATIVE_AUDIT:-${roy_root}/research/output/lhtb/native/audit.json}"
+native_execution_base="${ROY_LHTB_NATIVE_EXECUTION_BASE:-${HOME}/rivermind-data/lhtb-native}"
+proot_runtime="${native_execution_base}/tools/proot-v5.3.1-99a84175"
+node_runtime="${roy_root}/research/.runtime/node-v22"
 dataset_path="${ROY_LHTB_DATASET_PATH:-}"
 parallelism="${ROY_LHTB_NODEWISE_CONCURRENCY:-4}"
 max_retries="${ROY_LHTB_MAX_ENV_RETRIES:-0}"
@@ -27,6 +30,16 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=load_roy_env.sh
 source "${script_dir}/load_roy_env.sh"
 load_deepseek_api_key "${roy_root}"
+
+[[ -x "${proot_runtime}/bin/proot" ]] || {
+  echo "the pinned PRoot runtime is required; run prepare_lhtb_native.sh prepare" >&2
+  exit 4
+}
+[[ -x "${node_runtime}/bin/node" ]] || {
+  echo "the prepared Node 22 runtime is required; run prepare_lhtb_native.sh prepare" >&2
+  exit 4
+}
+export PATH="${proot_runtime}/bin:${node_runtime}/bin:${PATH}"
 
 [[ -n "${DEEPSEEK_API_KEY:-}" ]] || { echo "DEEPSEEK_API_KEY is required" >&2; exit 4; }
 [[ -x "${python_bin}" && -x "${harbor_bin}" ]] || {
