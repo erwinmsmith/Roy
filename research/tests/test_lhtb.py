@@ -37,7 +37,9 @@ from roy_research.value_model import (
     trajectory_weighted_advantages,
     update_ema,
 )
-from roy_research.harbor_agent import PersistentNodeRPC, RoyHarborAgent
+from roy_research.harbor_agent import (
+    FrozenFinalizeNowAgent, PersistentNodeRPC, RoyHarborAgent,
+)
 from roy_research.lhtb_experiment import (
     build_training_schedule,
     select_dev_checkpoint,
@@ -630,6 +632,14 @@ for line in sys.stdin:
             trusted = f"PROOT_TMP_DIR={root / 'tmp'}"
             self.assertIn(trusted, values)
             self.assertNotIn("PROOT_TMP_DIR=/untrusted", values)
+
+    def test_frozen_finalize_agent_performs_no_action(self) -> None:
+        agent = FrozenFinalizeNowAgent.__new__(FrozenFinalizeNowAgent)
+        context = SimpleNamespace(metadata={})
+        asyncio.run(agent.run("task", SimpleNamespace(), context))
+        self.assertEqual(context.metadata["structural_actions"], 0)
+        self.assertEqual(context.metadata["terminal_commands"], 0)
+        self.assertEqual(FrozenFinalizeNowAgent.name(), "roy-frozen-finalize-now")
 
     def test_native_audit_is_fail_closed_and_uses_environment_digest(self) -> None:
         self.assertEqual(

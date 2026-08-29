@@ -204,6 +204,99 @@ class NativeProcessEnvironment(BaseEnvironment):
         audit_path = self.trial_paths.trial_dir / "native-environment.json"
         audit_path.write_text(json.dumps(audit, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
+    async def create_training_checkpoint(
+        self, destination: Path | str, source_state_fingerprint: str
+    ) -> Mapping[str, Any]:
+        """Clone one idle, service-free native state for node-wise training.
+
+        GPUHome cannot snapshot arbitrary process or service state. This method
+        therefore fails closed unless the reviewed task has no persistent
+        services and no task command is active at the control boundary.
+        """
+        if self.session_root is None or self._manifest is None:
+            raise RuntimeError("native environment is not started")
+        if self._manifest.get("services") or self._service_audit:
+            raise RuntimeError("native checkpoint cannot clone persistent service state")
+        if self._process_groups:
+            raise RuntimeError("native checkpoint requires an idle command boundary")
+        target = Path(destination).expanduser().resolve()
+        if target.exists():
+            raise RuntimeError(f"refusing to overwrite native checkpoint {target}")
+        if target == self.session_root or target.is_relative_to(self.session_root):
+            raise ValueError("native checkpoint must be outside its source session")
+        payload = target / "payload"
+        payload.mkdir(parents=True)
+        names = ("app", "opt", "tests", "solution", "tmp", "home", "logs")
+        for name in names:
+            source = self.session_root / name
+            if source.exists():
+                await asyncio.to_thread(
+                    shutil.copytree, source, payload / name,
+                    dirs_exist_ok=True, symlinks=True,
+                )
+        payload_digest = tree_digest(payload)
+        audit = {
+            "schema_version": 1,
+            "mode": "full_clone",
+            "complete": True,
+            "task_id": self.native_task_id,
+            "source_session_id": self.session_id,
+            "source_state_fingerprint": source_state_fingerprint,
+            "source_environment_digest": self.environment_digest,
+            "payload_digest": payload_digest,
+            "directories": list(names),
+            "services": [],
+        }
+        (target / "checkpoint.json").write_text(
+            json.dumps(audit, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        return audit
+
+    async def restore_training_checkpoint(self, source: Path | str) -> Mapping[str, Any]:
+        if self.session_root is None or self._manifest is None:
+            raise RuntimeError("native environment is not started")
+        if self._manifest.get("services") or self._service_audit:
+            raise RuntimeError("native checkpoint cannot restore persistent service state")
+        if self._process_groups:
+            raise RuntimeError("native checkpoint restore requires an idle environment")
+        root = Path(source).expanduser().resolve(strict=True)
+        manifest_path = root / "checkpoint.json"
+        payload = root / "payload"
+        if not manifest_path.is_file() or not payload.is_dir():
+            raise ValueError("native training checkpoint is incomplete")
+        audit = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if audit.get("schema_version") != 1 or audit.get("complete") is not True:
+            raise ValueError("unsupported or incomplete native training checkpoint")
+        if audit.get("mode") != "full_clone":
+            raise ValueError("native backend accepts only complete filesystem clones")
+        if audit.get("task_id") != self.native_task_id:
+            raise ValueError("native checkpoint belongs to another LHTB task")
+        if audit.get("source_environment_digest") != self.environment_digest:
+            raise ValueError("native checkpoint environment digest mismatch")
+        if audit.get("payload_digest") != tree_digest(payload):
+            raise ValueError("native checkpoint payload digest mismatch")
+        for name in audit.get("directories", []):
+            if name not in ("app", "opt", "tests", "solution", "tmp", "home", "logs"):
+                raise ValueError(f"native checkpoint contains an invalid directory {name}")
+            target = self.session_root / name
+            await asyncio.to_thread(shutil.rmtree, target, True)
+            await asyncio.to_thread(
+                shutil.copytree, payload / name, target,
+                dirs_exist_ok=True, symlinks=True,
+            )
+        await asyncio.to_thread(self._chown_session)
+        await asyncio.to_thread(self._apply_path_permissions)
+        restore_audit = {
+            **audit,
+            "restored_session_id": self.session_id,
+            "restore_verified": True,
+        }
+        (self.trial_paths.trial_dir / "native-checkpoint-restore.json").write_text(
+            json.dumps(restore_audit, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return restore_audit
+
     @staticmethod
     def _allocate_loopback_port() -> int:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:

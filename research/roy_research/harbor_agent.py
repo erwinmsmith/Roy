@@ -389,3 +389,42 @@ class RoyHarborAgent(BaseAgent):
 
     def close(self) -> None:
         self.rpc.close()
+
+
+class FrozenFinalizeNowAgent(BaseAgent):
+    """Fixed A0 readout for artifact-state value labels.
+
+    The agent performs no terminal command and no Roy structural action. Harbor
+    immediately invokes the task's original verifier on the current environment,
+    so the resulting score measures the task value already realized in that
+    checkpoint. Checkpoint restoration, when used, is owned and audited by the
+    environment backend before this agent runs.
+    """
+
+    SUPPORTS_ATIF = False
+
+    @staticmethod
+    def name() -> str:
+        return "roy-frozen-finalize-now"
+
+    def version(self) -> str:
+        return "1"
+
+    async def setup(self, environment: Any) -> None:
+        restore_path = os.environ.get("ROY_LHTB_FINALIZE_CHECKPOINT")
+        if restore_path:
+            restore = getattr(environment, "restore_training_checkpoint", None)
+            if not callable(restore):
+                raise RuntimeError(
+                    "forced-finalize checkpoint requires a clonable environment backend"
+                )
+            await restore(Path(restore_path))
+
+    async def run(self, instruction: str, environment: Any, context: Any) -> None:
+        context.metadata = {
+            **(context.metadata or {}),
+            "finalizer_policy": "frozen_finalize_now_no_structural_actions",
+            "finalizer_revision": "artifact-identity-a0-v1",
+            "structural_actions": 0,
+            "terminal_commands": 0,
+        }
