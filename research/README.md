@@ -125,7 +125,7 @@ Native task virtual environments default to the host's Python 3.12 and are inclu
 
 This backend intentionally records `network_isolation=false` and the absence of PID/mount namespaces. A task declaring `allow_internet=false` is rejected unless `ROY_LHTB_ALLOW_NETWORK_DEGRADED=true` is explicitly set, and such a run is labeled degraded. Native results use a content-derived environment digest and the original final verifier, but they are not Docker-equivalent or official leaderboard-comparable. Reports must keep them separate from the official Docker protocol.
 
-Dev checkpoint selection uses highest mean reward, then fewer tokens and earlier epoch. Final test compares `single_agent_direct`, `roy_runtime_heuristic` and `learned_information_realization` for three repetitions. Direct uses the same model/executor/runtime while enforcing one root node and no communication. Report mean reward, success at `R >= 0.95`, paired bootstrap 95% CI, tokens, time, topology, per-node actions and failures.
+Dev checkpoint selection uses highest mean official environment utility, then fewer tokens and earlier epoch. Final test compares `single_agent_direct`, `roy_runtime_heuristic` and `learned_information_realization` for three repetitions. Direct uses the same model/executor/runtime while enforcing one root node and no communication. Report mean `u_env`, success at `u_env >= 0.95`, paired bootstrap 95% CI, tokens, time, topology, per-node actions and failures. Node-wise `R_t^MIA` is reported separately as a training-credit diagnostic and never thresholded as task success.
 
 See [the implementation note](reports/lhtb-process-reward-implementation.md) for the delivered components, validation boundary and formal-run outputs.
 

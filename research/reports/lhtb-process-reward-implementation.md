@@ -26,7 +26,7 @@ At an actor checkpoint, `G=8` direct action samples start from the same complete
 
 `prepare_lhtb.sh` checks x86_64, 16 CPUs, 64 GB RAM, at least 200 GB disk, 15% free space, Docker/buildx, Node 22 and Python 3.12. It pins LHTB and bundled Harbor, downloads the pinned MiniLM revision and runs the official oracle smoke. It never prunes Docker automatically.
 
-`run_lhtb_training.sh` samples and immediately updates each group, runs all eight dev tasks after every epoch, checkpoints every epoch and applies the locked dev selection rule. `run_lhtb_test.sh` restores official task timeouts and compares true single-agent direct, Roy heuristic and frozen learned Roy with three repeats. The report contains reward, success at 0.95, paired bootstrap intervals, token/time/topology/per-node-action metrics and failure records.
+`run_lhtb_training.sh` samples and immediately updates each group, runs all eight dev tasks after every epoch, checkpoints every epoch and applies the locked dev selection rule. `run_lhtb_test.sh` restores official task timeouts and compares true single-agent direct, Roy heuristic and frozen learned Roy with three repeats. The report contains official environment utility `u_env`, success at `u_env >= 0.95`, paired bootstrap intervals, token/time/topology/per-node-action metrics and failure records. Node-wise `R_t^MIA` is reported separately and is never interpreted as the benchmark success score.
 
 Generated trajectories, process states, semantic/model audits, Harbor results, checkpoints, Docker data and benchmark assets remain under ignored `research/output/` or the external LHTB checkout.
 

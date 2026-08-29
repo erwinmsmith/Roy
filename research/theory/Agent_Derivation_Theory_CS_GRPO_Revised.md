@@ -164,7 +164,7 @@ The previous complete-trajectory terminal-reward GRPO remains a named baseline. 
 
 The benchmark is `zli12321/LHTB` pinned with its bundled Harbor to commit `84d7ba5ee34fae6c11f0d7cb8ed5faa73a9ece54`. Its 46 tasks follow the pinned README's eight-category taxonomy. Within each category, fixed SHA-256 ordering selects one dev task and one test task; the remaining tasks form the 30-task train split. The checked manifest is `30 train / 8 dev / 8 test`, and the trainer rejects dev or test task IDs.
 
-Formal training uses four epochs, eight trajectories per train task and 960 rollouts total. Each training rollout may run for up to six hours, with concurrency four and a DeepSeek response ceiling of 32,768 tokens. These execution settings do not add structural reward or force an agent count. At each epoch boundary, learned Roy runs once on every dev task. Checkpoint selection maximizes dev mean reward, breaking ties by fewer tokens and earlier epoch.
+Formal training uses four epochs, eight trajectories per train task and 960 rollouts total. Each training rollout may run for up to six hours, with concurrency four and a DeepSeek response ceiling of 32,768 tokens. These execution settings do not add structural reward or force an agent count. At each epoch boundary, learned Roy runs once on every dev task. Checkpoint selection maximizes dev mean official environment utility, breaking ties by fewer tokens and earlier epoch.
 
 The selected checkpoint is tested once, with three repetitions, against:
 
@@ -172,7 +172,7 @@ The selected checkpoint is tested once, with three repetitions, against:
 - `roy_runtime_heuristic`: the same recursive runtime controlled by the compatibility heuristic;
 - `learned_information_realization`: the learned six-action shared recursive Controller.
 
-Report mean reward, success rate at `R >= 0.95`, paired bootstrap 95% confidence intervals, tokens, time, nodes, DAG structure, waits, communication edges, action distributions and failures. An interval crossing zero is reported as inconclusive. After freezing the selected model, τ³ is used only for smoke and held-out zero-shot transfer, with no benchmark-specific update.
+Report mean `u_env`, success rate at `u_env >= 0.95`, paired bootstrap 95% confidence intervals, tokens, time, nodes, DAG structure, waits, communication edges, action distributions and failures. Report `R_t^MIA` distributions separately as process-credit diagnostics; they do not define task success. An interval crossing zero is reported as inconclusive. After freezing the selected model, τ³ is used only for smoke and held-out zero-shot transfer, with no benchmark-specific update.
 
 ## 8. Training and recovery invariants
 
