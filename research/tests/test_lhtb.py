@@ -623,6 +623,7 @@ for line in sys.stdin:
                 environment_backend="native",
                 native_runtime_root=Path(directory) / "runtime",
                 native_template_root=Path(directory) / "templates",
+                dataset_path="/audit/finalize-overlay/tasks",
             )
             finalize_value = json.loads(finalize.read_text())
             self.assertEqual(finalize_value["agents"][0]["import_path"],
@@ -630,6 +631,8 @@ for line in sys.stdin:
             self.assertEqual(finalize_value["agents"][0]["model_name"],
                              "frozen/artifact-identity-a0-v1")
             self.assertEqual(finalize_value["agents"][0]["kwargs"], {})
+            self.assertEqual(finalize_value["datasets"][0]["path"],
+                             "/audit/finalize-overlay/tasks")
 
             safe = Path(directory) / "safe.json"
             write_harbor_group_config(

@@ -28,7 +28,8 @@ from .lhtb_experiment import build_training_schedule, disk_preflight, select_dev
 from .lhtb_training import LHTBProcessGRPOTrainer
 from .lhtb_nodewise import LHTBNodeWiseDeltaVTrainer, build_forced_finalize_label
 from .lhtb_results import (
-    import_harbor_group, official_lhtb_reward, sample_audit, validate_smoke,
+    import_harbor_group, official_lhtb_reward, official_lhtb_task_utility,
+    sample_audit, validate_smoke,
 )
 from .lhtb_native import (
     native_environment_digest,
@@ -382,6 +383,10 @@ def parser() -> argparse.ArgumentParser:
     lhtb_config.add_argument("--allow-network-degraded", action="store_true")
     lhtb_config.add_argument("--max-retries", type=int, default=2)
     lhtb_config.add_argument("--concurrency", type=int, default=4)
+    lhtb_config.add_argument(
+        "--dataset-path", default="./tasks",
+        help="Reviewed task dataset path; forced-finalize probes require a continue=false overlay",
+    )
 
     lhtb_dev = commands.add_parser(
         "lhtb-dev-metrics", help="Append checkpoint-selection metrics for one dev epoch"
@@ -525,7 +530,7 @@ def main(argv: List[str] | None = None) -> None:
         state = json.loads(args.state.read_text(encoding="utf-8"))
         harbor_results = [json.loads(path.read_text(encoding="utf-8"))
                           for path in args.harbor_result]
-        task_utilities = [official_lhtb_reward(value) for value in harbor_results]
+        task_utilities = [official_lhtb_task_utility(value) for value in harbor_results]
         verifier_provenance = [{
             "harbor_result_path": str(path.resolve()),
             "harbor_result_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
@@ -601,7 +606,7 @@ def main(argv: List[str] | None = None) -> None:
                                   args.official_timeout, args.environment_backend,
                                   args.native_runtime_root, args.native_template_root,
                                   args.allow_network_degraded, args.max_retries,
-                                  args.concurrency)
+                                  args.concurrency, args.dataset_path)
         print(json.dumps({"output": str(args.output), "task_id": args.task_id}))
     elif args.command == "lhtb-dev-metrics":
         records = [value for value in read_jsonl(args.trajectories)

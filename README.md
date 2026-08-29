@@ -174,7 +174,8 @@ organization_policy           shared actor invoked separately for each executing
 legal_action_mask             graph, dependency and environment preconditions
 global_epistemic_state        immutable M_0...M_T with terminal/tool side effects
 semantic_state_builder        DeepSeek labels; MiniLM top-8 candidate recall only
-terminal_reward_grpo          official LHTB final R with group-relative advantages
+terminal_utility_grpo         baseline using official LHTB U_T with group-relative advantages
+nodewise_derived_reward       main method: R_t = V_psi(S_t+1) - V_psi(S_t)
 ```
 
 The organization grammar is `DERIVE / ACQUIRE / CONNECT / EXECUTE / RETURN / PRUNE / STOP`. Agents are generated from residual requirements rather than selected from predefined roles. Training uses no teacher, no imitation warm start, no weighted multi-objective reward, no keyword matching and no forced agent-count/depth target.

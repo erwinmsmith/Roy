@@ -16,7 +16,13 @@ from .organization import LHTB_POLICY_INTERFACE_REVISION
 from .io import write_jsonl
 
 
-def official_lhtb_reward(result: Mapping[str, Any]) -> float:
+def official_lhtb_task_utility(result: Mapping[str, Any]) -> float:
+    """Read the benchmark's terminal utility U_T from a Harbor result.
+
+    Harbor calls this field ``reward``.  Within Roy's derivation theory it is
+    deliberately named task utility so it cannot be confused with the derived
+    node-wise reward R_t = V(S_{t+1}) - V(S_t).
+    """
     verifier = result.get("verifier_result") or {}
     rewards = verifier.get("rewards") if isinstance(verifier, Mapping) else None
     if not isinstance(rewards, Mapping) or not rewards:
@@ -29,8 +35,13 @@ def official_lhtb_reward(result: Mapping[str, Any]) -> float:
         raise ValueError(f"ambiguous official verifier rewards: {sorted(rewards)}")
     reward = float(value)
     if not 0.0 <= reward <= 1.0:
-        raise ValueError("official LHTB reward is outside [0,1]")
+        raise ValueError("official LHTB task utility is outside [0,1]")
     return reward
+
+
+def official_lhtb_reward(result: Mapping[str, Any]) -> float:
+    """Compatibility alias for the historical terminal-GRPO pipeline."""
+    return official_lhtb_task_utility(result)
 
 
 def import_harbor_group(

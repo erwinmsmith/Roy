@@ -190,6 +190,7 @@ def write_harbor_group_config(
     allow_network_degraded: bool = False,
     max_retries: int = 2,
     concurrency: int = CONCURRENCY,
+    dataset_path: str = "./tasks",
 ) -> None:
     if arm not in ("single_agent_direct", "roy_runtime_heuristic",
                    "learned_information_realization", "frozen_finalize_now"):
@@ -251,7 +252,7 @@ def write_harbor_group_config(
         "retry": {"max_retries": max_retries},
         "environment": environment,
         "agents": agents,
-        "datasets": [{"path": "./tasks", "task_names": [task_id]}],
+        "datasets": [{"path": dataset_path, "task_names": [task_id]}],
     }
     if not official_timeout and arm != "frozen_finalize_now":
         for agent in value["agents"]:
