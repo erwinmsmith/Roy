@@ -13,18 +13,22 @@ let organizationSeed = 20260820;
 
 async function dispatch(request: Request): Promise<unknown> {
   const params = request.params ?? {};
-  if (request.method === 'run') {
+  if (request.method === 'run' || request.method === 'initialize') {
     session = new RoyLHTBSession(String(params.trajectoryId), String(params.taskId),
       String(params.instruction), String(params.environmentRevision ?? 'lhtb-pinned'),
       (params.organizationMode ?? 'learned_information_realization') as LHTBSessionSnapshot['organizationMode'],
       String(params.initialSnapshotFingerprint ?? ''),
       Number(params.organizationSeed ?? 20260820));
     organizationSeed = session.organizationSeed;
+    if (request.method === 'initialize') {
+      return { status: 'ready', snapshot: session.snapshot() };
+    }
     controller ??= new LHTBAutonomousController();
     return controller.advance(session, organizationSeed++);
   }
   if (request.method === 'restore') {
     session = RoyLHTBSession.restore(params.snapshot as unknown as LHTBSessionSnapshot);
+    organizationSeed = session.organizationSeed;
     return { status: 'restored', snapshot: session.snapshot() };
   }
   if (!session) throw new Error('run or restore must initialize the LHTB session');
@@ -54,7 +58,23 @@ async function dispatch(request: Request): Promise<unknown> {
     controller ??= new LHTBAutonomousController();
     return controller.advance(session, organizationSeed++);
   }
-  if (request.method === 'advance') {
+  if (request.method === 'resume_boundary') {
+    const before = session.snapshot().pendingTerminalRequest;
+    const result = params.result as unknown as TerminalResult;
+    session.acceptTerminalResult(result);
+    if (!before) throw new Error('resume_boundary has no pending terminal request');
+    if (before.organizationActionKind === 'EXECUTE') {
+      session.applyOrganizationAction({ kind: 'EXECUTE', actorNodeId: before.nodeId });
+    } else {
+      session.applyOrganizationAction({ kind: 'ACQUIRE', actorNodeId: before.nodeId,
+        observation: { id: `observation-${before.id}`, sourceType: 'environment',
+          queryOrAction: before.command,
+          observation: `${result.stdout}${result.stderr}`,
+          provenance: `harbor:${before.id}:exit-${result.exitCode}`, supports: [] } });
+    }
+    return { status: 'ready', snapshot: session.snapshot() };
+  }
+  if (request.method === 'advance' || request.method === 'advance_one') {
     controller ??= new LHTBAutonomousController();
     return controller.advance(session, organizationSeed++);
   }

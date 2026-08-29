@@ -428,3 +428,161 @@ class FrozenFinalizeNowAgent(BaseAgent):
             "structural_actions": 0,
             "terminal_commands": 0,
         }
+
+
+class NodewiseCheckpointFinalizeAgent(BaseAgent):
+    """Capture S_t or execute exactly one node macro-action before verification.
+
+    A zero-step run materializes an auditable base checkpoint.  A one-step run
+    restores that exact checkpoint and Roy session, samples one action for the
+    scheduler-selected context node, completes only that action's terminal
+    side effect (if any), then stops.  Harbor's verifier supplies U_T for the
+    resulting state; it does not supply the derived reward R_t.
+    """
+
+    SUPPORTS_ATIF = False
+
+    def __init__(
+        self, *args: Any, macro_steps: int,
+        output_snapshot_path: str, output_state_path: str,
+        output_checkpoint_path: str,
+        source_snapshot_path: str | None = None,
+        source_checkpoint_path: str | None = None,
+        node_command: str | None = None, rpc_timeout: float = 720.0,
+        extra_env: Mapping[str, str] | None = None, **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        if macro_steps not in (0, 1):
+            raise ValueError("node-wise finalize permits exactly zero or one macro-action")
+        if bool(source_snapshot_path) != bool(source_checkpoint_path):
+            raise ValueError("source Roy snapshot and environment checkpoint must be paired")
+        if macro_steps == 1 and not source_snapshot_path:
+            raise ValueError("one-step node-wise finalize requires one exact source checkpoint")
+        self.macro_steps = macro_steps
+        self.output_snapshot_path = Path(output_snapshot_path).expanduser().resolve()
+        self.output_state_path = Path(output_state_path).expanduser().resolve()
+        self.output_checkpoint_path = Path(output_checkpoint_path).expanduser().resolve()
+        self.source_snapshot_path = (
+            Path(source_snapshot_path).expanduser().resolve() if source_snapshot_path else None
+        )
+        self.source_checkpoint_path = (
+            Path(source_checkpoint_path).expanduser().resolve()
+            if source_checkpoint_path else None
+        )
+        configured = node_command or os.environ.get(
+            "ROY_LHTB_NODE_COMMAND", "node dist/cli/LhtbAgent.js"
+        )
+        child_environment = dict(os.environ)
+        child_environment.update({str(key): str(value)
+                                  for key, value in (extra_env or {}).items()})
+        self.rpc = PersistentNodeRPC(
+            shlex.split(configured), timeout=rpc_timeout, environment=child_environment,
+            stderr_path=Path(self.logs_dir) / "nodewise-child-stderr.log",
+        )
+        self.environment: Any | None = None
+        atexit.register(self.close)
+
+    @staticmethod
+    def name() -> str:
+        return "roy-nodewise-checkpoint-finalize"
+
+    def version(self) -> str:
+        return "1"
+
+    async def setup(self, environment: Any) -> None:
+        self.environment = environment
+        if self.source_checkpoint_path is not None:
+            restore = getattr(environment, "restore_training_checkpoint", None)
+            if not callable(restore):
+                raise RuntimeError("node-wise source requires a clonable environment backend")
+            await restore(self.source_checkpoint_path)
+        self.rpc.start()
+
+    async def run(self, instruction: str, environment: Any, context: Any) -> None:
+        self.environment = environment
+        if self.source_snapshot_path is not None:
+            source_snapshot = json.loads(
+                self.source_snapshot_path.read_text(encoding="utf-8")
+            )
+            response = await asyncio.to_thread(
+                self.rpc.request, "restore", {"snapshot": source_snapshot}
+            )
+        else:
+            trajectory_id = str(uuid.uuid4())
+            response = await asyncio.to_thread(self.rpc.request, "initialize", {
+                "trajectoryId": trajectory_id,
+                "taskId": getattr(environment, "environment_name", "unknown"),
+                "instruction": instruction,
+                "environmentRevision": os.environ.get("LHTB_COMMIT", "pinned"),
+                "organizationMode": "learned_information_realization",
+                "organizationSeed": int(os.environ.get(
+                    "ROY_LHTB_ORGANIZATION_SEED", "20260820"
+                )),
+                "initialSnapshotFingerprint": os.environ.get(
+                    "ROY_LHTB_INITIAL_FINGERPRINT", ""
+                ),
+            })
+        base_snapshot = dict(response.get("snapshot") or {})
+        base_policy_count = len(base_snapshot.get("policyRecords") or [])
+        if self.macro_steps == 1:
+            response = await asyncio.to_thread(self.rpc.request, "advance_one", {})
+            if response.get("status") == "terminal_request":
+                request = dict(response["request"])
+                started = time.monotonic()
+                result = await environment.exec(
+                    str(request["command"]), cwd=request.get("cwd"),
+                    timeout_sec=max(1, int(float(request.get("timeoutMs", 120_000)) / 1000)),
+                )
+                response = await asyncio.to_thread(self.rpc.request, "resume_boundary", {
+                    "result": {
+                        "requestId": request["id"], "exitCode": result.return_code,
+                        "stdout": result.stdout or "", "stderr": result.stderr or "",
+                        "durationMs": int((time.monotonic() - started) * 1000),
+                        "fileChanges": [],
+                    },
+                })
+        snapshot = dict(response.get("snapshot") or self.rpc.last_snapshot or {})
+        states = list(snapshot.get("processStates") or [])
+        if not states:
+            raise RuntimeError("node-wise checkpoint has no process state")
+        policy_count = len(snapshot.get("policyRecords") or [])
+        if policy_count - base_policy_count != self.macro_steps:
+            raise RuntimeError("node-wise checkpoint did not execute exactly one policy action")
+        state = dict(states[-1])
+        fingerprint = str(state.get("fingerprint") or "")
+        if not fingerprint:
+            raise RuntimeError("node-wise process state has no immutable fingerprint")
+        self._write_json(self.output_snapshot_path, snapshot)
+        self._write_json(self.output_state_path, state)
+        checkpoint = getattr(environment, "create_training_checkpoint", None)
+        if not callable(checkpoint):
+            raise RuntimeError("node-wise output requires a clonable environment backend")
+        checkpoint_audit = await checkpoint(self.output_checkpoint_path, fingerprint)
+        usage = dict(state.get("usage") or {})
+        context.n_input_tokens = int(usage.get("inputTokens", 0))
+        context.n_output_tokens = int(usage.get("outputTokens", 0))
+        context.metadata = {
+            **(context.metadata or {}),
+            "nodewise_protocol": "same_checkpoint_single_node_macro_action_v1",
+            "macro_steps": self.macro_steps,
+            "derived_reward_emitted": False,
+            "task_utility_role": "value_supervision_only",
+            "state_fingerprint": fingerprint,
+            "session_snapshot_path": str(self.output_snapshot_path),
+            "process_state_path": str(self.output_state_path),
+            "environment_checkpoint_path": str(self.output_checkpoint_path),
+            "checkpoint_audit": dict(checkpoint_audit),
+        }
+
+    @staticmethod
+    def _write_json(path: Path, value: Mapping[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+
+    def close(self) -> None:
+        self.rpc.close()

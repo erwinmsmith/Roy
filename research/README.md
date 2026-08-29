@@ -6,6 +6,8 @@ The current method uses one shared six-action node-level Controller and a frozen
 
 Structural training compares `G=8` macro-actions cloned from the same node checkpoint. An independently trained `V_psi(S)` is supervised only by a fixed finalize-now readout scored by the official LHTB verifier. One frozen value revision supplies `Delta V = V_psi(S_next) - V_psi(S)` for the complete group, followed by group-relative clipped actor learning. This is counterfactual training data, not MCTS: inference directly samples one action per real node and does not use the value model or sibling outcomes. The earlier complete-trajectory terminal-score updater remains available as an explicit baseline and never shares groups with the node-wise updater.
 
+The implementation names the benchmark output `U_T`/`official_lhtb_task_utility`, never node reward. `nodewise_checkpoint_finalize` first captures an idle, service-free Roy session and native filesystem checkpoint. Each successor trial restores both identities, invokes the shared actor for exactly one scheduler-selected node, completes at most that macro-action's terminal side effect, stops before another policy decision, and lets the unchanged official verifier score the resulting artifact state. Only after `V_psi` is fitted from these forced-finalize utilities does Roy emit the theoretically derived `R_t = Delta V`; no task utility is copied into a step reward.
+
 ## Primary LHTB workflow
 
 LHTB and its bundled Harbor are pinned to commit `84d7ba5ee34fae6c11f0d7cb8ed5faa73a9ece54`. The checked [split manifest](config/lhtb_split.json) fixes all 46 official tasks to 30 train, 8 dev and 8 test records by per-category SHA-256 ordering. The trainer rejects dev/test IDs and stale policy revisions.

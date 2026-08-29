@@ -38,7 +38,8 @@ from roy_research.value_model import (
     update_ema,
 )
 from roy_research.harbor_agent import (
-    FrozenFinalizeNowAgent, PersistentNodeRPC, RoyHarborAgent,
+    FrozenFinalizeNowAgent, NodewiseCheckpointFinalizeAgent,
+    PersistentNodeRPC, RoyHarborAgent,
 )
 from roy_research.lhtb_experiment import (
     build_training_schedule,
@@ -634,6 +635,25 @@ for line in sys.stdin:
             self.assertEqual(finalize_value["datasets"][0]["path"],
                              "/audit/finalize-overlay/tasks")
 
+            nodewise = Path(directory) / "nodewise.json"
+            write_harbor_group_config(
+                nodewise, "task", Path(directory) / "nodewise-jobs",
+                "nodewise_checkpoint_finalize", "fingerprint", 1, attempts=1,
+                environment_backend="native",
+                native_runtime_root=Path(directory) / "runtime",
+                native_template_root=Path(directory) / "templates",
+                nodewise_macro_steps=0,
+                nodewise_output_snapshot=Path(directory) / "snapshot.json",
+                nodewise_output_state=Path(directory) / "state.json",
+                nodewise_output_checkpoint=Path(directory) / "checkpoint",
+            )
+            nodewise_value = json.loads(nodewise.read_text())
+            self.assertEqual(
+                nodewise_value["agents"][0]["import_path"],
+                "roy_research.harbor_agent:NodewiseCheckpointFinalizeAgent",
+            )
+            self.assertEqual(nodewise_value["agents"][0]["kwargs"]["macro_steps"], 0)
+
             safe = Path(directory) / "safe.json"
             write_harbor_group_config(
                 safe, "task", Path(directory) / "jobs", "learned_information_realization",
@@ -658,6 +678,73 @@ for line in sys.stdin:
         self.assertEqual(context.metadata["structural_actions"], 0)
         self.assertEqual(context.metadata["terminal_commands"], 0)
         self.assertEqual(FrozenFinalizeNowAgent.name(), "roy-frozen-finalize-now")
+
+    def test_nodewise_checkpoint_agent_executes_exactly_one_macro_action(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_snapshot = root / "source.json"
+            source_checkpoint = root / "source-checkpoint"
+            source_checkpoint.mkdir()
+            source_snapshot.write_text(json.dumps({
+                "processStates": [{"fingerprint": "m0", "usage": {}}],
+                "policyRecords": [],
+            }))
+            server = root / "server.py"
+            server.write_text("""import json, sys
+source = {'processStates': [{'fingerprint': 'm0', 'usage': {}}], 'policyRecords': []}
+pending = {'processStates': source['processStates'], 'policyRecords': [{'selectedAction': 'CONTINUE'}]}
+final = {'processStates': source['processStates'] + [{'fingerprint': 'm1', 'usage': {'inputTokens': 3, 'outputTokens': 2}}], 'policyRecords': pending['policyRecords']}
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request['method']
+    if method == 'restore': result = {'status': 'restored', 'snapshot': source}
+    elif method == 'advance_one': result = {'status': 'terminal_request', 'request': {'id': 'one', 'command': 'true', 'timeoutMs': 1000, 'nodeId': 'root'}, 'snapshot': pending}
+    elif method == 'resume_boundary': result = {'status': 'ready', 'snapshot': final}
+    else: result = {'status': 'shutdown'}
+    print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
+""", encoding="utf-8")
+
+            class Environment:
+                environment_name = "task"
+
+                def __init__(self) -> None:
+                    self.restored = None
+
+                async def restore_training_checkpoint(self, source: Path) -> dict:
+                    self.restored = source
+                    return {"restore_verified": True}
+
+                async def exec(self, command: str, **_: object) -> SimpleNamespace:
+                    self.assert_command = command
+                    return SimpleNamespace(return_code=0, stdout="ok", stderr="")
+
+                async def create_training_checkpoint(self, destination: Path,
+                                                     fingerprint: str) -> dict:
+                    destination.mkdir()
+                    return {"mode": "full_clone", "source_state_fingerprint": fingerprint}
+
+            environment = Environment()
+            agent = NodewiseCheckpointFinalizeAgent(
+                logs_dir=root / "logs", model_name="mock", macro_steps=1,
+                source_snapshot_path=str(source_snapshot),
+                source_checkpoint_path=str(source_checkpoint),
+                output_snapshot_path=str(root / "successor-snapshot.json"),
+                output_state_path=str(root / "successor-state.json"),
+                output_checkpoint_path=str(root / "successor-checkpoint"),
+                node_command=f"{sys.executable} -u {server}", rpc_timeout=2,
+            )
+            context = SimpleNamespace(metadata=None, n_input_tokens=0, n_output_tokens=0)
+            try:
+                asyncio.run(agent.setup(environment))
+                asyncio.run(agent.run("task", environment, context))
+            finally:
+                agent.close()
+            self.assertEqual(environment.restored, source_checkpoint.resolve())
+            self.assertEqual(json.loads((root / "successor-state.json").read_text())[
+                "fingerprint"], "m1")
+            self.assertEqual(context.metadata["macro_steps"], 1)
+            self.assertFalse(context.metadata["derived_reward_emitted"])
+            self.assertEqual(context.n_input_tokens, 3)
 
     def test_native_audit_is_fail_closed_and_uses_environment_digest(self) -> None:
         self.assertEqual(

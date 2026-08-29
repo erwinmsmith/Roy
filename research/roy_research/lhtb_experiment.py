@@ -191,9 +191,16 @@ def write_harbor_group_config(
     max_retries: int = 2,
     concurrency: int = CONCURRENCY,
     dataset_path: str = "./tasks",
+    nodewise_macro_steps: int | None = None,
+    nodewise_source_snapshot: Path | None = None,
+    nodewise_source_checkpoint: Path | None = None,
+    nodewise_output_snapshot: Path | None = None,
+    nodewise_output_state: Path | None = None,
+    nodewise_output_checkpoint: Path | None = None,
 ) -> None:
     if arm not in ("single_agent_direct", "roy_runtime_heuristic",
-                   "learned_information_realization", "frozen_finalize_now"):
+                   "learned_information_realization", "frozen_finalize_now",
+                   "nodewise_checkpoint_finalize"):
         raise ValueError(f"unknown LHTB arm {arm}")
     if environment_backend == "docker":
         environment = {"type": "docker", "force_build": False, "delete": True}
@@ -216,6 +223,18 @@ def write_harbor_group_config(
         raise ValueError("Harbor max_retries cannot be negative")
     if concurrency < 1:
         raise ValueError("Harbor concurrency must be positive")
+    if arm == "nodewise_checkpoint_finalize":
+        if attempts != 1:
+            raise ValueError("node-wise checkpoint finalize requires exactly one Harbor attempt")
+        if nodewise_macro_steps not in (0, 1):
+            raise ValueError("node-wise checkpoint finalize requires zero or one macro step")
+        if not all((nodewise_output_snapshot, nodewise_output_state,
+                    nodewise_output_checkpoint)):
+            raise ValueError("node-wise checkpoint finalize requires all output paths")
+        if bool(nodewise_source_snapshot) != bool(nodewise_source_checkpoint):
+            raise ValueError("node-wise source snapshot and checkpoint must be paired")
+        if nodewise_macro_steps == 1 and not nodewise_source_snapshot:
+            raise ValueError("one-step node-wise finalize requires a source checkpoint")
     def agent_config() -> Dict[str, Any]:
         if arm == "frozen_finalize_now":
             return {
@@ -223,6 +242,28 @@ def write_harbor_group_config(
                 "model_name": "frozen/artifact-identity-a0-v1",
                 "kwargs": {},
                 "env": {"ROY_LHTB_ENVIRONMENT_BACKEND": environment_backend},
+            }
+        if arm == "nodewise_checkpoint_finalize":
+            return {
+                "import_path": "roy_research.harbor_agent:NodewiseCheckpointFinalizeAgent",
+                "model_name": "deepseek/deepseek-v4-flash",
+                "kwargs": {
+                    "macro_steps": nodewise_macro_steps,
+                    "source_snapshot_path": (str(nodewise_source_snapshot)
+                                             if nodewise_source_snapshot else None),
+                    "source_checkpoint_path": (str(nodewise_source_checkpoint)
+                                               if nodewise_source_checkpoint else None),
+                    "output_snapshot_path": str(nodewise_output_snapshot),
+                    "output_state_path": str(nodewise_output_state),
+                    "output_checkpoint_path": str(nodewise_output_checkpoint),
+                    "rpc_timeout": 720,
+                },
+                "env": {
+                    "ROY_LHTB_ENVIRONMENT_BACKEND": environment_backend,
+                    "ROY_LHTB_ARM": "learned_information_realization",
+                    "ROY_LHTB_INITIAL_FINGERPRINT": initial_fingerprint,
+                    "ROY_LHTB_ORGANIZATION_SEED": str(organization_seed),
+                },
             }
         kwargs: Dict[str, Any] = {"rpc_timeout": 720}
         agent_env = {"ROY_LHTB_ARM": arm,

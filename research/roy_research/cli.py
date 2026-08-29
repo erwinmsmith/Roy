@@ -371,7 +371,8 @@ def parser() -> argparse.ArgumentParser:
     lhtb_config.add_argument("--task-id", required=True)
     lhtb_config.add_argument("--arm", choices=("single_agent_direct", "roy_runtime_heuristic",
                                                 "learned_information_realization",
-                                                "frozen_finalize_now"), required=True)
+                                                "frozen_finalize_now",
+                                                "nodewise_checkpoint_finalize"), required=True)
     lhtb_config.add_argument("--initial-fingerprint", required=True)
     lhtb_config.add_argument("--organization-seed", type=int, required=True)
     lhtb_config.add_argument("--attempts", type=int, default=8)
@@ -387,6 +388,12 @@ def parser() -> argparse.ArgumentParser:
         "--dataset-path", default="./tasks",
         help="Reviewed task dataset path; forced-finalize probes require a continue=false overlay",
     )
+    lhtb_config.add_argument("--nodewise-macro-steps", type=int, choices=(0, 1))
+    lhtb_config.add_argument("--nodewise-source-snapshot", type=Path)
+    lhtb_config.add_argument("--nodewise-source-checkpoint", type=Path)
+    lhtb_config.add_argument("--nodewise-output-snapshot", type=Path)
+    lhtb_config.add_argument("--nodewise-output-state", type=Path)
+    lhtb_config.add_argument("--nodewise-output-checkpoint", type=Path)
 
     lhtb_dev = commands.add_parser(
         "lhtb-dev-metrics", help="Append checkpoint-selection metrics for one dev epoch"
@@ -606,7 +613,13 @@ def main(argv: List[str] | None = None) -> None:
                                   args.official_timeout, args.environment_backend,
                                   args.native_runtime_root, args.native_template_root,
                                   args.allow_network_degraded, args.max_retries,
-                                  args.concurrency, args.dataset_path)
+                                  args.concurrency, args.dataset_path,
+                                  args.nodewise_macro_steps,
+                                  args.nodewise_source_snapshot,
+                                  args.nodewise_source_checkpoint,
+                                  args.nodewise_output_snapshot,
+                                  args.nodewise_output_state,
+                                  args.nodewise_output_checkpoint)
         print(json.dumps({"output": str(args.output), "task_id": args.task_id}))
     elif args.command == "lhtb-dev-metrics":
         records = [value for value in read_jsonl(args.trajectories)
