@@ -1169,6 +1169,16 @@ describe('LHTB process state', () => {
       const normalizedProviderShape = harness.validateCandidates(providerShaped, session);
       expect(normalizedProviderShape.candidates.map(value => value.id))
         .toContain('return-worker');
+      const providerClaimShape = structuredClone(response) as unknown as { candidates: Array<{
+        action: { report: typeof report & { claims: Array<Record<string, unknown>> } } }> };
+      providerClaimShape.candidates[0].action.report.claims = [{
+        id: 'provider-claim', statement: 'one verified finding', type: 'finding',
+        confidence: 0.8, provenance: 'worker',
+      }];
+      const normalizedClaim = harness.validateCandidates(providerClaimShape, session);
+      expect((normalizedClaim.candidates[0] as unknown as { action: { report: {
+        claims: Array<Record<string, unknown>> } } }).action.report.claims[0])
+        .toMatchObject({ status: 'tentative', originNodeId: 'worker' });
       const malformedResidual = structuredClone(response);
       malformedResidual.candidates[0].action.report.residualRequirements = [{} as never];
       const normalized = harness.validateCandidates(malformedResidual, session);

@@ -768,6 +768,46 @@ function normalizeReturnReportCollections(
     'blindSpots', 'residualRequirements', 'proposedChildren', 'informationToPropagate']) {
     if (!Array.isArray(report[field])) report[field] = [];
   }
+  const claimStatuses = new Set(['supported', 'tentative', 'rejected']);
+  report.claims = (report.claims as unknown[]).filter(item => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
+    const claim = item as Record<string, unknown>;
+    if (!['id', 'statement'].every(field =>
+      typeof claim[field] === 'string' && String(claim[field]).trim().length > 0)) return false;
+    // Providers commonly emit type/confidence/provenance fields even when the
+    // JSON prompt requests the runtime schema. Fill only missing structural
+    // provenance; an explicit conflicting origin remains invalid downstream.
+    if (typeof claim.originNodeId !== 'string' || !claim.originNodeId.trim()) {
+      claim.originNodeId = actorNodeId;
+    }
+    if (!claimStatuses.has(String(claim.status))) claim.status = 'tentative';
+    return true;
+  });
+  report.evidence = (report.evidence as unknown[]).filter(item => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
+    const evidence = item as Record<string, unknown>;
+    if (!['id', 'content', 'provenance'].every(field =>
+      typeof evidence[field] === 'string' && String(evidence[field]).trim().length > 0)) {
+      return false;
+    }
+    if (!Array.isArray(evidence.supports)) evidence.supports = [];
+    if (evidence.contradicts !== undefined && !Array.isArray(evidence.contradicts)) {
+      evidence.contradicts = [];
+    }
+    return true;
+  });
+  const assumptionStatuses = new Set(['verified', 'unverified', 'contradicted']);
+  report.assumptions = (report.assumptions as unknown[]).filter(item => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
+    const assumption = item as Record<string, unknown>;
+    if (!['id', 'statement'].every(field =>
+      typeof assumption[field] === 'string' && String(assumption[field]).trim().length > 0)) {
+      return false;
+    }
+    if (!assumptionStatuses.has(String(assumption.status))) assumption.status = 'unverified';
+    if (!Array.isArray(assumption.supportingEvidence)) assumption.supportingEvidence = [];
+    return true;
+  });
   const mechanisms = new Set(['acquisition', 'representation', 'conversion', 'mixed']);
   const statuses = new Set(['open', 'assigned', 'resolved', 'rejected']);
   report.residualRequirements = (report.residualRequirements as unknown[]).filter(item => {
