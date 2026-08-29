@@ -287,9 +287,48 @@ class NodeWiseDeltaVTests(unittest.TestCase):
                 set(range(100, 108)),
             )
 
+    def test_nodewise_import_accepts_isolated_nonrestorable_successor_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            digest = "sha256:service-environment"
+            base = root / "base"
+            self._write_nodewise_run(
+                base, "base-service", digest, 0.0, [], 10,
+                mode="deterministic_replay", restorable=True,
+            )
+            samples = root / "samples"
+            for index in range(8):
+                record = {
+                    "behaviorPolicy": "actor",
+                    "stateFingerprint": "base-service",
+                    "contextNodeId": "root",
+                    "candidateId": "controller:CONTINUE",
+                    "maskedOldLogProbability": -0.5,
+                    "selectedAction": "CONTINUE",
+                    "policyState": policy_state("base-service"),
+                }
+                self._write_nodewise_run(
+                    samples / f"sample-{index}", f"service-next-{index}",
+                    digest, 0.25, [record], 20 + index,
+                    mode=("isolated_instance_observation" if index == 0
+                          else "deterministic_replay"),
+                    restorable=index != 0,
+                )
+            labels, records = import_nodewise_macro_group(
+                base_run=base, samples_root=samples, group_id="service:g8",
+                task_id=self.task_id, split="train", epoch=0,
+                policy_revision=0, value_revision=0,
+                environment_digest=digest,
+            )
+            self.assertEqual(labels[1]["clone_provenance"]["mode"],
+                             "isolated_instance")
+            self.assertTrue(labels[1]["clone_provenance"]["complete"])
+            self.assertEqual(len(records), 8)
+
     def _write_nodewise_run(
         self, root: Path, fingerprint: str, digest: str, utility: float,
-        policy_records, seed: int,
+        policy_records, seed: int, *, mode: str = "full_clone",
+        restorable=None,
     ) -> None:
         artifacts = root / "artifacts"
         checkpoint = artifacts / "environment-checkpoint"
@@ -303,14 +342,17 @@ class NodeWiseDeltaVTests(unittest.TestCase):
             "processStates": [state],
             "policyRecords": policy_records,
         }))
-        (checkpoint / "checkpoint.json").write_text(json.dumps({
+        checkpoint_payload = {
             "complete": True,
-            "mode": "full_clone",
+            "mode": mode,
             "payload_digest": f"payload-{fingerprint}",
             "source_environment_digest": digest,
             "source_state_fingerprint": fingerprint,
             "task_id": self.task_id,
-        }))
+        }
+        if restorable is not None:
+            checkpoint_payload["restorable"] = restorable
+        (checkpoint / "checkpoint.json").write_text(json.dumps(checkpoint_payload))
         (trial / "result.json").write_text(json.dumps({
             "task_checksum": "task-sha",
             "exception_info": None,

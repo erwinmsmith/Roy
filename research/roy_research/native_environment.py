@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import shlex
@@ -208,18 +209,20 @@ class NativeProcessEnvironment(BaseEnvironment):
     async def create_training_checkpoint(
         self, destination: Path | str, source_state_fingerprint: str
     ) -> Mapping[str, Any]:
-        """Clone one idle, service-free native state for node-wise training.
+        """Record a restorable clone or an isolated non-restorable observation.
 
-        GPUHome cannot snapshot arbitrary process or service state. This method
-        therefore fails closed unless the reviewed task has no persistent
-        services and no task command is active at the control boundary.
+        Reviewed persistent services can be replayed only while still in their
+        deterministic initial state. After any task command may have mutated a
+        service, the filesystem and complete observation are retained for value
+        supervision, but the artifact is explicitly non-restorable.
         """
         if self.session_root is None or self._manifest is None:
             raise RuntimeError("native environment is not started")
-        if self._manifest.get("services") or self._service_audit:
-            raise RuntimeError("native checkpoint cannot clone persistent service state")
         if self._process_groups:
-            raise RuntimeError("native checkpoint requires an idle command boundary")
+            service_pids = {int(value.get("pid", -1)) for value in self._service_audit}
+            unexpected = self._process_groups - service_pids
+            if unexpected:
+                raise RuntimeError("native checkpoint requires an idle command boundary")
         target = Path(destination).expanduser().resolve()
         if target.exists():
             raise RuntimeError(f"refusing to overwrite native checkpoint {target}")
@@ -240,17 +243,35 @@ class NativeProcessEnvironment(BaseEnvironment):
                     "path": f"{name}/{value['path']}",
                 } for value in excluded)
         payload_digest = tree_digest(payload)
+        services = list(self._manifest.get("services") or [])
+        service_digest = hashlib.sha256(json.dumps(
+            services, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest() if services else None
+        service_state_touched = bool(services and self._exec_index > 0)
+        mode = (
+            "isolated_instance_observation" if service_state_touched
+            else "deterministic_replay" if services
+            else "full_clone"
+        )
         audit = {
             "schema_version": 1,
-            "mode": "full_clone",
+            "mode": mode,
             "complete": True,
+            "restorable": not service_state_touched,
             "task_id": self.native_task_id,
             "source_session_id": self.session_id,
             "source_state_fingerprint": source_state_fingerprint,
             "source_environment_digest": self.environment_digest,
             "payload_digest": payload_digest,
             "directories": list(names),
-            "services": [],
+            "services": [str(value.get("name")) for value in services],
+            "service_replay_digest": service_digest,
+            "service_state": (
+                "mutated_isolated_observation" if service_state_touched
+                else "initial_deterministic_replay" if services
+                else "absent"
+            ),
+            "exec_count_at_capture": self._exec_index,
             "excluded_special_files": excluded_special_files,
         }
         (target / "checkpoint.json").write_text(
@@ -261,10 +282,9 @@ class NativeProcessEnvironment(BaseEnvironment):
     async def restore_training_checkpoint(self, source: Path | str) -> Mapping[str, Any]:
         if self.session_root is None or self._manifest is None:
             raise RuntimeError("native environment is not started")
-        if self._manifest.get("services") or self._service_audit:
-            raise RuntimeError("native checkpoint cannot restore persistent service state")
-        if self._process_groups:
-            raise RuntimeError("native checkpoint restore requires an idle environment")
+        service_pids = {int(value.get("pid", -1)) for value in self._service_audit}
+        if self._process_groups - service_pids or self._exec_index != 0:
+            raise RuntimeError("native checkpoint restore requires a fresh idle environment")
         root = Path(source).expanduser().resolve(strict=True)
         manifest_path = root / "checkpoint.json"
         payload = root / "payload"
@@ -273,12 +293,22 @@ class NativeProcessEnvironment(BaseEnvironment):
         audit = json.loads(manifest_path.read_text(encoding="utf-8"))
         if audit.get("schema_version") != 1 or audit.get("complete") is not True:
             raise ValueError("unsupported or incomplete native training checkpoint")
-        if audit.get("mode") != "full_clone":
-            raise ValueError("native backend accepts only complete filesystem clones")
+        restorable = audit.get("restorable", audit.get("mode") == "full_clone")
+        if audit.get("mode") not in ("full_clone", "deterministic_replay") \
+                or restorable is not True:
+            raise ValueError("native backend accepts only restorable checkpoint states")
         if audit.get("task_id") != self.native_task_id:
             raise ValueError("native checkpoint belongs to another LHTB task")
         if audit.get("source_environment_digest") != self.environment_digest:
             raise ValueError("native checkpoint environment digest mismatch")
+        services = list(self._manifest.get("services") or [])
+        service_digest = hashlib.sha256(json.dumps(
+            services, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest() if services else None
+        if audit.get("service_replay_digest") != service_digest:
+            raise ValueError("native checkpoint service replay configuration mismatch")
+        if services and audit.get("service_state") != "initial_deterministic_replay":
+            raise ValueError("native checkpoint does not contain replayable service state")
         if audit.get("payload_digest") != tree_digest(payload):
             raise ValueError("native checkpoint payload digest mismatch")
         for name in audit.get("directories", []):

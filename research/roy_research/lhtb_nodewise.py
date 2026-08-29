@@ -134,7 +134,7 @@ def import_nodewise_macro_group(
     base_fingerprint = str(base_state.get("fingerprint") or "")
     if not base_fingerprint:
         raise ValueError("node-wise base state has no fingerprint")
-    _validate_nodewise_identity(base, task_id, environment_digest)
+    _validate_nodewise_identity(base, task_id, environment_digest, require_restorable=True)
 
     labels = [_nodewise_value_label(
         loaded=base,
@@ -156,7 +156,9 @@ def import_nodewise_macro_group(
     seeds: set[int] = set()
     for index, sample_dir in enumerate(sample_dirs):
         loaded = _load_nodewise_run(sample_dir)
-        _validate_nodewise_identity(loaded, task_id, environment_digest)
+        _validate_nodewise_identity(
+            loaded, task_id, environment_digest, require_restorable=False
+        )
         snapshot = loaded["snapshot"]
         policy_records = list(snapshot.get("policyRecords") or [])
         if len(policy_records) != base_policy_count + 1:
@@ -259,7 +261,8 @@ def _load_nodewise_run(path: Path) -> Dict[str, Any]:
 
 
 def _validate_nodewise_identity(
-    loaded: Mapping[str, Any], task_id: str, environment_digest: str
+    loaded: Mapping[str, Any], task_id: str, environment_digest: str,
+    *, require_restorable: bool,
 ) -> None:
     checkpoint = loaded["checkpoint"]
     state = loaded["state"]
@@ -270,6 +273,18 @@ def _validate_nodewise_identity(
         raise ValueError("node-wise checkpoint environment digest mismatch")
     if not checkpoint.get("complete"):
         raise ValueError("node-wise checkpoint is incomplete")
+    restorable = checkpoint.get(
+        "restorable", checkpoint.get("mode") == "full_clone"
+    )
+    if require_restorable and (
+        restorable is not True
+        or checkpoint.get("mode") not in ("full_clone", "deterministic_replay")
+    ):
+        raise ValueError("node-wise base checkpoint is not restorable")
+    if checkpoint.get("mode") not in (
+        "full_clone", "deterministic_replay", "isolated_instance_observation"
+    ):
+        raise ValueError("node-wise checkpoint has an unsupported capture mode")
     fingerprint = str(state.get("fingerprint") or "")
     if str(checkpoint.get("source_state_fingerprint") or "") != fingerprint:
         raise ValueError("node-wise checkpoint/state fingerprint mismatch")
@@ -295,7 +310,11 @@ def _nodewise_value_label(
         environment_digest=environment_digest,
         checkpoint_id=str(checkpoint.get("payload_digest") or ""),
         clone_provenance={
-            "mode": str(checkpoint.get("mode") or "full_clone"),
+            "mode": (
+                "isolated_instance"
+                if checkpoint.get("mode") == "isolated_instance_observation"
+                else str(checkpoint.get("mode") or "full_clone")
+            ),
             "complete": bool(checkpoint.get("complete")),
             "source_state_fingerprint": str(state["fingerprint"]),
             "source_environment_digest": environment_digest,
@@ -788,8 +807,12 @@ def _validate_clone_provenance(
 ) -> None:
     if not isinstance(value, Mapping) or value.get("complete") is not True:
         raise ValueError(f"{context} requires a complete checkpoint clone")
-    if value.get("mode") not in ("full_clone", "deterministic_replay"):
-        raise ValueError(f"{context} requires full clone or deterministic replay")
+    if value.get("mode") not in (
+        "full_clone", "deterministic_replay", "isolated_instance"
+    ):
+        raise ValueError(
+            f"{context} requires full clone, deterministic replay or isolated instance"
+        )
     if str(value.get("source_state_fingerprint", "")) != source_fingerprint:
         raise ValueError(f"{context} clone uses another source state")
     if str(value.get("source_environment_digest", "")) != environment_digest:

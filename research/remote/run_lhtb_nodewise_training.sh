@@ -221,11 +221,19 @@ committed = int(hashlib.sha256((group_id+":continuation").encode()).hexdigest()[
 chosen = None
 for offset in range(8):
     index = (committed + offset) % 8
-    state = json.load(open(root/f"sample-{index}"/"artifacts"/"state.json", encoding="utf-8"))
+    sample_root = root/f"sample-{index}"
+    state = json.load(open(sample_root/"artifacts"/"state.json", encoding="utf-8"))
+    checkpoint = json.load(open(
+        sample_root/"artifacts"/"environment-checkpoint"/"checkpoint.json",
+        encoding="utf-8",
+    ))
     active = list(state.get("activeSubtree") or [])
     statuses = {str(x.get("id")): str(x.get("status")) for x in state.get("nodes", [])}
     actionable = [node for node in active if statuses.get(str(node)) not in {"returned", "pruned", "failed"}]
-    if actionable:
+    restorable = checkpoint.get(
+        "restorable", checkpoint.get("mode") == "full_clone"
+    )
+    if actionable and restorable is True:
         chosen = (index, state, actionable, offset)
         break
 if chosen is None:
