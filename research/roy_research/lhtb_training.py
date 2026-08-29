@@ -48,17 +48,21 @@ class LHTBProcessGRPOTrainer:
         self._precache_group_text(records)
         group_id = str(records[0]["group_id"])
         rewards = [float(value["terminal_reward"]) for value in records]
-        reward_tensor = torch.tensor(rewards, dtype=torch.float32, device=self.device)
+        # Group statistics are computed in float64 so a constant decimal score
+        # (for example eight copies of 0.4) cannot acquire a machine-dependent
+        # float32 standard deviation and trigger a spurious actor update.
+        reward_tensor = torch.tensor(rewards, dtype=torch.float64, device=self.device)
         reward_mean = reward_tensor.mean()
         reward_std = reward_tensor.std(unbiased=False)
+        has_preference_signal = max(rewards) - min(rewards) > 1e-12
         trajectory_advantages = (
-            torch.zeros_like(reward_tensor) if float(reward_std) <= 1e-8
+            torch.zeros_like(reward_tensor) if not has_preference_signal
             else (reward_tensor - reward_mean) / (reward_std + 1e-8)
-        )
+        ).to(dtype=torch.float32)
 
         actor_updated = False
         actor_loss_value: float | None = None
-        if float(reward_std) > 1e-8:
+        if has_preference_signal:
             actor_updated = True
             actor_loss_value = self._update_actor(records, trajectory_advantages)
             self.actor_steps += 1
@@ -86,7 +90,7 @@ class LHTBProcessGRPOTrainer:
             "actor_skip_reason": None if actor_updated
             else "zero_official_terminal_reward_variance",
             "actor_loss": actor_loss_value,
-            "terminal_reward_std": float(torch.tensor(rewards).std(unbiased=False)),
+            "terminal_reward_std": float(reward_std.detach().cpu()),
             "terminal_reward_mean": float(reward_mean.detach().cpu()),
             "trajectory_advantages": trajectory_advantages.detach().cpu().tolist(),
             "reward_source": "official_lhtb_terminal_verifier_only",
