@@ -8,6 +8,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - formal runner uses Python 3.12.
@@ -22,6 +23,16 @@ from .lhtb import LHTB_COMMIT, load_lhtb_manifest
 NATIVE_SCHEMA_VERSION = 1
 NATIVE_BACKEND_ID = "lhtb-native-process-v1"
 NATIVE_SOURCE_TASK_MARKER = ".roy-native-source-task"
+
+
+def _runtime_write_probe(runtime_root: Path) -> None:
+    """Verify write access without a cross-trial fixed-name race."""
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=runtime_root,
+        prefix=".write-probe-", delete=True,
+    ) as probe:
+        probe.write("ok")
+        probe.flush()
 
 
 def native_proot_launcher_environment(
@@ -315,9 +326,7 @@ def native_preflight(runtime_root: Path, *, task_gid: int = 210000) -> Dict[str,
             + traversal.stderr.strip()
         )
     result["runtime_traversal_acl"] = "parent-execute-only"
-    probe = runtime_root / ".write-probe"
-    probe.write_text("ok", encoding="utf-8")
-    probe.unlink()
+    _runtime_write_probe(runtime_root)
     return result
 
 

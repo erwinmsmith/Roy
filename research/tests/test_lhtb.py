@@ -7,6 +7,7 @@ import unittest
 import sys
 import asyncio
 import time
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
@@ -61,6 +62,7 @@ from roy_research.lhtb_training import (
     LHTBProcessGRPOTrainer,
 )
 from roy_research.lhtb_native import (
+    _runtime_write_probe,
     audit_native_tasks,
     native_task_id_from_harbor,
     native_environment_digest,
@@ -670,6 +672,15 @@ for line in sys.stdin:
             trusted = f"PROOT_TMP_DIR={root / 'tmp'}"
             self.assertIn(trusted, values)
             self.assertNotIn("PROOT_TMP_DIR=/untrusted", values)
+
+    def test_native_write_probe_is_safe_under_concurrent_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futures = [pool.submit(_runtime_write_probe, root) for _ in range(32)]
+                for future in futures:
+                    future.result()
+            self.assertEqual(list(root.glob(".write-probe-*")), [])
 
     def test_frozen_finalize_agent_performs_no_action(self) -> None:
         agent = FrozenFinalizeNowAgent.__new__(FrozenFinalizeNowAgent)
