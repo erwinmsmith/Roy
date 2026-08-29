@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +9,7 @@ from pathlib import Path
 import torch
 
 from roy_research.lhtb import build_lhtb_split
+from roy_research.cli import main as research_cli_main
 from roy_research.lhtb_nodewise import (
     LHTBNodeWiseDeltaVTrainer,
     NODEWISE_ALGORITHM_REVISION,
@@ -108,6 +110,30 @@ class NodeWiseDeltaVTests(unittest.TestCase):
         self.assertEqual(label["finalizer_policy"],
                          "frozen_finalize_now_no_structural_actions")
         self.assertEqual(label["state_fingerprint"], "m3")
+
+    def test_finalize_label_cli_hashes_official_harbor_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_path = root / "state.json"
+            result_path = root / "result.json"
+            output = root / "labels.jsonl"
+            state_path.write_text(json.dumps(process_state("m-cli")))
+            result_path.write_text(json.dumps({
+                "verifier_result": {"rewards": {"reward": 0.625}},
+            }))
+            research_cli_main([
+                "lhtb-finalize-label", "--state", str(state_path),
+                "--output", str(output), "--label-id", "cli-label",
+                "--task-id", self.task_id, "--split", "train",
+                "--checkpoint-id", "checkpoint-cli",
+                "--finalizer-revision", "frozen-a0", "--task-checksum", "task-sha",
+                "--environment-digest", "sha256:environment",
+                "--clone-mode", "full_clone", "--clone-audit-id", "clone-cli",
+                "--harbor-result", str(result_path), "--sample-seed", "7",
+            ])
+            label = json.loads(output.read_text())
+            self.assertEqual(label["value_target"], 0.625)
+            self.assertEqual(len(label["samples"][0]["harbor_result_sha256"]), 64)
 
     def test_value_update_rejects_non_official_or_non_frozen_labels(self):
         with tempfile.TemporaryDirectory() as directory:
