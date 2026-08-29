@@ -23,6 +23,7 @@ NODEWISE_ALGORITHM_REVISION = "forced-finalize-delta-v-nodewise-grpo-v1"
 FINALIZE_LABEL_SCHEMA_VERSION = 1
 MACRO_GROUP_SCHEMA_VERSION = 1
 NODEWISE_GROUP_SIZE = 8
+MIA_REWARD_DEFINITION = "R_t^MIA=V_psi(S_t+1)-V_psi(S_t)"
 MACRO_BOUNDARIES = {
     "worker_phase_complete",
     "external_observation_recorded",
@@ -93,7 +94,8 @@ def build_forced_finalize_label(
         "environment_digest": environment_digest,
         "clone_provenance": dict(clone_provenance),
         "samples": [
-            {"seed": int(seed), "official_lhtb_task_utility": utility,
+            {"seed": int(seed), "environment_utility": utility,
+             "official_lhtb_task_utility": utility,
              **dict(provenance)}
             for seed, utility, provenance in zip(seeds, normalized, verifier_provenance)
         ],
@@ -211,13 +213,13 @@ class LHTBNodeWiseDeltaVTrainer:
             values = self._value_predictions([base_state, *successor_states])
         base_value = float(values[0].detach().cpu())
         successor_values = values[1:]
-        delta = successor_values - values[0]
-        deviation = delta.std(unbiased=False)
-        has_signal = float(delta.max() - delta.min()) > 1e-12
+        mia_rewards = successor_values - values[0]
+        deviation = mia_rewards.std(unbiased=False)
+        has_signal = float(mia_rewards.max() - mia_rewards.min()) > 1e-12
         advantages = (
-            torch.zeros_like(delta)
+            torch.zeros_like(mia_rewards)
             if not has_signal
-            else (delta - delta.mean()) / (deviation + 1e-8)
+            else (mia_rewards - mia_rewards.mean()) / (deviation + 1e-8)
         ).detach()
         actor_updated = False
         actor_loss: float | None = None
@@ -254,9 +256,18 @@ class LHTBNodeWiseDeltaVTrainer:
             "value_frozen_during_group": True,
             "base_value": base_value,
             "successor_values": [float(value.detach().cpu()) for value in successor_values],
-            "derived_process_rewards": [float(value.detach().cpu()) for value in delta],
+            "mia_rewards": [float(value.detach().cpu()) for value in mia_rewards],
+            # Historical audit alias. New consumers must use ``mia_rewards``.
+            "derived_process_rewards": [
+                float(value.detach().cpu()) for value in mia_rewards
+            ],
             "advantages": [float(value.detach().cpu()) for value in advantages],
             "actions": [str(value["selected_action"]) for value in records],
+            "mia_reward_definition": MIA_REWARD_DEFINITION,
+            "mia_reward_source": "frozen_forced_finalize_state_value_increment",
+            "environment_utility_role": "value_supervision_and_evaluation_only",
+            "environment_utility_used_by_actor": False,
+            # Compatibility metadata for already-collected experiment readers.
             "derived_reward_definition": "V_psi(S_next)-V_psi(S_base)",
             "derived_reward_source": "frozen_forced_finalize_state_value_increment",
             "task_utility_source": "official_lhtb_verifier_for_value_supervision_only",
@@ -276,8 +287,15 @@ class LHTBNodeWiseDeltaVTrainer:
             "value_revision": self.value_revision,
             "actor_steps": self.actor_steps,
             "value_steps": self.value_steps,
+            "value_supervision_available": bool(
+                self.value_revision > 0 and self.used_value_label_ids
+            ),
             "training_protocol": "same_state_macro_action_delta_v_grpo_no_mcts",
             "value_label_protocol": "frozen_finalize_now_official_lhtb_task_utility",
+            "mia_reward_definition": MIA_REWARD_DEFINITION,
+            "environment_utility_symbol": "u_env",
+            "environment_utility_role": "value_supervision_and_evaluation_only",
+            "environment_utility_used_by_actor": False,
             "derived_reward_definition": "R_t=V_psi(S_t+1)-V_psi(S_t)",
             "inference_protocol": "shared_actor_per_actual_node_without_value_or_search",
             "controller_action_space": list(ORGANIZATION_ACTIONS),
@@ -347,7 +365,10 @@ class LHTBNodeWiseDeltaVTrainer:
             samples = value.get("samples")
             if not isinstance(samples, Sequence) or len(samples) != int(value.get("k", 0)):
                 raise ValueError("forced-finalize label is missing its K verifier probes")
-            scores = [float(sample.get("official_lhtb_task_utility", -1))
+            scores = [float(sample.get(
+                "environment_utility",
+                sample.get("official_lhtb_task_utility", -1),
+            ))
                       for sample in samples if isinstance(sample, Mapping)]
             if len(scores) != len(samples) or any(not 0.0 <= score <= 1.0 for score in scores):
                 raise ValueError("forced-finalize probes require legal official task utilities")
@@ -362,6 +383,10 @@ class LHTBNodeWiseDeltaVTrainer:
     def _validate_macro_group(self, records: Sequence[Mapping[str, Any]]) -> str:
         if len(records) != NODEWISE_GROUP_SIZE:
             raise ValueError("node-wise GRPO requires exactly G=8 macro-action outcomes")
+        if self.value_revision <= 0 or not self.used_value_label_ids:
+            raise ValueError(
+                "node-wise GRPO requires a forced-finalize-trained V_psi revision"
+            )
         group_ids = {str(value.get("group_id", "")) for value in records}
         if len(group_ids) != 1 or "" in group_ids:
             raise ValueError("macro-action outcomes must share one group ID")

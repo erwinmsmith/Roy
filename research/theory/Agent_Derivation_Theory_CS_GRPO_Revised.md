@@ -14,7 +14,7 @@ S_t  fidelity of the distributed representation of that information,
 G_t  conversion of represented information into a useful output.
 ```
 
-The operational target is terminal task utility, used as the benchmark estimator of information realization:
+The terminal objective is task utility, used as the benchmark estimator of information realization:
 
 ```text
 J(tau) = U_T(Y, Y_hat_terminal)
@@ -24,7 +24,20 @@ maximize_pi  E[tau ~ pi][J(tau)]
 
 Agent count, depth, latency, token use, tool calls, topology complexity, communication, rationality and redundancy are never added to `J`. Roy does not impose a learned node-count, depth, or total-token preference. Benchmark timeouts, unavailable actions, Docker isolation and provider safety controls remain operational execution conditions, not theoretical reward terms or artificial structural ceilings.
 
-MIA supplies the information-processing interpretation and its data-processing/information-preservation bounds; it does not license an independently scaled proxy reward. Adjacent changes in acquisition, representation, uncertainty, coverage or conversion may be logged and estimated for mechanism analysis, but an estimated `Delta Phi` is neither added to the LHTB score nor substituted for it in the main GRPO objective. This avoids the dimensionally invalid weighted objective rejected by the original derivation. Any future information estimator is evaluated by whether it predicts or explains terminal utility, not treated as ground-truth information creation.
+MIA supplies the information-processing interpretation and its data-processing/information-preservation bounds; it does not license an independently scaled proxy reward. The theoretical realizable information value of state `S` is
+
+```text
+Psi(S) = I(Y; Y_hat_S)
+       = I(Y; Z_base_S) GL(S).
+```
+
+The structural reward derived from this single potential is therefore
+
+```text
+R_t^MIA = Psi(S_t+1) - Psi(S_t).
+```
+
+In natural-language Agent traces these mutual-information terms are not treated as directly measurable empirical quantities. Roy operationalizes `Psi` with the realizable task-value estimator `V_psi` defined in Section 6, giving `R_t^MIA = Delta V_psi`. Adjacent changes in acquisition, representation, uncertainty, coverage or conversion may still be logged for mechanism analysis, but an independently estimated `Delta Phi` is neither added to `R_t^MIA` nor substituted for it. This avoids the dimensionally invalid weighted objective rejected by the original derivation. Any future information estimator is evaluated by whether it predicts or explains realizable task value, not treated as ground-truth information creation.
 
 ## 2. State and information flow
 
@@ -124,11 +137,11 @@ Every label records the state fingerprint, task checksum, environment digest, fi
 
 At a real decision checkpoint `S_t` for node `i`, Roy samples `G=8` structural actions directly from the current masked actor. The complete checkpoint is cloned eight times. Each sampled action is executed to the next meaningful SMDP control boundary: one Worker phase or external observation for `CONTINUE`/derivation, report integration for `RETURN`, actual branch removal for `PRUNE`, or official verification for `FINISH`. Merely creating an idle child is not a completed macro-action. All outcomes share the same task, base fingerprint, context node, actor revision, frozen value revision, Runtime configuration and environment digest; only the actor sampling seed and selected macro-action outcome differ.
 
-The single derived process reward is:
+The single derived MIA process reward is:
 
 ```text
-r_t,g = V_psi(S_t+1,g) - V_psi(S_t).
-A_t,g = (r_t,g - mean_h r_t,h) / (std_h r_t,h + epsilon).
+R_t,g^MIA = V_psi(S_t+1,g) - V_psi(S_t).
+A_t,g = (R_t,g^MIA - mean_h R_t,h^MIA) / (std_h R_t,h^MIA + epsilon).
 ```
 
 The value model is frozen throughout the group. The Controller update uses the exact saved masked probability:
@@ -145,7 +158,7 @@ This is same-state node-wise GRPO, not MCTS: there is no tree policy, PUCT, valu
 
 The previous complete-trajectory terminal-reward GRPO remains a named baseline. It computes one relative advantage from eight official final scores and assigns it to every node decision in a trajectory. It must not be mixed with node-wise records or presented as the derived process-credit algorithm. Since `sum_t Delta V_t` telescopes, collapsing node-wise increments back into one trajectory scalar would remove the intended credit-assignment benefit.
 
-`V_psi` is periodically refreshed from newly sampled on-policy states, but never inside an actor group. Dev/test snapshots never train either model. Final benchmark evaluation ignores `V_psi` and reports only the independent official LHTB task utility `U_T`, preventing self-reward circularity. `U_T` must not be denoted by the node-wise reward symbol `R_t`. There is no teacher, imitation, predefined role pool, MCTS, entropy bonus, cost penalty, topology bonus or weighted reward sum.
+`V_psi` is periodically refreshed from newly sampled on-policy states, but never inside an actor group. Dev/test snapshots never train either model. Final benchmark evaluation ignores `V_psi` and reports only the independent official LHTB environment utility `u_env = U_T`, preventing self-reward circularity. `u_env` supervises `V_psi` through frozen finalize-now probes but is never copied into the node-wise actor reward `R_t^MIA`. There is no teacher, imitation, predefined role pool, MCTS, entropy bonus, cost penalty, topology bonus or weighted reward sum.
 
 ## 7. LHTB protocol and evaluation
 

@@ -12,6 +12,7 @@ from roy_research.lhtb import build_lhtb_split
 from roy_research.cli import main as research_cli_main
 from roy_research.lhtb_nodewise import (
     LHTBNodeWiseDeltaVTrainer,
+    MIA_REWARD_DEFINITION,
     NODEWISE_ALGORITHM_REVISION,
     build_forced_finalize_label,
 )
@@ -110,6 +111,7 @@ class NodeWiseDeltaVTests(unittest.TestCase):
         self.assertEqual(label["finalizer_policy"],
                          "frozen_finalize_now_no_structural_actions")
         self.assertEqual(label["state_fingerprint"], "m3")
+        self.assertEqual(label["samples"][0]["environment_utility"], 0.2)
 
     def test_finalize_label_cli_hashes_official_harbor_result(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -167,6 +169,8 @@ class NodeWiseDeltaVTests(unittest.TestCase):
             trainer = LHTBNodeWiseDeltaVTrainer(
                 checkpoint, self.manifest, encoder=encoder
             )
+            trainer.value_revision = 1
+            trainer.used_value_label_ids.add("bootstrap-value-label")
             state = policy_state("shared-m4")
             records = []
             for index in range(8):
@@ -192,7 +196,7 @@ class NodeWiseDeltaVTests(unittest.TestCase):
                     "selected_action": actor_record["selected_action"],
                     "policy_record": actor_record,
                     "policy_revision": 0,
-                    "value_revision": 0,
+                    "value_revision": 1,
                     "macro_boundary": "worker_phase_complete",
                     "sampling_protocol": "same_state_direct_macro_action_no_mcts",
                     "task_checksum": "task-sha",
@@ -211,9 +215,12 @@ class NodeWiseDeltaVTests(unittest.TestCase):
             trainer._value_predictions = lambda _states: values.to(trainer.device)
             update = trainer.update_macro_group(records)
             self.assertTrue(update["actor_updated"])
-            self.assertEqual(update["value_revision"], 0)
+            self.assertEqual(update["value_revision"], 1)
             self.assertEqual(update["actor_revision"], 1)
             self.assertAlmostEqual(update["derived_process_rewards"][0], -0.15, places=6)
+            self.assertEqual(update["mia_rewards"], update["derived_process_rewards"])
+            self.assertEqual(update["mia_reward_definition"], MIA_REWARD_DEFINITION)
+            self.assertFalse(update["environment_utility_used_by_actor"])
             self.assertAlmostEqual(sum(update["advantages"]), 0.0, places=5)
             self.assertEqual(update["derived_reward_source"],
                              "frozen_forced_finalize_state_value_increment")
@@ -222,11 +229,19 @@ class NodeWiseDeltaVTests(unittest.TestCase):
                 checkpoint, self.manifest, encoder=encoder, resume=True
             )
             self.assertEqual(restored.actor_revision, 1)
-            self.assertEqual(restored.value_revision, 0)
+            self.assertEqual(restored.value_revision, 1)
             self.assertEqual(restored.metadata()["algorithm_revision"],
                              NODEWISE_ALGORITHM_REVISION)
             with self.assertRaisesRegex(ValueError, "already optimized"):
                 restored.update_macro_group(records)
+
+    def test_nodewise_group_rejects_untrained_constant_value(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trainer = LHTBNodeWiseDeltaVTrainer(
+                Path(directory) / "model.pt", self.manifest, encoder=FakeEncoder384()
+            )
+            with self.assertRaisesRegex(ValueError, "forced-finalize-trained"):
+                trainer.update_macro_group([{}] * 8)
 
 
 if __name__ == "__main__":
