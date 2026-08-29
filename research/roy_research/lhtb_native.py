@@ -127,6 +127,79 @@ def resolve_native_task_source(task_root: Path, task_id: str) -> Path:
     return source
 
 
+def write_native_finalize_overlay(
+    lhtb_root: Path,
+    manifest: Sequence[Mapping[str, Any]],
+    output_root: Path,
+) -> Dict[str, Any]:
+    """Create a complete control-only dataset for one-step forced finalization."""
+    source_tasks = lhtb_root.expanduser().resolve() / "tasks"
+    output_root = output_root.expanduser().resolve()
+    task_ids = sorted(str(value["task_id"]) for value in manifest)
+    if len(task_ids) != 46 or len(set(task_ids)) != 46:
+        raise ValueError("native finalize overlay requires the pinned 46-task manifest")
+    metadata_path = output_root / "overlay-manifest.json"
+    if metadata_path.is_file():
+        existing = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if (existing.get("lhtb_commit") != LHTB_COMMIT
+                or existing.get("task_ids") != task_ids):
+            raise ValueError("existing native finalize overlay has incompatible provenance")
+        for value in existing.get("tasks", []):
+            task_id = str(value["task_id"])
+            source = source_tasks / task_id
+            target = output_root / "tasks" / task_id
+            if tree_digest(source) != value.get("source_task_digest"):
+                raise ValueError(f"native finalize overlay source changed for {task_id}")
+            if _sha256_file(target / "task.toml") != value.get("overlay_task_toml_sha256"):
+                raise ValueError(f"native finalize overlay changed for {task_id}")
+        return existing
+    if output_root.exists() and any(output_root.iterdir()):
+        raise ValueError(f"refusing to overwrite non-empty finalize overlay {output_root}")
+
+    output_root.mkdir(parents=True, exist_ok=True)
+    output_tasks = output_root / "tasks"
+    output_tasks.mkdir()
+    records: list[dict[str, Any]] = []
+    needle = "continue_until_timeout = true"
+    for task_id in task_ids:
+        source = source_tasks / task_id
+        if not (source / "task.toml").is_file() or not (source / "environment").is_dir():
+            raise ValueError(f"pinned LHTB task is incomplete: {task_id}")
+        target = output_tasks / task_id
+        target.mkdir()
+        for entry in source.iterdir():
+            if entry.name != "task.toml":
+                (target / entry.name).symlink_to(
+                    entry.resolve(), target_is_directory=entry.is_dir()
+                )
+        text = (source / "task.toml").read_text(encoding="utf-8")
+        if text.count(needle) > 1:
+            raise ValueError(f"repeated continue_until_timeout in {task_id}")
+        modified = text.replace(needle, "continue_until_timeout = false")
+        (target / "task.toml").write_text(modified, encoding="utf-8")
+        (target / NATIVE_SOURCE_TASK_MARKER).write_text(
+            str(source.resolve()) + "\n", encoding="utf-8"
+        )
+        records.append({
+            "task_id": task_id,
+            "source_task_digest": tree_digest(source),
+            "source_task_toml_sha256": _sha256_file(source / "task.toml"),
+            "overlay_task_toml_sha256": _sha256_file(target / "task.toml"),
+            "continue_until_timeout_overridden": needle in text,
+        })
+    result = {
+        "schema_version": 1,
+        "purpose": "nodewise_forced_finalize_control_only",
+        "lhtb_commit": LHTB_COMMIT,
+        "task_ids": task_ids,
+        "tasks": records,
+    }
+    metadata_path.write_text(
+        json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return result
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:

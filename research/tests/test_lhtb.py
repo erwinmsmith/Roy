@@ -75,6 +75,7 @@ from roy_research.lhtb_native import (
     provision_native_task,
     resolve_native_task_source,
     tree_digest,
+    write_native_finalize_overlay,
 )
 from roy_research.organization_replay import (
     _categorical_action_log_probs,
@@ -944,6 +945,44 @@ for line in sys.stdin:
             )
             with self.assertRaisesRegex(ValueError, "invalid native source"):
                 resolve_native_task_source(overlay, "different")
+
+    def test_native_finalize_overlay_covers_all_pinned_tasks_idempotently(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lhtb = root / "LHTB"
+            manifest = []
+            for index in range(46):
+                task_id = f"fixture-{index:02d}"
+                source = lhtb / "tasks" / task_id
+                (source / "environment").mkdir(parents=True)
+                (source / "environment" / "Dockerfile").write_text(
+                    "FROM scratch\n", encoding="utf-8"
+                )
+                continuation = (
+                    "\ncontinue_until_timeout = true\n" if index % 2 else "\n"
+                )
+                (source / "task.toml").write_text(
+                    "[verifier]" + continuation, encoding="utf-8"
+                )
+                manifest.append({"task_id": task_id})
+            output = root / "overlay"
+            first = write_native_finalize_overlay(lhtb, manifest, output)
+            second = write_native_finalize_overlay(lhtb, manifest, output)
+            self.assertEqual(first, second)
+            self.assertEqual(len(first["task_ids"]), 46)
+            self.assertEqual(
+                len(list((output / "tasks").glob("*/task.toml"))), 46
+            )
+            modified = (output / "tasks" / "fixture-01" / "task.toml").read_text()
+            self.assertIn("continue_until_timeout = false", modified)
+            self.assertNotIn("continue_until_timeout = true", modified)
+            self.assertIn(
+                "continue_until_timeout = true",
+                (lhtb / "tasks" / "fixture-01" / "task.toml").read_text(),
+            )
+            self.assertTrue(
+                (output / "tasks" / "fixture-01" / "environment").is_symlink()
+            )
 
     def test_dev_selection_and_test_report_follow_locked_rules(self) -> None:
         dev = []

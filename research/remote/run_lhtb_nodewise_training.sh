@@ -19,7 +19,7 @@ model="${run_root}/checkpoints/current.pt"
 native_runtime_root="${ROY_LHTB_NATIVE_ROOT:-${HOME}/rivermind-data/lhtb-native/runtime}"
 native_template_root="${ROY_LHTB_NATIVE_TEMPLATE_ROOT:-${HOME}/rivermind-data/lhtb-native/templates}"
 native_audit="${ROY_LHTB_NATIVE_AUDIT:-${roy_root}/research/output/lhtb/native/audit.json}"
-dataset_path="${ROY_LHTB_DATASET_PATH:-${roy_root}/research/output/lhtb/native/oracle-overlays/roy-native-oracle-suite-20260824T045107Z/tasks}"
+dataset_path="${ROY_LHTB_DATASET_PATH:-}"
 parallelism="${ROY_LHTB_NODEWISE_CONCURRENCY:-4}"
 max_retries="${ROY_LHTB_MAX_ENV_RETRIES:-0}"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,8 +33,8 @@ load_deepseek_api_key "${roy_root}"
   echo "the prepared Roy research virtual environment is required" >&2
   exit 4
 }
-[[ -f "${native_audit}" && -d "${dataset_path}" ]] || {
-  echo "the reviewed native audit and frozen-finalize task overlay are required" >&2
+[[ -f "${native_audit}" ]] || {
+  echo "the reviewed native audit is required" >&2
   exit 4
 }
 [[ "$(git -C "${lhtb_root}" rev-parse HEAD)" == \
@@ -49,6 +49,16 @@ load_deepseek_api_key "${roy_root}"
 
 mkdir -p "${run_root}/checkpoints" "${run_root}/groups" "${run_root}/task-state"
 export PYTHONPATH="${roy_root}/research${PYTHONPATH:+:${PYTHONPATH}}"
+if [[ -z "${dataset_path}" ]]; then
+  overlay_root="${run_root}/dataset-overlay"
+  "${python_bin}" -m roy_research lhtb-native-finalize-overlay \
+    --lhtb-root "${lhtb_root}" --manifest "${manifest}" --output "${overlay_root}"
+  dataset_path="${overlay_root}/tasks"
+fi
+[[ -d "${dataset_path}" ]] || {
+  echo "the frozen-finalize task overlay is missing: ${dataset_path}" >&2
+  exit 4
+}
 export ROY_LHTB_ENVIRONMENT_BACKEND=native
 export ROY_LHTB_NODE_COMMAND="node ${roy_root}/dist/cli/LhtbAgent.js"
 export ROY_LHTB_POLICY_COMMAND="${python_bin} -m roy_research.lhtb_policy_server"

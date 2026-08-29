@@ -40,6 +40,7 @@ from .lhtb_native import (
     native_environment_digest,
     native_preflight,
     provision_native_task,
+    write_native_finalize_overlay,
     write_native_audit,
 )
 from .training import TRAINING_VARIANTS, evaluate_groups, train_groups
@@ -252,6 +253,14 @@ def parser() -> argparse.ArgumentParser:
     )
     native_digest.add_argument("--audit", type=Path, required=True)
     native_digest.add_argument("--task-id", required=True)
+
+    native_overlay = commands.add_parser(
+        "lhtb-native-finalize-overlay",
+        help="Create the pinned 46-task control-only forced-finalize dataset",
+    )
+    native_overlay.add_argument("--lhtb-root", type=Path, required=True)
+    native_overlay.add_argument("--manifest", type=Path, required=True)
+    native_overlay.add_argument("--output", type=Path, required=True)
 
     lhtb_schedule = commands.add_parser(
         "lhtb-schedule", help="Create the formal four-epoch, 960-rollout schedule"
@@ -502,6 +511,11 @@ def main(argv: List[str] | None = None) -> None:
     elif args.command == "lhtb-native-digest":
         audit = json.loads(args.audit.read_text(encoding="utf-8"))
         print(native_environment_digest(audit, args.task_id))
+    elif args.command == "lhtb-native-finalize-overlay":
+        result = write_native_finalize_overlay(
+            args.lhtb_root, load_lhtb_manifest(args.manifest), args.output
+        )
+        print(json.dumps({"output": str(args.output), "tasks": len(result["task_ids"])}))
     elif args.command == "lhtb-schedule":
         schedule = build_training_schedule(load_lhtb_manifest(args.manifest))
         write_json(args.output, {"schema_version": 1, "epochs": 4, "group_size": 8,
