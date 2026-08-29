@@ -89,7 +89,7 @@ class NodeWiseDeltaVTests(unittest.TestCase):
         state = process_state("m3", 2)
         label = build_forced_finalize_label(
             label_id="label-1", task_id=self.task_id, split="train",
-            process_state=state, scores=[0.2, 0.5, 0.8],
+            process_state=state, task_utilities=[0.2, 0.5, 0.8],
             finalizer_revision="frozen-a0", task_checksum="task-sha",
             environment_digest="sha256:environment", checkpoint_id="checkpoint-3",
             clone_provenance={"mode": "full_clone", "complete": True,
@@ -104,7 +104,7 @@ class NodeWiseDeltaVTests(unittest.TestCase):
             sample_seeds=[11, 12, 13],
         )
         self.assertAlmostEqual(label["value_target"], 0.5)
-        self.assertEqual(label["score_source"], "official_lhtb_verifier")
+        self.assertEqual(label["task_utility_source"], "official_lhtb_verifier")
         self.assertEqual(label["finalizer_policy"],
                          "frozen_finalize_now_no_structural_actions")
         self.assertEqual(label["state_fingerprint"], "m3")
@@ -116,7 +116,7 @@ class NodeWiseDeltaVTests(unittest.TestCase):
             )
             label = build_forced_finalize_label(
                 label_id="label-1", task_id=self.task_id, split="train",
-                process_state=process_state("m0"), scores=[0.4],
+                process_state=process_state("m0"), task_utilities=[0.4],
                 finalizer_revision="frozen-a0", task_checksum="task-sha",
                 environment_digest="sha256:environment", checkpoint_id="checkpoint-0",
                 clone_provenance={"mode": "deterministic_replay", "complete": True,
@@ -127,7 +127,7 @@ class NodeWiseDeltaVTests(unittest.TestCase):
                                       "harbor_result_sha256": "sha-result"}],
             )
             invalid = dict(label)
-            invalid["score_source"] = "learned_self_judge"
+            invalid["task_utility_source"] = "learned_self_judge"
             with self.assertRaisesRegex(ValueError, "official LHTB verifier"):
                 trainer.update_value([invalid], epochs=1)
             update = trainer.update_value([label], epochs=1)
@@ -187,10 +187,10 @@ class NodeWiseDeltaVTests(unittest.TestCase):
             self.assertTrue(update["actor_updated"])
             self.assertEqual(update["value_revision"], 0)
             self.assertEqual(update["actor_revision"], 1)
-            self.assertAlmostEqual(update["delta_v_rewards"][0], -0.15, places=6)
+            self.assertAlmostEqual(update["derived_process_rewards"][0], -0.15, places=6)
             self.assertAlmostEqual(sum(update["advantages"]), 0.0, places=5)
-            self.assertEqual(update["reward_source"],
-                             "frozen_forced_finalize_value_increment")
+            self.assertEqual(update["derived_reward_source"],
+                             "frozen_forced_finalize_state_value_increment")
 
             restored = LHTBNodeWiseDeltaVTrainer(
                 checkpoint, self.manifest, encoder=encoder, resume=True

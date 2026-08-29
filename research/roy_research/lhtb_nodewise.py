@@ -38,7 +38,7 @@ def build_forced_finalize_label(
     task_id: str,
     split: str,
     process_state: Mapping[str, Any],
-    scores: Sequence[float],
+    task_utilities: Sequence[float],
     finalizer_revision: str,
     task_checksum: str,
     environment_digest: str,
@@ -52,15 +52,16 @@ def build_forced_finalize_label(
     The fixed finalizer is allowed to read the supplied snapshot, but it may not
     perform another structural action.  Every score must come from the official
     LHTB verifier; no model score or epistemic feature is accepted as a label.
+    These values are task utilities U_T, not the derived Controller reward R_t.
     """
     if not label_id or not task_id or not checkpoint_id:
         raise ValueError("forced-finalize labels require stable IDs")
     fingerprint = str(process_state.get("fingerprint") or "")
     if not fingerprint:
         raise ValueError("forced-finalize state requires an immutable fingerprint")
-    if not scores:
+    if not task_utilities:
         raise ValueError("forced-finalize labels require at least one verifier score")
-    normalized = [float(value) for value in scores]
+    normalized = [float(value) for value in task_utilities]
     if any(not math.isfinite(value) or not 0.0 <= value <= 1.0 for value in normalized):
         raise ValueError("official LHTB forced-finalize scores must be in [0,1]")
     seeds = list(sample_seeds if sample_seeds is not None else range(len(normalized)))
@@ -87,13 +88,14 @@ def build_forced_finalize_label(
         "process_state": dict(process_state),
         "finalizer_revision": finalizer_revision,
         "finalizer_policy": "frozen_finalize_now_no_structural_actions",
-        "score_source": "official_lhtb_verifier",
+        "task_utility_source": "official_lhtb_verifier",
         "task_checksum": task_checksum,
         "environment_digest": environment_digest,
         "clone_provenance": dict(clone_provenance),
         "samples": [
-            {"seed": int(seed), "official_lhtb_reward": score, **dict(provenance)}
-            for seed, score, provenance in zip(seeds, normalized, verifier_provenance)
+            {"seed": int(seed), "official_lhtb_task_utility": utility,
+             **dict(provenance)}
+            for seed, utility, provenance in zip(seeds, normalized, verifier_provenance)
         ],
         "k": len(normalized),
         "value_target": sum(normalized) / len(normalized),
@@ -252,10 +254,12 @@ class LHTBNodeWiseDeltaVTrainer:
             "value_frozen_during_group": True,
             "base_value": base_value,
             "successor_values": [float(value.detach().cpu()) for value in successor_values],
-            "delta_v_rewards": [float(value.detach().cpu()) for value in delta],
+            "derived_process_rewards": [float(value.detach().cpu()) for value in delta],
             "advantages": [float(value.detach().cpu()) for value in advantages],
             "actions": [str(value["selected_action"]) for value in records],
-            "reward_source": "frozen_forced_finalize_value_increment",
+            "derived_reward_definition": "V_psi(S_next)-V_psi(S_base)",
+            "derived_reward_source": "frozen_forced_finalize_state_value_increment",
+            "task_utility_source": "official_lhtb_verifier_for_value_supervision_only",
         }
         self.history.append(result)
         self.save()
@@ -273,7 +277,8 @@ class LHTBNodeWiseDeltaVTrainer:
             "actor_steps": self.actor_steps,
             "value_steps": self.value_steps,
             "training_protocol": "same_state_macro_action_delta_v_grpo_no_mcts",
-            "value_label_protocol": "frozen_finalize_now_official_lhtb_verifier",
+            "value_label_protocol": "frozen_finalize_now_official_lhtb_task_utility",
+            "derived_reward_definition": "R_t=V_psi(S_t+1)-V_psi(S_t)",
             "inference_protocol": "shared_actor_per_actual_node_without_value_or_search",
             "controller_action_space": list(ORGANIZATION_ACTIONS),
             "updated_macro_group_ids": sorted(self.updated_macro_group_ids),
@@ -325,7 +330,7 @@ class LHTBNodeWiseDeltaVTrainer:
             require_training_task(str(value.get("task_id", "")), self.manifest)
             if value.get("benchmark") != "lhtb" or value.get("split") != "train":
                 raise ValueError("value learning accepts only LHTB train snapshots")
-            if value.get("score_source") != "official_lhtb_verifier":
+            if value.get("task_utility_source") != "official_lhtb_verifier":
                 raise ValueError("V(S) labels must come from the official LHTB verifier")
             if value.get("finalizer_policy") != "frozen_finalize_now_no_structural_actions":
                 raise ValueError("V(S) labels require the frozen finalize-now policy")
@@ -342,10 +347,10 @@ class LHTBNodeWiseDeltaVTrainer:
             samples = value.get("samples")
             if not isinstance(samples, Sequence) or len(samples) != int(value.get("k", 0)):
                 raise ValueError("forced-finalize label is missing its K verifier probes")
-            scores = [float(sample.get("official_lhtb_reward", -1))
+            scores = [float(sample.get("official_lhtb_task_utility", -1))
                       for sample in samples if isinstance(sample, Mapping)]
             if len(scores) != len(samples) or any(not 0.0 <= score <= 1.0 for score in scores):
-                raise ValueError("forced-finalize probes require legal official rewards")
+                raise ValueError("forced-finalize probes require legal official task utilities")
             if any(not str(sample.get("harbor_result_path", ""))
                    or not str(sample.get("harbor_result_sha256", ""))
                    for sample in samples if isinstance(sample, Mapping)):

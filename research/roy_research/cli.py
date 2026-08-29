@@ -524,14 +524,14 @@ def main(argv: List[str] | None = None) -> None:
         state = json.loads(args.state.read_text(encoding="utf-8"))
         harbor_results = [json.loads(path.read_text(encoding="utf-8"))
                           for path in args.harbor_result]
-        scores = [official_lhtb_reward(value) for value in harbor_results]
+        task_utilities = [official_lhtb_reward(value) for value in harbor_results]
         verifier_provenance = [{
             "harbor_result_path": str(path.resolve()),
             "harbor_result_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         } for path in args.harbor_result]
         label = build_forced_finalize_label(
             label_id=args.label_id, task_id=args.task_id, split=args.split,
-            process_state=state, scores=scores,
+            process_state=state, task_utilities=task_utilities,
             finalizer_revision=args.finalizer_revision,
             task_checksum=args.task_checksum,
             environment_digest=args.environment_digest,

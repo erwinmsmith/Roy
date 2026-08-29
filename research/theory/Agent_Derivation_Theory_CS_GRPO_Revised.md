@@ -145,7 +145,7 @@ This is same-state node-wise GRPO, not MCTS: there is no tree policy, PUCT, valu
 
 The previous complete-trajectory terminal-reward GRPO remains a named baseline. It computes one relative advantage from eight official final scores and assigns it to every node decision in a trajectory. It must not be mixed with node-wise records or presented as the derived process-credit algorithm. Since `sum_t Delta V_t` telescopes, collapsing node-wise increments back into one trajectory scalar would remove the intended credit-assignment benefit.
 
-`V_psi` is periodically refreshed from newly sampled on-policy states, but never inside an actor group. Dev/test snapshots never train either model. Final benchmark evaluation ignores `V_psi` and reports only the independent official LHTB verifier score, preventing self-reward circularity. There is no teacher, imitation, predefined role pool, MCTS, entropy bonus, cost penalty, topology bonus or weighted reward sum.
+`V_psi` is periodically refreshed from newly sampled on-policy states, but never inside an actor group. Dev/test snapshots never train either model. Final benchmark evaluation ignores `V_psi` and reports only the independent official LHTB task utility `U_T`, preventing self-reward circularity. `U_T` must not be denoted by the node-wise reward symbol `R_t`. There is no teacher, imitation, predefined role pool, MCTS, entropy bonus, cost penalty, topology bonus or weighted reward sum.
 
 ## 7. LHTB protocol and evaluation
 
