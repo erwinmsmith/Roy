@@ -805,6 +805,9 @@ export class LHTBAutonomousController {
     const snapshot = session.snapshot();
     if (snapshot.runtime.stopped) return { status: 'completed', snapshot };
     const requestState = compactEpistemicWorkingState(snapshot);
+    if (snapshot.organizationMode === 'learned_information_realization') {
+      return this.advanceLearnedController(session, snapshot, requestState, seed);
+    }
     const messages: LLMMessage[] = [
       { role: 'system', content: PROPOSER_PROMPT },
       { role: 'user', content: JSON.stringify(requestState) },
@@ -900,26 +903,9 @@ export class LHTBAutonomousController {
     }
     if (!completion || !validation) throw new Error('DeepSeek proposer did not return a completion');
     const candidates = validation.candidates;
-    let selected: ProposedCandidate;
-    let policyRecord: OrganizationPolicyRecord | undefined;
-    if (snapshot.organizationMode === 'learned_information_realization') {
-      if (!this.learnedPolicy) {
-        throw new Error('Learned mode requires ROY_LHTB_POLICY_COMMAND and has no heuristic fallback');
-      }
-      const controllerCandidates = this.structuralControllerCandidates(snapshot, candidates);
-      const policyState = this.policyState(snapshot, controllerCandidates);
-      const decision = await this.learnedPolicy.select(
-        policyState, controllerCandidates, seed
-      );
-      selected = this.workerPayloadForControllerAction(
-        decision.candidate.kind, candidates, completion.value.preferred_candidate_id
-      );
-      policyRecord = decision.record;
-      policyRecord.selectedSpawnMode = selected.action.childSpecification?.realizationMode;
-    } else {
-      selected = candidates.find(value => value.id === completion.value.preferred_candidate_id)
-        ?? candidates[0];
-    }
+    const policyRecord: OrganizationPolicyRecord | undefined = undefined;
+    const selected = candidates.find(value => value.id === completion.value.preferred_candidate_id)
+      ?? candidates[0];
     if (selected.kind === 'ACQUIRE' || selected.kind === 'EXECUTE') {
       if (!selected.command?.trim()) {
         throw new Error(`${selected.kind} candidate requires a terminal command`);
@@ -936,6 +922,141 @@ export class LHTBAutonomousController {
     const result = session.snapshot();
     return result.runtime.stopped ? { status: 'completed', snapshot: result }
       : { status: 'continue', snapshot: result };
+  }
+
+  private async advanceLearnedController(
+    session: RoyLHTBSession,
+    snapshot: ReturnType<RoyLHTBSession['snapshot']>,
+    requestState: Record<string, unknown>,
+    seed: number,
+  ): Promise<ControllerResult> {
+    if (!this.learnedPolicy) {
+      throw new Error('Learned mode requires ROY_LHTB_POLICY_COMMAND and has no heuristic fallback');
+    }
+    const controllerCandidates = this.legalStructuralControllerCandidates(snapshot);
+    const policyState = this.policyState(snapshot, controllerCandidates);
+    const decision = await this.learnedPolicy.select(policyState, controllerCandidates, seed);
+    const selected = await this.materializeWorkerPayload(
+      session, snapshot, requestState, decision.candidate.kind
+    );
+    decision.record.selectedSpawnMode = selected.action.childSpecification?.realizationMode;
+    if (selected.kind === 'ACQUIRE' || selected.kind === 'EXECUTE') {
+      if (!selected.command?.trim()) {
+        throw new Error(`${selected.kind} Worker payload requires a terminal command`);
+      }
+      const request = { id: `terminal-${snapshot.processStates.length}-${selected.id}`,
+        command: selected.command, cwd: selected.cwd, timeoutMs: selected.timeoutMs ?? 120_000,
+        nodeId: selected.actorNodeId, organizationActionKind: selected.kind };
+      session.requestTerminal(request);
+      session.recordPolicyDecision(decision.record);
+      return { status: 'terminal_request', request, snapshot: session.snapshot() };
+    }
+    session.applyOrganizationAction(selected.action);
+    session.recordPolicyDecision(decision.record);
+    const result = session.snapshot();
+    return result.runtime.stopped ? { status: 'completed', snapshot: result }
+      : { status: 'continue', snapshot: result };
+  }
+
+  /** Runtime legality only; frozen Worker preference must never define actor support. */
+  private legalStructuralControllerCandidates(
+    snapshot: ReturnType<RoyLHTBSession['snapshot']>
+  ): StructuralControllerCandidate[] {
+    const contextNodeId = scheduledOrganizationContextNode(snapshot);
+    const contextNode = snapshot.runtime.nodes.find(node => node.id === contextNodeId);
+    if (!contextNode) throw new Error(`Scheduler context node does not exist: ${contextNodeId}`);
+    const profile = activeTopologySamplingProfile(snapshot.organizationSeed);
+    const kinds: StructuralControllerActionKind[] = ['CONTINUE'];
+    const hasOpenLocalGap = snapshot.runtime.requirements.some(requirement =>
+      requirement.parentNodeId === contextNodeId && requirement.status === 'open');
+    if (hasOpenLocalGap && profile?.id !== 'single') {
+      kinds.push('DERIVE_INFO', 'DERIVE_ORG');
+    }
+    const prunable = snapshot.runtime.nodes.some(node => node.id !== snapshot.runtime.rootId
+      && !['returned', 'pruned', 'failed'].includes(node.status)
+      && !snapshot.runtime.dependencyEdges.some(edge => edge.producerId === node.id && !edge.resolved)
+      && !snapshot.runtime.derivationEdges.some(edge => edge.parentId === node.id
+        && snapshot.runtime.nodes.some(child => child.id === edge.childId
+          && !['returned', 'pruned', 'completed'].includes(child.status))));
+    if (prunable && profile?.id !== 'single') kinds.push('PRUNE');
+    const events = snapshot.runtimeEvents ?? snapshot.processStates.at(-1)?.runtimeEvents ?? [];
+    const externalChildNeedsResult = contextNodeId !== snapshot.runtime.rootId
+      && contextNode.specification?.realizationMode === 'acquire_external'
+      && !events.some(event => event.kind === 'terminal_result' && event.nodeId === contextNodeId);
+    if (contextNodeId !== snapshot.runtime.rootId && !externalChildNeedsResult) kinds.push('RETURN');
+    if (contextNodeId === snapshot.runtime.rootId
+      && !snapshot.runtime.dependencyEdges.some(edge => !edge.resolved)
+      && !this.verifierRetryNeedsProgress(snapshot)) kinds.push('FINISH');
+    return kinds.map(kind => ({ id: `controller:${kind}`, kind, actorNodeId: contextNodeId,
+      description: CONTROLLER_ACTION_DESCRIPTIONS[kind], schedulerComplexity: 0 }));
+  }
+
+  private async materializeWorkerPayload(
+    session: RoyLHTBSession,
+    snapshot: ReturnType<RoyLHTBSession['snapshot']>,
+    requestState: Record<string, unknown>,
+    selectedKind: StructuralControllerActionKind,
+  ): Promise<ProposedCandidate> {
+    if (selectedKind === 'FINISH') {
+      return { id: 'worker:finish-official-verifier', kind: 'STOP',
+        actorNodeId: snapshot.runtime.rootId,
+        description: 'Submit the current task environment to the official verifier',
+        schedulerComplexity: 0, action: { kind: 'STOP', actorNodeId: snapshot.runtime.rootId,
+          finalOutput: { status: 'submitted_to_official_verifier',
+            stateFingerprint: snapshot.processStates.at(-1)?.fingerprint } } };
+    }
+    const requiredRuntimeKinds: Record<Exclude<StructuralControllerActionKind, 'FINISH'>,
+      OrganizationCandidate['kind'][]> = {
+      CONTINUE: ['ACQUIRE', 'CONNECT', 'EXECUTE'],
+      DERIVE_INFO: ['DERIVE'], DERIVE_ORG: ['DERIVE'], PRUNE: ['PRUNE'], RETURN: ['RETURN'],
+    };
+    const selectedInstruction = `The shared Controller has already selected ${selectedKind}. `
+      + `Return concise Runtime payloads only for this selected category. Do not choose another `
+      + `Controller action. For DERIVE, realizationMode must be ${selectedKind === 'DERIVE_INFO'
+        ? 'acquire_external' : selectedKind === 'DERIVE_ORG' ? 'organize_knowledge' : 'unchanged'}.`;
+    const messages: LLMMessage[] = [{ role: 'system', content: PROPOSER_PROMPT },
+      { role: 'user', content: JSON.stringify({ ...requestState,
+        selectedControllerAction: selectedKind, selectedControllerInstruction: selectedInstruction }) }];
+    const attempts = Math.max(1, Number(process.env.ROY_LHTB_PROPOSAL_ATTEMPTS ?? 5));
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      let completion: LLMJSONCompletionResult<ProposalResponse>;
+      try {
+        completion = await this.provider.completeJSONWithUsage<ProposalResponse>(messages,
+          { temperature: 0, maxTokens: PROPOSER_RESPONSE_MAX_TOKENS,
+            thinking: { type: 'disabled' } });
+      } catch (error) {
+        if (!(error instanceof LLMJSONParseError)) throw error;
+        session.recordModelUsage(error.completion.usage?.inputTokens
+          ?? error.completion.usage?.promptTokens ?? 0,
+        error.completion.usage?.outputTokens
+          ?? error.completion.usage?.completionTokens ?? 0,
+        error.completion.model);
+        await this.auditProposalFailure(requestState, error, attempt);
+        if (attempt === attempts) {
+          throw new Error('sampling_invalid:worker_payload_json_malformed', { cause: error });
+        }
+        continue;
+      }
+      await this.auditProposal(requestState, completion);
+      session.recordModelUsage(completion.completion.usage?.inputTokens
+        ?? completion.completion.usage?.promptTokens ?? 0,
+      completion.completion.usage?.outputTokens
+        ?? completion.completion.usage?.completionTokens ?? 0,
+      completion.completion.model);
+      const validation = this.validateCandidates(completion.value, session);
+      await this.auditCandidateValidation(validation);
+      const matching = validation.candidates.filter(candidate =>
+        requiredRuntimeKinds[selectedKind].includes(candidate.kind)
+        && controllerActionForCandidate(candidate) === selectedKind);
+      const selected = matching.find(candidate =>
+        candidate.id === completion.value.preferred_candidate_id) ?? matching[0];
+      if (selected) return selected;
+      messages.splice(1, 1, { role: 'user', content: JSON.stringify({ ...requestState,
+        selectedControllerAction: selectedKind,
+        selectedControllerInstruction: `${selectedInstruction} The prior payload did not match `
+          + `${selectedKind} or failed Runtime legality. Return a fresh matching payload only.` }) });
+    }
+    throw new Error(`sampling_invalid:no_worker_payload_for:${selectedKind}`);
   }
 
   /** Collapse frozen-Worker payloads into one categorical option per Controller action. */
@@ -963,24 +1084,6 @@ export class LHTBAutonomousController {
       throw new Error(`sampling_invalid:no_legal_controller_action:${contextNodeId}`);
     }
     return result;
-  }
-
-  /**
-   * The trainable Controller chooses only a structural category.  The frozen
-   * Worker remains responsible for the concrete semantic payload within that
-   * category; temperature-zero Worker preference makes this handoff auditable
-   * and independent of the actor probability.
-   */
-  private workerPayloadForControllerAction(
-    kind: StructuralControllerActionKind,
-    candidates: ProposedCandidate[],
-    preferredCandidateId: string
-  ): ProposedCandidate {
-    const available = candidates.filter(candidate => controllerActionForCandidate(candidate) === kind);
-    const selected = available.find(candidate => candidate.id === preferredCandidateId)
-      ?? available[0];
-    if (!selected) throw new Error(`Frozen Worker supplied no payload for ${kind}`);
-    return selected;
   }
 
   close(): void {

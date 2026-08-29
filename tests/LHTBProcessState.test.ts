@@ -689,7 +689,7 @@ describe('LHTB process state', () => {
         expect(result.request.command).toBe('pwd');
         expect(result.request.nodeId).toBe('root');
       }
-      expect(calls).toBe(2);
+      expect(calls).toBe(1);
       expect(session.snapshot().runtime.stopped).toBe(false);
     } finally {
       controller.close();
@@ -788,11 +788,11 @@ describe('LHTB process state', () => {
     }
   });
 
-  it('keeps STOP legal when it is the only usable early-exploration candidate', async () => {
+  it('does not let Worker payload preference define learned Controller support', async () => {
     const priorAttempts = process.env.ROY_LHTB_PROPOSAL_ATTEMPTS;
     const priorProfile = process.env.ROY_LHTB_TOPOLOGY_PROFILE;
     process.env.ROY_LHTB_PROPOSAL_ATTEMPTS = '1';
-    process.env.ROY_LHTB_TOPOLOGY_PROFILE = 'connected';
+    delete process.env.ROY_LHTB_TOPOLOGY_PROFILE;
     const session = new RoyLHTBSession('stop-only', 'task', 'finish', 'commit',
       'learned_information_realization');
     const semantic = { async processEvent(event: { id: string }) {
@@ -824,11 +824,14 @@ describe('LHTB process state', () => {
     try {
       const result = await controller.advance(session, 1);
       expect(result.status).toBe('completed');
-      expect(observedState?.exploration_stop_masked).toBe(true);
+      expect(observedState?.exploration_stop_masked).toBe(false);
       expect(observedState?.context_node_id).toBe('root');
       expect((observedState?.candidates as Array<Record<string, unknown>>)
-        .map(candidate => candidate.kind)).toEqual(['FINISH']);
-      expect((observedState?.candidates as Array<Record<string, unknown>>)[0]?.legal).toBe(true);
+        .map(candidate => candidate.kind)).toEqual([
+          'CONTINUE', 'DERIVE_INFO', 'DERIVE_ORG', 'FINISH',
+        ]);
+      expect((observedState?.candidates as Array<Record<string, unknown>>)
+        .find(candidate => candidate.kind === 'FINISH')?.legal).toBe(true);
     } finally {
       controller.close();
       if (priorAttempts === undefined) delete process.env.ROY_LHTB_PROPOSAL_ATTEMPTS;
@@ -1130,6 +1133,8 @@ describe('LHTB process state', () => {
       };
       structuralCandidateDeficits(snapshot: ReturnType<RoyLHTBSession['snapshot']>,
         candidates: Array<{ kind: string; actorNodeId: string }>): string[];
+      legalStructuralControllerCandidates(snapshot: ReturnType<RoyLHTBSession['snapshot']>):
+        Array<{ kind: string }>;
     };
     const harness = controller as unknown as Harness;
     const priorAttempts = process.env.ROY_LHTB_PROPOSAL_ATTEMPTS;
@@ -1140,9 +1145,8 @@ describe('LHTB process state', () => {
         .toContain('external_child_return_without_local_terminal_result');
       expect(harness.structuralCandidateDeficits(session.snapshot(), []))
         .toContain('missing_external_child_progress_candidate:worker');
-      process.env.ROY_LHTB_PROPOSAL_ATTEMPTS = '2';
-      await expect(controller.advance(session, 1))
-        .rejects.toThrow(/missing_external_child_progress_candidate:worker/);
+      expect(harness.legalStructuralControllerCandidates(session.snapshot())
+        .map(value => value.kind)).toEqual(['CONTINUE', 'PRUNE']);
       session.requestTerminal({ id: 'worker-check', command: 'true', timeoutMs: 1000,
         nodeId: 'worker', organizationActionKind: 'EXECUTE' });
       session.acceptTerminalResult({ requestId: 'worker-check', exitCode: 0, stdout: '',
@@ -1157,6 +1161,8 @@ describe('LHTB process state', () => {
         residualRequirements: unknown[] } } }).action.report.residualRequirements).toEqual([]);
       expect(harness.structuralCandidateDeficits(session.snapshot(), []))
         .not.toContain('missing_external_child_progress_candidate:worker');
+      expect(harness.legalStructuralControllerCandidates(session.snapshot())
+        .map(value => value.kind)).toContain('RETURN');
       expect(harness.structuralCandidateDeficits(session.snapshot(), []))
         .toContain('missing_child_return_candidate:worker');
       expect(harness.structuralCandidateDeficits(session.snapshot(), accepted.candidates))
