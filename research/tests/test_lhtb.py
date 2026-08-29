@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import socket
 import tempfile
 import unittest
 import sys
@@ -64,6 +65,7 @@ from roy_research.lhtb_training import (
 from roy_research.lhtb_native import (
     _runtime_write_probe,
     audit_native_tasks,
+    copy_checkpoint_tree,
     native_task_id_from_harbor,
     native_environment_digest,
     native_proot_launcher_environment,
@@ -686,6 +688,28 @@ for line in sys.stdin:
                 for future in futures:
                     future.result()
             self.assertEqual(list(root.glob(".write-probe-*")), [])
+
+    def test_native_checkpoint_excludes_unix_socket_but_keeps_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            destination = root / "destination"
+            source.mkdir()
+            (source / "state.json").write_text('{"moves": 3}\n', encoding="utf-8")
+            (source / "state-link").symlink_to("state.json")
+            endpoint = socket.socket(socket.AF_UNIX)
+            try:
+                endpoint.bind(str(source / "game.sock"))
+                excluded = copy_checkpoint_tree(source, destination)
+            finally:
+                endpoint.close()
+            self.assertEqual(excluded, [{"path": "game.sock", "kind": "socket"}])
+            self.assertEqual(
+                (destination / "state.json").read_text(encoding="utf-8"),
+                '{"moves": 3}\n',
+            )
+            self.assertTrue((destination / "state-link").is_symlink())
+            self.assertFalse((destination / "game.sock").exists())
 
     def test_frozen_finalize_agent_performs_no_action(self) -> None:
         agent = FrozenFinalizeNowAgent.__new__(FrozenFinalizeNowAgent)

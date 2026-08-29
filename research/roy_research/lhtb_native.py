@@ -25,6 +25,41 @@ NATIVE_BACKEND_ID = "lhtb-native-process-v1"
 NATIVE_SOURCE_TASK_MARKER = ".roy-native-source-task"
 
 
+def copy_checkpoint_tree(source: Path, destination: Path) -> list[dict[str, str]]:
+    """Copy serializable state while auditing kernel-backed endpoints."""
+    excluded: list[dict[str, str]] = []
+
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        skipped: set[str] = set()
+        directory_path = Path(directory)
+        for name in names:
+            path = directory_path / name
+            try:
+                mode = path.lstat().st_mode
+            except FileNotFoundError:
+                # A disappearing runtime endpoint cannot be stable state.
+                kind = "disappeared"
+            else:
+                kind = next((label for predicate, label in (
+                    (stat.S_ISSOCK, "socket"),
+                    (stat.S_ISFIFO, "fifo"),
+                    (stat.S_ISCHR, "character_device"),
+                    (stat.S_ISBLK, "block_device"),
+                ) if predicate(mode)), "")
+            if kind:
+                skipped.add(name)
+                excluded.append({
+                    "path": str(path.relative_to(source)),
+                    "kind": kind,
+                })
+        return skipped
+
+    shutil.copytree(
+        source, destination, dirs_exist_ok=True, symlinks=True, ignore=ignore
+    )
+    return sorted(excluded, key=lambda value: (value["path"], value["kind"]))
+
+
 def _runtime_write_probe(runtime_root: Path) -> None:
     """Verify write access without a cross-trial fixed-name race."""
     with tempfile.NamedTemporaryFile(

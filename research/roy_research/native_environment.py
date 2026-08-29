@@ -19,6 +19,7 @@ from harbor.environments.capabilities import EnvironmentCapabilities
 
 from .lhtb_native import (
     NATIVE_BACKEND_ID,
+    copy_checkpoint_tree,
     load_task_native_manifest,
     native_task_id_from_harbor,
     native_preflight,
@@ -227,13 +228,17 @@ class NativeProcessEnvironment(BaseEnvironment):
         payload = target / "payload"
         payload.mkdir(parents=True)
         names = ("app", "opt", "tests", "solution", "tmp", "home", "logs")
+        excluded_special_files: list[dict[str, str]] = []
         for name in names:
             source = self.session_root / name
             if source.exists():
-                await asyncio.to_thread(
-                    shutil.copytree, source, payload / name,
-                    dirs_exist_ok=True, symlinks=True,
+                excluded = await asyncio.to_thread(
+                    copy_checkpoint_tree, source, payload / name,
                 )
+                excluded_special_files.extend({
+                    **value,
+                    "path": f"{name}/{value['path']}",
+                } for value in excluded)
         payload_digest = tree_digest(payload)
         audit = {
             "schema_version": 1,
@@ -246,6 +251,7 @@ class NativeProcessEnvironment(BaseEnvironment):
             "payload_digest": payload_digest,
             "directories": list(names),
             "services": [],
+            "excluded_special_files": excluded_special_files,
         }
         (target / "checkpoint.json").write_text(
             json.dumps(audit, indent=2, sort_keys=True) + "\n", encoding="utf-8"
