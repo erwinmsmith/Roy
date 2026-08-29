@@ -616,6 +616,21 @@ for line in sys.stdin:
             self.assertEqual(native_value["agents"][0]["override_timeout_sec"], 21_600)
             self.assertEqual(native_value["agents"][0]["kwargs"]["rollout_timeout_sec"], 21_000)
 
+            finalize = Path(directory) / "finalize.json"
+            write_harbor_group_config(
+                finalize, "task", Path(directory) / "finalize-jobs",
+                "frozen_finalize_now", "fingerprint", 1, attempts=1,
+                environment_backend="native",
+                native_runtime_root=Path(directory) / "runtime",
+                native_template_root=Path(directory) / "templates",
+            )
+            finalize_value = json.loads(finalize.read_text())
+            self.assertEqual(finalize_value["agents"][0]["import_path"],
+                             "roy_research.harbor_agent:FrozenFinalizeNowAgent")
+            self.assertEqual(finalize_value["agents"][0]["model_name"],
+                             "frozen/artifact-identity-a0-v1")
+            self.assertEqual(finalize_value["agents"][0]["kwargs"], {})
+
             safe = Path(directory) / "safe.json"
             write_harbor_group_config(
                 safe, "task", Path(directory) / "jobs", "learned_information_realization",

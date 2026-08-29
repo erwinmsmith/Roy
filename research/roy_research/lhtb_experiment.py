@@ -192,7 +192,7 @@ def write_harbor_group_config(
     concurrency: int = CONCURRENCY,
 ) -> None:
     if arm not in ("single_agent_direct", "roy_runtime_heuristic",
-                   "learned_information_realization"):
+                   "learned_information_realization", "frozen_finalize_now"):
         raise ValueError(f"unknown LHTB arm {arm}")
     if environment_backend == "docker":
         environment = {"type": "docker", "force_build": False, "delete": True}
@@ -216,6 +216,13 @@ def write_harbor_group_config(
     if concurrency < 1:
         raise ValueError("Harbor concurrency must be positive")
     def agent_config() -> Dict[str, Any]:
+        if arm == "frozen_finalize_now":
+            return {
+                "import_path": "roy_research.harbor_agent:FrozenFinalizeNowAgent",
+                "model_name": "frozen/artifact-identity-a0-v1",
+                "kwargs": {},
+                "env": {"ROY_LHTB_ENVIRONMENT_BACKEND": environment_backend},
+            }
         kwargs: Dict[str, Any] = {"rpc_timeout": 720}
         agent_env = {"ROY_LHTB_ARM": arm,
                      "ROY_LHTB_ENVIRONMENT_BACKEND": environment_backend,
@@ -246,7 +253,7 @@ def write_harbor_group_config(
         "agents": agents,
         "datasets": [{"path": "./tasks", "task_names": [task_id]}],
     }
-    if not official_timeout:
+    if not official_timeout and arm != "frozen_finalize_now":
         for agent in value["agents"]:
             agent["override_timeout_sec"] = MAX_ROLLOUT_SECONDS
             agent["kwargs"]["rollout_timeout_sec"] = (

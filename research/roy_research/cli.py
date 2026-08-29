@@ -369,7 +369,8 @@ def parser() -> argparse.ArgumentParser:
     lhtb_config.add_argument("--jobs-dir", type=Path, required=True)
     lhtb_config.add_argument("--task-id", required=True)
     lhtb_config.add_argument("--arm", choices=("single_agent_direct", "roy_runtime_heuristic",
-                                                "learned_information_realization"), required=True)
+                                                "learned_information_realization",
+                                                "frozen_finalize_now"), required=True)
     lhtb_config.add_argument("--initial-fingerprint", required=True)
     lhtb_config.add_argument("--organization-seed", type=int, required=True)
     lhtb_config.add_argument("--attempts", type=int, default=8)
