@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import sys
 import asyncio
+import time
 from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
@@ -339,6 +340,58 @@ for line in sys.stdin:
             self.assertIsNone(partial["pendingTerminalRequest"])
             self.assertEqual(len(partial["processStates"]), 2)
 
+    def test_rollout_deadline_is_shared_by_verifier_continuations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            server = Path(directory) / "continuation_deadline_server.py"
+            server.write_text("""import json, sys, time
+snapshot = {'processStates': [{'sequence': 0, 'usage': {}}]}
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request['method']
+    if method == 'run':
+        result = {'status': 'completed', 'snapshot': snapshot}
+    elif method == 'verifier_rejection':
+        result = {'status': 'continue', 'snapshot': snapshot}
+    elif method == 'advance':
+        time.sleep(1)
+        result = {'status': 'continue', 'snapshot': snapshot}
+    elif method == 'restore':
+        snapshot = request['params']['snapshot']
+        result = {'status': 'restored', 'snapshot': snapshot}
+    elif method == 'rollout_deadline':
+        snapshot = {**snapshot, 'processStates': [*snapshot['processStates'],
+                    {'sequence': 1, 'usage': {}}]}
+        result = {'status': 'completed', 'snapshot': snapshot}
+    else:
+        result = {'status': 'completed', 'snapshot': snapshot}
+    print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
+""", encoding="utf-8")
+
+            class Environment:
+                environment_name = "fake-task"
+
+            agent = RoyHarborAgent(
+                logs_dir=Path(directory), model_name="deepseek/deepseek-v4-flash",
+                node_command=f"{sys.executable} -u {server}", rpc_timeout=2,
+                rollout_timeout_sec=0.3, track_file_changes=False,
+            )
+            try:
+                initial = SimpleNamespace(metadata=None)
+                asyncio.run(agent.run("solve", Environment(), initial))
+                time.sleep(0.05)
+                continuation = SimpleNamespace(metadata=None)
+                asyncio.run(agent.resume_after_verifier_rejection(
+                    "not solved", continuation
+                ))
+            finally:
+                agent.close()
+            self.assertEqual(initial.metadata["termination_reason"],
+                             "confirmed_task_complete")
+            self.assertEqual(continuation.metadata["termination_reason"],
+                             "rollout_deadline")
+            partial = json.loads(agent.partial_path.read_text())
+            self.assertEqual(len(partial["processStates"]), 2)
+
     def test_partial_snapshot_writes_are_throttled_but_forced_at_completion(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             agent = RoyHarborAgent(
@@ -528,7 +581,14 @@ for line in sys.stdin:
             self.assertEqual(native_value["retry"]["max_retries"], 0)
             self.assertEqual(native_value["agents"][0]["kwargs"]["rpc_timeout"], 720)
             self.assertEqual(native_value["agents"][0]["override_timeout_sec"], 21_600)
-            self.assertEqual(native_value["agents"][0]["kwargs"]["rollout_timeout_sec"], 21_570)
+            self.assertEqual(native_value["agents"][0]["kwargs"]["rollout_timeout_sec"], 21_000)
+
+            safe = Path(directory) / "safe.json"
+            write_harbor_group_config(
+                safe, "task", Path(directory) / "jobs", "learned_information_realization",
+                "fingerprint", 1, attempts=8, concurrency=2,
+            )
+            self.assertEqual(json.loads(safe.read_text())["n_concurrent_trials"], 2)
 
     def test_native_proot_uses_the_uid_owned_session_tmp_before_guest_mounts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

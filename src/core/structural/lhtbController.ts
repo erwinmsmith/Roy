@@ -626,6 +626,9 @@ export function compactProposalRepairRequest(
   const requiredChildReturnNodeIds = reasons.filter(reason =>
     reason.startsWith('missing_child_return_candidate:'))
     .map(reason => reason.slice('missing_child_return_candidate:'.length));
+  const requiredPostVerifierProgressNodeIds = reasons.filter(reason =>
+    reason.startsWith('missing_post_verifier_progress_candidate:'))
+    .map(reason => reason.slice('missing_post_verifier_progress_candidate:'.length));
   return JSON.stringify({
     repairProtocol: 'legal-candidate-interface-v3',
     instruction: [
@@ -635,6 +638,7 @@ export function compactProposalRepairRequest(
       'Topology is selected by MCTS; do not target a node count or depth or fabricate work.',
       'For every requiredExternalChildProgressNodeId, include at least one ACQUIRE or EXECUTE candidate whose actorNodeId is that exact node. A RETURN is not a substitute.',
       'For every requiredChildReturnNodeId, include one legal RETURN candidate with an evidence-grounded report for that exact node. Other useful actions may remain as alternatives.',
+      'After an official verifier rejection, every requiredPostVerifierProgressNodeId must receive a new ACQUIRE or EXECUTE candidate before STOP can be legal again.',
     ],
     rejectionReasons: reasons,
     rejectedCandidates,
@@ -654,6 +658,7 @@ export function compactProposalRepairRequest(
       preferredTopologyRange: exploration.preferredTopologyRange,
       requiredExternalChildProgressNodeIds,
       requiredChildReturnNodeIds,
+      requiredPostVerifierProgressNodeIds,
       returnCandidateSchema: {
         id: '<unique-return-candidate-id>', kind: 'RETURN',
         actorNodeId: '<requiredChildReturnNodeId>',
@@ -830,7 +835,8 @@ export class LHTBAutonomousController {
       if (attempt === proposalAttempts) {
         const hasHardProgressDeficit = structuralDeficits.some(reason =>
           reason.startsWith('missing_external_child_progress_candidate:')
-          || reason.startsWith('missing_child_return_candidate:'));
+          || reason.startsWith('missing_child_return_candidate:')
+          || reason.startsWith('missing_post_verifier_progress_candidate:'));
         if (currentValidation.candidates.length > 0 && structuralDeficits.length > 0
           && !hasHardProgressDeficit) {
           // Topology profiles are sampling interventions, not hard resource or
@@ -1121,7 +1127,8 @@ export class LHTBAutonomousController {
       });
       const hardDeficit = structuralDeficits.some(reason =>
         reason.startsWith('missing_external_child_progress_candidate:')
-        || reason.startsWith('missing_child_return_candidate:'));
+        || reason.startsWith('missing_child_return_candidate:')
+        || reason.startsWith('missing_post_verifier_progress_candidate:'));
       if (validation.candidates.length > 0 && !hardDeficit) {
         return { candidates: validation.candidates, calls, inputTokens, outputTokens,
           models: [...models], attempts: attempt };
@@ -1147,9 +1154,16 @@ export class LHTBAutonomousController {
     if (!this.learnedPolicy) throw new Error('MCTS requires the learned policy sidecar');
     const contextNodeId = scheduledOrganizationContextNode(snapshot);
     const localCandidates = candidates.filter(candidate => candidate.actorNodeId === contextNodeId);
+    // The mask is part of the behavior policy. A zero actor prior alone does not
+    // make a child impossible under PUCT when visited scores are close.
+    const rootPolicyState = this.policyState(snapshot, localCandidates);
+    const legalCandidateIds = new Set((rootPolicyState.candidates as Array<{
+      id: string; legal?: boolean }>)
+      .filter(candidate => candidate.legal !== false).map(candidate => candidate.id));
     const valid: Array<{ candidate: ProposedCandidate;
       state: ReturnType<RoyLHTBSession['snapshot']>; terminal: boolean }> = [];
     for (const candidate of localCandidates) {
+      if (!legalCandidateIds.has(candidate.id)) continue;
       try {
         const probe = RoyLHTBSession.restore(snapshot);
         let terminal = false;
@@ -1561,6 +1575,10 @@ export class LHTBAutonomousController {
     const deficits = needsExternalProgress && !candidates.some(candidate =>
       candidate.actorNodeId === contextNodeId && ['ACQUIRE', 'EXECUTE'].includes(candidate.kind))
       ? [`missing_external_child_progress_candidate:${contextNodeId}`] : [];
+    if (this.verifierRetryNeedsProgress(snapshot) && !candidates.some(candidate =>
+      candidate.actorNodeId === contextNodeId && ['ACQUIRE', 'EXECUTE'].includes(candidate.kind))) {
+      deficits.push(`missing_post_verifier_progress_candidate:${contextNodeId}`);
+    }
     const hasSuccessfulLocalResult = contextNode?.id !== snapshot.runtime.rootId
       && events.some(event => event.kind === 'terminal_result' && event.nodeId === contextNodeId
         && (event.exitCode ?? 0) === 0);
@@ -1731,6 +1749,7 @@ export class LHTBAutonomousController {
     const maximumDepthReached = Math.max(0, ...snapshot.runtime.nodes.map(node => node.depth));
     const explorationStopMasked = openRequirements.length > 0
       && (snapshot.runtime.nodes.length < minimumNodes || maximumDepthReached < minimumDepth);
+    const verifierRetryStopMasked = this.verifierRetryNeedsProgress(snapshot);
     const hasExplorationAlternative = contextCandidates.some(candidate => candidate.kind !== 'STOP');
     const policyCandidates = contextCandidates.map(candidate => ({ id: candidate.id, kind: candidate.kind,
       actor_node_id: candidate.actorNodeId, description: candidate.description,
@@ -1748,7 +1767,7 @@ export class LHTBAutonomousController {
       resolves_gap: candidate.kind === 'ACQUIRE' || candidate.kind === 'RETURN',
       depth_delta: candidate.kind === 'DERIVE' ? 1 : 0,
       sampling_logit_bias: topologySamplingCandidateLogitBias(snapshot, candidate),
-      legal: !(candidate.kind === 'STOP' && explorationStopMasked
+      legal: !(candidate.kind === 'STOP' && (explorationStopMasked || verifierRetryStopMasked)
         && hasExplorationAlternative) }));
     return {
       interface_revision: LHTB_POLICY_INTERFACE_REVISION,
@@ -1775,7 +1794,10 @@ export class LHTBAutonomousController {
       available_actions: [...new Set(contextCandidates.map(candidate => candidate.kind))],
       topology_sampling_phase: topologySamplingPhase(snapshot).id,
       exploration_stop_masked: explorationStopMasked,
-      stop_legal_reason: explorationStopMasked
+      verifier_retry_stop_masked: verifierRetryStopMasked,
+      stop_legal_reason: verifierRetryStopMasked
+        ? 'masked_until_external_progress_after_verifier_rejection'
+        : explorationStopMasked
         ? 'masked_during_early_exploration_with_real_open_residual_gap'
         : openRequirements.length === 0 ? 'no_real_open_residual_gap'
           : 'exploration_minimum_satisfied',
@@ -1791,6 +1813,22 @@ export class LHTBAutonomousController {
       organization_temperature: Number(process.env.ROY_LHTB_ORGANIZATION_TEMPERATURE ?? 1),
       unbounded_structure: true,
     };
+  }
+
+  private verifierRetryNeedsProgress(
+    snapshot: ReturnType<RoyLHTBSession['snapshot']>
+  ): boolean {
+    const events = snapshot.runtimeEvents ?? snapshot.processStates.at(-1)?.runtimeEvents ?? [];
+    let rejectionIndex = -1;
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index];
+      if (event.kind === 'verifier' && event.attributes?.result === 'rejected') {
+        rejectionIndex = index;
+        break;
+      }
+    }
+    if (rejectionIndex < 0) return false;
+    return !events.slice(rejectionIndex + 1).some(event => event.kind === 'terminal_result');
   }
 
   private async auditProposal(request: Record<string, unknown>,

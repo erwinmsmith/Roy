@@ -17,7 +17,7 @@ import numpy as np
 TRAIN_EPOCHS = 4
 GROUP_SIZE = 8
 MAX_ROLLOUT_SECONDS = 6 * 60 * 60
-ROLLOUT_FINALIZATION_MARGIN_SECONDS = 30
+ROLLOUT_FINALIZATION_MARGIN_SECONDS = 10 * 60
 CONCURRENCY = 4
 MAX_RESPONSE_TOKENS = 32768
 SOLVE_THRESHOLD = 0.95
@@ -190,6 +190,7 @@ def write_harbor_group_config(
     native_template_root: Path | None = None,
     allow_network_degraded: bool = False,
     max_retries: int = 2,
+    concurrency: int = CONCURRENCY,
 ) -> None:
     if arm not in ("single_agent_direct", "roy_runtime_heuristic",
                    "learned_information_realization"):
@@ -213,6 +214,8 @@ def write_harbor_group_config(
         raise ValueError(f"unknown LHTB environment backend {environment_backend}")
     if max_retries < 0:
         raise ValueError("Harbor max_retries cannot be negative")
+    if concurrency < 1:
+        raise ValueError("Harbor concurrency must be positive")
     def agent_config() -> Dict[str, Any]:
         kwargs: Dict[str, Any] = {"rpc_timeout": 720}
         agent_env = {"ROY_LHTB_ARM": arm,
@@ -238,7 +241,7 @@ def write_harbor_group_config(
     value = {
         "job_name": f"roy-{task_id}-{organization_seed}",
         "jobs_dir": str(jobs_dir), "n_attempts": harbor_attempts,
-        "n_concurrent_trials": min(CONCURRENCY, attempts), "timeout_multiplier": 1.0,
+        "n_concurrent_trials": min(concurrency, attempts), "timeout_multiplier": 1.0,
         "retry": {"max_retries": max_retries},
         "environment": environment,
         "agents": agents,

@@ -162,6 +162,10 @@ class RoyHarborAgent(BaseAgent):
         self._trajectory_id: str | None = None
         self._continuation_count = 0
         self.rollout_timeout_sec = rollout_timeout_sec
+        # One Harbor trial calls ``run`` once and may then call
+        # ``resume_after_verifier_rejection`` many times. Keep one deadline for
+        # that complete lifecycle so the outer Harbor timeout never wins.
+        self._rollout_deadline: float | None = None
         self.partial_save_interval_sec = max(0.0, float(child_environment.get(
             "ROY_LHTB_PARTIAL_SAVE_INTERVAL_SEC", "30"
         )))
@@ -179,8 +183,11 @@ class RoyHarborAgent(BaseAgent):
         self.rpc.start()
 
     async def run(self, instruction: str, environment: Any, context: Any) -> None:
-        deadline = (time.monotonic() + self.rollout_timeout_sec
-                    if self.rollout_timeout_sec is not None else None)
+        self._rollout_deadline = (
+            time.monotonic() + self.rollout_timeout_sec
+            if self.rollout_timeout_sec is not None else None
+        )
+        deadline = self._rollout_deadline
         try:
             trajectory_id = str(uuid.uuid4())
             self._environment = environment
@@ -225,13 +232,17 @@ class RoyHarborAgent(BaseAgent):
             raise RuntimeError("Roy has no session to resume")
         try:
             self._continuation_count += 1
-            response = await asyncio.to_thread(self.rpc.request, "verifier_rejection", {
+            response = await self._rpc_before_deadline("verifier_rejection", {
                 "feedback": user_prompt,
-            })
+            }, self._rollout_deadline)
             self._save_partial()
-            await self._drive(response, self._environment)
+            await self._drive(response, self._environment, self._rollout_deadline)
             self._save_partial(force=True)
             self._update_context(context, termination_reason="confirmed_task_complete")
+        except RolloutDeadlineReached:
+            await self._finalize_rollout_deadline()
+            self._save_partial(force=True)
+            self._update_context(context, termination_reason="rollout_deadline")
         except BaseException:
             self._save_partial(force=True)
             self.close()

@@ -68,7 +68,8 @@ else
 fi
 
 group_environment_args=(--environment-backend "${environment_backend}"
-  --max-retries "${ROY_LHTB_MAX_ENV_RETRIES:-8}")
+  --max-retries "${ROY_LHTB_MAX_ENV_RETRIES:-8}"
+  --concurrency "${ROY_LHTB_CONCURRENCY:-4}")
 if [[ "${environment_backend}" == "native" ]]; then
   [[ -f "${native_audit}" ]] || { echo "native audit is missing" >&2; exit 4; }
   group_environment_args+=(--native-runtime-root "${native_runtime_root}"

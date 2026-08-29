@@ -319,6 +319,43 @@ describe('LHTB process state', () => {
       .toBe('Verifier rejected phase one');
   });
 
+  it('masks STOP after verifier rejection until a new external result arrives', () => {
+    const session = new RoyLHTBSession('retry-mask', 'task', 'solve it', 'commit');
+    session.applyOrganizationAction({ kind: 'STOP', actorNodeId: 'root', finalOutput: 'draft' });
+    session.resumeAfterVerifierRejection('not solved');
+    const execute = { id: 'repair', kind: 'EXECUTE', actorNodeId: 'root',
+      description: 'apply a repair', schedulerComplexity: 1, command: 'true',
+      action: { kind: 'EXECUTE', actorNodeId: 'root' } };
+    const stop = { id: 'stop', kind: 'STOP', actorNodeId: 'root', description: 'submit',
+      schedulerComplexity: 1,
+      action: { kind: 'STOP', actorNodeId: 'root', finalOutput: 'done' } };
+    const semantic = { async processEvent(event: { id: string }) {
+      return { event_id: event.id, requirements: [], claims: [], assumptions: [], evidence: [],
+        external_observations: [], blind_spots: [], relations: [] };
+    }, close() {} };
+    const controller = new LHTBAutonomousController({ provider: { isConfigured: () => true },
+      semantic, auditRoot: false, learnedPolicy: { close() {} } as never });
+    const policyState = (controller as unknown as { policyState(
+      snapshot: ReturnType<RoyLHTBSession['snapshot']>, candidates: unknown[]):
+      Record<string, unknown> }).policyState.bind(controller);
+    try {
+      const before = policyState(session.snapshot(), [execute, stop]);
+      expect(before.verifier_retry_stop_masked).toBe(true);
+      expect((before.candidates as Array<{ id: string; legal: boolean }>)
+        .find(candidate => candidate.id === 'stop')?.legal).toBe(false);
+      session.requestTerminal({ id: 'repair-command', command: 'true', timeoutMs: 1000,
+        nodeId: 'root', organizationActionKind: 'EXECUTE' });
+      session.acceptTerminalResult({ requestId: 'repair-command', exitCode: 0, stdout: '',
+        stderr: '', durationMs: 1 });
+      const after = policyState(session.snapshot(), [execute, stop]);
+      expect(after.verifier_retry_stop_masked).toBe(false);
+      expect((after.candidates as Array<{ id: string; legal: boolean }>)
+        .find(candidate => candidate.id === 'stop')?.legal).toBe(true);
+    } finally {
+      controller.close();
+    }
+  });
+
   it('integrates mock DeepSeek semantics before the next organization decision', async () => {
     const session = new RoyLHTBSession('mock', 'task', 'solve it', 'commit',
       'roy_runtime_heuristic');

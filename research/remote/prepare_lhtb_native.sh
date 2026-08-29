@@ -458,7 +458,8 @@ PY
       --arm learned_information_realization --initial-fingerprint "${fingerprint}" \
       --organization-seed "${seed}" --attempts 8 --environment-backend native \
       --native-runtime-root "${native_root}" --native-template-root "${template_root}" \
-      --allow-network-degraded --max-retries "${ROY_LHTB_MAX_ENV_RETRIES:-8}"
+      --allow-network-degraded --max-retries "${ROY_LHTB_MAX_ENV_RETRIES:-8}" \
+      --concurrency "${ROY_LHTB_CONCURRENCY:-4}"
     cd "${lhtb_root}"
     "${harbor_bin}" run -c "${config}" --yes
     cd "${roy_root}"
