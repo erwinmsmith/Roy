@@ -254,7 +254,11 @@ describe('recursive information realization runtime', () => {
     }, 4);
     const snapshot = runtime.snapshot();
     expect(snapshot.nodes.map(node => node.id)).toEqual(['root', 'child']);
-    expect(snapshot.requirements[0]?.status).toBe('assigned');
+    expect(snapshot.requirements[0]).toMatchObject({
+      status: 'assigned', assignedNodeId: 'child',
+    });
+    expect(snapshot.nodes.find(node => node.id === 'child')?.assignedRequirementIds)
+      .toEqual(['gap-1']);
     expect(snapshot.observations[0]?.observation).toBe('external fact');
     expect(snapshot.derivationEdges).toEqual([{ parentId: 'root', childId: 'child' }]);
     expect(RecursiveInformationRealizationRuntime.restore(snapshot).snapshot()).toEqual(snapshot);
@@ -262,6 +266,40 @@ describe('recursive information realization runtime', () => {
       ...snapshot,
       stopped: true,
     })).toThrow(/fingerprint/);
+  });
+
+  it('lets the current child refine its assigned requirement into a subchild', () => {
+    const runtime = new RecursiveInformationRealizationRuntime('root', 'answer task', 1);
+    runtime.apply({ kind: 'EXECUTE', actorNodeId: 'root', report: report('root', 'gap-1') }, 2);
+    const child = specification();
+    runtime.apply({ kind: 'DERIVE', actorNodeId: 'root', childSpecification: child }, 3);
+    const grandchild: OpenAgentSpecification = {
+      ...child,
+      id: 'spec-grandchild',
+      nodeId: 'grandchild',
+      parentId: 'child',
+      depth: 2,
+      parentGoal: child.localObjective,
+      localObjective: 'verify one primary source identifier',
+      refinement: {
+        ...child.refinement,
+        parentScope: child.localObjective,
+        childScope: 'verify one source identifier',
+        newInformationNeeded: 'one verified source identifier',
+        executableEndCondition: 'identifier is verified or rejected',
+      },
+      terminationCondition: 'return the verified identifier',
+    };
+    runtime.apply({ kind: 'DERIVE', actorNodeId: 'child', childSpecification: grandchild }, 4);
+    const snapshot = runtime.snapshot();
+    expect(snapshot.derivationEdges).toEqual([
+      { parentId: 'root', childId: 'child' },
+      { parentId: 'child', childId: 'grandchild' },
+    ]);
+    expect(snapshot.requirements.find(value => value.id === 'gap-1'))
+      .toMatchObject({ status: 'assigned', assignedNodeId: 'grandchild' });
+    expect(snapshot.nodes.find(node => node.id === 'grandchild')?.assignedRequirementIds)
+      .toEqual(['gap-1']);
   });
 
   it('reuses a spawned agent through a required connection and assigns the open gap', () => {

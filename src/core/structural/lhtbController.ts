@@ -131,6 +131,36 @@ interface SamplingPhase {
 
 const SCHEDULER_RUNNABLE_STATUSES = new Set(['ready', 'running', 'completed']);
 
+type LHTBSessionSnapshot = ReturnType<RoyLHTBSession['snapshot']>;
+type RuntimeRequirement = LHTBSessionSnapshot['runtime']['requirements'][number];
+
+/**
+ * Resolve the node that currently owns an unresolved requirement. DERIVE
+ * transfers execution ownership without changing the requirement's original
+ * provenance parent. Older checkpoints did not persist assignedNodeId, so the
+ * active triggering-gap lineage is used only as a backwards-compatible repair.
+ */
+function effectiveRequirementOwner(
+  snapshot: LHTBSessionSnapshot,
+  requirement: RuntimeRequirement,
+): string {
+  if (requirement.status === 'assigned' && requirement.assignedNodeId) {
+    return requirement.assignedNodeId;
+  }
+  if (requirement.status === 'assigned') {
+    const inferred = snapshot.runtime.nodes.filter(node =>
+      node.triggeringGapId === requirement.id
+      && SCHEDULER_RUNNABLE_STATUSES.has(node.status))
+      .sort((left, right) => right.depth - left.depth || right.updatedAt - left.updatedAt)[0];
+    if (inferred) return inferred.id;
+  }
+  return requirement.parentNodeId;
+}
+
+function isDelegableRequirement(requirement: RuntimeRequirement): boolean {
+  return requirement.status === 'open' || requirement.status === 'assigned';
+}
+
 /** Deterministic execution ownership; never part of the learned action. */
 export function scheduledOrganizationContextNode(
   snapshot: ReturnType<RoyLHTBSession['snapshot']>
@@ -556,8 +586,10 @@ export function compactEpistemicWorkingState(
     assignedNodeId: value.assignedNodeId,
     description: compactText(value.description),
     requiredInformation: compactText(value.requiredInformation) }));
-  const openRequirements = snapshot.runtime.requirements.filter(value => value.status === 'open'
-    && activeNodes.some(node => node.id === value.parentNodeId));
+  const openRequirements = snapshot.runtime.requirements
+    .filter(value => isDelegableRequirement(value)
+      && activeNodes.some(node => node.id === effectiveRequirementOwner(snapshot, value)))
+    .map(value => ({ ...value, parentNodeId: effectiveRequirementOwner(snapshot, value) }));
   const profile = activeTopologySamplingProfile(snapshot.organizationSeed);
   const maximumDepthReached = Math.max(0, ...snapshot.runtime.nodes.map(node => node.depth));
   const schedulerContextNode = scheduledOrganizationContextNode(snapshot);
@@ -974,7 +1006,8 @@ export class LHTBAutonomousController {
     const profile = activeTopologySamplingProfile(snapshot.organizationSeed);
     const kinds: StructuralControllerActionKind[] = ['CONTINUE'];
     const hasOpenLocalGap = snapshot.runtime.requirements.some(requirement =>
-      requirement.parentNodeId === contextNodeId && requirement.status === 'open');
+      isDelegableRequirement(requirement)
+      && effectiveRequirementOwner(snapshot, requirement) === contextNodeId);
     if (hasOpenLocalGap && profile?.id !== 'single') {
       kinds.push('DERIVE_INFO', 'DERIVE_ORG');
     }
@@ -1636,8 +1669,9 @@ export class LHTBAutonomousController {
         if (realizationMode === 'acquire_external' && externalAccess?.allowed !== true) {
           reasons.push('external_acquisition_child_requires_external_access');
         }
-        if (requirement?.status === 'open' && requirement.parentNodeId !== actorNodeId) {
-          reasons.push(`derive_requirement_owner_mismatch:${triggeringGapId}:expected=${requirement.parentNodeId}`);
+        if (requirement && (!isDelegableRequirement(requirement)
+          || effectiveRequirementOwner(snapshot, requirement) !== actorNodeId)) {
+          reasons.push(`derive_requirement_owner_mismatch:${triggeringGapId}:expected=${effectiveRequirementOwner(snapshot, requirement)}`);
         }
         if (typeof specification.parentId === 'string'
           && specification.parentId !== actorNodeId) {

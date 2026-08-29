@@ -219,16 +219,26 @@ export class RecursiveInformationRealizationRuntime {
       throw new Error('Child specification requires an executable termination condition');
     }
     const requirement = this.requirements.get(specification.triggeringGapId);
-    if (!requirement || requirement.parentNodeId !== parent.id || requirement.status !== 'open') {
+    const assignedToParent = requirement?.status === 'assigned'
+      && (requirement.assignedNodeId === parent.id
+        // Older persisted checkpoints predate explicit DERIVE assignment
+        // provenance.  The triggering-gap lineage is sufficient to recover
+        // the current owner once, after which the assignment is materialized.
+        || (!requirement.assignedNodeId && parent.triggeringGapId === requirement.id));
+    const ownedByParent = requirement?.status === 'open'
+      && requirement.parentNodeId === parent.id;
+    if (!requirement || (!ownedByParent && !assignedToParent)) {
       throw new Error(`Triggering gap ${specification.triggeringGapId} is not an open parent requirement`);
     }
     requirement.status = 'assigned';
+    requirement.assignedNodeId = specification.nodeId;
     this.nodes.set(specification.nodeId, {
       id: specification.nodeId,
       parentId: parent.id,
       depth: specification.depth,
       localObjective: specification.localObjective,
       triggeringGapId: specification.triggeringGapId,
+      assignedRequirementIds: [requirement.id],
       status: 'ready',
       specification: structuredClone(specification),
       createdAt: at,

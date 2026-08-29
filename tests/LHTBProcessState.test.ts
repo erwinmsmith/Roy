@@ -898,6 +898,9 @@ describe('LHTB process state', () => {
       id: string; kind: string;
     }>) {
       observedState = policyState;
+      expect(values.map(value => value.kind)).toEqual([
+        'CONTINUE', 'DERIVE_INFO', 'DERIVE_ORG', 'PRUNE',
+      ]);
       const candidate = values.find(value => value.kind === 'CONTINUE')!;
       return { candidate, record: { stateFingerprint: String(policyState.state_fingerprint),
         contextNodeId: 'worker', candidateId: candidate.id, maskedOldLogProbability: 0,
@@ -913,6 +916,10 @@ describe('LHTB process state', () => {
         .toBe(childSpecification.localObjective);
       expect((observedState?.context_node as Record<string, unknown>).ancestry)
         .toEqual([expect.objectContaining({ id: 'root', depth: 0 })]);
+      expect((observedState?.context_node as Record<string, unknown>).requirements)
+        .toEqual([expect.objectContaining({
+          id: 'root-task-requirement', status: 'assigned', assigned_node_id: 'worker',
+        })]);
       expect((observedState?.topology_search as Record<string, unknown>).mode)
         .toBe('actor_direct_on_policy');
     } finally {
@@ -1146,7 +1153,9 @@ describe('LHTB process state', () => {
       expect(harness.structuralCandidateDeficits(session.snapshot(), []))
         .toContain('missing_external_child_progress_candidate:worker');
       expect(harness.legalStructuralControllerCandidates(session.snapshot())
-        .map(value => value.kind)).toEqual(['CONTINUE', 'PRUNE']);
+        .map(value => value.kind)).toEqual([
+          'CONTINUE', 'DERIVE_INFO', 'DERIVE_ORG', 'PRUNE',
+        ]);
       session.requestTerminal({ id: 'worker-check', command: 'true', timeoutMs: 1000,
         nodeId: 'worker', organizationActionKind: 'EXECUTE' });
       session.acceptTerminalResult({ requestId: 'worker-check', exitCode: 0, stdout: '',
