@@ -991,6 +991,14 @@ for line in sys.stdin:
                         "checkpoint": f"epoch-{epoch}.pt", "reward": reward,
                         "value_mae": mae, "tokens": tokens} for index in range(8))
         self.assertEqual(select_dev_checkpoint(dev)["epoch"], 1)
+        tied = []
+        for epoch, mae, tokens in ((0, 0.2, 10), (1, 0.1, 20)):
+            tied.extend({"split": "dev", "epoch": epoch,
+                         "task_id": f"tied-{index}",
+                         "checkpoint": f"tied-{epoch}.pt", "reward": 0.5,
+                         "value_mae": mae, "tokens": tokens}
+                        for index in range(8))
+        self.assertEqual(select_dev_checkpoint(tied)["epoch"], 1)
         test = []
         for arm, reward in (("single_agent_direct", 0.2),
                             ("roy_runtime_heuristic", 0.3),

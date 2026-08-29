@@ -43,6 +43,7 @@ from .lhtb_native import (
     write_native_finalize_overlay,
     write_native_audit,
 )
+from .lhtb_value_metrics import annotate_value_traces, value_metrics
 from .training import TRAINING_VARIANTS, evaluate_groups, train_groups
 
 
@@ -529,7 +530,20 @@ def main(argv: List[str] | None = None) -> None:
         print(json.dumps(selected))
     elif args.command == "lhtb-report":
         records = list(read_jsonl(args.results))
-        summary = summarize_test(records)
+        report_records = records
+        if args.checkpoint is not None:
+            report_records = list(annotate_value_traces(
+                records, str(args.checkpoint)
+            ))
+            write_jsonl(
+                args.output.with_name(f"{args.output.stem}-value-traces.jsonl"),
+                report_records,
+            )
+        summary = summarize_test(report_records)
+        if args.checkpoint is not None:
+            summary["value_metrics"] = value_metrics(
+                records, str(args.checkpoint)
+            )
         write_json(args.output, summary)
         write_lhtb_svg(args.output.with_suffix(".svg"), summary)
         print(json.dumps(summary))
@@ -686,11 +700,12 @@ def main(argv: List[str] | None = None) -> None:
     elif args.command == "lhtb-dev-metrics":
         records = [value for value in read_jsonl(args.trajectories)
                    if value.get("split") == "dev" and int(value.get("epoch", -1)) == args.epoch]
+        metrics = value_metrics(records, str(args.checkpoint), args.device)
         rows = [{"split": "dev", "epoch": args.epoch, "task_id": value["task_id"],
                  "checkpoint": str(args.checkpoint), "reward": value["terminal_reward"],
-                 "tokens": value.get("tokens", 0)} for value in records]
+                 "tokens": value.get("tokens", 0), **metrics} for value in records]
         write_jsonl(args.output, rows, append=args.output.exists())
-        print(json.dumps({"records": len(rows)}))
+        print(json.dumps({"records": len(rows), **metrics}))
     elif args.command == "lhtb-smoke-validate":
         task_ids = tuple(args.task_id) if args.task_id else (
             "great-expectations-audit", "poc-exploit-craft",

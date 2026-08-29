@@ -51,7 +51,10 @@ def annotate_value_traces(records: Sequence[Mapping[str, Any]], checkpoint: str,
                           device_name: str = "cpu") -> Sequence[Mapping[str, Any]]:
     device = torch.device(device_name)
     payload = torch.load(checkpoint, map_location=device, weights_only=False)
-    target_revision = int(payload.get("metadata", {}).get("groups", 0))
+    metadata = payload.get("metadata", {})
+    target_revision = int(metadata.get(
+        "value_revision", metadata.get("groups", 0)
+    ))
     value = EpistemicValueModel().to(device)
     target = EpistemicValueModel().to(device)
     value.load_state_dict(payload["value_state_dict"])

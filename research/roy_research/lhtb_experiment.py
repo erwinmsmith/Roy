@@ -95,10 +95,13 @@ def select_dev_checkpoint(records: Sequence[Mapping[str, Any]]) -> Mapping[str, 
             "epoch": epoch,
             "checkpoint": values[0]["checkpoint"],
             "mean_reward": float(np.mean([float(value["reward"]) for value in values])),
+            "value_mae": float(np.mean([
+                float(value.get("value_mae", math.inf)) for value in values
+            ])),
             "tokens": int(sum(int(value["tokens"]) for value in values)),
         })
     return sorted(candidates, key=lambda value: (
-        -value["mean_reward"], value["tokens"], value["epoch"]
+        -value["mean_reward"], value["value_mae"], value["tokens"], value["epoch"]
     ))[0]
 
 

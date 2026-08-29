@@ -34,6 +34,12 @@ load_deepseek_api_key "${roy_root}"
 selected_model="$("${python_bin}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["checkpoint"])' "${selection}")"
 selected_epoch="$("${python_bin}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["epoch"])' "${selection}")"
 [[ -f "${selected_model}" ]] || { echo "selected checkpoint is missing" >&2; exit 4; }
+selected_revision="$("${python_bin}" - "${selected_model}" <<'PY'
+import sys, torch
+metadata = torch.load(sys.argv[1], map_location="cpu", weights_only=False)["metadata"]
+print(metadata.get("actor_revision", metadata.get("groups", 0)))
+PY
+)"
 
 mkdir -p "${run_root}/jobs" "${run_root}/configs"
 export PYTHONPATH="${roy_root}/research${PYTHONPATH:+:${PYTHONPATH}}"
@@ -47,7 +53,9 @@ export DEEPSEEK_MODEL_REVISION="${DEEPSEEK_MODEL_REVISION:-deepseek-v4-flash-api
 export ROY_LHTB_MCTS_ENABLED=false
 export ROY_LHTB_ORGANIZATION_INTERVAL=1
 
-group_environment_args=(--environment-backend "${environment_backend}")
+group_environment_args=(--environment-backend "${environment_backend}"
+  --max-retries "${ROY_LHTB_MAX_ENV_RETRIES:-2}"
+  --concurrency "${ROY_LHTB_TEST_CONCURRENCY:-3}")
 if [[ "${environment_backend}" == "native" ]]; then
   [[ -f "${native_audit}" ]] || { echo "native audit is missing" >&2; exit 4; }
   group_environment_args+=(--native-runtime-root "${native_runtime_root}"
@@ -91,7 +99,7 @@ PY
     "${python_bin}" -m roy_research lhtb-import-group --job-dir "${job_dir}" \
       --output "${results}" --group-id "test:${arm}:${task_id}" --task-id "${task_id}" \
       --category "${category}" --split test --epoch "${selected_epoch}" \
-      --policy-revision 0 --environment-digest "${digest}" \
+      --policy-revision "${selected_revision}" --environment-digest "${digest}" \
       --environment-backend "${environment_backend}" --expected 3 --arm "${arm}"
   done
 done < <("${python_bin}" - "${manifest}" <<'PY'
