@@ -251,6 +251,8 @@ class LHTBProcessGRPOTrainer:
                     local_context.get("id", "")
                 ) != context_node:
                     raise ValueError("actor decision must save the node's complete local context")
+                if not isinstance(local_context.get("ancestry"), Sequence):
+                    raise ValueError("actor decision must save the node's explicit ancestry")
                 controller_candidates = policy_state.get("candidates")
                 if not isinstance(controller_candidates, Sequence) or not controller_candidates:
                     raise ValueError("actor state requires a six-action Controller mask")

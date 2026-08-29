@@ -124,6 +124,7 @@ def direct_node_policy_state(state_fingerprint="m0"):
         "context_node": {"id": "root", "parent_id": None, "depth": 0,
             "status": "ready", "local_objective": "solve",
             "assigned_requirement_ids": [], "requirements": [],
+            "ancestry": [],
             "recent_runtime_events": []},
         "candidates": [
             {"id": "controller:FINISH", "kind": "FINISH", "actor_node_id": "root",
@@ -1051,6 +1052,7 @@ for line in sys.stdin:
         child_state["context_node_id"] = "child"
         child_state["context_node"] = {"id": "child", "parent_id": "root", "depth": 1,
             "status": "ready", "local_objective": "verify", "requirements": [],
+            "ancestry": [{"id": "root", "depth": 0, "status": "running"}],
             "recent_runtime_events": []}
         for candidate in child_state["candidates"]:
             candidate["actor_node_id"] = "child"

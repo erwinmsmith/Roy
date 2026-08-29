@@ -908,6 +908,8 @@ describe('LHTB process state', () => {
       expect(observedState?.context_node_id).toBe('worker');
       expect((observedState?.context_node as Record<string, unknown>).local_objective)
         .toBe(childSpecification.localObjective);
+      expect((observedState?.context_node as Record<string, unknown>).ancestry)
+        .toEqual([expect.objectContaining({ id: 'root', depth: 0 })]);
       expect((observedState?.topology_search as Record<string, unknown>).mode)
         .toBe('actor_direct_on_policy');
     } finally {

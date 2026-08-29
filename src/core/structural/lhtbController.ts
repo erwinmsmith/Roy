@@ -1678,6 +1678,25 @@ export class LHTBAutonomousController {
     const requirementsByNode = new Map(snapshot.runtime.nodes.map(node => [node.id,
       snapshot.runtime.requirements.filter(requirement => requirement.parentNodeId === node.id
         || requirement.assignedNodeId === node.id)]));
+    const nodesById = new Map(snapshot.runtime.nodes.map(node => [node.id, node]));
+    const ancestryForNode = (nodeId: string) => {
+      const result: Array<Record<string, unknown>> = [];
+      const visited = new Set<string>([nodeId]);
+      let parentId = nodesById.get(nodeId)?.parentId;
+      while (parentId && !visited.has(parentId)) {
+        visited.add(parentId);
+        const ancestor = nodesById.get(parentId);
+        if (!ancestor) break;
+        result.push({ id: ancestor.id, parent_id: ancestor.parentId, depth: ancestor.depth,
+          status: ancestor.status, local_objective: ancestor.localObjective,
+          realization_mode: ancestor.specification?.realizationMode,
+          unresolved_requirement_count: (requirementsByNode.get(ancestor.id) ?? [])
+            .filter(requirement => requirement.status === 'open'
+              || requirement.status === 'assigned').length });
+        parentId = ancestor.parentId;
+      }
+      return result.reverse();
+    };
     const nodeRuntimeEvents = (nodeId: string) => events.filter(event => event.nodeId === nodeId)
       .slice(-12);
     const agentNodes = snapshot.runtime.nodes.map(node => {
@@ -1691,6 +1710,7 @@ export class LHTBAutonomousController {
         status: node.status,
         triggering_gap_id: node.triggeringGapId,
         assigned_requirement_ids: node.assignedRequirementIds ?? [],
+        ancestry: ancestryForNode(node.id),
         requirements: localRequirements.map(requirement => ({ id: requirement.id,
           description: requirement.description, required_information: requirement.requiredInformation,
           status: requirement.status, parent_node_id: requirement.parentNodeId,
@@ -1841,6 +1861,7 @@ export class LHTBAutonomousController {
         local_objective: contextNode.localObjective,
         triggering_gap_id: contextNode.triggeringGapId,
         assigned_requirement_ids: contextNode.assignedRequirementIds ?? [],
+        ancestry: ancestryForNode(contextNodeId),
         requirements: (requirementsByNode.get(contextNodeId) ?? []).map(requirement => ({
           id: requirement.id, description: requirement.description,
           required_information: requirement.requiredInformation, status: requirement.status,

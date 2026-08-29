@@ -421,6 +421,7 @@ class InformationRealizationTests(unittest.TestCase):
             "context_node_id": "root",
             "context_node": {"id": "root", "depth": 0, "status": "ready",
                 "local_objective": "root objective", "requirements": [],
+                "ancestry": [],
                 "recent_runtime_events": []},
             "candidates": [
                 {
