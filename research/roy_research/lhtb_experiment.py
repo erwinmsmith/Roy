@@ -244,6 +244,11 @@ def write_harbor_group_config(
                 "env": {"ROY_LHTB_ENVIRONMENT_BACKEND": environment_backend},
             }
         if arm == "nodewise_checkpoint_finalize":
+            output_parent = nodewise_output_state.parent
+            output_root = (
+                output_parent.parent if output_parent.name == "artifacts" else output_parent
+            )
+            audit_root = output_root / "runtime-audit"
             return {
                 "import_path": "roy_research.harbor_agent:NodewiseCheckpointFinalizeAgent",
                 "model_name": "deepseek/deepseek-v4-flash",
@@ -266,6 +271,7 @@ def write_harbor_group_config(
                     "ROY_LHTB_ARM": "learned_information_realization",
                     "ROY_LHTB_INITIAL_FINGERPRINT": initial_fingerprint,
                     "ROY_LHTB_ORGANIZATION_SEED": str(organization_seed),
+                    "ROY_LHTB_AUDIT_ROOT": str(audit_root),
                 },
             }
         kwargs: Dict[str, Any] = {"rpc_timeout": 720}

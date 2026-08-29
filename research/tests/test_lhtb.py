@@ -656,6 +656,10 @@ for line in sys.stdin:
             )
             self.assertEqual(nodewise_value["agents"][0]["kwargs"]["macro_steps"], 0)
             self.assertEqual(nodewise_value["agents"][0]["kwargs"]["organization_seed"], 1)
+            self.assertEqual(
+                nodewise_value["agents"][0]["env"]["ROY_LHTB_AUDIT_ROOT"],
+                str(Path(directory) / "runtime-audit"),
+            )
 
             safe = Path(directory) / "safe.json"
             write_harbor_group_config(
