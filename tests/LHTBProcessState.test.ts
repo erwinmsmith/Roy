@@ -1200,6 +1200,184 @@ describe('LHTB process state', () => {
     }
   });
 
+  it('executes DERIVE_INFO through one child acquisition macro boundary', async () => {
+    const session = new RoyLHTBSession('info-macro', 'task', 'inspect and solve', 'commit',
+      'learned_information_realization');
+    const childSpecification = {
+      id: 'spec-info', nodeId: 'info-child', parentId: 'root', depth: 1,
+      parentGoal: 'inspect and solve', triggeringGapId: 'root-task-requirement',
+      realizationMode: 'acquire_external' as const,
+      localObjective: 'Inspect one missing environmental fact.', refinement: {
+        parentScope: 'inspect and solve', childScope: 'inspect one fact',
+        triggeringRequirementId: 'root-task-requirement', narrowerThanParent: true,
+        newInformationNeeded: 'one environmental fact',
+        executableEndCondition: 'one terminal observation is recorded',
+        duplicatedByExistingNode: false,
+      }, requiredClaims: [], requiredEvidence: [], relevantReportIds: [],
+      externalAccess: { allowed: true, tools: ['terminal'], purpose: 'inspect' },
+      expectedOutput: { requiredInformation: 'one verified fact',
+        outputType: 'epistemic_report' as const },
+      terminationCondition: 'record the observation',
+      reuseReview: { searchedNodeIds: [], decision: 'spawn_distinct' as const,
+        reason: 'no spawned agent exists' },
+    };
+    let calls = 0;
+    const provider = { isConfigured: () => true, async completeJSONWithUsage(messages: Array<{
+      content: string;
+    }>) {
+      calls += 1;
+      const request = JSON.parse(messages.at(-1)?.content ?? '{}') as Record<string, unknown>;
+      const selected = String(request.selectedControllerAction);
+      const candidate = selected === 'CONTINUE' ? {
+        id: 'info-acquire', kind: 'ACQUIRE', actorNodeId: 'info-child',
+        description: 'inspect one fact', schedulerComplexity: 1, command: 'printf fact',
+        action: { kind: 'ACQUIRE', actorNodeId: 'info-child' },
+      } : {
+        id: 'derive-info', kind: 'DERIVE', actorNodeId: 'root',
+        description: 'derive an information child', schedulerComplexity: 1,
+        action: { kind: 'DERIVE', actorNodeId: 'root', childSpecification },
+      };
+      return { value: { preferred_candidate_id: candidate.id, candidates: [candidate] },
+        completion: { content: '{}', model: 'mock', usage: {
+          promptTokens: 1, completionTokens: 1, totalTokens: 2,
+        } } };
+    } };
+    const semantic = { async processEvent(event: { id: string }) {
+      return { event_id: event.id, requirements: [], claims: [], assumptions: [], evidence: [],
+        external_observations: [], blind_spots: [], relations: [] };
+    }, close() {} };
+    const learnedPolicy = { async select(policyState: Record<string, unknown>, candidates: Array<{
+      id: string; kind: string;
+    }>) {
+      const candidate = candidates.find(value => value.kind === 'DERIVE_INFO')!;
+      return { candidate, record: { stateFingerprint: String(policyState.state_fingerprint),
+        contextNodeId: 'root', candidateId: candidate.id, maskedOldLogProbability: 0,
+        envelopeId: 'lhtb-open', behaviorPolicy: 'actor', policyState } };
+    }, close() {} };
+    const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false,
+      learnedPolicy: learnedPolicy as never });
+    try {
+      const result = await controller.advanceMacro(session, 19);
+      expect(result.status).toBe('terminal_request');
+      if (result.status !== 'terminal_request') throw new Error('expected terminal request');
+      expect(result.request.nodeId).toBe('info-child');
+      expect(result.controllerActionKind).toBe('DERIVE_INFO');
+      expect(calls).toBe(2);
+      expect(session.snapshot().policyRecords).toHaveLength(1);
+    } finally {
+      controller.close();
+    }
+  });
+
+  it('executes DERIVE_ORG through a child report integration macro boundary', async () => {
+    const session = new RoyLHTBSession('org-macro', 'task', 'synthesize and solve', 'commit',
+      'learned_information_realization');
+    const childSpecification = {
+      id: 'spec-org', nodeId: 'org-child', parentId: 'root', depth: 1,
+      parentGoal: 'synthesize and solve', triggeringGapId: 'root-task-requirement',
+      realizationMode: 'organize_knowledge' as const,
+      localObjective: 'Synthesize the represented evidence.', refinement: {
+        parentScope: 'synthesize and solve', childScope: 'synthesize represented evidence',
+        triggeringRequirementId: 'root-task-requirement', narrowerThanParent: true,
+        newInformationNeeded: 'none; organize represented evidence',
+        executableEndCondition: 'one report is integrated', duplicatedByExistingNode: false,
+      }, requiredClaims: [], requiredEvidence: [], relevantReportIds: [],
+      externalAccess: { allowed: false, tools: [] },
+      expectedOutput: { requiredInformation: 'organized conclusion',
+        outputType: 'epistemic_report' as const },
+      terminationCondition: 'return one synthesis report',
+      reuseReview: { searchedNodeIds: [], decision: 'spawn_distinct' as const,
+        reason: 'no spawned agent exists' },
+    };
+    const report = { id: 'org-report', nodeId: 'org-child', parentId: 'root', depth: 1,
+      localObjective: childSpecification.localObjective,
+      triggeringGapId: 'root-task-requirement', conclusion: 'organized conclusion',
+      reasoningSummary: 'represented evidence was synthesized', claims: [], evidence: [],
+      externalObservations: [], assumptions: [], uncertainty: { confidence: 0.7,
+        uncertainAbout: [], confidenceBasis: 'represented evidence' }, conflicts: [],
+      coverage: { resolved: ['root-task-requirement'], unresolved: [], notExamined: [] },
+      blindSpots: [], residualRequirements: [], proposedChildren: [], resolvedParentGap: true,
+      informationToPropagate: ['organized conclusion'],
+    };
+    let calls = 0;
+    const provider = { isConfigured: () => true, async completeJSONWithUsage(messages: Array<{
+      content: string;
+    }>) {
+      calls += 1;
+      const request = JSON.parse(messages.at(-1)?.content ?? '{}') as Record<string, unknown>;
+      const selected = String(request.selectedControllerAction);
+      const candidate = selected === 'RETURN' ? {
+        id: 'org-return', kind: 'RETURN', actorNodeId: 'org-child',
+        description: 'integrate the synthesis', schedulerComplexity: 0,
+        action: { kind: 'RETURN', actorNodeId: 'org-child', report },
+      } : {
+        id: 'derive-org', kind: 'DERIVE', actorNodeId: 'root',
+        description: 'derive an organization child', schedulerComplexity: 1,
+        action: { kind: 'DERIVE', actorNodeId: 'root', childSpecification },
+      };
+      return { value: { preferred_candidate_id: candidate.id, candidates: [candidate] },
+        completion: { content: '{}', model: 'mock', usage: {
+          promptTokens: 1, completionTokens: 1, totalTokens: 2,
+        } } };
+    } };
+    const semantic = { async processEvent(event: { id: string }) {
+      return { event_id: event.id, requirements: [], claims: [], assumptions: [], evidence: [],
+        external_observations: [], blind_spots: [], relations: [] };
+    }, close() {} };
+    const learnedPolicy = { async select(policyState: Record<string, unknown>, candidates: Array<{
+      id: string; kind: string;
+    }>) {
+      const candidate = candidates.find(value => value.kind === 'DERIVE_ORG')!;
+      return { candidate, record: { stateFingerprint: String(policyState.state_fingerprint),
+        contextNodeId: 'root', candidateId: candidate.id, maskedOldLogProbability: 0,
+        envelopeId: 'lhtb-open', behaviorPolicy: 'actor', policyState } };
+    }, close() {} };
+    const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false,
+      learnedPolicy: learnedPolicy as never });
+    try {
+      const result = await controller.advanceMacro(session, 23);
+      expect(result.status).toBe('continue');
+      expect(result.controllerActionKind).toBe('DERIVE_ORG');
+      expect(calls).toBe(2);
+      expect(session.snapshot().policyRecords).toHaveLength(1);
+      expect(session.snapshot().runtime.nodes.find(node => node.id === 'org-child')?.status)
+        .toBe('returned');
+      expect(session.snapshot().runtime.reports.map(value => value.id)).toContain('org-report');
+    } finally {
+      controller.close();
+    }
+  });
+
+  it('uses frozen finalize-now for one root conversion without an actor decision', async () => {
+    const session = new RoyLHTBSession('finalize-a0', 'task', 'finish the artifact', 'commit',
+      'learned_information_realization');
+    const provider = { isConfigured: () => true, async completeJSONWithUsage() {
+      const candidate = { id: 'finalize-execute', kind: 'EXECUTE', actorNodeId: 'root',
+        description: 'materialize the represented solution', schedulerComplexity: 1,
+        command: 'printf done > result.txt',
+        action: { kind: 'EXECUTE', actorNodeId: 'root' } };
+      return { value: { preferred_candidate_id: candidate.id, candidates: [candidate] },
+        completion: { content: '{}', model: 'mock', usage: {
+          promptTokens: 1, completionTokens: 1, totalTokens: 2,
+        } } };
+    } };
+    const semantic = { async processEvent(event: { id: string }) {
+      return { event_id: event.id, requirements: [], claims: [], assumptions: [], evidence: [],
+        external_observations: [], blind_spots: [], relations: [] };
+    }, close() {} };
+    const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false });
+    try {
+      const result = await controller.advanceFinalizeNow(session);
+      expect(result.status).toBe('terminal_request');
+      if (result.status !== 'terminal_request') throw new Error('expected terminal request');
+      expect(result.request.nodeId).toBe('root');
+      expect(result.request.command).toContain('result.txt');
+      expect(session.snapshot().policyRecords).toHaveLength(0);
+    } finally {
+      controller.close();
+    }
+  });
+
   it('projects cumulative terminal text for the proposer without mutating M_t', async () => {
     const session = new RoyLHTBSession('projection', 'task', 'finish', 'commit',
       'roy_runtime_heuristic');

@@ -8,6 +8,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import time
 import urllib.error
@@ -778,6 +779,31 @@ class NativeProcessEnvironment(BaseEnvironment):
             shutil.copytree, source, destination,
             dirs_exist_ok=True, symlinks=True,
         )
+
+    async def snapshot_workspace_files(self, cwd: str | None = None) -> Mapping[str, str]:
+        """Observe native workspace files without creating a task command."""
+        working_directory = cwd or str(
+            self._manifest.get("working_directory", "/app")  # type: ignore[union-attr]
+        )
+        root = self._mounted_path(working_directory)
+
+        def collect() -> dict[str, str]:
+            values: dict[str, str] = {}
+            if not root.exists():
+                return values
+            for path in sorted(root.rglob("*")):
+                try:
+                    stat_value = path.lstat()
+                except OSError:
+                    continue
+                if not stat.S_ISREG(stat_value.st_mode):
+                    continue
+                values[str(path.relative_to(root))] = (
+                    f"{stat_value.st_size}\t{stat_value.st_mtime_ns}"
+                )
+            return values
+
+        return await asyncio.to_thread(collect)
 
     def _command(self, command: str, cwd: str | None, env: Mapping[str, str],
                  execution_uid: int | None = None) -> list[str]:

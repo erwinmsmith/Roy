@@ -79,11 +79,21 @@ async function dispatch(request: Request): Promise<unknown> {
           observation: `${result.stdout}${result.stderr}`,
           provenance: `harbor:${before.id}:exit-${result.exitCode}`, supports: [] } });
     }
+    controller ??= new LHTBAutonomousController();
+    await controller.prepareDecisionBoundary(session);
     return { status: 'ready', snapshot: session.snapshot() };
   }
-  if (request.method === 'advance' || request.method === 'advance_one') {
+  if (request.method === 'advance') {
     controller ??= new LHTBAutonomousController();
     return controller.advance(session, organizationSeed++);
+  }
+  if (request.method === 'advance_one') {
+    controller ??= new LHTBAutonomousController();
+    return controller.advanceMacro(session, organizationSeed++);
+  }
+  if (request.method === 'finalize_now') {
+    controller ??= new LHTBAutonomousController();
+    return controller.advanceFinalizeNow(session);
   }
   if (request.method === 'verifier_rejection') {
     session.resumeAfterVerifierRejection(String(params.feedback ?? 'Verifier rejected completion'));

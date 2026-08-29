@@ -21,7 +21,8 @@ from .organization_replay import replay_joint_log_probabilities
 from .value_model import EpistemicValueModel, LHTB_VALUE_MODEL_REVISION
 
 
-NODEWISE_ALGORITHM_REVISION = "forced-finalize-delta-v-nodewise-grpo-v1"
+NODEWISE_ALGORITHM_REVISION = "forced-finalize-delta-v-nodewise-grpo-v2"
+FINALIZER_REVISION = "frozen-one-root-conversion-a0-v2"
 FINALIZE_LABEL_SCHEMA_VERSION = 1
 MACRO_GROUP_SCHEMA_VERSION = 1
 NODEWISE_GROUP_SIZE = 8
@@ -174,6 +175,7 @@ def import_nodewise_macro_group(
         seeds.add(seed)
         successor_state = loaded["state"]
         action = str(policy_record["selected_action"])
+        _validate_macro_transition(action, base_state, successor_state, index)
         records.append({
             "schema_version": MACRO_GROUP_SCHEMA_VERSION,
             "group_id": group_id,
@@ -249,6 +251,12 @@ def _load_nodewise_run(path: Path) -> Dict[str, Any]:
     result_path, result = results[0]
     if result.get("exception_info"):
         raise ValueError("node-wise Harbor result contains an exception")
+    metadata = _result_agent_metadata(result)
+    if metadata.get("nodewise_protocol") \
+            != "same_checkpoint_single_node_macro_action_v1":
+        raise ValueError("node-wise Harbor result has no macro protocol provenance")
+    if metadata.get("finalizer_revision") != FINALIZER_REVISION:
+        raise ValueError("node-wise Harbor result uses another frozen finalizer")
     return {
         key: json.loads(value.read_text(encoding="utf-8"))
         for key, value in required.items()
@@ -305,7 +313,7 @@ def _nodewise_value_label(
         split=split,
         process_state=state,
         task_utilities=[float(loaded["utility"])],
-        finalizer_revision="artifact-identity-a0-v1",
+        finalizer_revision=FINALIZER_REVISION,
         task_checksum=str(loaded["result"].get("task_checksum") or ""),
         environment_digest=environment_digest,
         checkpoint_id=str(checkpoint.get("payload_digest") or ""),
@@ -351,11 +359,61 @@ def _normalize_policy_record(record: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _result_agent_metadata(result: Mapping[str, Any]) -> Mapping[str, Any]:
+    if isinstance(result.get("agent_result"), Mapping):
+        return result["agent_result"].get("metadata") or {}
+    for step in reversed(result.get("step_results") or []):
+        if isinstance(step, Mapping) and isinstance(step.get("agent_result"), Mapping):
+            return step["agent_result"].get("metadata") or {}
+    return {}
+
+
+def _validate_macro_transition(
+    action: str,
+    base_state: Mapping[str, Any],
+    successor_state: Mapping[str, Any],
+    sample_index: int,
+) -> None:
+    base_nodes = list(base_state.get("nodes") or [])
+    successor_nodes = list(successor_state.get("nodes") or [])
+    node_delta = len(successor_nodes) - len(base_nodes)
+    if node_delta > 1:
+        raise ValueError(f"sample {sample_index} creates more than one node per action")
+    if action not in {"DERIVE_INFO", "DERIVE_ORG"}:
+        return
+    if node_delta != 1:
+        raise ValueError(f"sample {sample_index} DERIVE did not create exactly one child")
+    base_ids = {str(value.get("id")) for value in base_nodes}
+    children = [value for value in successor_nodes if str(value.get("id")) not in base_ids]
+    child = children[0]
+    if action == "DERIVE_INFO":
+        if len(successor_state.get("externalObservations") or []) \
+                <= len(base_state.get("externalObservations") or []):
+            raise ValueError(
+                f"sample {sample_index} DERIVE_INFO child completed no acquisition phase"
+            )
+        return
+    represented_fields = (
+        "claims", "evidence", "assumptions", "semanticRelations", "blindSpots"
+    )
+    represented_delta = any(
+        len(successor_state.get(field) or []) > len(base_state.get(field) or [])
+        for field in represented_fields
+    )
+    if child.get("status") != "returned" or not child.get("reportId") \
+            or not represented_delta:
+        raise ValueError(
+            f"sample {sample_index} DERIVE_ORG child completed no integrated report phase"
+        )
+
+
 def _macro_boundary(
     action: str, base_state: Mapping[str, Any], successor_state: Mapping[str, Any]
 ) -> str:
     if action == "FINISH":
         return "official_verifier_complete"
+    if action == "DERIVE_ORG":
+        return "parent_report_integrated"
     if action == "RETURN":
         return "parent_report_integrated"
     if action == "PRUNE":

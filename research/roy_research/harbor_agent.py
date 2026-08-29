@@ -543,23 +543,30 @@ class NodewiseCheckpointFinalizeAgent(BaseAgent):
         if not base_states or not str(base_states[-1].get("fingerprint") or ""):
             raise RuntimeError("node-wise base is not a fingerprinted decision boundary")
         base_fingerprint = str(base_states[-1]["fingerprint"])
+        macro_terminal_commands = 0
         if self.macro_steps == 1:
             response = await asyncio.to_thread(self.rpc.request, "advance_one", {})
             if response.get("status") == "terminal_request":
                 request = dict(response["request"])
                 started = time.monotonic()
+                before_files = await self._file_snapshot(environment, request.get("cwd"))
                 result = await environment.exec(
                     str(request["command"]), cwd=request.get("cwd"),
                     timeout_sec=max(1, int(float(request.get("timeoutMs", 120_000)) / 1000)),
                 )
+                after_files = await self._file_snapshot(environment, request.get("cwd"))
                 response = await asyncio.to_thread(self.rpc.request, "resume_boundary", {
                     "result": {
                         "requestId": request["id"], "exitCode": result.return_code,
                         "stdout": result.stdout or "", "stderr": result.stderr or "",
                         "durationMs": int((time.monotonic() - started) * 1000),
-                        "fileChanges": [],
+                        "fileChanges": sorted(
+                            path for path in set(before_files).union(after_files)
+                            if before_files.get(path) != after_files.get(path)
+                        ),
                     },
                 })
+                macro_terminal_commands += 1
         snapshot = dict(response.get("snapshot") or self.rpc.last_snapshot or {})
         states = list(snapshot.get("processStates") or [])
         if not states:
@@ -583,7 +590,38 @@ class NodewiseCheckpointFinalizeAgent(BaseAgent):
         if not callable(checkpoint):
             raise RuntimeError("node-wise output requires a clonable environment backend")
         checkpoint_audit = await checkpoint(self.output_checkpoint_path, fingerprint)
-        usage = dict(state.get("usage") or {})
+        finalizer_steps = 0
+        finalizer_terminal_commands = 0
+        while finalizer_steps < 16:
+            finalizer = await asyncio.to_thread(self.rpc.request, "finalize_now", {})
+            finalizer_steps += 1
+            if finalizer.get("status") == "terminal_request":
+                request = dict(finalizer["request"])
+                started = time.monotonic()
+                result = await environment.exec(
+                    str(request["command"]), cwd=request.get("cwd"),
+                    timeout_sec=max(
+                        1, int(float(request.get("timeoutMs", 120_000)) / 1000)
+                    ),
+                )
+                await asyncio.to_thread(self.rpc.request, "resume_boundary", {
+                    "result": {
+                        "requestId": request["id"], "exitCode": result.return_code,
+                        "stdout": result.stdout or "", "stderr": result.stderr or "",
+                        "durationMs": int((time.monotonic() - started) * 1000),
+                        "fileChanges": [],
+                    },
+                })
+                finalizer_terminal_commands += 1
+                break
+            if finalizer.get("status") == "completed":
+                break
+            if finalizer.get("status") != "continue":
+                raise RuntimeError("frozen finalize-now returned an invalid boundary")
+        else:
+            raise RuntimeError("frozen finalize-now exceeded its integration step limit")
+        latest_states = list((self.rpc.last_snapshot or {}).get("processStates") or [])
+        usage = dict((latest_states[-1] if latest_states else state).get("usage") or {})
         context.n_input_tokens = int(usage.get("inputTokens", 0))
         context.n_output_tokens = int(usage.get("outputTokens", 0))
         context.metadata = {
@@ -599,7 +637,19 @@ class NodewiseCheckpointFinalizeAgent(BaseAgent):
             "process_state_path": str(self.output_state_path),
             "environment_checkpoint_path": str(self.output_checkpoint_path),
             "checkpoint_audit": dict(checkpoint_audit),
+            "macro_terminal_commands": macro_terminal_commands,
+            "finalizer_policy": "frozen_finalize_now_no_structural_actions",
+            "finalizer_revision": "frozen-one-root-conversion-a0-v2",
+            "finalizer_worker_steps": finalizer_steps,
+            "finalizer_terminal_commands": finalizer_terminal_commands,
         }
+
+    @staticmethod
+    async def _file_snapshot(environment: Any, cwd: str | None) -> Dict[str, str]:
+        snapshot = getattr(environment, "snapshot_workspace_files", None)
+        if callable(snapshot):
+            return dict(await snapshot(cwd))
+        return {}
 
     @staticmethod
     def _write_json(path: Path, value: Mapping[str, Any]) -> None:

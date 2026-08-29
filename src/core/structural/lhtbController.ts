@@ -288,11 +288,12 @@ export function topologySamplingCandidateLogitBias(
   return 0;
 }
 
-export type ControllerResult =
+export type ControllerResult = (
   | { status: 'terminal_request'; request: { id: string; command: string; cwd?: string;
     timeoutMs: number; nodeId: string }; snapshot: ReturnType<RoyLHTBSession['snapshot']> }
   | { status: 'continue'; snapshot: ReturnType<RoyLHTBSession['snapshot']> }
-  | { status: 'completed'; snapshot: ReturnType<RoyLHTBSession['snapshot']> };
+  | { status: 'completed'; snapshot: ReturnType<RoyLHTBSession['snapshot']> }
+) & { controllerActionKind?: StructuralControllerActionKind };
 
 interface ControllerProvider {
   isConfigured(): boolean;
@@ -982,6 +983,61 @@ export class LHTBAutonomousController {
       : { status: 'continue', snapshot: result };
   }
 
+  /** Execute one sampled Controller action through its meaningful SMDP boundary. */
+  async advanceMacro(session: RoyLHTBSession, seed: number): Promise<ControllerResult> {
+    const controllerResult = await this.advance(session, seed);
+    const kind = controllerResult.controllerActionKind;
+    if (kind !== 'DERIVE_INFO' && kind !== 'DERIVE_ORG') return controllerResult;
+    if (controllerResult.status !== 'continue') {
+      throw new Error(`${kind} did not leave a live child Worker boundary`);
+    }
+    await this.prepareDecisionBoundary(session);
+    const snapshot = session.snapshot();
+    const contextNodeId = scheduledOrganizationContextNode(snapshot);
+    const contextNode = snapshot.runtime.nodes.find(node => node.id === contextNodeId);
+    const expectedMode = kind === 'DERIVE_INFO' ? 'acquire_external' : 'organize_knowledge';
+    if (!contextNode || contextNode.id === snapshot.runtime.rootId
+      || contextNode.specification?.realizationMode !== expectedMode) {
+      throw new Error(`${kind} did not schedule its newly derived child Worker`);
+    }
+    const selectedKind: StructuralControllerActionKind = kind === 'DERIVE_INFO'
+      ? 'CONTINUE' : 'RETURN';
+    const worker = await this.materializeWorkerPayload(
+      session, snapshot, compactEpistemicWorkingState(snapshot), selectedKind,
+      kind === 'DERIVE_INFO' ? ['ACQUIRE'] : ['RETURN'],
+    );
+    if (worker.actorNodeId !== contextNodeId) {
+      throw new Error(`${kind} Worker payload was materialized for another node`);
+    }
+    const result = this.applyMaterializedWorkerPayload(
+      session, snapshot, worker, undefined, kind,
+    );
+    if (result.status === 'terminal_request') return result;
+    await this.prepareDecisionBoundary(session);
+    return { ...result, snapshot: session.snapshot() };
+  }
+
+  /** Frozen A0 readout: integrate existing children, then perform one root conversion step. */
+  async advanceFinalizeNow(session: RoyLHTBSession): Promise<ControllerResult> {
+    await this.prepareDecisionBoundary(session);
+    const snapshot = session.snapshot();
+    if (snapshot.runtime.stopped) return { status: 'completed', snapshot };
+    const contextNodeId = scheduledOrganizationContextNode(snapshot);
+    const isRoot = contextNodeId === snapshot.runtime.rootId;
+    const selectedKind: StructuralControllerActionKind = isRoot ? 'CONTINUE' : 'RETURN';
+    const worker = await this.materializeWorkerPayload(
+      session, snapshot, compactEpistemicWorkingState(snapshot), selectedKind,
+      isRoot ? ['EXECUTE'] : ['RETURN'],
+    );
+    if (worker.actorNodeId !== contextNodeId) {
+      throw new Error('Frozen finalize-now Worker payload was materialized for another node');
+    }
+    const result = this.applyMaterializedWorkerPayload(session, snapshot, worker);
+    if (result.status === 'terminal_request') return result;
+    await this.prepareDecisionBoundary(session);
+    return { ...result, snapshot: session.snapshot() };
+  }
+
   /** Complete deterministic/frozen semantic projection before actor sampling. */
   async prepareDecisionBoundary(session: RoyLHTBSession): Promise<void> {
     for (const event of session.unprocessedSemanticEvents()) {
@@ -1018,6 +1074,18 @@ export class LHTBAutonomousController {
       session, snapshot, requestState, decision.candidate.kind
     );
     decision.record.selectedSpawnMode = selected.action.childSpecification?.realizationMode;
+    return this.applyMaterializedWorkerPayload(
+      session, snapshot, selected, decision.record, decision.candidate.kind,
+    );
+  }
+
+  private applyMaterializedWorkerPayload(
+    session: RoyLHTBSession,
+    snapshot: ReturnType<RoyLHTBSession['snapshot']>,
+    selected: ProposedCandidate,
+    policyRecord?: OrganizationPolicyRecord,
+    controllerActionKind?: StructuralControllerActionKind,
+  ): ControllerResult {
     if (selected.kind === 'ACQUIRE' || selected.kind === 'EXECUTE') {
       if (!selected.command?.trim()) {
         throw new Error(`${selected.kind} Worker payload requires a terminal command`);
@@ -1026,14 +1094,16 @@ export class LHTBAutonomousController {
         command: selected.command, cwd: selected.cwd, timeoutMs: selected.timeoutMs ?? 120_000,
         nodeId: selected.actorNodeId, organizationActionKind: selected.kind };
       session.requestTerminal(request);
-      session.recordPolicyDecision(decision.record);
-      return { status: 'terminal_request', request, snapshot: session.snapshot() };
+      if (policyRecord) session.recordPolicyDecision(policyRecord);
+      return { status: 'terminal_request', request, snapshot: session.snapshot(),
+        controllerActionKind };
     }
     session.applyOrganizationAction(selected.action);
-    session.recordPolicyDecision(decision.record);
+    if (policyRecord) session.recordPolicyDecision(policyRecord);
     const result = session.snapshot();
-    return result.runtime.stopped ? { status: 'completed', snapshot: result }
-      : { status: 'continue', snapshot: result };
+    return result.runtime.stopped
+      ? { status: 'completed', snapshot: result, controllerActionKind }
+      : { status: 'continue', snapshot: result, controllerActionKind };
   }
 
   /** Runtime legality only; frozen Worker preference must never define actor support. */
@@ -1075,6 +1145,7 @@ export class LHTBAutonomousController {
     snapshot: ReturnType<RoyLHTBSession['snapshot']>,
     requestState: Record<string, unknown>,
     selectedKind: StructuralControllerActionKind,
+    requiredRuntimeKindsOverride?: OrganizationCandidate['kind'][],
   ): Promise<ProposedCandidate> {
     if (selectedKind === 'FINISH') {
       return { id: 'worker:finish-official-verifier', kind: 'STOP',
@@ -1134,8 +1205,9 @@ export class LHTBAutonomousController {
       completion.completion.model);
       const validation = this.validateCandidates(completion.value, session);
       await this.auditCandidateValidation(validation);
+      const requiredKinds = requiredRuntimeKindsOverride ?? requiredRuntimeKinds[selectedKind];
       const matching = validation.candidates.filter(candidate =>
-        requiredRuntimeKinds[selectedKind].includes(candidate.kind)
+        requiredKinds.includes(candidate.kind)
         && controllerActionForCandidate(candidate) === selectedKind);
       const selected = matching.find(candidate =>
         candidate.id === completion.value.preferred_candidate_id) ?? matching[0];
@@ -1638,6 +1710,20 @@ export class LHTBAutonomousController {
         actionValue.report = raw.report;
       }
       if (kind === 'RETURN') normalizeReturnReportCollections(actionValue, actorNodeId);
+      if (kind === 'RETURN') {
+        const actor = snapshot.runtime.nodes.find(node => node.id === actorNodeId);
+        const report = actionValue.report && typeof actionValue.report === 'object'
+          ? actionValue.report as Record<string, unknown> : undefined;
+        if (!report || typeof report.conclusion !== 'string' || !report.conclusion.trim()) {
+          reasons.push('return_report_missing_conclusion');
+        }
+        if (actor?.specification?.realizationMode === 'organize_knowledge') {
+          const represented = ['claims', 'evidence', 'assumptions', 'blindSpots',
+            'residualRequirements', 'informationToPropagate'].some(field =>
+            Array.isArray(report?.[field]) && (report?.[field] as unknown[]).length > 0);
+          if (!represented) reasons.push('organization_report_has_no_represented_information');
+        }
+      }
       const explicitActionKind = typeof actionValue.kind === 'string' ? actionValue.kind
         : typeof actionValue.type === 'string' ? actionValue.type : undefined;
       const explicitActionActor = typeof actionValue.actorNodeId === 'string'

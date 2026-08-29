@@ -356,6 +356,10 @@ class NodeWiseDeltaVTests(unittest.TestCase):
         (trial / "result.json").write_text(json.dumps({
             "task_checksum": "task-sha",
             "exception_info": None,
+            "agent_result": {"metadata": {
+                "nodewise_protocol": "same_checkpoint_single_node_macro_action_v1",
+                "finalizer_revision": "frozen-one-root-conversion-a0-v2",
+            }},
             "verifier_result": {"rewards": {"reward": utility}},
         }))
 
