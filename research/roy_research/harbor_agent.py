@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 import hashlib
+import inspect
 from pathlib import Path
 from typing import Any, Dict, Mapping, Sequence
 
@@ -589,7 +590,13 @@ class NodewiseCheckpointFinalizeAgent(BaseAgent):
         checkpoint = getattr(environment, "create_training_checkpoint", None)
         if not callable(checkpoint):
             raise RuntimeError("node-wise output requires a clonable environment backend")
-        checkpoint_audit = await checkpoint(self.output_checkpoint_path, fingerprint)
+        checkpoint_parameters = inspect.signature(checkpoint).parameters
+        if "reuse_matching" in checkpoint_parameters:
+            checkpoint_audit = await checkpoint(
+                self.output_checkpoint_path, fingerprint, reuse_matching=True
+            )
+        else:
+            checkpoint_audit = await checkpoint(self.output_checkpoint_path, fingerprint)
         finalizer_steps = 0
         finalizer_terminal_commands = 0
         while finalizer_steps < 16:

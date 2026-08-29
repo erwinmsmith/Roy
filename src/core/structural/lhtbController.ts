@@ -1160,6 +1160,11 @@ export class LHTBAutonomousController {
       CONTINUE: ['ACQUIRE', 'CONNECT', 'EXECUTE'],
       DERIVE_INFO: ['DERIVE'], DERIVE_ORG: ['DERIVE'], PRUNE: ['PRUNE'], RETURN: ['RETURN'],
     };
+    const selectedRuntimeKinds = requiredRuntimeKindsOverride ?? requiredRuntimeKinds[selectedKind];
+    const runtimeKindConstraint = requiredRuntimeKindsOverride
+      ? `This frozen macro boundary requires exactly one of these Runtime payload kinds: `
+        + `${selectedRuntimeKinds.join(', ')}. Payloads of every other Runtime kind are invalid. `
+      : '';
     const semanticBoundary = selectedKind === 'DERIVE_INFO'
       ? 'The child may only acquire a specific missing external observation, fact, measurement, or piece of evidence through an allowed tool/environment. It must not implement the task, edit the deliverable, organize all existing knowledge, or take ownership of the parent objective.'
       : selectedKind === 'DERIVE_ORG'
@@ -1171,7 +1176,8 @@ export class LHTBAutonomousController {
             : 'Return only this node evidence-grounded report to its parent; do not perform other work.';
     const selectedInstruction = `The shared Controller has already selected ${selectedKind}. `
       + `Return concise Runtime payloads only for this selected category. Do not choose another `
-      + `Controller action. ${semanticBoundary} For DERIVE, realizationMode must be `
+      + `Controller action. ${runtimeKindConstraint}${semanticBoundary} `
+      + `For DERIVE, realizationMode must be `
       + `${selectedKind === 'DERIVE_INFO' ? 'acquire_external'
         : selectedKind === 'DERIVE_ORG' ? 'organize_knowledge' : 'unchanged'}.`;
     const messages: LLMMessage[] = [{ role: 'system', content: PROPOSER_PROMPT },
@@ -1205,9 +1211,8 @@ export class LHTBAutonomousController {
       completion.completion.model);
       const validation = this.validateCandidates(completion.value, session);
       await this.auditCandidateValidation(validation);
-      const requiredKinds = requiredRuntimeKindsOverride ?? requiredRuntimeKinds[selectedKind];
       const matching = validation.candidates.filter(candidate =>
-        requiredKinds.includes(candidate.kind)
+        selectedRuntimeKinds.includes(candidate.kind)
         && controllerActionForCandidate(candidate) === selectedKind);
       const selected = matching.find(candidate =>
         candidate.id === completion.value.preferred_candidate_id) ?? matching[0];

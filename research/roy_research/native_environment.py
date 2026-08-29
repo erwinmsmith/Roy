@@ -208,7 +208,8 @@ class NativeProcessEnvironment(BaseEnvironment):
         audit_path.write_text(json.dumps(audit, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     async def create_training_checkpoint(
-        self, destination: Path | str, source_state_fingerprint: str
+        self, destination: Path | str, source_state_fingerprint: str,
+        *, reuse_matching: bool = False,
     ) -> Mapping[str, Any]:
         """Record a restorable clone or an isolated non-restorable observation.
 
@@ -226,6 +227,20 @@ class NativeProcessEnvironment(BaseEnvironment):
                 raise RuntimeError("native checkpoint requires an idle command boundary")
         target = Path(destination).expanduser().resolve()
         if target.exists():
+            manifest_path = target / "checkpoint.json"
+            payload = target / "payload"
+            if reuse_matching and manifest_path.is_file() and payload.is_dir():
+                existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if (
+                    existing.get("complete") is True
+                    and existing.get("task_id") == self.native_task_id
+                    and existing.get("source_state_fingerprint")
+                    == source_state_fingerprint
+                    and existing.get("source_environment_digest")
+                    == self.environment_digest
+                    and existing.get("payload_digest") == tree_digest(payload)
+                ):
+                    return {**existing, "reused_matching_retry_checkpoint": True}
             raise RuntimeError(f"refusing to overwrite native checkpoint {target}")
         if target == self.session_root or target.is_relative_to(self.session_root):
             raise ValueError("native checkpoint must be outside its source session")

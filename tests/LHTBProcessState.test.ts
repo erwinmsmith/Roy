@@ -1351,7 +1351,23 @@ describe('LHTB process state', () => {
   it('uses frozen finalize-now for one root conversion without an actor decision', async () => {
     const session = new RoyLHTBSession('finalize-a0', 'task', 'finish the artifact', 'commit',
       'learned_information_realization');
-    const provider = { isConfigured: () => true, async completeJSONWithUsage() {
+    let calls = 0;
+    const provider = { isConfigured: () => true, async completeJSONWithUsage(messages: Array<{
+      content: string;
+    }>) {
+      calls += 1;
+      const request = JSON.parse(messages.at(-1)?.content ?? '{}') as Record<string, unknown>;
+      const instruction = String(request.selectedControllerInstruction ?? '');
+      if (calls === 1) {
+        expect(instruction).toContain('requires exactly one of these Runtime payload kinds: EXECUTE');
+        const acquire = { id: 'wrong-acquire', kind: 'ACQUIRE', actorNodeId: 'root',
+          description: 'inspect instead of convert', schedulerComplexity: 1,
+          command: 'pwd', action: { kind: 'ACQUIRE', actorNodeId: 'root' } };
+        return { value: { preferred_candidate_id: acquire.id, candidates: [acquire] },
+          completion: { content: '{}', model: 'mock', usage: {
+            promptTokens: 1, completionTokens: 1, totalTokens: 2,
+          } } };
+      }
       const candidate = { id: 'finalize-execute', kind: 'EXECUTE', actorNodeId: 'root',
         description: 'materialize the represented solution', schedulerComplexity: 1,
         command: 'printf done > result.txt',
@@ -1372,6 +1388,7 @@ describe('LHTB process state', () => {
       if (result.status !== 'terminal_request') throw new Error('expected terminal request');
       expect(result.request.nodeId).toBe('root');
       expect(result.request.command).toContain('result.txt');
+      expect(calls).toBe(2);
       expect(session.snapshot().policyRecords).toHaveLength(0);
     } finally {
       controller.close();
