@@ -1010,10 +1010,20 @@ export class LHTBAutonomousController {
       CONTINUE: ['ACQUIRE', 'CONNECT', 'EXECUTE'],
       DERIVE_INFO: ['DERIVE'], DERIVE_ORG: ['DERIVE'], PRUNE: ['PRUNE'], RETURN: ['RETURN'],
     };
+    const semanticBoundary = selectedKind === 'DERIVE_INFO'
+      ? 'The child may only acquire a specific missing external observation, fact, measurement, or piece of evidence through an allowed tool/environment. It must not implement the task, edit the deliverable, organize all existing knowledge, or take ownership of the parent objective.'
+      : selectedKind === 'DERIVE_ORG'
+        ? 'The child may only compare, synthesize, verify, disambiguate, or plan from information already represented in Roy. It must not retrieve new external evidence, implement the whole task, edit the final deliverable, or take ownership of the parent objective.'
+        : selectedKind === 'CONTINUE'
+          ? 'The current Worker performs the actual local reasoning, tool use, environment inspection, implementation, or verification. Do not spawn a child in this payload.'
+          : selectedKind === 'PRUNE'
+            ? 'Choose only the concrete low-value non-root branch to remove; do not perform other work.'
+            : 'Return only this node evidence-grounded report to its parent; do not perform other work.';
     const selectedInstruction = `The shared Controller has already selected ${selectedKind}. `
       + `Return concise Runtime payloads only for this selected category. Do not choose another `
-      + `Controller action. For DERIVE, realizationMode must be ${selectedKind === 'DERIVE_INFO'
-        ? 'acquire_external' : selectedKind === 'DERIVE_ORG' ? 'organize_knowledge' : 'unchanged'}.`;
+      + `Controller action. ${semanticBoundary} For DERIVE, realizationMode must be `
+      + `${selectedKind === 'DERIVE_INFO' ? 'acquire_external'
+        : selectedKind === 'DERIVE_ORG' ? 'organize_knowledge' : 'unchanged'}.`;
     const messages: LLMMessage[] = [{ role: 'system', content: PROPOSER_PROMPT },
       { role: 'user', content: JSON.stringify({ ...requestState,
         selectedControllerAction: selectedKind, selectedControllerInstruction: selectedInstruction }) }];
