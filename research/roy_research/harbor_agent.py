@@ -446,6 +446,9 @@ class NodewiseCheckpointFinalizeAgent(BaseAgent):
         self, *args: Any, macro_steps: int,
         output_snapshot_path: str, output_state_path: str,
         output_checkpoint_path: str,
+        organization_seed: int = 20260820,
+        initial_snapshot_fingerprint: str = "",
+        environment_revision: str = "lhtb-pinned",
         source_snapshot_path: str | None = None,
         source_checkpoint_path: str | None = None,
         node_command: str | None = None, rpc_timeout: float = 720.0,
@@ -459,6 +462,9 @@ class NodewiseCheckpointFinalizeAgent(BaseAgent):
         if macro_steps == 1 and not source_snapshot_path:
             raise ValueError("one-step node-wise finalize requires one exact source checkpoint")
         self.macro_steps = macro_steps
+        self.organization_seed = int(organization_seed)
+        self.initial_snapshot_fingerprint = initial_snapshot_fingerprint
+        self.environment_revision = environment_revision
         self.output_snapshot_path = Path(output_snapshot_path).expanduser().resolve()
         self.output_state_path = Path(output_state_path).expanduser().resolve()
         self.output_checkpoint_path = Path(output_checkpoint_path).expanduser().resolve()
@@ -507,9 +513,7 @@ class NodewiseCheckpointFinalizeAgent(BaseAgent):
             response = await asyncio.to_thread(
                 self.rpc.request, "restore", {
                     "snapshot": source_snapshot,
-                    "organizationSeed": int(os.environ.get(
-                        "ROY_LHTB_ORGANIZATION_SEED", "20260820"
-                    )),
+                    "organizationSeed": self.organization_seed,
                 }
             )
         else:
@@ -518,14 +522,10 @@ class NodewiseCheckpointFinalizeAgent(BaseAgent):
                 "trajectoryId": trajectory_id,
                 "taskId": getattr(environment, "environment_name", "unknown"),
                 "instruction": instruction,
-                "environmentRevision": os.environ.get("LHTB_COMMIT", "pinned"),
+                "environmentRevision": self.environment_revision,
                 "organizationMode": "learned_information_realization",
-                "organizationSeed": int(os.environ.get(
-                    "ROY_LHTB_ORGANIZATION_SEED", "20260820"
-                )),
-                "initialSnapshotFingerprint": os.environ.get(
-                    "ROY_LHTB_INITIAL_FINGERPRINT", ""
-                ),
+                "organizationSeed": self.organization_seed,
+                "initialSnapshotFingerprint": self.initial_snapshot_fingerprint,
             })
             response = await asyncio.to_thread(
                 self.rpc.request, "prepare_boundary", {}
@@ -587,6 +587,7 @@ class NodewiseCheckpointFinalizeAgent(BaseAgent):
             "task_utility_role": "value_supervision_only",
             "state_fingerprint": fingerprint,
             "base_decision_fingerprint": base_fingerprint,
+            "organization_seed": self.organization_seed,
             "session_snapshot_path": str(self.output_snapshot_path),
             "process_state_path": str(self.output_state_path),
             "environment_checkpoint_path": str(self.output_checkpoint_path),

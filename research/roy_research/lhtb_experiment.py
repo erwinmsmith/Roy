@@ -256,6 +256,9 @@ def write_harbor_group_config(
                     "output_snapshot_path": str(nodewise_output_snapshot),
                     "output_state_path": str(nodewise_output_state),
                     "output_checkpoint_path": str(nodewise_output_checkpoint),
+                    "organization_seed": organization_seed,
+                    "initial_snapshot_fingerprint": initial_fingerprint,
+                    "environment_revision": "lhtb-pinned",
                     "rpc_timeout": 720,
                 },
                 "env": {

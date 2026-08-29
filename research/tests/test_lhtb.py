@@ -655,6 +655,7 @@ for line in sys.stdin:
                 "roy_research.harbor_agent:NodewiseCheckpointFinalizeAgent",
             )
             self.assertEqual(nodewise_value["agents"][0]["kwargs"]["macro_steps"], 0)
+            self.assertEqual(nodewise_value["agents"][0]["kwargs"]["organization_seed"], 1)
 
             safe = Path(directory) / "safe.json"
             write_harbor_group_config(
