@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import hashlib
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
@@ -11,6 +12,7 @@ from torch import Tensor
 from torch.nn import functional as F
 
 from .lhtb import require_training_task
+from .lhtb_results import official_lhtb_task_utility
 from .lhtb_value_metrics import _state_graph
 from .model import FrozenTextEncoder, graph_tensors
 from .organization import LHTB_POLICY_INTERFACE_REVISION, ORGANIZATION_ACTIONS
@@ -102,6 +104,254 @@ def build_forced_finalize_label(
         "k": len(normalized),
         "value_target": sum(normalized) / len(normalized),
     }
+
+
+def import_nodewise_macro_group(
+    *,
+    base_run: Path,
+    samples_root: Path,
+    group_id: str,
+    task_id: str,
+    split: str,
+    epoch: int,
+    policy_revision: int,
+    value_revision: int,
+    environment_digest: str,
+    expected: int = NODEWISE_GROUP_SIZE,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Import one exact-checkpoint node-wise group and its V(S) labels.
+
+    Harbor's official verifier utility is retained only as a forced-finalize
+    target for the base and successor states.  Macro records intentionally carry
+    no precomputed reward: ``LHTBNodeWiseDeltaVTrainer`` must derive
+    ``R_t^MIA`` from one frozen value revision during the actor update.
+    """
+    if expected != NODEWISE_GROUP_SIZE:
+        raise ValueError("node-wise macro import requires exactly G=8 successors")
+    base = _load_nodewise_run(base_run)
+    base_state = base["state"]
+    base_snapshot = base["snapshot"]
+    base_fingerprint = str(base_state.get("fingerprint") or "")
+    if not base_fingerprint:
+        raise ValueError("node-wise base state has no fingerprint")
+    _validate_nodewise_identity(base, task_id, environment_digest)
+
+    labels = [_nodewise_value_label(
+        loaded=base,
+        label_id=f"{group_id}:base",
+        task_id=task_id,
+        split=split,
+    )]
+    records: List[Dict[str, Any]] = []
+    sample_dirs = sorted(
+        (path for path in samples_root.iterdir()
+         if path.is_dir() and path.name.startswith("sample-")),
+        key=lambda path: int(path.name.split("-", 1)[1]),
+    )
+    if len(sample_dirs) != expected:
+        raise ValueError(
+            f"expected {expected} node-wise successor runs, found {len(sample_dirs)}"
+        )
+    base_policy_count = len(base_snapshot.get("policyRecords") or [])
+    seeds: set[int] = set()
+    for index, sample_dir in enumerate(sample_dirs):
+        loaded = _load_nodewise_run(sample_dir)
+        _validate_nodewise_identity(loaded, task_id, environment_digest)
+        snapshot = loaded["snapshot"]
+        policy_records = list(snapshot.get("policyRecords") or [])
+        if len(policy_records) != base_policy_count + 1:
+            raise ValueError(
+                f"sample {index} did not execute exactly one new Controller action"
+            )
+        policy_record = _normalize_policy_record(policy_records[-1])
+        if policy_record["state_fingerprint"] != base_fingerprint:
+            raise ValueError(f"sample {index} was not sampled from the shared base state")
+        seed = int(snapshot.get("organizationSeed", -1))
+        if seed < 0 or seed in seeds:
+            raise ValueError("node-wise successors require unique organization seeds")
+        seeds.add(seed)
+        successor_state = loaded["state"]
+        action = str(policy_record["selected_action"])
+        records.append({
+            "schema_version": MACRO_GROUP_SCHEMA_VERSION,
+            "group_id": group_id,
+            "benchmark": "lhtb",
+            "task_id": task_id,
+            "split": split,
+            "epoch": int(epoch),
+            "sample_index": index,
+            "organization_seed": seed,
+            "checkpoint_id": str(base["checkpoint"].get("payload_digest") or ""),
+            "context_node_id": str(policy_record["context_node_id"]),
+            "base_state_fingerprint": base_fingerprint,
+            "base_state": base_state,
+            "successor_state": successor_state,
+            "selected_action": action,
+            "policy_record": policy_record,
+            "policy_revision": int(policy_revision),
+            "value_revision": int(value_revision),
+            "macro_boundary": _macro_boundary(action, base_state, successor_state),
+            "sampling_protocol": "same_state_direct_macro_action_no_mcts",
+            "task_checksum": str(base["result"].get("task_checksum") or ""),
+            "environment_digest": environment_digest,
+            "runtime_config": {
+                "macro_steps": 1,
+                "controller": "shared_node_actor",
+                "mcts_enabled": False,
+            },
+            "clone_provenance": {
+                "mode": str(base["checkpoint"].get("mode") or "full_clone"),
+                "complete": bool(base["checkpoint"].get("complete")),
+                "source_state_fingerprint": base_fingerprint,
+                "source_environment_digest": environment_digest,
+                "clone_audit_id": _sha256_json({
+                    "base_checkpoint": base["checkpoint"],
+                    "successor_checkpoint": loaded["checkpoint"],
+                    "sample_index": index,
+                }),
+            },
+            "environment_utility": float(loaded["utility"]),
+            "environment_utility_role": "value_supervision_only",
+            "mia_reward": None,
+            "mia_reward_emitted": False,
+        })
+        labels.append(_nodewise_value_label(
+            loaded=loaded,
+            label_id=f"{group_id}:successor:{index}",
+            task_id=task_id,
+            split=split,
+        ))
+    return labels, records
+
+
+def _load_nodewise_run(path: Path) -> Dict[str, Any]:
+    artifacts = path / "artifacts"
+    required = {
+        "snapshot": artifacts / "session.json",
+        "state": artifacts / "state.json",
+        "checkpoint": artifacts / "environment-checkpoint" / "checkpoint.json",
+    }
+    missing = [str(value) for value in required.values() if not value.is_file()]
+    if missing:
+        raise ValueError(f"node-wise run is missing artifacts: {missing}")
+    results = []
+    for result_path in path.rglob("result.json"):
+        try:
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if isinstance(result.get("verifier_result"), Mapping):
+            results.append((result_path, result))
+    if len(results) != 1:
+        raise ValueError(f"node-wise run requires one official Harbor result, found {len(results)}")
+    result_path, result = results[0]
+    if result.get("exception_info"):
+        raise ValueError("node-wise Harbor result contains an exception")
+    return {
+        key: json.loads(value.read_text(encoding="utf-8"))
+        for key, value in required.items()
+    } | {
+        "result": result,
+        "result_path": result_path.resolve(),
+        "result_sha256": hashlib.sha256(result_path.read_bytes()).hexdigest(),
+        "utility": official_lhtb_task_utility(result),
+    }
+
+
+def _validate_nodewise_identity(
+    loaded: Mapping[str, Any], task_id: str, environment_digest: str
+) -> None:
+    checkpoint = loaded["checkpoint"]
+    state = loaded["state"]
+    snapshot = loaded["snapshot"]
+    if str(checkpoint.get("task_id") or "") != task_id:
+        raise ValueError("node-wise checkpoint task mismatch")
+    if str(checkpoint.get("source_environment_digest") or "") != environment_digest:
+        raise ValueError("node-wise checkpoint environment digest mismatch")
+    if not checkpoint.get("complete"):
+        raise ValueError("node-wise checkpoint is incomplete")
+    fingerprint = str(state.get("fingerprint") or "")
+    if str(checkpoint.get("source_state_fingerprint") or "") != fingerprint:
+        raise ValueError("node-wise checkpoint/state fingerprint mismatch")
+    states = list(snapshot.get("processStates") or [])
+    if not states or str(states[-1].get("fingerprint") or "") != fingerprint:
+        raise ValueError("node-wise snapshot/state fingerprint mismatch")
+
+
+def _nodewise_value_label(
+    *, loaded: Mapping[str, Any], label_id: str, task_id: str, split: str
+) -> Dict[str, Any]:
+    checkpoint = loaded["checkpoint"]
+    state = loaded["state"]
+    environment_digest = str(checkpoint["source_environment_digest"])
+    return build_forced_finalize_label(
+        label_id=label_id,
+        task_id=task_id,
+        split=split,
+        process_state=state,
+        task_utilities=[float(loaded["utility"])],
+        finalizer_revision="artifact-identity-a0-v1",
+        task_checksum=str(loaded["result"].get("task_checksum") or ""),
+        environment_digest=environment_digest,
+        checkpoint_id=str(checkpoint.get("payload_digest") or ""),
+        clone_provenance={
+            "mode": str(checkpoint.get("mode") or "full_clone"),
+            "complete": bool(checkpoint.get("complete")),
+            "source_state_fingerprint": str(state["fingerprint"]),
+            "source_environment_digest": environment_digest,
+            "clone_audit_id": _sha256_json(checkpoint),
+        },
+        verifier_provenance=[{
+            "harbor_result_path": str(loaded["result_path"]),
+            "harbor_result_sha256": str(loaded["result_sha256"]),
+        }],
+        sample_seeds=[int(loaded["snapshot"].get("organizationSeed", 0))],
+    )
+
+
+def _normalize_policy_record(record: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        "behavior_policy": record.get("behaviorPolicy", record.get("behavior_policy")),
+        "state_fingerprint": str(record.get(
+            "stateFingerprint", record.get("state_fingerprint", "")
+        )),
+        "context_node_id": str(record.get(
+            "contextNodeId", record.get("context_node_id", "")
+        )),
+        "candidate_id": str(record.get("candidateId", record.get("candidate_id", ""))),
+        "masked_old_log_probability": float(record.get(
+            "maskedOldLogProbability", record.get("masked_old_log_probability")
+        )),
+        "selected_action": str(record.get(
+            "selectedAction", record.get("selected_action", "")
+        )),
+        "policy_state": dict(record.get("policyState", record.get("policy_state")) or {}),
+        "mcts_search_samples": record.get(
+            "mctsSearchSamples", record.get("mcts_search_samples")
+        ),
+    }
+
+
+def _macro_boundary(
+    action: str, base_state: Mapping[str, Any], successor_state: Mapping[str, Any]
+) -> str:
+    if action == "FINISH":
+        return "official_verifier_complete"
+    if action == "RETURN":
+        return "parent_report_integrated"
+    if action == "PRUNE":
+        return "branch_pruned"
+    if len(successor_state.get("externalObservations", [])) > len(
+        base_state.get("externalObservations", [])
+    ):
+        return "external_observation_recorded"
+    return "worker_phase_complete"
+
+
+def _sha256_json(value: Mapping[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")).hexdigest()
 
 
 class LHTBNodeWiseDeltaVTrainer:

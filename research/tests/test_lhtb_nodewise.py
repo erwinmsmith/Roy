@@ -15,6 +15,7 @@ from roy_research.lhtb_nodewise import (
     MIA_REWARD_DEFINITION,
     NODEWISE_ALGORITHM_REVISION,
     build_forced_finalize_label,
+    import_nodewise_macro_group,
 )
 from roy_research.organization import LHTB_POLICY_INTERFACE_REVISION
 from roy_research.organization_replay import sample_organization_decision
@@ -242,6 +243,79 @@ class NodeWiseDeltaVTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "forced-finalize-trained"):
                 trainer.update_macro_group([{}] * 8)
+
+    def test_nodewise_import_separates_environment_utility_from_mia_reward(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            digest = "sha256:environment"
+            base = root / "base"
+            self._write_nodewise_run(
+                base, "base-state", digest, 0.0, [], 90
+            )
+            samples = root / "samples"
+            for index in range(8):
+                record = {
+                    "behaviorPolicy": "actor",
+                    "stateFingerprint": "base-state",
+                    "contextNodeId": "root",
+                    "candidateId": "controller:CONTINUE",
+                    "maskedOldLogProbability": -0.5,
+                    "selectedAction": "CONTINUE",
+                    "policyState": policy_state("base-state"),
+                }
+                self._write_nodewise_run(
+                    samples / f"sample-{index}", f"next-{index}", digest,
+                    index / 7, [record], 100 + index,
+                )
+            labels, records = import_nodewise_macro_group(
+                base_run=base, samples_root=samples, group_id="node:g8",
+                task_id=self.task_id, split="train", epoch=0,
+                policy_revision=0, value_revision=0,
+                environment_digest=digest,
+            )
+            self.assertEqual(len(labels), 9)
+            self.assertEqual(len(records), 8)
+            self.assertEqual(records[-1]["environment_utility"], 1.0)
+            self.assertIsNone(records[-1]["mia_reward"])
+            self.assertFalse(records[-1]["mia_reward_emitted"])
+            self.assertEqual(
+                {record["base_state_fingerprint"] for record in records},
+                {"base-state"},
+            )
+            self.assertEqual(
+                {record["organization_seed"] for record in records},
+                set(range(100, 108)),
+            )
+
+    def _write_nodewise_run(
+        self, root: Path, fingerprint: str, digest: str, utility: float,
+        policy_records, seed: int,
+    ) -> None:
+        artifacts = root / "artifacts"
+        checkpoint = artifacts / "environment-checkpoint"
+        trial = root / "jobs" / "job" / "trial"
+        checkpoint.mkdir(parents=True)
+        trial.mkdir(parents=True)
+        state = process_state(fingerprint)
+        (artifacts / "state.json").write_text(json.dumps(state))
+        (artifacts / "session.json").write_text(json.dumps({
+            "organizationSeed": seed,
+            "processStates": [state],
+            "policyRecords": policy_records,
+        }))
+        (checkpoint / "checkpoint.json").write_text(json.dumps({
+            "complete": True,
+            "mode": "full_clone",
+            "payload_digest": f"payload-{fingerprint}",
+            "source_environment_digest": digest,
+            "source_state_fingerprint": fingerprint,
+            "task_id": self.task_id,
+        }))
+        (trial / "result.json").write_text(json.dumps({
+            "task_checksum": "task-sha",
+            "exception_info": None,
+            "verifier_result": {"rewards": {"reward": utility}},
+        }))
 
 
 if __name__ == "__main__":

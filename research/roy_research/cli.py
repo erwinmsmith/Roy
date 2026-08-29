@@ -27,7 +27,11 @@ from .tau3_runner import evaluate_tau3_against_direct, train_tau3_on_policy
 from .lhtb import build_lhtb_split, verify_lhtb_checkout, write_lhtb_manifest, load_lhtb_manifest
 from .lhtb_experiment import build_training_schedule, disk_preflight, select_dev_checkpoint, summarize_test, write_json, write_harbor_group_config, write_lhtb_svg
 from .lhtb_training import LHTBProcessGRPOTrainer
-from .lhtb_nodewise import LHTBNodeWiseDeltaVTrainer, build_forced_finalize_label
+from .lhtb_nodewise import (
+    LHTBNodeWiseDeltaVTrainer,
+    build_forced_finalize_label,
+    import_nodewise_macro_group,
+)
 from .lhtb_results import (
     import_harbor_group, official_lhtb_reward, official_lhtb_task_utility,
     sample_audit, validate_smoke,
@@ -341,6 +345,25 @@ def parser() -> argparse.ArgumentParser:
     lhtb_node_update.add_argument("--device", default="cpu")
     lhtb_node_update.add_argument("--resume", action="store_true")
 
+    lhtb_node_import = commands.add_parser(
+        "lhtb-nodewise-import",
+        help="Import a base checkpoint and eight one-step successors",
+    )
+    lhtb_node_import.add_argument("--base-run", type=Path, required=True)
+    lhtb_node_import.add_argument("--samples-root", type=Path, required=True)
+    lhtb_node_import.add_argument("--labels-output", type=Path, required=True)
+    lhtb_node_import.add_argument("--groups-output", type=Path, required=True)
+    lhtb_node_import.add_argument("--group-id", required=True)
+    lhtb_node_import.add_argument("--task-id", required=True)
+    lhtb_node_import.add_argument(
+        "--split", choices=("train", "dev", "test"), required=True
+    )
+    lhtb_node_import.add_argument("--epoch", type=int, required=True)
+    lhtb_node_import.add_argument("--policy-revision", type=int, required=True)
+    lhtb_node_import.add_argument("--value-revision", type=int, required=True)
+    lhtb_node_import.add_argument("--environment-digest", required=True)
+    lhtb_node_import.add_argument("--expected", type=int, default=8)
+
     lhtb_import = commands.add_parser(
         "lhtb-import-group", help="Import one Harbor G=8 job into append-only trajectories"
     )
@@ -589,6 +612,30 @@ def main(argv: List[str] | None = None) -> None:
             write_jsonl(args.updates, [update], append=args.updates.exists())
             updates.append(update)
         print(json.dumps({"new_updates": len(updates), **trainer.metadata()}))
+    elif args.command == "lhtb-nodewise-import":
+        labels, records = import_nodewise_macro_group(
+            base_run=args.base_run,
+            samples_root=args.samples_root,
+            group_id=args.group_id,
+            task_id=args.task_id,
+            split=args.split,
+            epoch=args.epoch,
+            policy_revision=args.policy_revision,
+            value_revision=args.value_revision,
+            environment_digest=args.environment_digest,
+            expected=args.expected,
+        )
+        write_jsonl(args.labels_output, labels, append=args.labels_output.exists())
+        write_jsonl(args.groups_output, records, append=args.groups_output.exists())
+        print(json.dumps({
+            "labels": len(labels),
+            "records": len(records),
+            "environment_utilities": [
+                value["environment_utility"] for value in records
+            ],
+            "labels_output": str(args.labels_output),
+            "groups_output": str(args.groups_output),
+        }))
     elif args.command == "lhtb-import-group":
         environment_digest = args.environment_digest or args.docker_digest
         if not environment_digest:
