@@ -505,7 +505,12 @@ class NodewiseCheckpointFinalizeAgent(BaseAgent):
                 self.source_snapshot_path.read_text(encoding="utf-8")
             )
             response = await asyncio.to_thread(
-                self.rpc.request, "restore", {"snapshot": source_snapshot}
+                self.rpc.request, "restore", {
+                    "snapshot": source_snapshot,
+                    "organizationSeed": int(os.environ.get(
+                        "ROY_LHTB_ORGANIZATION_SEED", "20260820"
+                    )),
+                }
             )
         else:
             trajectory_id = str(uuid.uuid4())

@@ -708,9 +708,13 @@ final = {'processStates': source['processStates'] + [{'fingerprint': 'm1', 'usag
 for line in sys.stdin:
     request = json.loads(line)
     method = request['method']
-    if method == 'restore': result = {'status': 'restored', 'snapshot': source}
+    if method == 'restore':
+        source['organizationSeed'] = request['params']['organizationSeed']
+        result = {'status': 'restored', 'snapshot': source}
     elif method == 'advance_one': result = {'status': 'terminal_request', 'request': {'id': 'one', 'command': 'true', 'timeoutMs': 1000, 'nodeId': 'root'}, 'snapshot': pending}
-    elif method == 'resume_boundary': result = {'status': 'ready', 'snapshot': final}
+    elif method == 'resume_boundary':
+        final['organizationSeed'] = source['organizationSeed']
+        result = {'status': 'ready', 'snapshot': final}
     else: result = {'status': 'shutdown'}
     print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
 """, encoding="utf-8")
@@ -756,6 +760,8 @@ for line in sys.stdin:
             self.assertEqual(context.metadata["macro_steps"], 1)
             self.assertFalse(context.metadata["derived_reward_emitted"])
             self.assertEqual(context.n_input_tokens, 3)
+            self.assertEqual(json.loads((root / "successor-snapshot.json").read_text())[
+                "organizationSeed"], 20260820)
 
     def test_native_audit_is_fail_closed_and_uses_environment_digest(self) -> None:
         self.assertEqual(

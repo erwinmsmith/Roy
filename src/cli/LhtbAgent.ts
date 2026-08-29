@@ -27,7 +27,9 @@ async function dispatch(request: Request): Promise<unknown> {
     return controller.advance(session, organizationSeed++);
   }
   if (request.method === 'restore') {
-    session = RoyLHTBSession.restore(params.snapshot as unknown as LHTBSessionSnapshot);
+    const source = params.snapshot as unknown as LHTBSessionSnapshot;
+    const restoredSeed = Number(params.organizationSeed ?? source.organizationSeed);
+    session = RoyLHTBSession.restore({ ...source, organizationSeed: restoredSeed });
     organizationSeed = session.organizationSeed;
     return { status: 'restored', snapshot: session.snapshot() };
   }
