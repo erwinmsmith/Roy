@@ -11,7 +11,7 @@ from .model import EDGE_KINDS, NODE_KINDS, RelationalMessagePassing, TEXT_DIMENS
 from .organization import ORGANIZATION_ACTIONS
 
 
-LHTB_ACTOR_MODEL_REVISION = "node-local-context-plus-global-m-relational-policy-20260829"
+LHTB_ACTOR_MODEL_REVISION = "shared-recursive-six-action-node-controller-20260829"
 
 
 class InformationRealizationPolicy(nn.Module):
@@ -19,8 +19,9 @@ class InformationRealizationPolicy(nn.Module):
 
     Each invocation observes that node's local context plus the current global
     epistemic/organization graph M_t.  Scheduling is not a learned routing
-    action.  The actor chooses the node's organization action and, when needed,
-    its open child specification or connection payload.
+    action.  The actor chooses only one of six categorical structural actions.
+    Frozen Workers, never this model, choose commands, child descriptions,
+    connection/reuse payloads, reports, and prune targets.
     """
 
     def __init__(

@@ -2,7 +2,21 @@ import type { ResourceEnvelope } from './types.js';
 
 export const INFORMATION_REALIZATION_SCHEMA_VERSION = 3 as const;
 export const LHTB_POLICY_INTERFACE_REVISION =
-  'node-actor-direct-on-policy-grpo-20260829' as const;
+  'recursive-shared-structural-controller-grpo-20260829' as const;
+
+/**
+ * The only choices made by the learned shared Controller.  These are kept
+ * deliberately separate from Runtime execution primitives: a frozen Worker
+ * supplies every semantic payload after (or independently of) this categorical
+ * structural choice.
+ */
+export type StructuralControllerActionKind =
+  | 'CONTINUE'
+  | 'DERIVE_INFO'
+  | 'DERIVE_ORG'
+  | 'PRUNE'
+  | 'RETURN'
+  | 'FINISH';
 
 export type OrganizationActionKind =
   | 'DERIVE'
@@ -183,6 +197,14 @@ export interface OrganizationCandidate {
   action: OrganizationAction;
 }
 
+export interface StructuralControllerCandidate {
+  id: string;
+  kind: StructuralControllerActionKind;
+  actorNodeId: string;
+  description: string;
+  schedulerComplexity: number;
+}
+
 export interface ExplorationEnvelope {
   id: string;
   minimumNodes: number;
@@ -202,10 +224,10 @@ export interface OrganizationPolicyRecord {
   maskedOldCandidateConditionalLogProbability?: number;
   envelopeId: string;
   policyState?: unknown;
-  availableActions?: OrganizationActionKind[];
-  rawProbabilities?: Partial<Record<OrganizationActionKind, number>>;
-  maskedProbabilities?: Partial<Record<OrganizationActionKind, number>>;
-  selectedAction?: OrganizationActionKind;
+  availableActions?: StructuralControllerActionKind[];
+  rawProbabilities?: Partial<Record<StructuralControllerActionKind, number>>;
+  maskedProbabilities?: Partial<Record<StructuralControllerActionKind, number>>;
+  selectedAction?: StructuralControllerActionKind;
   selectedSpawnMode?: OpenAgentSpecification['realizationMode'];
   spawnModeProbabilities?: Partial<Record<OpenAgentSpecification['realizationMode'], number>>;
   numRealResidualGaps?: number;

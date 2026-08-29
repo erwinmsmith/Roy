@@ -24,6 +24,8 @@ maximize_pi  E[tau ~ pi][J(tau)]
 
 Agent count, depth, latency, token use, tool calls, topology complexity, communication, rationality and redundancy are never added to `J`. Roy does not impose a learned node-count, depth, or total-token preference. Benchmark timeouts, unavailable actions, Docker isolation and provider safety controls remain operational execution conditions, not theoretical reward terms or artificial structural ceilings.
 
+MIA supplies the information-processing interpretation and its data-processing/information-preservation bounds; it does not license an independently scaled proxy reward. Adjacent changes in acquisition, representation, uncertainty, coverage or conversion may be logged and estimated for mechanism analysis, but an estimated `Delta Phi` is neither added to the LHTB score nor substituted for it in the main GRPO objective. This avoids the dimensionally invalid weighted objective rejected by the original derivation. Any future information estimator is evaluated by whether it predicts or explains terminal utility, not treated as ground-truth information creation.
+
 ## 2. State and information flow
 
 The organization state contains:
@@ -41,15 +43,27 @@ Derivation and communication have different meanings. A derivation edge records 
 
 External observations must be stored separately from model inference. Tool, API, database, KB, code and environment results require provenance and their claim-support links. This preserves the distinction between information acquisition and reasoning over already available information.
 
-## 3. Fixed grammar, open agent space
+## 3. Semantic--structural--execution separation
 
-The organization grammar is fixed:
+Roy has three non-overlapping layers:
 
 ```text
-DERIVE, ACQUIRE, CONNECT, EXECUTE, RETURN, PRUNE, STOP
+frozen Worker pi_W: semantic reasoning, tools and payload construction;
+shared Controller pi_theta: one categorical structural decision for the current node;
+Runtime: deterministic execution, routing, lifecycle and audit.
 ```
 
-The grammar does not define roles. `DERIVE` takes an open agent specification tied to one residual requirement. In the current implementation a frozen LLM proposer emits those specifications inside the node report, while the trainable organization policy selects among the current open proposals. Therefore the learned claim is proposal selection and organization control, not RL generation of arbitrary specifications. A valid child:
+The learned Controller vocabulary is fixed:
+
+```text
+CONTINUE, DERIVE_INFO, DERIVE_ORG, PRUNE, RETURN, FINISH
+```
+
+It contains no natural-language action and no node-routing action. `CONTINUE` means that the current Worker continues its semantic work. `DERIVE_INFO` asks the current Worker to specify one child for external information acquisition. `DERIVE_ORG` asks it to specify one child for organization, comparison, verification or integration of information already represented in Roy. `PRUNE` asks the Worker to identify a legal low-value branch. `RETURN` ends the current non-root node and propagates its Worker-authored report to its parent. `FINISH` is root-only and submits the task to the official verifier.
+
+The Runtime may record lower-level execution primitives `DERIVE`, `ACQUIRE`, `CONNECT`, `EXECUTE`, `RETURN`, `PRUNE` and `STOP`. Those primitives are not the learned action vocabulary. In particular, concrete terminal commands, tool access, report text, connection/reuse endpoints, child prompts and prune targets are frozen-Worker semantic payloads. They never become categorical Controller candidates and their text is not encoded by the actor.
+
+The grammar does not define roles. For either derivation action, the frozen Worker emits an open agent specification tied to one residual requirement. The learned claim is whether and which information-realization mode to derive, not RL generation or selection of arbitrary child descriptions. A valid child:
 
 - is a strict, narrower refinement of the parent objective;
 - identifies the parent gap that caused its creation;
@@ -61,21 +75,19 @@ The grammar does not define roles. `DERIVE` takes an open agent specification ti
 
 Every node returns a structured epistemic report containing concise reasoning summaries rather than hidden chain-of-thought. The report includes claims, evidence, external observations, assumptions, uncertainty, conflicts, coverage, blind spots, residual requirements, optional open child proposals, whether the parent gap was resolved, and information to propagate.
 
-`ACQUIRE` performs admissible external information access. `CONNECT` adds a legal communication route. `EXECUTE` updates a node's report. `RETURN` propagates a report to the parent. `PRUNE` removes a node only when no unresolved dependency requires it. `STOP` is a root action and is illegal while required dependencies remain unresolved.
+Worker-selected `ACQUIRE` performs admissible external information access, `CONNECT` adds or reuses a legal communication route, and `EXECUTE` changes or verifies the task environment. They realize a selected `CONTINUE` or derivation payload but are not optimized as separate actor labels. Runtime `PRUNE` removes a Worker-selected node only when no unresolved dependency requires it. Runtime `STOP` realizes Controller `FINISH` and is illegal while required dependencies remain unresolved.
 
 ## 4. One autonomous policy
 
-Roy learns one organization policy. A deterministic dependency/event-locality scheduler first supplies the current execution owner `n_t`; this observed context is not an RL action. The policy selects an outer grammar action and then an open payload conditioned on that action:
+Roy learns one organization policy shared by every node. A deterministic dependency/event-locality scheduler first supplies the current execution owner `n_t`; this observed context is not an RL action. The policy makes one masked categorical choice:
 
 ```text
-pi_theta(a, z | s, n_t)
-  = pi_action(a | s, n_t)
-    pi_payload(z | s, n_t, a).
+a_i,t ~ pi_theta(a | M_t, L_i,t, H_i)
 ```
 
-Here `a` is one grammar action and `z` is its open payload, such as a proposed child specification, acquisition requirement, connection, report, or prune target. A `DERIVE` payload explicitly identifies whether the new child realizes information by `acquire_external` or `organize_knowledge`; the specification remains open rather than selecting from a role catalog. Outer action mass is computed independently of the number of payload candidates; multiple DERIVE specifications therefore compete only inside `pi_payload` and cannot multiply DERIVE's outer probability. Candidate count and node count are variable. No fixed role ID, fixed child catalog, teacher trajectory, or teacher score is part of the model.
+Here `M_t` is the current global epistemic/organization graph, `L_i,t` is the exact current node context and `H_i` is its ancestry. The six action logits are independent of how many semantic payloads the Worker could construct. The actor receives one generic token for each legal action kind and never receives candidate descriptions or payloads. After the categorical choice, the frozen Worker supplies any required open payload. No fixed role ID, fixed child catalog, trainable payload selector, teacher trajectory, or teacher score is part of the model.
 
-The policy encoder is a typed relational network over derivation, dependency, communication, tool-use, evidence and return edges. Learned-attention, mean and max pooling retain complementary full-graph summaries, while the relationally updated scheduler-supplied context-node embedding preserves the current agent's local position and task. The actor scores only legal open candidates owned by that node against both representations. Other nodes remain visible for dependency, reuse and connection payloads, but the actor never routes execution to them. `DERIVE` deterministically transfers the following decision to the child, which permits an observed child-local action or recursive child-to-grandchild derivation; `RETURN` transfers it back to the parent. After a child tool result, a parent that still owns an open requirement receives a deterministic reuse/connection turn. Training replay reconstructs every such conditional probability exactly.
+The policy encoder is a typed relational network over derivation, dependency, communication, tool-use, evidence and return edges. Learned-attention, mean and max pooling retain complementary full-graph summaries, while the relationally updated scheduler-supplied context-node embedding preserves the current agent's local task, progress and ancestry. Other nodes remain visible as global structure, but the actor never routes execution to one of them. `DERIVE_INFO` or `DERIVE_ORG` creates exactly one Worker-specified child and transfers the following decision to that child, which permits genuine child-to-grandchild recursion. `RETURN` transfers ownership back to the parent. Training replay reconstructs the exact masked six-way probability.
 
 Environment and graph validity are enforced before sampling by the action mask:
 
@@ -86,7 +98,7 @@ pi_theta(a | s) = softmax(mask(logits_theta(s), A_legal(s))).
 
 The same mask semantics are reconstructed during replay. Runtime usage is absent from terminal utility, process credit, advantage and the GRPO loss. The implementation does not assign theoretical costs such as `DERIVE = 2`.
 
-Formal sampling does not assign a topology profile, minimum node count or minimum depth, and does not perform MCTS or another look-ahead search. Whenever a node owns execution, the current policy directly samples one legal `DERIVE`, `ACQUIRE`, `CONNECT`, `EXECUTE`, `RETURN`, `PRUNE`, or `STOP` candidate for that node. Repeated real decisions make node count, derivation depth and connectivity trajectory outcomes. `STOP` remains in support whenever required report dependencies permit it, including at the root-only initial state, so both early single-agent termination and deeper recursive organizations are ordinary on-policy outcomes. Explicit topology profiles remain available only for controlled diagnostics and cannot enter formal actor updates.
+Formal sampling does not assign a topology profile, minimum node count or minimum depth, and does not perform MCTS or another look-ahead search. Whenever a node owns execution, the current policy directly samples one legal six-way structural action for that node. Repeated real decisions make node count, derivation depth and connectivity trajectory outcomes. `FINISH` remains in support whenever required report dependencies permit it, including at the root-only initial state, so both early single-agent termination and deeper recursive organizations are ordinary on-policy outcomes. Explicit topology profiles remain available only for controlled diagnostics and cannot enter formal actor updates.
 
 ## 5. LHTB state and semantic construction
 
@@ -120,7 +132,7 @@ The exact masked old-policy probability is saved at collection time and reconstr
 
 The immutable dataset still retains every adjacent `M_t -> M_t+1` transition and SMDP decision span for audit. Each record contains fingerprints, the acting node, node-local context, legal candidates, selected action and exact topology delta, but these fields are not rewards. The full raw runtime and semantic ledgers are stored once; each fingerprinted `M_t` contains a deterministic bounded relational projection with active requirements, recent typed entities, blind spots, usage and immutable ledger references. Node count and topology complexity do not enter `R_i` or the advantage.
 
-Collection is ordinary current-policy rollout. The candidate proposer observes the real current state and acting node, generates legal open directions, and the actor samples directly from its masked distribution. Only the selected action is executed; hypothetical sibling states are neither rolled out nor assigned rewards. Different organization seeds across the matched group provide exploration, while later groups are sampled from the newly updated actor.
+Collection is ordinary current-policy rollout. The frozen Worker observes the real current state and acting node and materializes valid semantic payloads only to establish legality and execute the selected category. The actor receives a payload-free six-action mask and samples directly from it. Only the selected real action is executed; hypothetical sibling states are neither rolled out nor assigned rewards. Different organization seeds across the matched group provide exploration, while later groups are sampled from the newly updated actor.
 
 There is no teacher, imitation, predefined role pool, staged objective, entropy bonus, cost penalty or weighted reward sum.
 
@@ -134,7 +146,7 @@ The selected checkpoint is tested once, with three repetitions, against:
 
 - `single_agent_direct`: the same DeepSeek and terminal executor in the same runtime, restricted to the root node with no derivation or communication;
 - `roy_runtime_heuristic`: the same recursive runtime controlled by the compatibility heuristic;
-- `learned_information_realization`: the learned seven-action policy.
+- `learned_information_realization`: the learned six-action shared recursive Controller.
 
 Report mean reward, success rate at `R >= 0.95`, paired bootstrap 95% confidence intervals, tokens, time, nodes, DAG structure, waits, communication edges, action distributions and failures. An interval crossing zero is reported as inconclusive. After freezing the selected model, τ³ is used only for smoke and held-out zero-shot transfer, with no benchmark-specific update.
 

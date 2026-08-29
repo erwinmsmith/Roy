@@ -65,9 +65,9 @@ class InformationRealizationTests(unittest.TestCase):
         envelope = training_envelope(0, 4)
         validate_exploration_group((envelope,) * 8)
         candidates = [
-            {"kind": "DERIVE", "legal": True},
-            {"kind": "EXECUTE", "legal": True},
-            {"kind": "STOP", "legal": True},
+            {"kind": "DERIVE_INFO", "legal": True},
+            {"kind": "CONTINUE", "legal": True},
+            {"kind": "FINISH", "legal": True},
         ]
         mask = envelope_legal_actions(candidates, envelope, 2, 1, True)
         self.assertEqual(mask, [True, False, False])
@@ -90,9 +90,9 @@ class InformationRealizationTests(unittest.TestCase):
     def test_depth_floor_prefers_only_depth_increasing_derivations(self) -> None:
         envelope = ExplorationEnvelope("depth", 3, 12, 3, 5, "expansive")
         candidates = [
-            {"kind": "DERIVE", "legal": True, "resulting_depth": 2},
-            {"kind": "DERIVE", "legal": True, "resulting_depth": 3},
-            {"kind": "ACQUIRE", "legal": True},
+            {"kind": "DERIVE_INFO", "legal": True, "resulting_depth": 2},
+            {"kind": "DERIVE_ORG", "legal": True, "resulting_depth": 3},
+            {"kind": "CONTINUE", "legal": True},
         ]
         self.assertEqual(
             envelope_legal_actions(candidates, envelope, 3, 2, True),
@@ -106,14 +106,12 @@ class InformationRealizationTests(unittest.TestCase):
     def test_floor_prefers_report_grounded_acquisition_when_no_child_exists(self) -> None:
         envelope = ExplorationEnvelope("acquire", 6, 12, 3, 5, "expansive")
         candidates = [
-            {"kind": "ACQUIRE", "legal": True, "resolves_gap": False},
-            {"kind": "ACQUIRE", "legal": True, "resolves_gap": True},
-            {"kind": "EXECUTE", "legal": True},
-            {"kind": "STOP", "legal": True},
+            {"kind": "CONTINUE", "legal": True, "resolves_gap": True},
+            {"kind": "FINISH", "legal": True},
         ]
         self.assertEqual(
             envelope_legal_actions(candidates, envelope, 2, 1, True),
-            [False, True, False, False],
+            [True, False],
         )
 
     def test_training_accepts_only_terminal_task_utility(self) -> None:
@@ -393,13 +391,13 @@ class InformationRealizationTests(unittest.TestCase):
         candidates = model.candidate_logits(
             graph,
             states[0],
-            torch.randn(11, 384),
-            torch.tensor([0, 0, 1, 2, 3, 3, 4, 5, 5, 6, 0]),
-            torch.zeros(11, 4),
+            torch.randn(6, 384),
+            torch.tensor([0, 1, 2, 3, 4, 5]),
+            torch.zeros(6, 4),
             resources,
-            torch.ones(11, dtype=torch.bool),
+            torch.ones(6, dtype=torch.bool),
         )
-        self.assertEqual(tuple(candidates.shape), (11,))
+        self.assertEqual(tuple(candidates.shape), (6,))
 
     def test_sample_and_replay_use_the_same_joint_conditional_policy(self) -> None:
         class FakeEncoder:
@@ -426,16 +424,16 @@ class InformationRealizationTests(unittest.TestCase):
                 "recent_runtime_events": []},
             "candidates": [
                 {
-                    "id": "execute",
-                    "kind": "EXECUTE",
+                    "id": "controller:CONTINUE",
+                    "kind": "CONTINUE",
                     "actor_node_id": "root",
                     "description": "reason locally",
                     "legal": True,
                     "scheduler_complexity": 1.0,
                 },
                 {
-                    "id": "derive",
-                    "kind": "DERIVE",
+                    "id": "controller:DERIVE_INFO",
+                    "kind": "DERIVE_INFO",
                     "actor_node_id": "root",
                     "description": "resolve the remaining evidence gap",
                     "legal": True,

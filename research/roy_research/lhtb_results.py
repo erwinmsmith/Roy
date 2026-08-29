@@ -211,9 +211,10 @@ def sample_audit(records: List[Mapping[str, Any]]) -> Dict[str, Any]:
                 (int(value.get("depth", 0)) for value in terminal.get("nodes", [])), default=0
             ),
             "derive_count": sum(value.get("selectedAction", value.get("selected_action"))
-                                == "DERIVE" for value in policy if isinstance(value, Mapping)),
-            "connect_count": sum(value.get("selectedAction", value.get("selected_action"))
-                                 == "CONNECT" for value in policy if isinstance(value, Mapping)),
+                                in {"DERIVE_INFO", "DERIVE_ORG"}
+                                for value in policy if isinstance(value, Mapping)),
+            "connect_count": sum(value.get("kind") == "communication"
+                                 for value in terminal.get("dagEdges", [])),
             "dependency_edge_count": sum(value.get("kind") == "dependency"
                                          for value in terminal.get("dagEdges", [])),
             "communication_edge_count": sum(value.get("kind") == "communication"
@@ -540,10 +541,12 @@ def validate_smoke(root: Path, task_ids: tuple[str, ...] = (
                 for value in records
             )
             derive_available = derive_available or any(
-                "DERIVE" in value.get("availableActions", []) for value in records
+                bool({"DERIVE_INFO", "DERIVE_ORG"}.intersection(
+                    value.get("availableActions", []))) for value in records
             )
             derive_selected = derive_selected or any(
-                value.get("selectedAction") == "DERIVE" for value in records
+                value.get("selectedAction") in {"DERIVE_INFO", "DERIVE_ORG"}
+                for value in records
             )
             raw_terminal_events = raw_terminal_events and any(
                 event.get("kind") == "terminal_result" and "output" in event

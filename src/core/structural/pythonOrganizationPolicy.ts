@@ -1,7 +1,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import readline from 'node:readline';
-import type { OrganizationCandidate, OrganizationPolicyRecord } from './informationRealizationTypes.js';
+import type { OrganizationPolicyRecord,
+  StructuralControllerCandidate } from './informationRealizationTypes.js';
 
 interface OrganizationResponse {
   id: string;
@@ -26,8 +27,9 @@ export class PythonOrganizationPolicyClient {
     private readonly args = ['-m', 'roy_research.lhtb_policy_server'],
     private readonly timeoutMs = 120_000) {}
 
-  async select(policyState: Record<string, unknown>, candidates: OrganizationCandidate[],
-    seed: number): Promise<{ candidate: OrganizationCandidate; record: OrganizationPolicyRecord }> {
+  async select(policyState: Record<string, unknown>, candidates: StructuralControllerCandidate[],
+    seed: number): Promise<{ candidate: StructuralControllerCandidate;
+      record: OrganizationPolicyRecord }> {
     const child = this.ensureProcess();
     const id = randomUUID();
     const response = await new Promise<OrganizationResponse>((resolve, reject) => {

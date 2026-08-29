@@ -393,6 +393,9 @@ def _policy_context_from_encoding(
     candidates = list(policy_state.get("candidates", []))
     if not candidates:
         raise ValueError("organization policy state contains no candidates")
+    kinds = [str(value.get("kind")) for value in candidates]
+    if len(set(kinds)) != len(kinds):
+        raise ValueError("shared Controller requires at most one candidate per structural action")
     if any(str(value.get("actor_node_id") or "") != context_node_id for value in candidates):
         raise ValueError("all organization candidates must belong to the scheduler context node")
     candidate_embeddings = encoder.encode([_candidate_text(value) for value in candidates]).to(device)
@@ -418,6 +421,9 @@ def _candidate_distribution(
     candidates = list(policy_state.get("candidates", []))
     if not candidates:
         raise ValueError("organization policy state contains no candidates")
+    kinds = [str(value.get("kind")) for value in candidates]
+    if len(set(kinds)) != len(kinds):
+        raise ValueError("shared Controller requires at most one candidate per structural action")
     envelope = ExplorationEnvelope(**dict(policy_state["envelope"]))
     if bool(policy_state.get("unbounded_structure", False)):
         legal_values = [bool(value.get("legal", True)) for value in candidates]
@@ -448,22 +454,13 @@ def _candidate_distribution(
         context["resources"],
         actor_mask,
     )
-    sampling_bias = torch.tensor(
-        [float(value.get("sampling_logit_bias", 0.0)) for value in candidates],
-        dtype=candidate_logits.dtype,
-        device=device,
-    )
-    candidate_logits = candidate_logits + sampling_bias
     temperature = float(policy_state.get("organization_temperature", 1.0))
     if temperature <= 0:
         raise ValueError("organization temperature must be positive during replay")
-    kinds = [str(value["kind"]) for value in candidates]
-    candidate_raw_log_probs, raw_outer, raw_inner = _hierarchical_candidate_log_probs(
-        kinds, candidate_logits, actor_mask, temperature
-    )
-    candidate_log_probs, masked_outer, masked_inner = _hierarchical_candidate_log_probs(
-        kinds, candidate_logits, legal_mask, temperature
-    )
+    candidate_raw_log_probs, raw_outer, raw_inner = _categorical_action_log_probs(
+        kinds, candidate_logits, actor_mask, temperature)
+    candidate_log_probs, masked_outer, masked_inner = _categorical_action_log_probs(
+        kinds, candidate_logits, legal_mask, temperature)
     return {
         "candidates": candidates,
         "candidate_raw_probabilities": candidate_raw_log_probs.exp(),
@@ -476,36 +473,20 @@ def _candidate_distribution(
     }
 
 
-def _hierarchical_candidate_log_probs(
+def _categorical_action_log_probs(
     kinds: Sequence[str], logits: Tensor, mask: Tensor, temperature: float,
 ) -> Tuple[Tensor, Dict[str, Tensor], Tensor]:
-    """Outer action then inner candidate; action mass is invariant to candidate count."""
+    """One exact masked categorical distribution over the six Controller actions."""
+    if len(set(kinds)) != len(kinds):
+        raise ValueError("Controller action candidates must be unique")
     scaled = logits / temperature
-    negative_infinity = torch.finfo(logits.dtype).min
-    outer_scores: List[Tensor] = []
-    represented_kinds: List[str] = []
-    inner = torch.full_like(logits, negative_infinity)
-    for kind in ORGANIZATION_ACTIONS:
-        indices = torch.tensor([
-            index for index, candidate_kind in enumerate(kinds)
-            if candidate_kind == kind and bool(mask[index])
-        ], dtype=torch.long, device=logits.device)
-        if indices.numel() == 0:
-            continue
-        values = scaled[indices]
-        # log-mean-exp prevents three DERIVE specifications from receiving three
-        # times the outer action mass of one EXECUTE candidate.
-        outer_scores.append(torch.logsumexp(values, dim=0) - math.log(indices.numel()))
-        represented_kinds.append(kind)
-        inner[indices] = torch.log_softmax(values, dim=0)
-    if not outer_scores:
-        raise ValueError("hierarchical organization policy has no legal action kind")
-    outer_values = torch.log_softmax(torch.stack(outer_scores), dim=0)
-    outer = {kind: value for kind, value in zip(represented_kinds, outer_values)}
-    joint = torch.full_like(logits, negative_infinity)
-    for index, kind in enumerate(kinds):
-        if kind in outer and bool(mask[index]):
-            joint[index] = outer[kind] + inner[index]
+    masked = scaled.masked_fill(~mask.bool(), torch.finfo(logits.dtype).min)
+    if not bool(mask.any()):
+        raise ValueError("categorical Controller policy has no legal action")
+    joint = torch.log_softmax(masked, dim=0)
+    outer = {kind: joint[index] for index, kind in enumerate(kinds) if bool(mask[index])}
+    inner = torch.full_like(logits, torch.finfo(logits.dtype).min)
+    inner[mask.bool()] = 0.0
     return joint, outer, inner
 
 
@@ -532,23 +513,20 @@ def _spawn_mode_probability_summary(
 
 
 def _candidate_features(value: Mapping[str, Any]) -> List[float]:
+    kind = str(value.get("kind") or "")
     return [
-        math.log1p(max(0.0, float(value.get("scheduler_complexity", 0.0)))),
-        float(bool(value.get("external_access", False))),
-        float(bool(value.get("resolves_gap", False))),
-        float(value.get("depth_delta", 0.0)),
+        0.0,
+        float(kind == "DERIVE_INFO"),
+        float(kind in {"RETURN", "FINISH"}),
+        float(kind in {"DERIVE_INFO", "DERIVE_ORG"}),
     ]
 
 
 def _candidate_text(value: Mapping[str, Any]) -> str:
-    payload = value.get("conditional_payload")
-    serialized = json.dumps(payload, sort_keys=True, ensure_ascii=False) if payload else ""
-    return " | ".join(filter(None, [
-        str(value.get("kind") or ""),
-        str(value.get("realization_mode") or ""),
-        str(value.get("description") or ""),
-        serialized,
-    ]))
+    # Semantic descriptions and payloads belong to the frozen Worker.  Encoding
+    # only the action token prevents the Controller from selecting child prompts,
+    # commands, reports, connection targets, or prune targets indirectly.
+    return str(value.get("kind") or "")
 
 
 def _organization_resource_tensor(resources: Mapping[str, Any], device: torch.device) -> Tensor:

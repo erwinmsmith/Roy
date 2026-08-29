@@ -179,7 +179,7 @@ terminal_reward_grpo          official LHTB final R with group-relative advantag
 
 The organization grammar is `DERIVE / ACQUIRE / CONNECT / EXECUTE / RETURN / PRUNE / STOP`. Agents are generated from residual requirements rather than selected from predefined roles. Training uses no teacher, no imitation warm start, no weighted multi-objective reward, no keyword matching and no forced agent-count/depth target.
 
-For LHTB sampling, Roy preserves the full append-only process ledger. At each organization decision the shared actor receives the executing node's local context plus the current global `M_t` graph, then directly samples that node's action without MCTS. Each decision saves raw/masked probabilities and exact old log-probability. Environment-invalid attempts are audited and resampled, never converted to zero reward. A `G=8` update uses eight valid matched trajectories and only their official final verifier scores.
+For LHTB sampling, Roy preserves the full append-only process ledger. At each organization decision the shared Controller receives the executing node's local context/ancestry plus the current global `M_t` graph, then directly samples one of six payload-free structural actions without MCTS. A frozen Worker supplies commands, child descriptions, reports and concrete targets; the Runtime only executes them. Each Controller decision saves raw/masked probabilities and exact old log-probability. Environment-invalid attempts are audited and resampled, never converted to zero reward. A `G=8` update uses eight valid matched trajectories and only their official final verifier scores; MIA quantities remain state/analysis variables rather than an added proxy reward.
 
 Run the lightweight checks with:
 

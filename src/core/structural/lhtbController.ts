@@ -1,7 +1,8 @@
 import { DeepSeekProvider, LLMJSONParseError } from '../llm/providers/openai.js';
 import { LHTB_POLICY_INTERFACE_REVISION } from './informationRealizationTypes.js';
 import type { OrganizationCandidate,
-  OrganizationPolicyRecord } from './informationRealizationTypes.js';
+  OrganizationPolicyRecord, StructuralControllerActionKind,
+  StructuralControllerCandidate } from './informationRealizationTypes.js';
 import { PythonOrganizationPolicyClient } from './pythonOrganizationPolicy.js';
 import { RoyLHTBSession } from './lhtbSession.js';
 import { searchOrganizationMCTS } from './mctsOrganizationSearch.js';
@@ -46,6 +47,29 @@ interface MCTSAgentProposalResult {
   outputTokens: number;
   models: string[];
   attempts: number;
+}
+
+const CONTROLLER_ACTION_DESCRIPTIONS: Record<StructuralControllerActionKind, string> = {
+  CONTINUE: 'Continue this node semantic work without spawning a new agent',
+  DERIVE_INFO: 'Derive one child to acquire missing task-relevant information',
+  DERIVE_ORG: 'Derive one child to organize, verify, or integrate available information',
+  PRUNE: 'Prune one low-value branch selected by the frozen Worker',
+  RETURN: 'Return this node result to its parent',
+  FINISH: 'Finish the root task and submit to the official verifier',
+};
+
+function controllerActionForCandidate(
+  candidate: ProposedCandidate
+): StructuralControllerActionKind {
+  if (candidate.kind === 'DERIVE') {
+    return candidate.action.childSpecification?.realizationMode === 'acquire_external'
+      ? 'DERIVE_INFO' : 'DERIVE_ORG';
+  }
+  if (candidate.kind === 'PRUNE' || candidate.kind === 'RETURN') return candidate.kind;
+  if (candidate.kind === 'STOP') return 'FINISH';
+  // ACQUIRE, EXECUTE, and CONNECT are frozen-Worker/Runtime payloads.  They are
+  // all semantic continuation from the learned Controller's perspective.
+  return 'CONTINUE';
 }
 
 export interface TopologySamplingProfile {
@@ -259,12 +283,17 @@ export interface LHTBControllerOptions {
   auditRoot?: string | false;
 }
 
-const PROPOSER_PROMPT = `You generate open organization candidates for Roy on LHTB.
+const PROPOSER_PROMPT = `You are Roy's frozen semantic Worker for LHTB.
+You materialize legal semantic payloads; you are not the trainable structural Controller.
 Return JSON only: {"preferred_candidate_id": string, "candidates": [...]}.
 Every candidate must have this exact outer shape:
 {"id": string, "kind": string, "actorNodeId": string, "description": string,
  "schedulerComplexity": number, "action": object}.
 Allowed kinds are DERIVE, ACQUIRE, CONNECT, EXECUTE, RETURN, PRUNE, STOP.
+These are Runtime payload kinds, not the learned action vocabulary. The shared Controller sees only
+CONTINUE, DERIVE_INFO, DERIVE_ORG, PRUNE, RETURN, FINISH. Runtime ACQUIRE/EXECUTE/CONNECT payloads
+all realize CONTINUE; DERIVE realizationMode maps to DERIVE_INFO or DERIVE_ORG; STOP maps to FINISH.
+The Controller never sees or chooses your command, child description, report, connection, or target.
 The Runtime deterministically supplies organization.schedulerContextNode. Generate candidates only
 for that exact node. actorNodeId is observed execution context, never a routing choice. ACQUIRE and
 EXECUTE are local actions by that node; DERIVE is the only action that spawns a new child.
@@ -316,8 +345,8 @@ existing reusableNodeId, and include loadJustification with numeric parallelWork
 availableCapacity, every concrete parallelRequirementId, and a concrete reason. The list must
 include the proposed triggering gap and an unresolved requirement already occupying the existing
 agent. Topology coverage alone is never load justification.
-When independent unresolved requirements exist, include useful legal DERIVE candidates alongside
-non-structural alternatives so MCTS can compare whether expansion improves predicted task value.
+When independent unresolved requirements exist, include useful legal DERIVE payloads alongside
+non-structural alternatives so the Controller has a valid categorical structural action mask.
 Never target a node count or depth. This is candidate support, not permission to invent work:
 never create a fake gap, duplicate an existing node ID or objective, reuse an assigned gap, or
 derive non-refining work. A requirement extracted from a child event belongs
@@ -328,8 +357,9 @@ CONNECT candidate when a real information handoff would help; never repeat an ac
 When a new child genuinely needs a report from an existing producer, childSpecification.dependencies
 may use {"producerNodeId":"<existing>","artifactId":"report:<existing>"}; never fabricate a
 dependency merely to make a DAG. PRUNE uses targetNodeId for a non-root node.
-Formal sampling uses unconstrained MCTS: node count, derivation depth and graph connectivity must be
-outcomes of search. Do not use a requested topology size, minimum depth, profile identity or
+Formal sampling uses no MCTS or look-ahead search: node count, derivation depth and graph
+connectivity must be outcomes of repeated real node-local decisions. Do not use a requested
+topology size, minimum depth, profile identity or
 complexity target. Progress one legal organization action at a time. A diagnostic profile may be
 present only in explicitly controlled tests; it is never terminal utility or a semantic reason to
 derive. Never relabel a root requirement as child-local to manufacture recursive depth.
@@ -358,9 +388,10 @@ end-to-end command succeeds, include a legal RETURN for a child or STOP for root
 one materially useful repair or verification action; record remaining uncertainty instead of
 creating an endless verification loop. More generally, after any successful local terminal result,
 a non-root actor must include one legal RETURN candidate with its evidence-grounded report. This
-only supplies the option: the policy and MCTS still decide whether to return or continue.
-Propose only semantically useful actions. Do not expose hidden reasoning, benchmark grader data,
-keyword fields or reward. The preferred candidate is your best next organization decision.`;
+only supplies a legal semantic payload: the shared Controller decides RETURN versus CONTINUE.
+Propose only semantically useful payloads. Do not expose hidden reasoning, benchmark grader data,
+keyword fields or reward. preferred_candidate_id selects your deterministic payload within a
+Controller category; it is not a learned structural decision.`;
 
 const PROPOSER_RECENT_EVENT_COUNT = 6;
 const PROPOSER_EVENT_TEXT_LIMIT = 2_000;
@@ -578,14 +609,14 @@ export function compactEpistemicWorkingState(
       resourceState: latest.usage,
     } : undefined,
     structuralExploration: {
-      searchMode: profile ? 'profile_conditioned_diagnostic' : 'mcts_unconstrained',
+      searchMode: profile ? 'profile_conditioned_diagnostic' : 'direct_node_actor_on_policy',
       currentNodeCount: snapshot.runtime.nodes.length,
       currentMaximumDepth: maximumDepthReached,
       samplingProfile: profile?.id,
       minimumNodeTarget: profile?.preferredNodeRange[0] ?? 0,
       preferredTopologyRange: profile?.preferredNodeRange,
       minimumDepthTarget: profile?.preferredMinimumDepth ?? 0,
-      focus: profile?.focus ?? 'choose topology only by MCTS backed-up task value',
+      focus: profile?.focus ?? 'topology emerges from repeated real node-local Controller actions',
       realOpenGapCount: openRequirements.length,
       realOpenGapIds: openRequirements.map(value => value.id),
       realOpenGaps: openRequirements.map(value => ({ id: value.id,
@@ -599,7 +630,7 @@ export function compactEpistemicWorkingState(
       childLocalOpenGapIds: [...topologySamplingPhase(snapshot).childLocalOpenGapIds],
       semantics: profile
         ? 'explicit diagnostic intervention only; never synthesize gaps or add reward'
-        : 'unconstrained MCTS; topology is a search outcome',
+        : 'no search; topology is an on-policy trajectory outcome',
     },
     projection: { recentRuntimeEventCount: PROPOSER_RECENT_EVENT_COUNT,
       eventTextLimit: PROPOSER_EVENT_TEXT_LIMIT, entityTextLimit: PROPOSER_ENTITY_TEXT_LIMIT,
@@ -636,7 +667,7 @@ export function compactProposalRepairRequest(
       'Return a fresh concise candidate set that passes this exact legal interface.',
       'For DERIVE, use one realOpenGaps entry and set candidate actorNodeId, action.actorNodeId, and childSpecification.parentId to that entry parentNodeId.',
       'Do not reproduce an unchanged rejected candidate, move a gap to a semantically related child, invent a gap, or repeat an active CONNECT edge.',
-      'Topology is selected by MCTS; do not target a node count or depth or fabricate work.',
+      'Topology emerges from repeated direct Controller actions; do not target a node count or depth or fabricate work.',
       'For every requiredExternalChildProgressNodeId, include at least one ACQUIRE or EXECUTE candidate whose actorNodeId is that exact node. A RETURN is not a substitute.',
       'For every requiredChildReturnNodeId, include one legal RETURN candidate with an evidence-grounded report for that exact node. Other useful actions may remain as alternatives.',
       'After an official verifier rejection, every requiredPostVerifierProgressNodeId must receive a new ACQUIRE or EXECUTE candidate before STOP can be legal again.',
@@ -875,11 +906,16 @@ export class LHTBAutonomousController {
       if (!this.learnedPolicy) {
         throw new Error('Learned mode requires ROY_LHTB_POLICY_COMMAND and has no heuristic fallback');
       }
+      const controllerCandidates = this.structuralControllerCandidates(snapshot, candidates);
+      const policyState = this.policyState(snapshot, controllerCandidates);
       const decision = await this.learnedPolicy.select(
-        this.policyState(snapshot, candidates), candidates, seed
+        policyState, controllerCandidates, seed
       );
-      selected = decision.candidate as ProposedCandidate;
+      selected = this.workerPayloadForControllerAction(
+        decision.candidate.kind, candidates, completion.value.preferred_candidate_id
+      );
       policyRecord = decision.record;
+      policyRecord.selectedSpawnMode = selected.action.childSpecification?.realizationMode;
     } else {
       selected = candidates.find(value => value.id === completion.value.preferred_candidate_id)
         ?? candidates[0];
@@ -900,6 +936,51 @@ export class LHTBAutonomousController {
     const result = session.snapshot();
     return result.runtime.stopped ? { status: 'completed', snapshot: result }
       : { status: 'continue', snapshot: result };
+  }
+
+  /** Collapse frozen-Worker payloads into one categorical option per Controller action. */
+  private structuralControllerCandidates(
+    snapshot: ReturnType<RoyLHTBSession['snapshot']>,
+    candidates: ProposedCandidate[]
+  ): StructuralControllerCandidate[] {
+    const contextNodeId = scheduledOrganizationContextNode(snapshot);
+    const kinds = new Set<StructuralControllerActionKind>();
+    const result: StructuralControllerCandidate[] = [];
+    for (const candidate of candidates) {
+      if (candidate.actorNodeId !== contextNodeId) continue;
+      const kind = controllerActionForCandidate(candidate);
+      if (kinds.has(kind)) continue;
+      kinds.add(kind);
+      result.push({
+        id: `controller:${kind}`,
+        kind,
+        actorNodeId: contextNodeId,
+        description: CONTROLLER_ACTION_DESCRIPTIONS[kind],
+        schedulerComplexity: 0,
+      });
+    }
+    if (result.length === 0) {
+      throw new Error(`sampling_invalid:no_legal_controller_action:${contextNodeId}`);
+    }
+    return result;
+  }
+
+  /**
+   * The trainable Controller chooses only a structural category.  The frozen
+   * Worker remains responsible for the concrete semantic payload within that
+   * category; temperature-zero Worker preference makes this handoff auditable
+   * and independent of the actor probability.
+   */
+  private workerPayloadForControllerAction(
+    kind: StructuralControllerActionKind,
+    candidates: ProposedCandidate[],
+    preferredCandidateId: string
+  ): ProposedCandidate {
+    const available = candidates.filter(candidate => controllerActionForCandidate(candidate) === kind);
+    const selected = available.find(candidate => candidate.id === preferredCandidateId)
+      ?? available[0];
+    if (!selected) throw new Error(`Frozen Worker supplied no payload for ${kind}`);
+    return selected;
   }
 
   close(): void {
@@ -997,10 +1078,10 @@ export class LHTBAutonomousController {
         Math.log(behaviorProbability / actionProbability),
       envelopeId: String((rootPolicyState.envelope as Record<string, unknown>).id),
       policyState: rootPolicyState,
-      availableActions: [...new Set(candidates.map(value => value.kind))],
+      availableActions: [...new Set(candidates.map(controllerActionForCandidate))],
       rawProbabilities: actorActionProbabilities,
       maskedProbabilities: behaviorActionProbabilities,
-      selectedAction: selected.kind,
+      selectedAction: controllerActionForCandidate(selected),
       selectedSpawnMode: selected.action.childSpecification?.realizationMode,
       spawnModeProbabilities: Object.fromEntries(['acquire_external', 'organize_knowledge'].map(
         mode => [mode, candidates.filter(candidate =>
@@ -1206,12 +1287,12 @@ export class LHTBAutonomousController {
 
   private actionProbabilitySummary(candidates: ProposedCandidate[],
     probabilities: Record<string, number>): OrganizationPolicyRecord['rawProbabilities'] {
-    const result: Record<string, number> = { DERIVE: 0, ACQUIRE: 0, CONNECT: 0, EXECUTE: 0,
-      RETURN: 0, PRUNE: 0, STOP: 0 };
+    const result: Partial<Record<StructuralControllerActionKind, number>> = {};
     for (const candidate of candidates) {
-      result[candidate.kind] = (result[candidate.kind] ?? 0) + (probabilities[candidate.id] ?? 0);
+      const kind = controllerActionForCandidate(candidate);
+      result[kind] = (result[kind] ?? 0) + (probabilities[candidate.id] ?? 0);
     }
-    return result as OrganizationPolicyRecord['rawProbabilities'];
+    return result;
   }
 
   private ensureLearnedTerminationCandidate(
@@ -1579,11 +1660,16 @@ export class LHTBAutonomousController {
   }
 
   private policyState(snapshot: ReturnType<RoyLHTBSession['snapshot']>,
-    candidates: ProposedCandidate[]): Record<string, unknown> {
+    candidates: StructuralControllerCandidate[] | ProposedCandidate[]): Record<string, unknown> {
     const contextNodeId = scheduledOrganizationContextNode(snapshot);
     const contextNode = snapshot.runtime.nodes.find(node => node.id === contextNodeId);
     if (!contextNode) throw new Error(`Scheduler context node does not exist: ${contextNodeId}`);
-    const contextCandidates = candidates.filter(candidate => candidate.actorNodeId === contextNodeId);
+    const controllerCandidates: StructuralControllerCandidate[] = candidates.some(candidate =>
+      ['ACQUIRE', 'CONNECT', 'EXECUTE', 'DERIVE', 'STOP'].includes(candidate.kind))
+      ? this.structuralControllerCandidates(snapshot, candidates as ProposedCandidate[])
+      : candidates as StructuralControllerCandidate[];
+    const contextCandidates = controllerCandidates.filter(candidate =>
+      candidate.actorNodeId === contextNodeId);
     const activeNodes = snapshot.runtime.nodes
       .filter(node => ['ready', 'running', 'waiting', 'completed'].includes(node.status));
     const latest = snapshot.processStates.at(-1);
@@ -1725,24 +1811,14 @@ export class LHTBAutonomousController {
     const explorationStopMasked = openRequirements.length > 0
       && (snapshot.runtime.nodes.length < minimumNodes || maximumDepthReached < minimumDepth);
     const verifierRetryStopMasked = this.verifierRetryNeedsProgress(snapshot);
-    const hasExplorationAlternative = contextCandidates.some(candidate => candidate.kind !== 'STOP');
+    const hasExplorationAlternative = contextCandidates.some(candidate => candidate.kind !== 'FINISH');
     const policyCandidates = contextCandidates.map(candidate => ({ id: candidate.id, kind: candidate.kind,
       actor_node_id: candidate.actorNodeId, description: candidate.description,
       scheduler_complexity: candidate.schedulerComplexity,
-      realization_mode: candidate.action.childSpecification?.realizationMode,
-      conditional_payload: candidate.kind === 'DERIVE' ? {
-        realization_mode: candidate.action.childSpecification?.realizationMode,
-        local_objective: candidate.action.childSpecification?.localObjective,
-        required_information:
-          candidate.action.childSpecification?.expectedOutput.requiredInformation,
-        triggering_gap_id: candidate.action.childSpecification?.triggeringGapId,
-      } : candidate.kind === 'CONNECT' ? candidate.action.connection : undefined,
-      external_access: candidate.kind === 'ACQUIRE'
-        || candidate.action.childSpecification?.realizationMode === 'acquire_external',
-      resolves_gap: candidate.kind === 'ACQUIRE' || candidate.kind === 'RETURN',
-      depth_delta: candidate.kind === 'DERIVE' ? 1 : 0,
-      sampling_logit_bias: topologySamplingCandidateLogitBias(snapshot, candidate),
-      legal: !(candidate.kind === 'STOP' && (explorationStopMasked || verifierRetryStopMasked)
+      external_access: candidate.kind === 'DERIVE_INFO',
+      resolves_gap: candidate.kind === 'RETURN',
+      depth_delta: ['DERIVE_INFO', 'DERIVE_ORG'].includes(candidate.kind) ? 1 : 0,
+      legal: !(candidate.kind === 'FINISH' && (explorationStopMasked || verifierRetryStopMasked)
         && hasExplorationAlternative) }));
     return {
       interface_revision: LHTB_POLICY_INTERFACE_REVISION,
@@ -1782,7 +1858,8 @@ export class LHTBAutonomousController {
       unresolved_gap_exists: openRequirements.length > 0,
       unresolved_requirement_ids: openRequirements.map(value => value.id),
       num_real_residual_gaps: openRequirements.length,
-      num_child_proposals: contextCandidates.filter(candidate => candidate.kind === 'DERIVE').length,
+      num_child_proposals: contextCandidates.filter(candidate =>
+        candidate.kind === 'DERIVE_INFO' || candidate.kind === 'DERIVE_ORG').length,
       available_actions: [...new Set(contextCandidates.map(candidate => candidate.kind))],
       topology_sampling_phase: topologySamplingPhase(snapshot).id,
       exploration_stop_masked: explorationStopMasked,

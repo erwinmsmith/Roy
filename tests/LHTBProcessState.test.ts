@@ -119,7 +119,7 @@ describe('LHTB process state', () => {
     try {
       const result = await controller.advance(session, 1);
       expect(result.status).toBe('terminal_request');
-      expect(policyCandidates.map(value => value.kind)).toEqual(['ACQUIRE', 'STOP']);
+      expect(policyCandidates.map(value => value.kind)).toEqual(['CONTINUE', 'FINISH']);
       expect(session.snapshot().runtime.nodes).toHaveLength(1);
       expect(session.snapshot().runtime.derivationEdges).toHaveLength(0);
     } finally {
@@ -342,7 +342,7 @@ describe('LHTB process state', () => {
       const before = policyState(session.snapshot(), [execute, stop]);
       expect(before.verifier_retry_stop_masked).toBe(true);
       expect((before.candidates as Array<{ id: string; legal: boolean }>)
-        .find(candidate => candidate.id === 'stop')?.legal).toBe(false);
+        .find(candidate => candidate.id === 'controller:FINISH')?.legal).toBe(false);
       session.requestTerminal({ id: 'repair-command', command: 'true', timeoutMs: 1000,
         nodeId: 'root', organizationActionKind: 'EXECUTE' });
       session.acceptTerminalResult({ requestId: 'repair-command', exitCode: 0, stdout: '',
@@ -350,7 +350,7 @@ describe('LHTB process state', () => {
       const after = policyState(session.snapshot(), [execute, stop]);
       expect(after.verifier_retry_stop_masked).toBe(false);
       expect((after.candidates as Array<{ id: string; legal: boolean }>)
-        .find(candidate => candidate.id === 'stop')?.legal).toBe(true);
+        .find(candidate => candidate.id === 'controller:FINISH')?.legal).toBe(true);
     } finally {
       controller.close();
     }
@@ -811,10 +811,13 @@ describe('LHTB process state', () => {
         } } };
     } };
     let observedState: Record<string, unknown> | undefined;
-    const learnedPolicy = { async select(policyState: Record<string, unknown>) {
+    const learnedPolicy = { async select(policyState: Record<string, unknown>, values: Array<{
+      id: string; kind: string;
+    }>) {
       observedState = policyState;
-      return { candidate: stop, record: { stateFingerprint: 'state', contextNodeId: 'root',
-        candidateId: 'stop', maskedOldLogProbability: 0, envelopeId: 'connected' } };
+      const candidate = values.find(value => value.kind === 'FINISH')!;
+      return { candidate, record: { stateFingerprint: 'state', contextNodeId: 'root',
+        candidateId: candidate.id, maskedOldLogProbability: 0, envelopeId: 'connected' } };
     }, close() {} };
     const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false,
       learnedPolicy: learnedPolicy as never });
@@ -824,7 +827,7 @@ describe('LHTB process state', () => {
       expect(observedState?.exploration_stop_masked).toBe(true);
       expect(observedState?.context_node_id).toBe('root');
       expect((observedState?.candidates as Array<Record<string, unknown>>)
-        .map(candidate => candidate.kind)).toEqual(['STOP']);
+        .map(candidate => candidate.kind)).toEqual(['FINISH']);
       expect((observedState?.candidates as Array<Record<string, unknown>>)[0]?.legal).toBe(true);
     } finally {
       controller.close();
@@ -888,9 +891,11 @@ describe('LHTB process state', () => {
         } } };
     } };
     let observedState: Record<string, unknown> | undefined;
-    const learnedPolicy = { async select(policyState: Record<string, unknown>, values: typeof candidates) {
+    const learnedPolicy = { async select(policyState: Record<string, unknown>, values: Array<{
+      id: string; kind: string;
+    }>) {
       observedState = policyState;
-      const candidate = values.find(value => value.id === 'execute-worker')!;
+      const candidate = values.find(value => value.kind === 'CONTINUE')!;
       return { candidate, record: { stateFingerprint: String(policyState.state_fingerprint),
         contextNodeId: 'worker', candidateId: candidate.id, maskedOldLogProbability: 0,
         envelopeId: 'lhtb-open', behaviorPolicy: 'actor', policyState } };
@@ -947,8 +952,8 @@ describe('LHTB process state', () => {
       const values = policyState.candidates as Array<Record<string, unknown>>;
       expect((policyState.topology_search as Record<string, unknown>).mode)
         .toBe('actor_direct_on_policy');
-      expect(values.map(value => value.id)).toContain('stop-official-verifier');
-      const candidate = candidates.find(value => value.id === 'stop-official-verifier')!;
+      expect(values.map(value => value.id)).toContain('controller:FINISH');
+      const candidate = candidates.find(value => value.id === 'controller:FINISH')!;
       return { candidate, record: { stateFingerprint: String(policyState.state_fingerprint),
         contextNodeId: 'root', candidateId: candidate.id, maskedOldLogProbability: 0,
         envelopeId: 'lhtb-open', behaviorPolicy: 'actor', policyState } };
@@ -959,7 +964,7 @@ describe('LHTB process state', () => {
       const result = await controller.advance(session, 1);
       expect(result.status).toBe('completed');
       expect(session.snapshot().policyRecords.at(-1)?.candidateId)
-        .toBe('stop-official-verifier');
+        .toBe('controller:FINISH');
     } finally {
       controller.close();
       if (priorMCTS === undefined) delete process.env.ROY_LHTB_MCTS_ENABLED;
@@ -1038,7 +1043,7 @@ describe('LHTB process state', () => {
       const learnedPolicy = { async select(policyState: Record<string, unknown>, candidates: Array<{
         id: string;
       }>) {
-        const candidate = candidates.find(value => value.id === 'derive-worker')!;
+        const candidate = candidates.find(value => value.id === 'controller:DERIVE_INFO')!;
         return { candidate, record: { stateFingerprint: String(policyState.state_fingerprint),
           contextNodeId: 'root', candidateId: candidate.id, maskedOldLogProbability: 0,
           envelopeId: 'lhtb-open', behaviorPolicy: 'actor', policyState } };

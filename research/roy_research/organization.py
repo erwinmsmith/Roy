@@ -5,16 +5,15 @@ from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
 
 ORGANIZATION_ACTIONS = (
-    "DERIVE",
-    "ACQUIRE",
-    "CONNECT",
-    "EXECUTE",
-    "RETURN",
+    "CONTINUE",
+    "DERIVE_INFO",
+    "DERIVE_ORG",
     "PRUNE",
-    "STOP",
+    "RETURN",
+    "FINISH",
 )
 
-LHTB_POLICY_INTERFACE_REVISION = "node-actor-direct-on-policy-grpo-20260829"
+LHTB_POLICY_INTERFACE_REVISION = "recursive-shared-structural-controller-grpo-20260829"
 
 
 @dataclass(frozen=True)
@@ -123,16 +122,16 @@ def envelope_legal_actions(
     for candidate in candidates:
         legal = bool(candidate.get("legal", True))
         kind = str(candidate.get("kind"))
-        if kind == "STOP" and not terminal_allowed:
+        if kind == "FINISH" and not terminal_allowed:
             legal = False
-        if kind == "DERIVE":
+        if kind in {"DERIVE_INFO", "DERIVE_ORG"}:
             resulting_depth = int(candidate.get("resulting_depth", maximum_depth_reached + 1))
             if not derivation_allowed or resulting_depth > envelope.maximum_depth:
                 legal = False
         result.append(legal)
     legal_derivations = [
         index for index, (candidate, legal) in enumerate(zip(candidates, result))
-        if legal and str(candidate.get("kind")) == "DERIVE"
+        if legal and str(candidate.get("kind")) in {"DERIVE_INFO", "DERIVE_ORG"}
     ]
     floors_unmet = (
         node_count < envelope.minimum_nodes
@@ -154,7 +153,7 @@ def envelope_legal_actions(
             preferred = [
                 index for index, (candidate, legal) in enumerate(zip(candidates, result))
                 if legal
-                and str(candidate.get("kind")) == "ACQUIRE"
+                and str(candidate.get("kind")) == "CONTINUE"
                 and bool(candidate.get("resolves_gap"))
             ]
         if preferred:

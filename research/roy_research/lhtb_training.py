@@ -10,7 +10,7 @@ import torch
 from .lhtb import require_training_task
 from .lhtb_transitions import build_state_transition_samples
 from .model import FrozenTextEncoder
-from .organization import LHTB_POLICY_INTERFACE_REVISION
+from .organization import LHTB_POLICY_INTERFACE_REVISION, ORGANIZATION_ACTIONS
 from .organization_model import InformationRealizationPolicy, LHTB_ACTOR_MODEL_REVISION
 from .organization_replay import _candidate_text, replay_joint_log_probabilities
 
@@ -251,6 +251,27 @@ class LHTBProcessGRPOTrainer:
                     local_context.get("id", "")
                 ) != context_node:
                     raise ValueError("actor decision must save the node's complete local context")
+                controller_candidates = policy_state.get("candidates")
+                if not isinstance(controller_candidates, Sequence) or not controller_candidates:
+                    raise ValueError("actor state requires a six-action Controller mask")
+                kinds = [str(item.get("kind", "")) for item in controller_candidates
+                         if isinstance(item, Mapping)]
+                if len(kinds) != len(controller_candidates) or len(set(kinds)) != len(kinds):
+                    raise ValueError("Controller state allows at most one candidate per action")
+                if any(kind not in ORGANIZATION_ACTIONS for kind in kinds):
+                    raise ValueError("actor state contains a Runtime or unknown action kind")
+                forbidden_payload_fields = {
+                    "conditional_payload", "command", "child_specification", "report",
+                    "connection", "target_node_id", "final_output",
+                }
+                if any(forbidden_payload_fields.intersection(item)
+                       for item in controller_candidates if isinstance(item, Mapping)):
+                    raise ValueError("Controller action candidates must not contain Worker payloads")
+                selected_action = str(record.get(
+                    "selected_action", record.get("selectedAction", "")
+                ))
+                if selected_action not in kinds:
+                    raise ValueError("recorded Controller action is absent from its legal mask")
                 if record.get("mcts_search_samples", record.get("mctsSearchSamples")):
                     raise ValueError("direct actor trajectories cannot contain MCTS search samples")
                 forbidden_search_fields = (
@@ -269,6 +290,9 @@ class LHTBProcessGRPOTrainer:
             "actor_model_revision": LHTB_ACTOR_MODEL_REVISION,
             "sampling_protocol": "direct_node_actor_on_policy_no_search",
             "inference_protocol": "shared_actor_invoked_separately_for_each_scheduled_node",
+            "controller_action_space": list(ORGANIZATION_ACTIONS),
+            "worker_policy": "frozen_semantic_payload_generator",
+            "payload_policy": "excluded_from_actor_input_and_grpo_probability",
             "reward_source": "official_lhtb_terminal_verifier_only",
             "actor_microbatch": self.actor_microbatch,
             "groups": self.groups, "actor_steps": self.actor_steps,

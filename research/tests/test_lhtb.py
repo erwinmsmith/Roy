@@ -70,7 +70,7 @@ from roy_research.lhtb_native import (
     tree_digest,
 )
 from roy_research.organization_replay import (
-    _hierarchical_candidate_log_probs,
+    _categorical_action_log_probs,
     organization_candidate_distribution,
     replay_joint_log_probabilities,
     replay_joint_log_probability,
@@ -126,9 +126,9 @@ def direct_node_policy_state(state_fingerprint="m0"):
             "assigned_requirement_ids": [], "requirements": [],
             "recent_runtime_events": []},
         "candidates": [
-            {"id": "stop", "kind": "STOP", "actor_node_id": "root",
+            {"id": "controller:FINISH", "kind": "FINISH", "actor_node_id": "root",
              "description": "finish", "scheduler_complexity": 0, "legal": True},
-            {"id": "execute", "kind": "EXECUTE", "actor_node_id": "root",
+            {"id": "controller:CONTINUE", "kind": "CONTINUE", "actor_node_id": "root",
              "description": "continue local execution", "scheduler_complexity": 1,
              "legal": True},
         ],
@@ -872,7 +872,8 @@ for line in sys.stdin:
         self.assertEqual(samples[1]["topology_delta"]["edge_count_delta"], 1)
         self.assertAlmostEqual(sum(value["process_reward"] for value in samples), -0.3)
         decisions = build_decision_transition_samples(states, [{
-            "stateFingerprint": "m0", "selectedAction": "DERIVE", "candidateId": "derive",
+            "stateFingerprint": "m0", "selectedAction": "DERIVE_INFO",
+            "candidateId": "controller:DERIVE_INFO",
             "policyState": {"sampling_profile": {"id": "compact"}},
         }, {
             "stateFingerprint": "m1", "selectedAction": "STOP", "candidateId": "stop",
@@ -882,18 +883,22 @@ for line in sys.stdin:
         self.assertEqual(decisions[0]["from_state_fingerprint"], "m0")
         self.assertEqual(decisions[0]["to_state_fingerprint"], "m1")
 
-    def test_outer_action_probability_is_not_multiplied_by_derive_candidate_count(self) -> None:
-        joint, outer, inner = _hierarchical_candidate_log_probs(
-            ["DERIVE", "DERIVE", "DERIVE", "EXECUTE"], torch.zeros(4),
-            torch.ones(4, dtype=torch.bool), 1.0,
+    def test_controller_is_one_categorical_choice_without_payload_selection(self) -> None:
+        joint, outer, inner = _categorical_action_log_probs(
+            ["DERIVE_INFO", "CONTINUE"], torch.zeros(2),
+            torch.ones(2, dtype=torch.bool), 1.0,
         )
-        self.assertAlmostEqual(float(outer["DERIVE"].exp()), 0.5, places=6)
-        self.assertAlmostEqual(float(outer["EXECUTE"].exp()), 0.5, places=6)
-        self.assertAlmostEqual(float(joint[:3].exp().sum()), 0.5, places=6)
-        self.assertAlmostEqual(float(joint[3].exp()), 0.5, places=6)
-        self.assertAlmostEqual(float(inner[:3].exp().sum()), 1.0, places=6)
+        self.assertAlmostEqual(float(outer["DERIVE_INFO"].exp()), 0.5, places=6)
+        self.assertAlmostEqual(float(outer["CONTINUE"].exp()), 0.5, places=6)
+        self.assertTrue(torch.allclose(joint.exp(), torch.tensor([0.5, 0.5])))
+        self.assertTrue(torch.allclose(inner, torch.zeros(2)))
+        with self.assertRaisesRegex(ValueError, "must be unique"):
+            _categorical_action_log_probs(
+                ["DERIVE_INFO", "DERIVE_INFO"], torch.zeros(2),
+                torch.ones(2, dtype=torch.bool), 1.0,
+            )
 
-    def test_topology_sampling_bias_is_soft_and_part_of_exact_old_policy(self) -> None:
+    def test_topology_sampling_bias_is_absent_from_exact_old_policy(self) -> None:
         model = InformationRealizationPolicy()
         policy_state = {
             "interface_revision": LHTB_POLICY_INTERFACE_REVISION,
@@ -904,10 +909,10 @@ for line in sys.stdin:
             "context_node": {"id": "root", "depth": 0, "status": "ready",
                 "local_objective": "solve", "requirements": [],
                 "recent_runtime_events": []},
-            "candidates": [{"id": "derive", "kind": "DERIVE",
+            "candidates": [{"id": "controller:DERIVE_INFO", "kind": "DERIVE_INFO",
                 "actor_node_id": "root", "description": "derive another child",
                 "scheduler_complexity": 1, "legal": True, "sampling_logit_bias": -100.0},
-                {"id": "execute", "kind": "EXECUTE", "actor_node_id": "root",
+                {"id": "controller:CONTINUE", "kind": "CONTINUE", "actor_node_id": "root",
                  "description": "execute current plan", "scheduler_complexity": 1,
                  "legal": True, "sampling_logit_bias": 0.0}],
             "envelope": {"id": "open", "minimum_nodes": 0, "maximum_nodes": 1_000_000,
@@ -925,16 +930,15 @@ for line in sys.stdin:
             model, FakeEncoder384(), policy_state, generator=generator,
             device=torch.device("cpu")
         )
-        self.assertEqual(candidate["id"], "execute")
-        self.assertGreater(record["masked_probabilities"]["DERIVE"], 0.0)
-        self.assertLess(record["masked_probabilities"]["DERIVE"], 1e-30)
+        self.assertIn(candidate["id"], {"controller:DERIVE_INFO", "controller:CONTINUE"})
+        self.assertGreater(record["masked_probabilities"]["DERIVE_INFO"], 0.0)
 
         distribution = organization_candidate_distribution(
             model, FakeEncoder384(), policy_state, device=torch.device("cpu")
         )
         self.assertAlmostEqual(sum(distribution["candidate_priors"].values()), 1.0, places=6)
         self.assertAlmostEqual(sum(distribution["action_priors"].values()), 1.0, places=6)
-        self.assertGreater(distribution["candidate_priors"]["execute"], 1 - 1e-6)
+        self.assertGreater(distribution["candidate_priors"]["controller:CONTINUE"], 0.0)
         single = replay_joint_log_probability(
             model, FakeEncoder384(), record, torch.device("cpu")
         )
@@ -1115,7 +1119,7 @@ for line in sys.stdin:
         policy_state = direct_node_policy_state()
         result = sample_audit([{"id": "one", "rollout_index": 0, "organization_seed": 1,
             "terminal_reward": 0.7, "process_states": states, "state_transitions": transitions,
-            "policy_records": [{"behaviorPolicy": "actor", "selectedAction": "DERIVE",
+            "policy_records": [{"behaviorPolicy": "actor", "selectedAction": "DERIVE_INFO",
                 "contextNodeId": "root", "maskedOldLogProbability": -0.3,
                 "policyState": policy_state}],
             "complete": True, "environment_failure": False, "tokens": 10,
@@ -1182,6 +1186,18 @@ for line in sys.stdin:
                     "process_states": states,
                     "state_transitions": build_state_transition_samples(states),
                 })
+            runtime_action_records = json.loads(json.dumps(records))
+            runtime_policy = runtime_action_records[0]["policy_records"][0]
+            runtime_policy["policy_state"]["candidates"][0]["kind"] = "EXECUTE"
+            runtime_policy["selected_action"] = "EXECUTE"
+            with self.assertRaisesRegex(ValueError, "Runtime or unknown action"):
+                trainer._validate(runtime_action_records)
+            payload_records = json.loads(json.dumps(records))
+            payload_records[0]["policy_records"][0]["policy_state"]["candidates"][0][
+                "command"
+            ] = "pytest -q"
+            with self.assertRaisesRegex(ValueError, "must not contain Worker payloads"):
+                trainer._validate(payload_records)
             update = trainer.update_group(records)
             self.assertFalse(update["actor_updated"])
             self.assertTrue(update["transition_samples"])
