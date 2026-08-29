@@ -522,8 +522,15 @@ class NodewiseCheckpointFinalizeAgent(BaseAgent):
                     "ROY_LHTB_INITIAL_FINGERPRINT", ""
                 ),
             })
+            response = await asyncio.to_thread(
+                self.rpc.request, "prepare_boundary", {}
+            )
         base_snapshot = dict(response.get("snapshot") or {})
         base_policy_count = len(base_snapshot.get("policyRecords") or [])
+        base_states = list(base_snapshot.get("processStates") or [])
+        if not base_states or not str(base_states[-1].get("fingerprint") or ""):
+            raise RuntimeError("node-wise base is not a fingerprinted decision boundary")
+        base_fingerprint = str(base_states[-1]["fingerprint"])
         if self.macro_steps == 1:
             response = await asyncio.to_thread(self.rpc.request, "advance_one", {})
             if response.get("status") == "terminal_request":
@@ -548,6 +555,12 @@ class NodewiseCheckpointFinalizeAgent(BaseAgent):
         policy_count = len(snapshot.get("policyRecords") or [])
         if policy_count - base_policy_count != self.macro_steps:
             raise RuntimeError("node-wise checkpoint did not execute exactly one policy action")
+        if self.macro_steps == 1:
+            new_record = list(snapshot.get("policyRecords") or [])[-1]
+            if str(new_record.get("stateFingerprint") or "") != base_fingerprint:
+                raise RuntimeError(
+                    "node-wise actor fingerprint differs from restored decision boundary"
+                )
         state = dict(states[-1])
         fingerprint = str(state.get("fingerprint") or "")
         if not fingerprint:
@@ -568,6 +581,7 @@ class NodewiseCheckpointFinalizeAgent(BaseAgent):
             "derived_reward_emitted": False,
             "task_utility_role": "value_supervision_only",
             "state_fingerprint": fingerprint,
+            "base_decision_fingerprint": base_fingerprint,
             "session_snapshot_path": str(self.output_snapshot_path),
             "process_state_path": str(self.output_state_path),
             "environment_checkpoint_path": str(self.output_checkpoint_path),

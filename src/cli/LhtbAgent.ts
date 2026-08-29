@@ -32,6 +32,11 @@ async function dispatch(request: Request): Promise<unknown> {
     return { status: 'restored', snapshot: session.snapshot() };
   }
   if (!session) throw new Error('run or restore must initialize the LHTB session');
+  if (request.method === 'prepare_boundary') {
+    controller ??= new LHTBAutonomousController();
+    await controller.prepareDecisionBoundary(session);
+    return { status: 'ready', snapshot: session.snapshot() };
+  }
   if (request.method === 'organization_action') {
     const state = session.applyOrganizationAction(params.action as unknown as OrganizationAction);
     return { status: 'ready', state, snapshot: session.snapshot() };

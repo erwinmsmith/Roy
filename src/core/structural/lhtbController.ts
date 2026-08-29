@@ -786,22 +786,7 @@ export class LHTBAutonomousController {
   }
 
   async advance(session: RoyLHTBSession, seed: number): Promise<ControllerResult> {
-    for (const event of session.unprocessedSemanticEvents()) {
-      const latest = session.snapshot().processStates.at(-1);
-      const existingRequirements = (latest?.requirements ?? [])
-        .filter(value => event.kind !== 'task_instruction'
-          || value.id !== 'root-task-requirement')
-        .slice(-SEMANTIC_RECALL_ENTITY_COUNT);
-      const update = await this.semantic.processEvent(event, {
-        requirements: existingRequirements,
-        claims: (latest?.claims ?? []).slice(-SEMANTIC_RECALL_ENTITY_COUNT),
-        assumptions: (latest?.assumptions ?? []).slice(-SEMANTIC_RECALL_ENTITY_COUNT),
-        evidence: (latest?.evidence ?? []).slice(-SEMANTIC_RECALL_ENTITY_COUNT),
-        external_observations: (latest?.externalObservations ?? [])
-          .slice(-SEMANTIC_RECALL_ENTITY_COUNT),
-      });
-      session.applySemanticUpdate(update);
-    }
+    await this.prepareDecisionBoundary(session);
     const snapshot = session.snapshot();
     if (snapshot.runtime.stopped) return { status: 'completed', snapshot };
     const requestState = compactEpistemicWorkingState(snapshot);
@@ -922,6 +907,26 @@ export class LHTBAutonomousController {
     const result = session.snapshot();
     return result.runtime.stopped ? { status: 'completed', snapshot: result }
       : { status: 'continue', snapshot: result };
+  }
+
+  /** Complete deterministic/frozen semantic projection before actor sampling. */
+  async prepareDecisionBoundary(session: RoyLHTBSession): Promise<void> {
+    for (const event of session.unprocessedSemanticEvents()) {
+      const latest = session.snapshot().processStates.at(-1);
+      const existingRequirements = (latest?.requirements ?? [])
+        .filter(value => event.kind !== 'task_instruction'
+          || value.id !== 'root-task-requirement')
+        .slice(-SEMANTIC_RECALL_ENTITY_COUNT);
+      const update = await this.semantic.processEvent(event, {
+        requirements: existingRequirements,
+        claims: (latest?.claims ?? []).slice(-SEMANTIC_RECALL_ENTITY_COUNT),
+        assumptions: (latest?.assumptions ?? []).slice(-SEMANTIC_RECALL_ENTITY_COUNT),
+        evidence: (latest?.evidence ?? []).slice(-SEMANTIC_RECALL_ENTITY_COUNT),
+        external_observations: (latest?.externalObservations ?? [])
+          .slice(-SEMANTIC_RECALL_ENTITY_COUNT),
+      });
+      session.applySemanticUpdate(update);
+    }
   }
 
   private async advanceLearnedController(

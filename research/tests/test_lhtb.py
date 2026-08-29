@@ -692,7 +692,7 @@ for line in sys.stdin:
             server = root / "server.py"
             server.write_text("""import json, sys
 source = {'processStates': [{'fingerprint': 'm0', 'usage': {}}], 'policyRecords': []}
-pending = {'processStates': source['processStates'], 'policyRecords': [{'selectedAction': 'CONTINUE'}]}
+pending = {'processStates': source['processStates'], 'policyRecords': [{'selectedAction': 'CONTINUE', 'stateFingerprint': 'm0'}]}
 final = {'processStates': source['processStates'] + [{'fingerprint': 'm1', 'usage': {'inputTokens': 3, 'outputTokens': 2}}], 'policyRecords': pending['policyRecords']}
 for line in sys.stdin:
     request = json.loads(line)
