@@ -3,6 +3,17 @@ set -euo pipefail
 
 roy_root="${ROY_ROOT:-${HOME}/rivermind-data/roy}"
 execution_base="${ROY_LHTB_NATIVE_EXECUTION_BASE:-${HOME}/rivermind-data/lhtb-native}"
+node_runtime="${roy_root}/research/.runtime/node-v22"
+proot_runtime="${execution_base}/tools/proot-v5.3.1-99a84175"
+[[ -x "${node_runtime}/bin/node" ]] || {
+  echo "native test requires the prepared Node 22 runtime" >&2
+  exit 4
+}
+[[ -x "${proot_runtime}/bin/proot" ]] || {
+  echo "native test requires the pinned PRoot runtime" >&2
+  exit 4
+}
+export PATH="${proot_runtime}/bin:${node_runtime}/bin:${PATH}"
 export ROY_LHTB_ENVIRONMENT_BACKEND=native
 export ROY_LHTB_NATIVE_ROOT="${ROY_LHTB_NATIVE_ROOT:-${execution_base}/runtime}"
 export ROY_LHTB_NATIVE_TEMPLATE_ROOT="${ROY_LHTB_NATIVE_TEMPLATE_ROOT:-${execution_base}/templates}"
