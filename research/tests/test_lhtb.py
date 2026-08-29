@@ -708,14 +708,18 @@ for line in sys.stdin:
             server = root / "server.py"
             server.write_text("""import json, sys
 source = {'processStates': [{'fingerprint': 'm0', 'usage': {}}], 'policyRecords': []}
-pending = {'processStates': source['processStates'], 'policyRecords': [{'selectedAction': 'CONTINUE', 'stateFingerprint': 'm0'}]}
-final = {'processStates': source['processStates'] + [{'fingerprint': 'm1', 'usage': {'inputTokens': 3, 'outputTokens': 2}}], 'policyRecords': pending['policyRecords']}
+prepared = {'processStates': source['processStates'] + [{'fingerprint': 'm0p', 'usage': {}}], 'policyRecords': []}
+pending = {'processStates': prepared['processStates'], 'policyRecords': [{'selectedAction': 'CONTINUE', 'stateFingerprint': 'm0p'}]}
+final = {'processStates': prepared['processStates'] + [{'fingerprint': 'm1', 'usage': {'inputTokens': 3, 'outputTokens': 2}}], 'policyRecords': pending['policyRecords']}
 for line in sys.stdin:
     request = json.loads(line)
     method = request['method']
     if method == 'restore':
         source['organizationSeed'] = request['params']['organizationSeed']
         result = {'status': 'restored', 'snapshot': source}
+    elif method == 'prepare_boundary':
+        prepared['organizationSeed'] = source['organizationSeed']
+        result = {'status': 'ready', 'snapshot': prepared}
     elif method == 'advance_one': result = {'status': 'terminal_request', 'request': {'id': 'one', 'command': 'true', 'timeoutMs': 1000, 'nodeId': 'root'}, 'snapshot': pending}
     elif method == 'resume_boundary':
         final['organizationSeed'] = source['organizationSeed']

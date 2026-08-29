@@ -516,6 +516,13 @@ class NodewiseCheckpointFinalizeAgent(BaseAgent):
                     "organizationSeed": self.organization_seed,
                 }
             )
+            # A saved macro successor is a valid SMDP boundary, but terminal/tool
+            # events produced by that macro may not yet have been projected into
+            # the next node's semantic state. Materialize that deterministic
+            # boundary before fingerprinting or sampling the next action.
+            response = await asyncio.to_thread(
+                self.rpc.request, "prepare_boundary", {}
+            )
         else:
             trajectory_id = str(uuid.uuid4())
             response = await asyncio.to_thread(self.rpc.request, "initialize", {
