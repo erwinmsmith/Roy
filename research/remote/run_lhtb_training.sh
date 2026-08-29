@@ -11,7 +11,7 @@ schedule="${run_root}/schedule.json"
 model="${run_root}/checkpoints/current.pt"
 trajectories="${run_root}/train-trajectories.jsonl"
 updates="${run_root}/update-audit.jsonl"
-transition_samples="${run_root}/transition-reward-samples.jsonl"
+transition_samples="${run_root}/transition-audit-samples.jsonl"
 dev_trajectories="${run_root}/dev-trajectories.jsonl"
 dev_metrics="${run_root}/dev-metrics.jsonl"
 environment_backend="${ROY_LHTB_ENVIRONMENT_BACKEND:-docker}"
@@ -54,18 +54,8 @@ export ROY_LHTB_SEMANTIC_COMMAND="${python_bin} -m roy_research.semantic_server"
 export ROY_LHTB_SEMANTIC_ROOT="${run_root}/semantic"
 export ROY_LHTB_MODEL="${model}"
 export DEEPSEEK_MODEL_REVISION="${DEEPSEEK_MODEL_REVISION:-deepseek-v4-flash-api-alias}"
-export ROY_LHTB_MCTS_ENABLED="${ROY_LHTB_MCTS_ENABLED:-true}"
-export ROY_LHTB_MCTS_SIMULATIONS="${ROY_LHTB_MCTS_SIMULATIONS:-24}"
-export ROY_LHTB_MCTS_MAX_DEPTH="${ROY_LHTB_MCTS_MAX_DEPTH:-3}"
-export ROY_LHTB_MCTS_CPUCT="${ROY_LHTB_MCTS_CPUCT:-1.5}"
-export ROY_LHTB_MCTS_TEMPERATURE="${ROY_LHTB_MCTS_TEMPERATURE:-1}"
-export ROY_LHTB_MCTS_AGENT_EXPANSIONS="${ROY_LHTB_MCTS_AGENT_EXPANSIONS:-4}"
-export ROY_LHTB_MCTS_PROPOSAL_ATTEMPTS="${ROY_LHTB_MCTS_PROPOSAL_ATTEMPTS:-2}"
-if [[ "${ROY_LHTB_MCTS_ENABLED}" == "true" ]]; then
-  export ROY_LHTB_ORGANIZATION_INTERVAL=1
-else
-  export ROY_LHTB_ORGANIZATION_INTERVAL="${ROY_LHTB_ORGANIZATION_INTERVAL:-5}"
-fi
+export ROY_LHTB_MCTS_ENABLED=false
+export ROY_LHTB_ORGANIZATION_INTERVAL=1
 
 group_environment_args=(--environment-backend "${environment_backend}"
   --max-retries "${ROY_LHTB_MAX_ENV_RETRIES:-8}"
@@ -125,7 +115,7 @@ PY
     local group_id="dev:${dev_epoch}:${task_id}"
     local task_tree initial_fingerprint job_dir config_path digest revision seed
     task_tree="$(git -C "${lhtb_root}" rev-parse "HEAD:tasks/${task_id}")"
-    initial_fingerprint="$(printf '%s' "${group_id}:${task_tree}:21600:32768:${ROY_LHTB_MCTS_ENABLED}:${ROY_LHTB_MCTS_SIMULATIONS}:${ROY_LHTB_MCTS_MAX_DEPTH}:${ROY_LHTB_MCTS_AGENT_EXPANSIONS}:${ROY_LHTB_MCTS_PROPOSAL_ATTEMPTS}" | shasum -a 256 | awk '{print $1}')"
+    initial_fingerprint="$(printf '%s' "${group_id}:${task_tree}:21600:32768:direct-node-actor" | shasum -a 256 | awk '{print $1}')"
     seed="$((16#$(printf '%s' "${group_id}" | shasum -a 256 | cut -c1-8)))"
     revision="$("${python_bin}" - "${model}" <<'PY'
 import sys, torch
@@ -147,7 +137,7 @@ PY
       --output "${dev_trajectories}" --group-id "${group_id}" --task-id "${task_id}" \
       --category "${category}" --split dev --epoch "${dev_epoch}" \
       --policy-revision "${revision}" --environment-digest "${digest}" \
-      --environment-backend "${environment_backend}" --expected 1 --model "${model}"
+      --environment-backend "${environment_backend}" --expected 1
   done < <("${python_bin}" - "${manifest}" <<'PY'
 import json, sys
 for value in json.load(open(sys.argv[1], encoding="utf-8"))["tasks"]:
@@ -196,7 +186,7 @@ print(torch.load(sys.argv[1], map_location="cpu", weights_only=False)["metadata"
 PY
 )"
   task_tree="$(git -C "${lhtb_root}" rev-parse "HEAD:tasks/${task_id}")"
-  initial_fingerprint="$(printf '%s' "${group_id}:${task_tree}:21600:32768:${ROY_LHTB_MCTS_ENABLED}:${ROY_LHTB_MCTS_SIMULATIONS}:${ROY_LHTB_MCTS_MAX_DEPTH}:${ROY_LHTB_MCTS_AGENT_EXPANSIONS}:${ROY_LHTB_MCTS_PROPOSAL_ATTEMPTS}" | shasum -a 256 | awk '{print $1}')"
+  initial_fingerprint="$(printf '%s' "${group_id}:${task_tree}:21600:32768:direct-node-actor" | shasum -a 256 | awk '{print $1}')"
   job_dir="${run_root}/jobs/${epoch}-${task_id}"
   config_path="${run_root}/configs/${epoch}-${task_id}.json"
   mkdir -p "${job_dir}"
@@ -217,22 +207,22 @@ PY
       --job-dir "${job_dir}" --output "${group_trajectories}" --group-id "${group_id}" \
       --task-id "${task_id}" --category "${category}" --split train --epoch "${epoch}" \
       --policy-revision "${policy_revision}" --environment-digest "${environment_digest}" \
-      --environment-backend "${environment_backend}" --model "${model}"
+      --environment-backend "${environment_backend}"
   fi
   "${python_bin}" -m roy_research lhtb-sample-audit \
     --trajectories "${group_trajectories}" --output "${group_audit}"
   "${python_bin}" - "${group_audit}" <<'PY'
 import json, sys
 audit = json.load(open(sys.argv[1], encoding="utf-8"))
-required = ("preconditions_for_training", "value_training_available",
-            "all_transition_chains_complete", "all_step_rewards_complete",
-            "all_mcts_traces_complete", "all_dynamic_agent_expansions_complete")
+required = ("preconditions_for_training", "official_terminal_labels_complete",
+            "all_transition_chains_complete", "all_direct_node_actor_records_complete",
+            "mcts_not_used")
 failed = [key for key in required if not audit.get(key)]
 if failed:
     raise SystemExit(f"G=8 sample audit rejected training group: {failed}")
 print(json.dumps({key: audit.get(key) for key in (
     "trajectory_count", "official_reward_std", "topology_search_modes",
-    "terminal_node_span", "shaped_return_std", "actor_dense_signal_available",
+    "terminal_node_span", "official_reward_std", "actor_terminal_signal_available",
     *required,
 )}))
 PY

@@ -89,6 +89,11 @@ def build_state_transition_samples(
         scored_rewards, scored_returns = process_credit([target_values], [terminal_reward])
         rewards, returns = scored_rewards[0], scored_returns[0]
     result = []
+    recorded_terminal_reward = terminal_reward
+    if recorded_terminal_reward is None and metadata is not None:
+        metadata_reward = metadata.get("terminal_reward")
+        recorded_terminal_reward = (float(metadata_reward)
+                                    if metadata_reward is not None else None)
     for index, (before, after) in enumerate(zip(states, states[1:])):
         delta = topology_delta(before, after)
         new_events = _new_events(before, after)
@@ -114,7 +119,7 @@ def build_state_transition_samples(
             "process_reward": process_reward,
             "reward_sign": _reward_sign(process_reward),
             "return_to_go": returns[index],
-            "terminal_reward": terminal_reward,
+            "terminal_reward": recorded_terminal_reward,
             "reward_target": "official_terminal" if index == len(states) - 2
                 and target_values is not None else "ema_delta_value"
                 if target_values is not None else None,

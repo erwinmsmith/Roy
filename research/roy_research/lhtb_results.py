@@ -12,7 +12,6 @@ from .process_state import canonical_fingerprint
 from .lhtb_transitions import build_state_transition_samples
 from .lhtb_native import normalize_native_task_id
 from .organization import LHTB_POLICY_INTERFACE_REVISION
-from .lhtb_value_metrics import annotate_value_traces
 
 from .io import write_jsonl
 
@@ -143,15 +142,13 @@ def import_harbor_group(
     if len(records) != expected:
         raise ValueError(f"expected {expected} Harbor results, found {len(records)}")
     if value_checkpoint is not None:
-        records = [dict(value) for value in annotate_value_traces(
-            records, str(value_checkpoint), device_name
-        )]
+        raise ValueError("value shaping is disabled; import raw terminal-R trajectories")
     write_jsonl(output, records, append=output.exists())
     return records
 
 
 def sample_audit(records: List[Mapping[str, Any]]) -> Dict[str, Any]:
-    """Summarize topology, MCTS and dense-credit completeness without updating models."""
+    """Audit direct node actions, topology transitions and official terminal labels."""
     trajectories = []
     for record in records:
         states = list(record.get("process_states", []))
@@ -162,6 +159,8 @@ def sample_audit(records: List[Mapping[str, Any]]) -> Dict[str, Any]:
         shaped_returns = [float(value) for value in record.get("shaped_returns", [])]
         mcts_records = [value for value in policy if isinstance(value, Mapping)
                         and value.get("behaviorPolicy", value.get("behavior_policy")) == "mcts_puct"]
+        actor_records = [value for value in policy if isinstance(value, Mapping)
+                         and value.get("behaviorPolicy", value.get("behavior_policy")) == "actor"]
         search_samples = [sample for value in mcts_records
                           for sample in value.get(
                               "mctsSearchSamples", value.get("mcts_search_samples", [])
@@ -234,6 +233,21 @@ def sample_audit(records: List[Mapping[str, Any]]) -> Dict[str, Any]:
                 for sign in ("positive", "zero", "negative")
             },
             "mcts_decision_count": len(mcts_records),
+            "actor_decision_count": len(actor_records),
+            "direct_node_actor_complete": len(actor_records) == len(policy) and bool(policy) and all(
+                math.isfinite(float(value.get(
+                    "maskedOldLogProbability", value.get("masked_old_log_probability", float("nan"))
+                )))
+                and str(value.get("contextNodeId", value.get("context_node_id", "")))
+                    == str((value.get("policyState", value.get("policy_state")) or {})
+                           .get("context_node_id", ""))
+                and isinstance((value.get("policyState", value.get("policy_state")) or {})
+                               .get("context_node"), Mapping)
+                and str(((value.get("policyState", value.get("policy_state")) or {})
+                         .get("context_node") or {}).get("id", ""))
+                    == str(value.get("contextNodeId", value.get("context_node_id", "")))
+                for value in actor_records
+            ),
             "mcts_selected_process_rewards": [
                 value.get("selectedProcessReward", value.get("selected_process_reward"))
                 for value in mcts_records
@@ -295,6 +309,10 @@ def sample_audit(records: List[Mapping[str, Any]]) -> Dict[str, Any]:
         "terminal_node_span": max(node_counts) - min(node_counts) if node_counts else None,
         "all_transition_chains_complete": all(value["transition_chain_complete"]
                                                for value in trajectories),
+        "all_direct_node_actor_records_complete": all(
+            value["direct_node_actor_complete"] for value in trajectories
+        ),
+        "mcts_not_used": all(value["mcts_decision_count"] == 0 for value in trajectories),
         "all_step_rewards_complete": all(value["process_reward_complete"]
                                          for value in trajectories),
         "all_mcts_traces_complete": all(value["mcts_trace_complete"]
@@ -319,23 +337,21 @@ def sample_audit(records: List[Mapping[str, Any]]) -> Dict[str, Any]:
         "mcts_search_sample_count": len(search_advantages),
         "mcts_search_advantage_std": float(np.std(search_advantages))
             if search_advantages else None,
-        "value_training_available": len(terminal_rewards) == len(trajectories)
+        "official_terminal_labels_complete": len(terminal_rewards) == len(trajectories)
             and len(trajectories) > 0,
-        "actor_dense_signal_available": (len(shaped_returns) > 1
-            and float(np.std(shaped_returns)) > 1e-8)
-            or (len(search_advantages) > 1 and float(np.std(search_advantages)) > 1e-8),
+        "value_training_available": False,
+        "actor_terminal_signal_available": len(terminal_rewards) == 8
+            and float(np.std(terminal_rewards)) > 1e-8,
+        "actor_dense_signal_available": False,
         "shaped_return_std": float(np.std(shaped_returns)) if shaped_returns else None,
         "preconditions_for_training": len(trajectories) == 8
             and all(value["complete"] and not value["environment_failure"]
                     for value in trajectories)
             and len({value["organization_seed"] for value in trajectories}) == 8
-            and search_mode_set == ["mcts_unconstrained"]
+            and search_mode_set == ["actor_direct_on_policy"]
             and all(value["transition_chain_complete"] for value in trajectories)
-            and all(value["process_reward_complete"] for value in trajectories)
-            and all(value["mcts_trace_complete"] for value in trajectories)
-            and all(value["mcts_search_samples_complete"] for value in trajectories)
-            and all(value["dynamic_agent_expansions_complete"] for value in trajectories)
-            and sum(value["dynamic_agent_expansion_count"] for value in trajectories) > 0
+            and all(value["direct_node_actor_complete"] for value in trajectories)
+            and all(value["mcts_decision_count"] == 0 for value in trajectories)
             and len(terminal_rewards) == 8,
         "trajectories": trajectories,
     }
@@ -491,13 +507,15 @@ def validate_smoke(root: Path, task_ids: tuple[str, ...] = (
                 str((((record.get("policyState") or {}).get("topology_search") or {}).get("mode")))
                 for record in records
             }
-            if trajectory_search_modes != {"mcts_unconstrained"}:
+            if trajectory_search_modes != {"actor_direct_on_policy"}:
                 raise ValueError(
-                    f"smoke trajectory is not unconstrained MCTS for {task_id}: "
+                    f"smoke trajectory is not direct node-actor sampling for {task_id}: "
                     f"{sorted(trajectory_search_modes)}"
                 )
             search_modes.update(trajectory_search_modes)
             policy_diagnostics = policy_diagnostics and bool(records) and all(
+                value.get("behaviorPolicy", value.get("behavior_policy")) == "actor"
+                and
                 isinstance(value.get("rawProbabilities"), Mapping)
                 and isinstance(value.get("maskedProbabilities"), Mapping)
                 and value.get("selectedAction")
@@ -561,7 +579,7 @@ def validate_smoke(root: Path, task_ids: tuple[str, ...] = (
     if len(groups) != len(task_ids):
         raise ValueError(f"expected {len(task_ids)} complete smoke groups, found {len(groups)}")
     if not any(value["reward_std"] > 1e-8 for value in groups.values()):
-        raise ValueError("smoke has no within-group continuous reward variance")
+        raise ValueError("smoke has no within-group official terminal reward variance")
     for audit in root.rglob("semantic-audit.jsonl"):
         for line in audit.read_text(encoding="utf-8").splitlines():
             if line and _contains_forbidden_benchmark_field(json.loads(line)):

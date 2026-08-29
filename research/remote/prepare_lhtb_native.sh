@@ -421,20 +421,10 @@ roy_smoke() {
   export ROY_LHTB_SEMANTIC_COMMAND="${python_bin} -m roy_research.semantic_server"
   export ROY_LHTB_SEMANTIC_ROOT="${smoke_root}/semantic"
   export ROY_LHTB_POLICY_COMMAND="${python_bin} -m roy_research.lhtb_policy_server"
-  export ROY_LHTB_MODEL="${roy_root}/research/output/lhtb/native/scheduler-structural-initial.pt"
+  export ROY_LHTB_MODEL="${roy_root}/research/output/lhtb/native/scheduler-node-grpo-initial.pt"
   export ROY_LHTB_NATIVE_ROOT="${native_root}"
-  export ROY_LHTB_MCTS_ENABLED="${ROY_LHTB_MCTS_ENABLED:-true}"
-  export ROY_LHTB_MCTS_SIMULATIONS="${ROY_LHTB_MCTS_SIMULATIONS:-16}"
-  export ROY_LHTB_MCTS_MAX_DEPTH="${ROY_LHTB_MCTS_MAX_DEPTH:-3}"
-  export ROY_LHTB_MCTS_CPUCT="${ROY_LHTB_MCTS_CPUCT:-1.5}"
-  export ROY_LHTB_MCTS_TEMPERATURE="${ROY_LHTB_MCTS_TEMPERATURE:-1}"
-  export ROY_LHTB_MCTS_AGENT_EXPANSIONS="${ROY_LHTB_MCTS_AGENT_EXPANSIONS:-4}"
-  export ROY_LHTB_MCTS_PROPOSAL_ATTEMPTS="${ROY_LHTB_MCTS_PROPOSAL_ATTEMPTS:-2}"
-  if [[ "${ROY_LHTB_MCTS_ENABLED}" == "true" ]]; then
-    export ROY_LHTB_ORGANIZATION_INTERVAL=1
-  else
-    export ROY_LHTB_ORGANIZATION_INTERVAL="${ROY_LHTB_ORGANIZATION_INTERVAL:-5}"
-  fi
+  export ROY_LHTB_MCTS_ENABLED=false
+  export ROY_LHTB_ORGANIZATION_INTERVAL=1
   if [[ ! -f "${ROY_LHTB_MODEL}" ]]; then
     "${python_bin}" -m roy_research lhtb-init \
       --manifest "${roy_root}/research/config/lhtb_split.json" --model "${ROY_LHTB_MODEL}"
@@ -449,7 +439,7 @@ for value in json.load(open(sys.argv[1], encoding="utf-8"))["tasks"]:
     if value["task_id"] == sys.argv[2]: print(value["category"]); break
 PY
 )"
-    fingerprint="$(printf '%s' "native-smoke:${task_id}:${revision}:${ROY_LHTB_MCTS_ENABLED}:${ROY_LHTB_MCTS_SIMULATIONS}:${ROY_LHTB_MCTS_MAX_DEPTH}:${ROY_LHTB_MCTS_AGENT_EXPANSIONS}:${ROY_LHTB_MCTS_PROPOSAL_ATTEMPTS}" | sha256sum | awk '{print $1}')"
+    fingerprint="$(printf '%s' "native-smoke:${task_id}:${revision}:direct-node-actor" | sha256sum | awk '{print $1}')"
     job_dir="${smoke_root}/${task_id}"
     config="${roy_root}/research/output/lhtb/native/configs/${run_id}-${task_id}.json"
     mkdir -p "${job_dir}" "$(dirname "${config}")"

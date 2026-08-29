@@ -87,7 +87,8 @@ export function resolveTopologySamplingProfile(
 /**
  * Topology profiles are retained only for explicit controlled diagnostics.
  * Formal learned-policy sampling leaves this unset so node count, depth and
- * graph connectivity are outcomes of MCTS rather than seed-conditioned inputs.
+ * graph connectivity emerge from repeated node-local actor decisions rather
+ * than seed-conditioned inputs.
  */
 export function activeTopologySamplingProfile(
   organizationSeed: number,
@@ -816,7 +817,7 @@ export class LHTBAutonomousController {
         ?? current.completion.usage?.completionTokens ?? 0,
       current.completion.model);
       const currentValidation = this.validateCandidates(current.value, session);
-      this.ensureMCTSTerminationCandidate(snapshot, currentValidation);
+      this.ensureLearnedTerminationCandidate(snapshot, currentValidation);
       const structuralDeficits = this.structuralCandidateDeficits(snapshot,
         currentValidation.candidates);
       if (structuralDeficits.length > 0) {
@@ -870,30 +871,15 @@ export class LHTBAutonomousController {
     const candidates = validation.candidates;
     let selected: ProposedCandidate;
     let policyRecord: OrganizationPolicyRecord | undefined;
-    if (snapshot.organizationMode === 'learned_information_realization'
-      && (this.mctsEnabled() || this.shouldInvokeOrganizationPolicy(snapshot))) {
+    if (snapshot.organizationMode === 'learned_information_realization') {
       if (!this.learnedPolicy) {
         throw new Error('Learned mode requires ROY_LHTB_POLICY_COMMAND and has no heuristic fallback');
       }
-      const decision = this.mctsEnabled()
-        ? await this.selectWithMCTS(snapshot, candidates, seed, session)
-        : await this.learnedPolicy.select(this.policyState(snapshot, candidates), candidates, seed);
+      const decision = await this.learnedPolicy.select(
+        this.policyState(snapshot, candidates), candidates, seed
+      );
       selected = decision.candidate as ProposedCandidate;
       policyRecord = decision.record;
-    } else if (snapshot.organizationMode === 'learned_information_realization') {
-      const local = this.localContinuationCandidate(snapshot, candidates,
-        completion.value.preferred_candidate_id);
-      if (local) selected = local;
-      else {
-        if (!this.learnedPolicy) {
-          throw new Error('Learned mode requires ROY_LHTB_POLICY_COMMAND and has no heuristic fallback');
-        }
-        const decision = await this.learnedPolicy.select(
-          this.policyState(snapshot, candidates), candidates, seed
-        );
-        selected = decision.candidate as ProposedCandidate;
-        policyRecord = decision.record;
-      }
     } else {
       selected = candidates.find(value => value.id === completion.value.preferred_candidate_id)
         ?? candidates[0];
@@ -1113,7 +1099,7 @@ export class LHTBAutonomousController {
       await this.auditProposal(requestState, current);
       const probe = RoyLHTBSession.restore(snapshot);
       const validation = this.validateCandidates(current.value, probe);
-      this.ensureMCTSTerminationCandidate(snapshot, validation);
+      this.ensureLearnedTerminationCandidate(snapshot, validation);
       const structuralDeficits = this.structuralCandidateDeficits(snapshot,
         validation.candidates);
       if (structuralDeficits.length > 0) {
@@ -1228,55 +1214,10 @@ export class LHTBAutonomousController {
     return result as OrganizationPolicyRecord['rawProbabilities'];
   }
 
-  private shouldInvokeOrganizationPolicy(snapshot: ReturnType<RoyLHTBSession['snapshot']>): boolean {
-    const previous = snapshot.policyRecords.at(-1)?.policyState;
-    if (!previous || typeof previous !== 'object') return true;
-    const policyState = previous as Record<string, unknown>;
-    const events = snapshot.runtimeEvents ?? snapshot.processStates.at(-1)?.runtimeEvents ?? [];
-    const priorTerminalCount = Number(policyState.terminal_result_count ?? 0);
-    const terminalResults = events.filter(event => event.kind === 'terminal_result');
-    const newTerminalResults = terminalResults.slice(priorTerminalCount);
-    const interval = Math.max(1, Number(process.env.ROY_LHTB_ORGANIZATION_INTERVAL ?? 5));
-    if (newTerminalResults.length >= interval) return true;
-    if (newTerminalResults.some(event => (event.exitCode ?? 0) !== 0
-      || (Array.isArray(event.attributes?.fileChanges) && event.attributes.fileChanges.length > 0))) {
-      return true;
-    }
-    const previousRequirements = new Set(Array.isArray(policyState.unresolved_requirement_ids)
-      ? policyState.unresolved_requirement_ids.map(String) : []);
-    const currentRequirements = snapshot.runtime.requirements
-      .filter(value => value.status === 'open').map(value => value.id);
-    if (currentRequirements.some(value => !previousRequirements.has(value))) return true;
-    const priorOrganizationActionCount = Number(policyState.organization_action_count ?? 0);
-    const newOrganizationActions = events.filter(event => event.kind === 'organization_action')
-      .slice(priorOrganizationActionCount);
-    if (newOrganizationActions.some(event => {
-      const action = event.attributes?.action as Record<string, unknown> | undefined;
-      return action && ['DERIVE', 'CONNECT', 'RETURN', 'PRUNE'].includes(String(action.kind));
-    })) return true;
-    const contradictionCount = snapshot.processStates.at(-1)?.semanticRelations.filter(value =>
-      value.label === 'contradict').length ?? 0;
-    if (contradictionCount > Number(policyState.contradiction_count ?? 0)) return true;
-    const completedNodeCount = snapshot.runtime.nodes.filter(node =>
-      ['completed', 'returned'].includes(node.status)).length;
-    return completedNodeCount > Number(policyState.completed_node_count ?? 0);
-  }
-
-  private localContinuationCandidate(snapshot: ReturnType<RoyLHTBSession['snapshot']>,
-    candidates: ProposedCandidate[], preferredId: string): ProposedCandidate | undefined {
-    const events = snapshot.runtimeEvents ?? snapshot.processStates.at(-1)?.runtimeEvents ?? [];
-    const actorId = [...events].reverse().find(event =>
-      event.kind === 'terminal_result' || event.kind === 'terminal_command')?.nodeId;
-    const local = candidates.filter(candidate =>
-      ['ACQUIRE', 'EXECUTE'].includes(candidate.kind)
-      && (!actorId || candidate.actorNodeId === actorId));
-    return local.find(candidate => candidate.id === preferredId) ?? local[0];
-  }
-
-  private ensureMCTSTerminationCandidate(
+  private ensureLearnedTerminationCandidate(
     snapshot: ReturnType<RoyLHTBSession['snapshot']>, validation: CandidateValidation
   ): void {
-    if (!this.mctsEnabled() || snapshot.organizationMode !== 'learned_information_realization'
+    if (snapshot.organizationMode !== 'learned_information_realization'
       || validation.candidates.some(candidate => candidate.kind === 'STOP')) return;
     if (scheduledOrganizationContextNode(snapshot) !== snapshot.runtime.rootId) return;
     const root = snapshot.runtime.nodes.find(node => node.id === snapshot.runtime.rootId);
@@ -1297,7 +1238,7 @@ export class LHTBAutonomousController {
     }
     validation.candidates.push(candidate);
     validation.dispositions.push({ index: -3, id: candidate.id, accepted: true,
-      reasons: ['system_mcts_termination_support'] });
+      reasons: ['system_direct_actor_termination_support'] });
   }
 
   private validateCandidates(response: ProposalResponse, session: RoyLHTBSession): CandidateValidation {
@@ -1640,15 +1581,49 @@ export class LHTBAutonomousController {
   private policyState(snapshot: ReturnType<RoyLHTBSession['snapshot']>,
     candidates: ProposedCandidate[]): Record<string, unknown> {
     const contextNodeId = scheduledOrganizationContextNode(snapshot);
+    const contextNode = snapshot.runtime.nodes.find(node => node.id === contextNodeId);
+    if (!contextNode) throw new Error(`Scheduler context node does not exist: ${contextNodeId}`);
     const contextCandidates = candidates.filter(candidate => candidate.actorNodeId === contextNodeId);
     const activeNodes = snapshot.runtime.nodes
       .filter(node => ['ready', 'running', 'waiting', 'completed'].includes(node.status));
     const latest = snapshot.processStates.at(-1);
     const events = snapshot.runtimeEvents ?? latest?.runtimeEvents ?? [];
     const projectedEvents = (latest?.runtimeEvents ?? events).slice(-24);
-    const agentNodes = snapshot.runtime.nodes.map(node => ({ id: node.id, kind: 'agent',
-      timestamp: node.createdAt, text: node.localObjective, status: node.status,
-      attributes: { signal: node.status === 'returned' || node.status === 'completed' ? 1 : 0 } }));
+    const requirementsByNode = new Map(snapshot.runtime.nodes.map(node => [node.id,
+      snapshot.runtime.requirements.filter(requirement => requirement.parentNodeId === node.id
+        || requirement.assignedNodeId === node.id)]));
+    const nodeRuntimeEvents = (nodeId: string) => events.filter(event => event.nodeId === nodeId)
+      .slice(-12);
+    const agentNodes = snapshot.runtime.nodes.map(node => {
+      const localRequirements = requirementsByNode.get(node.id) ?? [];
+      const recentLocalEvents = nodeRuntimeEvents(node.id);
+      const specification = node.specification;
+      const localContext = {
+        objective: node.localObjective,
+        parent_id: node.parentId,
+        depth: node.depth,
+        status: node.status,
+        triggering_gap_id: node.triggeringGapId,
+        assigned_requirement_ids: node.assignedRequirementIds ?? [],
+        requirements: localRequirements.map(requirement => ({ id: requirement.id,
+          description: requirement.description, required_information: requirement.requiredInformation,
+          status: requirement.status, parent_node_id: requirement.parentNodeId,
+          assigned_node_id: requirement.assignedNodeId })),
+        realization_mode: specification?.realizationMode,
+        required_claims: specification?.requiredClaims ?? [],
+        required_evidence: specification?.requiredEvidence ?? [],
+        allowed_tools: specification?.externalAccess.tools ?? [],
+        expected_output: specification?.expectedOutput.requiredInformation,
+        termination_condition: specification?.terminationCondition,
+        recent_events: recentLocalEvents.map(event => ({ kind: event.kind,
+          command: event.command, exit_code: event.exitCode,
+          output: projectText(event.output), action: event.attributes?.action })),
+      };
+      return { id: node.id, kind: 'agent', timestamp: node.createdAt,
+        text: JSON.stringify(localContext), status: node.status,
+        attributes: { signal: node.status === 'returned' || node.status === 'completed' ? 1 : 0,
+          depth: node.depth, is_context_node: node.id === contextNodeId ? 1 : 0 } };
+    });
     const epistemicNodes = [
       ...(latest?.requirements ?? []).map(value => ({ id: value.id, kind: 'subtask',
         timestamp: 0, text: value.description, status: value.status,
@@ -1771,7 +1746,8 @@ export class LHTBAutonomousController {
         && hasExplorationAlternative) }));
     return {
       interface_revision: LHTB_POLICY_INTERFACE_REVISION,
-      topology_search: { mode: profile ? 'profile_conditioned_diagnostic' : 'mcts_unconstrained',
+      topology_search: { mode: profile ? 'profile_conditioned_diagnostic'
+        : 'actor_direct_on_policy',
         profile_id: profile?.id,
         reward_semantics: 'official terminal task utility only; topology has no intrinsic reward' },
       sampling_profile: profile ? { id: profile.id,
@@ -1781,6 +1757,22 @@ export class LHTBAutonomousController {
       state_fingerprint: snapshot.processStates.at(-1)?.fingerprint,
       event_graph: { nodes, edges },
       context_node_id: contextNodeId,
+      context_node: {
+        id: contextNode.id,
+        parent_id: contextNode.parentId,
+        depth: contextNode.depth,
+        status: contextNode.status,
+        local_objective: contextNode.localObjective,
+        triggering_gap_id: contextNode.triggeringGapId,
+        assigned_requirement_ids: contextNode.assignedRequirementIds ?? [],
+        requirements: (requirementsByNode.get(contextNodeId) ?? []).map(requirement => ({
+          id: requirement.id, description: requirement.description,
+          required_information: requirement.requiredInformation, status: requirement.status,
+          parent_node_id: requirement.parentNodeId, assigned_node_id: requirement.assignedNodeId,
+        })),
+        specification: contextNode.specification,
+        recent_runtime_events: nodeRuntimeEvents(contextNodeId),
+      },
       scheduler: { kind: 'deterministic_dependency_event_locality', learned: false },
       candidates: policyCandidates,
       envelope: { id: 'lhtb-open', minimum_nodes: minimumNodes, maximum_nodes: 1_000_000,

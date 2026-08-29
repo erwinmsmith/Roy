@@ -47,6 +47,7 @@ export class PythonOrganizationPolicyClient {
     if (!candidate) throw new Error('Learned policy selected an unavailable open candidate');
     const raw = response.policy_record;
     return { candidate, record: {
+      behaviorPolicy: 'actor',
       stateFingerprint: String(raw.state_fingerprint), contextNodeId: String(raw.context_node_id),
       candidateId: String(raw.candidate_id),
       maskedOldLogProbability: Number(raw.masked_old_log_probability),

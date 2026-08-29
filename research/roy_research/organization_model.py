@@ -11,16 +11,16 @@ from .model import EDGE_KINDS, NODE_KINDS, RelationalMessagePassing, TEXT_DIMENS
 from .organization import ORGANIZATION_ACTIONS
 
 
-LHTB_ACTOR_MODEL_REVISION = "scheduler-context-relational-attention-policy-20260829"
+LHTB_ACTOR_MODEL_REVISION = "node-local-context-plus-global-m-relational-policy-20260829"
 
 
 class InformationRealizationPolicy(nn.Module):
-    """Structural action policy for a scheduler-selected context node.
+    """Shared structural actor invoked separately for each scheduled node.
 
-    The Runtime scheduler supplies the node that currently owns execution.  It
-    is observed context, never a learned routing action.  The policy chooses an
-    outer organization action and, conditionally, its open child specification
-    or connection payload from the candidates generated for that one node.
+    Each invocation observes that node's local context plus the current global
+    epistemic/organization graph M_t.  Scheduling is not a learned routing
+    action.  The actor chooses the node's organization action and, when needed,
+    its open child specification or connection payload.
     """
 
     def __init__(

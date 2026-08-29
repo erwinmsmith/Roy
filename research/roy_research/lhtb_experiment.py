@@ -95,11 +95,10 @@ def select_dev_checkpoint(records: Sequence[Mapping[str, Any]]) -> Mapping[str, 
             "epoch": epoch,
             "checkpoint": values[0]["checkpoint"],
             "mean_reward": float(np.mean([float(value["reward"]) for value in values])),
-            "value_mae": float(np.mean([float(value["value_mae"]) for value in values])),
             "tokens": int(sum(int(value["tokens"]) for value in values)),
         })
     return sorted(candidates, key=lambda value: (
-        -value["mean_reward"], value["value_mae"], value["tokens"], value["epoch"]
+        -value["mean_reward"], value["tokens"], value["epoch"]
     ))[0]
 
 
@@ -230,9 +229,9 @@ def write_harbor_group_config(
             "env": agent_env,
         }
     if arm == "learned_information_realization":
-        # Every rollout uses the same unconstrained MCTS interface. Distinct
-        # organization seeds produce different on-policy searches; topology is
-        # observed after the rollout and is never assigned as an input profile.
+        # Every rollout samples the current node actor directly. Distinct
+        # organization seeds produce different on-policy trajectories; topology
+        # is observed after rollout and is never assigned as an input profile.
         agents = [agent_config() for _ in range(attempts)]
         harbor_attempts = 1
     else:

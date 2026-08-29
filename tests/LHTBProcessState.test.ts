@@ -119,7 +119,7 @@ describe('LHTB process state', () => {
     try {
       const result = await controller.advance(session, 1);
       expect(result.status).toBe('terminal_request');
-      expect(policyCandidates.map(value => value.kind)).toEqual(['ACQUIRE']);
+      expect(policyCandidates.map(value => value.kind)).toEqual(['ACQUIRE', 'STOP']);
       expect(session.snapshot().runtime.nodes).toHaveLength(1);
       expect(session.snapshot().runtime.derivationEdges).toHaveLength(0);
     } finally {
@@ -835,7 +835,7 @@ describe('LHTB process state', () => {
     }
   });
 
-  it('drops terminal candidates whose actor returned inside an MCTS branch', async () => {
+  it('invokes the shared direct actor with a child node local context', async () => {
     const priorMCTS = process.env.ROY_LHTB_MCTS_ENABLED;
     const priorSimulations = process.env.ROY_LHTB_MCTS_SIMULATIONS;
     const priorDepth = process.env.ROY_LHTB_MCTS_MAX_DEPTH;
@@ -843,7 +843,7 @@ describe('LHTB process state', () => {
     process.env.ROY_LHTB_MCTS_ENABLED = 'true';
     process.env.ROY_LHTB_MCTS_SIMULATIONS = '4';
     process.env.ROY_LHTB_MCTS_MAX_DEPTH = '2';
-    process.env.ROY_LHTB_TOPOLOGY_PROFILE = 'compact';
+    delete process.env.ROY_LHTB_TOPOLOGY_PROFILE;
     const session = new RoyLHTBSession('mcts-returned-actor', 'task', 'finish', 'commit',
       'learned_information_realization');
     const childSpecification = {
@@ -887,26 +887,24 @@ describe('LHTB process state', () => {
           promptTokens: 1, completionTokens: 1, totalTokens: 2,
         } } };
     } };
-    let analyses = 0;
-    const analyzedContexts: string[] = [];
-    const learnedPolicy = { async analyze(policyState: Record<string, unknown>) {
-      analyses += 1;
-      analyzedContexts.push(String(policyState.context_node_id));
-      const values = policyState.candidates as Array<Record<string, unknown>>;
-      return { targetValue: 0.5, targetRevision: 0,
-        candidatePriors: Object.fromEntries(values.map(value => [String(value.id), 1])),
-        actionPriors: {}, actorPaths: [] };
-    }, async targetValue() { return { targetValue: 0.5, targetRevision: 0 }; },
-    async targetValues(graphs: Array<Record<string, unknown>>) {
-      return { targetValues: graphs.map(() => 0.5), targetRevision: 0 };
+    let observedState: Record<string, unknown> | undefined;
+    const learnedPolicy = { async select(policyState: Record<string, unknown>, values: typeof candidates) {
+      observedState = policyState;
+      const candidate = values.find(value => value.id === 'execute-worker')!;
+      return { candidate, record: { stateFingerprint: String(policyState.state_fingerprint),
+        contextNodeId: 'worker', candidateId: candidate.id, maskedOldLogProbability: 0,
+        envelopeId: 'lhtb-open', behaviorPolicy: 'actor', policyState } };
     }, close() {} };
     const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false,
       learnedPolicy: learnedPolicy as never });
     try {
       const result = await controller.advance(session, 7);
-      expect(['continue', 'terminal_request']).toContain(result.status);
-      expect(analyses).toBeGreaterThan(0);
-      expect(analyzedContexts).toContain('worker');
+      expect(result.status).toBe('terminal_request');
+      expect(observedState?.context_node_id).toBe('worker');
+      expect((observedState?.context_node as Record<string, unknown>).local_objective)
+        .toBe(childSpecification.localObjective);
+      expect((observedState?.topology_search as Record<string, unknown>).mode)
+        .toBe('actor_direct_on_policy');
     } finally {
       controller.close();
       if (priorMCTS === undefined) delete process.env.ROY_LHTB_MCTS_ENABLED;
@@ -920,7 +918,7 @@ describe('LHTB process state', () => {
     }
   });
 
-  it('gives unconstrained MCTS a legal STOP branch when the proposer omits it', async () => {
+  it('keeps a legal single-node STOP in direct actor support', async () => {
     const priorMCTS = process.env.ROY_LHTB_MCTS_ENABLED;
     const priorSimulations = process.env.ROY_LHTB_MCTS_SIMULATIONS;
     const priorDepth = process.env.ROY_LHTB_MCTS_MAX_DEPTH;
@@ -943,17 +941,17 @@ describe('LHTB process state', () => {
         promptTokens: 1, completionTokens: 1, totalTokens: 2,
       } } };
     } };
-    const learnedPolicy = { async analyze(policyState: Record<string, unknown>) {
+    const learnedPolicy = { async select(policyState: Record<string, unknown>, candidates: Array<{
+      id: string;
+    }>) {
       const values = policyState.candidates as Array<Record<string, unknown>>;
       expect((policyState.topology_search as Record<string, unknown>).mode)
-        .toBe('mcts_unconstrained');
+        .toBe('actor_direct_on_policy');
       expect(values.map(value => value.id)).toContain('stop-official-verifier');
-      return { targetValue: 0.5, targetRevision: 0,
-        candidatePriors: Object.fromEntries(values.map(value => [String(value.id),
-          value.id === 'stop-official-verifier' ? 100 : 1])), actionPriors: {}, actorPaths: [] };
-    }, async targetValue() { return { targetValue: 0.5, targetRevision: 0 }; },
-    async targetValues(graphs: Array<Record<string, unknown>>) {
-      return { targetValues: graphs.map(() => 0.5), targetRevision: 0 };
+      const candidate = candidates.find(value => value.id === 'stop-official-verifier')!;
+      return { candidate, record: { stateFingerprint: String(policyState.state_fingerprint),
+        contextNodeId: 'root', candidateId: candidate.id, maskedOldLogProbability: 0,
+        envelopeId: 'lhtb-open', behaviorPolicy: 'actor', policyState } };
     }, close() {} };
     const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false,
       learnedPolicy: learnedPolicy as never });
@@ -975,7 +973,7 @@ describe('LHTB process state', () => {
     }
   });
 
-  it('uses the agent proposer to generate fresh directions inside hypothetical MCTS states',
+  it('executes one direct actor sample without hypothetical search expansions',
     async () => {
       const prior = {
         enabled: process.env.ROY_LHTB_MCTS_ENABLED,
@@ -1037,15 +1035,13 @@ describe('LHTB process state', () => {
         return { event_id: event.id, requirements: [], claims: [], assumptions: [], evidence: [],
           external_observations: [], blind_spots: [], relations: [] };
       }, close() {} };
-      const learnedPolicy = { async analyze(policyState: Record<string, unknown>) {
-        const values = policyState.candidates as Array<Record<string, unknown>>;
-        return { targetValue: 0.5, targetRevision: 0,
-          candidatePriors: Object.fromEntries(values.map(value => [String(value.id),
-            value.id === 'stop-official-verifier' ? 0.001 : 1])),
-          actionPriors: {}, actorPaths: [] };
-      }, async targetValue() { return { targetValue: 0.5, targetRevision: 0 }; },
-      async targetValues(graphs: Array<Record<string, unknown>>) {
-        return { targetValues: graphs.map(() => 0.5), targetRevision: 0 };
+      const learnedPolicy = { async select(policyState: Record<string, unknown>, candidates: Array<{
+        id: string;
+      }>) {
+        const candidate = candidates.find(value => value.id === 'derive-worker')!;
+        return { candidate, record: { stateFingerprint: String(policyState.state_fingerprint),
+          contextNodeId: 'root', candidateId: candidate.id, maskedOldLogProbability: 0,
+          envelopeId: 'lhtb-open', behaviorPolicy: 'actor', policyState } };
       }, close() {} };
       const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false,
         learnedPolicy: learnedPolicy as never });
@@ -1053,14 +1049,11 @@ describe('LHTB process state', () => {
         const result = await controller.advance(session, 17);
         expect(result.status).toBe('continue');
         const record = session.snapshot().policyRecords.at(-1)!;
-        expect(calls).toBeGreaterThan(1);
-        expect(observedContexts).toContain('worker');
-        expect(record.mctsAgentExpansionCount).toBeGreaterThan(0);
-        expect(record.mctsAgentProposalCalls).toBeGreaterThan(0);
-        expect(record.mctsSearchSamples?.map(value => value.candidateId))
-          .toContain('child-execute');
-        expect(record.mctsSearchTrace?.some(value =>
-          value.proposalSource === 'dynamic_agent_search_expansion')).toBe(true);
+        expect(calls).toBe(1);
+        expect(observedContexts).toEqual(['root']);
+        expect(record.behaviorPolicy).toBe('actor');
+        expect(record.mctsSearchSamples).toBeUndefined();
+        expect(session.snapshot().runtime.nodes.map(node => node.id)).toContain('worker');
       } finally {
         controller.close();
         for (const [name, value] of Object.entries({

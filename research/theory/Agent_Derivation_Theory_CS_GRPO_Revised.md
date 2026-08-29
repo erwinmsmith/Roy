@@ -86,7 +86,7 @@ pi_theta(a | s) = softmax(mask(logits_theta(s), A_legal(s))).
 
 The same mask semantics are reconstructed during replay. Runtime usage is absent from terminal utility, process credit, advantage and the GRPO loss. The implementation does not assign theoretical costs such as `DERIVE = 2`.
 
-Formal sampling does not assign a topology profile, minimum node count or minimum depth. MCTS compares legal `DERIVE`, `CONNECT`, local work, return, prune and `STOP` candidates from the current epistemic state; node count, derivation depth and connectivity are therefore trajectory outcomes. `STOP` remains in support whenever required report dependencies permit it, including at the root-only initial state, so both early single-agent termination and deeper recursive organizations are genuine search outcomes. Explicit topology profiles remain available only for controlled diagnostics and cannot enter formal actor updates.
+Formal sampling does not assign a topology profile, minimum node count or minimum depth, and does not perform MCTS or another look-ahead search. Whenever a node owns execution, the current policy directly samples one legal `DERIVE`, `ACQUIRE`, `CONNECT`, `EXECUTE`, `RETURN`, `PRUNE`, or `STOP` candidate for that node. Repeated real decisions make node count, derivation depth and connectivity trajectory outcomes. `STOP` remains in support whenever required report dependencies permit it, including at the root-only initial state, so both early single-agent termination and deeper recursive organizations are ordinary on-policy outcomes. Explicit topology profiles remain available only for controlled diagnostics and cannot enter formal actor updates.
 
 ## 5. LHTB state and semantic construction
 
@@ -98,29 +98,29 @@ Coverage, assumption closure, conflicts and blind spots are structural inputs to
 
 The immutable ledger and the policy input are intentionally distinct. The ledger retains every event and full text needed for audit or later retrieval. The proposer and actor receive a bounded working projection containing active structure, unresolved gaps, selected epistemic entities, recent event deltas and immutable references back to the raw ledger. This projection is not a lossy replacement for `M_t`. Organization-policy decisions are event-driven: they occur initially and when a real state change exposes a gap, failure, file mutation, contradiction, completed node, structural transition or a bounded accumulation of terminal results. Local execution may continue between organization decisions.
 
-## 6. On-policy groups and continuous process credit
+## 6. On-policy groups and terminal-reward GRPO
 
 Training samples fresh complete trajectories from the current masked policy. Each LHTB task and epoch produces `G=8` trajectories from eight fresh matched execution environments with the same task checksum, immutable environment digest, initial-state fingerprint, environment configuration and actor revision. Only organization sampling seeds differ. The official protocol realizes these environments as fresh Docker containers. A native portability backend may be used only as a separately labeled experimental condition and does not imply Docker-equivalent isolation. Every decision stores its exact masked old-policy joint log-probability.
 
-The sole environment target is the official LHTB final score `R_i` in `[0,1]`. An independent relational value model `V_psi(M_t)` shares only the frozen MiniLM encoder with the actor; it shares no trainable parameters. It is fitted with equal trajectory weight:
+The sole reward is the official LHTB final score `R_i` in `[0,1]`. For a matched group, GRPO computes one trajectory-level normalized advantage:
 
 ```text
-L_V = (1/G) sum_i (1/T_i) sum_t Huber(V_psi(M_i,t), R_i).
+A_i = (R_i - mean_j R_j) / (std_j R_j + epsilon).
 ```
 
-An EMA target network `V_bar` is frozen while a group is sampled and updated. Its potential difference gives process credit:
+Every sampled node decision in trajectory `i` receives the same `A_i`; the loss normalizes by that trajectory's number of organization decisions:
 
 ```text
-r_proc(i,t) = V_bar(M_i,t+1) - V_bar(M_i,t)       for non-final decisions
-r_proc(i,T-1) = R_i - V_bar(M_i,T-1)             for the final decision
-G_i,t = R_i - V_bar(M_i,t).
+L_actor = -(1/G) sum_i (1/T_i) sum_t
+  min(rho_i,t A_i, clip(rho_i,t, 1-epsilon, 1+epsilon) A_i),
+rho_i,t = pi_theta(a_i,t | M_i,t, n_i,t) / pi_old(a_i,t | M_i,t, n_i,t).
 ```
 
-Thus the process rewards telescope exactly to `R_i - V_bar(M_i,0)` and do not introduce another objective. Across all decisions in the group, mean and variance use step weight `1/T_i`; every trajectory therefore has total statistical weight one. The resulting single advantage enters the length-normalized clipped surrogate with exact old-policy ratios. Update order is actor, value, then EMA. The value head starts at constant `0.5`, so the first group preserves terminal-GRPO ordering. When final scores are equal, the value model still learns; the actor updates only if shaped returns have variance.
+The exact masked old-policy probability is saved at collection time and reconstructed during replay. There is no learned value model, EMA target, search backup, intermediate shaped reward, topology bonus or synthetic per-step `R`. When all eight official scores are equal, the group has no preference signal and the actor update is skipped.
 
-The immutable dataset retains both adjacent event transitions and SMDP decision spans. Each adjacent sample contains the exact `M_t` and `M_t+1` fingerprints, one-step topology delta, target values and signed process reward. Decision credit is the telescoping sum over all adjacent transitions until the next organization decision. The full raw runtime and semantic audit ledgers are stored once; each fingerprinted `M_t` contains a deterministic bounded relational projection with active requirements, recent typed entities, blind spots, usage and immutable ledger references. This representation prevents quadratic serialization without changing reward. Node count and topology complexity never determine reward sign; only the final-score-trained frozen value potential does.
+The immutable dataset still retains every adjacent `M_t -> M_t+1` transition and SMDP decision span for audit. Each record contains fingerprints, the acting node, node-local context, legal candidates, selected action and exact topology delta, but these fields are not rewards. The full raw runtime and semantic ledgers are stored once; each fingerprinted `M_t` contains a deterministic bounded relational projection with active requirements, recent typed entities, blind spots, usage and immutable ledger references. Node count and topology complexity do not enter `R_i` or the advantage.
 
-During collection, PUCT may use the actor as a prior and the same frozen potential as its search score. The Agent proposes the root directions from the real state. Whenever search first visits a new cloneable hypothetical state, the same frozen proposer observes that state's complete MAS graph and scheduler context node and generates fresh legal node-local directions; search therefore does not reuse one root candidate list as a surrogate for future Agent capability. The finite per-decision proposal-expansion setting controls sampling computation only and is absent from utility and reward. For an edge from state `M` to a searched leaf `M'`, backup is `V_bar(M') - V_bar(M)`; with discount one this is exactly the telescoping sum of the intervening process rewards. Every expanded sibling edge—not only the ultimately executed edge—is persisted with its deduplicated policy state, context node, conditional structural payload, actor prior, visits, target revision, backed-up utility and signed potential difference. Proposal requests, responses, rejected directions, usage and failed hypothetical expansions are retained as provenance. The actually executed edge is later anchored by its official-verifier return; unexecuted edges remain explicitly labelled frozen-value bootstrap and are never represented as official rewards. These saved local counterfactual groups provide positive, negative and zero policy samples for replay. MCTS runs only while collecting data: optimizer updates read the saved samples and never invoke search. Search therefore changes exploration and supplies counterfactual estimates without introducing another task objective. External tool actions are treated as leaves whenever their side effects cannot be cloned; claims about MCTS coverage are restricted to the cloneable organization-state candidate space.
+Collection is ordinary current-policy rollout. The candidate proposer observes the real current state and acting node, generates legal open directions, and the actor samples directly from its masked distribution. Only the selected action is executed; hypothetical sibling states are neither rolled out nor assigned rewards. Different organization seeds across the matched group provide exploration, while later groups are sampled from the newly updated actor.
 
 There is no teacher, imitation, predefined role pool, staged objective, entropy bonus, cost penalty or weighted reward sum.
 
@@ -128,7 +128,7 @@ There is no teacher, imitation, predefined role pool, staged objective, entropy 
 
 The benchmark is `zli12321/LHTB` pinned with its bundled Harbor to commit `84d7ba5ee34fae6c11f0d7cb8ed5faa73a9ece54`. Its 46 tasks follow the pinned README's eight-category taxonomy. Within each category, fixed SHA-256 ordering selects one dev task and one test task; the remaining tasks form the 30-task train split. The checked manifest is `30 train / 8 dev / 8 test`, and the trainer rejects dev or test task IDs.
 
-Formal training uses four epochs, eight trajectories per train task and 960 rollouts total. Each training rollout may run for up to six hours, with concurrency four and a DeepSeek response ceiling of 32,768 tokens. These execution settings do not add structural reward or force an agent count. At each epoch boundary, learned Roy runs once on every dev task. Checkpoint selection maximizes dev mean reward, breaking ties by lower value MAE, fewer tokens and earlier epoch.
+Formal training uses four epochs, eight trajectories per train task and 960 rollouts total. Each training rollout may run for up to six hours, with concurrency four and a DeepSeek response ceiling of 32,768 tokens. These execution settings do not add structural reward or force an agent count. At each epoch boundary, learned Roy runs once on every dev task. Checkpoint selection maximizes dev mean reward, breaking ties by fewer tokens and earlier epoch.
 
 The selected checkpoint is tested once, with three repetitions, against:
 
@@ -136,17 +136,17 @@ The selected checkpoint is tested once, with three repetitions, against:
 - `roy_runtime_heuristic`: the same recursive runtime controlled by the compatibility heuristic;
 - `learned_information_realization`: the learned seven-action policy.
 
-Report mean reward, success rate at `R >= 0.95`, paired bootstrap 95% confidence intervals, tokens, time, nodes, DAG structure, waits, communication edges, process-value traces, value MAE/Spearman and failures. An interval crossing zero is reported as inconclusive. After freezing the selected model, τ³ is used only for smoke and held-out zero-shot transfer, with no benchmark-specific update.
+Report mean reward, success rate at `R >= 0.95`, paired bootstrap 95% confidence intervals, tokens, time, nodes, DAG structure, waits, communication edges, action distributions and failures. An interval crossing zero is reported as inconclusive. After freezing the selected model, τ³ is used only for smoke and held-out zero-shot transfer, with no benchmark-specific update.
 
 ## 8. Training and recovery invariants
 
-- Every actor/value update consumes exactly eight complete current-policy train trajectories.
-- Runtime crashes, environment-invalid attempts, environment failures and incomplete trajectories are preserved for audit but excluded from actor and value updates. Environment-invalid attempts are resampled rather than assigned reward zero.
+- Every actor update consumes exactly eight complete current-policy train trajectories.
+- Runtime crashes, environment-invalid attempts, environment failures and incomplete trajectories are preserved for audit but excluded from actor updates. Environment-invalid attempts are resampled rather than assigned reward zero.
 - A normal six-hour training deadline triggers the official verifier; its partial score is a valid terminal label.
 - Every trajectory preserves `M_0...M_T`, runtime events, semantic audits, raw and masked action probabilities, selected actions, exact old log-probabilities, real-gap diagnostics, task checksum, source and converted environment digests, backend capabilities, model revisions and final Harbor result.
-- Actor, value, EMA, both optimizers and updated group IDs are restored together; a group ID can be optimized only once.
+- Actor, its optimizer and updated group IDs are restored together; a group ID can be optimized only once.
 - Dev selects checkpoints but never updates them. Test runs only after selection and never updates weights.
-- Neither the local Docker protocol nor the native portability backend claims Harbor's timed process verifier. “Continuous process reward” means final-score-supervised `V_psi` and `Delta V` credit.
+- Neither the local Docker protocol nor the native portability backend invents a timed process reward. Adjacent state transitions are audit records; the official final verifier score is the only GRPO reward.
 
 ## 9. Limits
 

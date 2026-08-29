@@ -14,7 +14,7 @@ ORGANIZATION_ACTIONS = (
     "STOP",
 )
 
-LHTB_POLICY_INTERFACE_REVISION = "dynamic-agent-mcts-verifier-progress-policy-20260829"
+LHTB_POLICY_INTERFACE_REVISION = "node-actor-direct-on-policy-grpo-20260829"
 
 
 @dataclass(frozen=True)

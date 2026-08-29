@@ -2,7 +2,7 @@ import type { ResourceEnvelope } from './types.js';
 
 export const INFORMATION_REALIZATION_SCHEMA_VERSION = 3 as const;
 export const LHTB_POLICY_INTERFACE_REVISION =
-  'dynamic-agent-mcts-verifier-progress-policy-20260829' as const;
+  'node-actor-direct-on-policy-grpo-20260829' as const;
 
 export type OrganizationActionKind =
   | 'DERIVE'

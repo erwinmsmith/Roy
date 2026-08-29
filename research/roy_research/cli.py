@@ -27,7 +27,6 @@ from .lhtb import build_lhtb_split, verify_lhtb_checkout, write_lhtb_manifest, l
 from .lhtb_experiment import build_training_schedule, disk_preflight, select_dev_checkpoint, summarize_test, write_json, write_harbor_group_config, write_lhtb_svg
 from .lhtb_training import LHTBProcessGRPOTrainer
 from .lhtb_results import import_harbor_group, sample_audit, validate_smoke
-from .lhtb_value_metrics import value_metrics, annotate_value_traces
 from .lhtb_native import (
     native_environment_digest,
     native_preflight,
@@ -265,7 +264,7 @@ def parser() -> argparse.ArgumentParser:
     lhtb_report.add_argument("--checkpoint", type=Path)
 
     lhtb_update = commands.add_parser(
-        "lhtb-update", help="Apply current-policy LHTB G=8 groups with value/EMA process credit"
+        "lhtb-update", help="Apply direct node-actor GRPO to current-policy LHTB G=8 groups"
     )
     lhtb_update.add_argument("--manifest", type=Path, required=True)
     lhtb_update.add_argument("--trajectories", type=Path, required=True)
@@ -273,14 +272,10 @@ def parser() -> argparse.ArgumentParser:
     lhtb_update.add_argument("--updates", type=Path, required=True)
     lhtb_update.add_argument("--transition-samples", type=Path)
     lhtb_update.add_argument("--device", default="cpu")
-    lhtb_update.add_argument(
-        "--value-state-samples", type=int, default=256,
-        help="Uniform value states per trajectory; 0 evaluates every state",
-    )
     lhtb_update.add_argument("--resume", action="store_true")
 
     lhtb_init = commands.add_parser(
-        "lhtb-init", help="Initialize independent actor/value/EMA state for LHTB"
+        "lhtb-init", help="Initialize the shared node-level LHTB actor"
     )
     lhtb_init.add_argument("--manifest", type=Path, required=True)
     lhtb_init.add_argument("--model", type=Path, required=True)
@@ -303,7 +298,7 @@ def parser() -> argparse.ArgumentParser:
                              default="docker")
     lhtb_import.add_argument("--expected", type=int, default=8)
     lhtb_import.add_argument("--model", type=Path,
-                             help="Actor/value checkpoint used to score every M_t transition")
+                             help="Deprecated; transition value shaping is disabled")
     lhtb_import.add_argument("--device", default="cpu")
     lhtb_import.add_argument("--arm", choices=("single_agent_direct", "roy_runtime_heuristic",
                                                "learned_information_realization"),
@@ -346,7 +341,8 @@ def parser() -> argparse.ArgumentParser:
     lhtb_smoke_validate.add_argument("--task-id", action="append")
     lhtb_smoke_validate.add_argument("--max-input-tokens", type=int, default=15_000_000)
     lhtb_sample_audit = commands.add_parser(
-        "lhtb-sample-audit", help="Audit topology, MCTS and per-step reward in imported samples"
+        "lhtb-sample-audit",
+        help="Audit direct node-actor records, topology transitions and official terminal R"
     )
     lhtb_sample_audit.add_argument("--trajectories", type=Path, required=True)
     lhtb_sample_audit.add_argument("--output", type=Path, required=True)
@@ -424,14 +420,7 @@ def main(argv: List[str] | None = None) -> None:
         print(json.dumps(selected))
     elif args.command == "lhtb-report":
         records = list(read_jsonl(args.results))
-        calibration = None
-        if args.checkpoint:
-            calibration = value_metrics(records, str(args.checkpoint))
-            records = list(annotate_value_traces(records, str(args.checkpoint)))
-            write_jsonl(args.output.with_suffix(".value-traces.jsonl"), records)
         summary = summarize_test(records)
-        if calibration is not None:
-            summary["value_calibration"] = calibration
         write_json(args.output, summary)
         write_lhtb_svg(args.output.with_suffix(".svg"), summary)
         print(json.dumps(summary))
@@ -439,7 +428,6 @@ def main(argv: List[str] | None = None) -> None:
         manifest = load_lhtb_manifest(args.manifest)
         trainer = LHTBProcessGRPOTrainer(
             args.model, manifest, device_name=args.device, resume=args.resume,
-            value_state_sample_limit=args.value_state_samples or None,
         )
         grouped: Dict[str, List[Dict[str, Any]]] = {}
         for record in read_jsonl(args.trajectories):
@@ -453,7 +441,7 @@ def main(argv: List[str] | None = None) -> None:
             update = trainer.update_group(records)
             transition_samples = list(update.pop("transition_samples", []))
             transition_path = args.transition_samples or args.updates.with_name(
-                "transition-reward-samples.jsonl"
+                "transition-audit-samples.jsonl"
             )
             if transition_samples:
                 write_jsonl(transition_path, transition_samples,
@@ -472,33 +460,18 @@ def main(argv: List[str] | None = None) -> None:
         environment_digest = args.environment_digest or args.docker_digest
         if not environment_digest:
             raise ValueError("an immutable environment digest is required")
-        mcts_enabled = args.arm == "learned_information_realization" \
-            and os.environ.get("ROY_LHTB_MCTS_ENABLED", "false").lower() == "true"
         records = import_harbor_group(
             args.job_dir, args.output, args.group_id, args.task_id, args.category,
             args.split, args.epoch, args.policy_revision, environment_digest,
             {"maximum_rollout_seconds": 21600, "max_response_tokens": 32768,
              "concurrency": 4, "organization_policy": args.arm,
              "policy_interface_revision": LHTB_POLICY_INTERFACE_REVISION,
-             "mcts_enabled": mcts_enabled,
-             "mcts_simulations": int(os.environ.get("ROY_LHTB_MCTS_SIMULATIONS", "24"))
-                 if mcts_enabled else 0,
-             "mcts_maximum_depth": int(os.environ.get("ROY_LHTB_MCTS_MAX_DEPTH", "3"))
-                 if mcts_enabled else 0,
-             "mcts_cpuct": float(os.environ.get("ROY_LHTB_MCTS_CPUCT", "1.5"))
-                 if mcts_enabled else 0.0,
-             "mcts_temperature": float(os.environ.get("ROY_LHTB_MCTS_TEMPERATURE", "1"))
-                 if mcts_enabled else 0.0,
-             "mcts_agent_expansions": int(os.environ.get(
-                 "ROY_LHTB_MCTS_AGENT_EXPANSIONS", "4"
-             )) if mcts_enabled else 0,
-             "mcts_proposal_attempts": int(os.environ.get(
-                 "ROY_LHTB_MCTS_PROPOSAL_ATTEMPTS", "2"
-             )) if mcts_enabled else 0},
+             "sampling_protocol": "direct_node_actor_on_policy_no_search",
+             "mcts_enabled": False},
             expected=args.expected,
             arm=args.arm,
             environment_backend=args.environment_backend,
-            value_checkpoint=args.model,
+            value_checkpoint=None,
             device_name=args.device,
         )
         print(json.dumps({"imported": len(records), "output": str(args.output)}))
@@ -513,12 +486,11 @@ def main(argv: List[str] | None = None) -> None:
     elif args.command == "lhtb-dev-metrics":
         records = [value for value in read_jsonl(args.trajectories)
                    if value.get("split") == "dev" and int(value.get("epoch", -1)) == args.epoch]
-        metrics = value_metrics(records, str(args.checkpoint), args.device)
         rows = [{"split": "dev", "epoch": args.epoch, "task_id": value["task_id"],
                  "checkpoint": str(args.checkpoint), "reward": value["terminal_reward"],
-                 "tokens": value.get("tokens", 0), **metrics} for value in records]
+                 "tokens": value.get("tokens", 0)} for value in records]
         write_jsonl(args.output, rows, append=args.output.exists())
-        print(json.dumps({"records": len(rows), **metrics}))
+        print(json.dumps({"records": len(rows)}))
     elif args.command == "lhtb-smoke-validate":
         task_ids = tuple(args.task_id) if args.task_id else (
             "great-expectations-audit", "poc-exploit-craft",

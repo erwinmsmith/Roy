@@ -214,6 +214,7 @@ def sample_organization_decision(
     selected_kind = str(candidate.get("kind"))
     joint_log_probability = values["candidate_log_probs"][candidate_index]
     record = {
+        "behavior_policy": "actor",
         "state_fingerprint": str(policy_state.get("state_fingerprint") or ""),
         "context_node_id": context["context_node_id"],
         "candidate_id": str(candidate["id"]),
@@ -382,6 +383,9 @@ def _policy_context_from_encoding(
     context_node_id = str(policy_state.get("context_node_id") or "")
     if not context_node_id or context_node_id not in node_index:
         raise ValueError("scheduler context node must reference an event graph node")
+    context_node = policy_state.get("context_node")
+    if not isinstance(context_node, Mapping) or str(context_node.get("id") or "") != context_node_id:
+        raise ValueError("organization policy state must include the exact node-local context")
     resources = _organization_resource_tensor(dict(policy_state.get("resources", {})), device)
     temperature = float(policy_state.get("organization_temperature", 1.0))
     if temperature <= 0:
