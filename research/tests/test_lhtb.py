@@ -736,6 +736,7 @@ source = {'processStates': [{'fingerprint': 'm0', 'usage': {}}], 'policyRecords'
 prepared = {'processStates': source['processStates'] + [{'fingerprint': 'm0p', 'usage': {}}], 'policyRecords': []}
 pending = {'processStates': prepared['processStates'], 'policyRecords': [{'selectedAction': 'CONTINUE', 'stateFingerprint': 'm0p'}]}
 final = {'processStates': prepared['processStates'] + [{'fingerprint': 'm1', 'usage': {'inputTokens': 3, 'outputTokens': 2}}], 'policyRecords': pending['policyRecords']}
+finalize_calls = 0
 for line in sys.stdin:
     request = json.loads(line)
     method = request['method']
@@ -747,7 +748,9 @@ for line in sys.stdin:
         result = {'status': 'ready', 'snapshot': prepared}
     elif method == 'advance_one': result = {'status': 'terminal_request', 'request': {'id': 'one', 'command': 'true', 'timeoutMs': 1000, 'nodeId': 'root'}, 'snapshot': pending}
     elif method == 'finalize_now':
-        result = {'status': 'terminal_request', 'request': {'id': 'finalize', 'command': 'true', 'timeoutMs': 1000, 'nodeId': 'root'}, 'snapshot': final}
+        finalize_calls += 1
+        kind = 'ACQUIRE' if finalize_calls == 1 else 'EXECUTE'
+        result = {'status': 'terminal_request', 'request': {'id': 'finalize-'+str(finalize_calls), 'command': 'true', 'timeoutMs': 1000, 'nodeId': 'root', 'organizationActionKind': kind}, 'snapshot': final}
     elif method == 'resume_boundary':
         final['organizationSeed'] = source['organizationSeed']
         result = {'status': 'ready', 'snapshot': final}
@@ -795,9 +798,10 @@ for line in sys.stdin:
                 "fingerprint"], "m1")
             self.assertEqual(context.metadata["macro_steps"], 1)
             self.assertEqual(context.metadata["macro_terminal_commands"], 1)
-            self.assertEqual(context.metadata["finalizer_terminal_commands"], 1)
+            self.assertEqual(context.metadata["finalizer_terminal_commands"], 2)
             self.assertEqual(context.metadata["finalizer_revision"],
-                             "frozen-one-root-conversion-a0-v2")
+                             "frozen-bounded-local-readout-a0-20260830")
+            self.assertFalse(context.metadata["finalizer_exhausted"])
             self.assertFalse(context.metadata["derived_reward_emitted"])
             self.assertEqual(context.n_input_tokens, 3)
             self.assertEqual(json.loads((root / "successor-snapshot.json").read_text())[

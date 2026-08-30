@@ -358,7 +358,7 @@ class NodeWiseDeltaVTests(unittest.TestCase):
             "exception_info": None,
             "agent_result": {"metadata": {
                 "nodewise_protocol": "same_checkpoint_single_node_macro_action_v1",
-                "finalizer_revision": "frozen-one-root-conversion-a0-v2",
+                "finalizer_revision": "frozen-bounded-local-readout-a0-20260830",
             }},
             "verifier_result": {"rewards": {"reward": utility}},
         }))

@@ -21,8 +21,10 @@ from .organization_replay import replay_joint_log_probabilities
 from .value_model import EpistemicValueModel, LHTB_VALUE_MODEL_REVISION
 
 
-NODEWISE_ALGORITHM_REVISION = "forced-finalize-delta-v-nodewise-grpo-v2"
-FINALIZER_REVISION = "frozen-one-root-conversion-a0-v2"
+NODEWISE_ALGORITHM_REVISION = (
+    "forced-finalize-delta-v-nodewise-grpo-bounded-readout-20260830"
+)
+FINALIZER_REVISION = "frozen-bounded-local-readout-a0-20260830"
 FINALIZE_LABEL_SCHEMA_VERSION = 1
 MACRO_GROUP_SCHEMA_VERSION = 1
 NODEWISE_GROUP_SIZE = 8

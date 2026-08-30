@@ -1017,7 +1017,7 @@ export class LHTBAutonomousController {
     return { ...result, snapshot: session.snapshot() };
   }
 
-  /** Frozen A0 readout: integrate existing children, then perform one root conversion step. */
+  /** Frozen A0 readout: integrate children, then take one root-local readout step. */
   async advanceFinalizeNow(session: RoyLHTBSession): Promise<ControllerResult> {
     await this.prepareDecisionBoundary(session);
     const snapshot = session.snapshot();
@@ -1027,7 +1027,7 @@ export class LHTBAutonomousController {
     const selectedKind: StructuralControllerActionKind = isRoot ? 'CONTINUE' : 'RETURN';
     const worker = await this.materializeWorkerPayload(
       session, snapshot, compactEpistemicWorkingState(snapshot), selectedKind,
-      isRoot ? ['EXECUTE'] : ['RETURN'],
+      isRoot ? ['ACQUIRE', 'EXECUTE'] : ['RETURN'],
     );
     if (worker.actorNodeId !== contextNodeId) {
       throw new Error('Frozen finalize-now Worker payload was materialized for another node');

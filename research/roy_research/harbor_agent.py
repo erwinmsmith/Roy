@@ -599,6 +599,7 @@ class NodewiseCheckpointFinalizeAgent(BaseAgent):
             checkpoint_audit = await checkpoint(self.output_checkpoint_path, fingerprint)
         finalizer_steps = 0
         finalizer_terminal_commands = 0
+        finalizer_exhausted = True
         while finalizer_steps < 16:
             finalizer = await asyncio.to_thread(self.rpc.request, "finalize_now", {})
             finalizer_steps += 1
@@ -620,13 +621,19 @@ class NodewiseCheckpointFinalizeAgent(BaseAgent):
                     },
                 })
                 finalizer_terminal_commands += 1
-                break
+                # Frozen A0 may inspect the local environment before converting
+                # represented information into the deliverable.  Neither step is
+                # a structural actor decision.  Verification begins after the
+                # first conversion command, or after the fixed readout budget.
+                if request.get("organizationActionKind") == "EXECUTE":
+                    finalizer_exhausted = False
+                    break
+                continue
             if finalizer.get("status") == "completed":
+                finalizer_exhausted = False
                 break
             if finalizer.get("status") != "continue":
                 raise RuntimeError("frozen finalize-now returned an invalid boundary")
-        else:
-            raise RuntimeError("frozen finalize-now exceeded its integration step limit")
         latest_states = list((self.rpc.last_snapshot or {}).get("processStates") or [])
         usage = dict((latest_states[-1] if latest_states else state).get("usage") or {})
         context.n_input_tokens = int(usage.get("inputTokens", 0))
@@ -645,10 +652,11 @@ class NodewiseCheckpointFinalizeAgent(BaseAgent):
             "environment_checkpoint_path": str(self.output_checkpoint_path),
             "checkpoint_audit": dict(checkpoint_audit),
             "macro_terminal_commands": macro_terminal_commands,
-            "finalizer_policy": "frozen_finalize_now_no_structural_actions",
-            "finalizer_revision": "frozen-one-root-conversion-a0-v2",
+            "finalizer_policy": "frozen_local_readout_no_structural_actions",
+            "finalizer_revision": "frozen-bounded-local-readout-a0-20260830",
             "finalizer_worker_steps": finalizer_steps,
             "finalizer_terminal_commands": finalizer_terminal_commands,
+            "finalizer_exhausted": finalizer_exhausted,
         }
 
     @staticmethod

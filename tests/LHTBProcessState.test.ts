@@ -1348,7 +1348,7 @@ describe('LHTB process state', () => {
     }
   });
 
-  it('uses frozen finalize-now for one root conversion without an actor decision', async () => {
+  it('uses frozen finalize-now for bounded root-local readout without actor decisions', async () => {
     const session = new RoyLHTBSession('finalize-a0', 'task', 'finish the artifact', 'commit',
       'learned_information_realization');
     let calls = 0;
@@ -1359,9 +1359,10 @@ describe('LHTB process state', () => {
       const request = JSON.parse(messages.at(-1)?.content ?? '{}') as Record<string, unknown>;
       const instruction = String(request.selectedControllerInstruction ?? '');
       if (calls === 1) {
-        expect(instruction).toContain('requires exactly one of these Runtime payload kinds: EXECUTE');
-        const acquire = { id: 'wrong-acquire', kind: 'ACQUIRE', actorNodeId: 'root',
-          description: 'inspect instead of convert', schedulerComplexity: 1,
+        expect(instruction).toContain(
+          'requires exactly one of these Runtime payload kinds: ACQUIRE, EXECUTE');
+        const acquire = { id: 'inspect-before-convert', kind: 'ACQUIRE', actorNodeId: 'root',
+          description: 'inspect before converting', schedulerComplexity: 1,
           command: 'pwd', action: { kind: 'ACQUIRE', actorNodeId: 'root' } };
         return { value: { preferred_candidate_id: acquire.id, candidates: [acquire] },
           completion: { content: '{}', model: 'mock', usage: {
@@ -1383,11 +1384,22 @@ describe('LHTB process state', () => {
     }, close() {} };
     const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false });
     try {
-      const result = await controller.advanceFinalizeNow(session);
-      expect(result.status).toBe('terminal_request');
-      if (result.status !== 'terminal_request') throw new Error('expected terminal request');
-      expect(result.request.nodeId).toBe('root');
-      expect(result.request.command).toContain('result.txt');
+      const inspection = await controller.advanceFinalizeNow(session);
+      expect(inspection.status).toBe('terminal_request');
+      if (inspection.status !== 'terminal_request') throw new Error('expected terminal request');
+      expect(inspection.request.organizationActionKind).toBe('ACQUIRE');
+      session.acceptTerminalResult({ requestId: inspection.request.id, exitCode: 0,
+        stdout: '/app', stderr: '', durationMs: 1, fileChanges: [] });
+      session.applyOrganizationAction({ kind: 'ACQUIRE', actorNodeId: 'root', observation: {
+        id: 'a0-inspection', sourceType: 'environment', queryOrAction: 'pwd',
+        observation: '/app', provenance: 'test', supports: [],
+      } });
+      const conversion = await controller.advanceFinalizeNow(session);
+      expect(conversion.status).toBe('terminal_request');
+      if (conversion.status !== 'terminal_request') throw new Error('expected terminal request');
+      expect(conversion.request.nodeId).toBe('root');
+      expect(conversion.request.organizationActionKind).toBe('EXECUTE');
+      expect(conversion.request.command).toContain('result.txt');
       expect(calls).toBe(2);
       expect(session.snapshot().policyRecords).toHaveLength(0);
     } finally {
