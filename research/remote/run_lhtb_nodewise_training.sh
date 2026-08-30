@@ -25,6 +25,7 @@ node_runtime="${roy_root}/research/.runtime/node-v22"
 dataset_path="${ROY_LHTB_DATASET_PATH:-}"
 parallelism="${ROY_LHTB_NODEWISE_CONCURRENCY:-4}"
 max_retries="${ROY_LHTB_MAX_ENV_RETRIES:-0}"
+decision_rounds="${ROY_LHTB_DECISION_ROUNDS_PER_TASK_PER_EPOCH:-2}"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 # shellcheck source=load_roy_env.sh
@@ -57,6 +58,10 @@ export PATH="${proot_runtime}/bin:${node_runtime}/bin:${PATH}"
 }
 [[ "${parallelism}" =~ ^[1-9][0-9]*$ && "${parallelism}" -le 8 ]] || {
   echo "ROY_LHTB_NODEWISE_CONCURRENCY must be between 1 and 8" >&2
+  exit 4
+}
+[[ "${decision_rounds}" =~ ^[1-9][0-9]*$ && "${decision_rounds}" -le 16 ]] || {
+  echo "ROY_LHTB_DECISION_ROUNDS_PER_TASK_PER_EPOCH must be between 1 and 16" >&2
   exit 4
 }
 
@@ -97,8 +102,19 @@ if [[ ! -f "${model}" ]]; then
 fi
 if [[ ! -f "${schedule}" ]]; then
   "${python_bin}" -m roy_research lhtb-schedule \
-    --manifest "${manifest}" --output "${schedule}"
+    --manifest "${manifest}" --output "${schedule}" \
+    --decision-rounds-per-task-per-epoch "${decision_rounds}"
 fi
+"${python_bin}" - "${schedule}" "${decision_rounds}" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+actual = int(value.get("decision_rounds_per_task_per_epoch", 1))
+expected = int(sys.argv[2])
+if actual != expected:
+    raise SystemExit(
+        f"schedule has {actual} decision rounds per task/epoch; runner requested {expected}"
+    )
+PY
 
 model_revisions() {
   "${python_bin}" - "${model}" <<'PY'
@@ -322,6 +338,7 @@ def topology(state):
 utilities = [float(x["environment_utility"]) for x in records]
 payload = {
   "group_id": group_id, "task_id": records[0]["task_id"], "epoch": records[0]["epoch"],
+  "decision_round": records[0].get("decision_round", 0),
   "base_state_fingerprint": records[0]["base_state_fingerprint"],
   "context_node_id": records[0]["context_node_id"],
   "actions": [x["selected_action"] for x in records],
@@ -340,18 +357,19 @@ print(json.dumps({k: payload[k] for k in ("group_id", "actions", "environment_ut
 PY
 }
 
-# Expand the checked 120-group schedule to a simple tab-separated stream.
+# Expand the checked schedule to a simple tab-separated stream. Tasks are
+# ordered epoch -> task -> decision round so every task evolves continuously.
 "${python_bin}" - "${schedule}" "${manifest}" <<'PY' >"${run_root}/schedule.tsv"
 import json, sys
 schedule = json.load(open(sys.argv[1], encoding="utf-8"))["groups"]
 manifest = {x["task_id"]: x for x in json.load(open(sys.argv[2], encoding="utf-8"))["tasks"]}
 for group in schedule:
-    print(group["epoch"], group["task_id"], manifest[group["task_id"]]["category"],
+    print(group["epoch"], group.get("decision_round", 0), group["task_id"], manifest[group["task_id"]]["category"],
           group["group_id"], ",".join(map(str, group["organization_seeds"])), sep="\t")
 PY
 
-while IFS=$'\t' read -r epoch task_id category group_id seed_csv; do
-  group_dir="${run_root}/groups/${epoch}-${task_id}"
+while IFS=$'\t' read -r epoch decision_round task_id category group_id seed_csv; do
+  group_dir="${run_root}/groups/${epoch}-${decision_round}-${task_id}"
   if [[ -f "${group_dir}/complete.json" ]]; then
     echo "skip completed ${group_id}"
     continue
@@ -400,6 +418,7 @@ PY
       --labels-output "${group_dir}/labels.jsonl" \
       --groups-output "${group_dir}/groups.jsonl" --group-id "${group_id}" \
       --task-id "${task_id}" --split train --epoch "${epoch}" \
+      --decision-round "${decision_round}" \
       --policy-revision "${actor_revision}" --value-revision "${value_revision}" \
       --environment-digest "${digest}" --expected 8
   fi

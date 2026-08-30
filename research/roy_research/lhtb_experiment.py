@@ -26,27 +26,37 @@ SOLVE_THRESHOLD = 0.95
 @dataclass(frozen=True)
 class ScheduledGroup:
     epoch: int
+    decision_round: int
     task_id: str
     group_id: str
     organization_seeds: Tuple[int, ...]
 
 
 def build_training_schedule(
-    manifest: Sequence[Mapping[str, object]], seed: int = 20260820
+    manifest: Sequence[Mapping[str, object]], seed: int = 20260820,
+    decision_rounds_per_task_per_epoch: int = 1,
 ) -> List[ScheduledGroup]:
+    if decision_rounds_per_task_per_epoch < 1:
+        raise ValueError("decision rounds per task per epoch must be positive")
     train = sorted(str(value["task_id"]) for value in manifest if value.get("split") == "train")
     if len(train) != 30:
         raise ValueError("formal LHTB training requires exactly 30 train tasks")
     result: List[ScheduledGroup] = []
     for epoch in range(TRAIN_EPOCHS):
         for task_id in train:
-            group_id = f"lhtb:{epoch}:{task_id}"
-            seeds = tuple(int(hashlib.sha256(
-                f"{seed}:{group_id}:{index}".encode("utf-8")
-            ).hexdigest()[:8], 16) for index in range(GROUP_SIZE))
-            result.append(ScheduledGroup(epoch, task_id, group_id, seeds))
-    if len(result) * GROUP_SIZE != 960:
-        raise AssertionError("formal LHTB schedule must contain 960 rollouts")
+            for decision_round in range(decision_rounds_per_task_per_epoch):
+                group_id = f"lhtb:{epoch}:round-{decision_round}:{task_id}"
+                seeds = tuple(int(hashlib.sha256(
+                    f"{seed}:{group_id}:{index}".encode("utf-8")
+                ).hexdigest()[:8], 16) for index in range(GROUP_SIZE))
+                result.append(ScheduledGroup(
+                    epoch, decision_round, task_id, group_id, seeds
+                ))
+    expected_rollouts = (
+        TRAIN_EPOCHS * len(train) * decision_rounds_per_task_per_epoch * GROUP_SIZE
+    )
+    if len(result) * GROUP_SIZE != expected_rollouts:
+        raise AssertionError("formal LHTB schedule has an inconsistent rollout count")
     return result
 
 

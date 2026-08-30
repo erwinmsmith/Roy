@@ -264,10 +264,14 @@ def parser() -> argparse.ArgumentParser:
     native_overlay.add_argument("--output", type=Path, required=True)
 
     lhtb_schedule = commands.add_parser(
-        "lhtb-schedule", help="Create the formal four-epoch, 960-rollout schedule"
+        "lhtb-schedule", help="Create a formal four-epoch LHTB schedule"
     )
     lhtb_schedule.add_argument("--manifest", type=Path, required=True)
     lhtb_schedule.add_argument("--output", type=Path, required=True)
+    lhtb_schedule.add_argument(
+        "--decision-rounds-per-task-per-epoch", type=int, default=1,
+        help="Sequential node decisions for each task inside one training epoch",
+    )
 
     lhtb_select = commands.add_parser(
         "lhtb-select", help="Select one checkpoint from complete dev metrics"
@@ -369,6 +373,7 @@ def parser() -> argparse.ArgumentParser:
         "--split", choices=("train", "dev", "test"), required=True
     )
     lhtb_node_import.add_argument("--epoch", type=int, required=True)
+    lhtb_node_import.add_argument("--decision-round", type=int, default=0)
     lhtb_node_import.add_argument("--policy-revision", type=int, required=True)
     lhtb_node_import.add_argument("--value-revision", type=int, required=True)
     lhtb_node_import.add_argument("--environment-digest", required=True)
@@ -518,12 +523,18 @@ def main(argv: List[str] | None = None) -> None:
         )
         print(json.dumps({"output": str(args.output), "tasks": len(result["task_ids"])}))
     elif args.command == "lhtb-schedule":
-        schedule = build_training_schedule(load_lhtb_manifest(args.manifest))
-        write_json(args.output, {"schema_version": 1, "epochs": 4, "group_size": 8,
-            "rollouts": 960, "groups": [{"epoch": value.epoch, "task_id": value.task_id,
+        schedule = build_training_schedule(
+            load_lhtb_manifest(args.manifest),
+            decision_rounds_per_task_per_epoch=args.decision_rounds_per_task_per_epoch,
+        )
+        rollouts = len(schedule) * 8
+        write_json(args.output, {"schema_version": 2, "epochs": 4, "group_size": 8,
+            "decision_rounds_per_task_per_epoch": args.decision_rounds_per_task_per_epoch,
+            "rollouts": rollouts, "groups": [{"epoch": value.epoch,
+                "decision_round": value.decision_round, "task_id": value.task_id,
                 "group_id": value.group_id, "organization_seeds": value.organization_seeds}
                 for value in schedule]})
-        print(json.dumps({"groups": len(schedule), "rollouts": 960}))
+        print(json.dumps({"groups": len(schedule), "rollouts": rollouts}))
     elif args.command == "lhtb-select":
         selected = select_dev_checkpoint(list(read_jsonl(args.metrics)))
         write_json(args.output, dict(selected))
@@ -648,6 +659,7 @@ def main(argv: List[str] | None = None) -> None:
             task_id=args.task_id,
             split=args.split,
             epoch=args.epoch,
+            decision_round=args.decision_round,
             policy_revision=args.policy_revision,
             value_revision=args.value_revision,
             environment_digest=args.environment_digest,

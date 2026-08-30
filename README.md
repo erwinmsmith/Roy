@@ -189,7 +189,7 @@ npm run research:test
 npm run research:smoke
 ```
 
-Create the pinned LHTB split and formal 960-rollout schedule with:
+Create the pinned LHTB split and a node-wise formal schedule with two sequential decisions per task/epoch (240 groups, 1,920 rollouts) with:
 
 ```bash
 PYTHONPATH=research python3 -m roy_research lhtb-manifest \
@@ -197,6 +197,7 @@ PYTHONPATH=research python3 -m roy_research lhtb-manifest \
 
 PYTHONPATH=research python3 -m roy_research lhtb-schedule \
   --manifest research/output/lhtb/manifest.json \
+  --decision-rounds-per-task-per-epoch 2 \
   --output research/output/lhtb/schedule.json
 
 PYTHONPATH=research python3 -m roy_research lhtb-update \
@@ -207,6 +208,8 @@ PYTHONPATH=research python3 -m roy_research lhtb-update \
 ```
 
 Formal LHTB evaluation uses the fixed 30/8/8 split. In the main training algorithm, eight one-macro-action outcomes share one exact node/environment checkpoint and the derived Controller reward is `R_t = V_psi(S_t+1)-V_psi(S_t)`. Official verifier task utility supervises frozen-finalize `V_psi` labels and evaluates the final frozen actor; it is not the node-wise `R_t`. Complete-trajectory official-utility GRPO remains a separate baseline. Neither path uses MCTS at inference. Crashed, incomplete or non-clonable outcomes remain audit-only. The checked [research README](research/README.md) contains preparation, protocol details and reproduction commands.
+
+Sequential decision rounds continue from a precommitted feasible successor, never from the highest-reward sibling. They make deeper trees and DAGs possible when the current node context plus global `M_t` justify additional derivation or connection, but they do not force complexity. Across four epochs, the default two rounds give each task eight opportunities to stay single-agent, derive information/organization children (including subchildren), connect or execute through `CONTINUE`, return, prune, or finish.
 
 On the dedicated `exp-roy-lhtb` Docker VM, run `research/remote/prepare_lhtb.sh oracle-smoke`, then `research/remote/run_lhtb_training.sh` and `research/remote/run_lhtb_test.sh`. Generated trajectories, semantic audits, checkpoints, benchmark assets and Docker state remain outside Git.
 

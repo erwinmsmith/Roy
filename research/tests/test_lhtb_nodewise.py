@@ -270,11 +270,13 @@ class NodeWiseDeltaVTests(unittest.TestCase):
             labels, records = import_nodewise_macro_group(
                 base_run=base, samples_root=samples, group_id="node:g8",
                 task_id=self.task_id, split="train", epoch=0,
+                decision_round=1,
                 policy_revision=0, value_revision=0,
                 environment_digest=digest,
             )
             self.assertEqual(len(labels), 9)
             self.assertEqual(len(records), 8)
+            self.assertEqual({record["decision_round"] for record in records}, {1})
             self.assertEqual(records[-1]["environment_utility"], 1.0)
             self.assertIsNone(records[-1]["mia_reward"])
             self.assertFalse(records[-1]["mia_reward_emitted"])

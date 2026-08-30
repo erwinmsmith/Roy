@@ -566,6 +566,22 @@ for line in sys.stdin:
         self.assertEqual(checked_value["tasks"], [value.to_dict() for value in records])
         self.assertEqual(len(build_training_schedule(manifest)), 120)
 
+        continuous = build_training_schedule(
+            manifest, decision_rounds_per_task_per_epoch=2
+        )
+        self.assertEqual(len(continuous), 240)
+        self.assertEqual(len({value.group_id for value in continuous}), 240)
+        first_task = sorted(
+            value.task_id for value in records if value.split == "train"
+        )[0]
+        first_groups = [value for value in continuous if value.task_id == first_task]
+        self.assertEqual(
+            [(value.epoch, value.decision_round) for value in first_groups],
+            [(epoch, decision_round) for epoch in range(4) for decision_round in range(2)],
+        )
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            build_training_schedule(manifest, decision_rounds_per_task_per_epoch=0)
+
     def test_harbor_config_and_official_reward_are_unambiguous(self) -> None:
         self.assertEqual(official_lhtb_reward({
             "verifier_result": {"rewards": {"reward": 0.75}}
