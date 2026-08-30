@@ -750,7 +750,8 @@ for line in sys.stdin:
     elif method == 'finalize_now':
         finalize_calls += 1
         kind = 'ACQUIRE' if finalize_calls == 1 else 'EXECUTE'
-        result = {'status': 'terminal_request', 'request': {'id': 'finalize-'+str(finalize_calls), 'command': 'true', 'timeoutMs': 1000, 'nodeId': 'root', 'organizationActionKind': kind}, 'snapshot': final}
+        command = 'pwd' if finalize_calls == 1 else 'true'
+        result = {'status': 'terminal_request', 'request': {'id': 'finalize-'+str(finalize_calls), 'command': command, 'timeoutMs': 1000, 'nodeId': 'root', 'organizationActionKind': kind}, 'snapshot': final}
     elif method == 'resume_boundary':
         final['organizationSeed'] = source['organizationSeed']
         result = {'status': 'ready', 'snapshot': final}
@@ -802,6 +803,7 @@ for line in sys.stdin:
             self.assertEqual(context.metadata["finalizer_revision"],
                              "frozen-bounded-local-readout-a0-20260830")
             self.assertFalse(context.metadata["finalizer_exhausted"])
+            self.assertIsNone(context.metadata["finalizer_stall_reason"])
             self.assertFalse(context.metadata["derived_reward_emitted"])
             self.assertEqual(context.n_input_tokens, 3)
             self.assertEqual(json.loads((root / "successor-snapshot.json").read_text())[

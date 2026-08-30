@@ -600,14 +600,21 @@ class NodewiseCheckpointFinalizeAgent(BaseAgent):
         finalizer_steps = 0
         finalizer_terminal_commands = 0
         finalizer_exhausted = True
+        finalizer_commands: set[str] = set()
+        finalizer_stall_reason: str | None = None
         while finalizer_steps < 16:
             finalizer = await asyncio.to_thread(self.rpc.request, "finalize_now", {})
             finalizer_steps += 1
             if finalizer.get("status") == "terminal_request":
                 request = dict(finalizer["request"])
+                command = str(request["command"])
+                if command in finalizer_commands:
+                    finalizer_stall_reason = "exact_terminal_command_repeated"
+                    break
+                finalizer_commands.add(command)
                 started = time.monotonic()
                 result = await environment.exec(
-                    str(request["command"]), cwd=request.get("cwd"),
+                    command, cwd=request.get("cwd"),
                     timeout_sec=max(
                         1, int(float(request.get("timeoutMs", 120_000)) / 1000)
                     ),
@@ -657,6 +664,7 @@ class NodewiseCheckpointFinalizeAgent(BaseAgent):
             "finalizer_worker_steps": finalizer_steps,
             "finalizer_terminal_commands": finalizer_terminal_commands,
             "finalizer_exhausted": finalizer_exhausted,
+            "finalizer_stall_reason": finalizer_stall_reason,
         }
 
     @staticmethod
