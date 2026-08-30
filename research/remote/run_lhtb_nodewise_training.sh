@@ -150,13 +150,49 @@ run_config() {
   if [[ -f "${output_dir}/artifacts/state.json" && \
         -f "${output_dir}/artifacts/session.json" && \
         -f "${output_dir}/artifacts/environment-checkpoint/checkpoint.json" && \
-        -n "$(find "${output_dir}" -type f -name result.json -print -quit)" ]]; then
+        -n "$(find "${output_dir}" -type f -name result.json -print -quit)" ]] && \
+      "${python_bin}" - "${output_dir}" <<'PY'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+valid = []
+for path in root.rglob("result.json"):
+    try:
+        result = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        continue
+    if result.get("exception_info") is None and isinstance(
+        result.get("verifier_result"), dict
+    ):
+        valid.append(path)
+raise SystemExit(0 if len(valid) == 1 else 1)
+PY
+  then
     return
   fi
+  local harbor_status=0
   (
     cd "${lhtb_root}"
     "${harbor_bin}" run -c "${output_dir}/config.json" --yes
-  ) >"${output_dir}/harbor.log" 2>&1
+  ) >"${output_dir}/harbor.log" 2>&1 || harbor_status=$?
+  if [[ "${harbor_status}" -ne 0 ]] || ! "${python_bin}" - "${output_dir}" <<'PY'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+valid = []
+for path in root.rglob("result.json"):
+    try:
+        result = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        continue
+    if result.get("exception_info") is None and isinstance(
+        result.get("verifier_result"), dict
+    ):
+        valid.append(path)
+raise SystemExit(0 if len(valid) == 1 else 1)
+PY
+  then
+    echo "node-wise Harbor run has no unique successful verifier result: ${output_dir}" >&2
+    return 6
+  fi
 }
 
 run_successors() {

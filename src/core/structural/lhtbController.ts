@@ -1025,10 +1025,22 @@ export class LHTBAutonomousController {
     const contextNodeId = scheduledOrganizationContextNode(snapshot);
     const isRoot = contextNodeId === snapshot.runtime.rootId;
     const selectedKind: StructuralControllerActionKind = isRoot ? 'CONTINUE' : 'RETURN';
-    const worker = await this.materializeWorkerPayload(
-      session, snapshot, compactEpistemicWorkingState(snapshot), selectedKind,
-      isRoot ? ['ACQUIRE', 'EXECUTE'] : ['RETURN'],
-    );
+    let worker: ProposedCandidate;
+    try {
+      worker = await this.materializeWorkerPayload(
+        session, snapshot, compactEpistemicWorkingState(snapshot), selectedKind,
+        isRoot ? ['ACQUIRE', 'EXECUTE'] : ['RETURN'],
+      );
+    } catch (error) {
+      if (isRoot && error instanceof Error
+        && error.message === 'sampling_invalid:no_worker_payload_for:CONTINUE') {
+        // A0 is a total, frozen readout policy. If its Worker repeatedly proposes
+        // an illegal/repeated local command, submit the already-realized artifact
+        // instead of converting a proposer failure into an environment failure.
+        return { status: 'completed', snapshot: session.snapshot() };
+      }
+      throw error;
+    }
     if (worker.actorNodeId !== contextNodeId) {
       throw new Error('Frozen finalize-now Worker payload was materialized for another node');
     }

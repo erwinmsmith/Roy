@@ -1407,6 +1407,37 @@ describe('LHTB process state', () => {
     }
   });
 
+  it('submits the current artifact when frozen A0 cannot materialize another legal command',
+    async () => {
+      const priorAttempts = process.env.ROY_LHTB_PROPOSAL_ATTEMPTS;
+      process.env.ROY_LHTB_PROPOSAL_ATTEMPTS = '1';
+      const session = new RoyLHTBSession('finalize-fallback', 'task', 'finish', 'commit',
+        'learned_information_realization');
+      const provider = { isConfigured: () => true, async completeJSONWithUsage() {
+        const candidate = { id: 'derive', kind: 'DERIVE', actorNodeId: 'root',
+          description: 'invalid structural readout', schedulerComplexity: 1,
+          action: { kind: 'DERIVE', actorNodeId: 'root' } };
+        return { value: { preferred_candidate_id: candidate.id, candidates: [candidate] },
+          completion: { content: '{}', model: 'mock', usage: {
+            promptTokens: 1, completionTokens: 1, totalTokens: 2,
+          } } };
+      } };
+      const semantic = { async processEvent(event: { id: string }) {
+        return { event_id: event.id, requirements: [], claims: [], assumptions: [], evidence: [],
+          external_observations: [], blind_spots: [], relations: [] };
+      }, close() {} };
+      const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false });
+      try {
+        const result = await controller.advanceFinalizeNow(session);
+        expect(result.status).toBe('completed');
+        expect(session.snapshot().policyRecords).toHaveLength(0);
+      } finally {
+        controller.close();
+        if (priorAttempts === undefined) delete process.env.ROY_LHTB_PROPOSAL_ATTEMPTS;
+        else process.env.ROY_LHTB_PROPOSAL_ATTEMPTS = priorAttempts;
+      }
+    });
+
   it('projects cumulative terminal text for the proposer without mutating M_t', async () => {
     const session = new RoyLHTBSession('projection', 'task', 'finish', 'commit',
       'roy_runtime_heuristic');
