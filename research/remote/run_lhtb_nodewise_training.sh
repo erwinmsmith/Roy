@@ -185,10 +185,31 @@ PY
   then
     return
   fi
+  local config_path="${output_dir}/config.json"
+  if [[ -n "$(find "${output_dir}" -type f -name result.json -print -quit)" ]]; then
+    local retry_index
+    retry_index="$(( $(find "${output_dir}" -maxdepth 1 -type f \
+      -name 'config.retry-*.json' | wc -l) + 1 ))"
+    config_path="${output_dir}/config.retry-${retry_index}.json"
+    "${python_bin}" - "${output_dir}/config.json" "${config_path}" \
+      "${output_dir}/jobs-retry-${retry_index}" "${retry_index}" <<'PY'
+import json, pathlib, sys
+source, output, jobs = map(pathlib.Path, sys.argv[1:4])
+retry_index = int(sys.argv[4])
+value = json.loads(source.read_text(encoding="utf-8"))
+value["jobs_dir"] = str(jobs.resolve())
+value["job_name"] = f'{value["job_name"]}-process-retry-{retry_index}'
+temporary = output.with_suffix(output.suffix + ".tmp")
+temporary.write_text(
+    json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+temporary.replace(output)
+PY
+  fi
   local harbor_status=0
   (
     cd "${lhtb_root}"
-    "${harbor_bin}" run -c "${output_dir}/config.json" --yes
+    "${harbor_bin}" run -c "${config_path}" --yes
   ) >"${output_dir}/harbor.log" 2>&1 || harbor_status=$?
   if [[ "${harbor_status}" -ne 0 ]] || ! "${python_bin}" - "${output_dir}" <<'PY'
 import json, pathlib, sys
