@@ -301,6 +301,11 @@ export class RecursiveInformationRealizationRuntime {
     if (!report || report.nodeId !== actor.id) {
       throw new Error(`${returning ? 'RETURN' : 'EXECUTE'} requires the actor epistemic report`);
     }
+    if (actor.specification?.realizationMode === 'organize_knowledge'
+      && ![report.claims, report.evidence, report.assumptions, report.blindSpots]
+        .some(values => values.length > 0)) {
+      throw new Error('organize_knowledge report must change the represented knowledge state');
+    }
     if (this.reports.has(report.id)) throw new Error(`Duplicate report ${report.id}`);
     for (const claim of report.claims) {
       if (claim.originNodeId !== actor.id) throw new Error(`Claim ${claim.id} has an invalid origin`);

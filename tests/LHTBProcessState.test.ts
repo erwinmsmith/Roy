@@ -1343,6 +1343,14 @@ describe('LHTB process state', () => {
       expect(session.snapshot().runtime.nodes.find(node => node.id === 'org-child')?.status)
         .toBe('returned');
       expect(session.snapshot().runtime.reports.map(value => value.id)).toContain('org-report');
+      const integrated = session.snapshot().runtime.reports.find(value => value.id === 'org-report');
+      expect(integrated?.claims).toEqual([expect.objectContaining({
+        statement: 'organized conclusion', status: 'tentative', originNodeId: 'org-child',
+      })]);
+      expect(session.snapshot().processStates.at(-1)?.claims)
+        .toEqual(expect.arrayContaining([expect.objectContaining({
+          statement: 'organized conclusion', originNodeId: 'org-child',
+        })]));
     } finally {
       controller.close();
     }

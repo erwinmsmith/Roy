@@ -11,6 +11,7 @@ import type { LLMJSONCompletionResult, LLMMessage, LLMCompletionOptions } from '
 import { appendFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { RecursiveInformationRealizationRuntime } from './recursiveRuntime.js';
+import { stableStructuralFingerprint } from './graphs.js';
 
 interface ProposedCandidate extends OrganizationCandidate {
   command?: string;
@@ -398,7 +399,9 @@ derive. Never relabel a root requirement as child-local to manufacture recursive
 RETURN is child-only and transfers a report to its parent; root must use STOP. RETURN action uses
 the property report (never epistemicReport), with this exact report shape:
 {"id":"...","nodeId":"<actor>","parentId":"...","depth":<actor-depth>,"localObjective":"...",
-"triggeringGapId":"...","conclusion":"...","reasoningSummary":"...","claims":[],
+"triggeringGapId":"...","conclusion":"...","reasoningSummary":"...","claims":[
+{"id":"claim-...","statement":"<one represented conclusion>","status":"tentative",
+"originNodeId":"<actor>"}],
 "evidence":[],"externalObservations":[],"assumptions":[],"uncertainty":{"confidence":0.5,
 "uncertainAbout":[],"confidenceBasis":"..."},"conflicts":[],"coverage":{"resolved":[],
 "unresolved":[],"notExamined":[]},"blindSpots":[],"residualRequirements":[],
@@ -409,6 +412,9 @@ partial object, null, or undefined item. In particular, residualRequirements sho
 every non-empty entry requires id, description, whyItMatters, likelyMechanism,
 requiredInformation, status, and parentNodeId equal to the returning actor. STOP is root-only and
 uses finalOutput.
+An organize_knowledge child must encode its conclusion in at least one valid claim, evidence item,
+assumption, or blind spot. informationToPropagate and coverage alone do not change the represented
+knowledge state and therefore cannot be the only non-empty report fields.
 Every candidate actorNodeId must equal organization.schedulerContextNode. Other active nodes are
 visible only for dependency and CONNECT/reuse decisions; never propose a turn for them.
 Never repeat an unchanged terminal command immediately after it failed without file changes;
@@ -736,7 +742,10 @@ export function compactProposalRepairRequest(
             localObjective: '<activeNodes objective>',
             triggeringGapId: '<activeNodes triggeringGapId>',
             conclusion: '<conclusion grounded in observed terminal results>',
-            reasoningSummary: '<concise summary>', claims: [], evidence: [],
+            reasoningSummary: '<concise summary>', claims: [{
+              id: '<unique-claim-id>', statement: '<represented conclusion>',
+              status: 'tentative', originNodeId: '<same requiredChildReturnNodeId>',
+            }], evidence: [],
             externalObservations: [], assumptions: [],
             uncertainty: { confidence: 0.5, uncertainAbout: [],
               confidenceBasis: '<observed evidence basis>' },
@@ -760,7 +769,8 @@ export function compactProposalRepairRequest(
 }
 
 function normalizeReturnReportCollections(
-  action: Record<string, unknown>, actorNodeId: string
+  action: Record<string, unknown>, actorNodeId: string,
+  ensureOrganizationStateDelta = false,
 ): void {
   const value = action.report;
   if (!value || typeof value !== 'object' || Array.isArray(value)) return;
@@ -826,6 +836,22 @@ function normalizeReturnReportCollections(
     if (!Array.isArray(coverage[field])) coverage[field] = [];
   }
   report.coverage = coverage;
+  if (ensureOrganizationStateDelta) {
+    const represented = ['claims', 'evidence', 'assumptions', 'blindSpots'].some(field =>
+      Array.isArray(report[field]) && (report[field] as unknown[]).length > 0);
+    if (!represented) {
+      const propagated = (report.informationToPropagate as unknown[])
+        .find(item => typeof item === 'string' && item.trim().length > 0);
+      const statement = typeof propagated === 'string' ? propagated.trim()
+        : typeof report.conclusion === 'string' ? report.conclusion.trim() : '';
+      if (statement) {
+        const id = `claim-org-${stableStructuralFingerprint({
+          reportId: report.id, actorNodeId, statement,
+        }).slice(0, 16)}`;
+        report.claims = [{ id, statement, status: 'tentative', originNodeId: actorNodeId }];
+      }
+    }
+  }
 }
 
 export class LHTBAutonomousController {
@@ -1726,17 +1752,17 @@ export class LHTBAutonomousController {
         // Runtime legality checks; the learned Controller never sees payloads.
         actionValue.report = raw.report;
       }
-      if (kind === 'RETURN') normalizeReturnReportCollections(actionValue, actorNodeId);
       if (kind === 'RETURN') {
         const actor = snapshot.runtime.nodes.find(node => node.id === actorNodeId);
+        normalizeReturnReportCollections(actionValue, actorNodeId,
+          actor?.specification?.realizationMode === 'organize_knowledge');
         const report = actionValue.report && typeof actionValue.report === 'object'
           ? actionValue.report as Record<string, unknown> : undefined;
         if (!report || typeof report.conclusion !== 'string' || !report.conclusion.trim()) {
           reasons.push('return_report_missing_conclusion');
         }
         if (actor?.specification?.realizationMode === 'organize_knowledge') {
-          const represented = ['claims', 'evidence', 'assumptions', 'blindSpots',
-            'residualRequirements', 'informationToPropagate'].some(field =>
+          const represented = ['claims', 'evidence', 'assumptions', 'blindSpots'].some(field =>
             Array.isArray(report?.[field]) && (report?.[field] as unknown[]).length > 0);
           if (!represented) reasons.push('organization_report_has_no_represented_information');
         }
