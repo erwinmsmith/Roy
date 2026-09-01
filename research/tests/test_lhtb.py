@@ -757,6 +757,7 @@ for line in sys.stdin:
     request = json.loads(line)
     method = request['method']
     if method == 'restore':
+        source = request['params']['snapshot']
         source['organizationSeed'] = request['params']['organizationSeed']
         result = {'status': 'restored', 'snapshot': source}
     elif method == 'prepare_boundary':
@@ -791,8 +792,13 @@ for line in sys.stdin:
 
                 async def create_training_checkpoint(self, destination: Path,
                                                      fingerprint: str) -> dict:
-                    destination.mkdir()
-                    return {"mode": "full_clone", "source_state_fingerprint": fingerprint}
+                    (destination / "payload").mkdir(parents=True)
+                    audit = {
+                        "complete": True, "mode": "full_clone", "restorable": True,
+                        "source_state_fingerprint": fingerprint,
+                    }
+                    (destination / "checkpoint.json").write_text(json.dumps(audit))
+                    return audit
 
             environment = Environment()
             agent = NodewiseCheckpointFinalizeAgent(
@@ -824,6 +830,86 @@ for line in sys.stdin:
             self.assertEqual(context.n_input_tokens, 3)
             self.assertEqual(json.loads((root / "successor-snapshot.json").read_text())[
                 "organizationSeed"], 20260820)
+
+            retry_environment = Environment()
+            retry_agent = NodewiseCheckpointFinalizeAgent(
+                logs_dir=root / "retry-logs", model_name="mock", macro_steps=1,
+                source_snapshot_path=str(source_snapshot),
+                source_checkpoint_path=str(source_checkpoint),
+                output_snapshot_path=str(root / "successor-snapshot.json"),
+                output_state_path=str(root / "successor-state.json"),
+                output_checkpoint_path=str(root / "successor-checkpoint"),
+                node_command=f"{sys.executable} -u {server}", rpc_timeout=2,
+            )
+            retry_context = SimpleNamespace(
+                metadata=None, n_input_tokens=0, n_output_tokens=0
+            )
+            try:
+                asyncio.run(retry_agent.setup(retry_environment))
+                asyncio.run(retry_agent.run("task", retry_environment, retry_context))
+            finally:
+                retry_agent.close()
+            self.assertEqual(
+                retry_environment.restored,
+                (root / "successor-checkpoint").resolve(),
+            )
+            self.assertTrue(retry_context.metadata["resumed_complete_retry_capture"])
+            self.assertEqual(retry_context.metadata["macro_terminal_commands"], 0)
+            self.assertTrue(
+                retry_context.metadata["checkpoint_audit"][
+                    "reused_complete_retry_capture"
+                ]
+            )
+
+    def test_nodewise_retry_capture_is_resumed_or_archived_as_one_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshot_path = root / "artifacts" / "session.json"
+            state_path = root / "artifacts" / "state.json"
+            checkpoint_path = root / "artifacts" / "environment-checkpoint"
+            (checkpoint_path / "payload").mkdir(parents=True)
+            snapshot_path.write_text(json.dumps({
+                "processStates": [{"fingerprint": "successor-state"}],
+                "policyRecords": [{"stateFingerprint": "base-state"}],
+            }))
+            state_path.write_text(json.dumps({"fingerprint": "successor-state"}))
+            (checkpoint_path / "checkpoint.json").write_text(json.dumps({
+                "complete": True,
+                "mode": "full_clone",
+                "restorable": True,
+                "source_state_fingerprint": "successor-state",
+            }))
+            agent = NodewiseCheckpointFinalizeAgent(
+                logs_dir=root / "logs", model_name="mock", macro_steps=0,
+                output_snapshot_path=str(snapshot_path),
+                output_state_path=str(state_path),
+                output_checkpoint_path=str(checkpoint_path),
+                node_command="true",
+            )
+            try:
+                capture = agent._load_complete_retry_capture()
+                self.assertIsNotNone(capture)
+                self.assertEqual(
+                    capture["state"]["fingerprint"], "successor-state"
+                )
+
+                state_path.write_text(json.dumps({"fingerprint": "different-state"}))
+                self.assertIsNone(agent._load_complete_retry_capture())
+                archive = agent._archive_incomplete_retry_capture()
+                self.assertIsNotNone(archive)
+                self.assertFalse(snapshot_path.exists())
+                self.assertFalse(state_path.exists())
+                self.assertFalse(checkpoint_path.exists())
+                self.assertTrue((archive / "session.json").is_file())
+                self.assertTrue((archive / "state.json").is_file())
+                self.assertTrue((archive / "environment-checkpoint" / "checkpoint.json").is_file())
+                reason = json.loads((archive / "reason.json").read_text())
+                self.assertEqual(
+                    reason["reason"],
+                    "incomplete_or_inconsistent_nodewise_capture",
+                )
+            finally:
+                agent.close()
 
     def test_native_audit_is_fail_closed_and_uses_environment_digest(self) -> None:
         self.assertEqual(

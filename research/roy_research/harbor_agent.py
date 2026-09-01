@@ -476,6 +476,8 @@ class NodewiseCheckpointFinalizeAgent(BaseAgent):
             Path(source_checkpoint_path).expanduser().resolve()
             if source_checkpoint_path else None
         )
+        self._retry_capture: Dict[str, Any] | None = None
+        self._retry_archive_path: Path | None = None
         configured = node_command or os.environ.get(
             "ROY_LHTB_NODE_COMMAND", "node dist/cli/LhtbAgent.js"
         )
@@ -496,9 +498,66 @@ class NodewiseCheckpointFinalizeAgent(BaseAgent):
     def version(self) -> str:
         return "1"
 
+    def _load_complete_retry_capture(self) -> Dict[str, Any] | None:
+        manifest_path = self.output_checkpoint_path / "checkpoint.json"
+        payload_path = self.output_checkpoint_path / "payload"
+        if not (
+            manifest_path.is_file() and payload_path.is_dir()
+            and self.output_snapshot_path.is_file()
+            and self.output_state_path.is_file()
+        ):
+            return None
+        try:
+            checkpoint = json.loads(manifest_path.read_text(encoding="utf-8"))
+            snapshot = json.loads(self.output_snapshot_path.read_text(encoding="utf-8"))
+            state = json.loads(self.output_state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        states = list(snapshot.get("processStates") or [])
+        fingerprint = str(state.get("fingerprint") or "")
+        snapshot_fingerprint = str(states[-1].get("fingerprint") or "") if states else ""
+        checkpoint_fingerprint = str(checkpoint.get("source_state_fingerprint") or "")
+        restorable = checkpoint.get(
+            "restorable", checkpoint.get("mode") == "full_clone"
+        )
+        if not (
+            checkpoint.get("complete") is True and restorable is True
+            and fingerprint and fingerprint == snapshot_fingerprint
+            and fingerprint == checkpoint_fingerprint
+        ):
+            return None
+        return {"checkpoint": checkpoint, "snapshot": snapshot, "state": state}
+
+    def _archive_incomplete_retry_capture(self) -> Path | None:
+        existing = [path for path in (
+            self.output_snapshot_path, self.output_state_path,
+            self.output_checkpoint_path,
+        ) if path.exists()]
+        if not existing:
+            return None
+        archive = self.output_checkpoint_path.parent / "retry-archive" / str(uuid.uuid4())
+        archive.mkdir(parents=True)
+        for path in existing:
+            os.replace(path, archive / path.name)
+        (archive / "reason.json").write_text(json.dumps({
+            "reason": "incomplete_or_inconsistent_nodewise_capture",
+            "output_snapshot_path": str(self.output_snapshot_path),
+            "output_state_path": str(self.output_state_path),
+            "output_checkpoint_path": str(self.output_checkpoint_path),
+        }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return archive
+
     async def setup(self, environment: Any) -> None:
         self.environment = environment
-        if self.source_checkpoint_path is not None:
+        self._retry_capture = self._load_complete_retry_capture()
+        if self._retry_capture is not None:
+            restore = getattr(environment, "restore_training_checkpoint", None)
+            if not callable(restore):
+                raise RuntimeError("node-wise retry requires a clonable environment backend")
+            await restore(self.output_checkpoint_path)
+        else:
+            self._retry_archive_path = self._archive_incomplete_retry_capture()
+        if self._retry_capture is None and self.source_checkpoint_path is not None:
             restore = getattr(environment, "restore_training_checkpoint", None)
             if not callable(restore):
                 raise RuntimeError("node-wise source requires a clonable environment backend")
@@ -507,7 +566,34 @@ class NodewiseCheckpointFinalizeAgent(BaseAgent):
 
     async def run(self, instruction: str, environment: Any, context: Any) -> None:
         self.environment = environment
-        if self.source_snapshot_path is not None:
+        checkpoint_audit: Mapping[str, Any]
+        macro_terminal_commands = 0
+        if self._retry_capture is not None:
+            captured_snapshot = dict(self._retry_capture["snapshot"])
+            response = await asyncio.to_thread(
+                self.rpc.request, "restore", {
+                    "snapshot": captured_snapshot,
+                    "organizationSeed": self.organization_seed,
+                }
+            )
+            snapshot = dict(response.get("snapshot") or captured_snapshot)
+            states = list(snapshot.get("processStates") or [])
+            if not states:
+                raise RuntimeError("node-wise retry capture has no process state")
+            state = dict(states[-1])
+            fingerprint = str(state.get("fingerprint") or "")
+            if fingerprint != str(self._retry_capture["state"].get("fingerprint") or ""):
+                raise RuntimeError("node-wise retry changed the captured state fingerprint")
+            policy_records = list(snapshot.get("policyRecords") or [])
+            base_fingerprint = (
+                str(policy_records[-1].get("stateFingerprint") or "")
+                if self.macro_steps == 1 and policy_records else fingerprint
+            )
+            checkpoint_audit = {
+                **dict(self._retry_capture["checkpoint"]),
+                "reused_complete_retry_capture": True,
+            }
+        elif self.source_snapshot_path is not None:
             source_snapshot = json.loads(
                 self.source_snapshot_path.read_text(encoding="utf-8")
             )
@@ -538,65 +624,69 @@ class NodewiseCheckpointFinalizeAgent(BaseAgent):
             response = await asyncio.to_thread(
                 self.rpc.request, "prepare_boundary", {}
             )
-        base_snapshot = dict(response.get("snapshot") or {})
-        base_policy_count = len(base_snapshot.get("policyRecords") or [])
-        base_states = list(base_snapshot.get("processStates") or [])
-        if not base_states or not str(base_states[-1].get("fingerprint") or ""):
-            raise RuntimeError("node-wise base is not a fingerprinted decision boundary")
-        base_fingerprint = str(base_states[-1]["fingerprint"])
-        macro_terminal_commands = 0
-        if self.macro_steps == 1:
-            response = await asyncio.to_thread(self.rpc.request, "advance_one", {})
-            if response.get("status") == "terminal_request":
-                request = dict(response["request"])
-                started = time.monotonic()
-                before_files = await self._file_snapshot(environment, request.get("cwd"))
-                result = await environment.exec(
-                    str(request["command"]), cwd=request.get("cwd"),
-                    timeout_sec=max(1, int(float(request.get("timeoutMs", 120_000)) / 1000)),
-                )
-                after_files = await self._file_snapshot(environment, request.get("cwd"))
-                response = await asyncio.to_thread(self.rpc.request, "resume_boundary", {
-                    "result": {
-                        "requestId": request["id"], "exitCode": result.return_code,
-                        "stdout": result.stdout or "", "stderr": result.stderr or "",
-                        "durationMs": int((time.monotonic() - started) * 1000),
-                        "fileChanges": sorted(
-                            path for path in set(before_files).union(after_files)
-                            if before_files.get(path) != after_files.get(path)
+        if self._retry_capture is None:
+            base_snapshot = dict(response.get("snapshot") or {})
+            base_policy_count = len(base_snapshot.get("policyRecords") or [])
+            base_states = list(base_snapshot.get("processStates") or [])
+            if not base_states or not str(base_states[-1].get("fingerprint") or ""):
+                raise RuntimeError("node-wise base is not a fingerprinted decision boundary")
+            base_fingerprint = str(base_states[-1]["fingerprint"])
+            if self.macro_steps == 1:
+                response = await asyncio.to_thread(self.rpc.request, "advance_one", {})
+                if response.get("status") == "terminal_request":
+                    request = dict(response["request"])
+                    started = time.monotonic()
+                    before_files = await self._file_snapshot(environment, request.get("cwd"))
+                    result = await environment.exec(
+                        str(request["command"]), cwd=request.get("cwd"),
+                        timeout_sec=max(
+                            1, int(float(request.get("timeoutMs", 120_000)) / 1000)
                         ),
-                    },
-                })
-                macro_terminal_commands += 1
-        snapshot = dict(response.get("snapshot") or self.rpc.last_snapshot or {})
-        states = list(snapshot.get("processStates") or [])
-        if not states:
-            raise RuntimeError("node-wise checkpoint has no process state")
-        policy_count = len(snapshot.get("policyRecords") or [])
-        if policy_count - base_policy_count != self.macro_steps:
-            raise RuntimeError("node-wise checkpoint did not execute exactly one policy action")
-        if self.macro_steps == 1:
-            new_record = list(snapshot.get("policyRecords") or [])[-1]
-            if str(new_record.get("stateFingerprint") or "") != base_fingerprint:
-                raise RuntimeError(
-                    "node-wise actor fingerprint differs from restored decision boundary"
+                    )
+                    after_files = await self._file_snapshot(environment, request.get("cwd"))
+                    response = await asyncio.to_thread(self.rpc.request, "resume_boundary", {
+                        "result": {
+                            "requestId": request["id"], "exitCode": result.return_code,
+                            "stdout": result.stdout or "", "stderr": result.stderr or "",
+                            "durationMs": int((time.monotonic() - started) * 1000),
+                            "fileChanges": sorted(
+                                path for path in set(before_files).union(after_files)
+                                if before_files.get(path) != after_files.get(path)
+                            ),
+                        },
+                    })
+                    macro_terminal_commands += 1
+            snapshot = dict(response.get("snapshot") or self.rpc.last_snapshot or {})
+            states = list(snapshot.get("processStates") or [])
+            if not states:
+                raise RuntimeError("node-wise checkpoint has no process state")
+            policy_count = len(snapshot.get("policyRecords") or [])
+            if policy_count - base_policy_count != self.macro_steps:
+                raise RuntimeError("node-wise checkpoint did not execute exactly one policy action")
+            if self.macro_steps == 1:
+                new_record = list(snapshot.get("policyRecords") or [])[-1]
+                if str(new_record.get("stateFingerprint") or "") != base_fingerprint:
+                    raise RuntimeError(
+                        "node-wise actor fingerprint differs from restored decision boundary"
+                    )
+            state = dict(states[-1])
+            fingerprint = str(state.get("fingerprint") or "")
+            if not fingerprint:
+                raise RuntimeError("node-wise process state has no immutable fingerprint")
+            self._write_json(self.output_snapshot_path, snapshot)
+            self._write_json(self.output_state_path, state)
+            checkpoint = getattr(environment, "create_training_checkpoint", None)
+            if not callable(checkpoint):
+                raise RuntimeError("node-wise output requires a clonable environment backend")
+            checkpoint_parameters = inspect.signature(checkpoint).parameters
+            if "reuse_matching" in checkpoint_parameters:
+                checkpoint_audit = await checkpoint(
+                    self.output_checkpoint_path, fingerprint, reuse_matching=True
                 )
-        state = dict(states[-1])
-        fingerprint = str(state.get("fingerprint") or "")
-        if not fingerprint:
-            raise RuntimeError("node-wise process state has no immutable fingerprint")
-        self._write_json(self.output_snapshot_path, snapshot)
-        self._write_json(self.output_state_path, state)
-        checkpoint = getattr(environment, "create_training_checkpoint", None)
-        if not callable(checkpoint):
-            raise RuntimeError("node-wise output requires a clonable environment backend")
-        checkpoint_parameters = inspect.signature(checkpoint).parameters
-        if "reuse_matching" in checkpoint_parameters:
-            checkpoint_audit = await checkpoint(
-                self.output_checkpoint_path, fingerprint, reuse_matching=True
-            )
-        else:
-            checkpoint_audit = await checkpoint(self.output_checkpoint_path, fingerprint)
+            else:
+                checkpoint_audit = await checkpoint(
+                    self.output_checkpoint_path, fingerprint
+                )
         finalizer_steps = 0
         finalizer_terminal_commands = 0
         finalizer_exhausted = True
@@ -658,6 +748,10 @@ class NodewiseCheckpointFinalizeAgent(BaseAgent):
             "process_state_path": str(self.output_state_path),
             "environment_checkpoint_path": str(self.output_checkpoint_path),
             "checkpoint_audit": dict(checkpoint_audit),
+            "resumed_complete_retry_capture": self._retry_capture is not None,
+            "retry_archive_path": (
+                str(self._retry_archive_path) if self._retry_archive_path else None
+            ),
             "macro_terminal_commands": macro_terminal_commands,
             "finalizer_policy": "frozen_local_readout_no_structural_actions",
             "finalizer_revision": "frozen-bounded-local-readout-a0-20260830",
