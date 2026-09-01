@@ -301,6 +301,10 @@ export class RecursiveInformationRealizationRuntime {
     if (!report || report.nodeId !== actor.id) {
       throw new Error(`${returning ? 'RETURN' : 'EXECUTE'} requires the actor epistemic report`);
     }
+    if (![report.claims, report.evidence, report.externalObservations, report.assumptions,
+      report.blindSpots, report.residualRequirements].every(Array.isArray)) {
+      throw new Error('Epistemic report collections must use the Runtime array schema');
+    }
     if (actor.specification?.realizationMode === 'organize_knowledge'
       && ![report.claims, report.evidence, report.assumptions, report.blindSpots]
         .some(values => values.length > 0)) {
@@ -316,7 +320,15 @@ export class RecursiveInformationRealizationRuntime {
       }
       this.requirements.set(requirement.id, structuredClone(requirement));
     }
+    const sourceTypes = new Set([
+      'web', 'database', 'memory', 'code', 'api', 'environment', 'tool', 'kb',
+    ]);
     for (const observation of report.externalObservations) {
+      if (!observation.id || !observation.observation || !observation.queryOrAction
+        || !observation.provenance || !sourceTypes.has(observation.sourceType)
+        || !Array.isArray(observation.supports)) {
+        throw new Error(`External observation ${observation.id || '<missing-id>'} has an invalid schema`);
+      }
       if (!this.observations.has(observation.id)) this.observations.set(observation.id, structuredClone(observation));
     }
     this.reports.set(report.id, structuredClone(report));

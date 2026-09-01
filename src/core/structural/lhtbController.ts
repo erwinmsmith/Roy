@@ -412,6 +412,8 @@ partial object, null, or undefined item. In particular, residualRequirements sho
 every non-empty entry requires id, description, whyItMatters, likelyMechanism,
 requiredInformation, status, and parentNodeId equal to the returning actor. STOP is root-only and
 uses finalOutput.
+Every externalObservations entry must use {"id":"...","sourceType":"tool|environment|web|database|memory|code|api|kb","queryOrAction":"...","observation":"...","provenance":"...","supports":[]}.
+Do not use source or timestamp as substitutes for these fields.
 An organize_knowledge child must encode its conclusion in at least one valid claim, evidence item,
 assumption, or blind spot. informationToPropagate and coverage alone do not change the represented
 knowledge state and therefore cannot be the only non-empty report fields.
@@ -805,6 +807,35 @@ function normalizeReturnReportCollections(
     if (evidence.contradicts !== undefined && !Array.isArray(evidence.contradicts)) {
       evidence.contradicts = [];
     }
+    return true;
+  });
+  const observationSourceTypes = new Set([
+    'web', 'database', 'memory', 'code', 'api', 'environment', 'tool', 'kb',
+  ]);
+  report.externalObservations = (report.externalObservations as unknown[]).filter(item => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
+    const observation = item as Record<string, unknown>;
+    if (!['id', 'observation'].every(field =>
+      typeof observation[field] === 'string'
+      && String(observation[field]).trim().length > 0)) return false;
+    const sourceAlias = typeof observation.source === 'string'
+      ? observation.source.trim().toLowerCase() : '';
+    if (!observationSourceTypes.has(String(observation.sourceType))) {
+      observation.sourceType = ['terminal', 'shell', 'command'].includes(sourceAlias)
+        ? 'tool' : sourceAlias === 'code' ? 'code' : 'environment';
+    }
+    if (typeof observation.queryOrAction !== 'string'
+      || !observation.queryOrAction.trim()) {
+      observation.queryOrAction = typeof report.localObjective === 'string'
+        && report.localObjective.trim() ? report.localObjective.trim() : 'worker observation';
+    }
+    if (typeof observation.provenance !== 'string' || !observation.provenance.trim()) {
+      const reportId = typeof report.id === 'string' && report.id.trim()
+        ? report.id.trim() : 'unidentified-report';
+      observation.provenance = sourceAlias
+        ? `${sourceAlias}:${reportId}` : `worker-report:${reportId}`;
+    }
+    if (!Array.isArray(observation.supports)) observation.supports = [];
     return true;
   });
   const assumptionStatuses = new Set(['verified', 'unverified', 'contradicted']);

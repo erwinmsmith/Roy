@@ -1185,6 +1185,21 @@ describe('LHTB process state', () => {
       expect(normalized.candidates).toHaveLength(1);
       expect((normalized.candidates[0] as unknown as { action: { report: {
         residualRequirements: unknown[] } } }).action.report.residualRequirements).toEqual([]);
+      const providerObservationShape = structuredClone(response) as unknown as { candidates: Array<{
+        action: { report: typeof report & { externalObservations: Array<Record<string, unknown>> } } }> };
+      providerObservationShape.candidates[0].action.report.externalObservations = [{
+        id: 'terminal-observation', source: 'terminal', observation: 'manifest inspected',
+        timestamp: '2026-01-01T00:00:00Z',
+      }];
+      const normalizedObservation = harness.validateCandidates(providerObservationShape, session);
+      expect(normalizedObservation.candidates).toHaveLength(1);
+      const normalizedObservationAction = normalizedObservation.candidates[0] as unknown as {
+        action: { report: { externalObservations: Array<Record<string, unknown>> } } };
+      expect(normalizedObservationAction.action.report.externalObservations[0]).toMatchObject({
+        id: 'terminal-observation', sourceType: 'tool',
+        queryOrAction: childSpecification.localObjective,
+        observation: 'manifest inspected', provenance: 'terminal:worker-report', supports: [],
+      });
       expect(harness.structuralCandidateDeficits(session.snapshot(), []))
         .not.toContain('missing_external_child_progress_candidate:worker');
       expect(harness.legalStructuralControllerCandidates(session.snapshot())
@@ -1193,6 +1208,11 @@ describe('LHTB process state', () => {
         .toContain('missing_child_return_candidate:worker');
       expect(harness.structuralCandidateDeficits(session.snapshot(), accepted.candidates))
         .not.toContain('missing_child_return_candidate:worker');
+      session.applyOrganizationAction(normalizedObservationAction.action as never);
+      expect(session.snapshot().processStates.at(-1)?.externalObservations)
+        .toEqual(expect.arrayContaining([expect.objectContaining({
+          id: 'terminal-observation', sourceType: 'tool', observation: 'manifest inspected',
+        })]));
     } finally {
       controller.close();
       if (priorAttempts === undefined) delete process.env.ROY_LHTB_PROPOSAL_ATTEMPTS;

@@ -480,27 +480,40 @@ class LHTBNodeWiseDeltaVTrainer:
         self,
         labels: Sequence[Mapping[str, Any]],
         *,
+        replay_labels: Sequence[Mapping[str, Any]] = (),
         epochs: int = 4,
         batch_size: int = 32,
     ) -> Dict[str, Any]:
         if epochs <= 0 or batch_size <= 0:
             raise ValueError("value epochs and batch size must be positive")
-        fresh = self._validate_value_labels(labels)
-        self._precache_states([value["process_state"] for value in fresh])
+        fresh = list(labels)
+        replay = list(replay_labels)
+        fresh_ids = [str(value.get("label_id", "")) for value in fresh]
+        replay_ids = [str(value.get("label_id", "")) for value in replay]
+        if not fresh or any(value in self.used_value_label_ids for value in fresh_ids):
+            raise ValueError("value update requires only fresh forced-finalize labels")
+        if any(value not in self.used_value_label_ids for value in replay_ids):
+            raise ValueError("value replay accepts only previously used labels")
+        training = self._validate_value_labels([*replay, *fresh])
+        self._precache_states([value["process_state"] for value in training])
         targets = torch.tensor(
-            [float(value["value_target"]) for value in fresh],
+            [float(value["value_target"]) for value in training],
             dtype=torch.float32,
             device=self.device,
         )
         self.value.train()
         losses: List[float] = []
-        for _ in range(epochs):
-            for start in range(0, len(fresh), batch_size):
-                batch = fresh[start:start + batch_size]
+        for epoch in range(epochs):
+            order = sorted(range(len(training)), key=lambda index: hashlib.sha256(
+                f"{epoch}:{training[index]['label_id']}".encode("utf-8")
+            ).digest())
+            for start in range(0, len(training), batch_size):
+                indices = order[start:start + batch_size]
+                batch = [training[index] for index in indices]
                 predictions = self._value_predictions(
                     [value["process_state"] for value in batch]
                 )
-                target = targets[start:start + len(batch)]
+                target = targets[indices]
                 loss = F.huber_loss(predictions, target)
                 self.value_optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -511,19 +524,27 @@ class LHTBNodeWiseDeltaVTrainer:
         self.value.eval()
         with torch.no_grad():
             prediction = self._value_predictions(
-                [value["process_state"] for value in fresh]
+                [value["process_state"] for value in training]
             ).detach().cpu().tolist()
-        target_values = [float(value["value_target"]) for value in fresh]
-        metrics = _value_metrics(fresh, prediction, target_values)
+        target_values = [float(value["value_target"]) for value in training]
+        metrics = _value_metrics(training, prediction, target_values)
+        fresh_start = len(replay)
+        fresh_metrics = _value_metrics(
+            fresh, prediction[fresh_start:], target_values[fresh_start:]
+        )
         self.value_revision += 1
         self.used_value_label_ids.update(str(value["label_id"]) for value in fresh)
         result = {
             "operation": "value_update",
             "value_revision": self.value_revision,
             "labels": len(fresh),
+            "fresh_labels": len(fresh),
+            "replay_labels": len(replay),
+            "training_labels": len(training),
             "optimizer_steps": len(losses),
             "mean_huber_loss": sum(losses) / max(1, len(losses)),
             **metrics,
+            **{f"fresh_{key}": value for key, value in fresh_metrics.items()},
         }
         self.history.append(result)
         self.save()
@@ -623,6 +644,7 @@ class LHTBNodeWiseDeltaVTrainer:
             ),
             "training_protocol": "same_state_macro_action_delta_v_grpo_no_mcts",
             "value_label_protocol": "frozen_finalize_now_official_lhtb_task_utility",
+            "value_training_protocol": "equal-label-huber-accumulated-replay",
             "mia_reward_definition": MIA_REWARD_DEFINITION,
             "environment_utility_symbol": "u_env",
             "environment_utility_role": "value_supervision_and_evaluation_only",
@@ -669,13 +691,12 @@ class LHTBNodeWiseDeltaVTrainer:
     def _validate_value_labels(
         self, labels: Sequence[Mapping[str, Any]]
     ) -> List[Mapping[str, Any]]:
-        fresh = [value for value in labels
-                 if str(value.get("label_id", "")) not in self.used_value_label_ids]
-        if not fresh:
-            raise ValueError("value update contains no fresh forced-finalize labels")
-        if len({str(value.get("label_id", "")) for value in fresh}) != len(fresh):
+        values = list(labels)
+        if not values:
+            raise ValueError("value update contains no forced-finalize labels")
+        if len({str(value.get("label_id", "")) for value in values}) != len(values):
             raise ValueError("forced-finalize label IDs must be unique")
-        for value in fresh:
+        for value in values:
             require_training_task(str(value.get("task_id", "")), self.manifest)
             if value.get("benchmark") != "lhtb" or value.get("split") != "train":
                 raise ValueError("value learning accepts only LHTB train snapshots")
@@ -709,7 +730,7 @@ class LHTBNodeWiseDeltaVTrainer:
                 raise ValueError("forced-finalize probes require Harbor result provenance")
             if abs(sum(scores) / len(scores) - float(value.get("value_target", -1))) > 1e-9:
                 raise ValueError("forced-finalize value target is not the MC score mean")
-        return fresh
+        return values
 
     def _validate_macro_group(self, records: Sequence[Mapping[str, Any]]) -> str:
         if len(records) != NODEWISE_GROUP_SIZE:

@@ -341,6 +341,10 @@ def parser() -> argparse.ArgumentParser:
     )
     lhtb_value_update.add_argument("--manifest", type=Path, required=True)
     lhtb_value_update.add_argument("--labels", type=Path, required=True)
+    lhtb_value_update.add_argument(
+        "--replay-labels", type=Path,
+        help="Previously used official labels replayed under the same Huber objective",
+    )
     lhtb_value_update.add_argument("--model", type=Path, required=True)
     lhtb_value_update.add_argument("--updates", type=Path, required=True)
     lhtb_value_update.add_argument("--epochs", type=int, default=4)
@@ -631,7 +635,10 @@ def main(argv: List[str] | None = None) -> None:
             resume=args.resume,
         )
         update = trainer.update_value(
-            list(read_jsonl(args.labels)), epochs=args.epochs, batch_size=args.batch_size
+            list(read_jsonl(args.labels)),
+            replay_labels=(list(read_jsonl(args.replay_labels))
+                           if args.replay_labels else ()),
+            epochs=args.epochs, batch_size=args.batch_size,
         )
         write_jsonl(args.updates, [update], append=args.updates.exists())
         print(json.dumps(update))

@@ -454,8 +454,13 @@ PY
 
   fresh_count="$(filter_fresh_labels "${group_dir}/labels.jsonl" "${group_dir}/fresh-labels.jsonl")"
   if [[ "${fresh_count}" -gt 0 ]]; then
+    replay_args=()
+    if [[ -s "${run_root}/value-labels.jsonl" ]]; then
+      replay_args+=(--replay-labels "${run_root}/value-labels.jsonl")
+    fi
     "${python_bin}" -m roy_research lhtb-value-update \
       --manifest "${manifest}" --labels "${group_dir}/fresh-labels.jsonl" \
+      "${replay_args[@]}" \
       --model "${model}" --updates "${run_root}/value-updates.jsonl" \
       --epochs "${ROY_LHTB_VALUE_EPOCHS_PER_GROUP:-4}" \
       --batch-size "${ROY_LHTB_VALUE_BATCH_SIZE:-32}" --resume

@@ -163,6 +163,27 @@ class NodeWiseDeltaVTests(unittest.TestCase):
             self.assertEqual(update["value_revision"], 1)
             self.assertEqual(update["labels"], 1)
 
+            replay = label
+            second = build_forced_finalize_label(
+                label_id="label-2", task_id=self.task_id, split="train",
+                process_state=process_state("m1", 1), task_utilities=[0.8],
+                finalizer_revision="frozen-a0", task_checksum="task-sha",
+                environment_digest="sha256:environment", checkpoint_id="checkpoint-1",
+                clone_provenance={"mode": "deterministic_replay", "complete": True,
+                    "source_state_fingerprint": "m1",
+                    "source_environment_digest": "sha256:environment",
+                    "clone_audit_id": "clone-label-2"},
+                verifier_provenance=[{"harbor_result_path": "/audit/result-2.json",
+                                      "harbor_result_sha256": "sha-result-2"}],
+            )
+            replay_update = trainer.update_value(
+                [second], replay_labels=[replay], epochs=1, batch_size=2
+            )
+            self.assertEqual(replay_update["fresh_labels"], 1)
+            self.assertEqual(replay_update["replay_labels"], 1)
+            self.assertEqual(replay_update["training_labels"], 2)
+            self.assertIn("fresh_value_spearman", replay_update)
+
     def test_nodewise_group_uses_same_state_frozen_delta_v_and_restores(self):
         with tempfile.TemporaryDirectory() as directory:
             checkpoint = Path(directory) / "model.pt"
