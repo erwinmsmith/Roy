@@ -23,6 +23,7 @@ from .lhtb import LHTB_COMMIT, load_lhtb_manifest
 NATIVE_SCHEMA_VERSION = 1
 NATIVE_BACKEND_ID = "lhtb-native-process-v1"
 NATIVE_SOURCE_TASK_MARKER = ".roy-native-source-task"
+NATIVE_PROOT_LAUNCHER_DIRECTORY = ".proot-launcher"
 
 
 def native_restore_boundary_is_idle(
@@ -95,6 +96,19 @@ def native_proot_launcher_environment(
               if key != "PROOT_TMP_DIR"]
     values.append(f"PROOT_TMP_DIR={session_tmp}")
     return values
+
+
+def native_proot_launcher_parent(session_root: Path, execution_uid: int) -> Path:
+    """Return the host-only parent for one execution identity's PRoot files.
+
+    PRoot extracts an executable loader below ``PROOT_TMP_DIR`` and recursively
+    chmods/removes that directory during shutdown.  The launcher directory must
+    therefore never be the same path that is bind-mounted as guest ``/tmp`` and
+    must not be shared by the distinct Agent and verifier UIDs.
+    """
+    if execution_uid < 0:
+        raise ValueError("native PRoot execution UID must be non-negative")
+    return session_root / NATIVE_PROOT_LAUNCHER_DIRECTORY / str(execution_uid)
 
 
 def oci_repository_reference(image: str) -> str:

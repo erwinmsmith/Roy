@@ -10,6 +10,7 @@ import signal
 import socket
 import stat
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -26,6 +27,7 @@ from .lhtb_native import (
     native_task_id_from_harbor,
     native_preflight,
     native_proot_launcher_environment,
+    native_proot_launcher_parent,
     native_restore_boundary_is_idle,
     native_session_uids,
     resolve_native_task_source,
@@ -200,6 +202,7 @@ class NativeProcessEnvironment(BaseEnvironment):
             "mount_namespace": False,
             "official_leaderboard_comparable": False,
             "proot_executable": self.proot_executable,
+            "proot_launcher_isolation": "per-exec-host-only-per-uid",
             "rootfs": str(self._rootfs) if self._rootfs else None,
             "oci_image": manifest.get("oci_image"),
             "oci_digest": manifest.get("oci_digest"),
@@ -833,8 +836,32 @@ class NativeProcessEnvironment(BaseEnvironment):
 
         return await asyncio.to_thread(collect)
 
+    def _prepare_proot_launcher_tmp(self, execution_uid: int) -> Path:
+        """Create a unique host-only PRoot temp directory for one command.
+
+        The guest-visible ``session_root/tmp`` cannot hold PRoot's own loader.
+        Long-running verifiers may clean or chmod guest ``/tmp`` and Agent and
+        verifier commands execute under different kernel UIDs.  A unique
+        launcher directory prevents both forms of cross-command corruption.
+        """
+        assert self.session_root is not None
+        launcher_root = self.session_root / ".proot-launcher"
+        launcher_root.mkdir(mode=0o711, exist_ok=True)
+        os.chown(launcher_root, 0, self.task_gid)
+        launcher_root.chmod(0o711)
+        identity_root = native_proot_launcher_parent(
+            self.session_root, execution_uid
+        )
+        identity_root.mkdir(mode=0o700, exist_ok=True)
+        os.chown(identity_root, execution_uid, self.task_gid)
+        identity_root.chmod(0o700)
+        path = Path(tempfile.mkdtemp(prefix="exec-", dir=identity_root))
+        os.chown(path, execution_uid, self.task_gid)
+        path.chmod(0o700)
+        return path
+
     def _command(self, command: str, cwd: str | None, env: Mapping[str, str],
-                 execution_uid: int | None = None) -> list[str]:
+                 execution_uid: int | None = None) -> tuple[list[str], Path]:
         assert self.session_root is not None
         template = self.template_root / self.native_task_id
         default_working_directory = str(
@@ -870,17 +897,17 @@ class NativeProcessEnvironment(BaseEnvironment):
             f"cd -- {shlex.quote(working_directory)} && "
             f"exec /bin/bash -c {shlex.quote(command)}"
         )
-        # PRoot resolves its temporary directory before guest bind mounts exist. Under
-        # setpriv the host default selected by PRoot is not reliably writable on
-        # GPUHome, so point it at the per-session directory already owned by this UID.
-        # This is launcher state, not a command-level environment workaround.
-        exported = native_proot_launcher_environment(env, self.session_root / "tmp")
         uid = self._uid if execution_uid is None else execution_uid
+        launcher_tmp = self._prepare_proot_launcher_tmp(uid)
+        # PRoot resolves and executes a loader from PROOT_TMP_DIR before guest
+        # bind mounts exist.  Keep this internal state outside guest /tmp and
+        # unique per command so no later UID inherits stale cleanup objects.
+        exported = native_proot_launcher_environment(env, launcher_tmp)
         return [
             "setpriv", f"--reuid={uid}", f"--regid={self.task_gid}",
             "--clear-groups", "--no-new-privs", "env", "-i", *exported,
             *proot, "/bin/bash", "-c", shell,
-        ]
+        ], launcher_tmp
 
     async def exec(
         self,
@@ -930,29 +957,37 @@ class NativeProcessEnvironment(BaseEnvironment):
                 return_code=0,
             )
         else:
-            process = await asyncio.create_subprocess_exec(
-                *self._command(command, cwd, merged, execution_uid),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd="/",
-                start_new_session=True,
+            launch_command, launcher_tmp = self._command(
+                command, cwd, merged, execution_uid
             )
-            self._process_groups.add(process.pid)
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), timeout=timeout_sec
-                ) if timeout_sec else await process.communicate()
-            except asyncio.TimeoutError:
-                timed_out = True
+                process = await asyncio.create_subprocess_exec(
+                    *launch_command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd="/",
+                    start_new_session=True,
+                )
+                self._process_groups.add(process.pid)
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                await process.wait()
-                stdout = b""
-                stderr = f"command timed out after {timeout_sec} seconds".encode()
+                    stdout, stderr = await asyncio.wait_for(
+                        process.communicate(), timeout=timeout_sec
+                    ) if timeout_sec else await process.communicate()
+                except asyncio.TimeoutError:
+                    timed_out = True
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    await process.wait()
+                    stdout = b""
+                    stderr = (
+                        f"command timed out after {timeout_sec} seconds".encode()
+                    )
+                finally:
+                    self._process_groups.discard(process.pid)
             finally:
-                self._process_groups.discard(process.pid)
+                await asyncio.to_thread(shutil.rmtree, launcher_tmp, True)
             result = ExecResult(
                 stdout=stdout.decode("utf-8", errors="replace"),
                 stderr=stderr.decode("utf-8", errors="replace"),

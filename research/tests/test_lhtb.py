@@ -69,6 +69,7 @@ from roy_research.lhtb_native import (
     native_task_id_from_harbor,
     native_environment_digest,
     native_proot_launcher_environment,
+    native_proot_launcher_parent,
     native_restore_boundary_is_idle,
     native_session_uids,
     normalize_native_task_id,
@@ -688,15 +689,24 @@ for line in sys.stdin:
             )
             self.assertEqual(json.loads(safe.read_text())["n_concurrent_trials"], 2)
 
-    def test_native_proot_uses_the_uid_owned_session_tmp_before_guest_mounts(self) -> None:
+    def test_native_proot_uses_host_only_per_exec_tmp_not_guest_tmp(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            agent_parent = native_proot_launcher_parent(root, 210001)
+            verifier_parent = native_proot_launcher_parent(root, 230001)
+            agent_tmp = agent_parent / "exec-agent"
             values = native_proot_launcher_environment({
                 "PATH": "/usr/bin:/bin", "PROOT_TMP_DIR": "/untrusted",
-            }, root / "tmp")
-            trusted = f"PROOT_TMP_DIR={root / 'tmp'}"
+            }, agent_tmp)
+            trusted = f"PROOT_TMP_DIR={agent_tmp}"
             self.assertIn(trusted, values)
             self.assertNotIn("PROOT_TMP_DIR=/untrusted", values)
+            self.assertNotEqual(agent_parent, verifier_parent)
+            self.assertFalse(agent_tmp.is_relative_to(root / "tmp"))
+
+    def test_native_proot_launcher_parent_rejects_negative_uid(self) -> None:
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            native_proot_launcher_parent(Path("/runtime/session"), -1)
 
     def test_native_write_probe_is_safe_under_concurrent_preflight(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
