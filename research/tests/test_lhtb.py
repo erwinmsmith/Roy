@@ -582,6 +582,17 @@ for line in sys.stdin:
             [(value.epoch, value.decision_round) for value in first_groups],
             [(epoch, decision_round) for epoch in range(4) for decision_round in range(2)],
         )
+        deeper = build_training_schedule(
+            manifest, decision_rounds_per_task_per_epoch=6
+        )
+        self.assertEqual(len(deeper), 720)
+        deeper_by_id = {value.group_id: value for value in deeper}
+        self.assertTrue(all(
+            value.group_id in deeper_by_id
+            and value.organization_seeds
+            == deeper_by_id[value.group_id].organization_seeds
+            for value in continuous
+        ))
         with self.assertRaisesRegex(ValueError, "must be positive"):
             build_training_schedule(manifest, decision_rounds_per_task_per_epoch=0)
 

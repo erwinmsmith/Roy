@@ -59,6 +59,16 @@ PYTHONPATH=research python3 -m roy_research lhtb-update \
 
 The node-wise formal schedule is four epochs over all 30 train tasks, with two sequential decision rounds per task/epoch and `G=8`, for 240 groups and 1,920 rollouts. The round count is configurable with `ROY_LHTB_DECISION_ROUNDS_PER_TASK_PER_EPOCH`; two rounds provide eight decision opportunities per task across training, so a trajectory can grow from one root to as many as nine nodes when the learned actor repeatedly derives. Nothing enforces a minimum node count, depth, edge count or topology: `CONTINUE`, `RETURN`, `PRUNE` and `FINISH` remain legal when state and action masks permit them, so single-agent and shallow outcomes remain part of the same distribution. Every group uses fresh matched environments with the same task checksum, immutable environment digest, initial fingerprint and runtime config. Each rollout has a six-hour training deadline, concurrency is four, and one DeepSeek response is capped at 32,768 tokens. Native runs reserve the final 30 seconds for append-only deadline finalization, return normally to Harbor, and then invoke the official verifier on the partial environment. These are execution settings, not reward terms.
 
+For controlled deeper-topology experiments, use a separate round-count schedule and filter execution without changing or replaying completed groups. For example, the following resumes only epoch 0 of `riscv-core-debug` with six rounds per task/epoch; completed rounds 0 and 1 are skipped, while rounds 2 through 5 extend the same append-only task trajectory. Six rounds allow at most seven nodes within the epoch because every node-level macro action adds at most one node, but `FINISH` remains legal and no node count is forced.
+
+```bash
+ROY_LHTB_DECISION_ROUNDS_PER_TASK_PER_EPOCH=6 \
+ROY_LHTB_SCHEDULE="$ROY_LHTB_RUN_ROOT/schedule-rounds-6.json" \
+ROY_LHTB_TASK_FILTER=riscv-core-debug \
+ROY_LHTB_EPOCH_FILTER=0 \
+bash research/remote/run_lhtb_native_training.sh
+```
+
 Each organization action and terminal result appends an immutable `GlobalEpistemicState` `M_t`. Frozen DeepSeek prompts separately extract entities and verify `entail / contradict / unknown`; pinned MiniLM only recalls top-eight candidate pairs. All requests, responses, cache keys and model revisions are retained. No benchmark keyword field, lexical rule, regex, frequency score or embedding threshold labels meaning.
 
 The append-only ledger remains complete. On every organization decision, the actor receives the acting node's local objective, parent/depth/status, assigned requirements, open child specification, tool access, termination condition and recent node-local events, together with a typed relational projection of the complete current `M_t` organization/epistemic graph. The same shared actor parameters are used separately for every node. Every sampled decision records the exact node context, candidates, raw and masked probabilities, selected action and exact old log-probability.

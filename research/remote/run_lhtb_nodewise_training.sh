@@ -14,7 +14,6 @@ python_bin="${roy_root}/research/.venv/bin/python"
 harbor_bin="${roy_root}/research/.venv/bin/harbor"
 run_root="${ROY_LHTB_RUN_ROOT:-${roy_root}/research/output/lhtb/native/formal-nodewise}"
 manifest="${ROY_LHTB_MANIFEST:-${roy_root}/research/config/lhtb_split.json}"
-schedule="${run_root}/schedule.json"
 model="${run_root}/checkpoints/current.pt"
 native_runtime_root="${ROY_LHTB_NATIVE_ROOT:-${HOME}/rivermind-data/lhtb-native/runtime}"
 native_template_root="${ROY_LHTB_NATIVE_TEMPLATE_ROOT:-${HOME}/rivermind-data/lhtb-native/templates}"
@@ -26,7 +25,18 @@ dataset_path="${ROY_LHTB_DATASET_PATH:-}"
 parallelism="${ROY_LHTB_NODEWISE_CONCURRENCY:-4}"
 max_retries="${ROY_LHTB_MAX_ENV_RETRIES:-0}"
 decision_rounds="${ROY_LHTB_DECISION_ROUNDS_PER_TASK_PER_EPOCH:-2}"
+schedule="${ROY_LHTB_SCHEDULE:-}"
+task_filter="${ROY_LHTB_TASK_FILTER:-}"
+epoch_filter="${ROY_LHTB_EPOCH_FILTER:-}"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ -z "${schedule}" ]]; then
+  if [[ "${decision_rounds}" == "2" ]]; then
+    schedule="${run_root}/schedule.json"
+  else
+    schedule="${run_root}/schedule-rounds-${decision_rounds}.json"
+  fi
+fi
 
 # shellcheck source=load_roy_env.sh
 source "${script_dir}/load_roy_env.sh"
@@ -380,13 +390,30 @@ PY
 
 # Expand the checked schedule to a simple tab-separated stream. Tasks are
 # ordered epoch -> task -> decision round so every task evolves continuously.
-"${python_bin}" - "${schedule}" "${manifest}" <<'PY' >"${run_root}/schedule.tsv"
+"${python_bin}" - "${schedule}" "${manifest}" "${task_filter}" \
+  "${epoch_filter}" <<'PY' >"${run_root}/schedule.tsv"
 import json, sys
 schedule = json.load(open(sys.argv[1], encoding="utf-8"))["groups"]
 manifest = {x["task_id"]: x for x in json.load(open(sys.argv[2], encoding="utf-8"))["tasks"]}
+task_filter = {x.strip() for x in sys.argv[3].split(",") if x.strip()}
+epoch_filter = {int(x.strip()) for x in sys.argv[4].split(",") if x.strip()}
+unknown_tasks = task_filter - set(manifest)
+if unknown_tasks:
+    raise SystemExit(f"unknown ROY_LHTB_TASK_FILTER task(s): {sorted(unknown_tasks)}")
+unknown_epochs = epoch_filter - {0, 1, 2, 3}
+if unknown_epochs:
+    raise SystemExit(f"invalid ROY_LHTB_EPOCH_FILTER epoch(s): {sorted(unknown_epochs)}")
+selected = 0
 for group in schedule:
+    if task_filter and group["task_id"] not in task_filter:
+        continue
+    if epoch_filter and int(group["epoch"]) not in epoch_filter:
+        continue
+    selected += 1
     print(group["epoch"], group.get("decision_round", 0), group["task_id"], manifest[group["task_id"]]["category"],
           group["group_id"], ",".join(map(str, group["organization_seeds"])), sep="\t")
+if selected == 0:
+    raise SystemExit("the node-wise execution filters selected no schedule groups")
 PY
 
 while IFS=$'\t' read -r epoch decision_round task_id category group_id seed_csv; do
