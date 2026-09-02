@@ -1115,15 +1115,25 @@ export class LHTBAutonomousController {
         .filter(value => event.kind !== 'task_instruction'
           || value.id !== 'root-task-requirement')
         .slice(-SEMANTIC_RECALL_ENTITY_COUNT);
-      const update = await this.semantic.processEvent(event, {
-        requirements: existingRequirements,
-        claims: (latest?.claims ?? []).slice(-SEMANTIC_RECALL_ENTITY_COUNT),
-        assumptions: (latest?.assumptions ?? []).slice(-SEMANTIC_RECALL_ENTITY_COUNT),
-        evidence: (latest?.evidence ?? []).slice(-SEMANTIC_RECALL_ENTITY_COUNT),
-        external_observations: (latest?.externalObservations ?? [])
-          .slice(-SEMANTIC_RECALL_ENTITY_COUNT),
-      });
-      session.applySemanticUpdate(update);
+      try {
+        const update = await this.semantic.processEvent(event, {
+          requirements: existingRequirements,
+          claims: (latest?.claims ?? []).slice(-SEMANTIC_RECALL_ENTITY_COUNT),
+          assumptions: (latest?.assumptions ?? []).slice(-SEMANTIC_RECALL_ENTITY_COUNT),
+          evidence: (latest?.evidence ?? []).slice(-SEMANTIC_RECALL_ENTITY_COUNT),
+          external_observations: (latest?.externalObservations ?? [])
+            .slice(-SEMANTIC_RECALL_ENTITY_COUNT),
+        });
+        session.applySemanticUpdate(update);
+      } catch (error) {
+        // The raw Runtime event is already authoritative process data.  A frozen
+        // extractor outage must remain visible as a blind spot, but must not turn
+        // an otherwise valid environment rollout into an infrastructure failure.
+        session.applySemanticFailure(
+          event.id,
+          error instanceof Error ? error.message : String(error),
+        );
+      }
     }
   }
 

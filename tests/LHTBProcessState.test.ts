@@ -394,6 +394,42 @@ describe('LHTB process state', () => {
     controller.close();
   });
 
+  it('records a semantic extractor outage without killing the rollout', async () => {
+    const session = new RoyLHTBSession('semantic-failure', 'task', 'solve it', 'commit');
+    let semanticCalls = 0;
+    const semantic = {
+      async processEvent() {
+        semanticCalls += 1;
+        throw new Error('The user aborted a request.');
+      },
+      close() {},
+    };
+    const provider = { isConfigured: () => true, async completeJSONWithUsage() {
+      throw new Error('provider should not be called');
+    } };
+    const controller = new LHTBAutonomousController({ provider, semantic, auditRoot: false });
+    try {
+      await controller.prepareDecisionBoundary(session);
+      await controller.prepareDecisionBoundary(session);
+      const snapshot = session.snapshot();
+      expect(semanticCalls).toBe(1);
+      expect(snapshot.processedSemanticEventIds).toContain('task-instruction');
+      expect(snapshot.processStates.at(-1)?.blindSpots).toContain(
+        'Semantic projection unavailable for runtime event task-instruction; raw event retained.',
+      );
+      expect(snapshot.runtimeEvents).toContainEqual(expect.objectContaining({
+        kind: 'failure',
+        attributes: expect.objectContaining({
+          failureType: 'semantic_projection',
+          sourceEventId: 'task-instruction',
+          reason: 'The user aborted a request.',
+        }),
+      }));
+    } finally {
+      controller.close();
+    }
+  });
+
   it('replaces the aggregate root gap with explicit task requirements', () => {
     const session = new RoyLHTBSession('task-decomposition', 'task',
       'produce an audit and a reconciliation report', 'commit');

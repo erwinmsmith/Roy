@@ -214,6 +214,31 @@ export class RoyLHTBSession {
     return this.recordState();
   }
 
+  applySemanticFailure(eventId: string, reason: string): GlobalEpistemicState {
+    if (this.processedSemanticEventIds.has(eventId)) {
+      throw new Error(`Semantic event ${eventId} was already processed`);
+    }
+    this.processedSemanticEventIds.add(eventId);
+    const sourceEvent = this.events.find(event => event.id === eventId);
+    const boundedReason = reason.trim().slice(0, 500) || 'semantic projection failed';
+    this.semanticBlindSpots.push(
+      `Semantic projection unavailable for runtime event ${eventId}; raw event retained.`,
+    );
+    this.events.push({
+      id: `semantic-failure-${this.eventSequence}`,
+      kind: 'failure',
+      at: Date.now(),
+      nodeId: sourceEvent?.nodeId ?? this.runtime.snapshot().rootId,
+      attributes: {
+        failureType: 'semantic_projection',
+        sourceEventId: eventId,
+        reason: boundedReason,
+      },
+    });
+    this.eventSequence += 1;
+    return this.recordState();
+  }
+
   requestTerminal(request: TerminalRequest): GlobalEpistemicState {
     if (this.pendingTerminalRequest) throw new Error('A terminal request is already pending');
     this.pendingTerminalRequest = structuredClone(request);
