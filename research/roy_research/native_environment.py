@@ -26,6 +26,7 @@ from .lhtb_native import (
     native_task_id_from_harbor,
     native_preflight,
     native_proot_launcher_environment,
+    native_restore_boundary_is_idle,
     native_session_uids,
     resolve_native_task_source,
     tree_digest,
@@ -299,7 +300,19 @@ class NativeProcessEnvironment(BaseEnvironment):
         if self.session_root is None or self._manifest is None:
             raise RuntimeError("native environment is not started")
         service_pids = {int(value.get("pid", -1)) for value in self._service_audit}
-        if self._process_groups - service_pids or self._exec_index != 0:
+        persistent_services = list(self._manifest.get("services") or [])
+        # Harbor may run a task healthcheck after start() and before Agent setup.
+        # For service-free tasks this does not invalidate a restore: the complete
+        # checkpoint payload replaces every mutable guest directory below.  A
+        # persistent service is different because its in-memory state cannot be
+        # restored from the filesystem payload, so retain the strict no-command
+        # boundary for those tasks.
+        if not native_restore_boundary_is_idle(
+            self._process_groups,
+            service_pids,
+            persistent_services,
+            self._exec_index,
+        ):
             raise RuntimeError("native checkpoint restore requires a fresh idle environment")
         root = Path(source).expanduser().resolve(strict=True)
         manifest_path = root / "checkpoint.json"
@@ -317,7 +330,7 @@ class NativeProcessEnvironment(BaseEnvironment):
             raise ValueError("native checkpoint belongs to another LHTB task")
         if audit.get("source_environment_digest") != self.environment_digest:
             raise ValueError("native checkpoint environment digest mismatch")
-        services = list(self._manifest.get("services") or [])
+        services = persistent_services
         service_digest = hashlib.sha256(json.dumps(
             services, sort_keys=True, separators=(",", ":"),
         ).encode("utf-8")).hexdigest() if services else None

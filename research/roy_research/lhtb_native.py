@@ -25,6 +25,23 @@ NATIVE_BACKEND_ID = "lhtb-native-process-v1"
 NATIVE_SOURCE_TASK_MARKER = ".roy-native-source-task"
 
 
+def native_restore_boundary_is_idle(
+    process_groups: Iterable[int],
+    service_pids: Iterable[int],
+    persistent_services: Sequence[Mapping[str, Any]],
+    exec_count: int,
+) -> bool:
+    """Validate whether a native checkpoint can safely replace guest state.
+
+    Harbor is allowed to run a filesystem healthcheck before Agent setup for a
+    service-free task because the checkpoint replaces every mutable guest path.
+    Commands remain disallowed after a persistent service starts because its
+    in-memory state is not represented by the filesystem checkpoint.
+    """
+    unexpected_processes = set(process_groups) - set(service_pids)
+    return not unexpected_processes and not (persistent_services and exec_count != 0)
+
+
 def copy_checkpoint_tree(source: Path, destination: Path) -> list[dict[str, str]]:
     """Copy serializable state while auditing kernel-backed endpoints."""
     excluded: list[dict[str, str]] = []

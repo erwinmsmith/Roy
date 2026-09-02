@@ -69,6 +69,7 @@ from roy_research.lhtb_native import (
     native_task_id_from_harbor,
     native_environment_digest,
     native_proot_launcher_environment,
+    native_restore_boundary_is_idle,
     native_session_uids,
     normalize_native_task_id,
     oci_repository_reference,
@@ -727,6 +728,16 @@ for line in sys.stdin:
             )
             self.assertTrue((destination / "state-link").is_symlink())
             self.assertFalse((destination / "game.sock").exists())
+
+    def test_native_restore_boundary_allows_service_free_preflight_exec(self) -> None:
+        self.assertTrue(native_restore_boundary_is_idle(set(), set(), [], 1))
+        self.assertFalse(native_restore_boundary_is_idle({123}, set(), [], 0))
+        self.assertTrue(native_restore_boundary_is_idle(
+            {456}, {456}, [{"name": "service"}], 0,
+        ))
+        self.assertFalse(native_restore_boundary_is_idle(
+            {456}, {456}, [{"name": "service"}], 1,
+        ))
 
     def test_frozen_finalize_agent_performs_no_action(self) -> None:
         agent = FrozenFinalizeNowAgent.__new__(FrozenFinalizeNowAgent)
