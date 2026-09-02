@@ -111,6 +111,17 @@ def native_proot_launcher_parent(session_root: Path, execution_uid: int) -> Path
     return session_root / NATIVE_PROOT_LAUNCHER_DIRECTORY / str(execution_uid)
 
 
+def native_proot_traversal_command(
+    proot_executable: str, execution_uid: int, task_gid: int
+) -> list[str]:
+    """Build the same privilege boundary used by the production launcher."""
+    return [
+        "setpriv", f"--reuid={execution_uid}", f"--regid={task_gid}",
+        "--clear-groups", "--no-new-privs", "env", "-i",
+        proot_executable, "--version",
+    ]
+
+
 def oci_repository_reference(image: str) -> str:
     """Remove a tag/digest without mistaking a registry port for an image tag."""
     without_digest = image.split("@", 1)[0]
@@ -454,10 +465,14 @@ def native_preflight(runtime_root: Path, *, task_gid: int = 210000) -> Dict[str,
         mountpoint.mkdir(parents=True, exist_ok=True)
         mountpoint.chmod(0o755)
     result["proot_mountpoints"] = [str(value) for value in mountpoints]
-    traversal = subprocess.run([
-        "setpriv", "--reuid=229999", f"--regid={task_gid}", "--clear-groups",
-        "--no-new-privs", proot_executable, "--version",
-    ], capture_output=True, text=True)
+    # Match the real launcher boundary.  ``setpriv ... proot`` can resolve the
+    # executable before dropping privileges, while the production chain
+    # inserts ``env -i`` and resolves PRoot after the UID switch.  The latter
+    # catches a reset ACL mask after host migration or key provisioning.
+    traversal = subprocess.run(
+        native_proot_traversal_command(proot_executable, 229999, task_gid),
+        capture_output=True, text=True,
+    )
     if traversal.returncode != 0:
         raise RuntimeError(
             "LHTB-native task GID cannot execute the pinned PRoot runtime; "

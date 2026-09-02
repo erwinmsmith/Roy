@@ -70,6 +70,7 @@ from roy_research.lhtb_native import (
     native_environment_digest,
     native_proot_launcher_environment,
     native_proot_launcher_parent,
+    native_proot_traversal_command,
     native_restore_boundary_is_idle,
     native_session_uids,
     normalize_native_task_id,
@@ -707,6 +708,14 @@ for line in sys.stdin:
     def test_native_proot_launcher_parent_rejects_negative_uid(self) -> None:
         with self.assertRaisesRegex(ValueError, "non-negative"):
             native_proot_launcher_parent(Path("/runtime/session"), -1)
+
+    def test_native_proot_preflight_resolves_binary_after_uid_switch(self) -> None:
+        command = native_proot_traversal_command("/tools/proot", 229999, 210000)
+        self.assertEqual(command[:5], [
+            "setpriv", "--reuid=229999", "--regid=210000",
+            "--clear-groups", "--no-new-privs",
+        ])
+        self.assertEqual(command[5:], ["env", "-i", "/tools/proot", "--version"])
 
     def test_native_write_probe_is_safe_under_concurrent_preflight(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
