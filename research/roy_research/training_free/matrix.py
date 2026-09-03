@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import copy
-import math
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
+import itertools
+import json
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
-from .llm import ChannelizerModel, PosteriorProbeModel, WorkerModel
+from .information import InformationMeasure
+from .llm import ChannelizerModel, WorkerModel
 from .types import AgentState, CandidateDependency
 
 
@@ -103,7 +105,6 @@ def expand_matrix(
     result.validate()
     return result
 
-
 def matrix_neighbors(
     matrix: InformationMatrix,
     levels: Sequence[float],
@@ -152,7 +153,9 @@ class MatrixSearchResult:
     matrix: InformationMatrix
     score: float
     evaluations: int
-    realization_posteriors: List[Dict[str, float]]
+    information_observations: List[Dict[str, Any]]
+    evaluated_matrices: List[Dict[str, Any]] = field(default_factory=list)
+    admissible_level_matrices: int = 0
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -160,7 +163,12 @@ class MatrixSearchResult:
             "matrix": self.matrix.to_dict(), "score": self.score,
             "delta_matrix": matrix_difference(self.initial_matrix, self.matrix).to_dict(),
             "evaluations": self.evaluations,
-            "realization_posteriors": self.realization_posteriors,
+            "information_observations": self.information_observations,
+            "search_space": {
+                "admissible_level_matrices": self.admissible_level_matrices,
+                "evaluated_count": len(self.evaluated_matrices),
+                "evaluated_matrices": self.evaluated_matrices,
+            },
         }
 
 
@@ -169,24 +177,43 @@ class SemanticRolloutEvaluator:
         self,
         worker: WorkerModel,
         channelizer: ChannelizerModel,
-        posterior: PosteriorProbeModel,
+        information_measure: InformationMeasure,
         *,
         benchmark: str,
         root_id: str,
         inbound_token_budget: int,
         communication_rounds: int,
-        posterior_rollouts: int,
+        information_rollouts: int,
         state_context: Mapping[str, object] | None = None,
     ) -> None:
         self.worker = worker
         self.channelizer = channelizer
-        self.posterior = posterior
+        self.information_measure = information_measure
         self.benchmark = benchmark
         self.root_id = root_id
         self.inbound_token_budget = inbound_token_budget
         self.communication_rounds = communication_rounds
-        self.posterior_rollouts = posterior_rollouts
+        self.information_rollouts = information_rollouts
         self.state_context = dict(state_context or {})
+        self._realization_cache: Dict[
+            Tuple[str, Tuple[float, ...], int], Dict[str, AgentState]
+        ] = {}
+
+    def _realize_for_evaluation(
+        self,
+        agents: Mapping[str, AgentState],
+        matrix: InformationMatrix,
+        rollout_index: int,
+    ) -> Dict[str, AgentState]:
+        agents_fingerprint = json.dumps(
+            {key: value.to_dict() for key, value in agents.items()},
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        cache_key = (agents_fingerprint, matrix.key(), rollout_index)
+        if cache_key not in self._realization_cache:
+            self._realization_cache[cache_key] = self.realize_once(agents, matrix)
+        return copy.deepcopy(self._realization_cache[cache_key])
 
     def realize_once(
         self,
@@ -221,21 +248,21 @@ class SemanticRolloutEvaluator:
         self,
         agents: Mapping[str, AgentState],
         matrix: InformationMatrix,
-        support: List[str],
-        prior: Mapping[str, float],
-    ) -> tuple[float, List[Dict[str, float]]]:
-        posteriors: List[Dict[str, float]] = []
-        for _ in range(self.posterior_rollouts):
-            realized = self.realize_once(agents, matrix)
+    ) -> tuple[float, List[Dict[str, Any]]]:
+        observations: List[Dict[str, Any]] = []
+        for rollout_index in range(self.information_rollouts):
+            realized = self._realize_for_evaluation(agents, matrix, rollout_index)
+            realized_root = realized[self.root_id]
             evaluated_context = {
                 **self.state_context,
                 "evaluated_matrix": matrix.to_dict(),
             }
-            posteriors.append(self.posterior.posterior(
-                realized[self.root_id], support, self.benchmark, evaluated_context,
-            ))
-        score = sum(kl_divergence(posterior, prior, support) for posterior in posteriors)
-        return score / len(posteriors), posteriors
+            observation = self.information_measure.compare(
+                agents[self.root_id], realized_root, self.benchmark, evaluated_context,
+            )
+            observations.append(observation.to_dict())
+        score = sum(item["score"] for item in observations)
+        return score / len(observations), observations
 
 
 class BeamCoordinateMatrixSearch:
@@ -260,36 +287,86 @@ class BeamCoordinateMatrixSearch:
         self,
         agents: Mapping[str, AgentState],
         initial: InformationMatrix,
-        support: List[str],
-        prior: Mapping[str, float],
         dependencies: Sequence[CandidateDependency] = (),
     ) -> MatrixSearchResult:
         hard = [edge for edge in dependencies if edge.kind == "hard"]
-        cache: Dict[Tuple[float, ...], tuple[float, List[Dict[str, float]]]] = {}
+        cache: Dict[
+            Tuple[str, Tuple[float, ...]],
+            tuple[float, List[Dict[str, Any]]],
+        ] = {}
+        discovered_at = {initial.key(): 0}
+        evaluated_matrices: List[Dict[str, Any]] = []
 
-        def score(matrix: InformationMatrix) -> tuple[float, List[Dict[str, float]]]:
-            key = matrix.key()
-            if key not in cache:
-                if len(cache) >= self.maximum_evaluations:
+        def score(matrix: InformationMatrix) -> tuple[float, List[Dict[str, Any]]]:
+            matrix_key = matrix.key()
+            cache_key = (self.evaluator.information_measure.revision, matrix_key)
+            if cache_key not in cache:
+                if len(evaluated_matrices) >= self.maximum_evaluations:
                     return float("-inf"), []
-                cache[key] = self.evaluator.evaluate(agents, matrix, support, prior)
-            return cache[key]
+                evaluated = self.evaluator.evaluate(agents, matrix)
+                cache_key = (self.evaluator.information_measure.revision, matrix_key)
+                cache[cache_key] = evaluated
+                evaluated_matrices.append({
+                    "evaluation_index": len(evaluated_matrices),
+                    "discovery_iteration": discovered_at.get(matrix_key, 0),
+                    "matrix": matrix.to_dict(),
+                    "delta_from_initial": matrix_difference(initial, matrix).to_dict(),
+                    "information_measure": self.evaluator.information_measure.name,
+                    "measure_revision": self.evaluator.information_measure.revision,
+                    "information_gain": evaluated[0],
+                    "information_observations": evaluated[1],
+                })
+            return cache[cache_key]
 
         beam = [initial]
         score(initial)
-        for _ in range(self.iterations):
+        for iteration in range(1, self.iterations + 1):
             candidates = {matrix.key(): matrix for matrix in beam}
             for matrix in beam:
                 for neighbor in matrix_neighbors(matrix, self.levels, hard, self.hard_minimum):
                     candidates.setdefault(neighbor.key(), neighbor)
+                    discovered_at.setdefault(neighbor.key(), iteration)
             ranked = sorted(candidates.values(), key=lambda candidate: candidate.key())
             ranked = sorted(
                 ranked, key=lambda candidate: score(candidate)[0], reverse=True,
             )
             beam = ranked[: self.beam_width]
         best = max(beam, key=lambda candidate: score(candidate)[0])
-        best_score, posteriors = score(best)
-        return MatrixSearchResult(initial.clone(), best, best_score, len(cache), posteriors)
+        best_score, observations = score(best)
+        return MatrixSearchResult(
+            initial.clone(), best, best_score, len(evaluated_matrices), observations,
+            evaluated_matrices=evaluated_matrices,
+            admissible_level_matrices=admissible_matrix_count(
+                initial.agent_ids, self.levels, hard, self.hard_minimum,
+            ),
+        )
+
+
+def admissible_matrix_count(
+    agent_ids: Sequence[str],
+    levels: Sequence[float],
+    hard_dependencies: Sequence[CandidateDependency] = (),
+    hard_minimum: float = 0.0,
+) -> int:
+    """Count the global discrete matrix space under inbound and hard-edge constraints."""
+    ordered_levels = sorted(set(float(value) for value in levels))
+    total = 1
+    for target in agent_ids:
+        sources = [source for source in agent_ids if source != target]
+        required_sources = {
+            edge.source for edge in hard_dependencies
+            if edge.kind == "hard" and edge.target == target and edge.source in sources
+        }
+        valid_columns = 0
+        for weights in itertools.product(ordered_levels, repeat=len(sources)):
+            if sum(weights) > 1.0 + 1e-9:
+                continue
+            by_source = dict(zip(sources, weights))
+            if any(by_source[source] + 1e-9 < hard_minimum for source in required_sources):
+                continue
+            valid_columns += 1
+        total *= valid_columns
+    return total
 
 
 def matrix_difference(previous: InformationMatrix, current: InformationMatrix) -> InformationMatrix:
@@ -306,35 +383,3 @@ def matrix_difference(previous: InformationMatrix, current: InformationMatrix) -
                 if source in current.agent_ids and target in current.agent_ids else 0.0
             result.set_weight(source, target, new - old)
     return result
-
-
-def hypothesis_support(
-    agent_sets: Iterable[Mapping[str, AgentState]],
-    *,
-    maximum: int = 8,
-) -> List[str]:
-    answers: List[str] = []
-    for agents in agent_sets:
-        for agent in agents.values():
-            answer = agent.result.candidate_answer.strip()
-            if answer and answer not in answers:
-                answers.append(answer)
-    answers = answers[: max(1, maximum - 1)]
-    return [*answers, "OTHER"] if answers else ["UNRESOLVED", "OTHER"]
-
-
-def kl_divergence(
-    posterior: Mapping[str, float],
-    prior: Mapping[str, float],
-    support: Sequence[str],
-    epsilon: float = 1e-9,
-) -> float:
-    return sum(
-        max(epsilon, posterior[item])
-        * math.log(max(epsilon, posterior[item]) / max(epsilon, prior[item]))
-        for item in support
-    )
-
-
-def entropy(distribution: Mapping[str, float]) -> float:
-    return -sum(value * math.log(value) for value in distribution.values() if value > 0)

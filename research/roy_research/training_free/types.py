@@ -301,7 +301,7 @@ class RealizedSubgraph:
 @dataclass(frozen=True)
 class BenchmarkTask:
     task_id: str
-    benchmark: Literal["MATH", "HumanEval"]
+    benchmark: str
     instruction: str
     public_tests: List[str]
     evaluator_payload: Dict[str, Any]

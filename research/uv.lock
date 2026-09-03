@@ -2741,7 +2741,7 @@ wheels = [
 ]
 
 [[package]]
-name = "roy-cs-grpo-research"
+name = "roy-information-realization-research"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
@@ -2751,6 +2751,7 @@ dependencies = [
     { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "sentence-transformers", version = "5.1.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "sentence-transformers", version = "5.7.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
+    { name = "tomli", marker = "python_full_version < '3.11'" },
     { name = "torch", version = "2.8.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10' and sys_platform != 'linux'" },
     { name = "torch", version = "2.8.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "python_full_version < '3.10' and sys_platform == 'linux'" },
     { name = "torch", version = "2.13.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10' and sys_platform != 'linux'" },
@@ -2781,6 +2782,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8" },
     { name = "scikit-learn", marker = "extra == 'analysis'", specifier = ">=1.4" },
     { name = "sentence-transformers", specifier = ">=3.0" },
+    { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0" },
     { name = "torch", marker = "sys_platform != 'linux'", specifier = ">=2.1" },
     { name = "torch", marker = "sys_platform == 'linux'", specifier = ">=2.1", index = "https://download.pytorch.org/whl/cpu" },
 ]

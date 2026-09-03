@@ -3,48 +3,66 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import shlex
 import shutil
 import sys
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, List
 
 from .analysis import paired_bootstrap_interval, summarize_groups
 from .baselines import evaluate_controlled_arms
 from .benchmarks import build_remote_manifest
-from .controlled import collect_group, generate_tasks, mechanism_diagnostics
-from .controlled import TERMINAL_SUCCESS_THRESHOLD
+from .controlled import (
+    TERMINAL_SUCCESS_THRESHOLD,
+    collect_group,
+    generate_tasks,
+    mechanism_diagnostics,
+)
 from .io import atomic_json, read_jsonl, write_jsonl
-from .live_controlled import collect_forced_full_mas, collect_live_group
-from .providers import DeepSeekClient
-from .reporting import write_utility_svg
-from .schema import TraceRecord
-from .token_ledger import PersistentTokenLedger
-from .tau3 import build_tau3_manifest, manifest_summary, verify_tau3_root
-from .organization import LHTB_POLICY_INTERFACE_REVISION, RuntimeBudget
-from .tau3_runner import evaluate_tau3_against_direct, train_tau3_on_policy
-from .lhtb import build_lhtb_split, verify_lhtb_checkout, write_lhtb_manifest, load_lhtb_manifest
-from .lhtb_experiment import build_training_schedule, disk_preflight, select_dev_checkpoint, summarize_test, write_json, write_harbor_group_config, write_lhtb_svg
-from .lhtb_training import LHTBProcessGRPOTrainer
+from .lhtb import (
+    build_lhtb_split,
+    load_lhtb_manifest,
+    verify_lhtb_checkout,
+    write_lhtb_manifest,
+)
+from .lhtb_experiment import (
+    build_training_schedule,
+    disk_preflight,
+    select_dev_checkpoint,
+    summarize_test,
+    write_harbor_group_config,
+    write_json,
+    write_lhtb_svg,
+)
+from .lhtb_native import (
+    native_environment_digest,
+    native_preflight,
+    provision_native_task,
+    write_native_audit,
+    write_native_finalize_overlay,
+)
 from .lhtb_nodewise import (
     LHTBNodeWiseDeltaVTrainer,
     build_forced_finalize_label,
     import_nodewise_macro_group,
 )
 from .lhtb_results import (
-    import_harbor_group, official_lhtb_reward, official_lhtb_task_utility,
-    sample_audit, validate_smoke,
+    import_harbor_group,
+    official_lhtb_task_utility,
+    sample_audit,
+    validate_smoke,
 )
-from .lhtb_native import (
-    native_environment_digest,
-    native_preflight,
-    provision_native_task,
-    write_native_finalize_overlay,
-    write_native_audit,
-)
+from .lhtb_training import LHTBProcessGRPOTrainer
 from .lhtb_value_metrics import annotate_value_traces, value_metrics
+from .live_controlled import collect_forced_full_mas, collect_live_group
+from .organization import LHTB_POLICY_INTERFACE_REVISION, RuntimeBudget
+from .providers import DeepSeekClient
+from .reporting import write_utility_svg
+from .schema import TraceRecord
+from .tau3 import build_tau3_manifest, manifest_summary, verify_tau3_root
+from .tau3_runner import evaluate_tau3_against_direct, train_tau3_on_policy
+from .token_ledger import PersistentTokenLedger
 from .training import TRAINING_VARIANTS, evaluate_groups, train_groups
 from .training_free.aflow import AFlowDataset, AFlowEvaluator
 from .training_free.engine import RoyTrainingFreeEngine, TrainingFreeConfig
@@ -164,8 +182,17 @@ def parser() -> argparse.ArgumentParser:
         default=Path(__file__).resolve().parents[1] / "config" / "training_free_v1.json",
     )
     training_free.add_argument("--benchmark", choices=("MATH", "HumanEval"), required=True)
+    training_free.add_argument(
+        "--arm", choices=("roy", "single_agent_direct"), default="roy",
+        help="Run Roy search or its matched one-call single-Agent baseline",
+    )
     training_free.add_argument("--split", choices=("optimization", "test"), default="optimization")
+    training_free.add_argument("--offset", type=int, default=0)
     training_free.add_argument("--limit", type=int)
+    training_free.add_argument(
+        "--resume", action="store_true", help="Skip task ids already present in the output JSONL",
+    )
+    training_free.add_argument("--max-task-attempts", type=int, default=2)
     training_free.add_argument("--output", type=Path, required=True)
     training_free.add_argument("--ledger", type=Path, required=True)
     training_free.add_argument("--events", type=Path, required=True)
@@ -991,7 +1018,18 @@ def main(argv: List[str] | None = None) -> None:
         config_value = json.loads(args.config.read_text(encoding="utf-8"))
         config = TrainingFreeConfig(**config_value)
         dataset = AFlowDataset(args.aflow_root, args.manifest)
-        tasks = dataset.load(args.benchmark, args.split, args.limit)
+        if args.offset < 0:
+            raise ValueError("--offset cannot be negative")
+        if args.max_task_attempts < 1:
+            raise ValueError("--max-task-attempts must be positive")
+        load_limit = None if args.limit is None else args.offset + args.limit
+        tasks = dataset.load(args.benchmark, args.split, load_limit)[args.offset:]
+        completed_task_ids = set()
+        if args.resume and args.output.exists():
+            completed_task_ids = {
+                str(row.get("task_id", "")) for row in read_jsonl(args.output)
+            }
+            tasks = [task for task in tasks if task.task_id not in completed_task_ids]
         ledger = PersistentTokenLedger(args.ledger, args.token_limit)
         worker_client = DeepSeekClient(
             ledger, model=args.worker_model, timeout=args.timeout, event_log=args.events,
@@ -1023,30 +1061,81 @@ def main(argv: List[str] | None = None) -> None:
         )
         if args.macos_readonly_tool_sandbox and not tool_sandbox_prefix:
             raise RuntimeError("the built-in macOS sandbox is unavailable on this host")
+        append_output = args.resume and args.output.exists()
         for task_index, task in enumerate(tasks):
-            engine = RoyTrainingFreeEngine(
-                worker_client, candidate_client, config=config,
-                code_sandbox_prefix=tool_sandbox_prefix,
-            )
-            run = engine.run(task)
-            row = run.to_dict()
-            row.update({
-                "split": args.split,
-                "worker_model": worker_client.model,
-                "candidate_model": candidate_client.model,
-            })
-            if evaluator is not None:
-                row["evaluation"] = evaluator.score(task, run.final_answer)
+            failed_attempts = []
+            attempt_tokens = 0
+            row = None
+            for attempt in range(1, args.max_task_attempts + 1):
+                engine = RoyTrainingFreeEngine(
+                    worker_client, candidate_client, config=config,
+                    code_sandbox_prefix=tool_sandbox_prefix,
+                )
+                try:
+                    run = (
+                        engine.run_direct(task)
+                        if args.arm == "single_agent_direct"
+                        else engine.run(task)
+                    )
+                    row = run.to_dict()
+                    row.update({
+                        "arm": args.arm,
+                        "split": args.split,
+                        "worker_model": worker_client.model,
+                        "candidate_model": candidate_client.model,
+                        "run_status": "completed",
+                        "execution_attempt": attempt,
+                        "failed_attempts": failed_attempts,
+                    })
+                    if evaluator is not None:
+                        row["evaluation"] = evaluator.score(task, run.final_answer)
+                    attempt_tokens += engine.audit.to_dict()["total_tokens"]
+                    row["all_attempts_total_tokens"] = attempt_tokens
+                    break
+                except Exception as error:
+                    attempt_tokens += engine.audit.to_dict()["total_tokens"]
+                    failed_attempts.append({
+                        "attempt": attempt,
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                        "tokens": engine.audit.to_dict()["total_tokens"],
+                    })
+            if row is None:
+                row = {
+                    "schema_version": 3,
+                    "method": (
+                        "single_agent_direct" if args.arm == "single_agent_direct"
+                        else "training_free_information_flow_search"
+                    ),
+                    "arm": args.arm,
+                    "task_id": task.task_id,
+                    "benchmark": task.benchmark,
+                    "split": args.split,
+                    "worker_model": worker_client.model,
+                    "candidate_model": candidate_client.model,
+                    "run_status": "failed",
+                    "final_answer": "",
+                    "rounds": [],
+                    "final_agents": {},
+                    "final_matrix": None,
+                    "failed_attempts": failed_attempts,
+                    "all_attempts_total_tokens": attempt_tokens,
+                    "evaluation": {"score": 0.0, "failure": "task_execution_failed"},
+                }
             output_rows.append(row)
-            write_jsonl(args.output, [row], append=task_index > 0)
+            write_jsonl(args.output, [row], append=append_output or task_index > 0)
             print(json.dumps({
                 "task_id": task.task_id,
-                "stop_reason": run.stop_reason,
+                "run_status": row["run_status"],
+                "stop_reason": row.get("stop_reason"),
                 "score": row.get("evaluation", {}).get("score"),
-                "tokens": run.call_audit.to_dict()["total_tokens"],
+                "tokens": row["all_attempts_total_tokens"],
             }), flush=True)
         print(json.dumps({
-            "output": str(args.output), "tasks": len(output_rows), "ledger": ledger.snapshot(),
+            "output": str(args.output),
+            "tasks_completed_this_invocation": len(output_rows),
+            "tasks_skipped": len(completed_task_ids),
+            "ledger": ledger.snapshot(),
         }))
     elif args.command == "experiment":
         args.output.mkdir(parents=True, exist_ok=True)

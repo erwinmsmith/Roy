@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List
@@ -13,6 +15,10 @@ from roy_research.training_free.engine import (
     TrainingFreeConfig,
     select_transition,
 )
+from roy_research.training_free.information import (
+    AnswerDistributionMeasure,
+    PairwiseStateMeasure,
+)
 from roy_research.training_free.harness import AgentHarness, AgentHarnessConfig
 from roy_research.training_free.llm import (
     CallAudit,
@@ -23,6 +29,8 @@ from roy_research.training_free.llm import (
 from roy_research.training_free.matrix import (
     InformationMatrix,
     MatrixSearchResult,
+    SemanticRolloutEvaluator,
+    admissible_matrix_count,
     expand_matrix,
     matrix_neighbors,
 )
@@ -35,6 +43,7 @@ from roy_research.training_free.types import (
     AgentState,
     AgentStatus,
     BenchmarkTask,
+    CandidateDependency,
     CandidateGraph,
     ContextState,
     MemoryState,
@@ -161,7 +170,7 @@ def test_engine_commits_externally_realized_candidate_x() -> None:
         matrix_iterations=1,
         matrix_beam_width=2,
         maximum_matrix_evaluations=4,
-        posterior_rollouts=1,
+        information_rollouts=1,
         communication_rounds=1,
         maximum_organization_rounds=1,
         information_gain_epsilon=0.001,
@@ -180,7 +189,7 @@ def test_engine_commits_externally_realized_candidate_x() -> None:
     assert expensive[0]["thinking"] == "enabled"
     assert expensive[0]["max_tokens"] == config.candidate_realizer_max_tokens
     value = run.to_dict()
-    assert value["schema_version"] == 2
+    assert value["schema_version"] == 3
     assert value["agent_harness"]["schema_version"] == 1
     assert value["agent_harness"]["config"]["maximum_memory_entries"] == 64
     assert [checkpoint["phase"] for checkpoint in value["checkpoints"]] == [
@@ -188,6 +197,9 @@ def test_engine_commits_externally_realized_candidate_x() -> None:
     ]
     assert value["rounds"][0]["transition_kind"] == "expand"
     assert value["rounds"][0]["topology_drift"]["agent_expansion"] == 1
+    assert value["rounds"][0]["provisional_agents"]["round-0-subgraph-0"][
+        "r0_A0_c1"
+    ]["result"]["candidate_answer"] == "135"
     assert {item["relation"] for item in value["dependency_ledger"]} == {
         "derivation", "hard",
     }
@@ -225,6 +237,19 @@ def test_engine_commits_externally_realized_candidate_x() -> None:
     )
 
 
+def test_matched_single_agent_direct_skips_all_organization_calls() -> None:
+    client = ScriptedClient()
+    run = RoyTrainingFreeEngine(client, config=TrainingFreeConfig()).run_direct(
+        BenchmarkTask("math-direct", "MATH", "pentagon", [], {"solution": "135"})
+    )
+    value = run.to_dict()
+    assert value["method"] == "single_agent_direct"
+    assert value["final_answer"] == "135"
+    assert value["rounds"] == []
+    assert [call["purpose"] for call in client.calls] == ["provisional_worker"]
+    assert value["call_audit"]["calls"] == {"provisional_worker": 1}
+
+
 def test_next_round_proposals_receive_committed_path_state() -> None:
     class TwoRoundClient(ScriptedClient):
         def complete(self, messages, **kwargs):
@@ -250,7 +275,7 @@ def test_next_round_proposals_receive_committed_path_state() -> None:
         matrix_iterations=1,
         matrix_beam_width=2,
         maximum_matrix_evaluations=4,
-        posterior_rollouts=1,
+        information_rollouts=1,
         communication_rounds=1,
         maximum_organization_rounds=2,
         information_gain_epsilon=0.001,
@@ -375,6 +400,13 @@ def test_humaneval_evaluator_requires_process_isolation(tmp_path: Path) -> None:
         evaluator.score(task, "def f(): return 1")
 
 
+def test_aflow_evaluator_preserves_virtual_environment_launcher(tmp_path: Path) -> None:
+    launcher = tmp_path / "python"
+    launcher.symlink_to(Path(sys.executable))
+    evaluator = AFlowEvaluator(tmp_path, launcher)
+    assert evaluator.python == launcher.absolute()
+
+
 def test_symbolic_math_tool_solves_equation_and_rejects_code_execution() -> None:
     task = BenchmarkTask("math", "MATH", "solve", [], {"solution": "2"})
     agent = AgentState(
@@ -384,7 +416,7 @@ def test_symbolic_math_tool_solves_equation_and_rejects_code_execution() -> None
     registry = TaskToolRegistry(task)
     solved = registry.execute(agent, ToolRequest(
         "symbolic_math",
-        {"operation": "solve", "expression": "2*x+1=5", "variable": "x"},
+        {"operation": "solve", "expression": " 2*x+1 = 5 ", "variable": "x"},
         "verify arithmetic",
     ))
     rejected = registry.execute(agent, ToolRequest(
@@ -473,6 +505,38 @@ def test_worker_reasons_again_after_tool_observation() -> None:
     assert json.loads(client.calls[1]["tool_observations"][0]["output"])["result"] == "[2]"
     assert registry.audit.to_dict()["successful_calls"] == 1
     assert registry.audit.records[0].scope == "counterfactual"
+
+
+def test_worker_recovers_from_malformed_tool_request() -> None:
+    class MalformedToolClient:
+        model = "malformed-tool"
+
+        def __init__(self) -> None:
+            self.calls = []
+
+        def complete(self, messages, **kwargs):
+            payload = json.loads(messages[1]["content"])
+            self.calls.append(payload)
+            if "tool_observations" not in payload:
+                value = {"result": {}, "tool_requests": ["not an object"]}
+            else:
+                value = {
+                    "result": {"candidate_answer": "\\boxed{2}", "confidence": 1},
+                    "tool_requests": [],
+                }
+            return FakeCompletion(json.dumps(value))
+
+    task = BenchmarkTask("math", "MATH", "solve", [], {"solution": "2"})
+    agent = AgentState(
+        "A0", None, "solve", "solver", ContextState("solve"), MemoryState("memory/A0"),
+        ["symbolic_math"], ResultState(), AgentStatus.READY, "answer", "done",
+    )
+    client = MalformedToolClient()
+    worker = WorkerModel(JsonLLM(client, CallAudit()), max_tool_rounds=1, max_tool_calls=1)
+    worker.configure_tools(TaskToolRegistry(task))
+    updated = worker.execute_local(agent, "MATH")
+    assert updated.result.candidate_answer == "\\boxed{2}"
+    assert client.calls[1]["tool_observations"][0]["tool_name"] == "INVALID_TOOL_REQUEST"
 
 
 def test_agent_harness_fixes_contract_and_bounds_private_runtime_state() -> None:
@@ -596,6 +660,99 @@ def test_matrix_search_neighbors_are_local_and_expansion_preserves_old_block() -
     expanded = expand_matrix(current, {"c1": child}, [])
     assert expanded.agent_ids == ["A0", "A1", "c1"]
     assert expanded.weight("A0", "A1") == current.weight("A0", "A1")
+
+    hard = [CandidateDependency("A1", "c1", "hard", "proof")]
+    constrained = matrix_neighbors(expanded, (0.0, 0.5, 1.0), hard, 0.5)
+    assert all(matrix.weight("A1", "c1") >= 0.5 for matrix in constrained)
+    assert admissible_matrix_count(["A0", "A1"], (0.0, 0.5, 1.0)) == 9
+
+
+def test_zero_communication_cannot_create_information_gain_from_probe_noise() -> None:
+    class ProbeMustNotRun:
+        def compare(self, *args, **kwargs):
+            raise AssertionError("unchanged state must reuse the supplied prior")
+
+    root = AgentState(
+        "A0", None, "solve", "solver", ContextState("task"), MemoryState("memory/A0"),
+        [], ResultState(candidate_answer="\\boxed{2}"), AgentStatus.DONE, "answer", "done",
+    )
+    evaluator = SemanticRolloutEvaluator(
+        worker=None,  # type: ignore[arg-type]
+        channelizer=None,  # type: ignore[arg-type]
+        information_measure=PairwiseStateMeasure(ProbeMustNotRun()),  # type: ignore[arg-type]
+        benchmark="MATH", root_id="A0", inbound_token_budget=100,
+        communication_rounds=1, information_rollouts=2,
+    )
+    score, observations = evaluator.evaluate(
+        {"A0": root}, InformationMatrix.zero(["A0"]),
+    )
+    assert score == 0.0
+    assert all(item["score"] == 0.0 for item in observations)
+
+
+def test_rollout_promotes_new_root_answer_into_dynamic_hypothesis_support() -> None:
+    class ExactAnswerProbe:
+        def posterior(self, root, support, benchmark, state_context):
+            answer = root.result.candidate_answer
+            selected = answer if answer in support else "OTHER"
+            return {item: float(item == selected) for item in support}
+
+    root = AgentState(
+        "A0", None, "solve", "solver", ContextState("task"), MemoryState("memory/A0"),
+        [], ResultState(candidate_answer="A"), AgentStatus.DONE, "answer", "done",
+    )
+    after = copy.deepcopy(root)
+    after.result.candidate_answer = "B"
+    measure = AnswerDistributionMeasure(ExactAnswerProbe(), [{"A0": root}])
+    observation = measure.compare(root, after, "MATH")
+    assert measure.support == ["A", "B", "OTHER"]
+    assert observation.after["distribution"] == {"A": 0.0, "B": 1.0, "OTHER": 0.0}
+    assert observation.score > 20.0
+
+
+def test_pairwise_information_measure_requires_no_hypothesis_support() -> None:
+    class PairwiseProbe:
+        def compare(self, before, after, benchmark, state_context):
+            return {
+                "information_gain": 0.7,
+                "before_uncertainty": 0.8,
+                "after_uncertainty": 0.1,
+                "new_information": ["public test now passes"],
+                "rationale": "Execution evidence resolved the defect.",
+            }
+
+    before = AgentState(
+        "A0", None, "implement", "coder", ContextState("task"), MemoryState("memory/A0"),
+        [], ResultState(candidate_answer="code-v1", confidence=0.2), AgentStatus.DONE,
+        "code", "tests pass",
+    )
+    after = copy.deepcopy(before)
+    after.result.candidate_answer = "code-v2"
+    after.result.confidence = 0.9
+    measure = PairwiseStateMeasure(PairwiseProbe())  # type: ignore[arg-type]
+    observation = measure.compare(before, after, "HumanEval")
+    assert observation.score == 0.7
+    assert "support" not in json.dumps(observation.to_dict())
+    assert observation.details["new_information"] == ["public test now passes"]
+
+
+def test_auto_information_measure_uses_support_free_fallback_for_new_benchmarks() -> None:
+    engine = RoyTrainingFreeEngine(ScriptedClient(), config=TrainingFreeConfig())
+    root = AgentState(
+        "A0", None, "solve", "worker", ContextState("task"), MemoryState("memory/A0"),
+        [], ResultState(), AgentStatus.READY, "artifact", "done",
+    )
+    assert isinstance(
+        engine._make_information_measure("FutureBenchmark", [{"A0": root}]),
+        PairwiseStateMeasure,
+    )
+
+    custom = PairwiseStateMeasure(object())  # type: ignore[arg-type]
+    custom_engine = RoyTrainingFreeEngine(
+        ScriptedClient(),
+        information_measure_factory=lambda benchmark, agent_sets: custom,
+    )
+    assert custom_engine._make_information_measure("Anything", [{"A0": root}]) is custom
 
 
 def test_positive_baseline_reorganization_is_committed_without_expansion() -> None:

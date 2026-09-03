@@ -48,7 +48,7 @@ class StateCheckpoint:
     agents: Dict[str, Dict[str, Any]]
     matrix: Dict[str, Any]
     dependencies: List[Dict[str, Any]]
-    posterior: Dict[str, float]
+    information_state: Dict[str, Any]
     history_event_count: int
     history_fingerprint: str
     fingerprint: str
@@ -63,13 +63,13 @@ class StateCheckpoint:
         agents: Mapping[str, AgentState],
         matrix: InformationMatrix,
         dependencies: List[DependencyRecord],
-        posterior: Mapping[str, float] | None,
+        information_state: Mapping[str, Any] | None,
         history_events: List[TrajectoryEvent],
     ) -> "StateCheckpoint":
         agent_value = {key: agent.to_dict() for key, agent in agents.items()}
         matrix_value = matrix.to_dict()
         dependency_value = [dependency.to_dict() for dependency in dependencies]
-        posterior_value = dict(posterior or {})
+        information_state_value = dict(information_state or {})
         history_value = [event.to_dict() for event in history_events]
         history_fingerprint = hashlib.sha256(
             json.dumps(history_value, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -78,7 +78,7 @@ class StateCheckpoint:
             "agents": agent_value,
             "matrix": matrix_value,
             "dependencies": dependency_value,
-            "posterior": posterior_value,
+            "information_state": information_state_value,
             "history_fingerprint": history_fingerprint,
         }
         fingerprint = hashlib.sha256(
@@ -92,7 +92,7 @@ class StateCheckpoint:
             agents=agent_value,
             matrix=matrix_value,
             dependencies=dependency_value,
-            posterior=posterior_value,
+            information_state=information_state_value,
             history_event_count=len(history_events),
             history_fingerprint=history_fingerprint,
             fingerprint=fingerprint,

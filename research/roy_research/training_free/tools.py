@@ -21,6 +21,8 @@ class ToolRequest:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "ToolRequest":
+        if not isinstance(value, Mapping):
+            raise ValueError("tool request must be an object")
         name = str(value.get("tool_name", "")).strip()
         arguments = value.get("arguments", {})
         reason = str(value.get("reason", "")).strip()
@@ -328,7 +330,7 @@ def convert(node):
     raise ValueError(f"syntax is not allowed: {type(node).__name__}")
 
 def parse(text):
-    return convert(ast.parse(text.replace("^", "**"), mode="eval"))
+    return convert(ast.parse(text.strip().replace("^", "**"), mode="eval"))
 
 text = payload["expression"]
 if "=" in text:

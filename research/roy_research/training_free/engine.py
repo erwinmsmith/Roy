@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import json
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Literal, Mapping
+from typing import Any, Callable, Dict, List, Literal, Mapping
 
 from .harness import AGENT_HARNESS_SCHEMA_VERSION, AgentHarness, AgentHarnessConfig
 from .llm import (
@@ -13,17 +13,17 @@ from .llm import (
     CompletionClient,
     GlobalSelector,
     JsonLLM,
+    PairwiseInformationProbeModel,
     PosteriorProbeModel,
     WorkerModel,
 )
+from .information import AnswerDistributionMeasure, InformationMeasure, PairwiseStateMeasure
 from .matrix import (
     BeamCoordinateMatrixSearch,
     InformationMatrix,
     MatrixSearchResult,
     SemanticRolloutEvaluator,
-    entropy,
     expand_matrix,
-    hypothesis_support,
 )
 from .tools import TaskToolRegistry, ToolAudit
 from .trajectory import (
@@ -55,33 +55,39 @@ class TrainingFreeConfig:
     matrix_beam_width: int = 3
     matrix_iterations: int = 3
     maximum_matrix_evaluations: int = 20
-    posterior_rollouts: int = 3
+    information_rollouts: int = 3
     communication_rounds: int = 2
     maximum_organization_rounds: int = 4
     inbound_token_budget: int = 4000
     information_gain_epsilon: float = 0.02
-    finish_entropy: float = 0.15
+    finish_uncertainty: float = 0.15
+    information_measure: str = "auto"
     activation_threshold: float = 0.05
     worker_max_tokens: int = 2048
     selector_max_tokens: int = 1024
     candidate_realizer_max_tokens: int = 4096
     channelizer_max_tokens: int = 768
-    posterior_max_tokens: int = 512
+    information_probe_max_tokens: int = 512
     candidate_thinking: str = "enabled"
     available_tools: tuple[str, ...] = ("symbolic_math", "python", "public_tests")
     maximum_tool_rounds: int = 2
     maximum_tool_calls_per_worker_call: int = 3
     tool_timeout_seconds: int = 5
+    hard_dependency_minimum: float = 0.5
 
     def __post_init__(self) -> None:
         if self.maximum_agents < 1 or self.maximum_nodes_per_subgraph < 1:
             raise ValueError("agent limits must be positive")
-        if self.posterior_rollouts < 1 or self.communication_rounds < 1:
+        if self.information_rollouts < 1 or self.communication_rounds < 1:
             raise ValueError("rollout counts must be positive")
         if self.maximum_matrix_evaluations < self.matrix_beam_width:
             raise ValueError("matrix evaluation budget must cover the beam")
         if self.maximum_tool_rounds < 0 or self.maximum_tool_calls_per_worker_call < 0:
             raise ValueError("tool loop limits cannot be negative")
+        if not 0 <= self.hard_dependency_minimum <= 1:
+            raise ValueError("hard dependency minimum must be in [0, 1]")
+        if self.information_measure not in ("auto", "answer_distribution", "pairwise_state"):
+            raise ValueError("unknown information measure")
 
 
 @dataclass
@@ -90,12 +96,13 @@ class RoundRecord:
     state_before_checkpoint_id: str
     post_execution_checkpoint_id: str
     committed_checkpoint_id: str | None
-    prior: Dict[str, float]
-    support: List[str]
+    information_measure: str
+    information_state_before: Dict[str, Any]
     candidate_graph: Dict[str, Any]
     baseline: MatrixSearchResult
     frontiers: Dict[str, MatrixSearchResult]
     realized_candidates: Dict[str, RealizedSubgraph]
+    provisional_agents: Dict[str, Dict[str, AgentState]]
     rejected_candidates: Dict[str, str]
     selected_subgraph_id: str | None
     expansion_gain: float
@@ -110,13 +117,19 @@ class RoundRecord:
             "state_before_checkpoint_id": self.state_before_checkpoint_id,
             "post_execution_checkpoint_id": self.post_execution_checkpoint_id,
             "committed_checkpoint_id": self.committed_checkpoint_id,
-            "prior": self.prior,
-            "support": self.support,
+            "information_measure": self.information_measure,
+            "information_state_before": self.information_state_before,
             "candidate_graph": self.candidate_graph,
             "baseline": self.baseline.to_dict(),
             "frontiers": {key: value.to_dict() for key, value in self.frontiers.items()},
             "realized_candidates": {
                 key: value.to_dict() for key, value in self.realized_candidates.items()
+            },
+            "provisional_agents": {
+                subgraph_id: {
+                    agent_id: agent.to_dict() for agent_id, agent in agents.items()
+                }
+                for subgraph_id, agents in self.provisional_agents.items()
             },
             "rejected_candidates": self.rejected_candidates,
             "selected_subgraph_id": self.selected_subgraph_id,
@@ -182,8 +195,8 @@ class TrainingFreeRun:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "schema_version": 2,
-            "method": "training_free_mia_matrix_trajectory",
+            "schema_version": 3,
+            "method": "training_free_information_flow_search",
             "agent_harness": {
                 "schema_version": AGENT_HARNESS_SCHEMA_VERSION,
                 "config": asdict(self.harness_config),
@@ -220,6 +233,45 @@ class TrainingFreeRun:
         }
 
 
+@dataclass
+class SingleAgentRun:
+    task_id: str
+    benchmark: str
+    final_agent: AgentState
+    call_audit: CallAudit
+    tool_audit: ToolAudit
+    harness_config: AgentHarnessConfig
+
+    @property
+    def final_answer(self) -> str:
+        return self.final_agent.result.candidate_answer
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": 3,
+            "method": "single_agent_direct",
+            "task_id": self.task_id,
+            "benchmark": self.benchmark,
+            "final_answer": self.final_answer,
+            "final_agents": {"A0": self.final_agent.to_dict()},
+            "final_matrix": InformationMatrix.zero(["A0"]).to_dict(),
+            "rounds": [],
+            "stop_reason": "single_execution_complete",
+            "call_audit": self.call_audit.to_dict(),
+            "tool_audit": self.tool_audit.to_dict(),
+            "checkpoints": [],
+            "dependency_ledger": [],
+            "event_ledger": [],
+            "cumulative_information_gain": 0.0,
+            "matrix_trajectory": [InformationMatrix.zero(["A0"]).to_dict()],
+            "agent_basis_trajectory": [{"A0": self.final_agent.to_dict()}],
+            "agent_harness": {
+                "schema_version": AGENT_HARNESS_SCHEMA_VERSION,
+                "config": asdict(self.harness_config),
+            },
+        }
+
+
 class RoyTrainingFreeEngine:
     def __init__(
         self,
@@ -228,6 +280,9 @@ class RoyTrainingFreeEngine:
         *,
         config: TrainingFreeConfig | None = None,
         code_sandbox_prefix: List[str] | None = None,
+        information_measure_factory: Callable[
+            [str, List[Mapping[str, AgentState]]], InformationMeasure
+        ] | None = None,
     ) -> None:
         self.config = config or TrainingFreeConfig()
         self.audit = CallAudit()
@@ -246,22 +301,19 @@ class RoyTrainingFreeEngine:
             self.config.candidate_thinking,
         )
         self.channelizer = ChannelizerModel(worker_llm, self.config.channelizer_max_tokens)
-        self.posterior = PosteriorProbeModel(worker_llm, self.config.posterior_max_tokens)
+        self.posterior = PosteriorProbeModel(
+            worker_llm, self.config.information_probe_max_tokens,
+        )
+        self.pairwise_probe = PairwiseInformationProbeModel(
+            worker_llm, self.config.information_probe_max_tokens,
+        )
         self.code_sandbox_prefix = list(code_sandbox_prefix or [])
+        self.information_measure_factory = information_measure_factory
         self.tool_registry: TaskToolRegistry | None = None
         self.available_tools = list(self.config.available_tools)
 
     def run(self, task: BenchmarkTask) -> TrainingFreeRun:
-        self.tool_registry = TaskToolRegistry(
-            task,
-            code_sandbox_prefix=self.code_sandbox_prefix,
-            timeout_seconds=self.config.tool_timeout_seconds,
-        )
-        configured_names = {item["name"] for item in self.tool_registry.catalog}
-        self.available_tools = [
-            name for name in self.config.available_tools if name in configured_names
-        ]
-        self.worker.configure_tools(self.tool_registry)
+        self._configure_task(task)
         root = self._root_agent(task)
         agents: Dict[str, AgentState] = {root.agent_id: root}
         matrix = InformationMatrix.zero(agents)
@@ -346,27 +398,28 @@ class RoyTrainingFreeEngine:
 
             all_bases: List[Mapping[str, AgentState]] = [agents]
             all_bases.extend({**agents, **candidate_agents} for candidate_agents in provisional.values())
-            support = hypothesis_support(all_bases)
             state_context = {
                 "current_matrix": matrix.to_dict(),
                 "dependency_state": [item.to_dict() for item in dependencies[-32:]],
                 "recent_history": _recent_committed_history(events),
             }
-            prior = self.posterior.posterior(
-                agents["A0"], support, task.benchmark, state_context,
+            information_measure = self._make_information_measure(task.benchmark, all_bases)
+            information_state_before = information_measure.state(
+                agents["A0"], task.benchmark, state_context,
             )
             post_execution_checkpoint_id = f"checkpoint-{round_index}-post-execution"
             checkpoints.append(StateCheckpoint.capture(
                 post_execution_checkpoint_id, state_before_checkpoint_id, round_index,
-                "post_execution", agents, matrix, dependencies, prior, events,
+                "post_execution", agents, matrix, dependencies,
+                information_state_before, events,
             ))
             evaluator = SemanticRolloutEvaluator(
-                self.worker, self.channelizer, self.posterior,
+                self.worker, self.channelizer, information_measure,
                 benchmark=task.benchmark,
                 root_id="A0",
                 inbound_token_budget=self.config.inbound_token_budget,
                 communication_rounds=self.config.communication_rounds,
-                posterior_rollouts=self.config.posterior_rollouts,
+                information_rollouts=self.config.information_rollouts,
                 state_context=state_context,
             )
             optimizer = BeamCoordinateMatrixSearch(
@@ -374,17 +427,36 @@ class RoyTrainingFreeEngine:
                 levels=self.config.matrix_levels,
                 beam_width=self.config.matrix_beam_width,
                 iterations=self.config.matrix_iterations,
+                hard_minimum=self.config.hard_dependency_minimum,
                 maximum_evaluations=self.config.maximum_matrix_evaluations,
             )
-            baseline = optimizer.optimize(agents, matrix, support, prior)
-            frontiers: Dict[str, MatrixSearchResult] = {}
-            for subgraph_id, new_agents in provisional.items():
-                basis = {**agents, **new_agents}
-                candidate = realized[subgraph_id]
-                initial = expand_matrix(matrix, new_agents, candidate.dependencies)
-                frontiers[subgraph_id] = optimizer.optimize(
-                    basis, initial, support, prior, candidate.dependencies,
+            for _ in range(8):
+                measure_revision_before_search = information_measure.revision
+                baseline = optimizer.optimize(agents, matrix)
+                frontiers: Dict[str, MatrixSearchResult] = {}
+                for subgraph_id, new_agents in provisional.items():
+                    basis = {**agents, **new_agents}
+                    candidate = realized[subgraph_id]
+                    initial = expand_matrix(matrix, new_agents, candidate.dependencies)
+                    frontiers[subgraph_id] = optimizer.optimize(
+                        basis, initial, candidate.dependencies,
+                    )
+                information_state_before = information_measure.state(
+                    agents["A0"], task.benchmark, state_context,
                 )
+                if information_measure.revision == measure_revision_before_search:
+                    break
+                events.append(TrajectoryEvent(
+                    f"event-{len(events)}", round_index, "information_measure_revised",
+                    {
+                        "measure": information_measure.name,
+                        "before_revision": measure_revision_before_search,
+                        "after_revision": information_measure.revision,
+                    },
+                    scope="counterfactual",
+                ))
+            else:  # pragma: no cover - adaptive measures are revision bounded
+                raise RuntimeError("information measure did not stabilize")
 
             decision = select_transition(
                 baseline, frontiers, self.config.information_gain_epsilon,
@@ -403,7 +475,11 @@ class RoyTrainingFreeEngine:
 
             if not commit:
                 stop_reason = (
-                    "answer_confident" if entropy(prior) <= self.config.finish_entropy
+                    "root_confident"
+                    if _is_confident(
+                        information_measure, information_state_before,
+                        self.config.finish_uncertainty,
+                    )
                     else "structural_saturation"
                 )
                 events.append(TrajectoryEvent(
@@ -417,7 +493,8 @@ class RoyTrainingFreeEngine:
                 committed_checkpoint_id = f"checkpoint-{round_index}-terminal"
                 checkpoints.append(StateCheckpoint.capture(
                     committed_checkpoint_id, post_execution_checkpoint_id, round_index,
-                    "terminal", agents, matrix, dependencies, prior, events,
+                    "terminal", agents, matrix, dependencies,
+                    information_state_before, events,
                 ))
                 last_checkpoint_id = committed_checkpoint_id
             else:
@@ -450,13 +527,13 @@ class RoyTrainingFreeEngine:
                     },
                 ))
                 committed_checkpoint_id = f"checkpoint-{round_index}-committed"
-                checkpoint_posterior = _mean_posterior(
-                    selected_result.realization_posteriors, support,
+                checkpoint_information_state = information_measure.state(
+                    agents["A0"], task.benchmark, state_context,
                 )
                 checkpoints.append(StateCheckpoint.capture(
                     committed_checkpoint_id, post_execution_checkpoint_id, round_index,
                     "committed", agents, matrix, dependencies,
-                    checkpoint_posterior, events,
+                    checkpoint_information_state, events,
                 ))
                 last_checkpoint_id = committed_checkpoint_id
 
@@ -465,12 +542,13 @@ class RoyTrainingFreeEngine:
                 state_before_checkpoint_id=state_before_checkpoint_id,
                 post_execution_checkpoint_id=post_execution_checkpoint_id,
                 committed_checkpoint_id=committed_checkpoint_id,
-                prior=prior,
-                support=support,
+                information_measure=information_measure.name,
+                information_state_before=information_state_before,
                 candidate_graph=candidate_graph.subset(candidate_graph.nodes),
                 baseline=baseline,
                 frontiers=frontiers,
                 realized_candidates=realized,
+                provisional_agents=provisional,
                 rejected_candidates=rejected,
                 selected_subgraph_id=selected_id,
                 expansion_gain=expansion_advantage,
@@ -500,6 +578,34 @@ class RoyTrainingFreeEngine:
             cumulative_information_gain=cumulative_information_gain,
             harness_config=self.worker.harness_config,
         )
+
+    def run_direct(self, task: BenchmarkTask) -> SingleAgentRun:
+        """Run the matched one-call, one-Agent baseline without organization search."""
+        self._configure_task(task)
+        root = self.worker.execute_local(
+            self._root_agent(task), task.benchmark, tool_scope="committed",
+        )
+        root.status = AgentStatus.DONE
+        return SingleAgentRun(
+            task_id=task.task_id,
+            benchmark=task.benchmark,
+            final_agent=root,
+            call_audit=self.audit,
+            tool_audit=self.tool_registry.audit,
+            harness_config=self.worker.harness_config,
+        )
+
+    def _configure_task(self, task: BenchmarkTask) -> None:
+        self.tool_registry = TaskToolRegistry(
+            task,
+            code_sandbox_prefix=self.code_sandbox_prefix,
+            timeout_seconds=self.config.tool_timeout_seconds,
+        )
+        configured_names = {item["name"] for item in self.tool_registry.catalog}
+        self.available_tools = [
+            name for name in self.config.available_tools if name in configured_names
+        ]
+        self.worker.configure_tools(self.tool_registry)
 
     def _execute_parents_and_collect_candidates(
         self,
@@ -620,16 +726,31 @@ class RoyTrainingFreeEngine:
                 continue
             dependency.status = "dormant" if target.status == AgentStatus.DORMANT else "active"
 
+    def _make_information_measure(
+        self,
+        benchmark: str,
+        agent_sets: List[Mapping[str, AgentState]],
+    ) -> InformationMeasure:
+        if self.information_measure_factory is not None:
+            return self.information_measure_factory(benchmark, agent_sets)
+        configured = self.config.information_measure
+        selected = (
+            "answer_distribution" if configured == "auto" and benchmark == "MATH"
+            else "pairwise_state" if configured == "auto"
+            else configured
+        )
+        if selected == "answer_distribution":
+            return AnswerDistributionMeasure(self.posterior, agent_sets)
+        return PairwiseStateMeasure(self.pairwise_probe)
 
-def _mean_posterior(
-    posteriors: List[Dict[str, float]], support: List[str],
-) -> Dict[str, float]:
-    if not posteriors:
-        return {}
-    return {
-        hypothesis: sum(posterior[hypothesis] for posterior in posteriors) / len(posteriors)
-        for hypothesis in support
-    }
+
+def _is_confident(
+    measure: InformationMeasure,
+    state: Mapping[str, Any],
+    threshold: float,
+) -> bool:
+    uncertainty = measure.uncertainty(state)
+    return uncertainty is not None and uncertainty <= threshold
 
 
 def _recent_committed_history(events: List[TrajectoryEvent]) -> List[Dict[str, Any]]:

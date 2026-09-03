@@ -90,7 +90,9 @@ class AFlowEvaluator:
         timeout_seconds: int = 30,
     ) -> None:
         self.root = root.resolve()
-        self.python = python.resolve()
+        # Keep the virtual-environment launcher path intact. Resolving its symlink
+        # silently switches to the base interpreter and loses the venv packages.
+        self.python = python.expanduser().absolute()
         self.sandbox_prefix = list(human_eval_sandbox_prefix or [])
         self.timeout_seconds = timeout_seconds
 

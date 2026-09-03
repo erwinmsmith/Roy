@@ -216,8 +216,8 @@ The `training-free` branch also contains a separate inference-only Roy path in
 dependency graph, uses the Global Semantic Searcher to retain at most three
 dependency-closed subgraphs, and compares every realized expansion against an
 optimized no-expansion baseline. The inner search evaluates complete weighted
-A2A matrices through semantic channelization and a frozen posterior probe; it
-does not add edge scores.
+A2A matrices through semantic channelization and a frozen, benchmark-adapted
+information measure; it does not add edge scores or require an answer space.
 
 Candidate proposal and candidate realization are deliberately different calls.
 The proposal is a cheap semantic direction. Only after global selection does an
@@ -253,8 +253,19 @@ searches. Its committed state is `S_t=(X_t,W_t,D_t,H_t)`: private Agent state,
 the current information matrix, dependency/derivation state, and an append-only
 event ledger. Every Parent proposal receives its current matrix, peer summaries,
 private memory, active dependencies, committed history, and a separately marked
-counterfactual search history. Posterior probes receive committed history only;
+counterfactual search history. Information probes receive committed history only;
 provisional candidate events cannot leak into `q_t`.
+
+The search core consumes only the `InformationMeasure` contract: a measure
+revision, a serializable state observation, uncertainty when available, and a
+scalar comparison of the root state before and after a rollout. MATH uses the
+optional `answer_distribution` adapter and KL divergence; its dynamic answer
+support is private to that adapter. HumanEval and unregistered future
+benchmarks default to the support-free `pairwise_state` adapter, which compares
+new verified evidence, resolved uncertainty, test behavior, contradictions,
+and actionable corrections. New benchmarks can therefore provide their own
+execution-, verifier-, utility-, or semantic-state measure through
+`information_measure_factory` without modifying the engine or matrix optimizer.
 
 For no expansion, matrix search starts at `W_t`; for expansion it starts at
 `[[W_t,B_t],[C_t,D_t]]`. A coordinate neighbor changes one edge by only one
@@ -265,7 +276,8 @@ continues; it stops only when both reorganization and admissible expansion fail
 to exceed the conditional-information threshold. Selected dependency subgraphs
 of up to two nodes provide the V1 short-horizon lookahead.
 
-Every output now includes schema-v2 `checkpoints`, `event_ledger`,
+Every output now includes schema-v3 generic `information_state` checkpoints,
+`event_ledger`,
 `dependency_ledger`, `matrix_trajectory`, `agent_basis_trajectory`, cumulative
 conditional information gain, per-round initial/final/delta matrices, and
 topology drift (`Delta N`, edge L1/Frobenius drift, and edge additions/removals).
@@ -276,13 +288,18 @@ For a small MATH validation run:
 ```bash
 PYTHONPATH=research python3 -m roy_research training-free-run \
   --aflow-root /path/to/AFlow \
-  --benchmark MATH --split optimization --limit 2 \
+  --benchmark MATH --arm roy --split optimization --limit 2 \
   --worker-model deepseek-v4-flash \
   --candidate-model YOUR_REASONING_MODEL \
   --ledger research/output/training-free/token-ledger.json \
   --events research/output/training-free/events.jsonl \
   --output research/output/training-free/math.jsonl
 ```
+
+Use the identical task range with `--arm single_agent_direct` for the matched
+one-call baseline. It uses the same root harness, Worker model, token ceiling,
+tool registry, and scorer, but never invokes candidate selection, X realization,
+channelization, an information probe, or matrix search.
 
 Add `--score --aflow-python /path/to/AFlow/.venv/bin/python` to invoke the pinned
 AFlow MATH scorer. HumanEval loads only its public tests into agent context and

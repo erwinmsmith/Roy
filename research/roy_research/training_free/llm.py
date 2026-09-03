@@ -99,13 +99,19 @@ class WorkerModel:
     SYSTEM = """You are Roy's frozen Worker. Execute only the supplied local objective using the
 agent's private state and visible context. Return one JSON object. Do not assume access to other
 agents or memories unless their content is present. For MATH, candidate_answer must be a concise
-answer and the final answer should be boxable. For HumanEval, candidate_answer must be complete
+answer containing only the final ``\\boxed{...}`` expression, with all derivation placed in the
+other result fields; textual answers must use ``\\boxed{\\text{WORD}}``. For HumanEval,
+candidate_answer must be complete
 Python code including the requested function. Also propose at most the requested number of genuinely
 different unresolved cognitive directions as a dependency graph. Proposals are semantic drafts, not
 complete agent configurations. Hard dependencies mean a node cannot execute without its producer;
 soft dependencies only indicate useful information flow. Candidate proposals are step-specific:
 use the current matrix, current peers, private memory, inbound messages, active dependencies and
-recent trajectory events. Never repeat a gap that the current state or history already resolved."""
+recent trajectory events. The candidate_answer must agree with the claims, evidence, and final
+reasoning summary; perform a final consistency check before returning it. On the root's first round,
+propose at least minimum_candidates independent verification directions whenever capacity permits,
+even if the answer is high-confidence. A failed tool call always requires a verification direction.
+Never repeat a gap that the current state or history already resolved."""
 
     def __init__(
         self,
@@ -140,6 +146,7 @@ recent trajectory events. Never repeat a gap that the current state or history a
                 "round_index": round_index,
                 "candidate_id_prefix": f"r{round_index}_{agent.agent_id}_c",
                 "max_candidates": max_candidates,
+                "minimum_candidates": 1 if round_index == 0 and max_candidates > 0 else 0,
                 "current_organization_context": dict(organization_context or {}),
                 "required_schema": {
                     "result": {
@@ -282,7 +289,16 @@ recent trajectory events. Never repeat a gap that the current state or history a
             for raw_request in raw_requests:
                 if calls >= self.max_tool_calls:
                     break
-                request = ToolRequest.from_dict(raw_request)
+                calls += 1
+                try:
+                    request = ToolRequest.from_dict(raw_request)
+                except (TypeError, ValueError) as error:
+                    observations.append({
+                        "tool_name": "INVALID_TOOL_REQUEST",
+                        "success": False,
+                        "error": f"{type(error).__name__}: {error}",
+                    })
+                    continue
                 fingerprint = json.dumps({
                     "tool_name": request.tool_name, "arguments": request.arguments,
                 }, sort_keys=True, default=str)
@@ -294,7 +310,6 @@ recent trajectory events. Never repeat a gap that the current state or history a
                     continue
                 fingerprints.add(fingerprint)
                 result = harness.execute_tool(request, scope=tool_scope)
-                calls += 1
                 observations.append({
                     "tool_name": request.tool_name,
                     "arguments": request.arguments,
@@ -310,7 +325,8 @@ class GlobalSelector:
 dependency-closed candidate subgraphs that target unresolved issues and are not redundant with the
 current MAS. You do not execute candidates and do not assign numerical information-gain scores.
 Return JSON only. Every selected subgraph must list candidate ids; hard predecessors will be closed
-and validated by the runtime."""
+and validated by the runtime. Retain at least one non-redundant independent verifier when the root
+has no successful external/tool verification; self-reported confidence is not verification."""
 
     def __init__(self, llm: JsonLLM, max_tokens: int = 1024) -> None:
         self.llm, self.max_tokens = llm, max_tokens
@@ -540,6 +556,54 @@ solve the task anew. Assign every probability, including OTHER, and make them su
         if total <= 0:
             return {item: 1.0 / len(support) for item in support}
         return {item: probability / total for item, probability in probabilities.items()}
+
+
+class PairwiseInformationProbeModel:
+    SYSTEM = """You are Roy's frozen task-agnostic information probe, separate from the Worker.
+Compare the supplied root state before and after an information-flow rollout. Measure only new,
+task-relevant, usable information: verified evidence, resolved uncertainty, detected contradictions,
+test behavior, or an actionable correction. Do not require an answer hypothesis set and do not solve
+the task anew. Paraphrase, unsupported confidence, and repeated facts have zero gain. Return JSON."""
+
+    def __init__(self, llm: JsonLLM, max_tokens: int = 512) -> None:
+        self.llm, self.max_tokens = llm, max_tokens
+
+    def compare(
+        self,
+        before: AgentState,
+        after: AgentState,
+        benchmark: str,
+        state_context: Mapping[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        value = self.llm.call(
+            "pairwise_information_probe",
+            self.SYSTEM,
+            {
+                "benchmark": benchmark,
+                "before_root_state": AgentHarness(before).execution_view(),
+                "after_root_state": AgentHarness(after).execution_view(),
+                "current_state_context": dict(state_context or {}),
+                "required_schema": {
+                    "information_gain": "number in [0, 1]",
+                    "before_uncertainty": "number in [0, 1]",
+                    "after_uncertainty": "number in [0, 1]",
+                    "new_information": ["concise task-relevant facts or behaviors"],
+                    "rationale": "brief comparison grounded only in supplied states",
+                },
+            },
+            max_tokens=self.max_tokens,
+        )
+        return {
+            "information_gain": min(1.0, max(0.0, float(value.get("information_gain", 0.0)))),
+            "before_uncertainty": min(
+                1.0, max(0.0, float(value.get("before_uncertainty", 1.0)))
+            ),
+            "after_uncertainty": min(
+                1.0, max(0.0, float(value.get("after_uncertainty", 1.0)))
+            ),
+            "new_information": [str(item) for item in value.get("new_information", [])],
+            "rationale": str(value.get("rationale", "")),
+        }
 
 
 def parse_json_object(content: str) -> Dict[str, Any]:
