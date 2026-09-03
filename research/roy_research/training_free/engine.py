@@ -64,11 +64,12 @@ class TrainingFreeConfig:
     information_measure: str = "auto"
     activation_threshold: float = 0.05
     worker_max_tokens: int = 2048
+    result_reconciler_max_tokens: int = 256
     selector_max_tokens: int = 1024
     candidate_realizer_max_tokens: int = 4096
     channelizer_max_tokens: int = 768
     information_probe_max_tokens: int = 512
-    candidate_thinking: str = "enabled"
+    candidate_thinking: str = "disabled"
     available_tools: tuple[str, ...] = ("symbolic_math", "python", "public_tests")
     maximum_tool_rounds: int = 2
     maximum_tool_calls_per_worker_call: int = 3
@@ -193,6 +194,33 @@ class TrainingFreeRun:
     cumulative_information_gain: float
     harness_config: AgentHarnessConfig
 
+    def organization_summary(self) -> Dict[str, int]:
+        return {
+            "rounds": len(self.rounds),
+            "candidates_proposed": sum(
+                len(record.candidate_graph.get("nodes", [])) for record in self.rounds
+            ),
+            "candidate_subgraphs_realized": sum(
+                len(record.realized_candidates) for record in self.rounds
+            ),
+            "candidate_subgraphs_rejected": sum(
+                len(record.rejected_candidates) for record in self.rounds
+            ),
+            "committed_expansions": sum(
+                record.committed and record.transition_kind == "expand" for record in self.rounds
+            ),
+            "committed_reorganizations": sum(
+                record.committed and record.transition_kind == "reorganize"
+                for record in self.rounds
+            ),
+            "terminal_stops": sum(
+                record.transition_kind == "stop" for record in self.rounds
+            ),
+            "committed_derivation_dependencies": sum(
+                dependency.relation == "derivation" for dependency in self.dependency_ledger
+            ),
+        }
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "schema_version": 3,
@@ -221,6 +249,7 @@ class TrainingFreeRun:
             "checkpoints": [checkpoint.to_dict() for checkpoint in self.checkpoints],
             "dependency_ledger": [dependency.to_dict() for dependency in self.dependency_ledger],
             "event_ledger": [event.to_dict() for event in self.event_ledger],
+            "organization_summary": self.organization_summary(),
             "cumulative_information_gain": self.cumulative_information_gain,
             "matrix_trajectory": [
                 checkpoint.matrix for checkpoint in self.checkpoints
@@ -262,6 +291,16 @@ class SingleAgentRun:
             "checkpoints": [],
             "dependency_ledger": [],
             "event_ledger": [],
+            "organization_summary": {
+                "rounds": 0,
+                "candidates_proposed": 0,
+                "candidate_subgraphs_realized": 0,
+                "candidate_subgraphs_rejected": 0,
+                "committed_expansions": 0,
+                "committed_reorganizations": 0,
+                "terminal_stops": 0,
+                "committed_derivation_dependencies": 0,
+            },
             "cumulative_information_gain": 0.0,
             "matrix_trajectory": [InformationMatrix.zero(["A0"]).to_dict()],
             "agent_basis_trajectory": [{"A0": self.final_agent.to_dict()}],
@@ -293,6 +332,7 @@ class RoyTrainingFreeEngine:
             self.config.worker_max_tokens,
             self.config.maximum_tool_rounds,
             self.config.maximum_tool_calls_per_worker_call,
+            self.config.result_reconciler_max_tokens,
         )
         self.selector = GlobalSelector(worker_llm, self.config.selector_max_tokens)
         self.realizer = CandidateXRealizer(
@@ -580,7 +620,7 @@ class RoyTrainingFreeEngine:
         )
 
     def run_direct(self, task: BenchmarkTask) -> SingleAgentRun:
-        """Run the matched one-call, one-Agent baseline without organization search."""
+        """Run the matched one-Agent baseline without organization search."""
         self._configure_task(task)
         root = self.worker.execute_local(
             self._root_agent(task), task.benchmark, tool_scope="committed",

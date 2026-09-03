@@ -297,7 +297,7 @@ PYTHONPATH=research python3 -m roy_research training-free-run \
 ```
 
 Use the identical task range with `--arm single_agent_direct` for the matched
-one-call baseline. It uses the same root harness, Worker model, token ceiling,
+single-Agent baseline. It uses the same root harness, Worker model, token ceiling,
 tool registry, and scorer, but never invokes candidate selection, X realization,
 channelization, an information probe, or matrix search.
 

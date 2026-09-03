@@ -150,6 +150,12 @@ class ScriptedClient:
                 },
                 "memory_entries": ["received cross-check"],
             }
+        elif purpose == "worker_result_reconciliation":
+            value = {
+                "candidate_answer": payload["result"]["candidate_answer"],
+                "ambiguous": False,
+                "basis": "the supplied derivation",
+            }
         elif purpose == "posterior_probe":
             support = payload["hypothesis_support"]
             answer = payload["root_state"]["result"]["candidate_answer"]
@@ -186,7 +192,7 @@ def test_engine_commits_externally_realized_candidate_x() -> None:
     assert realized.agents["r0_A0_c1"].memory.namespace == "memory/r0_A0_c1"
     expensive = [call for call in client.calls if call["purpose"] == "candidate_x_realization"]
     assert len(expensive) == 1
-    assert expensive[0]["thinking"] == "enabled"
+    assert expensive[0]["thinking"] == "disabled"
     assert expensive[0]["max_tokens"] == config.candidate_realizer_max_tokens
     value = run.to_dict()
     assert value["schema_version"] == 3
@@ -202,6 +208,16 @@ def test_engine_commits_externally_realized_candidate_x() -> None:
     ]["result"]["candidate_answer"] == "135"
     assert {item["relation"] for item in value["dependency_ledger"]} == {
         "derivation", "hard",
+    }
+    assert value["organization_summary"] == {
+        "rounds": 1,
+        "candidates_proposed": 1,
+        "candidate_subgraphs_realized": 1,
+        "candidate_subgraphs_rejected": 0,
+        "committed_expansions": 1,
+        "committed_reorganizations": 0,
+        "terminal_stops": 0,
+        "committed_derivation_dependencies": 1,
     }
     worker_payload = next(
         call["payload"] for call in client.calls if call["purpose"] == "worker"
@@ -246,8 +262,60 @@ def test_matched_single_agent_direct_skips_all_organization_calls() -> None:
     assert value["method"] == "single_agent_direct"
     assert value["final_answer"] == "135"
     assert value["rounds"] == []
-    assert [call["purpose"] for call in client.calls] == ["provisional_worker"]
-    assert value["call_audit"]["calls"] == {"provisional_worker": 1}
+    assert [call["purpose"] for call in client.calls] == [
+        "provisional_worker", "worker_result_reconciliation",
+    ]
+    assert value["call_audit"]["calls"] == {
+        "provisional_worker": 1, "worker_result_reconciliation": 1,
+    }
+
+
+def test_math_worker_reconciles_candidate_answer_with_its_own_derivation() -> None:
+    class InconsistentClient:
+        model = "inconsistent"
+
+        def complete(self, messages, **kwargs):
+            purpose = kwargs["metadata"]["purpose"]
+            if purpose == "provisional_worker":
+                value = {
+                    "result": {
+                        "candidate_answer": "\\boxed{144}",
+                        "claims": ["8x=540, so the requested angle is 135"],
+                        "evidence": ["540/4=135"], "assumptions": [], "unresolved": [],
+                        "reasoning_summary": "Therefore the requested angle is 135 degrees.",
+                        "confidence": 1.0,
+                    },
+                    "memory_entries": [],
+                }
+            elif purpose == "worker_result_reconciliation":
+                value = {
+                    "candidate_answer": "\\boxed{135}", "ambiguous": False,
+                    "basis": "claims and reasoning both conclude 135",
+                }
+            else:  # pragma: no cover
+                raise AssertionError(purpose)
+            return FakeCompletion(json.dumps(value))
+
+    run = RoyTrainingFreeEngine(InconsistentClient()).run_direct(
+        BenchmarkTask("math", "MATH", "angle", [], {"solution": "135"})
+    )
+    assert run.final_answer == "\\boxed{135}"
+
+
+def test_runtime_preserves_immutable_original_task_from_candidate_realizer() -> None:
+    agent = AgentState.from_dict(
+        {
+            "agent_id": "candidate", "parent_id": "A0", "objective": "verify",
+            "role": "verifier", "tools": [],
+            "context": {"original_task": "a paraphrase owned by the model"},
+            "memory": {"namespace": "memory/candidate"},
+            "result": {}, "status": "ready", "expected_output": "evidence",
+            "stop_condition": "evidence produced",
+        },
+        original_task="the exact benchmark instruction",
+        available_tools=[],
+    )
+    assert agent.context.original_task == "the exact benchmark instruction"
 
 
 def test_next_round_proposals_receive_committed_path_state() -> None:
@@ -497,7 +565,10 @@ def test_worker_reasons_again_after_tool_observation() -> None:
     )
     client = ToolLoopClient()
     registry = TaskToolRegistry(task)
-    worker = WorkerModel(JsonLLM(client, CallAudit()), max_tool_rounds=2, max_tool_calls=2)
+    worker = WorkerModel(
+        JsonLLM(client, CallAudit()), max_tool_rounds=2, max_tool_calls=2,
+        result_reconciler_max_tokens=0,
+    )
     worker.configure_tools(registry)
     updated = worker.execute_local(agent, "MATH")
     assert updated.result.candidate_answer == "2"

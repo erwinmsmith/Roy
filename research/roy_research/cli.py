@@ -184,7 +184,7 @@ def parser() -> argparse.ArgumentParser:
     training_free.add_argument("--benchmark", choices=("MATH", "HumanEval"), required=True)
     training_free.add_argument(
         "--arm", choices=("roy", "single_agent_direct"), default="roy",
-        help="Run Roy search or its matched one-call single-Agent baseline",
+        help="Run Roy search or its matched single-Agent baseline without organization search",
     )
     training_free.add_argument("--split", choices=("optimization", "test"), default="optimization")
     training_free.add_argument("--offset", type=int, default=0)

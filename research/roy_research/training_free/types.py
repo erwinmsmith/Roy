@@ -54,7 +54,10 @@ class ContextState:
             for key, weight in dict(value.get("weighted_inputs", {})).items()
         }
         return cls(
-            original_task=str(value.get("original_task") or original_task),
+            # The external realizer may describe or paraphrase the task, but it
+            # does not own this immutable harness field. Always bind C_i to the
+            # runtime-supplied source text.
+            original_task=original_task,
             mandatory_inputs=_strings(value.get("mandatory_inputs")),
             weighted_inputs=weighted,
             received_messages=_strings(value.get("received_messages")),

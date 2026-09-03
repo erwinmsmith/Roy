@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Mapping, Protocol
 
 from .harness import AgentHarness, AgentHarnessConfig
@@ -113,17 +113,25 @@ propose at least minimum_candidates independent verification directions whenever
 even if the answer is high-confidence. A failed tool call always requires a verification direction.
 Never repeat a gap that the current state or history already resolved."""
 
+    RECONCILE_SYSTEM = """You are the final consistency pass inside Roy's frozen Worker harness.
+Do not solve the task anew and do not add facts. Read the supplied structured result and return the
+single MATH boxed answer actually entailed by its claims, evidence, and reasoning summary. If those
+fields do not entail a unique answer, preserve the existing candidate_answer and mark ambiguity.
+Return JSON only."""
+
     def __init__(
         self,
         llm: JsonLLM,
         max_tokens: int = 2048,
         max_tool_rounds: int = 2,
         max_tool_calls: int = 3,
+        result_reconciler_max_tokens: int = 256,
         harness_config: AgentHarnessConfig | None = None,
     ) -> None:
         self.llm, self.max_tokens = llm, max_tokens
         self.max_tool_rounds = max_tool_rounds
         self.max_tool_calls = max_tool_calls
+        self.result_reconciler_max_tokens = result_reconciler_max_tokens
         self.harness_config = harness_config or AgentHarnessConfig()
         self.tools: TaskToolRegistry | None = None
 
@@ -182,7 +190,7 @@ Never repeat a gap that the current state or history already resolved."""
             agent,
             max_tokens=self.max_tokens,
         )
-        result = ResultState.from_dict(value.get("result"))
+        result = self._result_from_value(value, benchmark)
         graph = CandidateGraph.from_dict(value.get("candidate_dependency_graph", {}), agent.agent_id)
         if len(graph.nodes) > max_candidates:
             raise ValueError(f"Worker proposed {len(graph.nodes)} candidates; maximum is {max_candidates}")
@@ -218,7 +226,7 @@ Never repeat a gap that the current state or history already resolved."""
             tool_scope=tool_scope,
         )
         harness.apply_model_update(
-            ResultState.from_dict(value.get("result")), value.get("memory_entries", []),
+            self._result_from_value(value, benchmark), value.get("memory_entries", []),
         )
         return updated
 
@@ -248,9 +256,33 @@ Never repeat a gap that the current state or history already resolved."""
             tool_scope=tool_scope,
         )
         AgentHarness(updated, self.tools, self.harness_config).apply_model_update(
-            ResultState.from_dict(value.get("result")), value.get("memory_entries", []),
+            self._result_from_value(value, benchmark), value.get("memory_entries", []),
         )
         return updated
+
+    def _result_from_value(self, value: Mapping[str, Any], benchmark: str) -> ResultState:
+        result = ResultState.from_dict(value.get("result"))
+        if benchmark != "MATH" or self.result_reconciler_max_tokens <= 0:
+            return result
+        reconciled = self.llm.call(
+            "worker_result_reconciliation",
+            self.RECONCILE_SYSTEM,
+            {
+                "result": asdict(result),
+                "required_schema": {
+                    "candidate_answer": "one exact boxed expression",
+                    "ambiguous": "boolean",
+                    "basis": "short pointer to the supplied derivation",
+                },
+            },
+            max_tokens=self.result_reconciler_max_tokens,
+        )
+        candidate = str(reconciled.get("candidate_answer", "")).strip()
+        if candidate and not bool(reconciled.get("ambiguous", False)):
+            if "\n" in candidate or len(candidate) > 256:
+                raise ValueError("Worker reconciler returned a non-concise MATH answer")
+            result.candidate_answer = candidate
+        return result
 
     def _call_with_tools(
         self,
@@ -385,9 +417,10 @@ T/tools must be a subset of available_tools. Z/result is the candidate's initial
 must preserve uncertainty rather than fabricate work not yet performed. Sigma/status must respect
 hard dependencies. expected_output and stop_condition must be observable. Return a concise
 configuration_reasoning_summary explaining the design tradeoffs, not private chain-of-thought.
+The context original_task field must copy the supplied original_task exactly.
 Return exactly one JSON object and configure all fields; the runtime will reject incomplete X."""
 
-    def __init__(self, llm: JsonLLM, max_tokens: int = 4096, thinking: str = "enabled") -> None:
+    def __init__(self, llm: JsonLLM, max_tokens: int = 4096, thinking: str = "disabled") -> None:
         self.llm, self.max_tokens, self.thinking = llm, max_tokens, thinking
 
     def realize(
@@ -424,7 +457,8 @@ Return exactly one JSON object and configure all fields; the runtime will reject
                         "agent_id": "exact candidate_id", "parent_id": "existing agent id",
                         "objective": "Q_i", "role": "R_i",
                         "context": {
-                            "original_task": "task", "mandatory_inputs": ["artifact"],
+                            "original_task": "exact supplied original_task",
+                            "mandatory_inputs": ["artifact"],
                             "weighted_inputs": {"source agent id": "0..1"},
                             "received_messages": [], "public_tests": ["allowed public test"],
                         },
@@ -466,8 +500,6 @@ Return exactly one JSON object and configure all fields; the runtime will reject
             draft = graph.nodes[candidate_id]
             if agent.parent_id != draft.parent_id or agent.parent_id not in agents:
                 raise ValueError(f"Agent {candidate_id} has invalid parent {agent.parent_id!r}")
-            if agent.context.original_task != original_task:
-                raise ValueError(f"Agent {candidate_id} altered the immutable original task")
             unknown_tests = set(agent.context.public_tests) - set(public_tests)
             if unknown_tests:
                 raise ValueError(f"Agent {candidate_id} introduced non-public tests")
