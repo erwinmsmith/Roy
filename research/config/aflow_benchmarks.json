@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "source": {
+    "repository": "https://github.com/FoundationAgents/AFlow.git",
+    "revision": "3f457218fc716093fe53f6df8a5d5e6379d66346",
+    "license": "MIT",
+    "dataset_download_id": "1DNoegtZiUhWtvkd2xoIuElmIi4ah7k8e"
+  },
+  "split_protocol": {
+    "optimization": "*_validate.jsonl",
+    "test": "*_test.jsonl",
+    "notes": [
+      "AFlow does not publish a separate training split in this bundle.",
+      "Validation records may be used for workflow optimization or Roy training.",
+      "Test records are reserved for one frozen-policy final evaluation.",
+      "Public tests are execution aids for HumanEval and MBPP, not training examples."
+    ]
+  },
+  "benchmarks": {
+    "DROP": {
+      "question_type": "qa",
+      "operators": ["Custom", "AnswerGenerate", "ScEnsemble"],
+      "scorer": "benchmarks.drop:DROPBenchmark",
+      "optimization": {
+        "path": "data/datasets/drop_validate.jsonl",
+        "records": 200,
+        "sha256": "fa761d3f46c3c995278532ee9354fe78fd03fa6567774ea359e149dea5cf2362"
+      },
+      "test": {
+        "path": "data/datasets/drop_test.jsonl",
+        "records": 800,
+        "sha256": "a0ae6fac687d2bb393c9c6a43d966edf9ed24d0d157cfb7f7a4747cc8b3d9742"
+      }
+    },
+    "GSM8K": {
+      "question_type": "math",
+      "operators": ["Custom", "ScEnsemble", "Programmer"],
+      "scorer": "benchmarks.gsm8k:GSM8KBenchmark",
+      "optimization": {
+        "path": "data/datasets/gsm8k_validate.jsonl",
+        "records": 264,
+        "sha256": "0502dcec3263f5172e450141ff79da1f84401ed0c7e5d51016b3f773fb7ee869"
+      },
+      "test": {
+        "path": "data/datasets/gsm8k_test.jsonl",
+        "records": 1055,
+        "sha256": "2b8372f7b81d842fea01efb66193152b42506e2b23c890c3d90d2aef228dd788"
+      }
+    },
+    "HotpotQA": {
+      "question_type": "qa",
+      "operators": ["Custom", "AnswerGenerate", "ScEnsemble"],
+      "scorer": "benchmarks.hotpotqa:HotpotQABenchmark",
+      "optimization": {
+        "path": "data/datasets/hotpotqa_validate.jsonl",
+        "records": 200,
+        "sha256": "a2fcafe6cb44c705b48e404ab4e9a2726874cfdecffed5ddfef06e46b6c78639"
+      },
+      "test": {
+        "path": "data/datasets/hotpotqa_test.jsonl",
+        "records": 800,
+        "sha256": "9b5a171af942e75d5cb7e8746dbc6639f381900467c02e8c2e27eceb77b9a8ce"
+      }
+    },
+    "HumanEval": {
+      "question_type": "code",
+      "operators": ["Custom", "CustomCodeGenerate", "ScEnsemble", "Test"],
+      "scorer": "benchmarks.humaneval:HumanEvalBenchmark",
+      "optimization": {
+        "path": "data/datasets/humaneval_validate.jsonl",
+        "records": 33,
+        "sha256": "7c09e2424572a0e82b14d2dc145bf86feb2aeef9828b8b37c7e87dfe88d902f7"
+      },
+      "test": {
+        "path": "data/datasets/humaneval_test.jsonl",
+        "records": 131,
+        "sha256": "5f7417d249b5a1153d1313c944fafe61f5bcb19717b8d952eb45e6ea5aaa23d9"
+      },
+      "public_tests": {
+        "path": "data/datasets/humaneval_public_test.jsonl",
+        "records": 159,
+        "sha256": "ad5e3bdddfa5d0a48ad75d027d293858b2cab4526ca645a54f117c4f0b596edc"
+      }
+    },
+    "MATH": {
+      "question_type": "math",
+      "operators": ["Custom", "ScEnsemble", "Programmer"],
+      "scorer": "benchmarks.math:MATHBenchmark",
+      "optimization": {
+        "path": "data/datasets/math_validate.jsonl",
+        "records": 119,
+        "sha256": "0ade63e8c9fe01fb8964fa22f73423be5e1c78addc9942808de464cabab188c0"
+      },
+      "test": {
+        "path": "data/datasets/math_test.jsonl",
+        "records": 486,
+        "sha256": "343361223de598f1a8ca101edd5d4a063b8152a3ae80f845855b0d8cfb858e5c"
+      }
+    },
+    "MBPP": {
+      "question_type": "code",
+      "operators": ["Custom", "CustomCodeGenerate", "ScEnsemble", "Test"],
+      "scorer": "benchmarks.mbpp:MBPPBenchmark",
+      "optimization": {
+        "path": "data/datasets/mbpp_validate.jsonl",
+        "records": 86,
+        "sha256": "04c54e076bb2cb1a583d8e57110e3a644ae3125699b3309104d3b8cf95436216"
+      },
+      "test": {
+        "path": "data/datasets/mbpp_test.jsonl",
+        "records": 341,
+        "sha256": "0e9485dee21c836087453255557f92457b145dce7dad22b980e007c0500a12b0"
+      },
+      "public_tests": {
+        "path": "data/datasets/mbpp_public_test.jsonl",
+        "records": 427,
+        "sha256": "a3a15f074b278432b5a01227fac049670f30c0ebf8a193013bb956c1f6f04e82"
+      }
+    }
+  },
+  "evaluation": {
+    "DROP": "token F1 over reference alternatives",
+    "GSM8K": "exact final numeric answer",
+    "HotpotQA": "normalized token F1",
+    "HumanEval": "pass/fail against executable tests",
+    "MATH": "boxed-answer exact, numeric, or symbolic equivalence",
+    "MBPP": "pass/fail against executable tests"
+  },
+  "security": {
+    "code_benchmarks": ["HumanEval", "MBPP"],
+    "require_process_isolation": true,
+    "reason": "The upstream evaluators execute generated Python code."
+  }
+}

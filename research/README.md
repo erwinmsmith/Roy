@@ -141,6 +141,74 @@ Dev checkpoint selection uses highest mean official environment utility, then fe
 
 See [the implementation note](reports/lhtb-process-reward-implementation.md) for the delivered components, validation boundary and formal-run outputs.
 
+## AFlow benchmark and baseline compatibility
+
+The AFlow comparison checkout is external to Roy and pinned in
+[`config/aflow_benchmarks.json`](config/aflow_benchmarks.json). Raw datasets,
+generated workflows and evaluation outputs remain outside Git. The official
+download bundle contains the six paper benchmarks: HumanEval, MBPP, GSM8K,
+MATH, HotpotQA and DROP. Although the current AFlow source also has a
+LiveCodeBench evaluator, that dataset is not part of the downloaded paper
+bundle and is excluded from the pinned comparison suite.
+
+AFlow names its optimization files `*_validate.jsonl`; it does not provide a
+separate train split in this bundle. For a leakage-safe comparison, Roy and
+AFlow both treat those records as the optimization/training set. The
+`*_test.jsonl` files are read only after the Roy actor or AFlow workflow is
+frozen. HumanEval and MBPP public tests may be exposed to the workflow during
+optimization, but their final tests remain evaluator-only.
+
+```bash
+# Clone next to Roy and pin the exact reviewed source revision.
+cd ~/rivermind-data/benchmarks
+git clone https://github.com/FoundationAgents/AFlow.git
+git -C AFlow checkout --detach 3f457218fc716093fe53f6df8a5d5e6379d66346
+
+# AFlow's documented environment is Python 3.9.
+cd AFlow
+python3.9 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python -c 'from data.download_data import download; download(["datasets"])'
+
+# Configure the optimizer and executor in the ignored config/config2.yaml,
+# then optimize only on the AFlow validation split.
+.venv/bin/python run.py --dataset GSM8K --sample 4 \
+  --optimized_path workspace --initial_round 1 --max_rounds 20 \
+  --validation_rounds 5 --opt_model_name MODEL --exec_model_name MODEL
+```
+
+Roy also provides a fail-closed preparation/audit wrapper. On GPUHome, where
+the managed Python 3.9 download may be unavailable, Python 3.12 has passed the
+four non-code scorer smoke tests and can be selected explicitly. This is a
+host compatibility mode, not the upstream documented interpreter.
+
+```bash
+research/remote/prepare_aflow.sh check
+
+AFLOW_VENV="$HOME/rivermind-data/benchmarks/AFlow/.venv312" \
+AFLOW_PYTHON_SPEC=/usr/bin/python3.12 \
+research/remote/prepare_aflow.sh env
+
+AFLOW_VENV="$HOME/rivermind-data/benchmarks/AFlow/.venv312" \
+research/remote/prepare_aflow.sh smoke
+```
+
+The upstream method uses an LLM-guided Monte Carlo-tree-search variant over
+Python-represented workflows. It selects previously scored workflow rounds,
+asks the optimizer model to mutate their graph/prompt using the dataset's
+allowed operators, evaluates each mutation on the validation data, and keeps
+the score history for later selection. This is an external `AFlow` baseline;
+its search decisions and generated workflow code are not imported as Roy
+GRPO labels and MCTS is not added to Roy training or inference.
+
+For a controlled comparison, use the same execution model, temperature,
+dataset records and scorer for `single_agent_direct`, frozen AFlow and frozen
+Roy. Report the upstream score, model calls/tokens and wall time. AFlow's
+bundled cost table does not price DeepSeek, so token counts are the comparable
+cost measure unless a pinned price table is supplied. Its HumanEval and MBPP
+evaluators execute generated Python with `exec`; run these two benchmarks in
+Roy's reviewed PRoot isolation rather than in the host research process.
+
 ## τ³ transfer compatibility (not primary training)
 
 The commands below preserve the earlier τ³ adapter and its historical exploration-envelope behavior for regression and transfer work. Its envelope is separate from LHTB's direct node-actor rollout; neither is part of task utility or a theoretical structural objective, and τ³ must not be reported as the primary training method.
