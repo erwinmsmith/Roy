@@ -1,0 +1,611 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List
+
+import pytest
+from roy_research.training_free.aflow import AFlowDataset, AFlowEvaluator
+from roy_research.training_free.engine import (
+    RoyTrainingFreeEngine,
+    TrainingFreeConfig,
+    select_transition,
+)
+from roy_research.training_free.harness import AgentHarness, AgentHarnessConfig
+from roy_research.training_free.llm import (
+    CallAudit,
+    CandidateXRealizer,
+    JsonLLM,
+    WorkerModel,
+)
+from roy_research.training_free.matrix import (
+    InformationMatrix,
+    MatrixSearchResult,
+    expand_matrix,
+    matrix_neighbors,
+)
+from roy_research.training_free.tools import (
+    TaskToolRegistry,
+    ToolRequest,
+    macos_readonly_sandbox_prefix,
+)
+from roy_research.training_free.types import (
+    AgentState,
+    AgentStatus,
+    BenchmarkTask,
+    CandidateGraph,
+    ContextState,
+    MemoryState,
+    ResultState,
+)
+
+
+@dataclass
+class FakeCompletion:
+    content: str
+    prompt_tokens: int = 10
+    completion_tokens: int = 20
+    total_tokens: int = 30
+    latency_ms: int = 1
+
+
+class ScriptedClient:
+    model = "scripted-model"
+
+    def __init__(self) -> None:
+        self.calls: List[Dict[str, Any]] = []
+
+    def complete(self, messages, **kwargs):
+        purpose = kwargs["metadata"]["purpose"]
+        payload = json.loads(messages[1]["content"])
+        self.calls.append({"purpose": purpose, "payload": payload, **kwargs})
+        candidate_id = "r0_A0_c1"
+        if purpose == "worker":
+            value = {
+                "result": {
+                    "candidate_answer": "120", "claims": ["initial attempt"],
+                    "evidence": [], "assumptions": [], "unresolved": ["angle sum check"],
+                    "reasoning_summary": "An uncertain initial computation.", "confidence": 0.55,
+                },
+                "candidate_dependency_graph": {
+                    "nodes": [{
+                        "candidate_id": candidate_id, "parent_id": "A0",
+                        "direction": "independently recompute the polygon angle sum",
+                        "why_needed": "the root arithmetic is uncertain",
+                        "required_inputs": ["A0.current_derivation"],
+                        "requested_tools": ["symbolic_math"],
+                        "expected_output": "a checked numeric angle",
+                        "stop_condition": "the angle sum has been independently verified",
+                    }],
+                    "dependencies": [{
+                        "source": "A0", "target": candidate_id, "kind": "hard",
+                        "artifact": "current_derivation",
+                    }],
+                },
+            }
+        elif purpose == "global_selector":
+            value = {"selected_subgraphs": [{
+                "candidate_ids": [candidate_id], "selection_reason": "resolves the only gap",
+            }]}
+        elif purpose == "candidate_x_realization":
+            value = {
+                "configuration_reasoning_summary": "Use an independent arithmetic verifier.",
+                "risks": ["may repeat the root approach"],
+                "agents": [{
+                    "agent_id": candidate_id, "parent_id": "A0",
+                    "objective": "Recompute the pentagon angle sum and verify the large angle.",
+                    "role": "Independent geometry arithmetic verifier.",
+                    "context": {
+                        "original_task": payload["original_task"],
+                        "mandatory_inputs": ["A0.current_derivation"],
+                        "weighted_inputs": {"A0": 0.5}, "received_messages": [],
+                        "public_tests": [],
+                    },
+                    "memory": {
+                        "namespace": f"memory/{candidate_id}",
+                        "inherited_refs": ["A0.current_derivation"], "entries": [],
+                    },
+                    "tools": ["symbolic_math"],
+                    "result": {
+                        "candidate_answer": "", "claims": [], "evidence": [],
+                        "assumptions": [], "unresolved": ["large angle"],
+                        "reasoning_summary": "Not executed yet.", "confidence": 0,
+                    },
+                    "status": "ready", "expected_output": "verified large angle",
+                    "stop_condition": "a numeric angle is derived and checked",
+                }],
+            }
+        elif purpose == "provisional_worker":
+            value = {
+                "result": {
+                    "candidate_answer": "135", "claims": ["8x=540"],
+                    "evidence": ["pentagon interior sum is 540"], "assumptions": [],
+                    "unresolved": [], "reasoning_summary": "The large angle is 135.",
+                    "confidence": 0.98,
+                },
+                "memory_entries": ["independent result: 135"],
+            }
+        elif purpose == "channelizer":
+            value = {"message": "Independent verification gives 8x=540 and large angle 135."}
+        elif purpose == "receiver_update":
+            agent_id = payload["agent"]["contract"]["agent_id"]
+            answer = "135" if agent_id == "A0" else payload["agent"]["result"]["candidate_answer"]
+            value = {
+                "result": {
+                    "candidate_answer": answer, "claims": ["cross-checked"],
+                    "evidence": payload["inbound_messages"], "assumptions": [],
+                    "unresolved": [], "reasoning_summary": "Integrated inbound evidence.",
+                    "confidence": 0.95,
+                },
+                "memory_entries": ["received cross-check"],
+            }
+        elif purpose == "posterior_probe":
+            support = payload["hypothesis_support"]
+            answer = payload["root_state"]["result"]["candidate_answer"]
+            preferred = "135" if answer == "135" and "135" in support else "120"
+            probabilities = {item: 0.1 / max(1, len(support) - 1) for item in support}
+            probabilities[preferred] = 0.9
+            value = {"probabilities": probabilities}
+        else:  # pragma: no cover
+            raise AssertionError(purpose)
+        return FakeCompletion(json.dumps(value))
+
+
+def test_engine_commits_externally_realized_candidate_x() -> None:
+    client = ScriptedClient()
+    config = TrainingFreeConfig(
+        maximum_selected_subgraphs=1,
+        maximum_nodes_per_subgraph=1,
+        matrix_iterations=1,
+        matrix_beam_width=2,
+        maximum_matrix_evaluations=4,
+        posterior_rollouts=1,
+        communication_rounds=1,
+        maximum_organization_rounds=1,
+        information_gain_epsilon=0.001,
+    )
+    task = BenchmarkTask(
+        "math-0", "MATH", "A pentagon problem", [], {"solution": "\\boxed{135}"},
+    )
+    run = RoyTrainingFreeEngine(client, client, config=config).run(task)
+
+    assert run.rounds[0].committed is True
+    assert run.final_answer == "135"
+    realized = run.rounds[0].realized_candidates["round-0-subgraph-0"]
+    assert realized.agents["r0_A0_c1"].memory.namespace == "memory/r0_A0_c1"
+    expensive = [call for call in client.calls if call["purpose"] == "candidate_x_realization"]
+    assert len(expensive) == 1
+    assert expensive[0]["thinking"] == "enabled"
+    assert expensive[0]["max_tokens"] == config.candidate_realizer_max_tokens
+    value = run.to_dict()
+    assert value["schema_version"] == 2
+    assert value["agent_harness"]["schema_version"] == 1
+    assert value["agent_harness"]["config"]["maximum_memory_entries"] == 64
+    assert [checkpoint["phase"] for checkpoint in value["checkpoints"]] == [
+        "initial", "post_execution", "committed",
+    ]
+    assert value["rounds"][0]["transition_kind"] == "expand"
+    assert value["rounds"][0]["topology_drift"]["agent_expansion"] == 1
+    assert {item["relation"] for item in value["dependency_ledger"]} == {
+        "derivation", "hard",
+    }
+    worker_payload = next(
+        call["payload"] for call in client.calls if call["purpose"] == "worker"
+    )
+    organization = worker_payload["current_organization_context"]
+    assert organization["current_matrix"]["agent_ids"] == ["A0"]
+    assert organization["recent_history"][0]["kind"] == "state_initialized"
+    assert worker_payload["agent"]["harness_schema_version"] == 1
+    assert [item["name"] for item in worker_payload["available_tool_schemas"]] == [
+        "symbolic_math"
+    ]
+    selector_payload = next(
+        call["payload"] for call in client.calls if call["purpose"] == "global_selector"
+    )
+    assert "entries" not in selector_payload["current_agents"]["A0"]
+    assert "memory_entry_count" in selector_payload["current_agents"]["A0"]
+    realizer_payload = next(
+        call["payload"] for call in client.calls if call["purpose"] == "candidate_x_realization"
+    )
+    assert "entries" not in realizer_payload["current_mas"]["A0"]
+    posterior_payloads = [
+        call["payload"] for call in client.calls if call["purpose"] == "posterior_probe"
+    ]
+    assert all(
+        "candidate_x_realized" not in {
+            event["kind"] for event in payload["current_state_context"]["recent_history"]
+        }
+        for payload in posterior_payloads
+    )
+    assert any(
+        "evaluated_matrix" in payload["current_state_context"]
+        for payload in posterior_payloads
+    )
+
+
+def test_next_round_proposals_receive_committed_path_state() -> None:
+    class TwoRoundClient(ScriptedClient):
+        def complete(self, messages, **kwargs):
+            purpose = kwargs["metadata"]["purpose"]
+            payload = json.loads(messages[1]["content"])
+            if purpose == "worker" and payload["round_index"] == 1:
+                self.calls.append({"purpose": purpose, "payload": payload, **kwargs})
+                return FakeCompletion(json.dumps({
+                    "result": {
+                        "candidate_answer": "135", "claims": ["verified"],
+                        "evidence": [], "assumptions": [], "unresolved": [],
+                        "reasoning_summary": "The earlier gap is resolved.", "confidence": 0.99,
+                    },
+                    "memory_entries": ["do not repeat the resolved angle check"],
+                    "candidate_dependency_graph": {"nodes": [], "dependencies": []},
+                }))
+            return super().complete(messages, **kwargs)
+
+    client = TwoRoundClient()
+    config = TrainingFreeConfig(
+        maximum_selected_subgraphs=1,
+        maximum_nodes_per_subgraph=1,
+        matrix_iterations=1,
+        matrix_beam_width=2,
+        maximum_matrix_evaluations=4,
+        posterior_rollouts=1,
+        communication_rounds=1,
+        maximum_organization_rounds=2,
+        information_gain_epsilon=0.001,
+    )
+    task = BenchmarkTask("math", "MATH", "pentagon", [], {"solution": "135"})
+    run = RoyTrainingFreeEngine(client, client, config=config).run(task)
+    assert len(run.rounds) == 2
+    assert run.rounds[0].transition_kind == "expand"
+    assert run.rounds[1].transition_kind == "stop"
+    second_round = [
+        call["payload"] for call in client.calls
+        if call["purpose"] == "worker" and call["payload"].get("round_index") == 1
+    ]
+    assert second_round
+    context = second_round[0]["current_organization_context"]
+    assert {item["relation"] for item in context["dependency_state"]} == {
+        "derivation", "hard",
+    }
+    assert "organization_transition_committed" in {
+        item["kind"] for item in context["recent_history"]
+    }
+    assert len(run.to_dict()["matrix_trajectory"]) == 3
+
+
+def test_candidate_graph_closes_hard_predecessors_and_rejects_cycles() -> None:
+    graph = CandidateGraph.from_dict({
+        "nodes": [
+            {"candidate_id": "c1", "direction": "one", "why_needed": "gap",
+             "required_inputs": [], "requested_tools": [], "expected_output": "one",
+             "stop_condition": "done"},
+            {"candidate_id": "c2", "direction": "two", "why_needed": "gap",
+             "required_inputs": [], "requested_tools": [], "expected_output": "two",
+             "stop_condition": "done"},
+        ],
+        "dependencies": [
+            {"source": "c1", "target": "c2", "kind": "hard", "artifact": "result"},
+        ],
+    }, "A0")
+    assert graph.hard_closure(["c2"], ["A0"]) == frozenset(("c1", "c2"))
+
+    with pytest.raises(ValueError, match="cycle"):
+        CandidateGraph.from_dict({
+            "nodes": [
+                {"candidate_id": "c1", "direction": "one", "why_needed": "gap",
+                 "expected_output": "one", "stop_condition": "done"},
+                {"candidate_id": "c2", "direction": "two", "why_needed": "gap",
+                 "expected_output": "two", "stop_condition": "done"},
+            ],
+            "dependencies": [
+                {"source": "c1", "target": "c2", "kind": "hard"},
+                {"source": "c2", "target": "c1", "kind": "hard"},
+            ],
+        }, "A0")
+
+
+def test_x_realizer_rejects_incomplete_external_configuration() -> None:
+    class IncompleteClient(ScriptedClient):
+        def complete(self, messages, **kwargs):
+            return FakeCompletion(json.dumps({
+                "configuration_reasoning_summary": "draft",
+                "agents": [{"agent_id": "c1", "objective": "check"}],
+            }))
+
+    graph = CandidateGraph.from_dict({
+        "nodes": [{
+            "candidate_id": "c1", "direction": "check", "why_needed": "gap",
+            "required_inputs": [], "requested_tools": [], "expected_output": "answer",
+            "stop_condition": "checked",
+        }],
+        "dependencies": [],
+    }, "A0")
+    root = AgentState(
+        "A0", None, "solve", "solver", ContextState("task"), MemoryState("memory/A0"),
+        [], ResultState(), AgentStatus.DONE, "answer", "done",
+    )
+    realizer = CandidateXRealizer(JsonLLM(IncompleteClient(), CallAudit()))
+    with pytest.raises(ValueError, match="incomplete|explicitly configure"):
+        realizer.realize(
+            "s0", ["c1"], graph, {"A0": root}, benchmark="MATH",
+            original_task="task", public_tests=[], available_tools=[],
+        )
+
+
+def test_aflow_loader_exposes_public_but_not_hidden_humaneval_tests(tmp_path: Path) -> None:
+    root = tmp_path / "AFlow"
+    data = root / "data" / "datasets"
+    data.mkdir(parents=True)
+    validation = data / "humaneval_validate.jsonl"
+    public = data / "humaneval_public_test.jsonl"
+    validation.write_text(json.dumps({
+        "task_id": "HumanEval/0", "prompt": "def f(): ...", "entry_point": "f",
+        "canonical_solution": "    return 1", "test": "def check(candidate): assert candidate()==1",
+    }) + "\n", encoding="utf-8")
+    public.write_text(json.dumps({
+        "problem_id": "HumanEval/0", "entry_point": "f", "test": ["assert candidate()==1"],
+    }) + "\n", encoding="utf-8")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({
+        "source": {"revision": "ignored"},
+        "benchmarks": {"HumanEval": {
+            "optimization": {"path": str(validation.relative_to(root)),
+                             "sha256": hashlib.sha256(validation.read_bytes()).hexdigest()},
+            "public_tests": {"path": str(public.relative_to(root)),
+                             "sha256": hashlib.sha256(public.read_bytes()).hexdigest()},
+        }},
+    }), encoding="utf-8")
+    dataset = AFlowDataset(root, manifest)
+    dataset.verify = lambda benchmark, split: None  # type: ignore[method-assign]
+    task = dataset.load("HumanEval", "optimization")[0]
+    assert task.public_tests == ["assert candidate()==1"]
+    assert "def check" not in task.instruction
+    assert "def check" in task.evaluator_payload["test"]
+
+
+def test_humaneval_evaluator_requires_process_isolation(tmp_path: Path) -> None:
+    task = BenchmarkTask(
+        "HumanEval/0", "HumanEval", "def f(): ...", [],
+        {"entry_point": "f", "canonical_solution": "return 1", "test": ""},
+    )
+    evaluator = AFlowEvaluator(tmp_path, Path("/usr/bin/python3"))
+    with pytest.raises(RuntimeError, match="process-isolation"):
+        evaluator.score(task, "def f(): return 1")
+
+
+def test_symbolic_math_tool_solves_equation_and_rejects_code_execution() -> None:
+    task = BenchmarkTask("math", "MATH", "solve", [], {"solution": "2"})
+    agent = AgentState(
+        "A0", None, "solve", "solver", ContextState("solve"), MemoryState("memory/A0"),
+        ["symbolic_math"], ResultState(), AgentStatus.READY, "answer", "done",
+    )
+    registry = TaskToolRegistry(task)
+    solved = registry.execute(agent, ToolRequest(
+        "symbolic_math",
+        {"operation": "solve", "expression": "2*x+1=5", "variable": "x"},
+        "verify arithmetic",
+    ))
+    rejected = registry.execute(agent, ToolRequest(
+        "symbolic_math",
+        {"operation": "evaluate", "expression": "__import__('os').getcwd()"},
+        "invalid request",
+    ))
+    assert solved.success is True
+    assert json.loads(solved.output)["result"] == "[2]"
+    assert rejected.success is False
+    assert registry.audit.to_dict()["total_calls"] == 2
+
+
+@pytest.mark.skipif(not macos_readonly_sandbox_prefix(), reason="macOS sandbox-exec unavailable")
+def test_public_test_tool_runs_only_agent_visible_tests() -> None:
+    task = BenchmarkTask(
+        "HumanEval/x", "HumanEval", "def increment", ["assert candidate(2) == 3"],
+        {
+            "entry_point": "increment",
+            "canonical_solution": "return x + 1",
+            "test": "def check(candidate): assert False  # hidden and must not run",
+        },
+    )
+    agent = AgentState(
+        "A0", None, "implement", "coder",
+        ContextState(task.instruction, public_tests=list(task.public_tests)),
+        MemoryState("memory/A0"), ["public_tests"], ResultState(), AgentStatus.READY,
+        "code", "public tests pass",
+    )
+    registry = TaskToolRegistry(task, code_sandbox_prefix=macos_readonly_sandbox_prefix())
+    result = registry.execute(agent, ToolRequest(
+        "public_tests", {"code": "def increment(x):\n    return x + 1"}, "check code",
+    ))
+    assert result.success is True
+    assert json.loads(result.output) == {"passed": 1, "total": 1, "all_passed": True}
+    assert "hidden" not in registry.audit.records[0].output
+
+
+def test_worker_reasons_again_after_tool_observation() -> None:
+    class ToolLoopClient:
+        model = "tool-loop"
+
+        def __init__(self) -> None:
+            self.calls = []
+
+        def complete(self, messages, **kwargs):
+            payload = json.loads(messages[1]["content"])
+            self.calls.append(payload)
+            if "tool_observations" not in payload:
+                value = {
+                    "result": {"candidate_answer": "", "unresolved": ["solve equation"]},
+                    "memory_entries": [],
+                    "tool_requests": [{
+                        "tool_name": "symbolic_math",
+                        "arguments": {
+                            "operation": "solve", "expression": "2*x+1=5", "variable": "x",
+                        },
+                        "reason": "obtain a checked solution",
+                    }],
+                }
+            else:
+                value = {
+                    "result": {
+                        "candidate_answer": "2", "claims": ["x=2"], "evidence": ["tool"],
+                        "assumptions": [], "unresolved": [], "reasoning_summary": "Used solver.",
+                        "confidence": 0.99,
+                    },
+                    "memory_entries": ["symbolic solver returned x=2"],
+                    "tool_requests": [],
+                }
+            return FakeCompletion(json.dumps(value))
+
+    task = BenchmarkTask("math", "MATH", "solve", [], {"solution": "2"})
+    agent = AgentState(
+        "A0", None, "solve equation", "solver", ContextState("solve"),
+        MemoryState("memory/A0"), ["symbolic_math"], ResultState(), AgentStatus.READY,
+        "answer", "done",
+    )
+    client = ToolLoopClient()
+    registry = TaskToolRegistry(task)
+    worker = WorkerModel(JsonLLM(client, CallAudit()), max_tool_rounds=2, max_tool_calls=2)
+    worker.configure_tools(registry)
+    updated = worker.execute_local(agent, "MATH")
+    assert updated.result.candidate_answer == "2"
+    assert len(client.calls) == 2
+    assert json.loads(client.calls[1]["tool_observations"][0]["output"])["result"] == "[2]"
+    assert registry.audit.to_dict()["successful_calls"] == 1
+    assert registry.audit.records[0].scope == "counterfactual"
+
+
+def test_agent_harness_fixes_contract_and_bounds_private_runtime_state() -> None:
+    state = AgentState(
+        "A7", "A0", "verify equation", "algebra verifier",
+        ContextState("solve the equation"), MemoryState("memory/A7"),
+        ["symbolic_math"], ResultState(unresolved=["equation"]),
+        AgentStatus.READY, "checked root", "root is verified",
+    )
+    config = AgentHarnessConfig(
+        maximum_memory_entries=2,
+        maximum_memory_entry_chars=20,
+        retrieved_memory_entries=1,
+        maximum_received_messages=2,
+        maximum_context_chars=24_000,
+    )
+    harness = AgentHarness(state, config=config)
+    fingerprint = harness.contract_fingerprint()
+    harness.remember(["geometry note", "equation x equals two", "irrelevant recent note"])
+    harness.receive_messages(["first", "second", "third", "third"])
+    harness.apply_model_update(ResultState(candidate_answer="2"), ["equation verified"])
+
+    view = harness.execution_view()
+    assert harness.contract_fingerprint() == fingerprint
+    assert state.memory.entries == ["irrelevant recent no", "equation verified"]
+    assert view["private_memory"]["namespace"] == "memory/A7"
+    assert view["private_memory"]["retrieved_entries"] == ["equation verified"]
+    assert view["context"]["received_messages"] == ["second", "third"]
+    assert "entries" not in harness.public_summary()
+
+    snapshot = harness.snapshot()
+    restored = AgentHarness.restore(snapshot, available_tools=["symbolic_math"])
+    assert restored.snapshot() == snapshot
+    state.role = "silently changed role"
+    with pytest.raises(ValueError, match="immutable contract"):
+        harness.execution_view()
+
+
+def test_agent_harness_enforces_tool_capabilities_before_registry_execution() -> None:
+    task = BenchmarkTask("math", "MATH", "solve", [], {"solution": "2"})
+    state = AgentState(
+        "A0", None, "solve equation", "solver", ContextState("solve"),
+        MemoryState("memory/A0"), ["symbolic_math"], ResultState(), AgentStatus.READY,
+        "answer", "done",
+    )
+    registry = TaskToolRegistry(task)
+    harness = AgentHarness(state, registry)
+    assert [item["name"] for item in harness.tool_catalog] == ["symbolic_math"]
+
+    denied = harness.execute_tool(
+        ToolRequest("python", {"code": "print(2)"}, "try unassigned capability"),
+        scope="committed",
+    )
+    allowed = harness.execute_tool(
+        ToolRequest(
+            "symbolic_math",
+            {"operation": "solve", "expression": "x=2", "variable": "x"},
+            "verify",
+        ),
+        scope="committed",
+    )
+    assert denied.success is False
+    assert "outside" in denied.error
+    assert allowed.success is True
+    assert registry.audit.to_dict()["total_calls"] == 1
+
+
+def test_agent_harness_public_summary_does_not_expose_private_memory() -> None:
+    source = AgentState(
+        "A1", "A0", "derive checksum", "verifier", ContextState("task"),
+        MemoryState("memory/A1", entries=["checksum is 42", "private unrelated note"]),
+        [], ResultState(candidate_answer="42"), AgentStatus.DONE, "checksum", "derived",
+    )
+    receiver = AgentState(
+        "A2", "A0", "check checksum", "reviewer", ContextState("task"),
+        MemoryState("memory/A2", entries=["receiver-only secret"]), [], ResultState(),
+        AgentStatus.READY, "review", "checked",
+    )
+    source_harness = AgentHarness(source)
+    public = source_harness.public_summary()
+    channel_source = source_harness.channel_source_view(receiver.objective)
+
+    assert "checksum is 42" not in json.dumps(public)
+    assert channel_source["relevant_private_memory"] == [
+        "checksum is 42", "private unrelated note",
+    ]
+    assert "receiver-only secret" not in json.dumps(channel_source)
+
+
+def test_agent_harness_execution_context_has_a_hard_serialized_size_limit() -> None:
+    state = AgentState(
+        "A0", None, "solve", "solver", ContextState("x" * 60_000),
+        MemoryState("memory/A0", entries=["memory" * 5_000]), [],
+        ResultState(reasoning_summary="reason" * 5_000), AgentStatus.READY,
+        "answer", "done",
+    )
+    config = AgentHarnessConfig(maximum_context_chars=8_000)
+    view = AgentHarness(state, config=config).execution_view()
+    assert len(json.dumps(view, ensure_ascii=False)) <= config.maximum_context_chars
+    assert view["context"]["original_task"].endswith("...[truncated]")
+
+
+def test_matrix_search_neighbors_are_local_and_expansion_preserves_old_block() -> None:
+    current = InformationMatrix.zero(["A0", "A1"])
+    current.set_weight("A0", "A1", 0.5)
+    neighbors = matrix_neighbors(current, (0.0, 0.5, 1.0), (), 0.0)
+    for neighbor in neighbors:
+        changes = [
+            abs(neighbor.values[row][column] - current.values[row][column])
+            for row in range(2) for column in range(2)
+        ]
+        assert max(changes) == 0.5
+        assert sum(change > 0 for change in changes) == 1
+
+    child = AgentState(
+        "c1", "A1", "verify", "verifier",
+        ContextState("task", weighted_inputs={"A1": 0.5}),
+        MemoryState("memory/c1"), [], ResultState(), AgentStatus.READY,
+        "proof", "verified",
+    )
+    expanded = expand_matrix(current, {"c1": child}, [])
+    assert expanded.agent_ids == ["A0", "A1", "c1"]
+    assert expanded.weight("A0", "A1") == current.weight("A0", "A1")
+
+
+def test_positive_baseline_reorganization_is_committed_without_expansion() -> None:
+    initial = InformationMatrix.zero(["A0", "A1"])
+    reorganized = initial.clone()
+    reorganized.set_weight("A1", "A0", 0.5)
+    baseline = MatrixSearchResult(initial, reorganized, 0.2, 2, [{"x": 1.0}])
+    candidate = MatrixSearchResult(initial, reorganized, 0.22, 2, [{"x": 1.0}])
+    decision = select_transition(baseline, {"candidate": candidate}, epsilon=0.05)
+    assert decision.kind == "reorganize"
+    assert decision.commit is True
+    assert decision.subgraph_id is None
+    assert decision.information_gain == 0.2

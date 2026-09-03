@@ -1,0 +1,559 @@
+from __future__ import annotations
+
+import copy
+import json
+import re
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Mapping, Protocol
+
+from .harness import AgentHarness, AgentHarnessConfig
+from .tools import TaskToolRegistry, ToolRequest
+from .types import (
+    AgentState,
+    AgentStatus,
+    CandidateGraph,
+    RealizedSubgraph,
+    ResultState,
+)
+
+
+class CompletionLike(Protocol):
+    content: str
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    latency_ms: int
+
+
+class CompletionClient(Protocol):
+    model: str
+
+    def complete(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int = 1024,
+        temperature: float = 0.0,
+        metadata: Dict[str, Any] | None = None,
+        json_mode: bool = False,
+        thinking: str | None = None,
+    ) -> CompletionLike: ...
+
+
+@dataclass
+class CallAudit:
+    calls: Dict[str, int] = field(default_factory=dict)
+    tokens: Dict[str, int] = field(default_factory=dict)
+    latency_ms: Dict[str, int] = field(default_factory=dict)
+
+    def record(self, purpose: str, completion: CompletionLike) -> None:
+        self.calls[purpose] = self.calls.get(purpose, 0) + 1
+        self.tokens[purpose] = self.tokens.get(purpose, 0) + int(completion.total_tokens)
+        self.latency_ms[purpose] = self.latency_ms.get(purpose, 0) + int(completion.latency_ms)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "calls": dict(self.calls),
+            "tokens": dict(self.tokens),
+            "latency_ms": dict(self.latency_ms),
+            "total_calls": sum(self.calls.values()),
+            "total_tokens": sum(self.tokens.values()),
+        }
+
+
+class JsonLLM:
+    def __init__(self, client: CompletionClient, audit: CallAudit) -> None:
+        self.client = client
+        self.audit = audit
+
+    def call(
+        self,
+        purpose: str,
+        system: str,
+        payload: Mapping[str, Any],
+        *,
+        max_tokens: int,
+        temperature: float = 0.0,
+        thinking: str | None = "disabled",
+    ) -> Dict[str, Any]:
+        completion = self.client.complete(
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False, sort_keys=True)},
+            ],
+            max_tokens=max_tokens,
+            temperature=temperature,
+            metadata={"purpose": purpose},
+            json_mode=True,
+            thinking=thinking,
+        )
+        self.audit.record(purpose, completion)
+        if not completion.content.strip():
+            raise ValueError(
+                f"{purpose} returned empty content after {completion.completion_tokens} "
+                "completion tokens; increase its budget or disable provider reasoning"
+            )
+        return parse_json_object(completion.content)
+
+
+class WorkerModel:
+    SYSTEM = """You are Roy's frozen Worker. Execute only the supplied local objective using the
+agent's private state and visible context. Return one JSON object. Do not assume access to other
+agents or memories unless their content is present. For MATH, candidate_answer must be a concise
+answer and the final answer should be boxable. For HumanEval, candidate_answer must be complete
+Python code including the requested function. Also propose at most the requested number of genuinely
+different unresolved cognitive directions as a dependency graph. Proposals are semantic drafts, not
+complete agent configurations. Hard dependencies mean a node cannot execute without its producer;
+soft dependencies only indicate useful information flow. Candidate proposals are step-specific:
+use the current matrix, current peers, private memory, inbound messages, active dependencies and
+recent trajectory events. Never repeat a gap that the current state or history already resolved."""
+
+    def __init__(
+        self,
+        llm: JsonLLM,
+        max_tokens: int = 2048,
+        max_tool_rounds: int = 2,
+        max_tool_calls: int = 3,
+        harness_config: AgentHarnessConfig | None = None,
+    ) -> None:
+        self.llm, self.max_tokens = llm, max_tokens
+        self.max_tool_rounds = max_tool_rounds
+        self.max_tool_calls = max_tool_calls
+        self.harness_config = harness_config or AgentHarnessConfig()
+        self.tools: TaskToolRegistry | None = None
+
+    def configure_tools(self, tools: TaskToolRegistry) -> None:
+        self.tools = tools
+
+    def execute(
+        self,
+        agent: AgentState,
+        benchmark: str,
+        *,
+        round_index: int,
+        max_candidates: int,
+        organization_context: Mapping[str, Any] | None = None,
+    ) -> tuple[ResultState, CandidateGraph]:
+        value = self._call_with_tools(
+            "worker",
+            {
+                "benchmark": benchmark,
+                "round_index": round_index,
+                "candidate_id_prefix": f"r{round_index}_{agent.agent_id}_c",
+                "max_candidates": max_candidates,
+                "current_organization_context": dict(organization_context or {}),
+                "required_schema": {
+                    "result": {
+                        "candidate_answer": "string", "claims": ["string"],
+                        "evidence": ["string"], "assumptions": ["string"],
+                        "unresolved": ["string"], "reasoning_summary": "string",
+                        "confidence": "0..1",
+                    },
+                    "memory_entries": ["new private-memory entry grounded in this execution"],
+                    "candidate_dependency_graph": {
+                        "nodes": [{
+                            "candidate_id": "unique string using candidate_id_prefix",
+                            "parent_id": agent.agent_id,
+                            "direction": "what to investigate, not a role label",
+                            "why_needed": "specific unresolved issue",
+                            "required_inputs": ["artifact references"],
+                            "requested_tools": ["available tool id"],
+                            "expected_output": "verifiable output",
+                            "stop_condition": "observable completion condition",
+                        }],
+                        "dependencies": [{
+                            "source": "agent/candidate id", "target": "candidate id",
+                            "kind": "hard|soft", "artifact": "required information",
+                        }],
+                    },
+                    "tool_requests": [{
+                        "tool_name": "assigned tool name",
+                        "arguments": {"tool-specific": "arguments"},
+                        "reason": "what uncertainty this call resolves",
+                    }],
+                },
+            },
+            agent,
+            max_tokens=self.max_tokens,
+        )
+        result = ResultState.from_dict(value.get("result"))
+        graph = CandidateGraph.from_dict(value.get("candidate_dependency_graph", {}), agent.agent_id)
+        if len(graph.nodes) > max_candidates:
+            raise ValueError(f"Worker proposed {len(graph.nodes)} candidates; maximum is {max_candidates}")
+        AgentHarness(agent, self.tools, self.harness_config).apply_model_update(
+            result, value.get("memory_entries", []),
+        )
+        return result, graph
+
+    def update(
+        self,
+        agent: AgentState,
+        benchmark: str,
+        inbound_messages: List[str],
+        *,
+        tool_scope: str = "counterfactual",
+    ) -> AgentState:
+        updated = copy.deepcopy(agent)
+        harness = AgentHarness(updated, self.tools, self.harness_config)
+        harness.receive_messages(inbound_messages)
+        value = self._call_with_tools(
+            "receiver_update",
+            {
+                "benchmark": benchmark,
+                "inbound_messages": inbound_messages,
+                "instruction": "Update Z and private M only. Return result and memory_entries.",
+                "required_schema": {
+                    "result": "ResultState", "memory_entries": ["string"],
+                    "tool_requests": ["optional ToolRequest"],
+                },
+            },
+            updated,
+            max_tokens=self.max_tokens,
+            tool_scope=tool_scope,
+        )
+        harness.apply_model_update(
+            ResultState.from_dict(value.get("result")), value.get("memory_entries", []),
+        )
+        return updated
+
+    def execute_local(
+        self,
+        agent: AgentState,
+        benchmark: str,
+        *,
+        tool_scope: str = "counterfactual",
+    ) -> AgentState:
+        updated = copy.deepcopy(agent)
+        value = self._call_with_tools(
+            "provisional_worker",
+            {
+                "benchmark": benchmark,
+                "instruction": (
+                    "Execute the local objective now. Do not propose children. "
+                    "Return the completed result and private memory updates."
+                ),
+                "required_schema": {
+                    "result": "ResultState", "memory_entries": ["string"],
+                    "tool_requests": ["optional ToolRequest"],
+                },
+            },
+            updated,
+            max_tokens=self.max_tokens,
+            tool_scope=tool_scope,
+        )
+        AgentHarness(updated, self.tools, self.harness_config).apply_model_update(
+            ResultState.from_dict(value.get("result")), value.get("memory_entries", []),
+        )
+        return updated
+
+    def _call_with_tools(
+        self,
+        purpose: str,
+        payload: Dict[str, Any],
+        agent: AgentState,
+        *,
+        max_tokens: int,
+        tool_scope: str = "committed",
+    ) -> Dict[str, Any]:
+        harness = AgentHarness(agent, self.tools, self.harness_config)
+        working_payload = dict(payload)
+        working_payload["agent"] = harness.execution_view()
+        working_payload["available_tool_schemas"] = harness.tool_catalog
+        observations: List[Dict[str, Any]] = []
+        fingerprints: set[str] = set()
+        calls = 0
+        for tool_round in range(self.max_tool_rounds + 1):
+            if observations:
+                working_payload["tool_observations"] = observations
+                working_payload["tool_instruction"] = (
+                    "Revise the result using these observations. Request another tool only if "
+                    "a specific unresolved issue remains. Never claim a failed tool succeeded."
+                )
+            value = self.llm.call(
+                purpose,
+                self.SYSTEM,
+                working_payload,
+                max_tokens=max_tokens,
+            )
+            raw_requests = value.get("tool_requests", [])
+            if not raw_requests or tool_round == self.max_tool_rounds or calls >= self.max_tool_calls:
+                return value
+            if self.tools is None:
+                raise ValueError("Worker requested tools but no task tool registry is configured")
+            for raw_request in raw_requests:
+                if calls >= self.max_tool_calls:
+                    break
+                request = ToolRequest.from_dict(raw_request)
+                fingerprint = json.dumps({
+                    "tool_name": request.tool_name, "arguments": request.arguments,
+                }, sort_keys=True, default=str)
+                if fingerprint in fingerprints:
+                    observations.append({
+                        "tool_name": request.tool_name, "success": False,
+                        "error": "duplicate tool request rejected",
+                    })
+                    continue
+                fingerprints.add(fingerprint)
+                result = harness.execute_tool(request, scope=tool_scope)
+                calls += 1
+                observations.append({
+                    "tool_name": request.tool_name,
+                    "arguments": request.arguments,
+                    "success": result.success,
+                    "output": result.output,
+                    "error": result.error,
+                })
+        return value
+
+
+class GlobalSelector:
+    SYSTEM = """You are Roy's frozen Global Semantic Searcher. Select a small set of distinct,
+dependency-closed candidate subgraphs that target unresolved issues and are not redundant with the
+current MAS. You do not execute candidates and do not assign numerical information-gain scores.
+Return JSON only. Every selected subgraph must list candidate ids; hard predecessors will be closed
+and validated by the runtime."""
+
+    def __init__(self, llm: JsonLLM, max_tokens: int = 1024) -> None:
+        self.llm, self.max_tokens = llm, max_tokens
+
+    def select(
+        self,
+        graph: CandidateGraph,
+        agents: Mapping[str, AgentState],
+        *,
+        maximum_subgraphs: int,
+        maximum_nodes: int,
+        organization_context: Mapping[str, Any] | None = None,
+    ) -> List[List[str]]:
+        value = self.llm.call(
+            "global_selector",
+            self.SYSTEM,
+            {
+                "current_agents": {
+                    key: AgentHarness(agent).public_summary() for key, agent in agents.items()
+                },
+                "candidate_graph": graph.subset(graph.nodes),
+                "current_organization_context": dict(organization_context or {}),
+                "maximum_subgraphs": maximum_subgraphs,
+                "maximum_nodes_per_subgraph": maximum_nodes,
+                "required_schema": {
+                    "selected_subgraphs": [{"candidate_ids": ["id"], "selection_reason": "string"}]
+                },
+            },
+            max_tokens=self.max_tokens,
+        )
+        selected: List[List[str]] = []
+        seen: set[frozenset[str]] = set()
+        for raw in value.get("selected_subgraphs", []):
+            closure = graph.hard_closure(raw.get("candidate_ids", []), agents)
+            if not closure or len(closure) > maximum_nodes or closure in seen:
+                continue
+            seen.add(closure)
+            selected.append(sorted(closure))
+            if len(selected) == maximum_subgraphs:
+                break
+        return selected
+
+
+class CandidateXRealizer:
+    """The deliberately expensive semantic call that materializes final candidate X."""
+
+    SYSTEM = """You are Roy's external Candidate X Realizer. This is the high-compute semantic
+configuration stage. Carefully reason about the original task, current MAS, selected dependency
+subgraph, benchmark contract, tool availability, and information-flow needs. Then configure every
+candidate as a complete autonomous state X_i=(Q_i,R_i,C_i,M_i,T_i,Z_i,Sigma_i).
+
+Q/objective must be narrow and executable. R/role is a capability boundary derived from Q, never a
+role-pool label. C/context must explicitly name mandatory artifact inputs and useful weighted source
+agents without copying hidden global memory. M/memory must be a private memory/<agent_id> namespace.
+T/tools must be a subset of available_tools. Z/result is the candidate's initial epistemic state and
+must preserve uncertainty rather than fabricate work not yet performed. Sigma/status must respect
+hard dependencies. expected_output and stop_condition must be observable. Return a concise
+configuration_reasoning_summary explaining the design tradeoffs, not private chain-of-thought.
+Return exactly one JSON object and configure all fields; the runtime will reject incomplete X."""
+
+    def __init__(self, llm: JsonLLM, max_tokens: int = 4096, thinking: str = "enabled") -> None:
+        self.llm, self.max_tokens, self.thinking = llm, max_tokens, thinking
+
+    def realize(
+        self,
+        subgraph_id: str,
+        selected_ids: List[str],
+        graph: CandidateGraph,
+        agents: Mapping[str, AgentState],
+        *,
+        benchmark: str,
+        original_task: str,
+        public_tests: List[str],
+        available_tools: List[str],
+        organization_context: Mapping[str, Any] | None = None,
+    ) -> RealizedSubgraph:
+        value = self.llm.call(
+            "candidate_x_realization",
+            self.SYSTEM,
+            {
+                "subgraph_id": subgraph_id,
+                "benchmark": benchmark,
+                "original_task": original_task,
+                "public_tests": public_tests,
+                "available_tools": available_tools,
+                "current_mas": {
+                    key: AgentHarness(agent).public_summary() for key, agent in agents.items()
+                },
+                "current_organization_context": dict(organization_context or {}),
+                "selected_candidate_subgraph": graph.subset(selected_ids),
+                "required_schema": {
+                    "configuration_reasoning_summary": "concise design rationale",
+                    "risks": ["configuration risk"],
+                    "agents": [{
+                        "agent_id": "exact candidate_id", "parent_id": "existing agent id",
+                        "objective": "Q_i", "role": "R_i",
+                        "context": {
+                            "original_task": "task", "mandatory_inputs": ["artifact"],
+                            "weighted_inputs": {"source agent id": "0..1"},
+                            "received_messages": [], "public_tests": ["allowed public test"],
+                        },
+                        "memory": {
+                            "namespace": "memory/<agent_id>", "inherited_refs": ["reference"],
+                            "entries": [],
+                        },
+                        "tools": ["available tool id"],
+                        "result": {
+                            "candidate_answer": "", "claims": [], "evidence": [],
+                            "assumptions": [], "unresolved": ["local unresolved objective"],
+                            "reasoning_summary": "configuration only; not execution", "confidence": 0,
+                        },
+                        "status": "ready|waiting_for_dependencies",
+                        "expected_output": "contract", "stop_condition": "condition",
+                    }],
+                },
+            },
+            max_tokens=self.max_tokens,
+            thinking=self.thinking,
+        )
+        raw_agents = value.get("agents", [])
+        by_id = {str(raw.get("agent_id", "")): raw for raw in raw_agents}
+        if set(by_id) != set(selected_ids):
+            raise ValueError(
+                f"X Realizer returned agents {sorted(by_id)}; expected {sorted(selected_ids)}"
+            )
+        realized = {
+            candidate_id: AgentState.from_dict(
+                by_id[candidate_id], original_task=original_task,
+                available_tools=available_tools, expected_agent_id=candidate_id,
+            )
+            for candidate_id in selected_ids
+        }
+        for agent in realized.values():
+            AgentHarness(agent)
+        allowed_sources = set(agents) | set(realized)
+        for candidate_id, agent in realized.items():
+            draft = graph.nodes[candidate_id]
+            if agent.parent_id != draft.parent_id or agent.parent_id not in agents:
+                raise ValueError(f"Agent {candidate_id} has invalid parent {agent.parent_id!r}")
+            if agent.context.original_task != original_task:
+                raise ValueError(f"Agent {candidate_id} altered the immutable original task")
+            unknown_tests = set(agent.context.public_tests) - set(public_tests)
+            if unknown_tests:
+                raise ValueError(f"Agent {candidate_id} introduced non-public tests")
+            unknown_sources = set(agent.context.weighted_inputs) - allowed_sources
+            if unknown_sources or candidate_id in agent.context.weighted_inputs:
+                raise ValueError(f"Agent {candidate_id} has invalid weighted input sources")
+            missing_inputs = set(draft.required_inputs) - set(agent.context.mandatory_inputs)
+            if missing_inputs:
+                raise ValueError(f"Agent {candidate_id} omitted mandatory draft inputs: {sorted(missing_inputs)}")
+        dependencies = [
+            edge for edge in graph.dependencies
+            if edge.target in realized and (edge.source in realized or edge.source in agents)
+        ]
+        for edge in dependencies:
+            if edge.kind == "hard" and edge.source in realized:
+                if realized[edge.target].status != AgentStatus.WAITING:
+                    raise ValueError(
+                        f"Agent {edge.target} must wait for hard predecessor {edge.source}"
+                    )
+        reasoning_summary = str(value.get("configuration_reasoning_summary", "")).strip()
+        if not reasoning_summary:
+            raise ValueError("X Realizer omitted configuration_reasoning_summary")
+        return RealizedSubgraph(
+            subgraph_id=subgraph_id,
+            candidate_ids=list(selected_ids),
+            agents=realized,
+            dependencies=dependencies,
+            configuration_reasoning_summary=reasoning_summary,
+            risks=[str(item) for item in value.get("risks", [])],
+        )
+
+
+class ChannelizerModel:
+    SYSTEM = """You are Roy's frozen A2A Channelizer. Compress only source information useful to
+the receiver's objective. Capacity is a semantic budget: low capacity carries a conclusion and
+critical evidence; high capacity may add derivation, assumptions, uncertainty, counterexamples and
+provenance. Never invent facts or expose unrelated memory. Return JSON only."""
+
+    def __init__(self, llm: JsonLLM, max_tokens: int = 768) -> None:
+        self.llm, self.max_tokens = llm, max_tokens
+
+    def message(self, source: AgentState, receiver: AgentState, weight: float, token_budget: int) -> str:
+        value = self.llm.call(
+            "channelizer",
+            self.SYSTEM,
+            {
+                "source": AgentHarness(source).channel_source_view(receiver.objective),
+                "receiver": AgentHarness(receiver).public_summary(),
+                "capacity_weight": weight, "maximum_tokens": max(1, round(weight * token_budget)),
+                "required_schema": {"message": "task-conditioned semantic message"},
+            },
+            max_tokens=min(self.max_tokens, max(64, round(weight * token_budget))),
+        )
+        return str(value.get("message", ""))
+
+
+class PosteriorProbeModel:
+    SYSTEM = """You are Roy's frozen Posterior Probe, separate from the Worker. Map only the supplied
+root epistemic state to a probability distribution over the exact shared hypothesis support. Do not
+solve the task anew. Assign every probability, including OTHER, and make them sum to one. Return JSON."""
+
+    def __init__(self, llm: JsonLLM, max_tokens: int = 512) -> None:
+        self.llm, self.max_tokens = llm, max_tokens
+
+    def posterior(
+        self,
+        root: AgentState,
+        support: List[str],
+        benchmark: str,
+        state_context: Mapping[str, Any] | None = None,
+    ) -> Dict[str, float]:
+        value = self.llm.call(
+            "posterior_probe",
+            self.SYSTEM,
+            {
+                "benchmark": benchmark, "root_state": AgentHarness(root).execution_view(),
+                "current_state_context": dict(state_context or {}),
+                "hypothesis_support": support,
+                "required_schema": {"probabilities": {item: "0..1" for item in support}},
+            },
+            max_tokens=self.max_tokens,
+        )
+        raw = dict(value.get("probabilities", {}))
+        probabilities = {item: max(0.0, float(raw.get(item, 0.0))) for item in support}
+        total = sum(probabilities.values())
+        if total <= 0:
+            return {item: 1.0 / len(support) for item in support}
+        return {item: probability / total for item, probability in probabilities.items()}
+
+
+def parse_json_object(content: str) -> Dict[str, Any]:
+    text = content.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
+    if fenced:
+        text = fenced.group(1)
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}")
+        if start < 0 or end <= start:
+            raise
+        value = json.loads(text[start : end + 1])
+    if not isinstance(value, dict):
+        raise ValueError("LLM response must be a JSON object")
+    return value

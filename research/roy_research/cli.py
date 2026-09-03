@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import sys
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -45,6 +46,9 @@ from .lhtb_native import (
 )
 from .lhtb_value_metrics import annotate_value_traces, value_metrics
 from .training import TRAINING_VARIANTS, evaluate_groups, train_groups
+from .training_free.aflow import AFlowDataset, AFlowEvaluator
+from .training_free.engine import RoyTrainingFreeEngine, TrainingFreeConfig
+from .training_free.tools import macos_readonly_sandbox_prefix
 
 
 def parser() -> argparse.ArgumentParser:
@@ -145,6 +149,47 @@ def parser() -> argparse.ArgumentParser:
     api_smoke.add_argument("--ledger", type=Path, required=True)
     api_smoke.add_argument("--max-tokens", type=int, default=256)
     api_smoke.add_argument("--token-limit", type=int, default=10_000_000)
+
+    training_free = commands.add_parser(
+        "training-free-run",
+        help="Run training-free variable-dimensional MAS search on pinned AFlow MATH/HumanEval",
+    )
+    training_free.add_argument("--aflow-root", type=Path, required=True)
+    training_free.add_argument(
+        "--manifest", type=Path,
+        default=Path(__file__).resolve().parents[1] / "config" / "aflow_benchmarks.json",
+    )
+    training_free.add_argument(
+        "--config", type=Path,
+        default=Path(__file__).resolve().parents[1] / "config" / "training_free_v1.json",
+    )
+    training_free.add_argument("--benchmark", choices=("MATH", "HumanEval"), required=True)
+    training_free.add_argument("--split", choices=("optimization", "test"), default="optimization")
+    training_free.add_argument("--limit", type=int)
+    training_free.add_argument("--output", type=Path, required=True)
+    training_free.add_argument("--ledger", type=Path, required=True)
+    training_free.add_argument("--events", type=Path, required=True)
+    training_free.add_argument("--token-limit", type=int, default=10_000_000)
+    training_free.add_argument("--timeout", type=float, default=120.0)
+    training_free.add_argument("--worker-model", default="deepseek-v4-flash")
+    training_free.add_argument(
+        "--candidate-model",
+        help="Independently configurable external model used only for expensive X realization",
+    )
+    training_free.add_argument("--score", action="store_true")
+    training_free.add_argument("--aflow-python", type=Path)
+    training_free.add_argument(
+        "--human-eval-sandbox-command",
+        help="Reviewed command prefix placed before the AFlow Python executable",
+    )
+    training_free.add_argument(
+        "--tool-sandbox-command",
+        help="Reviewed command prefix for Agent python/public_tests tools",
+    )
+    training_free.add_argument(
+        "--macos-readonly-tool-sandbox", action="store_true",
+        help="Use the built-in read-only, network-denied sandbox-exec profile for Agent tools",
+    )
 
     ledger_limit = commands.add_parser(
         "raise-ledger-limit", help="Increase an existing persistent token ledger hard limit"
@@ -942,6 +987,67 @@ def main(argv: List[str] | None = None) -> None:
             "ledger": ledger.snapshot(),
         })
         print(json.dumps({"output": str(args.output), "tokens": completion.total_tokens}))
+    elif args.command == "training-free-run":
+        config_value = json.loads(args.config.read_text(encoding="utf-8"))
+        config = TrainingFreeConfig(**config_value)
+        dataset = AFlowDataset(args.aflow_root, args.manifest)
+        tasks = dataset.load(args.benchmark, args.split, args.limit)
+        ledger = PersistentTokenLedger(args.ledger, args.token_limit)
+        worker_client = DeepSeekClient(
+            ledger, model=args.worker_model, timeout=args.timeout, event_log=args.events,
+        )
+        candidate_client = DeepSeekClient(
+            ledger, model=args.candidate_model or args.worker_model,
+            timeout=args.timeout, event_log=args.events,
+        )
+        evaluator = None
+        if args.score:
+            if args.aflow_python is None:
+                raise ValueError("--aflow-python is required with --score")
+            evaluator = AFlowEvaluator(
+                args.aflow_root,
+                args.aflow_python,
+                human_eval_sandbox_prefix=(
+                    shlex.split(args.human_eval_sandbox_command)
+                    if args.human_eval_sandbox_command else None
+                ),
+            )
+        output_rows = []
+        if args.tool_sandbox_command and args.macos_readonly_tool_sandbox:
+            raise ValueError("choose only one Agent tool sandbox option")
+        tool_sandbox_prefix = (
+            shlex.split(args.tool_sandbox_command)
+            if args.tool_sandbox_command else (
+                macos_readonly_sandbox_prefix() if args.macos_readonly_tool_sandbox else []
+            )
+        )
+        if args.macos_readonly_tool_sandbox and not tool_sandbox_prefix:
+            raise RuntimeError("the built-in macOS sandbox is unavailable on this host")
+        for task_index, task in enumerate(tasks):
+            engine = RoyTrainingFreeEngine(
+                worker_client, candidate_client, config=config,
+                code_sandbox_prefix=tool_sandbox_prefix,
+            )
+            run = engine.run(task)
+            row = run.to_dict()
+            row.update({
+                "split": args.split,
+                "worker_model": worker_client.model,
+                "candidate_model": candidate_client.model,
+            })
+            if evaluator is not None:
+                row["evaluation"] = evaluator.score(task, run.final_answer)
+            output_rows.append(row)
+            write_jsonl(args.output, [row], append=task_index > 0)
+            print(json.dumps({
+                "task_id": task.task_id,
+                "stop_reason": run.stop_reason,
+                "score": row.get("evaluation", {}).get("score"),
+                "tokens": run.call_audit.to_dict()["total_tokens"],
+            }), flush=True)
+        print(json.dumps({
+            "output": str(args.output), "tasks": len(output_rows), "ledger": ledger.snapshot(),
+        }))
     elif args.command == "experiment":
         args.output.mkdir(parents=True, exist_ok=True)
         learned: Dict[str, Any] = {}

@@ -209,6 +209,96 @@ cost measure unless a pinned price table is supplied. Its HumanEval and MBPP
 evaluators execute generated Python with `exec`; run these two benchmarks in
 Roy's reviewed PRoot isolation rather than in the host research process.
 
+### Training-free variable-dimensional MAS (MATH/HumanEval V1)
+
+The `training-free` branch also contains a separate inference-only Roy path in
+`roy_research.training_free`. It starts with `A0`, lets the Worker propose a
+dependency graph, uses the Global Semantic Searcher to retain at most three
+dependency-closed subgraphs, and compares every realized expansion against an
+optimized no-expansion baseline. The inner search evaluates complete weighted
+A2A matrices through semantic channelization and a frozen posterior probe; it
+does not add edge scores.
+
+Candidate proposal and candidate realization are deliberately different calls.
+The proposal is a cheap semantic direction. Only after global selection does an
+independently configurable external candidate model perform the high-compute
+`XRealizer` call. That call must explicitly configure the complete
+`X_i=(Q_i,R_i,C_i,M_i,T_i,Z_i,Sigma_i)` for every candidate. Incomplete states,
+unknown tools, shared-memory namespaces, invalid dependencies, and wrong agent
+ids fail closed. The same realized `X` is cached and reused across all matrix
+rollouts, so matrix search never silently redesigns the candidate agents.
+
+Every realized state runs through the same versioned single-Agent harness. Its
+immutable contract is `(agent_id, parent_id, Q/objective, R/role, T/tools,
+expected_output, stop_condition, static-context hash, memory namespace and
+inherited-memory references)`; only received messages, private-memory entries,
+`Z/result`, and `Sigma/status` evolve during execution. The
+harness supplies a bounded execution view, deterministic private-memory
+retrieval, deduplicated bounded inbound messages, capability-filtered tool
+schemas and calls, model-update application, cloning, and versioned snapshots.
+Contract mutation fails closed through a fingerprint check.
+
+Private memory is namespaced exactly as `memory/<agent_id>` and is never placed
+in global-search, candidate-realization, or peer-summary payloads. A peer sees
+only the source's public epistemic result. The Channelizer is the sole boundary
+allowed to retrieve task-relevant entries from the source's private memory; it
+compresses those entries into a receiver-specific message, and only that
+message enters the receiver context. Tool membership is also part of the
+immutable contract: Candidate X must choose a subset of the task registry, the
+model sees only that subset's schemas, and out-of-capability calls are rejected
+before registry execution. Each result records the harness schema and limits.
+
+The runtime is path-dependent rather than a sequence of independent graph
+searches. Its committed state is `S_t=(X_t,W_t,D_t,H_t)`: private Agent state,
+the current information matrix, dependency/derivation state, and an append-only
+event ledger. Every Parent proposal receives its current matrix, peer summaries,
+private memory, active dependencies, committed history, and a separately marked
+counterfactual search history. Posterior probes receive committed history only;
+provisional candidate events cannot leak into `q_t`.
+
+For no expansion, matrix search starts at `W_t`; for expansion it starts at
+`[[W_t,B_t],[C_t,D_t]]`. A coordinate neighbor changes one edge by only one
+adjacent configured weight level, so repeated beam iterations optimize a
+reachable `Delta W_t` instead of rebuilding an unrelated graph. A positive
+no-expansion frontier is committed as a `reorganize` transition and the system
+continues; it stops only when both reorganization and admissible expansion fail
+to exceed the conditional-information threshold. Selected dependency subgraphs
+of up to two nodes provide the V1 short-horizon lookahead.
+
+Every output now includes schema-v2 `checkpoints`, `event_ledger`,
+`dependency_ledger`, `matrix_trajectory`, `agent_basis_trajectory`, cumulative
+conditional information gain, per-round initial/final/delta matrices, and
+topology drift (`Delta N`, edge L1/Frobenius drift, and edge additions/removals).
+
+The checked V1 budget is in [`config/training_free_v1.json`](config/training_free_v1.json).
+For a small MATH validation run:
+
+```bash
+PYTHONPATH=research python3 -m roy_research training-free-run \
+  --aflow-root /path/to/AFlow \
+  --benchmark MATH --split optimization --limit 2 \
+  --worker-model deepseek-v4-flash \
+  --candidate-model YOUR_REASONING_MODEL \
+  --ledger research/output/training-free/token-ledger.json \
+  --events research/output/training-free/events.jsonl \
+  --output research/output/training-free/math.jsonl
+```
+
+Add `--score --aflow-python /path/to/AFlow/.venv/bin/python` to invoke the pinned
+AFlow MATH scorer. HumanEval loads only its public tests into agent context and
+keeps hidden tests in the evaluator payload. Its scorer refuses to run unless
+`--human-eval-sandbox-command` supplies a reviewed isolation prefix.
+
+Agents can make bounded structured tool requests during Worker and provisional
+execution. `symbolic_math` uses an AST allowlist before calling SymPy and is
+available by default. `python` and `public_tests` appear in the model's tool
+catalog only when a code sandbox is configured. On macOS, add
+`--macos-readonly-tool-sandbox`; other hosts should pass a reviewed PRoot,
+container, or equivalent prefix with `--tool-sandbox-command`. The public-test
+tool receives only tests already present in that Agent's `C_i`, never hidden
+evaluator tests. Tool calls, arguments, results, failures, latency, and sandbox
+backend are written under `tool_audit` in every result record.
+
 ## τ³ transfer compatibility (not primary training)
 
 The commands below preserve the earlier τ³ adapter and its historical exploration-envelope behavior for regression and transfer work. Its envelope is separate from LHTB's direct node-actor rollout; neither is part of task utility or a theoretical structural objective, and τ³ must not be reported as the primary training method.
