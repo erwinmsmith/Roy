@@ -57,7 +57,7 @@ from .lhtb_training import LHTBProcessGRPOTrainer
 from .lhtb_value_metrics import annotate_value_traces, value_metrics
 from .live_controlled import collect_forced_full_mas, collect_live_group
 from .organization import LHTB_POLICY_INTERFACE_REVISION, RuntimeBudget
-from .providers import DeepSeekClient
+from .providers import DeepSeekClient, ProviderCircuitOpenError
 from .reporting import write_utility_svg
 from .schema import TraceRecord
 from .tau3 import build_tau3_manifest, manifest_summary, verify_tau3_root
@@ -197,7 +197,16 @@ def parser() -> argparse.ArgumentParser:
     training_free.add_argument(
         "--resume", action="store_true", help="Skip task ids already present in the output JSONL",
     )
+    training_free.add_argument(
+        "--retry-failures-from", type=Path, action="append", default=[],
+        help=(
+            "Run only task ids whose prior row has run_status=failed; repeat for multiple "
+            "source JSONL files and write results to a separate --output"
+        ),
+    )
     training_free.add_argument("--max-task-attempts", type=int, default=2)
+    training_free.add_argument("--provider-max-retries", type=int, default=4)
+    training_free.add_argument("--provider-retry-base-seconds", type=float, default=2.0)
     training_free.add_argument("--output", type=Path, required=True)
     training_free.add_argument("--ledger", type=Path, required=True)
     training_free.add_argument("--events", type=Path, required=True)
@@ -556,6 +565,17 @@ def _tau3_runtime_budget(args: argparse.Namespace) -> RuntimeBudget:
         maximum_depth=args.max_depth,
         maximum_decisions=args.max_decisions,
     )
+
+
+def _failed_task_ids(paths: List[Path], output: Path) -> set[str]:
+    latest_status: Dict[str, str] = {}
+    for path in paths:
+        if path.resolve() == output.resolve():
+            raise ValueError("--retry-failures-from must differ from --output")
+        for row in read_jsonl(path):
+            if row.get("task_id"):
+                latest_status[str(row["task_id"])] = str(row.get("run_status", ""))
+    return {task_id for task_id, status in latest_status.items() if status == "failed"}
 
 
 def main(argv: List[str] | None = None) -> None:
@@ -1031,6 +1051,9 @@ def main(argv: List[str] | None = None) -> None:
             raise ValueError("--max-task-attempts must be positive")
         load_limit = None if args.limit is None else args.offset + args.limit
         tasks = dataset.load(args.benchmark, args.split, load_limit)[args.offset:]
+        retry_task_ids = _failed_task_ids(args.retry_failures_from, args.output)
+        if args.retry_failures_from:
+            tasks = [task for task in tasks if task.task_id in retry_task_ids]
         completed_task_ids = set()
         if args.resume and args.output.exists():
             completed_task_ids = {
@@ -1040,10 +1063,14 @@ def main(argv: List[str] | None = None) -> None:
         ledger = PersistentTokenLedger(args.ledger, args.token_limit)
         worker_client = DeepSeekClient(
             ledger, model=args.worker_model, timeout=args.timeout, event_log=args.events,
+            max_retries=args.provider_max_retries,
+            retry_base_seconds=args.provider_retry_base_seconds,
         )
         candidate_client = DeepSeekClient(
             ledger, model=args.candidate_model or args.worker_model,
             timeout=args.timeout, event_log=args.events,
+            max_retries=args.provider_max_retries,
+            retry_base_seconds=args.provider_retry_base_seconds,
         )
         evaluator = None
         if args.score:
@@ -1115,6 +1142,10 @@ def main(argv: List[str] | None = None) -> None:
                     completed_row["all_attempts_total_tokens"] = attempt_tokens
                     row = completed_row
                     break
+                except ProviderCircuitOpenError:
+                    # Persistent provider outages are shard-level failures. Do not
+                    # turn every remaining task into a synthetic zero-score row.
+                    raise
                 except Exception as error:
                     attempt_tokens += engine.audit.to_dict()["total_tokens"]
                     failed_attempts.append({

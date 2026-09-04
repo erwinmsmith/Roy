@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -34,7 +35,12 @@ from roy_research.live_controlled import (
     parse_answer,
     score_output,
 )
-from roy_research.providers import Completion, DeepSeekClient
+from roy_research.providers import (
+    Completion,
+    DeepSeekClient,
+    ProviderPaymentRequiredError,
+    ProviderRetryExhaustedError,
+)
 
 
 class GRPOTests(unittest.TestCase):
@@ -250,9 +256,9 @@ class RuntimeBoundaryTests(unittest.TestCase):
             ledger = PersistentTokenLedger(Path(directory) / "ledger.json", limit=10_000)
             events = Path(directory) / "events.jsonl"
             with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key"}, clear=True):
-                client = DeepSeekClient(ledger, event_log=events)
+                client = DeepSeekClient(ledger, event_log=events, max_retries=0)
             with patch("roy_research.providers.urllib.request.urlopen", side_effect=TimeoutError("ambiguous timeout")):
-                with self.assertRaises(TimeoutError):
+                with self.assertRaises(ProviderRetryExhaustedError):
                     client.complete([{"role": "user", "content": "bounded"}], max_tokens=64)
             snapshot = ledger.snapshot()
             self.assertEqual(snapshot["reserved"], 0)
@@ -260,6 +266,55 @@ class RuntimeBoundaryTests(unittest.TestCase):
             event = json.loads(events.read_text(encoding="utf-8").strip())
             self.assertEqual(event["status"], "failed")
             self.assertEqual(event["reservation"], snapshot["used"])
+
+    def test_provider_retries_429_without_charging_rejected_attempts(self) -> None:
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "choices": [{"message": {"content": "ok"}}],
+                    "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+                }).encode()
+
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = PersistentTokenLedger(Path(directory) / "ledger.json", limit=10_000)
+            error = urllib.error.HTTPError(
+                "https://api.deepseek.com", 429, "Too Many Requests", {}, None,
+            )
+            with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key"}, clear=True):
+                client = DeepSeekClient(
+                    ledger, max_retries=2, retry_base_seconds=0, retry_max_seconds=0,
+                )
+            with patch(
+                "roy_research.providers.urllib.request.urlopen",
+                side_effect=[error, error, Response()],
+            ) as opened:
+                completion = client.complete(
+                    [{"role": "user", "content": "bounded"}], max_tokens=64,
+                )
+            self.assertEqual(completion.content, "ok")
+            self.assertEqual(opened.call_count, 3)
+            self.assertEqual(ledger.snapshot()["used"], 3)
+            self.assertEqual(ledger.snapshot()["reserved"], 0)
+
+    def test_provider_402_opens_circuit_without_poisoning_token_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = PersistentTokenLedger(Path(directory) / "ledger.json", limit=10_000)
+            error = urllib.error.HTTPError(
+                "https://api.deepseek.com", 402, "Payment Required", {}, None,
+            )
+            with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key"}, clear=True):
+                client = DeepSeekClient(ledger)
+            with patch("roy_research.providers.urllib.request.urlopen", side_effect=error):
+                with self.assertRaises(ProviderPaymentRequiredError):
+                    client.complete([{"role": "user", "content": "bounded"}], max_tokens=64)
+            self.assertEqual(ledger.snapshot()["used"], 0)
+            self.assertEqual(ledger.snapshot()["reserved"], 0)
 
 
 class LiveRolloutTests(unittest.TestCase):

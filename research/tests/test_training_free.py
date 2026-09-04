@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import pytest
+from roy_research.cli import _failed_task_ids
 from roy_research.training_free.aflow import AFlowDataset, AFlowEvaluator
 from roy_research.training_free.engine import (
     RoyTrainingFreeEngine,
@@ -473,7 +474,7 @@ def test_math_worker_rejects_a_fake_reconciler_correction() -> None:
                     },
                     "memory_entries": [],
                 }))
-            if purpose == "worker_result_reconciliation":
+            if purpose.startswith("worker_result_reconciliation"):
                 return FakeCompletion(json.dumps({
                     "candidate_answer": "\\boxed{72}", "verdict": "corrected",
                     "basis": "72 conflicts with the derivation",
@@ -484,6 +485,36 @@ def test_math_worker_rejects_a_fake_reconciler_correction() -> None:
         RoyTrainingFreeEngine(FakeCorrectionClient()).run_direct(
             BenchmarkTask("math", "MATH", "mean", [], {"solution": "79.5"})
         )
+
+
+def test_math_worker_keeps_supported_result_after_two_invalid_reconciliations() -> None:
+    class BrokenAuxiliaryClient:
+        model = "broken-auxiliary"
+
+        def complete(self, messages, **kwargs):
+            purpose = kwargs["metadata"]["purpose"]
+            if purpose == "root_worker":
+                return FakeCompletion(json.dumps({
+                    "result": {
+                        "candidate_answer": "\\boxed{72}",
+                        "claims": ["The calculation gives 72."],
+                        "evidence": ["8 * 9 = 72"], "assumptions": [],
+                        "unresolved": [], "reasoning_summary": "Therefore the answer is 72.",
+                        "confidence": 1.0,
+                    },
+                    "memory_entries": [],
+                }))
+            if purpose.startswith("worker_result_reconciliation"):
+                return FakeCompletion(json.dumps({
+                    "candidate_answer": "\\boxed{72}", "verdict": "corrected",
+                    "basis": "The supplied derivation concludes 72.",
+                }))
+            raise AssertionError(purpose)
+
+    run = RoyTrainingFreeEngine(BrokenAuxiliaryClient()).run_direct(
+        BenchmarkTask("math", "MATH", "multiply", [], {"solution": "72"})
+    )
+    assert run.final_answer == "\\boxed{72}"
 
 
 def test_math_worker_rejects_answer_absent_from_reconciler_basis() -> None:
@@ -934,6 +965,24 @@ def test_humaneval_evaluator_requires_process_isolation(tmp_path: Path) -> None:
     evaluator = AFlowEvaluator(tmp_path, Path("/usr/bin/python3"))
     with pytest.raises(RuntimeError, match="process-isolation"):
         evaluator.score(task, "def f(): return 1")
+
+
+def test_failed_task_selector_uses_only_failed_rows_and_separate_output(
+    tmp_path: Path,
+) -> None:
+    prior = tmp_path / "prior.jsonl"
+    prior.write_text(
+        "\n".join([
+            json.dumps({"task_id": "MATH/test/1", "run_status": "completed"}),
+            json.dumps({"task_id": "MATH/test/2", "run_status": "failed"}),
+            json.dumps({"task_id": "MATH/test/3", "run_status": "failed"}),
+            json.dumps({"task_id": "MATH/test/3", "run_status": "completed"}),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    assert _failed_task_ids([prior], tmp_path / "retry.jsonl") == {"MATH/test/2"}
+    with pytest.raises(ValueError, match="must differ"):
+        _failed_task_ids([prior], prior)
 
 
 def test_aflow_evaluator_preserves_virtual_environment_launcher(tmp_path: Path) -> None:

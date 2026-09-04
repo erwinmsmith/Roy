@@ -546,19 +546,55 @@ discovering a shared mistake. Return exactly one JSON object."""
             raise ValueError("Worker returned an empty candidate_answer")
         if benchmark != "MATH" or self.result_reconciler_max_tokens <= 0:
             return result
+        payload = {
+            "result": asdict(result),
+            "required_schema": {
+                "candidate_answer": "one exact boxed expression",
+                "verdict": "consistent|corrected|ambiguous",
+                "basis": "short pointer to the supplied derivation",
+            },
+        }
         reconciled = self.llm.call(
             "worker_result_reconciliation",
             self.RECONCILE_SYSTEM,
-            {
-                "result": asdict(result),
-                "required_schema": {
-                    "candidate_answer": "one exact boxed expression",
-                    "verdict": "consistent|corrected|ambiguous",
-                    "basis": "short pointer to the supplied derivation",
-                },
-            },
+            payload,
             max_tokens=self.result_reconciler_max_tokens,
         )
+        try:
+            return self._apply_reconciled_result(result, reconciled)
+        except ValueError as first_error:
+            repaired = self.llm.call(
+                "worker_result_reconciliation_contract_retry",
+                self.RECONCILE_SYSTEM + (
+                    "\nThe prior reconciliation violated the output contract. Re-read only the "
+                    "supplied result, ensure the verdict matches whether the answer changes, and "
+                    "state the exact returned expression in basis."
+                ),
+                {
+                    **payload,
+                    "prior_contract_error": str(first_error),
+                },
+                max_tokens=max(512, self.result_reconciler_max_tokens),
+            )
+            try:
+                return self._apply_reconciled_result(result, repaired)
+            except ValueError as second_error:
+                # A malformed auxiliary reconciliation must not discard a Worker
+                # result whose own public derivation explicitly supports its answer.
+                own_basis = " ".join([
+                    *result.claims,
+                    *result.evidence,
+                    result.reasoning_summary,
+                ])
+                if _math_answer_supported_by_basis(result.candidate_answer, own_basis):
+                    return result
+                raise second_error from first_error
+
+    @staticmethod
+    def _apply_reconciled_result(
+        result: ResultState,
+        reconciled: Mapping[str, Any],
+    ) -> ResultState:
         verdict = str(reconciled.get("verdict", "")).strip()
         if verdict not in {"consistent", "corrected", "ambiguous"}:
             raise ValueError("Worker reconciler omitted a valid consistency verdict")
@@ -576,8 +612,9 @@ discovering a shared mistake. Return exactly one JSON object."""
             return result
         if candidate == result.candidate_answer:
             raise ValueError("Worker reconciler claimed a correction but preserved the answer")
-        result.candidate_answer = candidate
-        return result
+        corrected = copy.deepcopy(result)
+        corrected.candidate_answer = candidate
+        return corrected
 
     def _call_with_tools(
         self,
