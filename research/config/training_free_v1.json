@@ -13,7 +13,7 @@
   "information_gain_epsilon": 0.02,
   "finish_uncertainty": 0.15,
   "activation_threshold": 0.05,
-  "worker_max_tokens": 2048,
+  "worker_max_tokens": 4096,
   "candidate_worker_max_tokens": 16384,
   "candidate_worker_thinking": "enabled",
   "result_reconciler_max_tokens": 256,

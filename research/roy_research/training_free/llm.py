@@ -183,7 +183,8 @@ the narrower convention. Do not use benchmark provenance as evidence. Adversaria
 attempt a counterexample,
 invariant, alternate derivation, tool check, or executable test rather than merely restating the
 committed conclusion. Keep internal reasoning bounded and reserve enough completion budget to emit
-one complete JSON object."""
+one complete JSON object. Keep claims and evidence diagnostic and concise: include at most eight of
+each and summarize repetitive calculations instead of enumerating every intermediate value."""
 
     RECONCILE_SYSTEM = """You are the final consistency pass inside Roy's frozen Worker harness.
 Do not solve the task anew and do not add facts. Read the supplied structured result and return the
