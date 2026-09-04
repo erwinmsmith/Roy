@@ -842,6 +842,14 @@ def test_mia_functional_scores_direct_multihop_and_redundancy_without_llm() -> N
     assert objective.redundancy_correction > 0
     assert objective.objective < objective.direct_delivery + objective.multi_hop_delivery
 
+    certain = SemanticInformationLandscape(
+        landscape.agent_ids, landscape.directional_potential, landscape.redundancy,
+        landscape.conversion_fidelity, "A0", 0.0, "the root has no removable uncertainty",
+    )
+    certain_objective = MIAObjectiveEvaluator(certain).objective(matrix)
+    assert certain_objective.usable_delivery > 0
+    assert certain_objective.objective == 0.0
+
 
 def test_mia_gain_is_relative_to_current_committed_matrix() -> None:
     landscape = SemanticInformationLandscape(

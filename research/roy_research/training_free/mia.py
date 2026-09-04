@@ -91,6 +91,8 @@ class SemanticInformationLandscape:
 @dataclass(frozen=True)
 class MIAObjective:
     objective: float
+    usable_delivery: float
+    root_uncertainty: float
     direct_delivery: float
     multi_hop_delivery: float
     redundancy_correction: float
@@ -104,7 +106,7 @@ class MIAObjective:
 class MIAObjectiveEvaluator:
     """Pure numerical matrix evaluator; evaluating W never invokes an LLM."""
 
-    name = "mia_matrix_functional_v1"
+    name = "mia_matrix_functional_v2"
 
     def __init__(
         self,
@@ -168,8 +170,15 @@ class MIAObjectiveEvaluator:
                     * propagation[left][root]
                     * propagation[right][root]
                 )
+        usable_delivery = max(0.0, total - correction)
+        # Information delivered to an already-certain root is not information
+        # gain. Bound the objective by the Judge's current removable uncertainty
+        # while preserving matrix ordering below saturation.
+        objective = landscape.root_uncertainty * min(1.0, usable_delivery)
         return MIAObjective(
-            objective=total - correction,
+            objective=objective,
+            usable_delivery=usable_delivery,
+            root_uncertainty=landscape.root_uncertainty,
             direct_delivery=direct,
             multi_hop_delivery=total - direct,
             redundancy_correction=correction,

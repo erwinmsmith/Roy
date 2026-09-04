@@ -269,7 +269,9 @@ semantic estimates, not measured bits. With `P=(W*G_hat)Lambda_hat`, the MIA
 functional accumulates direct and bounded multi-hop delivery to the root and
 subtracts redundancy through an inclusion-exclusion correction. The root is an
 absorbing destination so cycles cannot manufacture repeatedly "new"
-information. Capacity and hard-dependency constraints define the admissible
+information. Its net usable delivery is gated and bounded by the Judge's current
+root uncertainty, so an already-certain root has zero predicted information gain
+even when a redundant verifier could send a high-quality message. Capacity and hard-dependency constraints define the admissible
 matrix space.
 
 For no expansion, matrix search starts at `W_t`; for expansion it starts at
