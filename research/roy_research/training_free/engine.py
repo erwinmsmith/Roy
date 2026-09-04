@@ -195,6 +195,14 @@ class TrainingFreeRun:
     cumulative_information_gain: float
     harness_config: AgentHarnessConfig
 
+    @property
+    def initial_root_answer(self) -> str:
+        checkpoint = next(
+            item for item in self.checkpoints
+            if item.phase == "search_state" and item.round_index == 0
+        )
+        return str(checkpoint.agents["A0"]["result"]["candidate_answer"])
+
     def organization_summary(self) -> Dict[str, int]:
         return {
             "rounds": len(self.rounds),
@@ -247,6 +255,7 @@ class TrainingFreeRun:
             },
             "task_id": self.task_id,
             "benchmark": self.benchmark,
+            "initial_root_answer": self.initial_root_answer,
             "final_answer": self.final_answer,
             "final_agents": {key: value.to_dict() for key, value in self.final_agents.items()},
             "final_matrix": self.final_matrix.to_dict(),
@@ -290,6 +299,7 @@ class SingleAgentRun:
             "method": "single_agent_direct",
             "task_id": self.task_id,
             "benchmark": self.benchmark,
+            "initial_root_answer": self.final_answer,
             "final_answer": self.final_answer,
             "final_agents": {"A0": self.final_agent.to_dict()},
             "final_matrix": InformationMatrix.zero(["A0"]).to_dict(),
@@ -655,7 +665,7 @@ class RoyTrainingFreeEngine:
     def run_direct(self, task: BenchmarkTask) -> SingleAgentRun:
         """Run the matched one-Agent baseline without organization search."""
         self._configure_task(task)
-        root = self.worker.execute_local(
+        root = self.worker.execute_root(
             self._root_agent(task), task.benchmark, tool_scope="committed",
         )
         root.status = AgentStatus.DONE
@@ -710,22 +720,27 @@ class RoyTrainingFreeEngine:
                     item.to_dict() for item in events if item.scope != "committed"
                 ][-16:],
             }
+            proposal_agent = agent
             if round_index == 0:
-                _result, graph = self.worker.execute(
-                    agent,
-                    benchmark,
-                    round_index=round_index,
-                    max_candidates=self.config.maximum_candidates,
-                    organization_context=organization_context,
+                proposal_agent = self.worker.execute_root(
+                    agent, benchmark, tool_scope="committed",
                 )
-                executed[agent_id] = agent
-            else:
-                graph = self.worker.propose_candidates(
-                    agent,
-                    round_index=round_index,
-                    max_candidates=self.config.maximum_candidates,
-                    organization_context=organization_context,
+                executed[agent_id] = proposal_agent
+            remaining_capacity = max(0, self.config.maximum_agents - len(agents))
+            minimum_candidates = 0
+            if remaining_capacity and agent_id == "A0":
+                minimum_candidates = min(
+                    3 if round_index == 0 else 1,
+                    remaining_capacity,
+                    self.config.maximum_candidates,
                 )
+            graph = self.worker.propose_candidates(
+                proposal_agent,
+                round_index=round_index,
+                max_candidates=self.config.maximum_candidates,
+                minimum_candidates=minimum_candidates,
+                organization_context=organization_context,
+            )
             collisions = set(nodes) & set(graph.nodes)
             if collisions:
                 raise ValueError(f"parents proposed duplicate candidate ids: {sorted(collisions)}")

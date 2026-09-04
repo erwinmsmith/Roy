@@ -172,9 +172,11 @@ class MIAObjectiveEvaluator:
                 )
         usable_delivery = max(0.0, total - correction)
         # Information delivered to an already-certain root is not information
-        # gain. Bound the objective by the Judge's current removable uncertainty
-        # while preserving matrix ordering below saturation.
-        objective = landscape.root_uncertainty * min(1.0, usable_delivery)
+        # gain. Both quantities use the same normalized semantic scale, so the
+        # realizable gain is their intersection. Multiplication would attenuate
+        # the estimate twice and make modest uncertainty mathematically unable
+        # to cross the organization threshold even under decisive delivery.
+        objective = min(landscape.root_uncertainty, usable_delivery)
         return MIAObjective(
             objective=objective,
             usable_delivery=usable_delivery,

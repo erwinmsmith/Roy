@@ -1089,6 +1089,16 @@ def main(argv: List[str] | None = None) -> None:
                     })
                     if evaluator is not None:
                         completed_row["evaluation"] = evaluator.score(task, run.final_answer)
+                        initial_answer = str(completed_row["initial_root_answer"])
+                        completed_row["initial_root_evaluation"] = (
+                            completed_row["evaluation"]
+                            if initial_answer == run.final_answer
+                            else evaluator.score(task, initial_answer)
+                        )
+                        completed_row["within_trajectory_score_delta"] = (
+                            float(completed_row["evaluation"]["score"])
+                            - float(completed_row["initial_root_evaluation"]["score"])
+                        )
                     attempt_tokens += engine.audit.to_dict()["total_tokens"]
                     completed_row["all_attempts_total_tokens"] = attempt_tokens
                     row = completed_row

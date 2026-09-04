@@ -227,7 +227,12 @@ matrix with the pure numerical MIA functional; it performs zero semantic LLM
 rollouts and executes only the selected winner.
 
 Candidate proposal and candidate realization are deliberately different calls.
-The proposal is a cheap semantic direction. Only after global selection does an
+The root first runs through the exact same `root_worker` request used by the
+direct arm, and candidate proposal is then a separate call over that committed
+root state. The proposal is a cheap semantic direction. When a model proposes
+too few directions, the runtime completes a generic epistemic portfolio with
+specification/assumption audit and adversarial falsification so correlated
+agreement cannot masquerade as verification. Only after global selection does an
 independently configurable external candidate model perform the high-compute
 `XRealizer` call. That call must explicitly configure the complete
 `X_i=(Q_i,R_i,C_i,M_i,T_i,Z_i,Sigma_i)` for every candidate. Incomplete states,
@@ -281,6 +286,12 @@ information. Its net usable delivery is gated and bounded by the Judge's current
 root uncertainty, so an already-certain root has zero predicted information gain
 even when a redundant verifier could send a high-quality message. Capacity and hard-dependency constraints define the admissible
 matrix space.
+The normalized objective is
+`min(root_uncertainty, usable_delivery)`: uncertainty is the ceiling on
+removable information, not a second multiplicative attenuation. The Judge must
+calibrate that ceiling from task-contract coverage, assumptions,
+contradictions, evidence quality, and method diversity rather than Agent
+self-reported confidence or correlated agreement.
 
 For no expansion, matrix search starts at `W_t`; for expansion it starts at
 `[[W_t,B_t],[C_t,D_t]]`. A coordinate neighbor changes one edge by only one

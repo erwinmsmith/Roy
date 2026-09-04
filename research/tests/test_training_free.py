@@ -76,13 +76,17 @@ class ScriptedClient:
         payload = json.loads(messages[1]["content"])
         self.calls.append({"purpose": purpose, "payload": payload, **kwargs})
         candidate_id = "r0_A0_c1"
-        if purpose == "worker":
+        if purpose == "root_worker":
             value = {
                 "result": {
                     "candidate_answer": "120", "claims": ["initial attempt"],
                     "evidence": [], "assumptions": [], "unresolved": ["angle sum check"],
                     "reasoning_summary": "An uncertain initial computation.", "confidence": 0.55,
                 },
+                "memory_entries": [],
+            }
+        elif purpose == "candidate_proposal":
+            value = {
                 "candidate_dependency_graph": {
                     "nodes": [{
                         "candidate_id": candidate_id, "parent_id": "A0",
@@ -219,6 +223,8 @@ def test_engine_commits_externally_realized_candidate_x() -> None:
     assert expensive[0]["max_tokens"] == config.candidate_realizer_max_tokens
     value = run.to_dict()
     assert value["schema_version"] == 5
+    assert value["initial_root_answer"] == "120"
+    assert value["final_answer"] == "135"
     assert value["agent_harness"]["schema_version"] == 1
     assert value["agent_harness"]["config"]["maximum_memory_entries"] == 64
     assert [checkpoint["phase"] for checkpoint in value["checkpoints"]] == [
@@ -234,7 +240,7 @@ def test_engine_commits_externally_realized_candidate_x() -> None:
     }
     assert value["organization_summary"] == {
         "rounds": 1,
-        "candidates_proposed": 1,
+        "candidates_proposed": 3,
         "candidate_subgraphs_realized": 1,
         "candidate_subgraphs_rejected": 0,
         "committed_expansions": 1,
@@ -243,9 +249,12 @@ def test_engine_commits_externally_realized_candidate_x() -> None:
         "committed_derivation_dependencies": 1,
     }
     worker_payload = next(
-        call["payload"] for call in client.calls if call["purpose"] == "worker"
+        call["payload"] for call in client.calls if call["purpose"] == "root_worker"
     )
-    organization = worker_payload["current_organization_context"]
+    proposal_payload = next(
+        call["payload"] for call in client.calls if call["purpose"] == "candidate_proposal"
+    )
+    organization = proposal_payload["current_organization_context"]
     assert organization["current_matrix"]["agent_ids"] == ["A0"]
     assert organization["recent_history"][0]["kind"] == "state_initialized"
     assert worker_payload["agent"]["harness_schema_version"] == 1
@@ -286,14 +295,43 @@ def test_matched_single_agent_direct_skips_all_organization_calls() -> None:
     )
     value = run.to_dict()
     assert value["method"] == "single_agent_direct"
-    assert value["final_answer"] == "135"
+    assert value["initial_root_answer"] == value["final_answer"]
+    assert value["final_answer"] == "120"
     assert value["rounds"] == []
     assert [call["purpose"] for call in client.calls] == [
-        "provisional_worker", "worker_result_reconciliation",
+        "root_worker", "worker_result_reconciliation",
     ]
     assert value["call_audit"]["calls"] == {
-        "provisional_worker": 1, "worker_result_reconciliation": 1,
+        "root_worker": 1, "worker_result_reconciliation": 1,
     }
+
+
+def test_roy_and_direct_use_the_identical_root_execution_request() -> None:
+    task = BenchmarkTask("same-root", "MATH", "pentagon", [], {"solution": "135"})
+    direct_client = ScriptedClient()
+    roy_client = ScriptedClient()
+    RoyTrainingFreeEngine(direct_client).run_direct(task)
+    RoyTrainingFreeEngine(
+        roy_client,
+        config=TrainingFreeConfig(maximum_agents=1, maximum_organization_rounds=1),
+    ).run(task)
+    direct_root = next(call for call in direct_client.calls if call["purpose"] == "root_worker")
+    roy_root = next(call for call in roy_client.calls if call["purpose"] == "root_worker")
+    assert direct_root["payload"] == roy_root["payload"]
+    assert direct_root["max_tokens"] == roy_root["max_tokens"]
+
+
+def test_initial_candidate_graph_has_generic_epistemic_coverage() -> None:
+    run = RoyTrainingFreeEngine(
+        ScriptedClient(),
+        config=TrainingFreeConfig(maximum_agents=4, maximum_organization_rounds=1),
+    ).run(BenchmarkTask("coverage", "MATH", "pentagon", [], {"solution": "135"}))
+    directions = [
+        node["direction"] for node in run.rounds[0].candidate_graph["nodes"]
+    ]
+    assert len(directions) >= 3
+    assert any("specification" in direction for direction in directions)
+    assert any("falsify" in direction for direction in directions)
 
 
 def test_math_worker_reconciles_candidate_answer_with_its_own_derivation() -> None:
@@ -302,7 +340,7 @@ def test_math_worker_reconciles_candidate_answer_with_its_own_derivation() -> No
 
         def complete(self, messages, **kwargs):
             purpose = kwargs["metadata"]["purpose"]
-            if purpose == "provisional_worker":
+            if purpose == "root_worker":
                 value = {
                     "result": {
                         "candidate_answer": "\\boxed{144}",
@@ -351,9 +389,9 @@ def test_worker_recovers_echoed_payload_with_reasoning_schema_retry() -> None:
         def complete(self, messages, **kwargs):
             purpose = kwargs["metadata"]["purpose"]
             self.calls.append((purpose, kwargs.get("thinking")))
-            if purpose == "provisional_worker":
+            if purpose == "root_worker":
                 return FakeCompletion(messages[1]["content"])
-            if purpose == "provisional_worker_schema_retry":
+            if purpose == "root_worker_schema_retry":
                 return FakeCompletion(json.dumps({
                     "result": {
                         "candidate_answer": "\\boxed{1}", "claims": ["the answer is 1"],
@@ -374,7 +412,7 @@ def test_worker_recovers_echoed_payload_with_reasoning_schema_retry() -> None:
         BenchmarkTask("math", "MATH", "solve this", [], {"solution": "1"})
     )
     assert run.final_answer == "\\boxed{1}"
-    assert ("provisional_worker_schema_retry", "enabled") in client.calls
+    assert ("root_worker_schema_retry", "enabled") in client.calls
 
 
 def test_json_llm_regenerates_malformed_json_once_with_reasoning() -> None:
@@ -439,6 +477,7 @@ def test_next_round_proposals_receive_committed_path_state() -> None:
         maximum_matrix_evaluations=4,
         communication_rounds=1,
         maximum_organization_rounds=2,
+        maximum_agents=2,
         information_gain_epsilon=0.001,
     )
     task = BenchmarkTask("math", "MATH", "pentagon", [], {"solution": "135"})
@@ -453,7 +492,7 @@ def test_next_round_proposals_receive_committed_path_state() -> None:
     ]
     assert second_round
     assert run.final_answer == "135"
-    assert sum(call["purpose"] == "worker" for call in client.calls) == 1
+    assert sum(call["purpose"] == "root_worker" for call in client.calls) == 1
     assert second_round[0]["committed_agent"]["result"]["candidate_answer"] == "135"
     context = second_round[0]["current_organization_context"]
     assert {item["relation"] for item in context["dependency_state"]} == {
@@ -949,6 +988,19 @@ def test_mia_gain_is_relative_to_current_committed_matrix() -> None:
     gain, observations = evaluator.evaluate({}, current)
     assert gain == pytest.approx(0.0)
     assert observations[0]["llm_rollouts"] == 0
+
+
+def test_mia_uses_intersection_not_product_of_uncertainty_and_delivery() -> None:
+    landscape = SemanticInformationLandscape(
+        ["A0", "A1"], [[0.0, 0.0], [0.2, 0.0]],
+        [[0.0, 0.0], [0.0, 0.0]], [1.0, 1.0],
+        "A0", 0.1, "A1 has a distinct check for the uncertain root",
+    )
+    matrix = InformationMatrix.zero(landscape.agent_ids)
+    matrix.set_weight("A1", "A0", 1.0)
+    objective = MIAObjectiveEvaluator(landscape).objective(matrix)
+    assert objective.usable_delivery == pytest.approx(0.2)
+    assert objective.objective == pytest.approx(0.1)
 
 
 def test_semantic_landscape_reorders_judge_axes_and_symmetrizes_redundancy() -> None:

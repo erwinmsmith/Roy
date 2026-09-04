@@ -13,6 +13,7 @@ from .types import (
     AgentState,
     AgentStatus,
     CandidateGraph,
+    CandidateNode,
     RealizedSubgraph,
     ResultState,
 )
@@ -165,8 +166,13 @@ rewrite that result, or mutate memory. Inspect the current MAS, matrix, dependen
 trajectory, then propose only genuinely unresolved cognitive directions as a dependency graph.
 Proposals are semantic drafts rather than complete agent configurations. Hard dependencies mean a
 candidate cannot execute without its producer; soft dependencies only indicate useful information
-flow. Never repeat a direction that the committed state or history already resolved. Return exactly
-one JSON object."""
+flow. Never repeat a direction that the committed state or history already resolved. Agreement and
+self-reported confidence are not external verification. When the requested minimum is positive,
+build an epistemically diverse portfolio rather than several copies of the same solution method:
+include independent reconstruction from task premises, specification/wording/edge-case and hidden-
+assumption audit, and adversarial falsification by an alternative method, invariant, tool, or test
+when capacity permits. A direction may confirm the current result, but it must be capable of
+discovering a shared mistake. Return exactly one JSON object."""
 
     def __init__(
         self,
@@ -285,6 +291,7 @@ one JSON object."""
         *,
         round_index: int,
         max_candidates: int,
+        minimum_candidates: int = 0,
         organization_context: Mapping[str, Any] | None = None,
     ) -> CandidateGraph:
         """Propose children from committed X_t without re-executing or mutating the parent."""
@@ -295,6 +302,11 @@ one JSON object."""
                 "round_index": round_index,
                 "candidate_id_prefix": f"r{round_index}_{agent.agent_id}_c",
                 "max_candidates": max_candidates,
+                "minimum_candidates": minimum_candidates,
+                "coverage_requirement": (
+                    "Use distinct epistemic operations: independent reconstruction, "
+                    "specification/assumption audit, and adversarial falsification when capacity permits."
+                ),
                 "committed_agent": AgentHarness(
                     agent, self.tools, self.harness_config,
                 ).execution_view(),
@@ -327,7 +339,67 @@ one JSON object."""
             raise ValueError(
                 f"Worker proposed {len(graph.nodes)} candidates; maximum is {max_candidates}"
             )
+        self._complete_epistemic_portfolio(
+            graph,
+            candidate_id_prefix=f"r{round_index}_{agent.agent_id}_c",
+            minimum_candidates=min(minimum_candidates, max_candidates),
+        )
         return graph
+
+    @staticmethod
+    def _complete_epistemic_portfolio(
+        graph: CandidateGraph,
+        *,
+        candidate_id_prefix: str,
+        minimum_candidates: int,
+    ) -> None:
+        """Guarantee generic epistemic coverage without configuring candidate X."""
+        templates = (
+            (
+                "Audit the exact task specification, wording, edge cases, and hidden assumptions; "
+                "identify any interpretation that changes the result.",
+                "High-confidence agents can agree after silently narrowing or misreading the contract.",
+                "A contract and assumption audit with decisive edge cases and a corrected result if needed.",
+                "All consequential wording and assumptions are enumerated and tested.",
+            ),
+            (
+                "Attempt to falsify the committed result using a genuinely different method, "
+                "invariant, counterexample, available tool, or executable test.",
+                "Adversarial evidence is more diagnostic than repeating the current method.",
+                "A counterexample or independent falsification report with a verified alternative result.",
+                "The current result is either falsified with evidence or survives a distinct decisive check.",
+            ),
+            (
+                "Independently reconstruct the result from the original task premises without "
+                "using the committed conclusion as a premise.",
+                "An independent derivation can expose a shared computational or reasoning error.",
+                "A self-contained alternative derivation and independently obtained result.",
+                "Every material step is checked and an independent result is reported.",
+            ),
+        )
+        occupied = set(graph.nodes)
+        template_index = 0
+        suffix = 0
+        while len(graph.nodes) < minimum_candidates:
+            candidate_id = f"{candidate_id_prefix}{suffix}"
+            suffix += 1
+            if candidate_id in occupied:
+                continue
+            direction, why_needed, expected_output, stop_condition = templates[
+                template_index % len(templates)
+            ]
+            template_index += 1
+            graph.nodes[candidate_id] = CandidateNode(
+                candidate_id=candidate_id,
+                parent_id=graph.parent_id,
+                direction=direction,
+                why_needed=why_needed,
+                required_inputs=[],
+                requested_tools=[],
+                expected_output=expected_output,
+                stop_condition=stop_condition,
+            )
+            occupied.add(candidate_id)
 
     def execute_local(
         self,
@@ -344,6 +416,37 @@ one JSON object."""
                 "instruction": (
                     "Execute the local objective now. Do not propose children. "
                     "Return the completed result and private memory updates."
+                ),
+                "required_schema": {
+                    "result": "ResultState", "memory_entries": ["string"],
+                    "tool_requests": ["optional ToolRequest"],
+                },
+            },
+            updated,
+            max_tokens=self.max_tokens,
+            tool_scope=tool_scope,
+        )
+        AgentHarness(updated, self.tools, self.harness_config).apply_model_update(
+            self._result_from_value(value, benchmark), value.get("memory_entries", []),
+        )
+        return updated
+
+    def execute_root(
+        self,
+        agent: AgentState,
+        benchmark: str,
+        *,
+        tool_scope: str = "committed",
+    ) -> AgentState:
+        """Execute the root through the one path shared by Roy and its direct arm."""
+        updated = copy.deepcopy(agent)
+        value = self._call_with_tools(
+            "root_worker",
+            {
+                "benchmark": benchmark,
+                "instruction": (
+                    "Solve the assigned root objective now. Do not propose or simulate children. "
+                    "Return only the completed result and private memory updates."
                 ),
                 "required_schema": {
                     "result": "ResultState", "memory_entries": ["string"],
@@ -682,7 +785,13 @@ information the source currently has for the receiver, conditional on what the r
 knows. R[i][j] is symmetric information redundancy in [0,1]. Lambda[i] is the receiving Agent's
 conversion fidelity in [0,1]. These are calibrated semantic estimates, never measured bits.
 Distinguish repeated conclusions from complementary evidence, respect direction and unresolved
-dependencies, and use the exact supplied agent order. Return JSON only."""
+dependencies, and use the exact supplied agent order. Root uncertainty estimates residual risk that
+the committed answer is wrong after auditing the exact task contract, assumptions, contradictions,
+evidence quality, and method diversity. It is not simply one minus self-reported confidence.
+Agreement among agents sharing an assumption or method is correlated evidence, not verification.
+Set root uncertainty to zero only when the supplied evidence is independently decisive. When agents
+disagree, it cannot be zero unless the supplied evidence conclusively refutes the alternatives.
+Return JSON only."""
 
     def __init__(self, llm: JsonLLM, max_tokens: int = 4096) -> None:
         self.llm, self.max_tokens = llm, max_tokens
@@ -716,7 +825,10 @@ dependencies, and use the exact supplied agent order. Return JSON only."""
                     ),
                     "redundancy": f"{size}x{size} symmetric R as arrays or agent-id map",
                     "conversion_fidelity": f"{size} Lambda values as array or agent-id map",
-                    "root_uncertainty": "number in [0,1] grounded in the root state",
+                    "root_uncertainty": (
+                        "residual probability-like risk in [0,1] after contract, assumption, "
+                        "contradiction, evidence-quality, and method-diversity audit"
+                    ),
                     "calibration_summary": "concise evidence-grounded rationale",
                 },
             },
