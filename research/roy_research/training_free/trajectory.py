@@ -44,7 +44,7 @@ class StateCheckpoint:
     checkpoint_id: str
     parent_checkpoint_id: str | None
     round_index: int
-    phase: Literal["initial", "post_execution", "committed", "terminal"]
+    phase: Literal["initial", "search_state", "committed", "terminal"]
     agents: Dict[str, Dict[str, Any]]
     matrix: Dict[str, Any]
     dependencies: List[Dict[str, Any]]
@@ -59,7 +59,7 @@ class StateCheckpoint:
         checkpoint_id: str,
         parent_checkpoint_id: str | None,
         round_index: int,
-        phase: Literal["initial", "post_execution", "committed", "terminal"],
+        phase: Literal["initial", "search_state", "committed", "terminal"],
         agents: Mapping[str, AgentState],
         matrix: InformationMatrix,
         dependencies: List[DependencyRecord],

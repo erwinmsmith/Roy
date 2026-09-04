@@ -254,7 +254,10 @@ before registry execution. Each result records the harness schema and limits.
 The runtime is path-dependent rather than a sequence of independent graph
 searches. Its committed state is `S_t=(X_t,W_t,D_t,H_t)`: private Agent state,
 the current information matrix, dependency/derivation state, and an append-only
-event ledger. Every Parent proposal receives its current matrix, peer summaries,
+event ledger. The root is executed exactly once to initialize `X_0`. After a
+winner is executed, its committed `X_(t+1)` is reused directly by the next
+proposal/Judge/search round; Parents are never implicitly rerun or allowed to
+overwrite that transition with a fresh sample. Every Parent proposal receives its current matrix, peer summaries,
 private memory, active dependencies, committed history, and a separately marked
 counterfactual search history. Provisional candidate events cannot leak into
 `q_t`.
@@ -281,7 +284,7 @@ continues; it stops only when both reorganization and admissible expansion fail
 to exceed the predicted MIA-gain threshold. Selected dependency subgraphs
 of up to two nodes provide the V1 short-horizon lookahead.
 
-Every output now includes schema-v4 generic `information_state` checkpoints,
+Every output now includes schema-v5 generic `information_state` checkpoints,
 `event_ledger`,
 `dependency_ledger`, `matrix_trajectory`, `agent_basis_trajectory`, cumulative
 predicted MIA gain, the complete per-round semantic landscape, every numerically

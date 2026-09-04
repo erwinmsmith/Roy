@@ -25,6 +25,7 @@ from roy_research.training_free.llm import (
     CandidateXRealizer,
     JsonLLM,
     WorkerModel,
+    parse_json_object,
 )
 from roy_research.training_free.mia import (
     MIAObjectiveEvaluator,
@@ -217,11 +218,11 @@ def test_engine_commits_externally_realized_candidate_x() -> None:
     assert expensive[0]["thinking"] == "disabled"
     assert expensive[0]["max_tokens"] == config.candidate_realizer_max_tokens
     value = run.to_dict()
-    assert value["schema_version"] == 4
+    assert value["schema_version"] == 5
     assert value["agent_harness"]["schema_version"] == 1
     assert value["agent_harness"]["config"]["maximum_memory_entries"] == 64
     assert [checkpoint["phase"] for checkpoint in value["checkpoints"]] == [
-        "initial", "post_execution", "committed",
+        "initial", "search_state", "committed",
     ]
     assert value["rounds"][0]["transition_kind"] == "expand"
     assert value["rounds"][0]["topology_drift"]["agent_expansion"] == 1
@@ -348,15 +349,9 @@ def test_next_round_proposals_receive_committed_path_state() -> None:
         def complete(self, messages, **kwargs):
             purpose = kwargs["metadata"]["purpose"]
             payload = json.loads(messages[1]["content"])
-            if purpose == "worker" and payload["round_index"] == 1:
+            if purpose == "candidate_proposal" and payload["round_index"] == 1:
                 self.calls.append({"purpose": purpose, "payload": payload, **kwargs})
                 return FakeCompletion(json.dumps({
-                    "result": {
-                        "candidate_answer": "135", "claims": ["verified"],
-                        "evidence": [], "assumptions": [], "unresolved": [],
-                        "reasoning_summary": "The earlier gap is resolved.", "confidence": 0.99,
-                    },
-                    "memory_entries": ["do not repeat the resolved angle check"],
                     "candidate_dependency_graph": {"nodes": [], "dependencies": []},
                 }))
             return super().complete(messages, **kwargs)
@@ -379,9 +374,13 @@ def test_next_round_proposals_receive_committed_path_state() -> None:
     assert run.rounds[1].transition_kind == "stop"
     second_round = [
         call["payload"] for call in client.calls
-        if call["purpose"] == "worker" and call["payload"].get("round_index") == 1
+        if call["purpose"] == "candidate_proposal"
+        and call["payload"].get("round_index") == 1
     ]
     assert second_round
+    assert run.final_answer == "135"
+    assert sum(call["purpose"] == "worker" for call in client.calls) == 1
+    assert second_round[0]["committed_agent"]["result"]["candidate_answer"] == "135"
     context = second_round[0]["current_organization_context"]
     assert {item["relation"] for item in context["dependency_state"]} == {
         "derivation", "hard",
@@ -392,6 +391,14 @@ def test_next_round_proposals_receive_committed_path_state() -> None:
     assert len(run.to_dict()["matrix_trajectory"]) == 3
     assert run.to_dict()["call_audit"]["calls"]["semantic_information_judge"] == 2
     assert sum(event.kind == "winner_matrix_executed" for event in run.event_ledger) == 1
+
+
+def test_json_parser_repairs_unescaped_latex_without_masking_truncation() -> None:
+    assert parse_json_object(r'{"answer":"\boxed{2\sqrt{3}}"}') == {
+        "answer": r"\boxed{2\sqrt{3}}",
+    }
+    with pytest.raises(json.JSONDecodeError):
+        parse_json_object('{"answer":"unterminated')
 
 
 def test_candidate_graph_closes_hard_predecessors_and_rejects_cycles() -> None:

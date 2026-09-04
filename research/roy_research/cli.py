@@ -1103,7 +1103,7 @@ def main(argv: List[str] | None = None) -> None:
                     })
             if row is None:
                 row = {
-                    "schema_version": 4,
+                    "schema_version": 5,
                     "method": (
                         "single_agent_direct" if args.arm == "single_agent_direct"
                         else "training_free_information_flow_search"

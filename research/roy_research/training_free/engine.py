@@ -91,7 +91,7 @@ class TrainingFreeConfig:
 class RoundRecord:
     round_index: int
     state_before_checkpoint_id: str
-    post_execution_checkpoint_id: str
+    search_state_checkpoint_id: str
     committed_checkpoint_id: str | None
     information_measure: str
     information_state_before: Dict[str, Any]
@@ -114,7 +114,7 @@ class RoundRecord:
         return {
             "round_index": self.round_index,
             "state_before_checkpoint_id": self.state_before_checkpoint_id,
-            "post_execution_checkpoint_id": self.post_execution_checkpoint_id,
+            "search_state_checkpoint_id": self.search_state_checkpoint_id,
             "committed_checkpoint_id": self.committed_checkpoint_id,
             "information_measure": self.information_measure,
             "information_state_before": self.information_state_before,
@@ -224,13 +224,14 @@ class TrainingFreeRun:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "schema_version": 4,
+            "schema_version": 5,
             "method": "training_free_information_flow_search",
             "search_architecture": {
                 "semantic_judge": "once_per_organization_round",
                 "matrix_objective": "pure_mia_functional",
                 "candidate_matrix_llm_rollouts": 0,
                 "execution_policy": "winner_only",
+                "state_transition_policy": "initialize_once_then_winner_execution_only",
             },
             "agent_harness": {
                 "schema_version": AGENT_HARNESS_SCHEMA_VERSION,
@@ -285,7 +286,7 @@ class SingleAgentRun:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "schema_version": 4,
+            "schema_version": 5,
             "method": "single_agent_direct",
             "task_id": self.task_id,
             "benchmark": self.benchmark,
@@ -375,12 +376,17 @@ class RoyTrainingFreeEngine:
 
         for round_index in range(self.config.maximum_organization_rounds):
             state_before_checkpoint_id = last_checkpoint_id
-            candidate_graph, executed_parent_ids = self._execute_parents_and_collect_candidates(
+            candidate_graph, executed_parent_ids = self._prepare_parents_and_collect_candidates(
                 agents, matrix, dependencies, events, task.benchmark, round_index,
             )
             events.append(TrajectoryEvent(
-                f"event-{len(events)}", round_index, "parents_executed",
-                {"agent_ids": executed_parent_ids, "matrix": matrix.to_dict()},
+                f"event-{len(events)}", round_index,
+                "parent_states_initialized" if round_index == 0 else "parent_states_reused",
+                {
+                    "executed_agent_ids": executed_parent_ids,
+                    "reused_agent_ids": [] if round_index == 0 else sorted(agents),
+                    "matrix": matrix.to_dict(),
+                },
             ))
             events.append(TrajectoryEvent(
                 f"event-{len(events)}", round_index, "step_candidates_proposed",
@@ -471,10 +477,10 @@ class RoyTrainingFreeEngine:
                 },
                 scope="audit",
             ))
-            post_execution_checkpoint_id = f"checkpoint-{round_index}-post-execution"
+            search_state_checkpoint_id = f"checkpoint-{round_index}-search-state"
             checkpoints.append(StateCheckpoint.capture(
-                post_execution_checkpoint_id, state_before_checkpoint_id, round_index,
-                "post_execution", agents, matrix, dependencies,
+                search_state_checkpoint_id, state_before_checkpoint_id, round_index,
+                "search_state", agents, matrix, dependencies,
                 information_state_before, events,
             ))
             evaluator = MIAObjectiveEvaluator(
@@ -542,7 +548,7 @@ class RoyTrainingFreeEngine:
                 ))
                 committed_checkpoint_id = f"checkpoint-{round_index}-terminal"
                 checkpoints.append(StateCheckpoint.capture(
-                    committed_checkpoint_id, post_execution_checkpoint_id, round_index,
+                    committed_checkpoint_id, search_state_checkpoint_id, round_index,
                     "terminal", agents, matrix, dependencies,
                     information_state_before, events,
                 ))
@@ -596,7 +602,7 @@ class RoyTrainingFreeEngine:
                     "state_changed_after_winner_execution": True,
                 }
                 checkpoints.append(StateCheckpoint.capture(
-                    committed_checkpoint_id, post_execution_checkpoint_id, round_index,
+                    committed_checkpoint_id, search_state_checkpoint_id, round_index,
                     "committed", agents, matrix, dependencies,
                     checkpoint_information_state, events,
                 ))
@@ -605,7 +611,7 @@ class RoyTrainingFreeEngine:
             record = RoundRecord(
                 round_index=round_index,
                 state_before_checkpoint_id=state_before_checkpoint_id,
-                post_execution_checkpoint_id=post_execution_checkpoint_id,
+                search_state_checkpoint_id=search_state_checkpoint_id,
                 committed_checkpoint_id=committed_checkpoint_id,
                 information_measure="mia_semantic_landscape",
                 information_state_before=information_state_before,
@@ -674,7 +680,7 @@ class RoyTrainingFreeEngine:
         ]
         self.worker.configure_tools(self.tool_registry)
 
-    def _execute_parents_and_collect_candidates(
+    def _prepare_parents_and_collect_candidates(
         self,
         agents: Dict[str, AgentState],
         matrix: InformationMatrix,
@@ -692,25 +698,34 @@ class RoyTrainingFreeEngine:
             agent = state_snapshot[agent_id]
             if agent.status in (AgentStatus.DORMANT, AgentStatus.FAILED, AgentStatus.WAITING):
                 continue
-            _result, graph = self.worker.execute(
-                agent,
-                benchmark,
-                round_index=round_index,
-                max_candidates=self.config.maximum_candidates,
-                organization_context={
-                    "current_matrix": matrix.to_dict(),
-                    "other_agents": {
-                        other_id: AgentHarness(other).public_summary()
-                        for other_id, other in state_snapshot.items() if other_id != agent_id
-                    },
-                    "dependency_state": [item.to_dict() for item in state_dependencies[-32:]],
-                    "recent_history": _recent_committed_history(events),
-                    "recent_search_history": [
-                        item.to_dict() for item in events if item.scope != "committed"
-                    ][-16:],
+            organization_context = {
+                "current_matrix": matrix.to_dict(),
+                "other_agents": {
+                    other_id: AgentHarness(other).public_summary()
+                    for other_id, other in state_snapshot.items() if other_id != agent_id
                 },
-            )
-            executed[agent_id] = agent
+                "dependency_state": [item.to_dict() for item in state_dependencies[-32:]],
+                "recent_history": _recent_committed_history(events),
+                "recent_search_history": [
+                    item.to_dict() for item in events if item.scope != "committed"
+                ][-16:],
+            }
+            if round_index == 0:
+                _result, graph = self.worker.execute(
+                    agent,
+                    benchmark,
+                    round_index=round_index,
+                    max_candidates=self.config.maximum_candidates,
+                    organization_context=organization_context,
+                )
+                executed[agent_id] = agent
+            else:
+                graph = self.worker.propose_candidates(
+                    agent,
+                    round_index=round_index,
+                    max_candidates=self.config.maximum_candidates,
+                    organization_context=organization_context,
+                )
             collisions = set(nodes) & set(graph.nodes)
             if collisions:
                 raise ValueError(f"parents proposed duplicate candidate ids: {sorted(collisions)}")

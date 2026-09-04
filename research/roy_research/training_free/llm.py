@@ -120,6 +120,15 @@ single MATH boxed answer actually entailed by its claims, evidence, and reasonin
 fields do not entail a unique answer, preserve the existing candidate_answer and mark ambiguity.
 Return JSON only."""
 
+    PROPOSE_SYSTEM = """You are Roy's frozen step-level candidate proposer. The supplied agent
+state is already the committed result of the previous transition. Never solve the task again,
+rewrite that result, or mutate memory. Inspect the current MAS, matrix, dependencies, and recent
+trajectory, then propose only genuinely unresolved cognitive directions as a dependency graph.
+Proposals are semantic drafts rather than complete agent configurations. Hard dependencies mean a
+candidate cannot execute without its producer; soft dependencies only indicate useful information
+flow. Never repeat a direction that the committed state or history already resolved. Return exactly
+one JSON object."""
+
     def __init__(
         self,
         llm: JsonLLM,
@@ -230,6 +239,56 @@ Return JSON only."""
             self._result_from_value(value, benchmark), value.get("memory_entries", []),
         )
         return updated
+
+    def propose_candidates(
+        self,
+        agent: AgentState,
+        *,
+        round_index: int,
+        max_candidates: int,
+        organization_context: Mapping[str, Any] | None = None,
+    ) -> CandidateGraph:
+        """Propose children from committed X_t without re-executing or mutating the parent."""
+        value = self.llm.call(
+            "candidate_proposal",
+            self.PROPOSE_SYSTEM,
+            {
+                "round_index": round_index,
+                "candidate_id_prefix": f"r{round_index}_{agent.agent_id}_c",
+                "max_candidates": max_candidates,
+                "committed_agent": AgentHarness(
+                    agent, self.tools, self.harness_config,
+                ).execution_view(),
+                "current_organization_context": dict(organization_context or {}),
+                "required_schema": {
+                    "candidate_dependency_graph": {
+                        "nodes": [{
+                            "candidate_id": "unique string using candidate_id_prefix",
+                            "parent_id": agent.agent_id,
+                            "direction": "what unresolved issue to investigate",
+                            "why_needed": "specific unresolved issue",
+                            "required_inputs": ["artifact references"],
+                            "requested_tools": ["available tool id"],
+                            "expected_output": "verifiable output",
+                            "stop_condition": "observable completion condition",
+                        }],
+                        "dependencies": [{
+                            "source": "agent/candidate id", "target": "candidate id",
+                            "kind": "hard|soft", "artifact": "required information",
+                        }],
+                    },
+                },
+            },
+            max_tokens=self.max_tokens,
+        )
+        graph = CandidateGraph.from_dict(
+            value.get("candidate_dependency_graph", {}), agent.agent_id,
+        )
+        if len(graph.nodes) > max_candidates:
+            raise ValueError(
+                f"Worker proposed {len(graph.nodes)} candidates; maximum is {max_candidates}"
+            )
+        return graph
 
     def execute_local(
         self,
@@ -712,13 +771,70 @@ def parse_json_object(content: str) -> Dict[str, Any]:
     fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
     if fenced:
         text = fenced.group(1)
-    try:
-        value = json.loads(text)
-    except json.JSONDecodeError:
-        start, end = text.find("{"), text.rfind("}")
-        if start < 0 or end <= start:
-            raise
-        value = json.loads(text[start : end + 1])
+    candidates = [text]
+    start, end = text.find("{"), text.rfind("}")
+    if start >= 0 and end > start and (start != 0 or end != len(text) - 1):
+        candidates.append(text[start : end + 1])
+    first_error: json.JSONDecodeError | None = None
+    value: Any = None
+    for candidate in candidates:
+        repaired = _escape_invalid_json_backslashes(candidate)
+        attempts = (repaired, candidate) if repaired != candidate else (candidate,)
+        for attempt in attempts:
+            try:
+                value = json.loads(attempt)
+                break
+            except json.JSONDecodeError as error:
+                first_error = first_error or error
+        else:
+            continue
+        break
+    else:
+        assert first_error is not None
+        raise first_error
     if not isinstance(value, dict):
         raise ValueError("LLM response must be a JSON object")
     return value
+
+
+def _escape_invalid_json_backslashes(text: str) -> str:
+    """Repair common LaTeX backslashes while leaving valid JSON escapes unchanged."""
+    output: List[str] = []
+    index = 0
+    inside_string = False
+    hexadecimal = frozenset("0123456789abcdefABCDEF")
+    latex_commands_with_json_escape_prefix = (
+        "begin", "boxed", "boldsymbol", "frac", "neq", "not", "right", "text",
+    )
+    while index < len(text):
+        character = text[index]
+        if character == '"':
+            inside_string = not inside_string
+            output.append(character)
+            index += 1
+            continue
+        if inside_string and character == "\\":
+            following = text[index + 1] if index + 1 < len(text) else ""
+            suffix = text[index + 1 :]
+            if suffix.startswith(latex_commands_with_json_escape_prefix):
+                output.append("\\\\")
+                index += 1
+                continue
+            if following in '"\\/bfnrt':
+                output.extend((character, following))
+                index += 2
+                continue
+            if (
+                following == "u"
+                and index + 5 < len(text)
+                and all(item in hexadecimal for item in text[index + 2 : index + 6])
+            ):
+                output.append(text[index : index + 6])
+                index += 6
+                continue
+            output.append("\\\\")
+            index += 1
+            continue
+        output.append(character)
+        index += 1
+    return "".join(output)
