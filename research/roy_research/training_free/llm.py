@@ -76,11 +76,12 @@ class JsonLLM:
         temperature: float = 0.0,
         thinking: str | None = "disabled",
     ) -> Dict[str, Any]:
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False, sort_keys=True)},
+        ]
         completion = self.client.complete(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False, sort_keys=True)},
-            ],
+            messages,
             max_tokens=max_tokens,
             temperature=temperature,
             metadata={"purpose": purpose},
@@ -93,7 +94,45 @@ class JsonLLM:
                 f"{purpose} returned empty content after {completion.completion_tokens} "
                 "completion tokens; increase its budget or disable provider reasoning"
             )
-        return parse_json_object(completion.content)
+        try:
+            return parse_json_object(completion.content)
+        except json.JSONDecodeError as error:
+            retry_purpose = f"{purpose}_json_retry"
+            retry_payload = {
+                **payload,
+                "_protocol_retry": {
+                    "reason": f"invalid JSON: {error.msg}",
+                    "instruction": (
+                        "Regenerate the requested semantic result. Return exactly one valid JSON "
+                        "object with the required schema. Do not quote, repair, or echo the prior "
+                        "response or this request."
+                    ),
+                },
+            }
+            retry = self.client.complete(
+                [
+                    {
+                        "role": "system",
+                        "content": system + "\nA prior protocol attempt produced invalid JSON.",
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(retry_payload, ensure_ascii=False, sort_keys=True),
+                    },
+                ],
+                max_tokens=max_tokens,
+                temperature=temperature,
+                metadata={"purpose": retry_purpose},
+                json_mode=True,
+                thinking="enabled",
+            )
+            self.audit.record(retry_purpose, retry)
+            if not retry.content.strip():
+                raise ValueError(
+                    f"{retry_purpose} returned empty content after {retry.completion_tokens} "
+                    "completion tokens"
+                ) from error
+            return parse_json_object(retry.content)
 
 
 class WorkerModel:

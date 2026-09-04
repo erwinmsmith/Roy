@@ -377,6 +377,31 @@ def test_worker_recovers_echoed_payload_with_reasoning_schema_retry() -> None:
     assert ("provisional_worker_schema_retry", "enabled") in client.calls
 
 
+def test_json_llm_regenerates_malformed_json_once_with_reasoning() -> None:
+    class MalformedThenValidClient:
+        model = "malformed-then-valid"
+
+        def __init__(self):
+            self.calls = []
+
+        def complete(self, messages, **kwargs):
+            self.calls.append((kwargs["metadata"]["purpose"], kwargs.get("thinking")))
+            if len(self.calls) == 1:
+                return FakeCompletion('{"answer": "broken"')
+            payload = json.loads(messages[1]["content"])
+            assert payload["_protocol_retry"]["reason"].startswith("invalid JSON")
+            return FakeCompletion('{"answer": "valid"}')
+
+    client = MalformedThenValidClient()
+    audit = CallAudit()
+    value = JsonLLM(client, audit).call(
+        "unit", "Return JSON.", {"required_schema": {"answer": "string"}}, max_tokens=64,
+    )
+    assert value == {"answer": "valid"}
+    assert client.calls == [("unit", "disabled"), ("unit_json_retry", "enabled")]
+    assert audit.calls == {"unit": 1, "unit_json_retry": 1}
+
+
 def test_runtime_preserves_immutable_original_task_from_candidate_realizer() -> None:
     agent = AgentState.from_dict(
         {
