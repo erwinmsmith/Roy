@@ -465,9 +465,9 @@ class RoyTrainingFreeEngine:
                         {"subgraph_id": subgraph_id, "error": rejected[subgraph_id]},
                         scope="counterfactual",
                     ))
-            if rejected:
+            if selected and not realized:
                 raise RuntimeError(
-                    "selected candidate portfolio was not fully realized: "
+                    "selected candidate portfolio produced no usable subgraph: "
                     + "; ".join(f"{key}={value}" for key, value in sorted(rejected.items()))
                 )
 

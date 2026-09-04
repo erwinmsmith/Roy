@@ -212,6 +212,7 @@ def test_cognitive_prompt_priors_change_behavior_not_state_space() -> None:
     assert "one unresolved information need" in CandidateXRealizer.SYSTEM
     assert "from that receiver's current state" in SemanticInformationJudge.SYSTEM
     assert "not for the sender" in ChannelizerModel.SYSTEM
+    assert "smallest checkable witness" in ChannelizerModel.SYSTEM
     combined = "\n".join((
         WorkerModel.PROPOSE_SYSTEM, GlobalSelector.SYSTEM, CandidateXRealizer.SYSTEM,
         SemanticInformationJudge.SYSTEM, ChannelizerModel.SYSTEM,
@@ -543,7 +544,7 @@ def test_engine_fails_closed_when_selected_candidate_x_never_materializes() -> N
                 return FakeCompletion("", completion_tokens=8192, total_tokens=8202)
             return super().complete(messages, **kwargs)
 
-    with pytest.raises(RuntimeError, match="portfolio was not fully realized"):
+    with pytest.raises(RuntimeError, match="portfolio produced no usable subgraph"):
         RoyTrainingFreeEngine(
             EmptyCandidateClient(),
             config=TrainingFreeConfig(
@@ -551,6 +552,40 @@ def test_engine_fails_closed_when_selected_candidate_x_never_materializes() -> N
                 maximum_organization_rounds=1,
             ),
         ).run(BenchmarkTask("math", "MATH", "solve", [], {"solution": "1"}))
+
+
+def test_engine_keeps_valid_subgraphs_when_a_peer_candidate_fails() -> None:
+    class PartialCandidateClient(ScriptedClient):
+        def complete(self, messages, **kwargs):
+            purpose = kwargs["metadata"]["purpose"]
+            payload = json.loads(messages[1]["content"])
+            if purpose == "global_selector":
+                candidate_ids = [
+                    node["candidate_id"] for node in payload["candidate_graph"]["nodes"][:2]
+                ]
+                self.fail_id = candidate_ids[1]
+                return FakeCompletion(json.dumps({
+                    "selected_subgraphs": [
+                        {"candidate_ids": [candidate_id], "selection_reason": "distinct evidence"}
+                        for candidate_id in candidate_ids
+                    ],
+                }))
+            if purpose.startswith("candidate_x_realization"):
+                selected = payload.get("selected_candidate_subgraph", {}).get("nodes", [])
+                if selected and selected[0]["candidate_id"] == self.fail_id:
+                    return FakeCompletion("", completion_tokens=8192, total_tokens=8202)
+            return super().complete(messages, **kwargs)
+
+    run = RoyTrainingFreeEngine(
+        PartialCandidateClient(),
+        config=TrainingFreeConfig(
+            maximum_selected_subgraphs=2, maximum_nodes_per_subgraph=1,
+            maximum_organization_rounds=1, information_gain_epsilon=0.001,
+        ),
+    ).run(BenchmarkTask("math", "MATH", "solve", [], {"solution": "135"}))
+    assert run.final_answer == "135"
+    assert len(run.rounds[0].realized_candidates) == 1
+    assert len(run.rounds[0].rejected_candidates) == 1
 
 
 def test_json_llm_regenerates_malformed_json_once_with_reasoning() -> None:

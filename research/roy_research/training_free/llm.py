@@ -325,7 +325,11 @@ discovering a shared mistake. Return exactly one JSON object."""
                     "in the task takes precedence over a learned genre/dataset convention unless "
                     "the task defines that convention; benchmark provenance is not evidence. If a "
                     "message supplies counterexamples to a claim, "
-                    "address them explicitly before accepting or rejecting it. Return result and "
+                    "address them explicitly before accepting or rejecting it. When competing "
+                    "claims differ on a deterministic calculation, count, test, or executable "
+                    "behavior and an applicable tool is available, request that tool instead of "
+                    "resolving the dispute by confidence or an unchecked assertion. Replay the "
+                    "smallest decisive calculation before choosing the answer. Return result and "
                     "memory_entries."
                 ),
                 "required_schema": {
@@ -992,7 +996,10 @@ critical evidence; high capacity may add derivation, assumptions, uncertainty, c
 provenance. Communicate for the receiver, not for the sender: subtract facts already present in the
 receiver state and prioritize grounded corrections, contradictions, decisive evidence, and unresolved
 implications most likely to revise or refine that state. Do not spend capacity on repeated background
-or a sender-centric summary. Never invent facts or expose unrelated memory. Return JSON only."""
+or a sender-centric summary. Transmit the smallest checkable witness that supports a correction, such
+as the decisive indexed item, counterexample, equation, tool observation, or test behavior. Every
+factual detail must be traceable to the supplied source state; never manufacture stronger evidence.
+Never invent facts or expose unrelated memory. Return JSON only."""
 
     def __init__(self, llm: JsonLLM, max_tokens: int = 768) -> None:
         self.llm, self.max_tokens = llm, max_tokens
