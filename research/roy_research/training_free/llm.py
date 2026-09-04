@@ -579,9 +579,11 @@ dependencies, and use the exact supplied agent order. Return JSON only."""
                 "current_state_context": dict(state_context or {}),
                 "required_schema": {
                     "agent_ids": "exact supplied agent_ids in the same order",
-                    "directional_potential": f"{size}x{size} G, row=source column=receiver",
-                    "redundancy": f"{size}x{size} symmetric R",
-                    "conversion_fidelity": f"{size} Lambda values",
+                    "directional_potential": (
+                        f"{size}x{size} G as arrays or agent-id map; row=source column=receiver"
+                    ),
+                    "redundancy": f"{size}x{size} symmetric R as arrays or agent-id map",
+                    "conversion_fidelity": f"{size} Lambda values as array or agent-id map",
                     "root_uncertainty": "number in [0,1] grounded in the root state",
                     "calibration_summary": "concise evidence-grounded rationale",
                 },

@@ -860,6 +860,28 @@ def test_semantic_landscape_reorders_judge_axes_and_symmetrizes_redundancy() -> 
     assert landscape.conversion_fidelity == [0.5, 0.9]
 
 
+def test_semantic_landscape_accepts_agent_id_maps_from_judge() -> None:
+    landscape = SemanticInformationLandscape.from_dict(
+        {
+            "agent_ids": ["A0", "A1"],
+            "directional_potential": {
+                "A0": {"A0": 0.0, "A1": 0.1},
+                "A1": {"A0": 0.8, "A1": 0.0},
+            },
+            "redundancy": {
+                "A0": {"A0": 0.0, "A1": 0.3},
+                "A1": {"A0": 0.3, "A1": 0.0},
+            },
+            "conversion_fidelity": {"A0": 0.9, "A1": 0.7},
+            "root_uncertainty": 0.2,
+            "calibration_summary": "mapped output",
+        },
+        expected_agent_ids=["A0", "A1"], root_id="A0",
+    )
+    assert landscape.directional_potential[1][0] == 0.8
+    assert landscape.conversion_fidelity == [0.9, 0.7]
+
+
 def test_rollout_promotes_new_root_answer_into_dynamic_hypothesis_support() -> None:
     class ExactAnswerProbe:
         def posterior(self, root, support, benchmark, state_context):

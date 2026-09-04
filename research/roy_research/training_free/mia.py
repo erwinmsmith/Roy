@@ -37,10 +37,12 @@ class SemanticInformationLandscape:
         expected = list(expected_agent_ids)
         if len(supplied_ids) != len(expected) or set(supplied_ids) != set(expected):
             raise ValueError("Semantic Judge must return every supplied agent exactly once")
-        source_g = _square_matrix(value.get("directional_potential"), len(expected), "G")
-        source_r = _square_matrix(value.get("redundancy"), len(expected), "R")
+        source_g = _square_matrix(
+            value.get("directional_potential"), supplied_ids, "G",
+        )
+        source_r = _square_matrix(value.get("redundancy"), supplied_ids, "R")
         source_lambdas = _unit_vector(
-            value.get("conversion_fidelity"), len(expected), "conversion_fidelity",
+            value.get("conversion_fidelity"), supplied_ids, "conversion_fidelity",
         )
         source_index = {agent_id: index for index, agent_id in enumerate(supplied_ids)}
         order = [source_index[agent_id] for agent_id in expected]
@@ -202,15 +204,35 @@ def _matmul(left: List[List[float]], right: List[List[float]]) -> List[List[floa
     ]
 
 
-def _square_matrix(value: Any, size: int, name: str) -> List[List[float]]:
-    rows = list(value or [])
+def _square_matrix(value: Any, agent_ids: Sequence[str], name: str) -> List[List[float]]:
+    size = len(agent_ids)
+    if isinstance(value, Mapping):
+        if set(map(str, value)) != set(agent_ids):
+            raise ValueError(f"Semantic Judge {name} mapping has incorrect row ids")
+        rows = []
+        for source in agent_ids:
+            row = value[source]
+            if isinstance(row, Mapping):
+                if set(map(str, row)) != set(agent_ids):
+                    raise ValueError(f"Semantic Judge {name} mapping has incorrect column ids")
+                rows.append([row[target] for target in agent_ids])
+            else:
+                rows.append(list(row))
+    else:
+        rows = list(value or [])
     if len(rows) != size or any(len(list(row)) != size for row in rows):
         raise ValueError(f"Semantic Judge {name} must be {size}x{size}")
     return [[_unit(float(item), name) for item in row] for row in rows]
 
 
-def _unit_vector(value: Any, size: int, name: str) -> List[float]:
-    items = list(value or [])
+def _unit_vector(value: Any, agent_ids: Sequence[str], name: str) -> List[float]:
+    size = len(agent_ids)
+    if isinstance(value, Mapping):
+        if set(map(str, value)) != set(agent_ids):
+            raise ValueError(f"Semantic Judge {name} mapping has incorrect agent ids")
+        items = [value[agent_id] for agent_id in agent_ids]
+    else:
+        items = list(value or [])
     if len(items) != size:
         raise ValueError(f"Semantic Judge {name} must contain {size} values")
     return [_unit(float(item), name) for item in items]
