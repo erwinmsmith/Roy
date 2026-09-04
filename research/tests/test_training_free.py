@@ -108,6 +108,7 @@ class ScriptedClient:
                 "candidate_ids": [candidate_id], "selection_reason": "resolves the only gap",
             }]}
         elif purpose == "candidate_x_realization":
+            candidate_id = payload["selected_candidate_subgraph"]["nodes"][0]["candidate_id"]
             value = {
                 "configuration_reasoning_summary": "Use an independent arithmetic verifier.",
                 "risks": ["may repeat the root approach"],
@@ -329,9 +330,17 @@ def test_initial_candidate_graph_has_generic_epistemic_coverage() -> None:
     directions = [
         node["direction"] for node in run.rounds[0].candidate_graph["nodes"]
     ]
+    operations = {
+        node["epistemic_operation"] for node in run.rounds[0].candidate_graph["nodes"]
+    }
     assert len(directions) >= 3
     assert any("specification" in direction for direction in directions)
     assert any("falsify" in direction for direction in directions)
+    assert {"specification_audit", "adversarial_falsification"} <= operations
+    assert (
+        len(run.rounds[0].realized_candidates)
+        + len(run.rounds[0].rejected_candidates)
+    ) == 3
 
 
 def test_math_worker_reconciles_candidate_answer_with_its_own_derivation() -> None:
@@ -413,6 +422,48 @@ def test_worker_recovers_echoed_payload_with_reasoning_schema_retry() -> None:
     )
     assert run.final_answer == "\\boxed{1}"
     assert ("root_worker_schema_retry", "enabled") in client.calls
+
+
+def test_json_llm_retries_reasoning_that_exhausts_budget_before_json() -> None:
+    class EmptyThenValidClient:
+        model = "empty-then-valid"
+
+        def __init__(self):
+            self.calls = []
+
+        def complete(self, messages, **kwargs):
+            self.calls.append(kwargs["metadata"]["purpose"])
+            if len(self.calls) == 1:
+                return FakeCompletion("", completion_tokens=8192, total_tokens=8202)
+            return FakeCompletion(json.dumps({"answer": "complete"}))
+
+    client = EmptyThenValidClient()
+    audit = CallAudit()
+    value = JsonLLM(client, audit).call(
+        "candidate_x_realization", "configure X", {},
+        max_tokens=16_384, thinking="enabled",
+    )
+    assert value == {"answer": "complete"}
+    assert client.calls == [
+        "candidate_x_realization", "candidate_x_realization_empty_retry",
+    ]
+
+
+def test_engine_fails_closed_when_selected_candidate_x_never_materializes() -> None:
+    class EmptyCandidateClient(ScriptedClient):
+        def complete(self, messages, **kwargs):
+            if kwargs["metadata"]["purpose"].startswith("candidate_x_realization"):
+                return FakeCompletion("", completion_tokens=8192, total_tokens=8202)
+            return super().complete(messages, **kwargs)
+
+    with pytest.raises(RuntimeError, match="portfolio was not fully realized"):
+        RoyTrainingFreeEngine(
+            EmptyCandidateClient(),
+            config=TrainingFreeConfig(
+                maximum_selected_subgraphs=1, maximum_nodes_per_subgraph=1,
+                maximum_organization_rounds=1,
+            ),
+        ).run(BenchmarkTask("math", "MATH", "solve", [], {"solution": "1"}))
 
 
 def test_json_llm_regenerates_malformed_json_once_with_reasoning() -> None:

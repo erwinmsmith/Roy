@@ -16,7 +16,7 @@
   "worker_max_tokens": 2048,
   "result_reconciler_max_tokens": 256,
   "selector_max_tokens": 1024,
-  "candidate_realizer_max_tokens": 8192,
+  "candidate_realizer_max_tokens": 16384,
   "channelizer_max_tokens": 768,
   "semantic_judge_max_tokens": 4096,
   "mia_path_horizon": 3,

@@ -178,6 +178,7 @@ class CandidateDependency:
 class CandidateNode:
     candidate_id: str
     parent_id: str
+    epistemic_operation: str
     direction: str
     why_needed: str
     required_inputs: List[str]
@@ -192,11 +193,19 @@ class CandidateNode:
         why_needed = str(value.get("why_needed", "")).strip()
         expected_output = str(value.get("expected_output", "")).strip()
         stop_condition = str(value.get("stop_condition", "")).strip()
+        operation = str(value.get("epistemic_operation", "targeted_gap")).strip()
+        allowed_operations = {
+            "independent_reconstruction", "specification_audit",
+            "adversarial_falsification", "targeted_gap",
+        }
+        if operation not in allowed_operations:
+            raise ValueError(f"invalid epistemic operation: {operation}")
         if not all((candidate_id, direction, why_needed, expected_output, stop_condition)):
             raise ValueError("candidate proposal is incomplete")
         return cls(
             candidate_id=candidate_id,
             parent_id=str(value.get("parent_id") or parent_id),
+            epistemic_operation=operation,
             direction=direction,
             why_needed=why_needed,
             required_inputs=_strings(value.get("required_inputs")),

@@ -63,7 +63,7 @@ class TrainingFreeConfig:
     worker_max_tokens: int = 2048
     result_reconciler_max_tokens: int = 256
     selector_max_tokens: int = 1024
-    candidate_realizer_max_tokens: int = 4096
+    candidate_realizer_max_tokens: int = 16_384
     channelizer_max_tokens: int = 768
     semantic_judge_max_tokens: int = 4096
     mia_path_horizon: int = 3
@@ -456,6 +456,11 @@ class RoyTrainingFreeEngine:
                         {"subgraph_id": subgraph_id, "error": rejected[subgraph_id]},
                         scope="counterfactual",
                     ))
+            if rejected:
+                raise RuntimeError(
+                    "selected candidate portfolio was not fully realized: "
+                    + "; ".join(f"{key}={value}" for key, value in sorted(rejected.items()))
+                )
 
             state_context = {
                 "current_matrix": matrix.to_dict(),

@@ -232,7 +232,10 @@ direct arm, and candidate proposal is then a separate call over that committed
 root state. The proposal is a cheap semantic direction. When a model proposes
 too few directions, the runtime completes a generic epistemic portfolio with
 specification/assumption audit and adversarial falsification so correlated
-agreement cannot masquerade as verification. Only after global selection does an
+agreement cannot masquerade as verification. Each draft carries an explicit
+generic `epistemic_operation`, and the pre-execution selector preserves distinct
+operations while subgraph capacity remains instead of predicting away the one
+direction that could falsify a shared error. Only after global selection does an
 independently configurable external candidate model perform the high-compute
 `XRealizer` call. That call must explicitly configure the complete
 `X_i=(Q_i,R_i,C_i,M_i,T_i,Z_i,Sigma_i)` for every candidate. Incomplete states,
@@ -240,6 +243,10 @@ unknown tools, shared-memory namespaces, invalid dependencies, and wrong agent
 ids fail closed. All retained candidate subgraphs are included in the same
 one-shot Judge call, so neither candidates nor matrices receive separate
 semantic scoring calls.
+Reasoning-mode X realization receives a separate large completion budget and an
+audited empty-output retry. If any selected portfolio member still cannot be
+materialized, the task attempt fails closed and is retried; infrastructure or
+schema failure is never recorded as theoretical saturation.
 The checked MATH and V1 experiment configs enable provider reasoning for this
 call and give it the largest semantic completion budget; the Worker, selector,
 Channelizer, and Judge remain separate frozen calls.

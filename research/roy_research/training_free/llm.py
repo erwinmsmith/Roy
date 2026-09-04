@@ -91,10 +91,32 @@ class JsonLLM:
         )
         self.audit.record(purpose, completion)
         if not completion.content.strip():
-            raise ValueError(
-                f"{purpose} returned empty content after {completion.completion_tokens} "
-                "completion tokens; increase its budget or disable provider reasoning"
+            retry_purpose = f"{purpose}_empty_retry"
+            retry = self.client.complete(
+                [
+                    {
+                        "role": "system",
+                        "content": system + (
+                            "\nThe prior attempt consumed its completion budget without emitting "
+                            "the required object. Keep internal reasoning bounded and reserve enough "
+                            "tokens to return exactly one complete JSON object."
+                        ),
+                    },
+                    {"role": "user", "content": messages[1]["content"]},
+                ],
+                max_tokens=max_tokens,
+                temperature=temperature,
+                metadata={"purpose": retry_purpose},
+                json_mode=True,
+                thinking=thinking,
             )
+            self.audit.record(retry_purpose, retry)
+            if not retry.content.strip():
+                raise ValueError(
+                    f"{purpose} and its empty-output retry returned no content after "
+                    f"{completion.completion_tokens + retry.completion_tokens} completion tokens"
+                )
+            completion = retry
         try:
             return parse_json_object(completion.content)
         except json.JSONDecodeError as error:
@@ -221,9 +243,13 @@ discovering a shared mistake. Return exactly one JSON object."""
                     "memory_entries": ["new private-memory entry grounded in this execution"],
                     "candidate_dependency_graph": {
                         "nodes": [{
-                            "candidate_id": "unique string using candidate_id_prefix",
-                            "parent_id": agent.agent_id,
-                            "direction": "what to investigate, not a role label",
+                        "candidate_id": "unique string using candidate_id_prefix",
+                        "parent_id": agent.agent_id,
+                        "epistemic_operation": (
+                            "independent_reconstruction|specification_audit|"
+                            "adversarial_falsification|targeted_gap"
+                        ),
+                        "direction": "what to investigate, not a role label",
                             "why_needed": "specific unresolved issue",
                             "required_inputs": ["artifact references"],
                             "requested_tools": ["available tool id"],
@@ -316,6 +342,10 @@ discovering a shared mistake. Return exactly one JSON object."""
                         "nodes": [{
                             "candidate_id": "unique string using candidate_id_prefix",
                             "parent_id": agent.agent_id,
+                            "epistemic_operation": (
+                                "independent_reconstruction|specification_audit|"
+                                "adversarial_falsification|targeted_gap"
+                            ),
                             "direction": "what unresolved issue to investigate",
                             "why_needed": "specific unresolved issue",
                             "required_inputs": ["artifact references"],
@@ -356,6 +386,7 @@ discovering a shared mistake. Return exactly one JSON object."""
         """Guarantee generic epistemic coverage without configuring candidate X."""
         templates = (
             (
+                "specification_audit",
                 "Audit the exact task specification, wording, edge cases, and hidden assumptions; "
                 "identify any interpretation that changes the result.",
                 "High-confidence agents can agree after silently narrowing or misreading the contract.",
@@ -363,6 +394,7 @@ discovering a shared mistake. Return exactly one JSON object."""
                 "All consequential wording and assumptions are enumerated and tested.",
             ),
             (
+                "adversarial_falsification",
                 "Attempt to falsify the committed result using a genuinely different method, "
                 "invariant, counterexample, available tool, or executable test.",
                 "Adversarial evidence is more diagnostic than repeating the current method.",
@@ -370,6 +402,7 @@ discovering a shared mistake. Return exactly one JSON object."""
                 "The current result is either falsified with evidence or survives a distinct decisive check.",
             ),
             (
+                "independent_reconstruction",
                 "Independently reconstruct the result from the original task premises without "
                 "using the committed conclusion as a premise.",
                 "An independent derivation can expose a shared computational or reasoning error.",
@@ -378,6 +411,9 @@ discovering a shared mistake. Return exactly one JSON object."""
             ),
         )
         occupied = set(graph.nodes)
+        existing_operations = {
+            node.epistemic_operation for node in graph.nodes.values()
+        }
         template_index = 0
         suffix = 0
         while len(graph.nodes) < minimum_candidates:
@@ -385,13 +421,14 @@ discovering a shared mistake. Return exactly one JSON object."""
             suffix += 1
             if candidate_id in occupied:
                 continue
-            direction, why_needed, expected_output, stop_condition = templates[
-                template_index % len(templates)
-            ]
+            candidates = [item for item in templates if item[0] not in existing_operations]
+            template = candidates[0] if candidates else templates[template_index % len(templates)]
             template_index += 1
+            operation, direction, why_needed, expected_output, stop_condition = template
             graph.nodes[candidate_id] = CandidateNode(
                 candidate_id=candidate_id,
                 parent_id=graph.parent_id,
+                epistemic_operation=operation,
                 direction=direction,
                 why_needed=why_needed,
                 required_inputs=[],
@@ -400,6 +437,7 @@ discovering a shared mistake. Return exactly one JSON object."""
                 stop_condition=stop_condition,
             )
             occupied.add(candidate_id)
+            existing_operations.add(operation)
 
     def execute_local(
         self,
@@ -633,6 +671,30 @@ has no successful external/tool verification; self-reported confidence is not ve
             claimed_candidates.update(closure)
             selected.append(sorted(closure))
             if len(selected) == maximum_subgraphs:
+                break
+        # Selection happens before candidate execution, so a semantic selector
+        # cannot reliably know which distinct epistemic operation will uncover
+        # the error. Preserve portfolio coverage while capacity remains.
+        for operation in (
+            "specification_audit", "adversarial_falsification",
+            "independent_reconstruction",
+        ):
+            if len(selected) == maximum_subgraphs:
+                break
+            if any(
+                graph.nodes[node_id].epistemic_operation == operation
+                for group in selected for node_id in group
+            ):
+                continue
+            for node_id in sorted(graph.nodes):
+                if graph.nodes[node_id].epistemic_operation != operation:
+                    continue
+                closure = graph.hard_closure([node_id], agents)
+                if len(closure) > maximum_nodes or claimed_candidates.intersection(closure):
+                    continue
+                seen.add(closure)
+                claimed_candidates.update(closure)
+                selected.append(sorted(closure))
                 break
         return selected
 
