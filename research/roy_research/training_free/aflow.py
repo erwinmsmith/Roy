@@ -97,9 +97,11 @@ class AFlowEvaluator:
         self.python = python.expanduser().absolute()
         self.sandbox_prefix = list(human_eval_sandbox_prefix or [])
         self.timeout_seconds = timeout_seconds
+        self._math_scorer_checked = False
 
     def score(self, task: BenchmarkTask, prediction: str) -> Dict[str, Any]:
         if task.benchmark == "MATH":
+            self._ensure_math_symbolic_equivalence()
             script = """
 import json, sys
 from benchmarks.math import MATHBenchmark
@@ -130,6 +132,24 @@ print(json.dumps({'score': 1.0 if status == benchmark.PASS else 0.0, 'details': 
             "test": task.evaluator_payload["test"],
             "entry_point": task.evaluator_payload["entry_point"],
         }, prefix=self.sandbox_prefix)
+
+    def _ensure_math_symbolic_equivalence(self) -> None:
+        if self._math_scorer_checked:
+            return
+        script = r"""
+import json
+from benchmarks.math import MATHBenchmark
+benchmark = MATHBenchmark.__new__(MATHBenchmark)
+equivalent = benchmark.math_equal(r"12\sqrt{2}+16", r"16+12\sqrt{2}")
+print(json.dumps({'symbolic_equivalence': bool(equivalent)}))
+"""
+        result = self._invoke(script, {})
+        if not result.get("symbolic_equivalence", False):
+            raise RuntimeError(
+                "AFlow MATH symbolic equivalence is unavailable; install "
+                "antlr4-python3-runtime==4.11.1 in the selected AFlow environment"
+            )
+        self._math_scorer_checked = True
 
     def _invoke(
         self,

@@ -98,6 +98,10 @@ prepare_env() {
   command -v uv >/dev/null || { echo "uv is required" >&2; exit 4; }
   uv venv --python "${python_spec}" "${venv}"
   uv pip install --python "${venv}/bin/python" -r "${aflow_root}/requirements.txt"
+  # SymPy's AFlow MATH scorer imports this parser at runtime, but the pinned
+  # upstream requirements omit it. Without 4.11, symbolic equivalence silently
+  # degrades to string comparison.
+  uv pip install --python "${venv}/bin/python" "antlr4-python3-runtime==4.11.1"
 }
 
 smoke() {
@@ -143,6 +147,11 @@ async def main():
             name, len(await benchmark.load_data()),
             benchmark.calculate_score(row[answer_key], row[answer_key])[0],
         ))
+    math_benchmark = MATHBenchmark("MATH", "data/datasets/math_validate.jsonl", "/tmp")
+    checks.append((
+        "MATH-symbolic-equivalence", 1,
+        int(math_benchmark.math_equal(r"12\sqrt{2}+16", r"16+12\sqrt{2}")),
+    ))
     if not all(score == 1 for _, _, score in checks):
         raise SystemExit(f"AFlow scorer smoke failed: {checks}")
     print(json.dumps({"safe_scorer_smoke": checks}))

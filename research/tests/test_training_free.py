@@ -582,6 +582,18 @@ def test_aflow_evaluator_preserves_virtual_environment_launcher(tmp_path: Path) 
     assert evaluator.python == launcher.absolute()
 
 
+def test_aflow_math_scorer_fails_closed_without_symbolic_equivalence(
+    tmp_path: Path,
+) -> None:
+    evaluator = AFlowEvaluator(tmp_path, Path(sys.executable))
+    evaluator._invoke = lambda *args, **kwargs: {  # type: ignore[method-assign]
+        "symbolic_equivalence": False,
+    }
+    task = BenchmarkTask("math", "MATH", "solve", [], {"solution": "\\boxed{1}"})
+    with pytest.raises(RuntimeError, match="antlr4-python3-runtime"):
+        evaluator.score(task, "\\boxed{1}")
+
+
 def test_aflow_scorer_runs_from_disposable_writable_directory(tmp_path: Path) -> None:
     evaluator = AFlowEvaluator(tmp_path, Path(sys.executable))
     value = evaluator._invoke(

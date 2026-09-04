@@ -181,6 +181,11 @@ Roy also provides a fail-closed preparation/audit wrapper. On GPUHome, where
 the managed Python 3.9 download may be unavailable, Python 3.12 has passed the
 four non-code scorer smoke tests and can be selected explicitly. This is a
 host compatibility mode, not the upstream documented interpreter.
+The wrapper installs `antlr4-python3-runtime==4.11.1`, which the pinned AFlow
+requirements omit even though SymPy's MATH LaTeX parser requires it. Its scorer
+smoke explicitly checks commutative symbolic equivalence; Roy's evaluator also
+fails closed if that check is unavailable instead of silently reducing MATH to
+string matching.
 
 ```bash
 research/remote/prepare_aflow.sh check
