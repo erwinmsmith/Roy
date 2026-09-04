@@ -187,8 +187,11 @@ one complete JSON object."""
 
     RECONCILE_SYSTEM = """You are the final consistency pass inside Roy's frozen Worker harness.
 Do not solve the task anew and do not add facts. Read the supplied structured result and return the
-single MATH boxed answer actually entailed by its claims, evidence, and reasoning summary. If those
-fields do not entail a unique answer, preserve the existing candidate_answer and mark ambiguity.
+single MATH boxed answer actually entailed by its claims, evidence, and reasoning summary. Return a
+verdict of consistent when the existing candidate_answer already matches that derivation, corrected
+when the derivation uniquely entails a different answer, or ambiguous when it entails no unique
+answer. For corrected, candidate_answer must contain the corrected answer and must differ from the
+existing candidate_answer. For consistent or ambiguous, copy the existing candidate_answer exactly.
 Return JSON only."""
 
     PROPOSE_SYSTEM = """You are Roy's frozen step-level candidate proposer. The supplied agent
@@ -537,17 +540,27 @@ discovering a shared mistake. Return exactly one JSON object."""
                 "result": asdict(result),
                 "required_schema": {
                     "candidate_answer": "one exact boxed expression",
-                    "ambiguous": "boolean",
+                    "verdict": "consistent|corrected|ambiguous",
                     "basis": "short pointer to the supplied derivation",
                 },
             },
             max_tokens=self.result_reconciler_max_tokens,
         )
+        verdict = str(reconciled.get("verdict", "")).strip()
+        if verdict not in {"consistent", "corrected", "ambiguous"}:
+            raise ValueError("Worker reconciler omitted a valid consistency verdict")
         candidate = str(reconciled.get("candidate_answer", "")).strip()
-        if candidate and not bool(reconciled.get("ambiguous", False)):
-            if "\n" in candidate or len(candidate) > 256:
-                raise ValueError("Worker reconciler returned a non-concise MATH answer")
-            result.candidate_answer = candidate
+        if not candidate or "\n" in candidate or len(candidate) > 256:
+            raise ValueError("Worker reconciler returned a non-concise MATH answer")
+        if verdict in {"consistent", "ambiguous"}:
+            if candidate != result.candidate_answer:
+                raise ValueError(
+                    f"Worker reconciler changed an answer under verdict {verdict!r}"
+                )
+            return result
+        if candidate == result.candidate_answer:
+            raise ValueError("Worker reconciler claimed a correction but preserved the answer")
+        result.candidate_answer = candidate
         return result
 
     def _call_with_tools(

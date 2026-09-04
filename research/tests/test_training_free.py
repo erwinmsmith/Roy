@@ -164,7 +164,7 @@ class ScriptedClient:
         elif purpose == "worker_result_reconciliation":
             value = {
                 "candidate_answer": payload["result"]["candidate_answer"],
-                "ambiguous": False,
+                "verdict": "consistent",
                 "basis": "the supplied derivation",
             }
         elif purpose == "semantic_information_judge":
@@ -373,7 +373,7 @@ def test_math_worker_reconciles_candidate_answer_with_its_own_derivation() -> No
                 }
             elif purpose == "worker_result_reconciliation":
                 value = {
-                    "candidate_answer": "\\boxed{135}", "ambiguous": False,
+                    "candidate_answer": "\\boxed{135}", "verdict": "corrected",
                     "basis": "claims and reasoning both conclude 135",
                 }
             else:  # pragma: no cover
@@ -384,6 +384,36 @@ def test_math_worker_reconciles_candidate_answer_with_its_own_derivation() -> No
         BenchmarkTask("math", "MATH", "angle", [], {"solution": "135"})
     )
     assert run.final_answer == "\\boxed{135}"
+
+
+def test_math_worker_rejects_a_fake_reconciler_correction() -> None:
+    class FakeCorrectionClient:
+        model = "fake-correction"
+
+        def complete(self, messages, **kwargs):
+            purpose = kwargs["metadata"]["purpose"]
+            if purpose == "root_worker":
+                return FakeCompletion(json.dumps({
+                    "result": {
+                        "candidate_answer": "\\boxed{72}",
+                        "claims": ["The calculation gives 79.5"],
+                        "evidence": ["(73+86)/2=79.5"], "assumptions": [],
+                        "unresolved": [], "reasoning_summary": "The answer is 79.5.",
+                        "confidence": 1.0,
+                    },
+                    "memory_entries": [],
+                }))
+            if purpose == "worker_result_reconciliation":
+                return FakeCompletion(json.dumps({
+                    "candidate_answer": "\\boxed{72}", "verdict": "corrected",
+                    "basis": "72 conflicts with the derivation",
+                }))
+            raise AssertionError(purpose)
+
+    with pytest.raises(ValueError, match="claimed a correction"):
+        RoyTrainingFreeEngine(FakeCorrectionClient()).run_direct(
+            BenchmarkTask("math", "MATH", "mean", [], {"solution": "79.5"})
+        )
 
 
 def test_worker_fails_closed_when_provider_echoes_the_request_payload() -> None:
@@ -422,7 +452,7 @@ def test_worker_recovers_echoed_payload_with_reasoning_schema_retry() -> None:
                 }))
             if purpose == "worker_result_reconciliation":
                 return FakeCompletion(json.dumps({
-                    "candidate_answer": "\\boxed{1}", "ambiguous": False,
+                    "candidate_answer": "\\boxed{1}", "verdict": "consistent",
                     "basis": "the supplied result",
                 }))
             raise AssertionError(purpose)
@@ -859,7 +889,10 @@ def test_worker_recovers_from_malformed_tool_request() -> None:
         ["symbolic_math"], ResultState(), AgentStatus.READY, "answer", "done",
     )
     client = MalformedToolClient()
-    worker = WorkerModel(JsonLLM(client, CallAudit()), max_tool_rounds=1, max_tool_calls=1)
+    worker = WorkerModel(
+        JsonLLM(client, CallAudit()), max_tool_rounds=1, max_tool_calls=1,
+        result_reconciler_max_tokens=0,
+    )
     worker.configure_tools(TaskToolRegistry(task))
     updated = worker.execute_local(agent, "MATH")
     assert updated.result.candidate_answer == "\\boxed{2}"
