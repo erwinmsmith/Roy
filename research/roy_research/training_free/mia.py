@@ -206,11 +206,15 @@ class MIAObjectiveEvaluator:
                 )
         usable_delivery = max(0.0, total - correction)
         # Information delivered to an already-certain root is not information
-        # gain. Both quantities use the same normalized semantic scale, so the
-        # realizable gain is their intersection. Multiplication would attenuate
-        # the estimate twice and make modest uncertainty mathematically unable
-        # to cross the organization threshold even under decisive delivery.
-        objective = min(landscape.root_uncertainty, usable_delivery)
+        # gain. Use a smooth intersection that stays below both normalized
+        # quantities while remaining strictly monotone in delivery. A hard
+        # minimum creates plateaus where weak redundant support ties decisive
+        # contradictory evidence; a raw product over-attenuates modest values.
+        uncertainty = landscape.root_uncertainty
+        objective = (
+            uncertainty * usable_delivery / (uncertainty + usable_delivery)
+            if uncertainty > 0.0 and usable_delivery > 0.0 else 0.0
+        )
         return MIAObjective(
             objective=objective,
             usable_delivery=usable_delivery,

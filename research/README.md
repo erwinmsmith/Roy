@@ -297,9 +297,11 @@ information. Its net usable delivery is gated and bounded by the Judge's current
 root uncertainty, so an already-certain root has zero predicted information gain
 even when a redundant verifier could send a high-quality message. Capacity and hard-dependency constraints define the admissible
 matrix space.
-The normalized objective is
-`min(root_uncertainty, usable_delivery)`: uncertainty is the ceiling on
-removable information, not a second multiplicative attenuation. The Judge must
+The normalized objective uses the smooth bounded intersection
+`root_uncertainty * usable_delivery / (root_uncertainty + usable_delivery)`.
+Uncertainty remains the ceiling on removable information, while the objective
+stays strictly monotone in delivery so weak redundant support cannot tie
+decisive contradictory evidence on a hard saturation plateau. The Judge must
 calibrate that ceiling from task-contract coverage, assumptions,
 contradictions, evidence quality, and method diversity rather than Agent
 self-reported confidence or correlated agreement.

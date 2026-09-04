@@ -1075,7 +1075,23 @@ def test_mia_uses_intersection_not_product_of_uncertainty_and_delivery() -> None
     matrix.set_weight("A1", "A0", 1.0)
     objective = MIAObjectiveEvaluator(landscape).objective(matrix)
     assert objective.usable_delivery == pytest.approx(0.2)
-    assert objective.objective == pytest.approx(0.1)
+    assert objective.objective == pytest.approx(0.1 * 0.2 / 0.3)
+
+
+def test_mia_smooth_intersection_preserves_delivery_order_below_uncertainty_ceiling() -> None:
+    landscape = SemanticInformationLandscape(
+        ["A0", "weak", "strong"],
+        [[0.0, 0.0, 0.0], [0.2, 0.0, 0.0], [0.8, 0.0, 0.0]],
+        [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+        [1.0, 1.0, 1.0], "A0", 0.2, "strong has more novel evidence",
+    )
+    weak = InformationMatrix.zero(landscape.agent_ids)
+    weak.set_weight("weak", "A0", 1.0)
+    strong = InformationMatrix.zero(landscape.agent_ids)
+    strong.set_weight("strong", "A0", 1.0)
+    evaluator = MIAObjectiveEvaluator(landscape)
+    assert evaluator.objective(strong).objective > evaluator.objective(weak).objective
+    assert evaluator.objective(strong).objective < landscape.root_uncertainty
 
 
 def test_semantic_landscape_reorders_judge_axes_and_symmetrizes_redundancy() -> None:

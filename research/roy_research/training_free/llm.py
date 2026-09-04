@@ -296,7 +296,14 @@ discovering a shared mistake. Return exactly one JSON object."""
             {
                 "benchmark": benchmark,
                 "inbound_messages": inbound_messages,
-                "instruction": "Update Z and private M only. Return result and memory_entries.",
+                "instruction": (
+                    "Update Z and private M only. Adjudicate every substantive contradiction "
+                    "against the exact original task and explicit evidence. Do not preserve the "
+                    "current answer merely because of self-reported confidence, prior consensus, "
+                    "or an unstated convention. If a message supplies counterexamples to a claim, "
+                    "address them explicitly before accepting or rejecting it. Return result and "
+                    "memory_entries."
+                ),
                 "required_schema": {
                     "result": "ResultState", "memory_entries": ["string"],
                     "tool_requests": ["optional ToolRequest"],
