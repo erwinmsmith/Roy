@@ -321,7 +321,12 @@ one JSON object."""
         return updated
 
     def _result_from_value(self, value: Mapping[str, Any], benchmark: str) -> ResultState:
-        result = ResultState.from_dict(value.get("result"))
+        raw_result = value.get("result")
+        if not isinstance(raw_result, Mapping):
+            raise ValueError("Worker omitted the required top-level result object")
+        result = ResultState.from_dict(raw_result)
+        if not result.candidate_answer.strip():
+            raise ValueError("Worker returned an empty candidate_answer")
         if benchmark != "MATH" or self.result_reconciler_max_tokens <= 0:
             return result
         reconciled = self.llm.call(

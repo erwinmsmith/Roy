@@ -328,6 +328,19 @@ def test_math_worker_reconciles_candidate_answer_with_its_own_derivation() -> No
     assert run.final_answer == "\\boxed{135}"
 
 
+def test_worker_fails_closed_when_provider_echoes_the_request_payload() -> None:
+    class EchoClient:
+        model = "echo"
+
+        def complete(self, messages, **kwargs):
+            return FakeCompletion(messages[1]["content"])
+
+    with pytest.raises(ValueError, match="top-level result"):
+        RoyTrainingFreeEngine(EchoClient()).run_direct(
+            BenchmarkTask("math", "MATH", "solve this", [], {"solution": "1"})
+        )
+
+
 def test_runtime_preserves_immutable_original_task_from_candidate_realizer() -> None:
     agent = AgentState.from_dict(
         {
