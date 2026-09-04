@@ -727,7 +727,7 @@ def test_engine_keeps_valid_subgraphs_when_a_peer_candidate_fails() -> None:
     assert len(run.rounds[0].rejected_candidates) == 1
 
 
-def test_json_llm_regenerates_malformed_json_once_with_reasoning() -> None:
+def test_json_llm_regenerates_malformed_json_without_reasoning() -> None:
     class MalformedThenValidClient:
         model = "malformed-then-valid"
 
@@ -748,7 +748,7 @@ def test_json_llm_regenerates_malformed_json_once_with_reasoning() -> None:
         "unit", "Return JSON.", {"required_schema": {"answer": "string"}}, max_tokens=64,
     )
     assert value == {"answer": "valid"}
-    assert client.calls == [("unit", "disabled"), ("unit_json_retry", "enabled")]
+    assert client.calls == [("unit", "disabled"), ("unit_json_retry", "disabled")]
     assert audit.calls == {"unit": 1, "unit_json_retry": 1}
 
 
@@ -771,6 +771,23 @@ def test_json_llm_makes_reasoning_json_retry_non_thinking() -> None:
     )
     assert value == {"answer": "valid"}
     assert client.calls == [("unit", "enabled"), ("unit_json_retry", "disabled")]
+
+
+def test_math_basis_support_accepts_prose_for_matrix_and_degree_list() -> None:
+    from roy_research.training_free.llm import _math_answer_supported_by_basis
+
+    assert _math_answer_supported_by_basis(
+        r"\boxed{\begin{pmatrix} \frac{23}{8} \\ \frac{7}{4} \end{pmatrix}}",
+        "The derived point is (23/8, 7/4).",
+    )
+    assert _math_answer_supported_by_basis(
+        r"\boxed{4^\circ, 20^\circ}",
+        "The two solutions are 4 degrees and 20 degrees.",
+    )
+    assert not _math_answer_supported_by_basis(
+        r"\boxed{\frac{32}{9}}",
+        "The derivation concludes 6*sqrt(3).",
+    )
 
 
 def test_runtime_preserves_immutable_original_task_from_candidate_realizer() -> None:

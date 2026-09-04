@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Mapping, Protocol
 
@@ -122,7 +123,11 @@ class JsonLLM:
             return parse_json_object(completion.content)
         except json.JSONDecodeError as error:
             retry_purpose = f"{purpose}_json_retry"
-            retry_thinking = "disabled" if thinking == "enabled" else "enabled"
+            # Protocol recovery needs to spend the whole completion budget on a
+            # complete JSON object. Enabling reasoning here can consume the
+            # budget and leave content empty, which converts a usable task into
+            # a synthetic execution failure.
+            retry_thinking = "disabled"
             retry_payload = {
                 **payload,
                 "_protocol_retry": {
@@ -1212,7 +1217,34 @@ def parse_json_object(content: str) -> Dict[str, Any]:
 
 def _math_answer_supported_by_basis(candidate: str, basis: str) -> bool:
     answer_key = _normalized_math_text(candidate)
-    return bool(answer_key) and answer_key in _normalized_math_text(basis)
+    basis_key = _normalized_math_text(basis)
+    if not answer_key:
+        return False
+    if answer_key in basis_key:
+        return True
+    # The reconciler is allowed to point to a derivation in ordinary prose.
+    # Exact normalized substring matching is too strict for matrices, tuples,
+    # degree notation, and lists because presentation-only LaTeX commands and
+    # connective words differ. Preserve a fail-closed check by requiring every
+    # signed numeric atom in the answer (including multiplicity) to occur in
+    # the stated basis. Purely symbolic answers still require exact support.
+    answer_numbers = Counter(_math_numeric_tokens(candidate))
+    if not answer_numbers:
+        return False
+    basis_numbers = Counter(_math_numeric_tokens(basis))
+    return all(basis_numbers[token] >= count for token, count in answer_numbers.items())
+
+
+def _math_numeric_tokens(value: str) -> List[str]:
+    text = value.lower()
+    for source, target in {"−": "-", "–": "-", "＋": "+"}.items():
+        text = text.replace(source, target)
+    fraction = re.compile(r"\\(?:d|t)?frac\s*\{([^{}]+)\}\s*\{([^{}]+)\}")
+    while fraction.search(text):
+        text = fraction.sub(r"\1/\2", text)
+    text = re.sub(r"\\[a-zA-Z]+", " ", text)
+    text = text.replace("{", " ").replace("}", " ")
+    return re.findall(r"(?<![a-z0-9.])[-+]?\d+(?:\.\d+)?", text)
 
 
 def _normalized_math_text(value: str) -> str:
