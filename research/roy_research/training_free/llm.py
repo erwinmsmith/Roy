@@ -1151,7 +1151,7 @@ def _normalized_math_text(value: str) -> str:
     }.items():
         text = text.replace(source, target)
     text = re.sub(r"\\(?:cdot|times)\b", "*", text)
-    fraction = re.compile(r"\\frac\s*\{([^{}]+)\}\s*\{([^{}]+)\}")
+    fraction = re.compile(r"\\(?:d|t)?frac\s*\{([^{}]+)\}\s*\{([^{}]+)\}")
     while fraction.search(text):
         text = fraction.sub(r"\1/\2", text)
     text = re.sub(r"\\(?:boxed|text|mathrm)\b", "", text)

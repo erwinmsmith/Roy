@@ -251,7 +251,7 @@ def test_engine_commits_externally_realized_candidate_x() -> None:
     assert candidate_execution
     assert all(call["thinking"] == "enabled" for call in candidate_execution)
     assert all(call["max_tokens"] == config.candidate_worker_max_tokens for call in candidate_execution)
-    assert config.worker_max_tokens == 4096
+    assert config.worker_max_tokens == 8192
     assert config.candidate_worker_max_tokens == 16_384
     value = run.to_dict()
     assert value["schema_version"] == 5
@@ -488,6 +488,36 @@ def test_math_worker_accepts_unicode_equivalent_in_reconciler_basis() -> None:
     )
 
     assert result.final_answer == "\\boxed{7\\pi}"
+
+
+def test_math_worker_accepts_mixed_tfrac_in_reconciler_basis() -> None:
+    class MixedFractionBasisClient:
+        model = "mixed-fraction-basis"
+
+        def complete(self, messages, **kwargs):
+            if kwargs["metadata"]["purpose"] == "root_worker":
+                return FakeCompletion(json.dumps({
+                    "result": {
+                        "candidate_answer": "\\boxed{11\\tfrac{2}{3}}",
+                        "claims": ["The time is 700/60 = 11 2/3 hours."],
+                        "evidence": ["700 minutes divided by 60."],
+                        "assumptions": [], "unresolved": [],
+                        "reasoning_summary": "The result is 11 2/3 hours.", "confidence": 1.0,
+                    },
+                    "memory_entries": [],
+                }))
+            return FakeCompletion(json.dumps({
+                "candidate_answer": "\\boxed{11\\tfrac{2}{3}}", "verdict": "consistent",
+                "basis": "The derivation converts 700/60 to 11 2/3 hours.",
+            }))
+
+    result = RoyTrainingFreeEngine(MixedFractionBasisClient()).run_direct(
+        BenchmarkTask("math", "MATH", "convert 700 minutes to hours", [], {
+            "solution": "11\\tfrac{2}{3}",
+        })
+    )
+
+    assert result.final_answer == "\\boxed{11\\tfrac{2}{3}}"
 
 
 def test_worker_fails_closed_when_provider_echoes_the_request_payload() -> None:
