@@ -98,10 +98,18 @@ def expand_matrix(
             proposed[edge.target][edge.source] = max(proposed[edge.target].get(edge.source, 0.0), minimum)
 
     for target, sources in proposed.items():
-        total = sum(sources.values())
-        scale = 1.0 if total <= 1.0 else 1.0 / total
-        for source, weight in sources.items():
-            result.set_weight(source, target, round(weight * scale, 6))
+        # W_t is the immutable upper-left block of an expansion. New edges may
+        # consume only unused inbound capacity; the coordinate search can later
+        # lower an old edge and raise a new one in separate admissible steps.
+        additions = {
+            source: weight for source, weight in sources.items()
+            if result.weight(source, target) <= 0
+        }
+        available = max(0.0, 1.0 - result.inbound(target))
+        total = sum(additions.values())
+        scale = 0.0 if total <= 0 else min(1.0, available / total)
+        for source, weight in additions.items():
+            result.set_weight(source, target, weight * scale)
     result.validate()
     return result
 

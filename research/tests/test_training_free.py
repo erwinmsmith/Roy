@@ -781,6 +781,13 @@ def test_matrix_search_neighbors_are_local_and_expansion_preserves_old_block() -
     assert expanded.agent_ids == ["A0", "A1", "c1"]
     assert expanded.weight("A0", "A1") == current.weight("A0", "A1")
 
+    saturated = InformationMatrix.zero(["A0", "A1"])
+    saturated.set_weight("A0", "A1", 1.0)
+    saturated_expansion = expand_matrix(saturated, {"c1": child}, [])
+    saturated_expansion.validate()
+    assert saturated_expansion.weight("A0", "A1") == 1.0
+    assert saturated_expansion.weight("c1", "A1") == 0.0
+
     hard = [CandidateDependency("A1", "c1", "hard", "proof")]
     constrained = matrix_neighbors(expanded, (0.0, 0.5, 1.0), hard, 0.5)
     assert all(matrix.weight("A1", "c1") >= 0.5 for matrix in constrained)
