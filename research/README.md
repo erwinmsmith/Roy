@@ -299,6 +299,12 @@ removable information, not a second multiplicative attenuation. The Judge must
 calibrate that ceiling from task-contract coverage, assumptions,
 contradictions, evidence quality, and method diversity rather than Agent
 self-reported confidence or correlated agreement.
+The same Judge explicitly labels each Agent result relative to the root as
+`supports`, `contradicts`, `complements`, or `unresolved`. Because disagreement
+is information even before its truth is known, the runtime checks these labels
+against `G`: a contradictory source-to-root edge receives an auditable novelty
+floor derived from its estimated non-redundancy instead of allowing an
+internally inconsistent all-zero landscape to suppress communication.
 
 For no expansion, matrix search starts at `W_t`; for expansion it starts at
 `[[W_t,B_t],[C_t,D_t]]`. A coordinate neighbor changes one edge by only one

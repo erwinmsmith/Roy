@@ -853,6 +853,10 @@ evidence quality, and method diversity. It is not simply one minus self-reported
 Agreement among agents sharing an assumption or method is correlated evidence, not verification.
 Set root uncertainty to zero only when the supplied evidence is independently decisive. When agents
 disagree, it cannot be zero unless the supplied evidence conclusively refutes the alternatives.
+For every agent, classify its current result relative to the root as supports, contradicts,
+complements, or unresolved. G measures novel usable information rather than the probability that the
+source is correct: a substantive contradiction must have positive source-to-root potential so the
+root can inspect it, even when the Judge cannot yet determine which answer is correct.
 Return JSON only."""
 
     def __init__(self, llm: JsonLLM, max_tokens: int = 4096) -> None:
@@ -887,6 +891,10 @@ Return JSON only."""
                     ),
                     "redundancy": f"{size}x{size} symmetric R as arrays or agent-id map",
                     "conversion_fidelity": f"{size} Lambda values as array or agent-id map",
+                    "root_relations": (
+                        "agent-id map covering every agent with exactly one of "
+                        "supports|contradicts|complements|unresolved; root itself is supports"
+                    ),
                     "root_uncertainty": (
                         "residual probability-like risk in [0,1] after contract, assumption, "
                         "contradiction, evidence-quality, and method-diversity audit"

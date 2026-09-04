@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Sequence
 
 if TYPE_CHECKING:
@@ -24,6 +24,8 @@ class SemanticInformationLandscape:
     root_id: str
     root_uncertainty: float
     calibration_summary: str
+    root_relations: Dict[str, str] = field(default_factory=dict)
+    coherence_adjustments: List[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(
@@ -59,10 +61,40 @@ class SemanticInformationLandscape:
         if root_id not in expected:
             raise ValueError(f"Semantic Judge root {root_id!r} is absent")
         uncertainty = _unit(float(value.get("root_uncertainty", 1.0)), "root_uncertainty")
+        raw_relations = value.get("root_relations")
+        if not isinstance(raw_relations, Mapping) or set(map(str, raw_relations)) != set(expected):
+            raise ValueError("Semantic Judge root_relations must cover every supplied agent")
+        allowed_relations = {"supports", "contradicts", "complements", "unresolved"}
+        root_relations = {agent_id: str(raw_relations[agent_id]) for agent_id in expected}
+        invalid_relations = set(root_relations.values()) - allowed_relations
+        if invalid_relations:
+            raise ValueError(f"Semantic Judge returned invalid root relations: {sorted(invalid_relations)}")
+        if root_relations[root_id] != "supports":
+            raise ValueError("Semantic Judge must mark the root as supporting its own current answer")
+        root_index = expected.index(root_id)
+        adjustments: List[str] = []
+        for source, relation in root_relations.items():
+            if source == root_id:
+                continue
+            source_index_value = expected.index(source)
+            novelty = max(0.0, 1.0 - redundancy[source_index_value][root_index])
+            minimum = novelty if relation == "contradicts" else (
+                0.25 * novelty if relation == "complements" else 0.0
+            )
+            if g[source_index_value][root_index] + 1e-9 < minimum:
+                previous = g[source_index_value][root_index]
+                g[source_index_value][root_index] = minimum
+                adjustments.append(
+                    f"G[{source}][{root_id}] raised from {previous:.6g} to {minimum:.6g} "
+                    f"for relation={relation} and redundancy={redundancy[source_index_value][root_index]:.6g}"
+                )
         summary = str(value.get("calibration_summary", "")).strip()
         if not summary:
             raise ValueError("Semantic Judge omitted calibration_summary")
-        return cls(expected, g, redundancy, lambdas, root_id, uncertainty, summary)
+        return cls(
+            expected, g, redundancy, lambdas, root_id, uncertainty, summary,
+            root_relations, adjustments,
+        )
 
     @property
     def revision(self) -> str:
@@ -82,6 +114,8 @@ class SemanticInformationLandscape:
             self.root_id,
             self.root_uncertainty,
             self.calibration_summary,
+            {agent_id: self.root_relations.get(agent_id, "unresolved") for agent_id in selected},
+            list(self.coherence_adjustments),
         )
 
     def to_dict(self) -> Dict[str, Any]:

@@ -182,6 +182,10 @@ class ScriptedClient:
                 "directional_potential": g,
                 "redundancy": [[0.0 for _ in agent_ids] for _ in agent_ids],
                 "conversion_fidelity": [1.0 for _ in agent_ids],
+                "root_relations": {
+                    agent_id: ("supports" if agent_id == "A0" else "contradicts")
+                    for agent_id in agent_ids
+                },
                 "root_uncertainty": 0.1,
                 "calibration_summary": "Independent verification is novel for the root.",
             }
@@ -1061,6 +1065,7 @@ def test_semantic_landscape_reorders_judge_axes_and_symmetrizes_redundancy() -> 
             "directional_potential": [[0.0, 0.7], [0.2, 0.0]],
             "redundancy": [[0.0, 0.8], [0.6, 0.0]],
             "conversion_fidelity": [0.9, 0.5],
+            "root_relations": {"A1": "contradicts", "A0": "supports"},
             "root_uncertainty": 0.25,
             "calibration_summary": "ordered semantic estimates",
         },
@@ -1085,6 +1090,7 @@ def test_semantic_landscape_accepts_agent_id_maps_from_judge() -> None:
                 "A1": {"A0": 0.3, "A1": 0.0},
             },
             "conversion_fidelity": {"A0": 0.9, "A1": 0.7},
+            "root_relations": {"A0": "supports", "A1": "complements"},
             "root_uncertainty": 0.2,
             "calibration_summary": "mapped output",
         },
@@ -1092,6 +1098,23 @@ def test_semantic_landscape_accepts_agent_id_maps_from_judge() -> None:
     )
     assert landscape.directional_potential[1][0] == 0.8
     assert landscape.conversion_fidelity == [0.9, 0.7]
+
+
+def test_semantic_landscape_repairs_zero_gain_for_explicit_contradiction() -> None:
+    landscape = SemanticInformationLandscape.from_dict(
+        {
+            "agent_ids": ["A0", "A1"],
+            "directional_potential": [[0.0, 0.0], [0.0, 0.0]],
+            "redundancy": [[0.0, 0.2], [0.2, 0.0]],
+            "conversion_fidelity": [1.0, 1.0],
+            "root_relations": {"A0": "supports", "A1": "contradicts"},
+            "root_uncertainty": 0.4,
+            "calibration_summary": "A1 gives a conflicting answer that A0 must inspect.",
+        },
+        expected_agent_ids=["A0", "A1"], root_id="A0",
+    )
+    assert landscape.directional_potential[1][0] == pytest.approx(0.8)
+    assert landscape.coherence_adjustments
 
 
 def test_rollout_promotes_new_root_answer_into_dynamic_hypothesis_support() -> None:
