@@ -1139,6 +1139,18 @@ def _math_answer_supported_by_basis(candidate: str, basis: str) -> bool:
 
 def _normalized_math_text(value: str) -> str:
     text = value.lower()
+    for source, target in {
+        "π": "pi",
+        "√": "sqrt",
+        "−": "-",
+        "–": "-",
+        "×": "*",
+        "·": "*",
+        "÷": "/",
+        "∞": "infty",
+    }.items():
+        text = text.replace(source, target)
+    text = re.sub(r"\\(?:cdot|times)\b", "*", text)
     fraction = re.compile(r"\\frac\s*\{([^{}]+)\}\s*\{([^{}]+)\}")
     while fraction.search(text):
         text = fraction.sub(r"\1/\2", text)

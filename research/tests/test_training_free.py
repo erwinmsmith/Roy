@@ -462,6 +462,34 @@ def test_math_worker_rejects_answer_absent_from_reconciler_basis() -> None:
         )
 
 
+def test_math_worker_accepts_unicode_equivalent_in_reconciler_basis() -> None:
+    class UnicodePiBasisClient:
+        model = "unicode-pi-basis"
+
+        def complete(self, messages, **kwargs):
+            if kwargs["metadata"]["purpose"] == "root_worker":
+                return FakeCompletion(json.dumps({
+                    "result": {
+                        "candidate_answer": "\\boxed{3\\pi}",
+                        "claims": ["The difference is 20π - 13π = 7π."],
+                        "evidence": ["The region areas are 20π and 13π."],
+                        "assumptions": [], "unresolved": [],
+                        "reasoning_summary": "The difference is 7π.", "confidence": 1.0,
+                    },
+                    "memory_entries": [],
+                }))
+            return FakeCompletion(json.dumps({
+                "candidate_answer": "\\boxed{7\\pi}", "verdict": "corrected",
+                "basis": "The derivation concludes 20π − 13π = 7π.",
+            }))
+
+    result = RoyTrainingFreeEngine(UnicodePiBasisClient()).run_direct(
+        BenchmarkTask("math", "MATH", "find the area difference", [], {"solution": "7\\pi"})
+    )
+
+    assert result.final_answer == "\\boxed{7\\pi}"
+
+
 def test_worker_fails_closed_when_provider_echoes_the_request_payload() -> None:
     class EchoClient:
         model = "echo"
