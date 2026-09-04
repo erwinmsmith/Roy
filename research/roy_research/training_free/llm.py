@@ -378,6 +378,22 @@ one JSON object."""
                 working_payload,
                 max_tokens=max_tokens,
             )
+            if not self._has_complete_result(value) and not value.get("tool_requests"):
+                retry_payload = {
+                    **working_payload,
+                    "schema_retry_instruction": (
+                        "The prior response was invalid because it echoed the request or omitted "
+                        "a non-empty top-level result.candidate_answer. Execute the objective now. "
+                        "Return only the requested output object; never repeat the input payload."
+                    ),
+                }
+                value = self.llm.call(
+                    f"{purpose}_schema_retry",
+                    self.SYSTEM + "\nThe previous schema attempt failed. Do not echo any input.",
+                    retry_payload,
+                    max_tokens=max_tokens,
+                    thinking="enabled",
+                )
             raw_requests = value.get("tool_requests", [])
             if not raw_requests or tool_round == self.max_tool_rounds or calls >= self.max_tool_calls:
                 return value
@@ -415,6 +431,13 @@ one JSON object."""
                     "error": result.error,
                 })
         return value
+
+    @staticmethod
+    def _has_complete_result(value: Mapping[str, Any]) -> bool:
+        result = value.get("result")
+        return isinstance(result, Mapping) and bool(
+            str(result.get("candidate_answer", "")).strip()
+        )
 
 
 class GlobalSelector:

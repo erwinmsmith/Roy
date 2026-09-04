@@ -341,6 +341,42 @@ def test_worker_fails_closed_when_provider_echoes_the_request_payload() -> None:
         )
 
 
+def test_worker_recovers_echoed_payload_with_reasoning_schema_retry() -> None:
+    class EchoThenRecoverClient:
+        model = "echo-then-recover"
+
+        def __init__(self):
+            self.calls = []
+
+        def complete(self, messages, **kwargs):
+            purpose = kwargs["metadata"]["purpose"]
+            self.calls.append((purpose, kwargs.get("thinking")))
+            if purpose == "provisional_worker":
+                return FakeCompletion(messages[1]["content"])
+            if purpose == "provisional_worker_schema_retry":
+                return FakeCompletion(json.dumps({
+                    "result": {
+                        "candidate_answer": "\\boxed{1}", "claims": ["the answer is 1"],
+                        "evidence": [], "assumptions": [], "unresolved": [],
+                        "reasoning_summary": "Solved after a schema retry.", "confidence": 1.0,
+                    },
+                    "memory_entries": [],
+                }))
+            if purpose == "worker_result_reconciliation":
+                return FakeCompletion(json.dumps({
+                    "candidate_answer": "\\boxed{1}", "ambiguous": False,
+                    "basis": "the supplied result",
+                }))
+            raise AssertionError(purpose)
+
+    client = EchoThenRecoverClient()
+    run = RoyTrainingFreeEngine(client).run_direct(
+        BenchmarkTask("math", "MATH", "solve this", [], {"solution": "1"})
+    )
+    assert run.final_answer == "\\boxed{1}"
+    assert ("provisional_worker_schema_retry", "enabled") in client.calls
+
+
 def test_runtime_preserves_immutable_original_task_from_candidate_realizer() -> None:
     agent = AgentState.from_dict(
         {
