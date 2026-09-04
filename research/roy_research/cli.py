@@ -1049,6 +1049,11 @@ def main(argv: List[str] | None = None) -> None:
         if args.score:
             if args.aflow_python is None:
                 raise ValueError("--aflow-python is required with --score")
+            if args.benchmark == "HumanEval" and not args.human_eval_sandbox_command:
+                raise ValueError(
+                    "--human-eval-sandbox-command is required when scoring HumanEval; "
+                    "validate isolation before spending any LLM tokens"
+                )
             evaluator = AFlowEvaluator(
                 args.aflow_root,
                 args.aflow_python,
