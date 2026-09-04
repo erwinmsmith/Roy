@@ -204,8 +204,13 @@ rewrite that result, or mutate memory. Inspect the current MAS, matrix, dependen
 trajectory, then propose only genuinely unresolved cognitive directions as a dependency graph.
 Proposals are semantic drafts rather than complete agent configurations. Hard dependencies mean a
 candidate cannot execute without its producer; soft dependencies only indicate useful information
-flow. Never repeat a direction that the committed state or history already resolved. Agreement and
-self-reported confidence are not external verification. When the requested minimum is positive,
+flow. Before proposing, distinguish (1) what the parent has established, (2) what remains uncertain,
+(3) what has already been attempted or failed, and (4) which unresolved information another existing
+agent already covers. Never repeat a direction that the committed state, another agent, or history
+already resolves. Directions are distinct only when their evidence source or resolution mechanism is
+distinct, not merely because their role names or wording differ. Add a dependency only when one
+direction genuinely requires another direction's artifact. Agreement and self-reported confidence
+are not external verification. When the requested minimum is positive,
 build an epistemically diverse portfolio rather than several copies of the same solution method:
 include independent reconstruction from task premises, specification/wording/edge-case and hidden-
 assumption audit, and adversarial falsification by an alternative method, invariant, tool, or test
@@ -666,7 +671,12 @@ discovering a shared mistake. Return exactly one JSON object."""
 class GlobalSelector:
     SYSTEM = """You are Roy's frozen Global Semantic Searcher. Select a small set of distinct,
 dependency-closed candidate subgraphs that target unresolved issues and are not redundant with the
-current MAS. You do not execute candidates and do not assign numerical information-gain scores.
+current MAS. Treat the MAS as distributed evidence: compare the information each candidate intends
+to produce against every existing agent and other selected candidates. Prefer unresolved information
+that is not represented globally. Preserve complementary candidates whose evidence or mechanism is
+distinct even when they contradict the root or current majority; disagreement is not redundancy.
+Different names with the same intended evidence are redundant. You do not execute candidates and do
+not assign numerical information-gain scores.
 Return JSON only. Every selected subgraph must list candidate ids; hard predecessors will be closed
 and validated by the runtime. Retain at least one non-redundant independent verifier when the root
 has no successful external/tool verification; self-reported confidence is not verification."""
@@ -756,6 +766,11 @@ and adversarial roles to test literal domains, qualifiers, edge cases, and count
 than rationalizing the committed answer from an unstated convention. If explicit wording conflicts
 with a learned genre, dataset, or benchmark convention, the explicit wording has precedence unless
 the task itself defines the restriction; benchmark provenance is not evidence.
+
+For every candidate, ground Q in one unresolved information need, identify what the existing MAS
+already covers, and configure a distinct evidence source or resolution mechanism for the missing
+part. Do not create differently named agents that reproduce the same intended evidence. Preserve the
+selected dependency graph: dependencies represent required artifacts, not mere topical similarity.
 
 Q/objective must be narrow and executable. R/role is a capability boundary derived from Q, never a
 role-pool label. C/context must explicitly name mandatory artifact inputs and useful weighted source
@@ -899,6 +914,12 @@ G[source][receiver] is a directional potential in [0,1]: how much novel, usable,
 information the source currently has for the receiver, conditional on what the receiver already
 knows. R[i][j] is symmetric information redundancy in [0,1]. Lambda[i] is the receiving Agent's
 conversion fidelity in [0,1]. These are calibrated semantic estimates, never measured bits.
+Evaluate every G[source][receiver] cell from that receiver's current state, never as a global quality
+score for the source. Credit only information that the receiver does not already possess, is grounded
+in reasoning/evidence/tools/observations rather than confidence, and could resolve, revise, or
+materially refine something unresolved for that receiver. Discount information already represented
+in the receiver even when it is phrased differently. The same source may therefore have very
+different potential for different receivers.
 Distinguish repeated conclusions from complementary evidence, respect direction and unresolved
 dependencies, and use the exact supplied agent order. Root uncertainty estimates residual risk that
 the committed answer is wrong after auditing the exact task contract, assumptions, contradictions,
@@ -968,7 +989,10 @@ class ChannelizerModel:
     SYSTEM = """You are Roy's frozen A2A Channelizer. Compress only source information useful to
 the receiver's objective. Capacity is a semantic budget: low capacity carries a conclusion and
 critical evidence; high capacity may add derivation, assumptions, uncertainty, counterexamples and
-provenance. Never invent facts or expose unrelated memory. Return JSON only."""
+provenance. Communicate for the receiver, not for the sender: subtract facts already present in the
+receiver state and prioritize grounded corrections, contradictions, decisive evidence, and unresolved
+implications most likely to revise or refine that state. Do not spend capacity on repeated background
+or a sender-centric summary. Never invent facts or expose unrelated memory. Return JSON only."""
 
     def __init__(self, llm: JsonLLM, max_tokens: int = 768) -> None:
         self.llm, self.max_tokens = llm, max_tokens

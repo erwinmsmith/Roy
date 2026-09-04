@@ -23,7 +23,10 @@ from roy_research.training_free.harness import AgentHarness, AgentHarnessConfig
 from roy_research.training_free.llm import (
     CallAudit,
     CandidateXRealizer,
+    ChannelizerModel,
+    GlobalSelector,
     JsonLLM,
+    SemanticInformationJudge,
     WorkerModel,
     parse_json_object,
 )
@@ -199,6 +202,21 @@ class ScriptedClient:
         else:  # pragma: no cover
             raise AssertionError(purpose)
         return FakeCompletion(json.dumps(value))
+
+
+def test_cognitive_prompt_priors_change_behavior_not_state_space() -> None:
+    assert "what the parent has established" in WorkerModel.PROPOSE_SYSTEM
+    assert "which unresolved information" in WorkerModel.PROPOSE_SYSTEM
+    assert "distributed evidence" in GlobalSelector.SYSTEM
+    assert "disagreement is not redundancy" in GlobalSelector.SYSTEM
+    assert "one unresolved information need" in CandidateXRealizer.SYSTEM
+    assert "from that receiver's current state" in SemanticInformationJudge.SYSTEM
+    assert "not for the sender" in ChannelizerModel.SYSTEM
+    combined = "\n".join((
+        WorkerModel.PROPOSE_SYSTEM, GlobalSelector.SYSTEM, CandidateXRealizer.SYSTEM,
+        SemanticInformationJudge.SYSTEM, ChannelizerModel.SYSTEM,
+    ))
+    assert "Theory of Mind" not in combined
 
 
 def test_engine_commits_externally_realized_candidate_x() -> None:
