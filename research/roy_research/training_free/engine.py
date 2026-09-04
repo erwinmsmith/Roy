@@ -61,6 +61,8 @@ class TrainingFreeConfig:
     finish_uncertainty: float = 0.15
     activation_threshold: float = 0.05
     worker_max_tokens: int = 2048
+    candidate_worker_max_tokens: int = 8192
+    candidate_worker_thinking: str = "enabled"
     result_reconciler_max_tokens: int = 256
     selector_max_tokens: int = 1024
     candidate_realizer_max_tokens: int = 16_384
@@ -349,6 +351,13 @@ class RoyTrainingFreeEngine:
         self.worker = WorkerModel(
             worker_llm,
             self.config.worker_max_tokens,
+            self.config.maximum_tool_rounds,
+            self.config.maximum_tool_calls_per_worker_call,
+            self.config.result_reconciler_max_tokens,
+        )
+        self.candidate_worker = WorkerModel(
+            candidate_llm,
+            self.config.candidate_worker_max_tokens,
             self.config.maximum_tool_rounds,
             self.config.maximum_tool_calls_per_worker_call,
             self.config.result_reconciler_max_tokens,
@@ -694,6 +703,7 @@ class RoyTrainingFreeEngine:
             name for name in self.config.available_tools if name in configured_names
         ]
         self.worker.configure_tools(self.tool_registry)
+        self.candidate_worker.configure_tools(self.tool_registry)
 
     def _prepare_parents_and_collect_candidates(
         self,
@@ -801,7 +811,9 @@ class RoyTrainingFreeEngine:
                     "result": asdict(source.result),
                 }, ensure_ascii=False, sort_keys=True)
                 AgentHarness(agent, self.tool_registry).receive_messages([dependency_message])
-            states[agent_id] = self.worker.execute_local(agent, benchmark)
+            states[agent_id] = self.candidate_worker.execute_local(
+                agent, benchmark, thinking=self.config.candidate_worker_thinking,
+            )
         return states
 
     def _apply_activation(

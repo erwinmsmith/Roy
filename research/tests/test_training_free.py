@@ -226,6 +226,12 @@ def test_engine_commits_externally_realized_candidate_x() -> None:
     assert len(expensive) == 1
     assert expensive[0]["thinking"] == "enabled"
     assert expensive[0]["max_tokens"] == config.candidate_realizer_max_tokens
+    candidate_execution = [
+        call for call in client.calls if call["purpose"] == "provisional_worker"
+    ]
+    assert candidate_execution
+    assert all(call["thinking"] == "enabled" for call in candidate_execution)
+    assert all(call["max_tokens"] == config.candidate_worker_max_tokens for call in candidate_execution)
     value = run.to_dict()
     assert value["schema_version"] == 5
     assert value["initial_root_answer"] == "120"

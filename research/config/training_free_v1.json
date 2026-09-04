@@ -14,6 +14,8 @@
   "finish_uncertainty": 0.15,
   "activation_threshold": 0.05,
   "worker_max_tokens": 2048,
+  "candidate_worker_max_tokens": 8192,
+  "candidate_worker_thinking": "enabled",
   "result_reconciler_max_tokens": 256,
   "selector_max_tokens": 1024,
   "candidate_realizer_max_tokens": 16384,

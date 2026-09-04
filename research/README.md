@@ -254,6 +254,11 @@ schema failure is never recorded as theoretical saturation.
 The checked MATH and V1 experiment configs enable provider reasoning for this
 call and give it the largest semantic completion budget; the Worker, selector,
 Channelizer, and Judge remain separate frozen calls.
+The same independently configured candidate model then executes the realized
+local objectives with reasoning enabled and its own token budget. Root/direct
+execution remains the identical lower-cost `root_worker` path, so candidate
+reasoning is an explicit MAS intervention rather than an accidental change to
+the baseline prompt.
 
 Every realized state runs through the same versioned single-Agent harness. Its
 immutable contract is `(agent_id, parent_id, Q/objective, R/role, T/tools,

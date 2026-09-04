@@ -174,7 +174,12 @@ recent trajectory events. The candidate_answer must agree with the claims, evide
 reasoning summary; perform a final consistency check before returning it. On the root's first round,
 propose at least minimum_candidates independent verification directions whenever capacity permits,
 even if the answer is high-confidence. A failed tool call always requires a verification direction.
-Never repeat a gap that the current state or history already resolved."""
+Never repeat a gap that the current state or history already resolved. The exact supplied task is the
+only benchmark contract. Never claim knowledge of a hidden reference answer or dataset convention.
+Explicit domains, qualifiers, tests, and edge cases in that contract are binding; an unstated
+convention cannot silently narrow them. Adversarial work must actually attempt a counterexample,
+invariant, alternate derivation, tool check, or executable test rather than merely restating the
+committed conclusion."""
 
     RECONCILE_SYSTEM = """You are the final consistency pass inside Roy's frozen Worker harness.
 Do not solve the task anew and do not add facts. Read the supplied structured result and return the
@@ -452,6 +457,7 @@ discovering a shared mistake. Return exactly one JSON object."""
         benchmark: str,
         *,
         tool_scope: str = "counterfactual",
+        thinking: str | None = "disabled",
     ) -> AgentState:
         updated = copy.deepcopy(agent)
         value = self._call_with_tools(
@@ -470,6 +476,7 @@ discovering a shared mistake. Return exactly one JSON object."""
             updated,
             max_tokens=self.max_tokens,
             tool_scope=tool_scope,
+            thinking=thinking,
         )
         AgentHarness(updated, self.tools, self.harness_config).apply_model_update(
             self._result_from_value(value, benchmark), value.get("memory_entries", []),
@@ -544,6 +551,7 @@ discovering a shared mistake. Return exactly one JSON object."""
         *,
         max_tokens: int,
         tool_scope: str = "committed",
+        thinking: str | None = "disabled",
     ) -> Dict[str, Any]:
         harness = AgentHarness(agent, self.tools, self.harness_config)
         working_payload = dict(payload)
@@ -564,6 +572,7 @@ discovering a shared mistake. Return exactly one JSON object."""
                 self.SYSTEM,
                 working_payload,
                 max_tokens=max_tokens,
+                thinking=thinking,
             )
             if not self._has_complete_result(value) and not value.get("tool_requests"):
                 retry_payload = {
@@ -713,6 +722,11 @@ class CandidateXRealizer:
 configuration stage. Carefully reason about the original task, current MAS, selected dependency
 subgraph, benchmark contract, tool availability, and information-flow needs. Then configure every
 candidate as a complete autonomous state X_i=(Q_i,R_i,C_i,M_i,T_i,Z_i,Sigma_i).
+
+The supplied original task and public tests are the complete observable benchmark contract. Never
+invent knowledge of a hidden reference answer or dataset convention. Configure specification audit
+and adversarial roles to test literal domains, qualifiers, edge cases, and counterexamples rather
+than rationalizing the committed answer from an unstated convention.
 
 Q/objective must be narrow and executable. R/role is a capability boundary derived from Q, never a
 role-pool label. C/context must explicitly name mandatory artifact inputs and useful weighted source
