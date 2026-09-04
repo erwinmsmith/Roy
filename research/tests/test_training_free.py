@@ -474,7 +474,7 @@ def test_json_llm_retries_reasoning_that_exhausts_budget_before_json() -> None:
             self.calls = []
 
         def complete(self, messages, **kwargs):
-            self.calls.append(kwargs["metadata"]["purpose"])
+            self.calls.append((kwargs["metadata"]["purpose"], kwargs.get("thinking")))
             if len(self.calls) == 1:
                 return FakeCompletion("", completion_tokens=8192, total_tokens=8202)
             return FakeCompletion(json.dumps({"answer": "complete"}))
@@ -487,7 +487,8 @@ def test_json_llm_retries_reasoning_that_exhausts_budget_before_json() -> None:
     )
     assert value == {"answer": "complete"}
     assert client.calls == [
-        "candidate_x_realization", "candidate_x_realization_empty_retry",
+        ("candidate_x_realization", "enabled"),
+        ("candidate_x_realization_empty_retry", "disabled"),
     ]
 
 
@@ -531,6 +532,27 @@ def test_json_llm_regenerates_malformed_json_once_with_reasoning() -> None:
     assert value == {"answer": "valid"}
     assert client.calls == [("unit", "disabled"), ("unit_json_retry", "enabled")]
     assert audit.calls == {"unit": 1, "unit_json_retry": 1}
+
+
+def test_json_llm_makes_reasoning_json_retry_non_thinking() -> None:
+    class MalformedReasoningClient:
+        model = "malformed-reasoning"
+
+        def __init__(self):
+            self.calls = []
+
+        def complete(self, messages, **kwargs):
+            self.calls.append((kwargs["metadata"]["purpose"], kwargs.get("thinking")))
+            return FakeCompletion(
+                '{"answer": "broken"' if len(self.calls) == 1 else '{"answer": "valid"}'
+            )
+
+    client = MalformedReasoningClient()
+    value = JsonLLM(client, CallAudit()).call(
+        "unit", "Return JSON.", {}, max_tokens=64, thinking="enabled",
+    )
+    assert value == {"answer": "valid"}
+    assert client.calls == [("unit", "enabled"), ("unit_json_retry", "disabled")]
 
 
 def test_runtime_preserves_immutable_original_task_from_candidate_realizer() -> None:

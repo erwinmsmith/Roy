@@ -92,6 +92,7 @@ class JsonLLM:
         self.audit.record(purpose, completion)
         if not completion.content.strip():
             retry_purpose = f"{purpose}_empty_retry"
+            retry_thinking = "disabled" if thinking == "enabled" else thinking
             retry = self.client.complete(
                 [
                     {
@@ -108,7 +109,7 @@ class JsonLLM:
                 temperature=temperature,
                 metadata={"purpose": retry_purpose},
                 json_mode=True,
-                thinking=thinking,
+                thinking=retry_thinking,
             )
             self.audit.record(retry_purpose, retry)
             if not retry.content.strip():
@@ -121,6 +122,7 @@ class JsonLLM:
             return parse_json_object(completion.content)
         except json.JSONDecodeError as error:
             retry_purpose = f"{purpose}_json_retry"
+            retry_thinking = "disabled" if thinking == "enabled" else "enabled"
             retry_payload = {
                 **payload,
                 "_protocol_retry": {
@@ -147,7 +149,7 @@ class JsonLLM:
                 temperature=temperature,
                 metadata={"purpose": retry_purpose},
                 json_mode=True,
-                thinking="enabled",
+                thinking=retry_thinking,
             )
             self.audit.record(retry_purpose, retry)
             if not retry.content.strip():
