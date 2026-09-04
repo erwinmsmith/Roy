@@ -186,6 +186,11 @@ def parser() -> argparse.ArgumentParser:
         "--arm", choices=("roy", "single_agent_direct"), default="roy",
         help="Run Roy search or its matched single-Agent baseline without organization search",
     )
+    training_free.add_argument(
+        "--matrix-objective",
+        choices=("scalar_reach", "precision_logdet"),
+        help="Override the configured pure-matrix objective for the Roy arm",
+    )
     training_free.add_argument("--split", choices=("optimization", "test"), default="optimization")
     training_free.add_argument("--offset", type=int, default=0)
     training_free.add_argument("--limit", type=int)
@@ -1016,6 +1021,8 @@ def main(argv: List[str] | None = None) -> None:
         print(json.dumps({"output": str(args.output), "tokens": completion.total_tokens}))
     elif args.command == "training-free-run":
         config_value = json.loads(args.config.read_text(encoding="utf-8"))
+        if args.matrix_objective is not None:
+            config_value["matrix_objective"] = args.matrix_objective
         config = TrainingFreeConfig(**config_value)
         dataset = AFlowDataset(args.aflow_root, args.manifest)
         if args.offset < 0:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Sequence
 
@@ -26,6 +27,10 @@ class SemanticInformationLandscape:
     calibration_summary: str
     root_relations: Dict[str, str] = field(default_factory=dict)
     coherence_adjustments: List[str] = field(default_factory=list)
+    task_dimensions: List[str] = field(default_factory=list)
+    observation_vectors: Dict[str, List[float]] = field(default_factory=dict)
+    observation_noise: Dict[str, float] = field(default_factory=dict)
+    root_dimension_uncertainty: List[float] = field(default_factory=list)
 
     @classmethod
     def from_dict(
@@ -34,6 +39,7 @@ class SemanticInformationLandscape:
         *,
         expected_agent_ids: Sequence[str],
         root_id: str,
+        precision_dimensions: int = 0,
     ) -> "SemanticInformationLandscape":
         supplied_ids = [str(item) for item in value.get("agent_ids", [])]
         expected = list(expected_agent_ids)
@@ -91,9 +97,55 @@ class SemanticInformationLandscape:
         summary = str(value.get("calibration_summary", "")).strip()
         if not summary:
             raise ValueError("Semantic Judge omitted calibration_summary")
+        task_dimensions: List[str] = []
+        observation_vectors: Dict[str, List[float]] = {}
+        observation_noise: Dict[str, float] = {}
+        root_dimension_uncertainty: List[float] = []
+        if precision_dimensions:
+            task_dimensions = [
+                str(item).strip() for item in value.get("task_dimensions", [])
+            ]
+            if (
+                len(task_dimensions) != precision_dimensions
+                or len(set(task_dimensions)) != precision_dimensions
+                or not all(task_dimensions)
+            ):
+                raise ValueError(
+                    f"Semantic Judge task_dimensions must contain {precision_dimensions} "
+                    "distinct non-empty dimensions"
+                )
+            raw_vectors = value.get("observation_vectors")
+            if not isinstance(raw_vectors, Mapping) or set(map(str, raw_vectors)) != set(expected):
+                raise ValueError("Semantic Judge observation_vectors must cover every supplied agent")
+            for agent_id in expected:
+                vector = list(raw_vectors[agent_id])
+                if len(vector) != precision_dimensions:
+                    raise ValueError(
+                        f"Semantic Judge h[{agent_id}] must contain {precision_dimensions} values"
+                    )
+                observation_vectors[agent_id] = [
+                    _unit(float(item), "observation_vectors") for item in vector
+                ]
+            raw_noise = value.get("observation_noise")
+            if not isinstance(raw_noise, Mapping) or set(map(str, raw_noise)) != set(expected):
+                raise ValueError("Semantic Judge observation_noise must cover every supplied agent")
+            observation_noise = {
+                agent_id: _unit(float(raw_noise[agent_id]), "observation_noise")
+                for agent_id in expected
+            }
+            raw_uncertainty = list(value.get("root_dimension_uncertainty", []))
+            if len(raw_uncertainty) != precision_dimensions:
+                raise ValueError(
+                    "Semantic Judge root_dimension_uncertainty must match task_dimensions"
+                )
+            root_dimension_uncertainty = [
+                _unit(float(item), "root_dimension_uncertainty")
+                for item in raw_uncertainty
+            ]
         return cls(
             expected, g, redundancy, lambdas, root_id, uncertainty, summary,
-            root_relations, adjustments,
+            root_relations, adjustments, task_dimensions, observation_vectors,
+            observation_noise, root_dimension_uncertainty,
         )
 
     @property
@@ -116,6 +168,16 @@ class SemanticInformationLandscape:
             self.calibration_summary,
             {agent_id: self.root_relations.get(agent_id, "unresolved") for agent_id in selected},
             list(self.coherence_adjustments),
+            list(self.task_dimensions),
+            {
+                agent_id: list(self.observation_vectors[agent_id])
+                for agent_id in selected if agent_id in self.observation_vectors
+            },
+            {
+                agent_id: self.observation_noise[agent_id]
+                for agent_id in selected if agent_id in self.observation_noise
+            },
+            list(self.root_dimension_uncertainty),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -244,6 +306,122 @@ class MIAObjectiveEvaluator:
         return gain, [observation]
 
 
+@dataclass(frozen=True)
+class PrecisionLogDetObjective:
+    objective: float
+    log_det_gain: float
+    root_reach: Dict[str, float]
+    observation_strength: Dict[str, float]
+    root_precision: List[List[float]]
+    realized_precision: List[List[float]]
+    path_horizon: int
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+class PrecisionLogDetObjectiveEvaluator:
+    """D-optimal semantic information gain over the transfer network."""
+
+    name = "mia_precision_logdet_v1"
+
+    def __init__(
+        self,
+        landscape: SemanticInformationLandscape,
+        *,
+        path_horizon: int = 3,
+        reference_matrix: InformationMatrix | None = None,
+        precision_floor: float = 1e-3,
+    ) -> None:
+        if path_horizon < 1:
+            raise ValueError("MIA path horizon must be positive")
+        if not 0.0 < precision_floor <= 1.0:
+            raise ValueError("precision_floor must be in (0, 1]")
+        if not landscape.task_dimensions:
+            raise ValueError("precision log-det objective requires Judge observation geometry")
+        self.landscape = landscape
+        self.path_horizon = path_horizon
+        self.precision_floor = precision_floor
+        self.reference = (
+            self.objective(reference_matrix).objective if reference_matrix is not None else 0.0
+        )
+
+    @property
+    def revision(self) -> str:
+        return f"{self.name}:{self.landscape.revision}:{self.precision_floor:.12g}"
+
+    def objective(self, matrix: InformationMatrix) -> PrecisionLogDetObjective:
+        landscape = self.landscape.subset(matrix.agent_ids)
+        size = len(matrix.agent_ids)
+        root = matrix.agent_ids.index(landscape.root_id)
+        operator = [
+            [
+                matrix.values[source][receiver]
+                * landscape.directional_potential[source][receiver]
+                * landscape.conversion_fidelity[receiver]
+                for receiver in range(size)
+            ]
+            for source in range(size)
+        ]
+        propagation = [[0.0 for _ in range(size)] for _ in range(size)]
+        power = [list(row) for row in operator]
+        horizon = min(self.path_horizon, max(1, size - 1))
+        for _ in range(horizon):
+            for row in range(size):
+                for column in range(size):
+                    propagation[row][column] += power[row][column]
+            absorb = [list(row) for row in operator]
+            for receiver in range(size):
+                absorb[root][receiver] = 0.0
+            power = _matmul(power, absorb)
+
+        reach = {
+            agent_id: min(1.0, max(0.0, propagation[index][root]))
+            for index, agent_id in enumerate(matrix.agent_ids)
+            if index != root
+        }
+        dimension_count = len(landscape.task_dimensions)
+        root_precision = [[0.0 for _ in range(dimension_count)] for _ in range(dimension_count)]
+        for index, uncertainty in enumerate(landscape.root_dimension_uncertainty):
+            root_precision[index][index] = 1.0 / max(uncertainty, self.precision_floor)
+        realized = [list(row) for row in root_precision]
+        strength: Dict[str, float] = {}
+        for agent_id, amplitude in reach.items():
+            noise = max(landscape.observation_noise[agent_id], self.precision_floor)
+            contribution = amplitude * amplitude / noise
+            strength[agent_id] = contribution
+            vector = landscape.observation_vectors[agent_id]
+            for row in range(dimension_count):
+                for column in range(dimension_count):
+                    realized[row][column] += contribution * vector[row] * vector[column]
+        gain = 0.5 * (_logdet_spd(realized) - _logdet_spd(root_precision))
+        return PrecisionLogDetObjective(
+            objective=max(0.0, gain),
+            log_det_gain=max(0.0, gain),
+            root_reach=reach,
+            observation_strength=strength,
+            root_precision=root_precision,
+            realized_precision=realized,
+            path_horizon=horizon,
+        )
+
+    def evaluate(
+        self,
+        agents: Mapping[str, object],
+        matrix: InformationMatrix,
+    ) -> tuple[float, List[Dict[str, Any]]]:
+        del agents
+        objective = self.objective(matrix)
+        gain = objective.objective - self.reference
+        return gain, [{
+            "estimator": self.name,
+            "score": gain,
+            "reference_objective": self.reference,
+            "objective": objective.to_dict(),
+            "llm_rollouts": 0,
+        }]
+
+
 def _matmul(left: List[List[float]], right: List[List[float]]) -> List[List[float]]:
     size = len(left)
     return [
@@ -291,3 +469,21 @@ def _unit(value: float, name: str) -> float:
     if not 0.0 <= value <= 1.0:
         raise ValueError(f"Semantic Judge {name} values must be in [0, 1]")
     return value
+
+
+def _logdet_spd(matrix: List[List[float]]) -> float:
+    """Return log(det(matrix)) using a small dependency-free Cholesky factorization."""
+    size = len(matrix)
+    lower = [[0.0 for _ in range(size)] for _ in range(size)]
+    for row in range(size):
+        for column in range(row + 1):
+            residual = matrix[row][column] - sum(
+                lower[row][inner] * lower[column][inner] for inner in range(column)
+            )
+            if row == column:
+                if residual <= 0.0:
+                    raise ValueError("precision matrix must be positive definite")
+                lower[row][column] = residual ** 0.5
+            else:
+                lower[row][column] = residual / lower[column][column]
+    return 2.0 * sum(math.log(lower[index][index]) for index in range(size))

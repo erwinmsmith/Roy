@@ -32,6 +32,7 @@ from roy_research.training_free.llm import (
 )
 from roy_research.training_free.mia import (
     MIAObjectiveEvaluator,
+    PrecisionLogDetObjectiveEvaluator,
     SemanticInformationLandscape,
 )
 from roy_research.training_free.matrix import (
@@ -318,6 +319,55 @@ def test_engine_commits_externally_realized_candidate_x() -> None:
         item["information_observations"][0]["llm_rollouts"] == 0
         for item in searched["evaluated_matrices"]
     )
+
+
+def test_engine_can_select_precision_logdet_matrix_objective() -> None:
+    class PrecisionScriptedClient(ScriptedClient):
+        def complete(self, messages, **kwargs):
+            completion = super().complete(messages, **kwargs)
+            if kwargs["metadata"]["purpose"] != "semantic_information_judge":
+                return completion
+            value = json.loads(completion.content)
+            agent_ids = value["agent_ids"]
+            value.update({
+                "task_dimensions": ["derivation", "verification"],
+                "observation_vectors": {
+                    agent_id: ([0.0, 0.0] if agent_id == "A0" else [1.0, 0.0])
+                    for agent_id in agent_ids
+                },
+                "observation_noise": {agent_id: 0.2 for agent_id in agent_ids},
+                "root_dimension_uncertainty": [1.0, 0.2],
+            })
+            return FakeCompletion(json.dumps(value))
+
+    client = PrecisionScriptedClient()
+    config = TrainingFreeConfig(
+        maximum_selected_subgraphs=1,
+        maximum_nodes_per_subgraph=1,
+        matrix_iterations=1,
+        matrix_beam_width=2,
+        maximum_matrix_evaluations=4,
+        communication_rounds=1,
+        maximum_organization_rounds=1,
+        information_gain_epsilon=0.001,
+        matrix_objective="precision_logdet",
+        precision_dimensions=2,
+    )
+    run = RoyTrainingFreeEngine(client, client, config=config).run(
+        BenchmarkTask("math-logdet", "MATH", "A pentagon problem", [], {"solution": "135"})
+    )
+    value = run.to_dict()
+
+    assert value["search_architecture"]["matrix_objective"] == "precision_logdet"
+    assert value["rounds"][0]["information_measure"] == "mia_precision_logdet"
+    observation = value["rounds"][0]["frontiers"]["round-0-subgraph-0"][
+        "information_observations"
+    ][0]
+    assert observation["estimator"] == "mia_precision_logdet_v1"
+    judge_call = next(
+        call for call in client.calls if call["purpose"] == "semantic_information_judge"
+    )
+    assert "observation_vectors" in judge_call["payload"]["required_schema"]
 
 
 def test_matched_single_agent_direct_skips_all_organization_calls() -> None:
@@ -1292,6 +1342,102 @@ def test_mia_smooth_intersection_preserves_delivery_order_below_uncertainty_ceil
     evaluator = MIAObjectiveEvaluator(landscape)
     assert evaluator.objective(strong).objective > evaluator.objective(weak).objective
     assert evaluator.objective(strong).objective < landscape.root_uncertainty
+
+
+def test_precision_logdet_rewards_complementary_information_directions() -> None:
+    agent_ids = ["A0", "A1", "A2", "A3"]
+    landscape = SemanticInformationLandscape.from_dict(
+        {
+            "agent_ids": agent_ids,
+            "directional_potential": [
+                [0.0, 0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+            ],
+            "redundancy": [[0.0] * 4 for _ in agent_ids],
+            "conversion_fidelity": [1.0] * 4,
+            "root_relations": {
+                "A0": "supports", "A1": "complements",
+                "A2": "complements", "A3": "complements",
+            },
+            "root_uncertainty": 0.8,
+            "calibration_summary": "A1 and A2 overlap; A3 covers the other requirement.",
+            "task_dimensions": ["derivation", "boundary"],
+            "observation_vectors": {
+                "A0": [0.2, 0.2], "A1": [1.0, 0.0],
+                "A2": [1.0, 0.0], "A3": [0.0, 1.0],
+            },
+            "observation_noise": {agent_id: 0.2 for agent_id in agent_ids},
+            "root_dimension_uncertainty": [1.0, 1.0],
+        },
+        expected_agent_ids=agent_ids,
+        root_id="A0",
+        precision_dimensions=2,
+    )
+    redundant = InformationMatrix.zero(agent_ids)
+    redundant.set_weight("A1", "A0", 0.5)
+    redundant.set_weight("A2", "A0", 0.5)
+    complementary = InformationMatrix.zero(agent_ids)
+    complementary.set_weight("A1", "A0", 0.5)
+    complementary.set_weight("A3", "A0", 0.5)
+    evaluator = PrecisionLogDetObjectiveEvaluator(landscape)
+
+    redundant_objective = evaluator.objective(redundant)
+    complementary_objective = evaluator.objective(complementary)
+
+    assert complementary_objective.objective > redundant_objective.objective
+    assert complementary_objective.root_precision == [[1.0, 0.0], [0.0, 1.0]]
+    assert complementary_objective.observation_strength == pytest.approx({
+        "A1": 1.25, "A2": 0.0, "A3": 1.25,
+    })
+
+
+def test_precision_logdet_uses_transfer_paths_noise_and_relative_gain() -> None:
+    agent_ids = ["A0", "relay", "source"]
+    landscape = SemanticInformationLandscape.from_dict(
+        {
+            "agent_ids": agent_ids,
+            "directional_potential": [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
+            "redundancy": [[0.0] * 3 for _ in agent_ids],
+            "conversion_fidelity": [1.0, 0.5, 1.0],
+            "root_relations": {
+                "A0": "supports", "relay": "complements", "source": "complements",
+            },
+            "root_uncertainty": 0.7,
+            "calibration_summary": "The source reaches the root through one lossy relay.",
+            "task_dimensions": ["correctness", "contract"],
+            "observation_vectors": {
+                "A0": [0.0, 0.0], "relay": [0.0, 0.0], "source": [1.0, 0.0],
+            },
+            "observation_noise": {"A0": 1.0, "relay": 1.0, "source": 0.1},
+            "root_dimension_uncertainty": [0.5, 0.25],
+        },
+        expected_agent_ids=agent_ids,
+        root_id="A0",
+        precision_dimensions=2,
+    )
+    connected = InformationMatrix.zero(agent_ids)
+    connected.set_weight("source", "relay", 1.0)
+    connected.set_weight("relay", "A0", 1.0)
+    evaluator = PrecisionLogDetObjectiveEvaluator(
+        landscape, path_horizon=2, reference_matrix=connected,
+    )
+    objective = evaluator.objective(connected)
+    same_gain, observations = evaluator.evaluate({}, connected)
+    disconnected = InformationMatrix.zero(agent_ids)
+
+    assert objective.root_reach["source"] == pytest.approx(0.5)
+    assert objective.observation_strength["source"] == pytest.approx(2.5)
+    assert objective.objective > 0.0
+    assert evaluator.objective(disconnected).objective == 0.0
+    assert same_gain == pytest.approx(0.0)
+    assert observations[0]["estimator"] == "mia_precision_logdet_v1"
+    assert observations[0]["llm_rollouts"] == 0
 
 
 def test_semantic_landscape_reorders_judge_axes_and_symmetrizes_redundancy() -> None:

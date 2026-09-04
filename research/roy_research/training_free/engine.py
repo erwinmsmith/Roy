@@ -16,7 +16,11 @@ from .llm import (
     SemanticInformationJudge,
     WorkerModel,
 )
-from .mia import MIAObjectiveEvaluator, SemanticInformationLandscape
+from .mia import (
+    MIAObjectiveEvaluator,
+    PrecisionLogDetObjectiveEvaluator,
+    SemanticInformationLandscape,
+)
 from .matrix import (
     A2AExecutor,
     BeamCoordinateMatrixSearch,
@@ -69,6 +73,9 @@ class TrainingFreeConfig:
     channelizer_max_tokens: int = 768
     semantic_judge_max_tokens: int = 4096
     mia_path_horizon: int = 3
+    matrix_objective: Literal["scalar_reach", "precision_logdet"] = "scalar_reach"
+    precision_dimensions: int = 4
+    precision_floor: float = 1e-3
     candidate_thinking: str = "enabled"
     available_tools: tuple[str, ...] = ("symbolic_math", "python", "public_tests")
     maximum_tool_rounds: int = 2
@@ -87,6 +94,12 @@ class TrainingFreeConfig:
             raise ValueError("tool loop limits cannot be negative")
         if not 0 <= self.hard_dependency_minimum <= 1:
             raise ValueError("hard dependency minimum must be in [0, 1]")
+        if self.matrix_objective not in {"scalar_reach", "precision_logdet"}:
+            raise ValueError("matrix_objective must be scalar_reach or precision_logdet")
+        if self.precision_dimensions < 1:
+            raise ValueError("precision_dimensions must be positive")
+        if not 0.0 < self.precision_floor <= 1.0:
+            raise ValueError("precision_floor must be in (0, 1]")
 
 
 @dataclass
@@ -196,6 +209,7 @@ class TrainingFreeRun:
     event_ledger: List[TrajectoryEvent]
     cumulative_information_gain: float
     harness_config: AgentHarnessConfig
+    matrix_objective: str
 
     @property
     def initial_root_answer(self) -> str:
@@ -238,7 +252,7 @@ class TrainingFreeRun:
             "method": "training_free_information_flow_search",
             "search_architecture": {
                 "semantic_judge": "once_per_organization_round",
-                "matrix_objective": "pure_mia_functional",
+                "matrix_objective": self.matrix_objective,
                 "candidate_matrix_llm_rollouts": 0,
                 "execution_policy": "winner_only",
                 "state_transition_policy": "initialize_once_then_winner_execution_only",
@@ -370,7 +384,12 @@ class RoyTrainingFreeEngine:
         )
         self.channelizer = ChannelizerModel(worker_llm, self.config.channelizer_max_tokens)
         self.semantic_judge = SemanticInformationJudge(
-            worker_llm, self.config.semantic_judge_max_tokens,
+            worker_llm,
+            self.config.semantic_judge_max_tokens,
+            (
+                self.config.precision_dimensions
+                if self.config.matrix_objective == "precision_logdet" else 0
+            ),
         )
         self.code_sandbox_prefix = list(code_sandbox_prefix or [])
         self.semantic_landscape_factory = semantic_landscape_factory
@@ -507,11 +526,19 @@ class RoyTrainingFreeEngine:
                 "search_state", agents, matrix, dependencies,
                 information_state_before, events,
             ))
-            evaluator = MIAObjectiveEvaluator(
-                landscape,
-                path_horizon=self.config.mia_path_horizon,
-                reference_matrix=matrix,
-            )
+            if self.config.matrix_objective == "precision_logdet":
+                evaluator = PrecisionLogDetObjectiveEvaluator(
+                    landscape,
+                    path_horizon=self.config.mia_path_horizon,
+                    reference_matrix=matrix,
+                    precision_floor=self.config.precision_floor,
+                )
+            else:
+                evaluator = MIAObjectiveEvaluator(
+                    landscape,
+                    path_horizon=self.config.mia_path_horizon,
+                    reference_matrix=matrix,
+                )
             optimizer = BeamCoordinateMatrixSearch(
                 evaluator,
                 levels=self.config.matrix_levels,
@@ -637,7 +664,10 @@ class RoyTrainingFreeEngine:
                 state_before_checkpoint_id=state_before_checkpoint_id,
                 search_state_checkpoint_id=search_state_checkpoint_id,
                 committed_checkpoint_id=committed_checkpoint_id,
-                information_measure="mia_semantic_landscape",
+                information_measure=(
+                    "mia_precision_logdet" if self.config.matrix_objective == "precision_logdet"
+                    else "mia_semantic_landscape"
+                ),
                 information_state_before=information_state_before,
                 semantic_landscape=landscape.to_dict(),
                 reference_mia_objective=evaluator.reference,
@@ -674,6 +704,7 @@ class RoyTrainingFreeEngine:
             event_ledger=events,
             cumulative_information_gain=cumulative_information_gain,
             harness_config=self.worker.harness_config,
+            matrix_objective=self.config.matrix_objective,
         )
 
     def run_direct(self, task: BenchmarkTask) -> SingleAgentRun:

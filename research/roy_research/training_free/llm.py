@@ -939,8 +939,32 @@ source is correct: a substantive contradiction must have positive source-to-root
 root can inspect it, even when the Judge cannot yet determine which answer is correct.
 Return JSON only."""
 
-    def __init__(self, llm: JsonLLM, max_tokens: int = 4096) -> None:
+    PRECISION_SYSTEM = """
+For the precision/log-det objective, also define exactly the requested number of shared, mutually
+distinguishable task-information dimensions. Dimensions are task-specific epistemic requirements,
+not Agent names or answer options; examples include a contract constraint, derivation component,
+edge-case behavior, or verification obligation. They must jointly cover the material ways the
+current answer could be right or wrong across benchmarks.
+
+For each Agent i, estimate h_i as a nonnegative observation vector in [0,1]^d. A component is high
+only when the Agent's current grounded claims/evidence actually observe that task dimension. Do not
+give credit for a proposed role, confidence, or work that has not been executed. Estimate
+observation_noise[i] in [0,1], where smaller means more reliable evidence and larger means noisy,
+assumption-dependent, self-contradictory, or weakly grounded evidence. Estimate the Root's residual
+uncertainty independently on every shared dimension in [0,1]. These values define one semantic
+Gaussian approximation for this organization step; they are not measured physical quantities.
+The runtime applies a small positive numerical floor when observation_noise is zero.
+Keep the same dimension names and ordering for every Agent in this response. You still do not choose
+or execute a candidate matrix."""
+
+    def __init__(
+        self,
+        llm: JsonLLM,
+        max_tokens: int = 4096,
+        precision_dimensions: int = 0,
+    ) -> None:
         self.llm, self.max_tokens = llm, max_tokens
+        self.precision_dimensions = precision_dimensions
 
     def estimate(
         self,
@@ -952,9 +976,41 @@ Return JSON only."""
     ) -> SemanticInformationLandscape:
         agent_ids = list(agents)
         size = len(agent_ids)
+        required_schema = {
+            "agent_ids": "exact supplied agent_ids in the same order",
+            "directional_potential": (
+                f"{size}x{size} G as arrays or agent-id map; row=source column=receiver"
+            ),
+            "redundancy": f"{size}x{size} symmetric R as arrays or agent-id map",
+            "conversion_fidelity": f"{size} Lambda values as array or agent-id map",
+            "root_relations": (
+                "agent-id map covering every agent with exactly one of "
+                "supports|contradicts|complements|unresolved; root itself is supports"
+            ),
+            "root_uncertainty": (
+                "residual probability-like risk in [0,1] after contract, assumption, "
+                "contradiction, evidence-quality, and method-diversity audit"
+            ),
+            "calibration_summary": "concise evidence-grounded rationale",
+        }
+        if self.precision_dimensions:
+            required_schema.update({
+                "task_dimensions": (
+                    f"exactly {self.precision_dimensions} distinct task-information dimension names"
+                ),
+                "observation_vectors": (
+                    f"agent-id map of h_i vectors, each with {self.precision_dimensions} values "
+                    "in [0,1]"
+                ),
+                "observation_noise": "agent-id map of sigma_i^2 values in [0,1]",
+                "root_dimension_uncertainty": (
+                    f"{self.precision_dimensions} residual uncertainty values in [0,1], in the "
+                    "same order as task_dimensions"
+                ),
+            })
         value = self.llm.call(
             "semantic_information_judge",
-            self.SYSTEM,
+            self.SYSTEM + (self.PRECISION_SYSTEM if self.precision_dimensions else ""),
             {
                 "benchmark": benchmark,
                 "root_id": root_id,
@@ -964,28 +1020,13 @@ Return JSON only."""
                     for agent_id, agent in agents.items()
                 },
                 "current_state_context": dict(state_context or {}),
-                "required_schema": {
-                    "agent_ids": "exact supplied agent_ids in the same order",
-                    "directional_potential": (
-                        f"{size}x{size} G as arrays or agent-id map; row=source column=receiver"
-                    ),
-                    "redundancy": f"{size}x{size} symmetric R as arrays or agent-id map",
-                    "conversion_fidelity": f"{size} Lambda values as array or agent-id map",
-                    "root_relations": (
-                        "agent-id map covering every agent with exactly one of "
-                        "supports|contradicts|complements|unresolved; root itself is supports"
-                    ),
-                    "root_uncertainty": (
-                        "residual probability-like risk in [0,1] after contract, assumption, "
-                        "contradiction, evidence-quality, and method-diversity audit"
-                    ),
-                    "calibration_summary": "concise evidence-grounded rationale",
-                },
+                "required_schema": required_schema,
             },
             max_tokens=self.max_tokens,
         )
         return SemanticInformationLandscape.from_dict(
             value, expected_agent_ids=agent_ids, root_id=root_id,
+            precision_dimensions=self.precision_dimensions,
         )
 
 
