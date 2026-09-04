@@ -628,6 +628,26 @@ def test_x_realizer_rejects_incomplete_external_configuration() -> None:
         )
 
 
+def test_x_realizer_binds_graph_required_inputs_before_freezing_contract() -> None:
+    graph = CandidateGraph.from_dict({
+        "nodes": [{
+            "candidate_id": "r0_A0_c1", "direction": "check", "why_needed": "gap",
+            "required_inputs": ["committed answer"], "requested_tools": [],
+            "expected_output": "answer", "stop_condition": "checked",
+        }],
+        "dependencies": [],
+    }, "A0")
+    root = AgentState(
+        "A0", None, "solve", "solver", ContextState("task"), MemoryState("memory/A0"),
+        [], ResultState(candidate_answer="1"), AgentStatus.DONE, "answer", "done",
+    )
+    realized = CandidateXRealizer(JsonLLM(ScriptedClient(), CallAudit())).realize(
+        "s0", ["r0_A0_c1"], graph, {"A0": root}, benchmark="MATH",
+        original_task="task", public_tests=[], available_tools=["symbolic_math"],
+    )
+    assert "committed answer" in realized.agents["r0_A0_c1"].context.mandatory_inputs
+
+
 def test_aflow_loader_exposes_public_but_not_hidden_humaneval_tests(tmp_path: Path) -> None:
     root = tmp_path / "AFlow"
     data = root / "data" / "datasets"

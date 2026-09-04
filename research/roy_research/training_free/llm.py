@@ -796,8 +796,6 @@ Return exactly one JSON object and configure all fields; the runtime will reject
             )
             for candidate_id in selected_ids
         }
-        for agent in realized.values():
-            AgentHarness(agent)
         allowed_sources = set(agents) | set(realized)
         for candidate_id, agent in realized.items():
             draft = graph.nodes[candidate_id]
@@ -809,9 +807,13 @@ Return exactly one JSON object and configure all fields; the runtime will reject
             unknown_sources = set(agent.context.weighted_inputs) - allowed_sources
             if unknown_sources or candidate_id in agent.context.weighted_inputs:
                 raise ValueError(f"Agent {candidate_id} has invalid weighted input sources")
-            missing_inputs = set(draft.required_inputs) - set(agent.context.mandatory_inputs)
-            if missing_inputs:
-                raise ValueError(f"Agent {candidate_id} omitted mandatory draft inputs: {sorted(missing_inputs)}")
+            # The dependency graph owns its artifact requirements. Bind them
+            # before the harness freezes the contract instead of requiring an
+            # external LLM to reproduce semantically equivalent labels byte for byte.
+            for required_input in draft.required_inputs:
+                if required_input not in agent.context.mandatory_inputs:
+                    agent.context.mandatory_inputs.append(required_input)
+            AgentHarness(agent)
         dependencies = [
             edge for edge in graph.dependencies
             if edge.target in realized and (edge.source in realized or edge.source in agents)

@@ -243,6 +243,10 @@ unknown tools, shared-memory namespaces, invalid dependencies, and wrong agent
 ids fail closed. All retained candidate subgraphs are included in the same
 one-shot Judge call, so neither candidates nor matrices receive separate
 semantic scoring calls.
+As with the derivation parent and original task, artifact requirements belong
+to the selected dependency graph: the runtime binds those required inputs into
+the realized context before freezing the harness contract, so harmless LLM
+paraphrases cannot drop an authoritative dependency or spuriously reject X.
 Reasoning-mode X realization receives a separate large completion budget and an
 audited empty-output retry. If any selected portfolio member still cannot be
 materialized, the task attempt fails closed and is retried; infrastructure or
