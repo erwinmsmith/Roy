@@ -215,7 +215,7 @@ def test_engine_commits_externally_realized_candidate_x() -> None:
     assert realized.agents["r0_A0_c1"].memory.namespace == "memory/r0_A0_c1"
     expensive = [call for call in client.calls if call["purpose"] == "candidate_x_realization"]
     assert len(expensive) == 1
-    assert expensive[0]["thinking"] == "disabled"
+    assert expensive[0]["thinking"] == "enabled"
     assert expensive[0]["max_tokens"] == config.candidate_realizer_max_tokens
     value = run.to_dict()
     assert value["schema_version"] == 5

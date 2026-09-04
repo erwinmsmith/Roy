@@ -230,6 +230,9 @@ unknown tools, shared-memory namespaces, invalid dependencies, and wrong agent
 ids fail closed. All retained candidate subgraphs are included in the same
 one-shot Judge call, so neither candidates nor matrices receive separate
 semantic scoring calls.
+The checked MATH and V1 experiment configs enable provider reasoning for this
+call and give it the largest semantic completion budget; the Worker, selector,
+Channelizer, and Judge remain separate frozen calls.
 
 Every realized state runs through the same versioned single-Agent harness. Its
 immutable contract is `(agent_id, parent_id, Q/objective, R/role, T/tools,

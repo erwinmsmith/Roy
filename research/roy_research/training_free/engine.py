@@ -67,7 +67,7 @@ class TrainingFreeConfig:
     channelizer_max_tokens: int = 768
     semantic_judge_max_tokens: int = 4096
     mia_path_horizon: int = 3
-    candidate_thinking: str = "disabled"
+    candidate_thinking: str = "enabled"
     available_tools: tuple[str, ...] = ("symbolic_math", "python", "public_tests")
     maximum_tool_rounds: int = 2
     maximum_tool_calls_per_worker_call: int = 3
