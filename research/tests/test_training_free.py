@@ -165,7 +165,7 @@ class ScriptedClient:
             value = {
                 "candidate_answer": payload["result"]["candidate_answer"],
                 "verdict": "consistent",
-                "basis": "the supplied derivation",
+                "basis": f"the supplied derivation concludes {payload['result']['candidate_answer']}",
             }
         elif purpose == "semantic_information_judge":
             agent_ids = payload["agent_ids"]
@@ -417,6 +417,32 @@ def test_math_worker_rejects_a_fake_reconciler_correction() -> None:
         )
 
 
+def test_math_worker_rejects_answer_absent_from_reconciler_basis() -> None:
+    class UnsupportedAnswerClient:
+        model = "unsupported-answer"
+
+        def complete(self, messages, **kwargs):
+            if kwargs["metadata"]["purpose"] == "root_worker":
+                return FakeCompletion(json.dumps({
+                    "result": {
+                        "candidate_answer": "\\boxed{\\frac{32}{9}}",
+                        "claims": ["The calculation gives 6 sqrt(3)"],
+                        "evidence": [], "assumptions": [], "unresolved": [],
+                        "reasoning_summary": "The result is 6 sqrt(3).", "confidence": 1.0,
+                    },
+                    "memory_entries": [],
+                }))
+            return FakeCompletion(json.dumps({
+                "candidate_answer": "\\boxed{\\frac{32}{9}}", "verdict": "consistent",
+                "basis": "The derivation concludes 6*sqrt(3).",
+            }))
+
+    with pytest.raises(ValueError, match="not supported by its stated basis"):
+        RoyTrainingFreeEngine(UnsupportedAnswerClient()).run_direct(
+            BenchmarkTask("math", "MATH", "geometry", [], {"solution": "12"})
+        )
+
+
 def test_worker_fails_closed_when_provider_echoes_the_request_payload() -> None:
     class EchoClient:
         model = "echo"
@@ -454,7 +480,7 @@ def test_worker_recovers_echoed_payload_with_reasoning_schema_retry() -> None:
             if purpose == "worker_result_reconciliation":
                 return FakeCompletion(json.dumps({
                     "candidate_answer": "\\boxed{1}", "verdict": "consistent",
-                    "basis": "the supplied result",
+                    "basis": "the supplied result concludes 1",
                 }))
             raise AssertionError(purpose)
 

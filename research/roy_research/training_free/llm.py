@@ -195,7 +195,8 @@ verdict of consistent when the existing candidate_answer already matches that de
 when the derivation uniquely entails a different answer, or ambiguous when it entails no unique
 answer. For corrected, candidate_answer must contain the corrected answer and must differ from the
 existing candidate_answer. For consistent or ambiguous, copy the existing candidate_answer exactly.
-Return JSON only."""
+The basis must explicitly restate the exact derived answer expression so the runtime can verify that
+it supports candidate_answer. Return JSON only."""
 
     PROPOSE_SYSTEM = """You are Roy's frozen step-level candidate proposer. The supplied agent
 state is already the committed result of the previous transition. Never solve the task again,
@@ -555,6 +556,9 @@ discovering a shared mistake. Return exactly one JSON object."""
         candidate = str(reconciled.get("candidate_answer", "")).strip()
         if not candidate or "\n" in candidate or len(candidate) > 256:
             raise ValueError("Worker reconciler returned a non-concise MATH answer")
+        basis = str(reconciled.get("basis", ""))
+        if verdict != "ambiguous" and not _math_answer_supported_by_basis(candidate, basis):
+            raise ValueError("Worker reconciler answer is not supported by its stated basis")
         if verdict in {"consistent", "ambiguous"}:
             if candidate != result.candidate_answer:
                 raise ValueError(
@@ -1095,6 +1099,20 @@ def parse_json_object(content: str) -> Dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("LLM response must be a JSON object")
     return value
+
+
+def _math_answer_supported_by_basis(candidate: str, basis: str) -> bool:
+    answer_key = _normalized_math_text(candidate)
+    return bool(answer_key) and answer_key in _normalized_math_text(basis)
+
+
+def _normalized_math_text(value: str) -> str:
+    text = value.lower()
+    fraction = re.compile(r"\\frac\s*\{([^{}]+)\}\s*\{([^{}]+)\}")
+    while fraction.search(text):
+        text = fraction.sub(r"\1/\2", text)
+    text = re.sub(r"\\(?:boxed|text|mathrm)\b", "", text)
+    return re.sub(r"[^a-z0-9.+/-]", "", text)
 
 
 def _escape_invalid_json_backslashes(text: str) -> str:
