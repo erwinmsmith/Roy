@@ -232,6 +232,7 @@ def test_engine_commits_externally_realized_candidate_x() -> None:
     assert candidate_execution
     assert all(call["thinking"] == "enabled" for call in candidate_execution)
     assert all(call["max_tokens"] == config.candidate_worker_max_tokens for call in candidate_execution)
+    assert config.candidate_worker_max_tokens == 16_384
     value = run.to_dict()
     assert value["schema_version"] == 5
     assert value["initial_root_answer"] == "120"

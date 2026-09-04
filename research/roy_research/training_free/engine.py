@@ -61,7 +61,7 @@ class TrainingFreeConfig:
     finish_uncertainty: float = 0.15
     activation_threshold: float = 0.05
     worker_max_tokens: int = 2048
-    candidate_worker_max_tokens: int = 8192
+    candidate_worker_max_tokens: int = 16_384
     candidate_worker_thinking: str = "enabled"
     result_reconciler_max_tokens: int = 256
     selector_max_tokens: int = 1024

@@ -177,9 +177,13 @@ even if the answer is high-confidence. A failed tool call always requires a veri
 Never repeat a gap that the current state or history already resolved. The exact supplied task is the
 only benchmark contract. Never claim knowledge of a hidden reference answer or dataset convention.
 Explicit domains, qualifiers, tests, and edge cases in that contract are binding; an unstated
-convention cannot silently narrow them. Adversarial work must actually attempt a counterexample,
+convention cannot silently narrow them. When an explicit task term conflicts with a learned genre,
+dataset, or benchmark convention, the explicit term has precedence unless the task itself defines
+the narrower convention. Do not use benchmark provenance as evidence. Adversarial work must actually
+attempt a counterexample,
 invariant, alternate derivation, tool check, or executable test rather than merely restating the
-committed conclusion."""
+committed conclusion. Keep internal reasoning bounded and reserve enough completion budget to emit
+one complete JSON object."""
 
     RECONCILE_SYSTEM = """You are the final consistency pass inside Roy's frozen Worker harness.
 Do not solve the task anew and do not add facts. Read the supplied structured result and return the
@@ -305,7 +309,10 @@ discovering a shared mistake. Return exactly one JSON object."""
                     "Update Z and private M only. Adjudicate every substantive contradiction "
                     "against the exact original task and explicit evidence. Do not preserve the "
                     "current answer merely because of self-reported confidence, prior consensus, "
-                    "or an unstated convention. If a message supplies counterexamples to a claim, "
+                    "or an unstated convention. An explicit domain, qualifier, test, or edge case "
+                    "in the task takes precedence over a learned genre/dataset convention unless "
+                    "the task defines that convention; benchmark provenance is not evidence. If a "
+                    "message supplies counterexamples to a claim, "
                     "address them explicitly before accepting or rejecting it. Return result and "
                     "memory_entries."
                 ),
@@ -726,7 +733,9 @@ candidate as a complete autonomous state X_i=(Q_i,R_i,C_i,M_i,T_i,Z_i,Sigma_i).
 The supplied original task and public tests are the complete observable benchmark contract. Never
 invent knowledge of a hidden reference answer or dataset convention. Configure specification audit
 and adversarial roles to test literal domains, qualifiers, edge cases, and counterexamples rather
-than rationalizing the committed answer from an unstated convention.
+than rationalizing the committed answer from an unstated convention. If explicit wording conflicts
+with a learned genre, dataset, or benchmark convention, the explicit wording has precedence unless
+the task itself defines the restriction; benchmark provenance is not evidence.
 
 Q/objective must be narrow and executable. R/role is a capability boundary derived from Q, never a
 role-pool label. C/context must explicitly name mandatory artifact inputs and useful weighted source
@@ -736,7 +745,8 @@ must preserve uncertainty rather than fabricate work not yet performed. Sigma/st
 hard dependencies. expected_output and stop_condition must be observable. Return a concise
 configuration_reasoning_summary explaining the design tradeoffs, not private chain-of-thought.
 The context original_task field must copy the supplied original_task exactly.
-Return exactly one JSON object and configure all fields; the runtime will reject incomplete X."""
+Keep internal reasoning bounded and reserve enough completion budget for the response. Return exactly
+one JSON object and configure all fields; the runtime will reject incomplete X."""
 
     def __init__(self, llm: JsonLLM, max_tokens: int = 4096, thinking: str = "disabled") -> None:
         self.llm, self.max_tokens, self.thinking = llm, max_tokens, thinking
@@ -874,6 +884,8 @@ dependencies, and use the exact supplied agent order. Root uncertainty estimates
 the committed answer is wrong after auditing the exact task contract, assumptions, contradictions,
 evidence quality, and method diversity. It is not simply one minus self-reported confidence.
 Agreement among agents sharing an assumption or method is correlated evidence, not verification.
+Explicit task domains, qualifiers, tests, and edge cases outrank learned genre/dataset conventions;
+benchmark provenance is not evidence and cannot make an otherwise substantive contradiction vanish.
 Set root uncertainty to zero only when the supplied evidence is independently decisive. When agents
 disagree, it cannot be zero unless the supplied evidence conclusively refutes the alternatives.
 For every agent, classify its current result relative to the root as supports, contradicts,
