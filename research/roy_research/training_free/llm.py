@@ -494,7 +494,13 @@ Return exactly one JSON object and configure all fields; the runtime will reject
             )
         realized = {
             candidate_id: AgentState.from_dict(
-                by_id[candidate_id], original_task=original_task,
+                {
+                    **by_id[candidate_id],
+                    # The dependency graph, not the external realizer, owns the
+                    # immutable derivation parent relation.
+                    "parent_id": graph.nodes[candidate_id].parent_id,
+                },
+                original_task=original_task,
                 available_tools=available_tools, expected_agent_id=candidate_id,
             )
             for candidate_id in selected_ids
@@ -504,7 +510,7 @@ Return exactly one JSON object and configure all fields; the runtime will reject
         allowed_sources = set(agents) | set(realized)
         for candidate_id, agent in realized.items():
             draft = graph.nodes[candidate_id]
-            if agent.parent_id != draft.parent_id or agent.parent_id not in agents:
+            if agent.parent_id not in agents:
                 raise ValueError(f"Agent {candidate_id} has invalid parent {agent.parent_id!r}")
             unknown_tests = set(agent.context.public_tests) - set(public_tests)
             if unknown_tests:

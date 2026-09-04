@@ -107,7 +107,8 @@ class ScriptedClient:
                 "configuration_reasoning_summary": "Use an independent arithmetic verifier.",
                 "risks": ["may repeat the root approach"],
                 "agents": [{
-                    "agent_id": candidate_id, "parent_id": "A0",
+                    # Runtime binds the immutable parent from the dependency graph.
+                    "agent_id": candidate_id, "parent_id": None,
                     "objective": "Recompute the pentagon angle sum and verify the large angle.",
                     "role": "Independent geometry arithmetic verifier.",
                     "context": {
