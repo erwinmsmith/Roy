@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Mapping, Protocol
 
 from .harness import AgentHarness, AgentHarnessConfig
+from .mia import SemanticInformationLandscape
 from .tools import TaskToolRegistry, ToolRequest
 from .types import (
     AgentState,
@@ -391,11 +392,16 @@ has no successful external/tool verification; self-reported confidence is not ve
         )
         selected: List[List[str]] = []
         seen: set[frozenset[str]] = set()
+        claimed_candidates: set[str] = set()
         for raw in value.get("selected_subgraphs", []):
             closure = graph.hard_closure(raw.get("candidate_ids", []), agents)
-            if not closure or len(closure) > maximum_nodes or closure in seen:
+            if (
+                not closure or len(closure) > maximum_nodes or closure in seen
+                or claimed_candidates.intersection(closure)
+            ):
                 continue
             seen.add(closure)
+            claimed_candidates.update(closure)
             selected.append(sorted(closure))
             if len(selected) == maximum_subgraphs:
                 break
@@ -529,6 +535,61 @@ Return exactly one JSON object and configure all fields; the runtime will reject
             dependencies=dependencies,
             configuration_reasoning_summary=reasoning_summary,
             risks=[str(item) for item in value.get("risks", [])],
+        )
+
+
+class SemanticInformationJudge:
+    """Estimate one shared semantic landscape for a whole organization step."""
+
+    SYSTEM = """You are Roy's frozen Semantic Information Judge. Inspect the supplied current
+agent states once and estimate the task-conditioned semantic parameters used by the MIA matrix
+functional. You do not choose an A2A matrix and do not simulate any candidate matrix.
+
+G[source][receiver] is a directional potential in [0,1]: how much novel, usable, task-relevant
+information the source currently has for the receiver, conditional on what the receiver already
+knows. R[i][j] is symmetric information redundancy in [0,1]. Lambda[i] is the receiving Agent's
+conversion fidelity in [0,1]. These are calibrated semantic estimates, never measured bits.
+Distinguish repeated conclusions from complementary evidence, respect direction and unresolved
+dependencies, and use the exact supplied agent order. Return JSON only."""
+
+    def __init__(self, llm: JsonLLM, max_tokens: int = 4096) -> None:
+        self.llm, self.max_tokens = llm, max_tokens
+
+    def estimate(
+        self,
+        agents: Mapping[str, AgentState],
+        *,
+        benchmark: str,
+        root_id: str,
+        state_context: Mapping[str, Any] | None = None,
+    ) -> SemanticInformationLandscape:
+        agent_ids = list(agents)
+        size = len(agent_ids)
+        value = self.llm.call(
+            "semantic_information_judge",
+            self.SYSTEM,
+            {
+                "benchmark": benchmark,
+                "root_id": root_id,
+                "agent_ids": agent_ids,
+                "current_agent_states": {
+                    agent_id: AgentHarness(agent).execution_view()
+                    for agent_id, agent in agents.items()
+                },
+                "current_state_context": dict(state_context or {}),
+                "required_schema": {
+                    "agent_ids": "exact supplied agent_ids in the same order",
+                    "directional_potential": f"{size}x{size} G, row=source column=receiver",
+                    "redundancy": f"{size}x{size} symmetric R",
+                    "conversion_fidelity": f"{size} Lambda values",
+                    "root_uncertainty": "number in [0,1] grounded in the root state",
+                    "calibration_summary": "concise evidence-grounded rationale",
+                },
+            },
+            max_tokens=self.max_tokens,
+        )
+        return SemanticInformationLandscape.from_dict(
+            value, expected_agent_ids=agent_ids, root_id=root_id,
         )
 
 

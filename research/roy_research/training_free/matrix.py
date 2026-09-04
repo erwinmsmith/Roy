@@ -4,7 +4,7 @@ import copy
 import itertools
 import json
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Protocol, Sequence, Tuple
 
 from .information import InformationMeasure
 from .llm import ChannelizerModel, WorkerModel
@@ -158,62 +158,58 @@ class MatrixSearchResult:
     admissible_level_matrices: int = 0
 
     def to_dict(self) -> Dict[str, object]:
+        top_matrices = sorted(
+            self.evaluated_matrices,
+            key=lambda item: float(item["predicted_information_gain"]),
+            reverse=True,
+        )[:10]
         return {
             "initial_matrix": self.initial_matrix.to_dict(),
             "matrix": self.matrix.to_dict(), "score": self.score,
+            "predicted_mia_gain": self.score,
             "delta_matrix": matrix_difference(self.initial_matrix, self.matrix).to_dict(),
             "evaluations": self.evaluations,
             "information_observations": self.information_observations,
             "search_space": {
                 "admissible_level_matrices": self.admissible_level_matrices,
                 "evaluated_count": len(self.evaluated_matrices),
+                "top_matrices": [
+                    {
+                        "evaluation_index": item["evaluation_index"],
+                        "matrix": item["matrix"],
+                        "predicted_mia_gain": item["predicted_information_gain"],
+                    }
+                    for item in top_matrices
+                ],
                 "evaluated_matrices": self.evaluated_matrices,
             },
         }
 
 
-class SemanticRolloutEvaluator:
+class MatrixEvaluator(Protocol):
+    @property
+    def revision(self) -> str: ...
+
+    def evaluate(
+        self, agents: Mapping[str, AgentState], matrix: InformationMatrix,
+    ) -> tuple[float, List[Dict[str, Any]]]: ...
+
+
+class A2AExecutor:
     def __init__(
         self,
         worker: WorkerModel,
         channelizer: ChannelizerModel,
-        information_measure: InformationMeasure,
         *,
         benchmark: str,
-        root_id: str,
         inbound_token_budget: int,
         communication_rounds: int,
-        information_rollouts: int,
-        state_context: Mapping[str, object] | None = None,
     ) -> None:
         self.worker = worker
         self.channelizer = channelizer
-        self.information_measure = information_measure
         self.benchmark = benchmark
-        self.root_id = root_id
         self.inbound_token_budget = inbound_token_budget
         self.communication_rounds = communication_rounds
-        self.information_rollouts = information_rollouts
-        self.state_context = dict(state_context or {})
-        self._realization_cache: Dict[
-            Tuple[str, Tuple[float, ...], int], Dict[str, AgentState]
-        ] = {}
-
-    def _realize_for_evaluation(
-        self,
-        agents: Mapping[str, AgentState],
-        matrix: InformationMatrix,
-        rollout_index: int,
-    ) -> Dict[str, AgentState]:
-        agents_fingerprint = json.dumps(
-            {key: value.to_dict() for key, value in agents.items()},
-            sort_keys=True,
-            ensure_ascii=False,
-        )
-        cache_key = (agents_fingerprint, matrix.key(), rollout_index)
-        if cache_key not in self._realization_cache:
-            self._realization_cache[cache_key] = self.realize_once(agents, matrix)
-        return copy.deepcopy(self._realization_cache[cache_key])
 
     def realize_once(
         self,
@@ -244,6 +240,56 @@ class SemanticRolloutEvaluator:
             states = next_states
         return states
 
+
+class SemanticRolloutEvaluator(A2AExecutor):
+    """Optional empirical validator; the production MIA search does not use it."""
+
+    def __init__(
+        self,
+        worker: WorkerModel,
+        channelizer: ChannelizerModel,
+        information_measure: InformationMeasure,
+        *,
+        benchmark: str,
+        root_id: str,
+        inbound_token_budget: int,
+        communication_rounds: int,
+        information_rollouts: int,
+        state_context: Mapping[str, object] | None = None,
+    ) -> None:
+        super().__init__(
+            worker, channelizer, benchmark=benchmark,
+            inbound_token_budget=inbound_token_budget,
+            communication_rounds=communication_rounds,
+        )
+        self.information_measure = information_measure
+        self.root_id = root_id
+        self.information_rollouts = information_rollouts
+        self.state_context = dict(state_context or {})
+        self._realization_cache: Dict[
+            Tuple[str, Tuple[float, ...], int], Dict[str, AgentState]
+        ] = {}
+
+    @property
+    def revision(self) -> str:
+        return self.information_measure.revision
+
+    def _realize_for_evaluation(
+        self,
+        agents: Mapping[str, AgentState],
+        matrix: InformationMatrix,
+        rollout_index: int,
+    ) -> Dict[str, AgentState]:
+        agents_fingerprint = json.dumps(
+            {key: value.to_dict() for key, value in agents.items()},
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        cache_key = (agents_fingerprint, matrix.key(), rollout_index)
+        if cache_key not in self._realization_cache:
+            self._realization_cache[cache_key] = self.realize_once(agents, matrix)
+        return copy.deepcopy(self._realization_cache[cache_key])
+
     def evaluate(
         self,
         agents: Mapping[str, AgentState],
@@ -268,7 +314,7 @@ class SemanticRolloutEvaluator:
 class BeamCoordinateMatrixSearch:
     def __init__(
         self,
-        evaluator: SemanticRolloutEvaluator,
+        evaluator: MatrixEvaluator,
         *,
         levels: Sequence[float] = (0.0, 0.5, 1.0),
         beam_width: int = 3,
@@ -299,21 +345,21 @@ class BeamCoordinateMatrixSearch:
 
         def score(matrix: InformationMatrix) -> tuple[float, List[Dict[str, Any]]]:
             matrix_key = matrix.key()
-            cache_key = (self.evaluator.information_measure.revision, matrix_key)
+            cache_key = (self.evaluator.revision, matrix_key)
             if cache_key not in cache:
                 if len(evaluated_matrices) >= self.maximum_evaluations:
                     return float("-inf"), []
                 evaluated = self.evaluator.evaluate(agents, matrix)
-                cache_key = (self.evaluator.information_measure.revision, matrix_key)
+                cache_key = (self.evaluator.revision, matrix_key)
                 cache[cache_key] = evaluated
                 evaluated_matrices.append({
                     "evaluation_index": len(evaluated_matrices),
                     "discovery_iteration": discovered_at.get(matrix_key, 0),
                     "matrix": matrix.to_dict(),
                     "delta_from_initial": matrix_difference(initial, matrix).to_dict(),
-                    "information_measure": self.evaluator.information_measure.name,
-                    "measure_revision": self.evaluator.information_measure.revision,
-                    "information_gain": evaluated[0],
+                    "matrix_evaluator": type(self.evaluator).__name__,
+                    "measure_revision": self.evaluator.revision,
+                    "predicted_information_gain": evaluated[0],
                     "information_observations": evaluated[1],
                 })
             return cache[cache_key]

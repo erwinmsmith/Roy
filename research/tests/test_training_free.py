@@ -26,6 +26,10 @@ from roy_research.training_free.llm import (
     JsonLLM,
     WorkerModel,
 )
+from roy_research.training_free.mia import (
+    MIAObjectiveEvaluator,
+    SemanticInformationLandscape,
+)
 from roy_research.training_free.matrix import (
     InformationMatrix,
     MatrixSearchResult,
@@ -156,6 +160,24 @@ class ScriptedClient:
                 "ambiguous": False,
                 "basis": "the supplied derivation",
             }
+        elif purpose == "semantic_information_judge":
+            agent_ids = payload["agent_ids"]
+            size = len(agent_ids)
+            g = [[0.0 for _ in agent_ids] for _ in agent_ids]
+            if size > 1:
+                root = agent_ids.index("A0")
+                for index in range(size):
+                    if index != root:
+                        g[index][root] = 0.9
+                        g[root][index] = 0.2
+            value = {
+                "agent_ids": agent_ids,
+                "directional_potential": g,
+                "redundancy": [[0.0 for _ in agent_ids] for _ in agent_ids],
+                "conversion_fidelity": [1.0 for _ in agent_ids],
+                "root_uncertainty": 0.1,
+                "calibration_summary": "Independent verification is novel for the root.",
+            }
         elif purpose == "posterior_probe":
             support = payload["hypothesis_support"]
             answer = payload["root_state"]["result"]["candidate_answer"]
@@ -176,7 +198,6 @@ def test_engine_commits_externally_realized_candidate_x() -> None:
         matrix_iterations=1,
         matrix_beam_width=2,
         maximum_matrix_evaluations=4,
-        information_rollouts=1,
         communication_rounds=1,
         maximum_organization_rounds=1,
         information_gain_epsilon=0.001,
@@ -195,7 +216,7 @@ def test_engine_commits_externally_realized_candidate_x() -> None:
     assert expensive[0]["thinking"] == "disabled"
     assert expensive[0]["max_tokens"] == config.candidate_realizer_max_tokens
     value = run.to_dict()
-    assert value["schema_version"] == 3
+    assert value["schema_version"] == 4
     assert value["agent_harness"]["schema_version"] == 1
     assert value["agent_harness"]["config"]["maximum_memory_entries"] == 64
     assert [checkpoint["phase"] for checkpoint in value["checkpoints"]] == [
@@ -238,18 +259,21 @@ def test_engine_commits_externally_realized_candidate_x() -> None:
         call["payload"] for call in client.calls if call["purpose"] == "candidate_x_realization"
     )
     assert "entries" not in realizer_payload["current_mas"]["A0"]
-    posterior_payloads = [
-        call["payload"] for call in client.calls if call["purpose"] == "posterior_probe"
-    ]
+    judge_calls = [call for call in client.calls if call["purpose"] == "semantic_information_judge"]
+    assert len(judge_calls) == 1
+    assert not {
+        "posterior_probe", "pairwise_information_probe"
+    } & {call["purpose"] for call in client.calls}
+    assert value["search_architecture"]["candidate_matrix_llm_rollouts"] == 0
+    assert value["call_audit"]["calls"]["semantic_information_judge"] == 1
+    assert sum(
+        event["kind"] == "winner_matrix_executed" for event in value["event_ledger"]
+    ) == 1
+    searched = value["rounds"][0]["frontiers"]["round-0-subgraph-0"]["search_space"]
+    assert searched["evaluated_count"] > 1
     assert all(
-        "candidate_x_realized" not in {
-            event["kind"] for event in payload["current_state_context"]["recent_history"]
-        }
-        for payload in posterior_payloads
-    )
-    assert any(
-        "evaluated_matrix" in payload["current_state_context"]
-        for payload in posterior_payloads
+        item["information_observations"][0]["llm_rollouts"] == 0
+        for item in searched["evaluated_matrices"]
     )
 
 
@@ -343,7 +367,6 @@ def test_next_round_proposals_receive_committed_path_state() -> None:
         matrix_iterations=1,
         matrix_beam_width=2,
         maximum_matrix_evaluations=4,
-        information_rollouts=1,
         communication_rounds=1,
         maximum_organization_rounds=2,
         information_gain_epsilon=0.001,
@@ -366,6 +389,8 @@ def test_next_round_proposals_receive_committed_path_state() -> None:
         item["kind"] for item in context["recent_history"]
     }
     assert len(run.to_dict()["matrix_trajectory"]) == 3
+    assert run.to_dict()["call_audit"]["calls"]["semantic_information_judge"] == 2
+    assert sum(event.kind == "winner_matrix_executed" for event in run.event_ledger) == 1
 
 
 def test_candidate_graph_closes_hard_predecessors_and_rejects_cycles() -> None:
@@ -473,6 +498,22 @@ def test_aflow_evaluator_preserves_virtual_environment_launcher(tmp_path: Path) 
     launcher.symlink_to(Path(sys.executable))
     evaluator = AFlowEvaluator(tmp_path, launcher)
     assert evaluator.python == launcher.absolute()
+
+
+def test_aflow_scorer_runs_from_disposable_writable_directory(tmp_path: Path) -> None:
+    evaluator = AFlowEvaluator(tmp_path, Path(sys.executable))
+    value = evaluator._invoke(
+        """
+import json
+from pathlib import Path
+Path('logs').mkdir()
+Path('logs/evaluator.log').write_text('ok')
+print(json.dumps({'score': 1.0}))
+""",
+        {},
+    )
+    assert value == {"score": 1.0}
+    assert not (tmp_path / "logs").exists()
 
 
 def test_symbolic_math_tool_solves_equation_and_rejects_code_execution() -> None:
@@ -761,6 +802,64 @@ def test_zero_communication_cannot_create_information_gain_from_probe_noise() ->
     assert all(item["score"] == 0.0 for item in observations)
 
 
+def test_mia_functional_scores_direct_multihop_and_redundancy_without_llm() -> None:
+    landscape = SemanticInformationLandscape(
+        ["A0", "A1", "A2"],
+        [
+            [0.0, 0.0, 0.0],
+            [0.8, 0.0, 0.7],
+            [0.2, 0.0, 0.0],
+        ],
+        [
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.5],
+            [0.0, 0.5, 0.0],
+        ],
+        [1.0, 0.5, 1.0], "A0", 0.6, "A1 has direct and relayed evidence",
+    )
+    matrix = InformationMatrix.zero(landscape.agent_ids)
+    matrix.set_weight("A1", "A0", 0.5)
+    matrix.set_weight("A1", "A2", 0.5)
+    matrix.set_weight("A2", "A0", 0.5)
+    objective = MIAObjectiveEvaluator(landscape, path_horizon=3).objective(matrix)
+    assert objective.direct_delivery == pytest.approx(0.5)
+    assert objective.multi_hop_delivery == pytest.approx(0.035)
+    assert objective.redundancy_correction > 0
+    assert objective.objective < objective.direct_delivery + objective.multi_hop_delivery
+
+
+def test_mia_gain_is_relative_to_current_committed_matrix() -> None:
+    landscape = SemanticInformationLandscape(
+        ["A0", "A1"], [[0.0, 0.0], [0.8, 0.0]],
+        [[0.0, 0.0], [0.0, 0.0]], [1.0, 1.0],
+        "A0", 0.2, "A1 can verify the root",
+    )
+    current = InformationMatrix.zero(landscape.agent_ids)
+    current.set_weight("A1", "A0", 1.0)
+    evaluator = MIAObjectiveEvaluator(landscape, reference_matrix=current)
+    gain, observations = evaluator.evaluate({}, current)
+    assert gain == pytest.approx(0.0)
+    assert observations[0]["llm_rollouts"] == 0
+
+
+def test_semantic_landscape_reorders_judge_axes_and_symmetrizes_redundancy() -> None:
+    landscape = SemanticInformationLandscape.from_dict(
+        {
+            "agent_ids": ["A1", "A0"],
+            "directional_potential": [[0.0, 0.7], [0.2, 0.0]],
+            "redundancy": [[0.0, 0.8], [0.6, 0.0]],
+            "conversion_fidelity": [0.9, 0.5],
+            "root_uncertainty": 0.25,
+            "calibration_summary": "ordered semantic estimates",
+        },
+        expected_agent_ids=["A0", "A1"], root_id="A0",
+    )
+    assert landscape.agent_ids == ["A0", "A1"]
+    assert landscape.directional_potential == [[0.0, 0.2], [0.7, 0.0]]
+    assert landscape.redundancy[0][1] == pytest.approx(0.7)
+    assert landscape.conversion_fidelity == [0.5, 0.9]
+
+
 def test_rollout_promotes_new_root_answer_into_dynamic_hypothesis_support() -> None:
     class ExactAnswerProbe:
         def posterior(self, root, support, benchmark, state_context):
@@ -807,23 +906,25 @@ def test_pairwise_information_measure_requires_no_hypothesis_support() -> None:
     assert observation.details["new_information"] == ["public test now passes"]
 
 
-def test_auto_information_measure_uses_support_free_fallback_for_new_benchmarks() -> None:
+def test_semantic_landscape_is_benchmark_agnostic_and_factory_injectable() -> None:
     engine = RoyTrainingFreeEngine(ScriptedClient(), config=TrainingFreeConfig())
     root = AgentState(
         "A0", None, "solve", "worker", ContextState("task"), MemoryState("memory/A0"),
         [], ResultState(), AgentStatus.READY, "artifact", "done",
     )
-    assert isinstance(
-        engine._make_information_measure("FutureBenchmark", [{"A0": root}]),
-        PairwiseStateMeasure,
+    estimated = engine._estimate_semantic_landscape(
+        "FutureBenchmark", {"A0": root}, {},
     )
+    assert estimated.agent_ids == ["A0"]
 
-    custom = PairwiseStateMeasure(object())  # type: ignore[arg-type]
+    custom = SemanticInformationLandscape(
+        ["A0"], [[0.0]], [[0.0]], [0.8], "A0", 0.4, "custom estimate",
+    )
     custom_engine = RoyTrainingFreeEngine(
         ScriptedClient(),
-        information_measure_factory=lambda benchmark, agent_sets: custom,
+        semantic_landscape_factory=lambda benchmark, agents, context: custom,
     )
-    assert custom_engine._make_information_measure("Anything", [{"A0": root}]) is custom
+    assert custom_engine._estimate_semantic_landscape("Anything", {"A0": root}, {}) is custom
 
 
 def test_positive_baseline_reorganization_is_committed_without_expansion() -> None:

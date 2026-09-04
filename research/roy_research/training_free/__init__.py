@@ -8,11 +8,13 @@ from .information import (
     InformationObservation,
     PairwiseStateMeasure,
 )
+from .mia import MIAObjective, MIAObjectiveEvaluator, SemanticInformationLandscape
 from .types import AgentState, BenchmarkTask, CandidateGraph, RealizedSubgraph
 
 __all__ = [
     "AgentHarness", "AgentHarnessConfig", "AgentState", "AnswerDistributionMeasure",
     "BenchmarkTask", "CandidateGraph", "InformationMeasure", "InformationObservation",
-    "PairwiseStateMeasure", "RealizedSubgraph",
+    "MIAObjective", "MIAObjectiveEvaluator", "PairwiseStateMeasure", "RealizedSubgraph",
     "RoyTrainingFreeEngine", "SingleAgentRun", "TrainingFreeConfig",
+    "SemanticInformationLandscape",
 ]

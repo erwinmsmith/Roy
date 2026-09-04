@@ -1077,8 +1077,8 @@ def main(argv: List[str] | None = None) -> None:
                         if args.arm == "single_agent_direct"
                         else engine.run(task)
                     )
-                    row = run.to_dict()
-                    row.update({
+                    completed_row = run.to_dict()
+                    completed_row.update({
                         "arm": args.arm,
                         "split": args.split,
                         "worker_model": worker_client.model,
@@ -1088,9 +1088,10 @@ def main(argv: List[str] | None = None) -> None:
                         "failed_attempts": failed_attempts,
                     })
                     if evaluator is not None:
-                        row["evaluation"] = evaluator.score(task, run.final_answer)
+                        completed_row["evaluation"] = evaluator.score(task, run.final_answer)
                     attempt_tokens += engine.audit.to_dict()["total_tokens"]
-                    row["all_attempts_total_tokens"] = attempt_tokens
+                    completed_row["all_attempts_total_tokens"] = attempt_tokens
+                    row = completed_row
                     break
                 except Exception as error:
                     attempt_tokens += engine.audit.to_dict()["total_tokens"]
@@ -1102,7 +1103,7 @@ def main(argv: List[str] | None = None) -> None:
                     })
             if row is None:
                 row = {
-                    "schema_version": 3,
+                    "schema_version": 4,
                     "method": (
                         "single_agent_direct" if args.arm == "single_agent_direct"
                         else "training_free_information_flow_search"
@@ -1122,6 +1123,9 @@ def main(argv: List[str] | None = None) -> None:
                     "all_attempts_total_tokens": attempt_tokens,
                     "evaluation": {"score": 0.0, "failure": "task_execution_failed"},
                 }
+            # Keep progress logging total even when an evaluator or compatibility
+            # result row omitted this optional accounting field.
+            row.setdefault("all_attempts_total_tokens", attempt_tokens)
             output_rows.append(row)
             write_jsonl(args.output, [row], append=append_output or task_index > 0)
             print(json.dumps({

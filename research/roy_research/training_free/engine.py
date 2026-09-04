@@ -13,16 +13,15 @@ from .llm import (
     CompletionClient,
     GlobalSelector,
     JsonLLM,
-    PairwiseInformationProbeModel,
-    PosteriorProbeModel,
+    SemanticInformationJudge,
     WorkerModel,
 )
-from .information import AnswerDistributionMeasure, InformationMeasure, PairwiseStateMeasure
+from .mia import MIAObjectiveEvaluator, SemanticInformationLandscape
 from .matrix import (
+    A2AExecutor,
     BeamCoordinateMatrixSearch,
     InformationMatrix,
     MatrixSearchResult,
-    SemanticRolloutEvaluator,
     expand_matrix,
 )
 from .tools import TaskToolRegistry, ToolAudit
@@ -55,20 +54,19 @@ class TrainingFreeConfig:
     matrix_beam_width: int = 3
     matrix_iterations: int = 3
     maximum_matrix_evaluations: int = 20
-    information_rollouts: int = 3
     communication_rounds: int = 2
     maximum_organization_rounds: int = 4
     inbound_token_budget: int = 4000
     information_gain_epsilon: float = 0.02
     finish_uncertainty: float = 0.15
-    information_measure: str = "auto"
     activation_threshold: float = 0.05
     worker_max_tokens: int = 2048
     result_reconciler_max_tokens: int = 256
     selector_max_tokens: int = 1024
     candidate_realizer_max_tokens: int = 4096
     channelizer_max_tokens: int = 768
-    information_probe_max_tokens: int = 512
+    semantic_judge_max_tokens: int = 4096
+    mia_path_horizon: int = 3
     candidate_thinking: str = "disabled"
     available_tools: tuple[str, ...] = ("symbolic_math", "python", "public_tests")
     maximum_tool_rounds: int = 2
@@ -79,16 +77,14 @@ class TrainingFreeConfig:
     def __post_init__(self) -> None:
         if self.maximum_agents < 1 or self.maximum_nodes_per_subgraph < 1:
             raise ValueError("agent limits must be positive")
-        if self.information_rollouts < 1 or self.communication_rounds < 1:
-            raise ValueError("rollout counts must be positive")
+        if self.communication_rounds < 1 or self.mia_path_horizon < 1:
+            raise ValueError("communication rounds and MIA path horizon must be positive")
         if self.maximum_matrix_evaluations < self.matrix_beam_width:
             raise ValueError("matrix evaluation budget must cover the beam")
         if self.maximum_tool_rounds < 0 or self.maximum_tool_calls_per_worker_call < 0:
             raise ValueError("tool loop limits cannot be negative")
         if not 0 <= self.hard_dependency_minimum <= 1:
             raise ValueError("hard dependency minimum must be in [0, 1]")
-        if self.information_measure not in ("auto", "answer_distribution", "pairwise_state"):
-            raise ValueError("unknown information measure")
 
 
 @dataclass
@@ -99,6 +95,8 @@ class RoundRecord:
     committed_checkpoint_id: str | None
     information_measure: str
     information_state_before: Dict[str, Any]
+    semantic_landscape: Dict[str, Any]
+    reference_mia_objective: float
     candidate_graph: Dict[str, Any]
     baseline: MatrixSearchResult
     frontiers: Dict[str, MatrixSearchResult]
@@ -120,6 +118,8 @@ class RoundRecord:
             "committed_checkpoint_id": self.committed_checkpoint_id,
             "information_measure": self.information_measure,
             "information_state_before": self.information_state_before,
+            "semantic_landscape": self.semantic_landscape,
+            "reference_mia_objective": self.reference_mia_objective,
             "candidate_graph": self.candidate_graph,
             "baseline": self.baseline.to_dict(),
             "frontiers": {key: value.to_dict() for key, value in self.frontiers.items()},
@@ -136,6 +136,7 @@ class RoundRecord:
             "selected_subgraph_id": self.selected_subgraph_id,
             "expansion_gain": self.expansion_gain,
             "selected_information_gain": self.selected_information_gain,
+            "predicted_mia_gain": self.selected_information_gain,
             "transition_kind": self.transition_kind,
             "topology_drift": self.topology_drift.to_dict() if self.topology_drift else None,
             "committed": self.committed,
@@ -223,8 +224,14 @@ class TrainingFreeRun:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "schema_version": 3,
+            "schema_version": 4,
             "method": "training_free_information_flow_search",
+            "search_architecture": {
+                "semantic_judge": "once_per_organization_round",
+                "matrix_objective": "pure_mia_functional",
+                "candidate_matrix_llm_rollouts": 0,
+                "execution_policy": "winner_only",
+            },
             "agent_harness": {
                 "schema_version": AGENT_HARNESS_SCHEMA_VERSION,
                 "config": asdict(self.harness_config),
@@ -251,6 +258,7 @@ class TrainingFreeRun:
             "event_ledger": [event.to_dict() for event in self.event_ledger],
             "organization_summary": self.organization_summary(),
             "cumulative_information_gain": self.cumulative_information_gain,
+            "cumulative_predicted_mia_gain": self.cumulative_information_gain,
             "matrix_trajectory": [
                 checkpoint.matrix for checkpoint in self.checkpoints
                 if checkpoint.phase in ("initial", "committed", "terminal")
@@ -277,7 +285,7 @@ class SingleAgentRun:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "schema_version": 3,
+            "schema_version": 4,
             "method": "single_agent_direct",
             "task_id": self.task_id,
             "benchmark": self.benchmark,
@@ -319,8 +327,8 @@ class RoyTrainingFreeEngine:
         *,
         config: TrainingFreeConfig | None = None,
         code_sandbox_prefix: List[str] | None = None,
-        information_measure_factory: Callable[
-            [str, List[Mapping[str, AgentState]]], InformationMeasure
+        semantic_landscape_factory: Callable[
+            [str, Mapping[str, AgentState], Mapping[str, Any]], SemanticInformationLandscape
         ] | None = None,
     ) -> None:
         self.config = config or TrainingFreeConfig()
@@ -341,14 +349,11 @@ class RoyTrainingFreeEngine:
             self.config.candidate_thinking,
         )
         self.channelizer = ChannelizerModel(worker_llm, self.config.channelizer_max_tokens)
-        self.posterior = PosteriorProbeModel(
-            worker_llm, self.config.information_probe_max_tokens,
-        )
-        self.pairwise_probe = PairwiseInformationProbeModel(
-            worker_llm, self.config.information_probe_max_tokens,
+        self.semantic_judge = SemanticInformationJudge(
+            worker_llm, self.config.semantic_judge_max_tokens,
         )
         self.code_sandbox_prefix = list(code_sandbox_prefix or [])
-        self.information_measure_factory = information_measure_factory
+        self.semantic_landscape_factory = semantic_landscape_factory
         self.tool_registry: TaskToolRegistry | None = None
         self.available_tools = list(self.config.available_tools)
 
@@ -436,31 +441,46 @@ class RoyTrainingFreeEngine:
                         scope="counterfactual",
                     ))
 
-            all_bases: List[Mapping[str, AgentState]] = [agents]
-            all_bases.extend({**agents, **candidate_agents} for candidate_agents in provisional.values())
             state_context = {
                 "current_matrix": matrix.to_dict(),
                 "dependency_state": [item.to_dict() for item in dependencies[-32:]],
                 "recent_history": _recent_committed_history(events),
             }
-            information_measure = self._make_information_measure(task.benchmark, all_bases)
-            information_state_before = information_measure.state(
-                agents["A0"], task.benchmark, state_context,
+            judge_agents = dict(agents)
+            for candidate_agents in provisional.values():
+                overlap = set(judge_agents) & set(candidate_agents)
+                if overlap:
+                    raise ValueError(
+                        f"candidate subgraphs must be disjoint for one-shot Judge: {sorted(overlap)}"
+                    )
+                judge_agents.update(candidate_agents)
+            landscape = self._estimate_semantic_landscape(
+                task.benchmark, judge_agents, state_context,
             )
+            information_state_before = {
+                "estimator": "mia_semantic_landscape",
+                "root_uncertainty": landscape.root_uncertainty,
+                "semantic_landscape_revision": landscape.revision,
+            }
+            events.append(TrajectoryEvent(
+                f"event-{len(events)}", round_index, "semantic_landscape_estimated",
+                {
+                    "revision": landscape.revision,
+                    "agent_ids": landscape.agent_ids,
+                    "judge_calls_this_round": 1,
+                },
+                scope="audit",
+            ))
             post_execution_checkpoint_id = f"checkpoint-{round_index}-post-execution"
             checkpoints.append(StateCheckpoint.capture(
                 post_execution_checkpoint_id, state_before_checkpoint_id, round_index,
                 "post_execution", agents, matrix, dependencies,
                 information_state_before, events,
             ))
-            evaluator = SemanticRolloutEvaluator(
-                self.worker, self.channelizer, information_measure,
-                benchmark=task.benchmark,
-                root_id="A0",
-                inbound_token_budget=self.config.inbound_token_budget,
-                communication_rounds=self.config.communication_rounds,
-                information_rollouts=self.config.information_rollouts,
-                state_context=state_context,
+            evaluator = MIAObjectiveEvaluator(
+                landscape,
+                path_horizon=self.config.mia_path_horizon,
+                reference_matrix=matrix,
             )
             optimizer = BeamCoordinateMatrixSearch(
                 evaluator,
@@ -470,33 +490,26 @@ class RoyTrainingFreeEngine:
                 hard_minimum=self.config.hard_dependency_minimum,
                 maximum_evaluations=self.config.maximum_matrix_evaluations,
             )
-            for _ in range(8):
-                measure_revision_before_search = information_measure.revision
-                baseline = optimizer.optimize(agents, matrix)
-                frontiers: Dict[str, MatrixSearchResult] = {}
-                for subgraph_id, new_agents in provisional.items():
-                    basis = {**agents, **new_agents}
-                    candidate = realized[subgraph_id]
-                    initial = expand_matrix(matrix, new_agents, candidate.dependencies)
-                    frontiers[subgraph_id] = optimizer.optimize(
-                        basis, initial, candidate.dependencies,
-                    )
-                information_state_before = information_measure.state(
-                    agents["A0"], task.benchmark, state_context,
+            baseline = optimizer.optimize(agents, matrix)
+            frontiers: Dict[str, MatrixSearchResult] = {}
+            for subgraph_id, new_agents in provisional.items():
+                basis = {**agents, **new_agents}
+                candidate = realized[subgraph_id]
+                initial = expand_matrix(matrix, new_agents, candidate.dependencies)
+                frontiers[subgraph_id] = optimizer.optimize(
+                    basis, initial, candidate.dependencies,
                 )
-                if information_measure.revision == measure_revision_before_search:
-                    break
-                events.append(TrajectoryEvent(
-                    f"event-{len(events)}", round_index, "information_measure_revised",
-                    {
-                        "measure": information_measure.name,
-                        "before_revision": measure_revision_before_search,
-                        "after_revision": information_measure.revision,
+            events.append(TrajectoryEvent(
+                f"event-{len(events)}", round_index, "mia_matrix_search_completed",
+                {
+                    "baseline_evaluations": baseline.evaluations,
+                    "frontier_evaluations": {
+                        key: result.evaluations for key, result in frontiers.items()
                     },
-                    scope="counterfactual",
-                ))
-            else:  # pragma: no cover - adaptive measures are revision bounded
-                raise RuntimeError("information measure did not stabilize")
+                    "candidate_matrix_llm_rollouts": 0,
+                },
+                scope="audit",
+            ))
 
             decision = select_transition(
                 baseline, frontiers, self.config.information_gain_epsilon,
@@ -516,18 +529,15 @@ class RoyTrainingFreeEngine:
             if not commit:
                 stop_reason = (
                     "root_confident"
-                    if _is_confident(
-                        information_measure, information_state_before,
-                        self.config.finish_uncertainty,
-                    )
+                    if landscape.root_uncertainty <= self.config.finish_uncertainty
                     else "structural_saturation"
                 )
                 events.append(TrajectoryEvent(
                     f"event-{len(events)}", round_index, "trajectory_stopped",
                     {
                         "reason": stop_reason,
-                        "baseline_information_gain": baseline.score,
-                        "best_candidate_information_gain": best_candidate_score,
+                        "baseline_predicted_mia_gain": baseline.score,
+                        "best_candidate_predicted_mia_gain": best_candidate_score,
                     },
                 ))
                 committed_checkpoint_id = f"checkpoint-{round_index}-terminal"
@@ -548,9 +558,23 @@ class RoyTrainingFreeEngine:
                         realized[selected_id].dependencies,
                     ))
                 winning_matrix = selected_result.matrix
-                next_agents = evaluator.realize_once(
+                executor = A2AExecutor(
+                    self.worker, self.channelizer,
+                    benchmark=task.benchmark,
+                    inbound_token_budget=self.config.inbound_token_budget,
+                    communication_rounds=self.config.communication_rounds,
+                )
+                next_agents = executor.realize_once(
                     winning_agents, winning_matrix, tool_scope="committed",
                 )
+                events.append(TrajectoryEvent(
+                    f"event-{len(events)}", round_index, "winner_matrix_executed",
+                    {
+                        "matrix": winning_matrix.to_dict(),
+                        "selected_subgraph_id": selected_id,
+                        "executed_matrix_count": 1,
+                    },
+                ))
                 self._apply_activation(next_agents, winning_matrix, dependencies)
                 agents = next_agents
                 matrix = winning_matrix
@@ -561,15 +585,16 @@ class RoyTrainingFreeEngine:
                     {
                         "transition_kind": transition_kind,
                         "subgraph_id": selected_id,
-                        "conditional_information_gain": selected_information_gain,
+                        "predicted_mia_gain": selected_information_gain,
                         "expansion_advantage": expansion_advantage,
                         "topology_drift": drift.to_dict(),
                     },
                 ))
                 committed_checkpoint_id = f"checkpoint-{round_index}-committed"
-                checkpoint_information_state = information_measure.state(
-                    agents["A0"], task.benchmark, state_context,
-                )
+                checkpoint_information_state = {
+                    **information_state_before,
+                    "state_changed_after_winner_execution": True,
+                }
                 checkpoints.append(StateCheckpoint.capture(
                     committed_checkpoint_id, post_execution_checkpoint_id, round_index,
                     "committed", agents, matrix, dependencies,
@@ -582,8 +607,10 @@ class RoyTrainingFreeEngine:
                 state_before_checkpoint_id=state_before_checkpoint_id,
                 post_execution_checkpoint_id=post_execution_checkpoint_id,
                 committed_checkpoint_id=committed_checkpoint_id,
-                information_measure=information_measure.name,
+                information_measure="mia_semantic_landscape",
                 information_state_before=information_state_before,
+                semantic_landscape=landscape.to_dict(),
+                reference_mia_objective=evaluator.reference,
                 candidate_graph=candidate_graph.subset(candidate_graph.nodes),
                 baseline=baseline,
                 frontiers=frontiers,
@@ -766,31 +793,17 @@ class RoyTrainingFreeEngine:
                 continue
             dependency.status = "dormant" if target.status == AgentStatus.DORMANT else "active"
 
-    def _make_information_measure(
+    def _estimate_semantic_landscape(
         self,
         benchmark: str,
-        agent_sets: List[Mapping[str, AgentState]],
-    ) -> InformationMeasure:
-        if self.information_measure_factory is not None:
-            return self.information_measure_factory(benchmark, agent_sets)
-        configured = self.config.information_measure
-        selected = (
-            "answer_distribution" if configured == "auto" and benchmark == "MATH"
-            else "pairwise_state" if configured == "auto"
-            else configured
+        agents: Mapping[str, AgentState],
+        state_context: Mapping[str, Any],
+    ) -> SemanticInformationLandscape:
+        if self.semantic_landscape_factory is not None:
+            return self.semantic_landscape_factory(benchmark, agents, state_context)
+        return self.semantic_judge.estimate(
+            agents, benchmark=benchmark, root_id="A0", state_context=state_context,
         )
-        if selected == "answer_distribution":
-            return AnswerDistributionMeasure(self.posterior, agent_sets)
-        return PairwiseStateMeasure(self.pairwise_probe)
-
-
-def _is_confident(
-    measure: InformationMeasure,
-    state: Mapping[str, Any],
-    threshold: float,
-) -> bool:
-    uncertainty = measure.uncertainty(state)
-    return uncertainty is not None and uncertainty <= threshold
 
 
 def _recent_committed_history(events: List[TrajectoryEvent]) -> List[Dict[str, Any]]:

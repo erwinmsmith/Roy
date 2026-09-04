@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
@@ -136,16 +138,24 @@ print(json.dumps({'score': 1.0 if status == benchmark.PASS else 0.0, 'details': 
         *,
         prefix: Sequence[str] = (),
     ) -> Dict[str, Any]:
-        command = [*prefix, str(self.python), "-c", script]
-        completed = subprocess.run(
-            command,
-            cwd=self.root,
-            input=json.dumps(payload),
-            text=True,
-            capture_output=True,
-            timeout=self.timeout_seconds,
-            check=False,
+        # AFlow initializes a file logger at import time. Give an unprivileged
+        # scorer a disposable writable cwd while importing benchmark code only
+        # from the pinned checkout.
+        pinned_script = (
+            f"import sys\nsys.path.insert(0, {str(self.root)!r})\n" + script
         )
+        command = [*prefix, str(self.python), "-c", pinned_script]
+        with tempfile.TemporaryDirectory(prefix="roy-aflow-score-") as directory:
+            os.chmod(directory, 0o777)
+            completed = subprocess.run(
+                command,
+                cwd=directory,
+                input=json.dumps(payload),
+                text=True,
+                capture_output=True,
+                timeout=self.timeout_seconds,
+                check=False,
+            )
         if completed.returncode != 0:
             raise RuntimeError(
                 f"AFlow scorer failed ({completed.returncode}): {completed.stderr.strip()}"

@@ -215,9 +215,11 @@ The `training-free` branch also contains a separate inference-only Roy path in
 `roy_research.training_free`. It starts with `A0`, lets the Worker propose a
 dependency graph, uses the Global Semantic Searcher to retain at most three
 dependency-closed subgraphs, and compares every realized expansion against an
-optimized no-expansion baseline. The inner search evaluates complete weighted
-A2A matrices through semantic channelization and a frozen, benchmark-adapted
-information measure; it does not add edge scores or require an answer space.
+optimized no-expansion baseline. Once per organization round, a frozen Semantic
+Information Judge maps the current Agent states to a shared estimated landscape
+`(G_hat, R_hat, Lambda_hat)`. Matrix search then evaluates every weighted A2A
+matrix with the pure numerical MIA functional; it performs zero semantic LLM
+rollouts and executes only the selected winner.
 
 Candidate proposal and candidate realization are deliberately different calls.
 The proposal is a cheap semantic direction. Only after global selection does an
@@ -225,8 +227,9 @@ independently configurable external candidate model perform the high-compute
 `XRealizer` call. That call must explicitly configure the complete
 `X_i=(Q_i,R_i,C_i,M_i,T_i,Z_i,Sigma_i)` for every candidate. Incomplete states,
 unknown tools, shared-memory namespaces, invalid dependencies, and wrong agent
-ids fail closed. The same realized `X` is cached and reused across all matrix
-rollouts, so matrix search never silently redesigns the candidate agents.
+ids fail closed. All retained candidate subgraphs are included in the same
+one-shot Judge call, so neither candidates nor matrices receive separate
+semantic scoring calls.
 
 Every realized state runs through the same versioned single-Agent harness. Its
 immutable contract is `(agent_id, parent_id, Q/objective, R/role, T/tools,
@@ -253,33 +256,36 @@ searches. Its committed state is `S_t=(X_t,W_t,D_t,H_t)`: private Agent state,
 the current information matrix, dependency/derivation state, and an append-only
 event ledger. Every Parent proposal receives its current matrix, peer summaries,
 private memory, active dependencies, committed history, and a separately marked
-counterfactual search history. Information probes receive committed history only;
-provisional candidate events cannot leak into `q_t`.
+counterfactual search history. Provisional candidate events cannot leak into
+`q_t`.
 
-The search core consumes only the `InformationMeasure` contract: a measure
-revision, a serializable state observation, uncertainty when available, and a
-scalar comparison of the root state before and after a rollout. MATH uses the
-optional `answer_distribution` adapter and KL divergence; its dynamic answer
-support is private to that adapter. HumanEval and unregistered future
-benchmarks default to the support-free `pairwise_state` adapter, which compares
-new verified evidence, resolved uncertainty, test behavior, contradictions,
-and actionable corrections. New benchmarks can therefore provide their own
-execution-, verifier-, utility-, or semantic-state measure through
-`information_measure_factory` without modifying the engine or matrix optimizer.
+`G_hat[source, receiver]` is a task-conditioned directional semantic information
+potential, `R_hat` estimates pairwise redundancy, and `Lambda_hat` estimates
+receiver conversion fidelity. They are explicitly recorded as calibrated
+semantic estimates, not measured bits. With `P=(W*G_hat)Lambda_hat`, the MIA
+functional accumulates direct and bounded multi-hop delivery to the root and
+subtracts redundancy through an inclusion-exclusion correction. The root is an
+absorbing destination so cycles cannot manufacture repeatedly "new"
+information. Capacity and hard-dependency constraints define the admissible
+matrix space.
 
 For no expansion, matrix search starts at `W_t`; for expansion it starts at
 `[[W_t,B_t],[C_t,D_t]]`. A coordinate neighbor changes one edge by only one
 adjacent configured weight level, so repeated beam iterations optimize a
-reachable `Delta W_t` instead of rebuilding an unrelated graph. A positive
+reachable `Delta W_t` instead of rebuilding an unrelated graph. Each candidate
+matrix is scored as `Delta Psi_MIA(W)=Psi_MIA(W)-Psi_MIA(W_t)`, which prevents a
+valuable but unchanged organization from causing an infinite reorganization
+loop. A positive
 no-expansion frontier is committed as a `reorganize` transition and the system
 continues; it stops only when both reorganization and admissible expansion fail
-to exceed the conditional-information threshold. Selected dependency subgraphs
+to exceed the predicted MIA-gain threshold. Selected dependency subgraphs
 of up to two nodes provide the V1 short-horizon lookahead.
 
-Every output now includes schema-v3 generic `information_state` checkpoints,
+Every output now includes schema-v4 generic `information_state` checkpoints,
 `event_ledger`,
 `dependency_ledger`, `matrix_trajectory`, `agent_basis_trajectory`, cumulative
-conditional information gain, per-round initial/final/delta matrices, and
+predicted MIA gain, the complete per-round semantic landscape, every numerically
+evaluated matrix with zero-rollout evidence, per-round initial/final/delta matrices, and
 topology drift (`Delta N`, edge L1/Frobenius drift, and edge additions/removals).
 
 The checked V1 budget is in [`config/training_free_v1.json`](config/training_free_v1.json).
