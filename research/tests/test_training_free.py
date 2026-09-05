@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import pytest
+
+sys.path.insert(0, str(Path(__file__).parents[1] / "remote"))
+from run_aflow_search_then_test import stage_workspace
+
 from roy_research.cli import _failed_task_ids
 from roy_research.training_free.aflow import AFlowDataset, AFlowEvaluator
 from roy_research.training_free.engine import (
@@ -220,6 +224,21 @@ def test_cognitive_prompt_priors_change_behavior_not_state_space() -> None:
         SemanticInformationJudge.SYSTEM, ChannelizerModel.SYSTEM,
     ))
     assert "Theory of Mind" not in combined
+
+
+def test_aflow_private_workspace_links_operator_data(tmp_path: Path) -> None:
+    aflow_root = tmp_path / "AFlow"
+    source = aflow_root / "workspace/HumanEval/workflows"
+    (aflow_root / "data/datasets").mkdir(parents=True)
+    (source / "template").mkdir(parents=True)
+    (source / "round_1").mkdir()
+    run_root = tmp_path / "run"
+
+    stage_workspace(aflow_root, run_root, "HumanEval", resume=False)
+    stage_workspace(aflow_root, run_root, "HumanEval", resume=True)
+
+    assert (run_root / "data").is_symlink()
+    assert (run_root / "data").resolve() == (aflow_root / "data").resolve()
 
 
 def test_engine_commits_externally_realized_candidate_x() -> None:

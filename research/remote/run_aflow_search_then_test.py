@@ -77,6 +77,13 @@ def stage_workspace(aflow_root: Path, run_root: Path, benchmark: str, resume: bo
     workspace = run_root / "workspace"
     if run_root.exists() and not resume:
         raise FileExistsError(f"refusing to overwrite {run_root}; pass --resume")
+    data_source = aflow_root / "data"
+    if not data_source.is_dir():
+        raise FileNotFoundError(f"missing AFlow data directory: {data_source}")
+    run_root.mkdir(parents=True, exist_ok=True)
+    data_link = run_root / "data"
+    if not data_link.exists():
+        data_link.symlink_to(data_source, target_is_directory=True)
     if workspace.exists():
         return
     source = aflow_root / "workspace" / benchmark / "workflows"
