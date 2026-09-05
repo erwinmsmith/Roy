@@ -1551,6 +1551,42 @@ def test_semantic_landscape_accepts_agent_id_maps_from_judge() -> None:
     assert landscape.conversion_fidelity == [0.9, 0.7]
 
 
+def test_semantic_judge_uses_runtime_owned_agent_ids() -> None:
+    class BadIdEchoLLM:
+        def __init__(self) -> None:
+            self.payload: Dict[str, Any] = {}
+
+        def call(self, purpose, system, payload, *, max_tokens):
+            self.payload = payload
+            return {
+                "agent_ids": "exact supplied agent_ids in the same order",
+                "directional_potential": [[0.0, 0.1], [0.8, 0.0]],
+                "redundancy": [[0.0, 0.2], [0.2, 0.0]],
+                "conversion_fidelity": [0.9, 0.7],
+                "root_relations": {"A0": "supports", "A1": "complements"},
+                "root_uncertainty": 0.3,
+                "calibration_summary": "A1 supplies complementary evidence.",
+            }
+
+    root = AgentState(
+        "A0", None, "solve", "solver", ContextState("task"), MemoryState("memory/A0"),
+        [], ResultState(candidate_answer="root"), AgentStatus.DONE, "answer", "done",
+    )
+    peer = AgentState(
+        "A1", "A0", "verify", "verifier", ContextState("task"), MemoryState("memory/A1"),
+        [], ResultState(candidate_answer="peer"), AgentStatus.DONE, "answer", "done",
+    )
+    llm = BadIdEchoLLM()
+
+    landscape = SemanticInformationJudge(llm).estimate(  # type: ignore[arg-type]
+        {"A0": root, "A1": peer}, benchmark="MATH", root_id="A0",
+    )
+
+    assert landscape.agent_ids == ["A0", "A1"]
+    assert landscape.directional_potential[1][0] == 0.8
+    assert "agent_ids" not in llm.payload["required_schema"]
+
+
 def test_semantic_landscape_repairs_zero_gain_for_explicit_contradiction() -> None:
     landscape = SemanticInformationLandscape.from_dict(
         {

@@ -1019,12 +1019,16 @@ or execute a candidate matrix."""
         agent_ids = list(agents)
         size = len(agent_ids)
         required_schema = {
-            "agent_ids": "exact supplied agent_ids in the same order",
             "directional_potential": (
-                f"{size}x{size} G as arrays or agent-id map; row=source column=receiver"
+                f"{size}x{size} G as arrays in supplied agent_ids order or agent-id map; "
+                "row=source column=receiver"
             ),
-            "redundancy": f"{size}x{size} symmetric R as arrays or agent-id map",
-            "conversion_fidelity": f"{size} Lambda values as array or agent-id map",
+            "redundancy": (
+                f"{size}x{size} symmetric R as arrays in supplied agent_ids order or agent-id map"
+            ),
+            "conversion_fidelity": (
+                f"{size} Lambda values as array in supplied agent_ids order or agent-id map"
+            ),
             "root_relations": (
                 "agent-id map covering every agent with exactly one of "
                 "supports|contradicts|complements|unresolved; root itself is supports"
@@ -1066,6 +1070,10 @@ or execute a candidate matrix."""
             },
             max_tokens=self.max_tokens,
         )
+        # Agent identity and ordering belong to the runtime contract, not the
+        # model's semantic estimate. This also avoids failing an expensive task
+        # when a model omits or inaccurately echoes the supplied IDs.
+        value["agent_ids"] = agent_ids
         return SemanticInformationLandscape.from_dict(
             value, expected_agent_ids=agent_ids, root_id=root_id,
             precision_dimensions=self.precision_dimensions,
