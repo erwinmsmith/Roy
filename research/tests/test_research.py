@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import urllib.error
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -38,6 +39,7 @@ from roy_research.live_controlled import (
 from roy_research.providers import (
     Completion,
     DeepSeekClient,
+    OpenAICompatibleClient,
     ProviderPaymentRequiredError,
     ProviderRetryExhaustedError,
 )
@@ -315,6 +317,50 @@ class RuntimeBoundaryTests(unittest.TestCase):
                     client.complete([{"role": "user", "content": "bounded"}], max_tokens=64)
             self.assertEqual(ledger.snapshot()["used"], 0)
             self.assertEqual(ledger.snapshot()["reserved"], 0)
+
+    def test_openai_compatible_client_uses_standard_sdk_fields(self) -> None:
+        class Response:
+            def model_dump(self, mode="python"):
+                self.mode = mode
+                return {
+                    "model": "qwen-compatible",
+                    "choices": [{"message": {"content": '{"status":"ok"}'}}],
+                    "usage": {
+                        "prompt_tokens": 7, "completion_tokens": 4, "total_tokens": 11,
+                    },
+                }
+
+        calls = []
+        sdk = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+            create=lambda **kwargs: calls.append(kwargs) or Response(),
+        )))
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = PersistentTokenLedger(Path(directory) / "ledger.json", limit=10_000)
+            events = Path(directory) / "events.jsonl"
+            with patch.dict(os.environ, {"TEST_OPENAI_KEY": "test-key"}, clear=True):
+                client = OpenAICompatibleClient(
+                    ledger,
+                    model="qwen-compatible",
+                    base_url="https://example.invalid/v1/",
+                    api_key_env="TEST_OPENAI_KEY",
+                    event_log=events,
+                    sdk_client=sdk,
+                )
+            completion = client.complete(
+                [{"role": "user", "content": "status"}],
+                max_tokens=64,
+                temperature=0.0,
+                json_mode=True,
+                thinking="enabled",
+            )
+            self.assertEqual(completion.content, '{"status":"ok"}')
+            self.assertEqual(ledger.snapshot()["used"], 11)
+            self.assertEqual(calls[0]["response_format"], {"type": "json_object"})
+            self.assertNotIn("thinking", calls[0])
+            event = json.loads(events.read_text(encoding="utf-8"))
+            self.assertEqual(event["provider"], "openai_compatible")
+            self.assertEqual(event["requested_thinking"], "enabled")
+            self.assertEqual(event["base_url"], "https://example.invalid/v1")
 
 
 class LiveRolloutTests(unittest.TestCase):

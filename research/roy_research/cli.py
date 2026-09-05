@@ -57,7 +57,7 @@ from .lhtb_training import LHTBProcessGRPOTrainer
 from .lhtb_value_metrics import annotate_value_traces, value_metrics
 from .live_controlled import collect_forced_full_mas, collect_live_group
 from .organization import LHTB_POLICY_INTERFACE_REVISION, RuntimeBudget
-from .providers import DeepSeekClient, ProviderCircuitOpenError
+from .providers import DeepSeekClient, OpenAICompatibleClient, ProviderCircuitOpenError
 from .reporting import write_utility_svg
 from .schema import TraceRecord
 from .tau3 import build_tau3_manifest, manifest_summary, verify_tau3_root
@@ -212,6 +212,16 @@ def parser() -> argparse.ArgumentParser:
     training_free.add_argument("--events", type=Path, required=True)
     training_free.add_argument("--token-limit", type=int, default=10_000_000)
     training_free.add_argument("--timeout", type=float, default=120.0)
+    training_free.add_argument(
+        "--provider", choices=("deepseek", "openai-compatible"), default="deepseek",
+    )
+    training_free.add_argument(
+        "--base-url", help="Base URL for --provider openai-compatible, including /v1",
+    )
+    training_free.add_argument(
+        "--api-key-env", default="OPENAI_API_KEY",
+        help="Environment variable containing the OpenAI-compatible API key",
+    )
     training_free.add_argument("--worker-model", default="deepseek-v4-flash")
     training_free.add_argument(
         "--candidate-model",
@@ -576,6 +586,33 @@ def _failed_task_ids(paths: List[Path], output: Path) -> set[str]:
             if row.get("task_id"):
                 latest_status[str(row["task_id"])] = str(row.get("run_status", ""))
     return {task_id for task_id, status in latest_status.items() if status == "failed"}
+
+
+def _training_free_client(
+    args: argparse.Namespace,
+    ledger: PersistentTokenLedger,
+    *,
+    model: str,
+):
+    common = {
+        "model": model,
+        "timeout": args.timeout,
+        "event_log": args.events,
+        "max_retries": args.provider_max_retries,
+        "retry_base_seconds": args.provider_retry_base_seconds,
+    }
+    if args.provider == "deepseek":
+        if args.base_url is not None:
+            raise ValueError("--base-url is only valid with --provider openai-compatible")
+        return DeepSeekClient(ledger, **common)
+    if not args.base_url:
+        raise ValueError("--base-url is required with --provider openai-compatible")
+    return OpenAICompatibleClient(
+        ledger,
+        base_url=args.base_url,
+        api_key_env=args.api_key_env,
+        **common,
+    )
 
 
 def main(argv: List[str] | None = None) -> None:
@@ -1061,16 +1098,9 @@ def main(argv: List[str] | None = None) -> None:
             }
             tasks = [task for task in tasks if task.task_id not in completed_task_ids]
         ledger = PersistentTokenLedger(args.ledger, args.token_limit)
-        worker_client = DeepSeekClient(
-            ledger, model=args.worker_model, timeout=args.timeout, event_log=args.events,
-            max_retries=args.provider_max_retries,
-            retry_base_seconds=args.provider_retry_base_seconds,
-        )
-        candidate_client = DeepSeekClient(
-            ledger, model=args.candidate_model or args.worker_model,
-            timeout=args.timeout, event_log=args.events,
-            max_retries=args.provider_max_retries,
-            retry_base_seconds=args.provider_retry_base_seconds,
+        worker_client = _training_free_client(args, ledger, model=args.worker_model)
+        candidate_client = _training_free_client(
+            args, ledger, model=args.candidate_model or args.worker_model,
         )
         evaluator = None
         if args.score:
@@ -1122,6 +1152,7 @@ def main(argv: List[str] | None = None) -> None:
                         "split": args.split,
                         "worker_model": worker_client.model,
                         "candidate_model": candidate_client.model,
+                        "provider": args.provider,
                         "run_status": "completed",
                         "execution_attempt": attempt,
                         "failed_attempts": failed_attempts,
@@ -1167,6 +1198,7 @@ def main(argv: List[str] | None = None) -> None:
                     "split": args.split,
                     "worker_model": worker_client.model,
                     "candidate_model": candidate_client.model,
+                    "provider": args.provider,
                     "run_status": "failed",
                     "final_answer": "",
                     "rounds": [],

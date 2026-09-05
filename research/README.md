@@ -355,6 +355,23 @@ single-Agent baseline. It uses the same root harness, Worker model, token ceilin
 tool registry, and scorer, but never invokes candidate selection, X realization,
 channelization, an information probe, or matrix search.
 
+Any OpenAI-compatible chat-completions endpoint can be selected without changing
+the benchmark or Agent harness. Keep the credential in an environment variable:
+
+```bash
+export OPENAI_COMPAT_API_KEY=...
+PYTHONPATH=research python3 -m roy_research training-free-run \
+  --provider openai-compatible \
+  --base-url https://api.code-soul.com/v1 \
+  --api-key-env OPENAI_COMPAT_API_KEY \
+  --worker-model 'qwen3.5:9b-128k' \
+  --candidate-model 'qwen3.5:9b-128k' \
+  ...
+```
+
+The generic provider uses the OpenAI Python SDK, preserves Roy's persistent token
+ledger and request audit, and does not forward vendor-specific `thinking` fields.
+
 Add `--score --aflow-python /path/to/AFlow/.venv/bin/python` to invoke the pinned
 AFlow MATH scorer. HumanEval loads only its public tests into agent context and
 keeps hidden tests in the evaluator payload. Its scorer refuses to run unless

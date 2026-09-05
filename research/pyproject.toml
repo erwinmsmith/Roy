@@ -5,6 +5,7 @@ description = "LHTB continuous process-credit training and transfer harness for 
 requires-python = ">=3.9"
 dependencies = [
   "numpy>=1.26,<3",
+  "openai>=1.82,<3",
   "torch>=2.1",
   "sentence-transformers>=3.0",
   "tomli>=2.0; python_version < '3.11'",
