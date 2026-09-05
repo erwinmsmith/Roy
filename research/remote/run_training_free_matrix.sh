@@ -13,6 +13,7 @@ api_key_env="${ROY_TF_API_KEY_ENV:-OPENAI_API_KEY}"
 base_url="${ROY_TF_BASE_URL:-}"
 wait_for_pid="${ROY_TF_WAIT_FOR_PID:-}"
 wait_seconds="${ROY_TF_WAIT_SECONDS:-30}"
+resume="${ROY_TF_RESUME:-false}"
 
 [[ "${limit}" == "all" || "${limit}" =~ ^[1-9][0-9]*$ ]] || {
   echo "LIMIT must be a positive integer or 'all'" >&2
@@ -26,6 +27,10 @@ if [[ -n "${wait_for_pid}" && ! "${wait_for_pid}" =~ ^[1-9][0-9]*$ ]]; then
   echo "ROY_TF_WAIT_FOR_PID must be a positive process id" >&2
   exit 2
 fi
+[[ "${resume}" == "true" || "${resume}" == "false" ]] || {
+  echo "ROY_TF_RESUME must be true or false" >&2
+  exit 2
+}
 [[ -x "${python_bin}" && -x "${aflow_python}" ]] || {
   echo "Roy and AFlow Python environments are required" >&2
   exit 2
@@ -43,7 +48,8 @@ if [[ -n "${wait_for_pid}" ]]; then
 fi
 
 mkdir -p "${run_root}"
-if find "${run_root}" -maxdepth 1 -name '*.jsonl' -print -quit | grep -q .; then
+if [[ "${resume}" != "true" ]] \
+  && find "${run_root}" -maxdepth 1 -name '*.jsonl' -print -quit | grep -q .; then
   echo "refusing to overwrite an existing experiment in ${run_root}" >&2
   exit 2
 fi
@@ -70,6 +76,9 @@ common=(
 )
 if [[ "${limit}" != "all" ]]; then
   common+=(--limit "${limit}")
+fi
+if [[ "${resume}" == "true" ]]; then
+  common+=(--resume)
 fi
 math_sandbox="${ROY_TF_MATH_SANDBOX:-env -i PATH=/usr/bin:/bin setpriv --reuid=210234 --regid=210000 --clear-groups --no-new-privs}"
 he_sandbox="${ROY_TF_HE_SANDBOX:-env -i PATH=/usr/bin PYTHONPATH=${aflow_root}/.venv/lib/python3.12/site-packages:${aflow_root} setpriv --reuid=210232 --regid=210000 --clear-groups --no-new-privs}"
@@ -99,10 +108,18 @@ launch() {
   if [[ "${serial}" == "true" ]]; then
     printf '%s\t%s\n' "${name}" "running" | tee -a "${pids_tmp}"
     local status=0
-    "${command[@]}" > "${run_root}/${name}.log" 2>&1 || status=$?
+    if [[ "${resume}" == "true" ]]; then
+      "${command[@]}" >> "${run_root}/${name}.log" 2>&1 || status=$?
+    else
+      "${command[@]}" > "${run_root}/${name}.log" 2>&1 || status=$?
+    fi
     printf '%s\t%s\n' "${name}" "exit=${status}" | tee -a "${pids_tmp}"
   else
-    nohup "${command[@]}" > "${run_root}/${name}.log" 2>&1 &
+    if [[ "${resume}" == "true" ]]; then
+      nohup "${command[@]}" >> "${run_root}/${name}.log" 2>&1 &
+    else
+      nohup "${command[@]}" > "${run_root}/${name}.log" 2>&1 &
+    fi
     printf '%s\t%s\n' "${name}" "$!" | tee -a "${pids_tmp}"
   fi
 }
