@@ -53,6 +53,7 @@ math_sandbox="${ROY_TF_MATH_SANDBOX:-env -i PATH=/usr/bin:/bin setpriv --reuid=2
 he_sandbox="${ROY_TF_HE_SANDBOX:-env -i PATH=/usr/bin PYTHONPATH=${aflow_root}/.venv/lib/python3.12/site-packages:${aflow_root} setpriv --reuid=210232 --regid=210000 --clear-groups --no-new-privs}"
 pids_tmp="${run_root}/pids.tsv.tmp"
 : > "${pids_tmp}"
+serial="${ROY_TF_SERIAL:-false}"
 
 launch() {
   local name="$1" config="$2" benchmark="$3" arm="$4" token_limit="$5"
@@ -62,7 +63,7 @@ launch() {
     sandbox="${he_sandbox}"
     benchmark_args+=(--human-eval-sandbox-command "${he_sandbox}")
   fi
-  nohup env PYTHONPATH="${roy_root}/research" "${python_bin}" -m roy_research \
+  local -a command=(env PYTHONPATH="${roy_root}/research" "${python_bin}" -m roy_research \
     training-free-run "${common[@]}" \
     --config "${roy_root}/${config}" \
     --benchmark "${benchmark}" \
@@ -72,22 +73,29 @@ launch() {
     "${benchmark_args[@]}" \
     --output "${run_root}/${name}.jsonl" \
     --ledger "${run_root}/${name}.ledger.json" \
-    --events "${run_root}/${name}.events.jsonl" \
-    > "${run_root}/${name}.log" 2>&1 &
-  printf '%s\t%s\n' "${name}" "$!" | tee -a "${pids_tmp}"
+    --events "${run_root}/${name}.events.jsonl")
+  if [[ "${serial}" == "true" ]]; then
+    printf '%s\t%s\n' "${name}" "running" | tee -a "${pids_tmp}"
+    local status=0
+    "${command[@]}" > "${run_root}/${name}.log" 2>&1 || status=$?
+    printf '%s\t%s\n' "${name}" "exit=${status}" | tee -a "${pids_tmp}"
+  else
+    nohup "${command[@]}" > "${run_root}/${name}.log" 2>&1 &
+    printf '%s\t%s\n' "${name}" "$!" | tee -a "${pids_tmp}"
+  fi
 }
 
+launch direct-math research/config/training_free_v1.json MATH single_agent_direct \
+  "${ROY_TF_DIRECT_TOKEN_LIMIT:-3000000}"
+launch direct-humaneval research/config/training_free_v1.json HumanEval single_agent_direct \
+  "${ROY_TF_DIRECT_TOKEN_LIMIT:-3000000}"
 launch scalar-math research/config/training_free_v1.json MATH roy \
+  "${ROY_TF_ROY_TOKEN_LIMIT:-10000000}"
+launch scalar-humaneval research/config/training_free_v1.json HumanEval roy \
   "${ROY_TF_ROY_TOKEN_LIMIT:-10000000}"
 launch logdet-math research/config/training_free_logdet_v1.json MATH roy \
   "${ROY_TF_ROY_TOKEN_LIMIT:-10000000}"
-launch direct-math research/config/training_free_v1.json MATH single_agent_direct \
-  "${ROY_TF_DIRECT_TOKEN_LIMIT:-3000000}"
-launch scalar-humaneval research/config/training_free_v1.json HumanEval roy \
-  "${ROY_TF_ROY_TOKEN_LIMIT:-10000000}"
 launch logdet-humaneval research/config/training_free_logdet_v1.json HumanEval roy \
   "${ROY_TF_ROY_TOKEN_LIMIT:-10000000}"
-launch direct-humaneval research/config/training_free_v1.json HumanEval single_agent_direct \
-  "${ROY_TF_DIRECT_TOKEN_LIMIT:-3000000}"
 
 mv "${pids_tmp}" "${run_root}/pids.tsv"
