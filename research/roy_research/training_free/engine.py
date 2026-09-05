@@ -484,11 +484,12 @@ class RoyTrainingFreeEngine:
                         {"subgraph_id": subgraph_id, "error": rejected[subgraph_id]},
                         scope="counterfactual",
                     ))
-            if selected and not realized:
-                raise RuntimeError(
-                    "selected candidate portfolio produced no usable subgraph: "
-                    + "; ".join(f"{key}={value}" for key, value in sorted(rejected.items()))
-                )
+            # Candidate X is counterfactual until selected by the matrix search.
+            # If every selected proposal violates the harness contract, preserve
+            # their rejection audit and continue with the committed agent basis.
+            # The baseline frontier can then reorganize existing agents or emit
+            # a normal terminal transition instead of discarding a valid Root
+            # result as a task-execution failure.
 
             state_context = {
                 "current_matrix": matrix.to_dict(),

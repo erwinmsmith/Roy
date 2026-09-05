@@ -676,21 +676,24 @@ def test_json_llm_retries_reasoning_that_exhausts_budget_before_json() -> None:
     ]
 
 
-def test_engine_fails_closed_when_selected_candidate_x_never_materializes() -> None:
+def test_engine_returns_committed_root_when_selected_candidate_x_never_materializes() -> None:
     class EmptyCandidateClient(ScriptedClient):
         def complete(self, messages, **kwargs):
             if kwargs["metadata"]["purpose"].startswith("candidate_x_realization"):
                 return FakeCompletion("", completion_tokens=8192, total_tokens=8202)
             return super().complete(messages, **kwargs)
 
-    with pytest.raises(RuntimeError, match="portfolio produced no usable subgraph"):
-        RoyTrainingFreeEngine(
-            EmptyCandidateClient(),
-            config=TrainingFreeConfig(
-                maximum_selected_subgraphs=1, maximum_nodes_per_subgraph=1,
-                maximum_organization_rounds=1,
-            ),
-        ).run(BenchmarkTask("math", "MATH", "solve", [], {"solution": "1"}))
+    run = RoyTrainingFreeEngine(
+        EmptyCandidateClient(),
+        config=TrainingFreeConfig(
+            maximum_selected_subgraphs=1, maximum_nodes_per_subgraph=1,
+            maximum_organization_rounds=1,
+        ),
+    ).run(BenchmarkTask("math", "MATH", "solve", [], {"solution": "1"}))
+    assert run.final_answer == "120"
+    assert len(run.rounds[0].realized_candidates) == 0
+    assert len(run.rounds[0].rejected_candidates) == 1
+    assert run.rounds[0].selected_subgraph_id is None
 
 
 def test_engine_keeps_valid_subgraphs_when_a_peer_candidate_fails() -> None:
