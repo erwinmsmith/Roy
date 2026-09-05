@@ -222,6 +222,10 @@ def parser() -> argparse.ArgumentParser:
         "--api-key-env", default="OPENAI_API_KEY",
         help="Environment variable containing the OpenAI-compatible API key",
     )
+    training_free.add_argument(
+        "--provider-max-output-tokens", type=int,
+        help="Clamp each OpenAI-compatible request to the provider's output-token limit",
+    )
     training_free.add_argument("--worker-model", default="deepseek-v4-flash")
     training_free.add_argument(
         "--candidate-model",
@@ -604,6 +608,10 @@ def _training_free_client(
     if args.provider == "deepseek":
         if args.base_url is not None:
             raise ValueError("--base-url is only valid with --provider openai-compatible")
+        if args.provider_max_output_tokens is not None:
+            raise ValueError(
+                "--provider-max-output-tokens is only valid with --provider openai-compatible"
+            )
         return DeepSeekClient(ledger, **common)
     if not args.base_url:
         raise ValueError("--base-url is required with --provider openai-compatible")
@@ -611,6 +619,7 @@ def _training_free_client(
         ledger,
         base_url=args.base_url,
         api_key_env=args.api_key_env,
+        max_output_tokens=args.provider_max_output_tokens,
         **common,
     )
 

@@ -364,6 +364,7 @@ PYTHONPATH=research python3 -m roy_research training-free-run \
   --provider openai-compatible \
   --base-url https://api.code-soul.com/v1 \
   --api-key-env OPENAI_COMPAT_API_KEY \
+  --provider-max-output-tokens 4096 \
   --worker-model 'qwen3.5:9b-128k' \
   --candidate-model 'qwen3.5:9b-128k' \
   ...

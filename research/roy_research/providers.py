@@ -233,6 +233,7 @@ class OpenAICompatibleClient:
         max_retries: int = 4,
         retry_base_seconds: float = 2.0,
         retry_max_seconds: float = 30.0,
+        max_output_tokens: int | None = None,
         sdk_client: Any | None = None,
     ) -> None:
         if not model.strip():
@@ -243,6 +244,8 @@ class OpenAICompatibleClient:
             raise ValueError("max_retries cannot be negative")
         if retry_base_seconds < 0 or retry_max_seconds < 0:
             raise ValueError("provider retry delays cannot be negative")
+        if max_output_tokens is not None and max_output_tokens < 1:
+            raise ValueError("max_output_tokens must be positive")
         api_key = os.environ.get(api_key_env)
         if not api_key:
             raise RuntimeError(f"{api_key_env} is not configured")
@@ -255,6 +258,7 @@ class OpenAICompatibleClient:
         self.max_retries = max_retries
         self.retry_base_seconds = retry_base_seconds
         self.retry_max_seconds = retry_max_seconds
+        self.max_output_tokens = max_output_tokens
         self.event_lock = Lock()
         self.client = sdk_client or OpenAI(
             api_key=api_key,
@@ -272,6 +276,8 @@ class OpenAICompatibleClient:
         json_mode: bool = False,
         thinking: str | None = None,
     ) -> Completion:
+        requested_max_tokens = max_tokens
+        max_tokens = min(max_tokens, self.max_output_tokens or max_tokens)
         prompt_reserve = max(
             1,
             sum(len(message["content"].encode("utf-8")) for message in messages) + 1024,
@@ -318,6 +324,7 @@ class OpenAICompatibleClient:
                     "provider": "openai_compatible",
                     "base_url": self.base_url,
                     "request": request_value,
+                    "requested_max_tokens": requested_max_tokens,
                     "requested_thinking": thinking,
                     "response": raw,
                     "reservation": reservation,
@@ -349,6 +356,7 @@ class OpenAICompatibleClient:
                     "provider": "openai_compatible",
                     "base_url": self.base_url,
                     "request": request_value,
+                    "requested_max_tokens": requested_max_tokens,
                     "requested_thinking": thinking,
                     "reservation": reservation,
                     "latency_ms": int((time.monotonic() - started) * 1000),

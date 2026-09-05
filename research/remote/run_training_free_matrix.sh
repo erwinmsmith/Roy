@@ -31,6 +31,9 @@ fi
 provider_args=(--provider "${provider}")
 if [[ "${provider}" == "openai-compatible" ]]; then
   provider_args+=(--base-url "${base_url}" --api-key-env "${api_key_env}")
+  if [[ -n "${ROY_TF_PROVIDER_MAX_OUTPUT_TOKENS:-}" ]]; then
+    provider_args+=(--provider-max-output-tokens "${ROY_TF_PROVIDER_MAX_OUTPUT_TOKENS}")
+  fi
 fi
 common=(
   --aflow-root "${aflow_root}"

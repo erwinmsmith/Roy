@@ -344,6 +344,7 @@ class RuntimeBoundaryTests(unittest.TestCase):
                     base_url="https://example.invalid/v1/",
                     api_key_env="TEST_OPENAI_KEY",
                     event_log=events,
+                    max_output_tokens=32,
                     sdk_client=sdk,
                 )
             completion = client.complete(
@@ -355,11 +356,13 @@ class RuntimeBoundaryTests(unittest.TestCase):
             )
             self.assertEqual(completion.content, '{"status":"ok"}')
             self.assertEqual(ledger.snapshot()["used"], 11)
+            self.assertEqual(calls[0]["max_tokens"], 32)
             self.assertEqual(calls[0]["response_format"], {"type": "json_object"})
             self.assertNotIn("thinking", calls[0])
             event = json.loads(events.read_text(encoding="utf-8"))
             self.assertEqual(event["provider"], "openai_compatible")
             self.assertEqual(event["requested_thinking"], "enabled")
+            self.assertEqual(event["requested_max_tokens"], 64)
             self.assertEqual(event["base_url"], "https://example.invalid/v1")
 
 
