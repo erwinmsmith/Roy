@@ -30,10 +30,18 @@ from roy_research.training_free.aflow import AFlowDataset, AFlowEvaluator
 class AFlowModelAdapter:
     """Expose AFlow's small async LLM interface over a Roy client."""
 
-    def __init__(self, client: Any, *, max_tokens: int, temperature: float) -> None:
+    def __init__(
+        self,
+        client: Any,
+        *,
+        max_tokens: int,
+        temperature: float,
+        purpose: str = "aflow_workflow_execution",
+    ) -> None:
         self.client = client
         self.max_tokens = max_tokens
         self.temperature = temperature
+        self.purpose = purpose
         self.total_input_tokens = 0
         self.total_output_tokens = 0
 
@@ -43,7 +51,7 @@ class AFlowModelAdapter:
             [{"role": "user", "content": prompt}],
             max_tokens=self.max_tokens,
             temperature=self.temperature,
-            metadata={"purpose": "aflow_workflow_execution"},
+            metadata={"purpose": self.purpose},
         )
         self.total_input_tokens += completion.prompt_tokens
         self.total_output_tokens += completion.completion_tokens
@@ -52,10 +60,21 @@ class AFlowModelAdapter:
     async def call_with_format(self, prompt: str, formatter: Any) -> Any:
         response = await self(formatter.prepare_prompt(prompt))
         valid, parsed = formatter.validate_response(response)
-        if not valid:
+        expected_fields = (
+            list(formatter._get_field_names())
+            if hasattr(formatter, "_get_field_names") else []
+        )
+        missing_fields = [
+            field for field in expected_fields
+            if not isinstance(parsed, dict) or not str(parsed.get(field, "")).strip()
+        ]
+        if not valid or missing_fields:
             from scripts.formatter import FormatError
 
-            raise FormatError(f"{formatter.format_error_message()}. Raw response: {response}")
+            detail = f" Missing or empty fields: {missing_fields}." if missing_fields else ""
+            raise FormatError(
+                f"{formatter.format_error_message()}.{detail} Raw response: {response}"
+            )
         return parsed
 
     def get_usage_summary(self) -> dict[str, Any]:
@@ -74,9 +93,15 @@ class AFlowModelAdapter:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--aflow-root", type=Path, required=True)
+    parser.add_argument(
+        "--workflow-root",
+        type=Path,
+        help="Root containing the frozen workspace package; defaults to --aflow-root",
+    )
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--benchmark", choices=("MATH", "HumanEval"), required=True)
     parser.add_argument("--round", type=int, default=1)
+    parser.add_argument("--split", choices=("optimization", "test"), default="test")
     parser.add_argument("--provider", choices=("deepseek", "openai-compatible"), default="deepseek")
     parser.add_argument("--model", required=True)
     parser.add_argument("--base-url")
@@ -129,7 +154,10 @@ async def run(args: argparse.Namespace) -> None:
     args.events.parent.mkdir(parents=True, exist_ok=True)
 
     aflow_root = args.aflow_root.resolve()
+    workflow_root = (args.workflow_root or aflow_root).resolve()
     sys.path.insert(0, str(aflow_root))
+    if workflow_root != aflow_root:
+        sys.path.insert(0, str(workflow_root))
     os.chdir(aflow_root)
 
     ledger = PersistentTokenLedger(args.ledger, args.token_limit)
@@ -150,7 +178,7 @@ async def run(args: argparse.Namespace) -> None:
     )
 
     dataset = AFlowDataset(aflow_root, args.manifest)
-    tasks = dataset.load(args.benchmark, "test", args.limit)
+    tasks = dataset.load(args.benchmark, args.split, args.limit)
     completed_ids = {
         str(row.get("task_id")) for row in read_jsonl(args.output)
     } if args.resume and args.output.exists() else set()
@@ -183,7 +211,7 @@ async def run(args: argparse.Namespace) -> None:
                     "method": f"aflow_round_{args.round}",
                     "task_id": task.task_id,
                     "benchmark": args.benchmark,
-                    "split": "test",
+                    "split": args.split,
                     "provider": args.provider,
                     "model": args.model,
                     "workflow_round": args.round,
@@ -206,7 +234,7 @@ async def run(args: argparse.Namespace) -> None:
                 "method": f"aflow_round_{args.round}",
                 "task_id": task.task_id,
                 "benchmark": args.benchmark,
-                "split": "test",
+                "split": args.split,
                 "provider": args.provider,
                 "model": args.model,
                 "workflow_round": args.round,

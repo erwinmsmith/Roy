@@ -177,6 +177,27 @@ python3.9 -m venv .venv
   --validation_rounds 5 --opt_model_name MODEL --exec_model_name MODEL
 ```
 
+For audited OpenAI-compatible or DeepSeek runs, the remote wrapper stages a
+private writable copy of AFlow's workflow package, searches exclusively on the
+optimization split, selects the highest-scoring round (earlier round breaks a
+tie), records SHA-256 hashes for the frozen graph and prompt, and only then
+loads and evaluates the test split:
+
+```bash
+PYTHONPATH=research /path/to/AFlow/.venv/bin/python \
+  research/remote/run_aflow_search_then_test.py \
+  --aflow-root /path/to/AFlow \
+  --manifest research/config/aflow_benchmarks.json \
+  --run-root research/output/training-free/aflow-search-MATH \
+  --benchmark MATH --provider deepseek --model MODEL \
+  --max-rounds 20 --validation-rounds 1
+```
+
+`selection.json` is the leakage audit boundary: its selected validation round
+and immutable file hashes are written before the first test record is read.
+Per-round optimization predictions and failures remain available beside each
+generated workflow, while `final-test.jsonl` contains only the frozen winner.
+
 Roy also provides a fail-closed preparation/audit wrapper. On GPUHome, where
 the managed Python 3.9 download may be unavailable, Python 3.12 has passed the
 four non-code scorer smoke tests and can be selected explicitly. This is a
