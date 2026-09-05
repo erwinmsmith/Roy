@@ -5,14 +5,27 @@ roy_root="${ROY_ROOT:-${HOME}/rivermind-data/roy}"
 aflow_root="${AFLOW_ROOT:-${HOME}/rivermind-data/benchmarks/AFlow}"
 python_bin="${ROY_TF_PYTHON:-${roy_root}/research/.venv/bin/python}"
 aflow_python="${AFLOW_PYTHON:-${aflow_root}/.venv/bin/python}"
-run_root="${1:?usage: run_training_free_matrix.sh RUN_ROOT MODEL [LIMIT]}"
-model="${2:?usage: run_training_free_matrix.sh RUN_ROOT MODEL [LIMIT]}"
+run_root="${1:?usage: run_training_free_matrix.sh RUN_ROOT MODEL [LIMIT|all]}"
+model="${2:?usage: run_training_free_matrix.sh RUN_ROOT MODEL [LIMIT|all]}"
 limit="${3:-8}"
 provider="${ROY_TF_PROVIDER:-deepseek}"
 api_key_env="${ROY_TF_API_KEY_ENV:-OPENAI_API_KEY}"
 base_url="${ROY_TF_BASE_URL:-}"
+wait_for_pid="${ROY_TF_WAIT_FOR_PID:-}"
+wait_seconds="${ROY_TF_WAIT_SECONDS:-30}"
 
-[[ "${limit}" =~ ^[1-9][0-9]*$ ]] || { echo "LIMIT must be positive" >&2; exit 2; }
+[[ "${limit}" == "all" || "${limit}" =~ ^[1-9][0-9]*$ ]] || {
+  echo "LIMIT must be a positive integer or 'all'" >&2
+  exit 2
+}
+[[ "${wait_seconds}" =~ ^[1-9][0-9]*$ ]] || {
+  echo "ROY_TF_WAIT_SECONDS must be positive" >&2
+  exit 2
+}
+if [[ -n "${wait_for_pid}" && ! "${wait_for_pid}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ROY_TF_WAIT_FOR_PID must be a positive process id" >&2
+  exit 2
+fi
 [[ -x "${python_bin}" && -x "${aflow_python}" ]] || {
   echo "Roy and AFlow Python environments are required" >&2
   exit 2
@@ -20,6 +33,13 @@ base_url="${ROY_TF_BASE_URL:-}"
 if [[ "${provider}" == "openai-compatible" ]]; then
   [[ -n "${base_url}" ]] || { echo "ROY_TF_BASE_URL is required" >&2; exit 2; }
   [[ -n "${!api_key_env:-}" ]] || { echo "${api_key_env} is required" >&2; exit 2; }
+fi
+
+if [[ -n "${wait_for_pid}" ]]; then
+  echo "waiting for process ${wait_for_pid} before starting ${run_root}"
+  while kill -0 "${wait_for_pid}" 2>/dev/null; do
+    sleep "${wait_seconds}"
+  done
 fi
 
 mkdir -p "${run_root}"
@@ -38,7 +58,6 @@ fi
 common=(
   --aflow-root "${aflow_root}"
   --split test
-  --limit "${limit}"
   "${provider_args[@]}"
   --worker-model "${model}"
   --candidate-model "${model}"
@@ -49,6 +68,9 @@ common=(
   --score
   --aflow-python "${aflow_python}"
 )
+if [[ "${limit}" != "all" ]]; then
+  common+=(--limit "${limit}")
+fi
 math_sandbox="${ROY_TF_MATH_SANDBOX:-env -i PATH=/usr/bin:/bin setpriv --reuid=210234 --regid=210000 --clear-groups --no-new-privs}"
 he_sandbox="${ROY_TF_HE_SANDBOX:-env -i PATH=/usr/bin PYTHONPATH=${aflow_root}/.venv/lib/python3.12/site-packages:${aflow_root} setpriv --reuid=210232 --regid=210000 --clear-groups --no-new-privs}"
 pids_tmp="${run_root}/pids.tsv.tmp"
