@@ -240,6 +240,8 @@ class OpenAICompatibleClient:
             raise ValueError("OpenAI-compatible model cannot be empty")
         if not base_url.strip():
             raise ValueError("OpenAI-compatible base URL cannot be empty")
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
         if max_retries < 0:
             raise ValueError("max_retries cannot be negative")
         if retry_base_seconds < 0 or retry_max_seconds < 0:
@@ -290,6 +292,10 @@ class OpenAICompatibleClient:
             "max_tokens": max_tokens,
             "temperature": temperature,
             "stream": False,
+            # Pin the timeout on every SDK request as well as on the shared
+            # client. This keeps long-running inference compatible with SDK
+            # clients or transports that override the client's default.
+            "timeout": self.timeout,
         }
         if json_mode:
             request_value["response_format"] = {"type": "json_object"}

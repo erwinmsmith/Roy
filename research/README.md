@@ -365,6 +365,7 @@ PYTHONPATH=research python3 -m roy_research training-free-run \
   --base-url https://api.code-soul.com/v1 \
   --api-key-env OPENAI_COMPAT_API_KEY \
   --provider-max-output-tokens 16384 \
+  --timeout 1800 \
   --worker-model 'qwen3.5:9b-128k' \
   --candidate-model 'qwen3.5:9b-128k' \
   ...
@@ -372,8 +373,8 @@ PYTHONPATH=research python3 -m roy_research training-free-run \
 
 The generic provider uses the OpenAI Python SDK, preserves Roy's persistent token
 ledger and request audit, and does not forward vendor-specific `thinking` fields.
-The example limit reflects the currently configured Qwen 3.5 endpoint; set this
-flag to the actual output-token limit advertised by a different provider.
+The example output limit and request timeout reflect the currently configured
+Qwen 3.5 endpoint; set both flags to the capabilities of a different provider.
 
 Add `--score --aflow-python /path/to/AFlow/.venv/bin/python` to invoke the pinned
 AFlow MATH scorer. HumanEval loads only its public tests into agent context and
