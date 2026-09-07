@@ -1250,8 +1250,9 @@ def main(argv: List[str] | None = None) -> None:
                                     "a2a_matrix", "derivation_lineage",
                                 ],
                                 "reset_per_item": [
-                                    "original_task", "result", "received_messages",
-                                    "task_dependencies", "public_tests",
+                                    "objective", "original_task", "result", "status",
+                                    "expected_output", "stop_condition", "received_messages",
+                                    "task_dependencies", "public_tests", "inherited_memory_refs",
                                 ],
                             },
                             "continual_sequence_index": sequence_index,

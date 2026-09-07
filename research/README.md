@@ -423,9 +423,10 @@ An additional `roy_continual` arm treats one ordered benchmark split as one
 path-dependent episode. `A0` is created only for the first item. Later items
 retain Agent ids, parent/child lineage, roles, private long-term memory and the
 A2A matrix, then may append new Agents with globally increasing round ids.
-Task-local answers, received messages, public tests and hard/soft evidence
-dependencies are reset before the next item. Official scores and hidden tests
-are never written into the persistent state. Every row contains a fingerprinted
+Task-local objectives/output contracts, answers, statuses, inherited references,
+received messages, public tests and hard/soft evidence dependencies are rebound
+or reset before the next item. Official scores and hidden tests are never written
+into the persistent state. Every row contains a fingerprinted
 `continual_state_after`, so `--resume` can continue only from an exact completed
 dataset prefix; a failed item halts the episode instead of silently skipping a
 state transition.
