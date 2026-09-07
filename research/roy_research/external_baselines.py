@@ -111,7 +111,8 @@ def _task_contract(task: BenchmarkTask) -> str:
     if task.benchmark == "MATH":
         return (
             f"{task.instruction}\n\nShow the reasoning, then put the final answer in "
-            "\\boxed{...}."
+            "\\boxed{...}. Put only the requested mathematical value inside the box; "
+            "do not append prose or physical units such as degrees."
         )
     tests = "\n".join(task.public_tests)
     public = f"\n\nPublic tests available to all methods:\n{tests}" if tests else ""

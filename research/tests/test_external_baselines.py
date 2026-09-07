@@ -46,6 +46,14 @@ def math_task() -> BenchmarkTask:
     )
 
 
+def test_math_contract_prevents_correct_value_from_failing_on_units() -> None:
+    from roy_research.external_baselines import _task_contract
+
+    contract = _task_contract(math_task())
+    assert "only the requested mathematical value" in contract
+    assert "do not append" in contract
+
+
 def test_literal_loader_does_not_import_upstream_dependencies(tmp_path: Path) -> None:
     source = tmp_path / "prompts.py"
     source.write_text("TEXT = 'hello'\nMAPPING = {'a': 'b'}\nimport missing_package\n", encoding="utf-8")
