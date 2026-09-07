@@ -121,6 +121,7 @@ class RoundRecord:
     semantic_landscape: Dict[str, Any]
     reference_mia_objective: float
     candidate_graph: Dict[str, Any]
+    candidate_calculation_list: List[List[str]]
     baseline: MatrixSearchResult
     frontiers: Dict[str, MatrixSearchResult]
     realized_candidates: Dict[str, RealizedSubgraph]
@@ -144,6 +145,7 @@ class RoundRecord:
             "semantic_landscape": self.semantic_landscape,
             "reference_mia_objective": self.reference_mia_objective,
             "candidate_graph": self.candidate_graph,
+            "candidate_calculation_list": self.candidate_calculation_list,
             "baseline": self.baseline.to_dict(),
             "frontiers": {key: value.to_dict() for key, value in self.frontiers.items()},
             "realized_candidates": {
@@ -173,6 +175,7 @@ class TransitionDecision:
     expansion_advantage: float
     kind: Literal["expand", "reorganize", "stop"]
     commit: bool
+    structural_contraction: bool
 
 
 def select_transition(
@@ -188,7 +191,17 @@ def select_transition(
     choose_expansion = best_candidate_id is not None and expansion_advantage > epsilon
     selected_id = best_candidate_id if choose_expansion else None
     selected_score = frontiers[selected_id].score if selected_id is not None else baseline.score
-    if selected_score <= epsilon:
+    structural_contraction = (
+        selected_id is None
+        and selected_score >= -1e-12
+        and (
+            baseline.matrix.total_capacity()
+            < baseline.initial_matrix.total_capacity() - 1e-12
+            or baseline.matrix.positive_edge_count()
+            < baseline.initial_matrix.positive_edge_count()
+        )
+    )
+    if selected_score <= epsilon and not structural_contraction:
         kind: Literal["expand", "reorganize", "stop"] = "stop"
     else:
         kind = "expand" if selected_id is not None else "reorganize"
@@ -198,6 +211,7 @@ def select_transition(
         expansion_advantage=expansion_advantage,
         kind=kind,
         commit=kind != "stop",
+        structural_contraction=structural_contraction,
     )
 
 
@@ -218,6 +232,7 @@ class TrainingFreeRun:
     cumulative_information_gain: float
     harness_config: AgentHarnessConfig
     matrix_objective: str
+    semantic_search_mode: str
 
     @property
     def initial_root_answer(self) -> str:
@@ -257,9 +272,20 @@ class TrainingFreeRun:
             "method": "training_free_information_flow_search",
             "search_architecture": {
                 "semantic_judge": "once_per_organization_round",
+                "candidate_selector_scope": "new_candidates_only",
+                "candidate_calculation_policy": "selector_fixed_sparse_list",
+                "judge_scope": "all_committed_agents_including_dormant_plus_selected_candidates",
+                "semantic_search_mode": self.semantic_search_mode,
+                "agent_x_policy": (
+                    "configure_once_reuse_across_items"
+                    if self.semantic_search_mode == "prospective_fixed_x"
+                    else "current_item_configuration"
+                ),
                 "matrix_objective": self.matrix_objective,
                 "candidate_matrix_llm_rollouts": 0,
                 "execution_policy": "winner_only",
+                "dormant_policy": "retained_judged_not_executed_until_matrix_reactivation",
+                "round_policy": "matrix_gain_or_cost_contraction_with_hard_cap",
                 "state_transition_policy": "initialize_once_then_winner_execution_only",
             },
             "agent_harness": {
@@ -504,6 +530,7 @@ class RoyTrainingFreeEngine:
         initial_matrix: InformationMatrix | None = None,
         initial_dependencies: List[DependencyRecord] | None = None,
         round_index_offset: int = 0,
+        prospective_semantic_search: bool = False,
     ) -> TrainingFreeRun:
         if round_index_offset < 0:
             raise ValueError("round_index_offset cannot be negative")
@@ -513,10 +540,15 @@ class RoyTrainingFreeEngine:
             agents: Dict[str, AgentState] = {root.agent_id: root}
             matrix = InformationMatrix.zero(agents)
             dependencies: List[DependencyRecord] = []
+            previously_dormant_agent_ids: List[str] = []
             initialization_kind = "state_initialized"
         else:
             if initial_matrix is None:
                 raise ValueError("continual Agents require an initial information matrix")
+            previously_dormant_agent_ids = sorted(
+                agent_id for agent_id, agent in initial_agents.items()
+                if agent.status == AgentStatus.DORMANT
+            )
             agents = self._rebind_continual_agents(initial_agents, task)
             matrix = initial_matrix.clone()
             matrix.validate()
@@ -531,6 +563,14 @@ class RoyTrainingFreeEngine:
             {
                 "root_id": "A0",
                 "reused_agent_ids": sorted(agents) if initial_agents is not None else [],
+                "previously_dormant_agent_ids": previously_dormant_agent_ids,
+                "dormant_agent_x_included_in_current_item_judge": bool(
+                    previously_dormant_agent_ids
+                ),
+                "agent_x_rebuilt": False,
+                "semantic_search_mode": (
+                    "prospective_fixed_x" if prospective_semantic_search else "executed_state"
+                ),
                 "task_specific_results_reset": initial_agents is not None,
                 "private_memory_retained": initial_agents is not None,
             },
@@ -549,6 +589,14 @@ class RoyTrainingFreeEngine:
             candidate_graph, executed_parent_ids = self._prepare_parents_and_collect_candidates(
                 agents, matrix, dependencies, events, task.benchmark, round_index,
                 execute_parents=local_round_index == 0,
+                execute_parent_ids=(
+                    {"A0"} if prospective_semantic_search and local_round_index == 0 else None
+                ),
+                proposal_parent_ids=(
+                    {"A0"}
+                    if prospective_semantic_search and local_round_index == 0
+                    else None
+                ),
             )
             events.append(TrajectoryEvent(
                 f"event-{len(events)}", round_index,
@@ -581,6 +629,22 @@ class RoyTrainingFreeEngine:
                     "recent_history": [item.to_dict() for item in events[-16:]],
                 },
             )
+            selected_candidate_ids = sorted({
+                candidate_id for group in selected for candidate_id in group
+            })
+            events.append(TrajectoryEvent(
+                f"event-{len(events)}", round_index, "candidate_calculation_list_fixed",
+                {
+                    "selected_subgraphs": selected,
+                    "selected_candidate_ids": selected_candidate_ids,
+                    "omitted_candidate_ids": sorted(
+                        set(candidate_graph.nodes) - set(selected_candidate_ids)
+                    ),
+                    "selector_scope": "new_candidates_only",
+                    "committed_agents_are_not_filtered": True,
+                },
+                scope="audit",
+            ))
 
             realized: Dict[str, RealizedSubgraph] = {}
             provisional: Dict[str, Dict[str, AgentState]] = {}
@@ -597,20 +661,30 @@ class RoyTrainingFreeEngine:
                         original_task=task.instruction,
                         public_tests=task.public_tests,
                         available_tools=self.available_tools,
+                        persistent=prospective_semantic_search,
                         organization_context={
                             "current_matrix": matrix.to_dict(),
                             "dependency_state": [item.to_dict() for item in dependencies[-32:]],
                             "recent_history": [item.to_dict() for item in events[-16:]],
                         },
                     )
-                    provisional_agents = self._provisional_execute(
-                        candidate, candidate_graph, agents, task.benchmark,
+                    provisional_agents = (
+                        copy.deepcopy(candidate.agents)
+                        if prospective_semantic_search
+                        else self._provisional_execute(
+                            candidate, candidate_graph, agents, task.benchmark,
+                        )
                     )
                     realized[subgraph_id] = candidate
                     provisional[subgraph_id] = provisional_agents
                     events.append(TrajectoryEvent(
                         f"event-{len(events)}", round_index, "candidate_x_realized",
-                        {"subgraph_id": subgraph_id, "candidate_ids": candidate_ids},
+                        {
+                            "subgraph_id": subgraph_id,
+                            "candidate_ids": candidate_ids,
+                            "configuration_built_once": True,
+                            "executed_before_judge": not prospective_semantic_search,
+                        },
                         scope="counterfactual",
                     ))
                 except (TypeError, ValueError, KeyError) as error:
@@ -642,17 +716,33 @@ class RoyTrainingFreeEngine:
                 judge_agents.update(candidate_agents)
             landscape = self._estimate_semantic_landscape(
                 task.benchmark, judge_agents, state_context,
+                prospective=prospective_semantic_search,
             )
             information_state_before = {
                 "estimator": "mia_semantic_landscape",
                 "root_uncertainty": landscape.root_uncertainty,
                 "semantic_landscape_revision": landscape.revision,
+                "committed_agent_ids": sorted(agents),
+                "previously_dormant_agent_ids": previously_dormant_agent_ids,
+                "selected_candidate_ids": selected_candidate_ids,
+                "semantic_search_mode": (
+                    "prospective_fixed_x" if prospective_semantic_search else "executed_state"
+                ),
             }
             events.append(TrajectoryEvent(
                 f"event-{len(events)}", round_index, "semantic_landscape_estimated",
                 {
                     "revision": landscape.revision,
                     "agent_ids": landscape.agent_ids,
+                    "committed_agent_ids": sorted(agents),
+                    "previously_dormant_agent_ids": previously_dormant_agent_ids,
+                    "selected_candidate_ids": selected_candidate_ids,
+                    "pairwise_scope": (
+                        "all_committed_agents_including_dormant_plus_selected_candidates"
+                    ),
+                    "semantic_search_mode": (
+                        "prospective_fixed_x" if prospective_semantic_search else "executed_state"
+                    ),
                     "judge_calls_this_round": 1,
                 },
                 scope="audit",
@@ -734,6 +824,7 @@ class RoyTrainingFreeEngine:
                         "best_candidate_predicted_mia_gain": best_candidate_score,
                     },
                 ))
+                self._apply_activation(agents, matrix, dependencies)
                 committed_checkpoint_id = f"checkpoint-{round_index}-terminal"
                 checkpoints.append(StateCheckpoint.capture(
                     committed_checkpoint_id, search_state_checkpoint_id, round_index,
@@ -745,13 +836,23 @@ class RoyTrainingFreeEngine:
                 previous_matrix = matrix
                 if selected_id is None:
                     winning_agents = agents
+                    selected_dependencies: List[CandidateDependency] = []
                 else:
                     winning_agents = {**agents, **provisional[selected_id]}
+                    selected_dependencies = realized[selected_id].dependencies
                     dependencies.extend(committed_dependency_records(
                         round_index, selected_id, provisional[selected_id],
                         realized[selected_id].dependencies,
                     ))
                 winning_matrix = selected_result.matrix
+                prospective_executed_agent_ids: List[str] = []
+                if prospective_semantic_search:
+                    winning_agents, prospective_executed_agent_ids = self._execute_prospective_winner(
+                        winning_agents,
+                        winning_matrix,
+                        task.benchmark,
+                        selected_dependencies,
+                    )
                 executor = A2AExecutor(
                     self.worker, self.channelizer,
                     benchmark=task.benchmark,
@@ -766,6 +867,17 @@ class RoyTrainingFreeEngine:
                     {
                         "matrix": winning_matrix.to_dict(),
                         "selected_subgraph_id": selected_id,
+                        "task_local_executed_agent_ids": prospective_executed_agent_ids,
+                        "a2a_active_agent_ids": sorted(
+                            winning_matrix.active_agent_ids(
+                                minimum_weight=self.config.activation_threshold,
+                            )
+                        ),
+                        "a2a_dormant_agent_ids": sorted(
+                            set(winning_agents) - winning_matrix.active_agent_ids(
+                                minimum_weight=self.config.activation_threshold,
+                            )
+                        ),
                         "executed_matrix_count": 1,
                     },
                 ))
@@ -781,6 +893,7 @@ class RoyTrainingFreeEngine:
                         "subgraph_id": selected_id,
                         "predicted_mia_gain": selected_information_gain,
                         "expansion_advantage": expansion_advantage,
+                        "structural_contraction": decision.structural_contraction,
                         "topology_drift": drift.to_dict(),
                     },
                 ))
@@ -809,6 +922,7 @@ class RoyTrainingFreeEngine:
                 semantic_landscape=landscape.to_dict(),
                 reference_mia_objective=evaluator.reference,
                 candidate_graph=candidate_graph.subset(candidate_graph.nodes),
+                candidate_calculation_list=selected,
                 baseline=baseline,
                 frontiers=frontiers,
                 realized_candidates=realized,
@@ -842,6 +956,9 @@ class RoyTrainingFreeEngine:
             cumulative_information_gain=cumulative_information_gain,
             harness_config=self.worker.harness_config,
             matrix_objective=self.config.matrix_objective,
+            semantic_search_mode=(
+                "prospective_fixed_x" if prospective_semantic_search else "executed_state"
+            ),
         )
 
     def run_continual(
@@ -862,6 +979,7 @@ class RoyTrainingFreeEngine:
             initial_matrix=None if prior is None else prior.matrix,
             initial_dependencies=None if prior is None else prior.lineage_dependencies,
             round_index_offset=0 if prior is None else prior.next_round_index,
+            prospective_semantic_search=True,
         )
         lineage = [
             copy.deepcopy(item) for item in run.dependency_ledger
@@ -931,6 +1049,8 @@ class RoyTrainingFreeEngine:
         round_index: int,
         *,
         execute_parents: bool = False,
+        execute_parent_ids: set[str] | None = None,
+        proposal_parent_ids: set[str] | None = None,
     ) -> tuple[CandidateGraph, List[str]]:
         nodes: Dict[str, CandidateNode] = {}
         state_dependencies = dependencies
@@ -954,7 +1074,9 @@ class RoyTrainingFreeEngine:
                 ][-16:],
             }
             proposal_agent = agent
-            if execute_parents:
+            if execute_parents and (
+                execute_parent_ids is None or agent_id in execute_parent_ids
+            ):
                 proposal_agent = (
                     self.worker.execute_root(agent, benchmark, tool_scope="committed")
                     if agent_id == "A0"
@@ -964,6 +1086,11 @@ class RoyTrainingFreeEngine:
                 )
                 executed[agent_id] = proposal_agent
             remaining_capacity = max(0, self.config.maximum_agents - len(agents))
+            if (
+                remaining_capacity == 0
+                or proposal_parent_ids is not None and agent_id not in proposal_parent_ids
+            ):
+                continue
             minimum_candidates = 0
             if remaining_capacity and agent_id == "A0":
                 minimum_candidates = min(
@@ -974,7 +1101,7 @@ class RoyTrainingFreeEngine:
             graph = self.worker.propose_candidates(
                 proposal_agent,
                 round_index=round_index,
-                max_candidates=self.config.maximum_candidates,
+                max_candidates=min(self.config.maximum_candidates, remaining_capacity),
                 minimum_candidates=minimum_candidates,
                 organization_context=organization_context,
             )
@@ -994,28 +1121,18 @@ class RoyTrainingFreeEngine:
         task: BenchmarkTask,
     ) -> Dict[str, AgentState]:
         rebound: Dict[str, AgentState] = {}
-        root_template = self._root_agent(task)
         for agent_id, persistent in persistent_agents.items():
             agent = copy.deepcopy(persistent)
-            if agent_id == "A0":
-                agent.objective = root_template.objective
-                agent.role = root_template.role
-            else:
-                agent.objective = (
-                    f"Apply the persistent specialization '{agent.role}' to independently solve, "
-                    "audit, or falsify the current benchmark item."
-                )
+            # X_i is configured exactly once. A new item supplies only an
+            # ephemeral task input and fresh runtime result/message buffers.
+            # Role, objective, tools, dependency preferences, memory namespace,
+            # output contract, and stop condition remain the committed X_i.
             agent.context.original_task = task.instruction
             agent.context.public_tests = list(task.public_tests)
-            agent.context.mandatory_inputs = []
-            agent.context.weighted_inputs = {}
             agent.context.received_messages = []
-            agent.memory.inherited_refs = []
             agent.tools = [tool for tool in agent.tools if tool in self.available_tools]
             agent.result = ResultState(unresolved=[agent.objective])
             agent.status = AgentStatus.READY
-            agent.expected_output = root_template.expected_output
-            agent.stop_condition = root_template.stop_condition
             AgentHarness(agent, self.tool_registry, self.worker.harness_config).validate()
             rebound[agent_id] = agent
         if "A0" not in rebound:
@@ -1072,21 +1189,86 @@ class RoyTrainingFreeEngine:
             )
         return states
 
+    def _execute_prospective_winner(
+        self,
+        agents: Mapping[str, AgentState],
+        matrix: InformationMatrix,
+        benchmark: str,
+        candidate_dependencies: List[CandidateDependency],
+    ) -> tuple[Dict[str, AgentState], List[str]]:
+        """Execute only fixed X_i selected by the winning nonzero matrix."""
+        states = copy.deepcopy(dict(agents))
+        active = matrix.active_agent_ids(
+            minimum_weight=self.config.activation_threshold,
+        )
+        executed: List[str] = []
+        completed = {
+            agent_id for agent_id in active
+            if states[agent_id].result.candidate_answer.strip()
+        }
+        pending = {
+            agent_id for agent_id in active
+            if agent_id != "A0" and agent_id not in completed
+        }
+        if "A0" not in completed:
+            states["A0"] = self.worker.execute_root(
+                states["A0"], benchmark, tool_scope="committed",
+            )
+            completed.add("A0")
+            executed.append("A0")
+
+        while pending:
+            progressed = False
+            for agent_id in sorted(pending):
+                hard_sources = {
+                    edge.source for edge in candidate_dependencies
+                    if edge.kind == "hard" and edge.target == agent_id and edge.source in active
+                }
+                if not hard_sources.issubset(completed):
+                    continue
+                agent = states[agent_id]
+                messages = [
+                    json.dumps({
+                        "source": source,
+                        "artifact": next(
+                            edge.artifact for edge in candidate_dependencies
+                            if edge.kind == "hard"
+                            and edge.source == source and edge.target == agent_id
+                        ),
+                        "result": asdict(states[source].result),
+                    }, ensure_ascii=False, sort_keys=True)
+                    for source in sorted(hard_sources)
+                ]
+                if messages:
+                    AgentHarness(
+                        agent, self.tool_registry, self.worker.harness_config,
+                    ).receive_messages(messages)
+                states[agent_id] = self.worker.execute_persistent(
+                    agent, benchmark, tool_scope="committed",
+                )
+                completed.add(agent_id)
+                executed.append(agent_id)
+                pending.remove(agent_id)
+                progressed = True
+            if not progressed:
+                raise ValueError(
+                    "winner contains an unsatisfied hard-dependency cycle or inactive source"
+                )
+        return states, executed
+
     def _apply_activation(
         self,
         agents: Dict[str, AgentState],
         matrix: InformationMatrix,
         dependencies: List[DependencyRecord],
     ) -> None:
-        hard_path_nodes = {
-            node for edge in dependencies if edge.relation == "hard" and edge.status == "active"
-            for node in (edge.source, edge.target)
-        }
+        active_agent_ids = matrix.active_agent_ids(
+            minimum_weight=self.config.activation_threshold,
+        )
         for agent_id, agent in agents.items():
             if agent_id == "A0":
                 agent.status = AgentStatus.DONE
-            elif matrix.activation(agent_id) < self.config.activation_threshold \
-                    and agent_id not in hard_path_nodes and not agent.result.unresolved:
+            elif agent_id not in active_agent_ids:
                 agent.status = AgentStatus.DORMANT
             elif agent.status != AgentStatus.FAILED:
                 agent.status = AgentStatus.DONE
@@ -1101,11 +1283,14 @@ class RoyTrainingFreeEngine:
         benchmark: str,
         agents: Mapping[str, AgentState],
         state_context: Mapping[str, Any],
+        *,
+        prospective: bool = False,
     ) -> SemanticInformationLandscape:
         if self.semantic_landscape_factory is not None:
             return self.semantic_landscape_factory(benchmark, agents, state_context)
         return self.semantic_judge.estimate(
             agents, benchmark=benchmark, root_id="A0", state_context=state_context,
+            prospective=prospective,
         )
 
 

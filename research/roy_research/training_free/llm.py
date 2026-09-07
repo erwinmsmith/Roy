@@ -755,6 +755,12 @@ that is not represented globally. Preserve complementary candidates whose eviden
 distinct even when they contradict the root or current majority; disagreement is not redundancy.
 Different names with the same intended evidence are redundant. You do not execute candidates and do
 not assign numerical information-gain scores.
+Your selection is the fixed sparse candidate-calculation list for this organization round. Only
+selected new candidates may receive an expensive X configuration; executed-state search then runs
+them provisionally, while prospective fixed-X search runs only the eventual winner. It is valid to
+select no new candidate when none adds a distinct information source. This filter applies
+only to proposed new candidates: every already-committed Agent, including a currently dormant one,
+remains in the subsequent semantic Judge and matrix search so it can be reactivated.
 Return JSON only. Every selected subgraph must list candidate ids; hard predecessors will be closed
 and validated by the runtime. Retain at least one non-redundant independent verifier when the root
 has no successful external/tool verification; self-reported confidence is not verification."""
@@ -803,30 +809,6 @@ has no successful external/tool verification; self-reported confidence is not ve
             selected.append(sorted(closure))
             if len(selected) == maximum_subgraphs:
                 break
-        # Selection happens before candidate execution, so a semantic selector
-        # cannot reliably know which distinct epistemic operation will uncover
-        # the error. Preserve portfolio coverage while capacity remains.
-        for operation in (
-            "specification_audit", "adversarial_falsification",
-            "independent_reconstruction",
-        ):
-            if len(selected) == maximum_subgraphs:
-                break
-            if any(
-                graph.nodes[node_id].epistemic_operation == operation
-                for group in selected for node_id in group
-            ):
-                continue
-            for node_id in sorted(graph.nodes):
-                if graph.nodes[node_id].epistemic_operation != operation:
-                    continue
-                closure = graph.hard_closure([node_id], agents)
-                if len(closure) > maximum_nodes or claimed_candidates.intersection(closure):
-                    continue
-                seen.add(closure)
-                claimed_candidates.update(closure)
-                selected.append(sorted(closure))
-                break
         return selected
 
 
@@ -858,6 +840,10 @@ must preserve uncertainty rather than fabricate work not yet performed. Sigma/st
 hard dependencies. expected_output and stop_condition must be observable. Return a concise
 configuration_reasoning_summary explaining the design tradeoffs, not private chain-of-thought.
 The context original_task field must copy the supplied original_task exactly.
+When configuration_scope is benchmark_persistent, construct a reusable specialization: objective,
+role, tools, input contract, output contract, and stop condition must describe a method applicable
+across items in that benchmark rather than embedding the current item's constants or answer. The
+supplied original_task is the current runtime input, not permission to make X item-specific.
 Keep internal reasoning bounded and reserve enough completion budget for the response. Return exactly
 one JSON object and configure all fields; the runtime will reject incomplete X."""
 
@@ -875,6 +861,7 @@ one JSON object and configure all fields; the runtime will reject incomplete X."
         original_task: str,
         public_tests: List[str],
         available_tools: List[str],
+        persistent: bool = False,
         organization_context: Mapping[str, Any] | None = None,
     ) -> RealizedSubgraph:
         value = self.llm.call(
@@ -886,6 +873,9 @@ one JSON object and configure all fields; the runtime will reject incomplete X."
                 "original_task": original_task,
                 "public_tests": public_tests,
                 "available_tools": available_tools,
+                "configuration_scope": (
+                    "benchmark_persistent" if persistent else "current_item"
+                ),
                 "current_mas": {
                     key: AgentHarness(agent).public_summary() for key, agent in agents.items()
                 },
@@ -1013,6 +1003,19 @@ source is correct: a substantive contradiction must have positive source-to-root
 root can inspect it, even when the Judge cannot yet determine which answer is correct.
 Return JSON only."""
 
+    PROSPECTIVE_SYSTEM = """
+This request is prospective fixed-X search for a continual benchmark episode. Each supplied Agent X
+was configured once when that Agent was derived. The current task input changes, but X is not rebuilt
+and dormant Agents have intentionally not executed this item yet. Estimate G, R, Lambda, observation
+coverage, noise, and root residual uncertainty as the information expected if each fixed X executes
+its specialization on this exact task. Use objective, role, tools, retained memory, input/output
+contracts, and the current task to make this task-conditioned estimate. Do not set an unexecuted or
+dormant Agent's potential to zero merely because its current result buffer is empty. Conversely, do
+not invent completed evidence: this is an ex-ante capability/information estimate, not a claim that
+the Agent has already produced it. Include every supplied committed Agent, including dormant ones,
+and every selected newly configured candidate in all ordered pairwise estimates. The matrix search,
+not you, decides which X_i will execute and whether a dormant X_i is reactivated."""
+
     PRECISION_SYSTEM = """
 For the precision/log-det objective, also define exactly the requested number of shared, mutually
 distinguishable task-information dimensions. Dimensions are task-specific epistemic requirements,
@@ -1047,6 +1050,7 @@ or execute a candidate matrix."""
         benchmark: str,
         root_id: str,
         state_context: Mapping[str, Any] | None = None,
+        prospective: bool = False,
     ) -> SemanticInformationLandscape:
         agent_ids = list(agents)
         size = len(agent_ids)
@@ -1088,10 +1092,15 @@ or execute a candidate matrix."""
             })
         value = self.llm.call(
             "semantic_information_judge",
-            self.SYSTEM + (self.PRECISION_SYSTEM if self.precision_dimensions else ""),
+            self.SYSTEM
+            + (self.PRECISION_SYSTEM if self.precision_dimensions else "")
+            + (self.PROSPECTIVE_SYSTEM if prospective else ""),
             {
                 "benchmark": benchmark,
                 "root_id": root_id,
+                "estimation_mode": (
+                    "prospective_fixed_x" if prospective else "executed_state"
+                ),
                 "agent_ids": agent_ids,
                 "current_agent_states": {
                     agent_id: AgentHarness(agent).execution_view()

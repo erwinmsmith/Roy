@@ -217,6 +217,8 @@ def test_cognitive_prompt_priors_change_behavior_not_state_space() -> None:
     assert "which unresolved information" in WorkerModel.PROPOSE_SYSTEM
     assert "distributed evidence" in GlobalSelector.SYSTEM
     assert "disagreement is not redundancy" in GlobalSelector.SYSTEM
+    assert "fixed sparse candidate-calculation list" in GlobalSelector.SYSTEM
+    assert "currently dormant" in GlobalSelector.SYSTEM
     assert "one unresolved information need" in CandidateXRealizer.SYSTEM
     assert "from that receiver's current state" in SemanticInformationJudge.SYSTEM
     assert "not for the sender" in ChannelizerModel.SYSTEM
@@ -226,6 +228,36 @@ def test_cognitive_prompt_priors_change_behavior_not_state_space() -> None:
         SemanticInformationJudge.SYSTEM, ChannelizerModel.SYSTEM,
     ))
     assert "Theory of Mind" not in combined
+
+
+def test_global_selector_can_fix_an_empty_sparse_candidate_calculation_list() -> None:
+    class EmptySelectionClient:
+        model = "empty-selection"
+
+        def complete(self, messages, **kwargs):
+            assert kwargs["metadata"]["purpose"] == "global_selector"
+            return FakeCompletion(json.dumps({"selected_subgraphs": []}))
+
+    graph = CandidateGraph.from_dict({
+        "nodes": [{
+            "candidate_id": "c1",
+            "direction": "repeat the existing derivation",
+            "why_needed": "weakly justified",
+            "required_inputs": [],
+            "requested_tools": [],
+            "expected_output": "answer",
+            "stop_condition": "done",
+        }],
+        "dependencies": [],
+    }, "A0")
+    root = AgentState(
+        "A0", None, "solve", "root", ContextState("task"), MemoryState("memory/A0"),
+        [], ResultState(candidate_answer="1"), AgentStatus.DONE, "answer", "done",
+    )
+    selector = GlobalSelector(JsonLLM(EmptySelectionClient(), CallAudit()))
+    assert selector.select(
+        graph, {"A0": root}, maximum_subgraphs=2, maximum_nodes=1,
+    ) == []
 
 
 def test_aflow_private_workspace_links_operator_data(tmp_path: Path) -> None:
@@ -286,6 +318,7 @@ def test_engine_commits_externally_realized_candidate_x() -> None:
         "initial", "search_state", "committed",
     ]
     assert value["rounds"][0]["transition_kind"] == "expand"
+    assert value["rounds"][0]["candidate_calculation_list"] == [["r0_A0_c1"]]
     assert value["rounds"][0]["topology_drift"]["agent_expansion"] == 1
     assert value["rounds"][0]["provisional_agents"]["round-0-subgraph-0"][
         "r0_A0_c1"
@@ -331,6 +364,10 @@ def test_engine_commits_externally_realized_candidate_x() -> None:
         "posterior_probe", "pairwise_information_probe"
     } & {call["purpose"] for call in client.calls}
     assert value["search_architecture"]["candidate_matrix_llm_rollouts"] == 0
+    assert value["search_architecture"]["candidate_selector_scope"] == "new_candidates_only"
+    assert value["search_architecture"]["judge_scope"] == (
+        "all_committed_agents_including_dormant_plus_selected_candidates"
+    )
     assert value["call_audit"]["calls"]["semantic_information_judge"] == 1
     assert sum(
         event["kind"] == "winner_matrix_executed" for event in value["event_ledger"]
@@ -398,6 +435,12 @@ def test_continual_episode_reuses_topology_memory_and_global_round_ids(tmp_path:
         first_client, first_client, config=config,
     ).run_continual(first_task, None)
     assert set(first_state.agents) == {"A0", "r0_A0_c1"}
+    assert not any(
+        call["purpose"] == "provisional_worker" for call in first_client.calls
+    )
+    assert first_run.to_dict()["search_architecture"]["agent_x_policy"] == (
+        "configure_once_reuse_across_items"
+    )
     first_state.agents["A0"].memory.entries.append("persistent method preference")
     serialized = first_state.to_dict()
     restored = ContinualBenchmarkState.from_dict(
@@ -413,6 +456,12 @@ def test_continual_episode_reuses_topology_memory_and_global_round_ids(tmp_path:
     assert first_run.rounds[0].round_index == 0
     assert second_run.rounds[0].round_index == 1
     assert set(second_run.checkpoints[0].agents) == {"A0", "r0_A0_c1"}
+    assert second_run.checkpoints[0].agents["r0_A0_c1"]["objective"] == (
+        first_state.agents["r0_A0_c1"].objective
+    )
+    assert second_run.checkpoints[0].agents["r0_A0_c1"]["role"] == (
+        first_state.agents["r0_A0_c1"].role
+    )
     assert "r1_A0_c1" in {
         node["candidate_id"] for node in second_run.rounds[0].candidate_graph["nodes"]
     }
@@ -430,6 +479,14 @@ def test_continual_episode_reuses_topology_memory_and_global_round_ids(tmp_path:
     assert sum(
         call["purpose"] == "persistent_worker" for call in second_client.calls
     ) == 1
+    second_purposes = [call["purpose"] for call in second_client.calls]
+    assert second_purposes.index("semantic_information_judge") < second_purposes.index(
+        "persistent_worker"
+    )
+    assert next(
+        call["payload"] for call in second_client.calls
+        if call["purpose"] == "semantic_information_judge"
+    )["estimation_mode"] == "prospective_fixed_x"
     output = tmp_path / "continual.jsonl"
     write_jsonl(output, [{
         "task_id": "math-0",
@@ -452,6 +509,62 @@ def test_continual_episode_reuses_topology_memory_and_global_round_ids(tmp_path:
         RoyTrainingFreeEngine(changed, changed, config=config).run_continual(
             second_task, restored,
         )
+
+
+def test_continual_dormant_agent_is_judged_and_can_be_reactivated() -> None:
+    config = TrainingFreeConfig(
+        maximum_agents=2,
+        maximum_candidates=1,
+        maximum_selected_subgraphs=1,
+        maximum_nodes_per_subgraph=1,
+        matrix_iterations=2,
+        matrix_beam_width=3,
+        maximum_matrix_evaluations=8,
+        communication_rounds=1,
+        maximum_organization_rounds=1,
+        information_gain_epsilon=0.001,
+    )
+    first_client = ScriptedClient()
+    _, state = RoyTrainingFreeEngine(
+        first_client, first_client, config=config,
+    ).run_continual(
+        BenchmarkTask("math-0", "MATH", "first", [], {"solution": "135"}), None,
+    )
+    child_id = next(agent_id for agent_id in state.agents if agent_id != "A0")
+    state.matrix = InformationMatrix.zero(state.agents)
+    state.agents[child_id].status = AgentStatus.DORMANT
+
+    second_client = ScriptedClient()
+    second_run, second_state = RoyTrainingFreeEngine(
+        second_client, second_client, config=config,
+    ).run_continual(
+        BenchmarkTask("math-1", "MATH", "second", [], {"solution": "135"}), state,
+    )
+
+    assert sum(
+        call["purpose"] == "persistent_worker" for call in second_client.calls
+    ) == 1
+    assert not any(
+        call["purpose"] == "candidate_proposal" for call in second_client.calls
+    )
+    judge_payload = next(
+        call["payload"] for call in second_client.calls
+        if call["purpose"] == "semantic_information_judge"
+    )
+    assert judge_payload["agent_ids"] == ["A0", child_id]
+    assert judge_payload["estimation_mode"] == "prospective_fixed_x"
+    purposes = [call["purpose"] for call in second_client.calls]
+    assert purposes.index("semantic_information_judge") < purposes.index("persistent_worker")
+    judge_event = next(
+        event for event in second_run.event_ledger
+        if event.kind == "semantic_landscape_estimated"
+    )
+    assert judge_event.details["previously_dormant_agent_ids"] == [child_id]
+    assert judge_event.details["pairwise_scope"] == (
+        "all_committed_agents_including_dormant_plus_selected_candidates"
+    )
+    assert second_run.final_matrix.weight(child_id, "A0") > 0
+    assert second_state.agents[child_id].status == AgentStatus.DONE
 
 
 def test_engine_can_select_precision_logdet_matrix_objective() -> None:
@@ -554,7 +667,8 @@ def test_initial_candidate_graph_has_generic_epistemic_coverage() -> None:
     assert (
         len(run.rounds[0].realized_candidates)
         + len(run.rounds[0].rejected_candidates)
-    ) == 3
+    ) == 1
+    assert run.rounds[0].candidate_calculation_list == [["r0_A0_c1"]]
 
 
 def test_math_worker_reconciles_candidate_answer_with_its_own_derivation() -> None:
@@ -946,6 +1060,12 @@ def test_next_round_proposals_receive_committed_path_state() -> None:
         def complete(self, messages, **kwargs):
             purpose = kwargs["metadata"]["purpose"]
             payload = json.loads(messages[1]["content"])
+            if purpose == "global_selector" and any(
+                str(node["candidate_id"]).startswith("r1_")
+                for node in payload["candidate_graph"]["nodes"]
+            ):
+                self.calls.append({"purpose": purpose, "payload": payload, **kwargs})
+                return FakeCompletion(json.dumps({"selected_subgraphs": []}))
             if purpose == "candidate_proposal" and payload["round_index"] == 1:
                 self.calls.append({"purpose": purpose, "payload": payload, **kwargs})
                 return FakeCompletion(json.dumps({
@@ -962,14 +1082,15 @@ def test_next_round_proposals_receive_committed_path_state() -> None:
         maximum_matrix_evaluations=4,
         communication_rounds=1,
         maximum_organization_rounds=2,
-        maximum_agents=2,
+        maximum_agents=3,
         information_gain_epsilon=0.001,
     )
     task = BenchmarkTask("math", "MATH", "pentagon", [], {"solution": "135"})
     run = RoyTrainingFreeEngine(client, client, config=config).run(task)
     assert len(run.rounds) == 2
     assert run.rounds[0].transition_kind == "expand"
-    assert run.rounds[1].transition_kind == "stop"
+    assert run.rounds[1].transition_kind == "reorganize"
+    assert run.rounds[1].selected_information_gain == 0.0
     second_round = [
         call["payload"] for call in client.calls
         if call["purpose"] == "candidate_proposal"
@@ -988,7 +1109,7 @@ def test_next_round_proposals_receive_committed_path_state() -> None:
     }
     assert len(run.to_dict()["matrix_trajectory"]) == 3
     assert run.to_dict()["call_audit"]["calls"]["semantic_information_judge"] == 2
-    assert sum(event.kind == "winner_matrix_executed" for event in run.event_ledger) == 1
+    assert sum(event.kind == "winner_matrix_executed" for event in run.event_ledger) == 2
 
 
 def test_json_parser_repairs_unescaped_latex_without_masking_truncation() -> None:
@@ -1814,3 +1935,28 @@ def test_positive_baseline_reorganization_is_committed_without_expansion() -> No
     assert decision.commit is True
     assert decision.subgraph_id is None
     assert decision.information_gain == 0.2
+
+
+def test_equal_information_matrix_contraction_is_committed_for_lower_a2a_cost() -> None:
+    initial = InformationMatrix.zero(["A0", "A1"])
+    initial.set_weight("A0", "A1", 0.5)
+    contracted = InformationMatrix.zero(["A0", "A1"])
+    baseline = MatrixSearchResult(initial, contracted, 0.0, 2, [{"x": 1.0}])
+
+    decision = select_transition(baseline, {}, epsilon=0.05)
+
+    assert decision.kind == "reorganize"
+    assert decision.commit is True
+    assert decision.structural_contraction is True
+    assert decision.information_gain == 0.0
+
+
+def test_matrix_sources_reaching_root_follow_edge_direction() -> None:
+    matrix = InformationMatrix.zero(["A0", "A1", "A2", "A3"])
+    matrix.set_weight("A2", "A1", 0.5)
+    matrix.set_weight("A1", "A0", 0.5)
+    matrix.set_weight("A0", "A3", 0.5)
+
+    assert matrix.sources_reaching("A0") == {"A0", "A1", "A2"}
+    assert matrix.sources_reaching("A0", minimum_weight=0.5) == {"A0"}
+    assert matrix.active_agent_ids() == {"A0", "A1", "A2", "A3"}

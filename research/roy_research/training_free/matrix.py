@@ -38,6 +38,49 @@ class InformationMatrix:
         index = self.agent_ids.index(agent_id)
         return sum(self.values[index]) + sum(row[index] for row in self.values)
 
+    def positive_edge_count(self, *, minimum_weight: float = 0.0) -> int:
+        return sum(
+            source != target and self.weight(source, target) > minimum_weight
+            for source in self.agent_ids for target in self.agent_ids
+        )
+
+    def total_capacity(self) -> float:
+        return sum(sum(row) for row in self.values)
+
+    def active_agent_ids(self, *, minimum_weight: float = 0.0) -> set[str]:
+        """Return A0 plus every endpoint of an executable matrix edge."""
+        active = {"A0"} if "A0" in self.agent_ids else set()
+        active.update(
+            agent_id for agent_id in self.agent_ids
+            if self.activation(agent_id) > minimum_weight
+        )
+        return active
+
+    def sources_reaching(
+        self,
+        target: str,
+        *,
+        minimum_weight: float = 0.0,
+    ) -> set[str]:
+        """Return sources with a directed positive-capacity path into target."""
+        if target not in self.agent_ids:
+            raise KeyError(target)
+        reaching = {target}
+        changed = True
+        while changed:
+            changed = False
+            for source in self.agent_ids:
+                if source in reaching:
+                    continue
+                if any(
+                    receiver in reaching
+                    and self.weight(source, receiver) > minimum_weight
+                    for receiver in self.agent_ids
+                ):
+                    reaching.add(source)
+                    changed = True
+        return reaching
+
     def validate(
         self,
         *,
@@ -382,10 +425,23 @@ class BeamCoordinateMatrixSearch:
                     discovered_at.setdefault(neighbor.key(), iteration)
             ranked = sorted(candidates.values(), key=lambda candidate: candidate.key())
             ranked = sorted(
-                ranked, key=lambda candidate: score(candidate)[0], reverse=True,
+                ranked,
+                key=lambda candidate: (
+                    score(candidate)[0],
+                    -candidate.total_capacity(),
+                    -candidate.positive_edge_count(),
+                ),
+                reverse=True,
             )
             beam = ranked[: self.beam_width]
-        best = max(beam, key=lambda candidate: score(candidate)[0])
+        best = max(
+            beam,
+            key=lambda candidate: (
+                score(candidate)[0],
+                -candidate.total_capacity(),
+                -candidate.positive_edge_count(),
+            ),
+        )
         best_score, observations = score(best)
         return MatrixSearchResult(
             initial.clone(), best, best_score, len(evaluated_matrices), observations,

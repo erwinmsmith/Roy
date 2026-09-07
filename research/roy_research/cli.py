@@ -1254,6 +1254,17 @@ def main(argv: List[str] | None = None) -> None:
                                     "expected_output", "stop_condition", "received_messages",
                                     "task_dependencies", "public_tests", "inherited_memory_refs",
                                 ],
+                                "candidate_selector_scope": "new_candidates_only",
+                                "candidate_calculation_policy": "selector_fixed_sparse_list",
+                                "judge_scope": (
+                                    "all_committed_agents_including_dormant_plus_selected_candidates"
+                                ),
+                                "agent_x_policy": "configure_once_reuse_across_items",
+                                "semantic_search_mode": "prospective_fixed_x",
+                                "dormant_policy": (
+                                    "retained_judged_not_executed_until_matrix_reactivation"
+                                ),
+                                "round_policy": "matrix_gain_or_cost_contraction_with_hard_cap",
                             },
                             "continual_sequence_index": sequence_index,
                             "continual_state_before_fingerprint": (

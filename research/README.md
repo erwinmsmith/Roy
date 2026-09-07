@@ -431,11 +431,25 @@ into the persistent state. Every row contains a fingerprinted
 dataset prefix; a failed item halts the episode instead of silently skipping a
 state transition.
 
-The default continual profile uses precision-logdet, one organization round per
-item, at most one committed Agent expansion per item, and a benchmark-wide cap
-of 12 persistent Agents. This keeps the growing Judge matrix and execution cost
-bounded while preserving the spawned structure. It is an online/continual
-protocol and must be reported separately from standard iid per-item accuracy:
+The default continual profile uses precision-logdet, up to three organization
+rounds per item, at most one committed Agent expansion in each round, and a
+benchmark-wide cap of 12 persistent Agents. A round continues only when matrix
+search predicts information gain or finds an equal-information contraction that
+reduces communication capacity; otherwise it stops early.
+
+The LLM Selector filters only proposed new candidates and freezes a sparse
+candidate calculation list before expensive candidate-X realization. Every
+already committed Agent X—including one marked dormant by the previous winner
+matrix—is reused without reconstruction and remains in the task-conditioned,
+prospective pairwise Semantic Judge and pure matrix search. Only A0 first obtains
+the direct answer needed for the current item. After search, Agents on a selected
+information path into A0 produce task-local results, followed by winner A2A;
+dormant Agents do not execute or propose descendants unless the newly searched
+matrix reconnects them. New candidate X is likewise configured once and executes
+only if its frontier wins. Thus dormancy is reversible, while candidate
+calculation, persistent population, and per-item organization rounds remain
+hard-bounded. This is an online/continual protocol and must be reported
+separately from standard iid per-item accuracy:
 
 ```bash
 PYTHONPATH=research research/.venv/bin/python -m roy_research training-free-run \
