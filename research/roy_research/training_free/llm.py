@@ -1012,9 +1012,12 @@ its specialization on this exact task. Use objective, role, tools, retained memo
 contracts, and the current task to make this task-conditioned estimate. Do not set an unexecuted or
 dormant Agent's potential to zero merely because its current result buffer is empty. Conversely, do
 not invent completed evidence: this is an ex-ante capability/information estimate, not a claim that
-the Agent has already produced it. Include every supplied committed Agent, including dormant ones,
-and every selected newly configured candidate in all ordered pairwise estimates. The matrix search,
-not you, decides which X_i will execute and whether a dormant X_i is reactivated."""
+the Agent has already produced it. Classify an unexecuted Agent's root relation as unresolved rather
+than fabricating support or contradiction. Root uncertainty is the residual uncertainty of A0's
+currently executed result before any expected contribution from unexecuted X_i is realized. Include
+every supplied committed Agent, including dormant ones, and every selected newly configured candidate
+in all ordered pairwise estimates. The matrix search, not you, decides which X_i will execute and
+whether a dormant X_i is reactivated."""
 
     PRECISION_SYSTEM = """
 For the precision/log-det objective, also define exactly the requested number of shared, mutually
@@ -1023,9 +1026,12 @@ not Agent names or answer options; examples include a contract constraint, deriv
 edge-case behavior, or verification obligation. They must jointly cover the material ways the
 current answer could be right or wrong across benchmarks.
 
-For each Agent i, estimate h_i as a nonnegative observation vector in [0,1]^d. A component is high
-only when the Agent's current grounded claims/evidence actually observe that task dimension. Do not
-give credit for a proposed role, confidence, or work that has not been executed. Estimate
+For each Agent i, estimate h_i as a nonnegative observation vector in [0,1]^d. In executed-state
+mode, a component is high only when the Agent's current grounded claims/evidence actually observe
+that task dimension; do not credit a proposed role or unexecuted work. In prospective fixed-X mode,
+follow the prospective instructions below and estimate the task-conditioned observation coverage
+expected from executing the fixed specialization, without pretending that evidence already exists.
+Estimate
 observation_noise[i] in [0,1], where smaller means more reliable evidence and larger means noisy,
 assumption-dependent, self-contradictory, or weakly grounded evidence. Estimate the Root's residual
 uncertainty independently on every shared dimension in [0,1]. These values define one semantic
