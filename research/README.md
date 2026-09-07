@@ -227,6 +227,49 @@ the score history for later selection. This is an external `AFlow` baseline;
 its search decisions and generated workflow code are not imported as Roy
 GRPO labels and MCTS is not added to Roy training or inference.
 
+### Source-pinned dynamic-MAS baselines
+
+DyLAN, AutoAgents, and EvoAgent remain external checkouts. Their exact revisions
+and adaptation boundaries are fixed in
+[`config/external_mas_baselines.json`](config/external_mas_baselines.json):
+
+```bash
+research/remote/prepare_external_mas_baselines.sh prepare
+research/remote/prepare_external_mas_baselines.sh check
+```
+
+DyLAN publishes MATH and HumanEval implementations, so the adapter retains its
+three-round/listwise prompts and control flow. AutoAgents and EvoAgent do not
+publish drivers for these datasets; the adapter retains their upstream
+planner/observer/generated-role and expert-evolution loops while supplying only
+benchmark input/output plumbing. It never places MATH solutions or HumanEval
+final tests in model context. HumanEval public tests remain allowed inputs, and
+the final score always comes from the pinned, process-isolated AFlow evaluator.
+
+Each resumable task row records generated roles or evolved agents, call stages,
+exact upstream revision and source fingerprint, score, and total tokens across
+all attempts:
+
+```bash
+PYTHONPATH=research research/.venv/bin/python \
+  research/remote/run_external_mas_baseline.py \
+  --method dylan \
+  --repository-root "$HOME/rivermind-data/benchmarks/DyLAN" \
+  --baseline-manifest research/config/external_mas_baselines.json \
+  --aflow-root "$HOME/rivermind-data/benchmarks/AFlow" \
+  --aflow-python "$HOME/rivermind-data/benchmarks/AFlow/.venv/bin/python" \
+  --aflow-manifest research/config/aflow_benchmarks.json \
+  --benchmark MATH --split test \
+  --provider deepseek --model deepseek-v4-flash \
+  --output research/output/external/dylan-math.jsonl \
+  --events research/output/external/dylan-math.events.jsonl \
+  --ledger research/output/external/dylan-math.ledger.json --resume
+```
+
+Use identical model, temperature, output-token cap, dataset and scorer settings
+for every arm. AutoAgents/EvoAgent numbers must be labeled benchmark-adapted,
+not reported as original paper benchmark numbers.
+
 For a controlled comparison, use the same execution model, temperature,
 dataset records and scorer for `single_agent_direct`, frozen AFlow and frozen
 Roy. Report the upstream score, model calls/tokens and wall time. AFlow's

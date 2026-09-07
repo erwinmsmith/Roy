@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "baselines": {
+    "dylan": {
+      "repository": "https://github.com/SALT-NLP/DyLAN.git",
+      "revision": "006e440a519f7cf21e2826f3b8033d84ae9bf07c",
+      "license": "MIT",
+      "integration": "native MATH/HumanEval prompts and three-round listwise control flow"
+    },
+    "autoagents": {
+      "repository": "https://github.com/Link-AGI/AutoAgents.git",
+      "revision": "223ad991988d752c446d25a0381e647f6e71c92c",
+      "license": "MIT",
+      "integration": "upstream planner, role/plan observers and generated-role execution with benchmark I/O adapter"
+    },
+    "evoagent": {
+      "repository": "https://github.com/siyuyuan/evoagent.git",
+      "revision": "fc6d087b119df69466c2372cfcaf588c040aaba8",
+      "license": "upstream repository has no root license file",
+      "integration": "upstream three-iteration expert evolution control flow with benchmark I/O adapter"
+    }
+  },
+  "protocol": {
+    "datasets": "research/config/aflow_benchmarks.json",
+    "optimization_split": "AFlow *_validate.jsonl",
+    "test_split": "AFlow *_test.jsonl",
+    "final_evaluator": "pinned AFlow scorer",
+    "model_access": "Roy audited provider client and persistent token ledger"
+  }
+}
