@@ -65,7 +65,11 @@ from .tau3_runner import evaluate_tau3_against_direct, train_tau3_on_policy
 from .token_ledger import PersistentTokenLedger
 from .training import TRAINING_VARIANTS, evaluate_groups, train_groups
 from .training_free.aflow import AFlowDataset, AFlowEvaluator
-from .training_free.engine import RoyTrainingFreeEngine, TrainingFreeConfig
+from .training_free.engine import (
+    ContinualBenchmarkState,
+    RoyTrainingFreeEngine,
+    TrainingFreeConfig,
+)
 from .training_free.tools import macos_readonly_sandbox_prefix
 
 
@@ -179,12 +183,18 @@ def parser() -> argparse.ArgumentParser:
     )
     training_free.add_argument(
         "--config", type=Path,
-        default=Path(__file__).resolve().parents[1] / "config" / "training_free_v1.json",
+        help=(
+            "Runtime config; defaults to training_free_continual_v1.json for roy_continual "
+            "and training_free_v1.json otherwise"
+        ),
     )
     training_free.add_argument("--benchmark", choices=("MATH", "HumanEval"), required=True)
     training_free.add_argument(
-        "--arm", choices=("roy", "single_agent_direct"), default="roy",
-        help="Run Roy search or its matched single-Agent baseline without organization search",
+        "--arm", choices=("roy", "roy_continual", "single_agent_direct"), default="roy",
+        help=(
+            "Run independent Roy, one ordered benchmark-wide Roy episode, or the matched "
+            "single-Agent baseline"
+        ),
     )
     training_free.add_argument(
         "--matrix-objective",
@@ -195,7 +205,11 @@ def parser() -> argparse.ArgumentParser:
     training_free.add_argument("--offset", type=int, default=0)
     training_free.add_argument("--limit", type=int)
     training_free.add_argument(
-        "--resume", action="store_true", help="Skip task ids already present in the output JSONL",
+        "--resume", action="store_true",
+        help=(
+            "Skip task ids already present, or restore the exact completed prefix and state "
+            "for roy_continual"
+        ),
     )
     training_free.add_argument(
         "--retry-failures-from", type=Path, action="append", default=[],
@@ -590,6 +604,37 @@ def _failed_task_ids(paths: List[Path], output: Path) -> set[str]:
             if row.get("task_id"):
                 latest_status[str(row["task_id"])] = str(row.get("run_status", ""))
     return {task_id for task_id, status in latest_status.items() if status == "failed"}
+
+
+def _restore_continual_state(
+    output: Path,
+    tasks: List[Any],
+    *,
+    available_tools: List[str],
+) -> tuple[ContinualBenchmarkState | None, int]:
+    if not output.exists():
+        return None, 0
+    completed_ids: List[str] = []
+    state: ContinualBenchmarkState | None = None
+    for row in read_jsonl(output):
+        if row.get("run_status") != "completed":
+            continue
+        index = len(completed_ids)
+        if index >= len(tasks) or str(row.get("task_id")) != tasks[index].task_id:
+            raise ValueError(
+                "roy_continual resume requires completed rows to be an exact dataset prefix"
+            )
+        raw_state = row.get("continual_state_after")
+        if not isinstance(raw_state, dict):
+            raise ValueError("completed continual row has no resumable state")
+        state = ContinualBenchmarkState.from_dict(
+            raw_state, available_tools=available_tools,
+        )
+        completed_ids.append(tasks[index].task_id)
+    if state is not None:
+        if state.items_completed != len(completed_ids) or state.task_ids != completed_ids:
+            raise ValueError("continual state history does not match completed output prefix")
+    return state, len(completed_ids)
 
 
 def _training_free_client(
@@ -1086,7 +1131,12 @@ def main(argv: List[str] | None = None) -> None:
         })
         print(json.dumps({"output": str(args.output), "tokens": completion.total_tokens}))
     elif args.command == "training-free-run":
-        config_value = json.loads(args.config.read_text(encoding="utf-8"))
+        config_name = (
+            "training_free_continual_v1.json"
+            if args.arm == "roy_continual" else "training_free_v1.json"
+        )
+        config_path = args.config or Path(__file__).resolve().parents[1] / "config" / config_name
+        config_value = json.loads(config_path.read_text(encoding="utf-8"))
         if args.matrix_objective is not None:
             config_value["matrix_objective"] = args.matrix_objective
         config = TrainingFreeConfig(**config_value)
@@ -1095,13 +1145,28 @@ def main(argv: List[str] | None = None) -> None:
             raise ValueError("--offset cannot be negative")
         if args.max_task_attempts < 1:
             raise ValueError("--max-task-attempts must be positive")
+        if args.arm == "roy_continual" and args.offset != 0:
+            raise ValueError("roy_continual is ordered and cannot start from --offset")
+        if args.arm == "roy_continual" and args.retry_failures_from:
+            raise ValueError(
+                "roy_continual cannot replay isolated failures without their preceding episode state"
+            )
         load_limit = None if args.limit is None else args.offset + args.limit
         tasks = dataset.load(args.benchmark, args.split, load_limit)[args.offset:]
         retry_task_ids = _failed_task_ids(args.retry_failures_from, args.output)
         if args.retry_failures_from:
             tasks = [task for task in tasks if task.task_id in retry_task_ids]
-        completed_task_ids = set()
-        if args.resume and args.output.exists():
+        completed_task_ids: set[str] = set()
+        continual_state: ContinualBenchmarkState | None = None
+        if args.arm == "roy_continual" and args.resume:
+            continual_state, completed_count = _restore_continual_state(
+                args.output,
+                tasks,
+                available_tools=list(config.available_tools),
+            )
+            completed_task_ids = {task.task_id for task in tasks[:completed_count]}
+            tasks = tasks[completed_count:]
+        elif args.resume and args.output.exists():
             completed_task_ids = {
                 str(row.get("task_id", "")) for row in read_jsonl(args.output)
             }
@@ -1144,17 +1209,24 @@ def main(argv: List[str] | None = None) -> None:
             failed_attempts = []
             attempt_tokens = 0
             row = None
+            sequence_index = (
+                continual_state.items_completed if continual_state is not None else task_index
+            )
             for attempt in range(1, args.max_task_attempts + 1):
                 engine = RoyTrainingFreeEngine(
                     worker_client, candidate_client, config=config,
                     code_sandbox_prefix=tool_sandbox_prefix,
                 )
                 try:
-                    run = (
-                        engine.run_direct(task)
-                        if args.arm == "single_agent_direct"
-                        else engine.run(task)
-                    )
+                    next_continual_state = None
+                    if args.arm == "single_agent_direct":
+                        run = engine.run_direct(task)
+                    elif args.arm == "roy_continual":
+                        run, next_continual_state = engine.run_continual(
+                            task, continual_state,
+                        )
+                    else:
+                        run = engine.run(task)
                     completed_row = run.to_dict()
                     completed_row.update({
                         "arm": args.arm,
@@ -1166,6 +1238,29 @@ def main(argv: List[str] | None = None) -> None:
                         "execution_attempt": attempt,
                         "failed_attempts": failed_attempts,
                     })
+                    if next_continual_state is not None:
+                        completed_row.update({
+                            "method": "training_free_continual_information_flow_search",
+                            "continual_protocol": {
+                                "unit": "ordered_benchmark_episode",
+                                "score_feedback_to_state": False,
+                                "hidden_tests_to_state": False,
+                                "retained": [
+                                    "agent_id", "parent_id", "role", "private_memory",
+                                    "a2a_matrix", "derivation_lineage",
+                                ],
+                                "reset_per_item": [
+                                    "original_task", "result", "received_messages",
+                                    "task_dependencies", "public_tests",
+                                ],
+                            },
+                            "continual_sequence_index": sequence_index,
+                            "continual_state_before_fingerprint": (
+                                None if continual_state is None
+                                else continual_state.to_dict()["fingerprint"]
+                            ),
+                            "continual_state_after": next_continual_state.to_dict(),
+                        })
                     if evaluator is not None:
                         completed_row["evaluation"] = evaluator.score(task, run.final_answer)
                         initial_answer = str(completed_row["initial_root_answer"])
@@ -1181,6 +1276,9 @@ def main(argv: List[str] | None = None) -> None:
                     attempt_tokens += engine.audit.to_dict()["total_tokens"]
                     completed_row["all_attempts_total_tokens"] = attempt_tokens
                     row = completed_row
+                    if next_continual_state is not None:
+                        # Evaluator output is deliberately not passed to this state.
+                        continual_state = next_continual_state
                     break
                 except ProviderCircuitOpenError:
                     # Persistent provider outages are shard-level failures. Do not
@@ -1199,7 +1297,11 @@ def main(argv: List[str] | None = None) -> None:
                     "schema_version": 5,
                     "method": (
                         "single_agent_direct" if args.arm == "single_agent_direct"
-                        else "training_free_information_flow_search"
+                        else (
+                            "training_free_continual_information_flow_search"
+                            if args.arm == "roy_continual"
+                            else "training_free_information_flow_search"
+                        )
                     ),
                     "arm": args.arm,
                     "task_id": task.task_id,
@@ -1217,6 +1319,15 @@ def main(argv: List[str] | None = None) -> None:
                     "all_attempts_total_tokens": attempt_tokens,
                     "evaluation": {"score": 0.0, "failure": "task_execution_failed"},
                 }
+                if args.arm == "roy_continual":
+                    row.update({
+                        "continual_sequence_index": sequence_index,
+                        "continual_state_before_fingerprint": (
+                            None if continual_state is None
+                            else continual_state.to_dict()["fingerprint"]
+                        ),
+                        "continual_state_after": None,
+                    })
             # Keep progress logging total even when an evaluator or compatibility
             # result row omitted this optional accounting field.
             row.setdefault("all_attempts_total_tokens", attempt_tokens)
@@ -1229,6 +1340,12 @@ def main(argv: List[str] | None = None) -> None:
                 "score": row.get("evaluation", {}).get("score"),
                 "tokens": row["all_attempts_total_tokens"],
             }), flush=True)
+            if args.arm == "roy_continual" and row["run_status"] != "completed":
+                print(json.dumps({
+                    "continual_episode_halted": True,
+                    "reason": "a missing item transition would invalidate later path dependence",
+                }), flush=True)
+                break
         print(json.dumps({
             "output": str(args.output),
             "tasks_completed_this_invocation": len(output_rows),

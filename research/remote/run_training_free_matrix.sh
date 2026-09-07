@@ -14,6 +14,7 @@ base_url="${ROY_TF_BASE_URL:-}"
 wait_for_pid="${ROY_TF_WAIT_FOR_PID:-}"
 wait_seconds="${ROY_TF_WAIT_SECONDS:-30}"
 resume="${ROY_TF_RESUME:-false}"
+include_continual="${ROY_TF_INCLUDE_CONTINUAL:-false}"
 
 [[ "${limit}" == "all" || "${limit}" =~ ^[1-9][0-9]*$ ]] || {
   echo "LIMIT must be a positive integer or 'all'" >&2
@@ -29,6 +30,10 @@ if [[ -n "${wait_for_pid}" && ! "${wait_for_pid}" =~ ^[1-9][0-9]*$ ]]; then
 fi
 [[ "${resume}" == "true" || "${resume}" == "false" ]] || {
   echo "ROY_TF_RESUME must be true or false" >&2
+  exit 2
+}
+[[ "${include_continual}" == "true" || "${include_continual}" == "false" ]] || {
+  echo "ROY_TF_INCLUDE_CONTINUAL must be true or false" >&2
   exit 2
 }
 [[ -x "${python_bin}" && -x "${aflow_python}" ]] || {
@@ -136,5 +141,11 @@ launch logdet-math research/config/training_free_logdet_v1.json MATH roy \
   "${ROY_TF_ROY_TOKEN_LIMIT:-10000000}"
 launch logdet-humaneval research/config/training_free_logdet_v1.json HumanEval roy \
   "${ROY_TF_ROY_TOKEN_LIMIT:-10000000}"
+if [[ "${include_continual}" == "true" ]]; then
+  launch continual-logdet-math research/config/training_free_continual_v1.json MATH roy_continual \
+    "${ROY_TF_CONTINUAL_TOKEN_LIMIT:-100000000}"
+  launch continual-logdet-humaneval research/config/training_free_continual_v1.json HumanEval roy_continual \
+    "${ROY_TF_CONTINUAL_TOKEN_LIMIT:-100000000}"
+fi
 
 mv "${pids_tmp}" "${run_root}/pids.tsv"

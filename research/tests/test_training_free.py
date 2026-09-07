@@ -13,9 +13,11 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parents[1] / "remote"))
 from run_aflow_search_then_test import stage_workspace
 
-from roy_research.cli import _failed_task_ids
+from roy_research.cli import _failed_task_ids, _restore_continual_state
+from roy_research.io import write_jsonl
 from roy_research.training_free.aflow import AFlowDataset, AFlowEvaluator
 from roy_research.training_free.engine import (
+    ContinualBenchmarkState,
     RoyTrainingFreeEngine,
     TrainingFreeConfig,
     select_transition,
@@ -85,7 +87,7 @@ class ScriptedClient:
         payload = json.loads(messages[1]["content"])
         self.calls.append({"purpose": purpose, "payload": payload, **kwargs})
         candidate_id = "r0_A0_c1"
-        if purpose == "root_worker":
+        if purpose in {"root_worker", "persistent_worker"}:
             value = {
                 "result": {
                     "candidate_answer": "120", "claims": ["initial attempt"],
@@ -339,6 +341,117 @@ def test_engine_commits_externally_realized_candidate_x() -> None:
         item["information_observations"][0]["llm_rollouts"] == 0
         for item in searched["evaluated_matrices"]
     )
+
+
+def test_continual_episode_reuses_topology_memory_and_global_round_ids(tmp_path: Path) -> None:
+    class ContinualClient(ScriptedClient):
+        def complete(self, messages, **kwargs):
+            purpose = kwargs["metadata"]["purpose"]
+            payload = json.loads(messages[1]["content"])
+            if purpose == "candidate_proposal":
+                self.calls.append({"purpose": purpose, "payload": payload, **kwargs})
+                candidate_id = payload["candidate_id_prefix"] + "1"
+                parent_id = payload["committed_agent"]["contract"]["agent_id"]
+                value = {
+                    "candidate_dependency_graph": {
+                        "nodes": [{
+                            "candidate_id": candidate_id,
+                            "parent_id": parent_id,
+                            "epistemic_operation": "independent_reconstruction",
+                            "direction": "independently solve the current item",
+                            "why_needed": "retain a distinct check",
+                            "required_inputs": [],
+                            "requested_tools": [],
+                            "expected_output": "checked answer",
+                            "stop_condition": "answer checked",
+                        }],
+                        "dependencies": [],
+                    },
+                }
+                return FakeCompletion(json.dumps(value))
+            if purpose == "global_selector":
+                self.calls.append({"purpose": purpose, "payload": payload, **kwargs})
+                candidate_id = payload["candidate_graph"]["nodes"][0]["candidate_id"]
+                return FakeCompletion(json.dumps({
+                    "selected_subgraphs": [{
+                        "candidate_ids": [candidate_id],
+                        "selection_reason": "independent check",
+                    }],
+                }))
+            return super().complete(messages, **kwargs)
+
+    config = TrainingFreeConfig(
+        maximum_agents=3,
+        maximum_candidates=1,
+        maximum_selected_subgraphs=1,
+        maximum_nodes_per_subgraph=1,
+        matrix_iterations=1,
+        matrix_beam_width=2,
+        maximum_matrix_evaluations=4,
+        communication_rounds=1,
+        maximum_organization_rounds=1,
+        information_gain_epsilon=0.001,
+    )
+    first_task = BenchmarkTask("math-0", "MATH", "first problem", [], {"solution": "135"})
+    first_client = ContinualClient()
+    first_run, first_state = RoyTrainingFreeEngine(
+        first_client, first_client, config=config,
+    ).run_continual(first_task, None)
+    assert set(first_state.agents) == {"A0", "r0_A0_c1"}
+    first_state.agents["A0"].memory.entries.append("persistent method preference")
+    serialized = first_state.to_dict()
+    restored = ContinualBenchmarkState.from_dict(
+        serialized, available_tools=list(config.available_tools),
+    )
+
+    second_task = BenchmarkTask("math-1", "MATH", "second problem", [], {"solution": "135"})
+    second_client = ContinualClient()
+    second_run, second_state = RoyTrainingFreeEngine(
+        second_client, second_client, config=config,
+    ).run_continual(second_task, restored)
+
+    assert first_run.rounds[0].round_index == 0
+    assert second_run.rounds[0].round_index == 1
+    assert set(second_run.checkpoints[0].agents) == {"A0", "r0_A0_c1"}
+    assert "r1_A0_c1" in {
+        node["candidate_id"] for node in second_run.rounds[0].candidate_graph["nodes"]
+    }
+    assert second_state.items_completed == 2
+    assert second_state.task_ids == ["math-0", "math-1"]
+    assert "persistent method preference" in second_state.agents["A0"].memory.entries
+    assert all(
+        agent.context.original_task == "second problem"
+        for agent in second_run.final_agents.values()
+    )
+    assert all(
+        dependency.relation == "derivation"
+        for dependency in second_state.lineage_dependencies
+    )
+    assert sum(
+        call["purpose"] == "persistent_worker" for call in second_client.calls
+    ) == 1
+    output = tmp_path / "continual.jsonl"
+    write_jsonl(output, [{
+        "task_id": "math-0",
+        "run_status": "completed",
+        "continual_state_after": serialized,
+    }])
+    resumed, completed = _restore_continual_state(
+        output,
+        [first_task, second_task],
+        available_tools=list(config.available_tools),
+    )
+    assert completed == 1
+    assert resumed is not None and resumed.task_ids == ["math-0"]
+
+    class ChangedModelClient(ContinualClient):
+        model = "changed-model"
+
+    changed = ChangedModelClient()
+    with pytest.raises(ValueError, match="runtime/model config changed"):
+        RoyTrainingFreeEngine(changed, changed, config=config).run_continual(
+            second_task, restored,
+        )
 
 
 def test_engine_can_select_precision_logdet_matrix_objective() -> None:

@@ -419,6 +419,37 @@ single-Agent baseline. It uses the same root harness, Worker model, token ceilin
 tool registry, and scorer, but never invokes candidate selection, X realization,
 channelization, an information probe, or matrix search.
 
+An additional `roy_continual` arm treats one ordered benchmark split as one
+path-dependent episode. `A0` is created only for the first item. Later items
+retain Agent ids, parent/child lineage, roles, private long-term memory and the
+A2A matrix, then may append new Agents with globally increasing round ids.
+Task-local answers, received messages, public tests and hard/soft evidence
+dependencies are reset before the next item. Official scores and hidden tests
+are never written into the persistent state. Every row contains a fingerprinted
+`continual_state_after`, so `--resume` can continue only from an exact completed
+dataset prefix; a failed item halts the episode instead of silently skipping a
+state transition.
+
+The default continual profile uses precision-logdet, one organization round per
+item, at most one committed Agent expansion per item, and a benchmark-wide cap
+of 12 persistent Agents. This keeps the growing Judge matrix and execution cost
+bounded while preserving the spawned structure. It is an online/continual
+protocol and must be reported separately from standard iid per-item accuracy:
+
+```bash
+PYTHONPATH=research research/.venv/bin/python -m roy_research training-free-run \
+  --arm roy_continual --config research/config/training_free_continual_v1.json \
+  --aflow-root /path/to/AFlow --aflow-python /path/to/AFlow/.venv/bin/python \
+  --benchmark MATH --split test --score \
+  --output research/output/continual-math.jsonl \
+  --ledger research/output/continual-math.ledger.json \
+  --events research/output/continual-math.events.jsonl
+
+# Opt into both continual MATH and HumanEval arms in the existing matrix launcher.
+ROY_TF_INCLUDE_CONTINUAL=true \
+  research/remote/run_training_free_matrix.sh RUN_ROOT MODEL all
+```
+
 Any OpenAI-compatible chat-completions endpoint can be selected without changing
 the benchmark or Agent harness. Keep the credential in an environment variable:
 

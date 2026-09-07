@@ -542,6 +542,38 @@ discovering a shared mistake. Return exactly one JSON object."""
         )
         return updated
 
+    def execute_persistent(
+        self,
+        agent: AgentState,
+        benchmark: str,
+        *,
+        tool_scope: str = "committed",
+    ) -> AgentState:
+        """Apply a previously spawned role to the current item of a continual episode."""
+        updated = copy.deepcopy(agent)
+        value = self._call_with_tools(
+            "persistent_worker",
+            {
+                "benchmark": benchmark,
+                "instruction": (
+                    "Apply the assigned persistent specialization to the current benchmark item. "
+                    "Solve, audit, or falsify it now; do not propose or simulate children. Return "
+                    "only the completed result and private memory updates."
+                ),
+                "required_schema": {
+                    "result": "ResultState", "memory_entries": ["string"],
+                    "tool_requests": ["optional ToolRequest"],
+                },
+            },
+            updated,
+            max_tokens=self.max_tokens,
+            tool_scope=tool_scope,
+        )
+        AgentHarness(updated, self.tools, self.harness_config).apply_model_update(
+            self._result_from_value(value, benchmark), value.get("memory_entries", []),
+        )
+        return updated
+
     def _result_from_value(self, value: Mapping[str, Any], benchmark: str) -> ResultState:
         raw_result = value.get("result")
         if not isinstance(raw_result, Mapping):

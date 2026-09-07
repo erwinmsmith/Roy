@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from dataclasses import asdict, dataclass
 from typing import Any, Callable, Dict, List, Literal, Mapping
@@ -45,6 +46,7 @@ from .types import (
     CandidateGraph,
     CandidateNode,
     RealizedSubgraph,
+    ResultState,
 )
 
 
@@ -86,8 +88,14 @@ class TrainingFreeConfig:
     def __post_init__(self) -> None:
         if self.maximum_agents < 1 or self.maximum_nodes_per_subgraph < 1:
             raise ValueError("agent limits must be positive")
-        if self.communication_rounds < 1 or self.mia_path_horizon < 1:
-            raise ValueError("communication rounds and MIA path horizon must be positive")
+        if (
+            self.communication_rounds < 1
+            or self.mia_path_horizon < 1
+            or self.maximum_organization_rounds < 1
+        ):
+            raise ValueError(
+                "communication rounds, organization rounds, and MIA path horizon must be positive"
+            )
         if self.maximum_matrix_evaluations < self.matrix_beam_width:
             raise ValueError("matrix evaluation budget must cover the beam")
         if self.maximum_tool_rounds < 0 or self.maximum_tool_calls_per_worker_call < 0:
@@ -213,10 +221,7 @@ class TrainingFreeRun:
 
     @property
     def initial_root_answer(self) -> str:
-        checkpoint = next(
-            item for item in self.checkpoints
-            if item.phase == "search_state" and item.round_index == 0
-        )
+        checkpoint = next(item for item in self.checkpoints if item.phase == "search_state")
         return str(checkpoint.agents["A0"]["result"]["candidate_answer"])
 
     def organization_summary(self) -> Dict[str, int]:
@@ -346,6 +351,93 @@ class SingleAgentRun:
         }
 
 
+@dataclass
+class ContinualBenchmarkState:
+    """Persistent organization carried between items of one ordered benchmark episode."""
+
+    benchmark: str
+    runtime_fingerprint: str
+    agents: Dict[str, AgentState]
+    matrix: InformationMatrix
+    lineage_dependencies: List[DependencyRecord]
+    next_round_index: int
+    items_completed: int
+    task_ids: List[str]
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = {
+            "schema_version": 1,
+            "benchmark": self.benchmark,
+            "runtime_fingerprint": self.runtime_fingerprint,
+            "agents": {key: value.to_dict() for key, value in self.agents.items()},
+            "matrix": self.matrix.to_dict(),
+            "lineage_dependencies": [item.to_dict() for item in self.lineage_dependencies],
+            "next_round_index": self.next_round_index,
+            "items_completed": self.items_completed,
+            "task_ids": list(self.task_ids),
+        }
+        payload["fingerprint"] = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        return payload
+
+    @classmethod
+    def from_dict(
+        cls,
+        value: Mapping[str, Any],
+        *,
+        available_tools: List[str],
+    ) -> "ContinualBenchmarkState":
+        payload = {key: item for key, item in value.items() if key != "fingerprint"}
+        expected = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        if value.get("schema_version") != 1 or value.get("fingerprint") != expected:
+            raise ValueError("invalid continual benchmark state fingerprint or schema")
+        raw_agents = value.get("agents")
+        raw_matrix = value.get("matrix")
+        if not isinstance(raw_agents, Mapping) or not isinstance(raw_matrix, Mapping):
+            raise ValueError("continual benchmark state is missing agents or matrix")
+        agents: Dict[str, AgentState] = {}
+        for agent_id, raw in raw_agents.items():
+            if not isinstance(raw, Mapping) or not isinstance(raw.get("context"), Mapping):
+                raise ValueError(f"invalid continual Agent state: {agent_id}")
+            agents[str(agent_id)] = AgentState.from_dict(
+                raw,
+                original_task=str(raw["context"].get("original_task", "")),
+                available_tools=available_tools,
+                expected_agent_id=str(agent_id),
+            )
+        matrix = InformationMatrix(
+            [str(item) for item in raw_matrix.get("agent_ids", [])],
+            [[float(weight) for weight in row] for row in raw_matrix.get("values", [])],
+        )
+        matrix.validate()
+        if set(matrix.agent_ids) != set(agents):
+            raise ValueError("continual matrix basis does not match persistent Agents")
+        dependencies = [
+            DependencyRecord(**dict(item))
+            for item in value.get("lineage_dependencies", [])
+        ]
+        if any(item.relation != "derivation" for item in dependencies):
+            raise ValueError("continual state may retain only role-lineage dependencies")
+        next_round_index = int(value.get("next_round_index", 0))
+        items_completed = int(value.get("items_completed", 0))
+        task_ids = [str(item) for item in value.get("task_ids", [])]
+        if next_round_index < 0 or items_completed < 0 or len(task_ids) != items_completed:
+            raise ValueError("continual state has invalid episode counters")
+        return cls(
+            benchmark=str(value.get("benchmark", "")),
+            runtime_fingerprint=str(value.get("runtime_fingerprint", "")),
+            agents=agents,
+            matrix=matrix,
+            lineage_dependencies=dependencies,
+            next_round_index=next_round_index,
+            items_completed=items_completed,
+            task_ids=task_ids,
+        )
+
+
 class RoyTrainingFreeEngine:
     def __init__(
         self,
@@ -359,6 +451,14 @@ class RoyTrainingFreeEngine:
         ] | None = None,
     ) -> None:
         self.config = config or TrainingFreeConfig()
+        self.worker_model = str(getattr(worker_client, "model", "unknown"))
+        self.candidate_model = str(getattr(candidate_client or worker_client, "model", "unknown"))
+        self.worker_endpoint = str(getattr(worker_client, "base_url", type(worker_client).__name__))
+        self.candidate_endpoint = str(getattr(
+            candidate_client or worker_client,
+            "base_url",
+            type(candidate_client or worker_client).__name__,
+        ))
         self.audit = CallAudit()
         worker_llm = JsonLLM(worker_client, self.audit)
         candidate_llm = JsonLLM(candidate_client or worker_client, self.audit)
@@ -396,33 +496,69 @@ class RoyTrainingFreeEngine:
         self.tool_registry: TaskToolRegistry | None = None
         self.available_tools = list(self.config.available_tools)
 
-    def run(self, task: BenchmarkTask) -> TrainingFreeRun:
+    def run(
+        self,
+        task: BenchmarkTask,
+        *,
+        initial_agents: Mapping[str, AgentState] | None = None,
+        initial_matrix: InformationMatrix | None = None,
+        initial_dependencies: List[DependencyRecord] | None = None,
+        round_index_offset: int = 0,
+    ) -> TrainingFreeRun:
+        if round_index_offset < 0:
+            raise ValueError("round_index_offset cannot be negative")
         self._configure_task(task)
-        root = self._root_agent(task)
-        agents: Dict[str, AgentState] = {root.agent_id: root}
-        matrix = InformationMatrix.zero(agents)
+        if initial_agents is None:
+            root = self._root_agent(task)
+            agents: Dict[str, AgentState] = {root.agent_id: root}
+            matrix = InformationMatrix.zero(agents)
+            dependencies: List[DependencyRecord] = []
+            initialization_kind = "state_initialized"
+        else:
+            if initial_matrix is None:
+                raise ValueError("continual Agents require an initial information matrix")
+            agents = self._rebind_continual_agents(initial_agents, task)
+            matrix = initial_matrix.clone()
+            matrix.validate()
+            if set(matrix.agent_ids) != set(agents):
+                raise ValueError("continual matrix basis does not match rebound Agents")
+            dependencies = copy.deepcopy(initial_dependencies or [])
+            initialization_kind = "continual_state_rebound"
         records: List[RoundRecord] = []
-        dependencies: List[DependencyRecord] = []
-        events = [TrajectoryEvent("event-0", -1, "state_initialized", {"root_id": "A0"})]
+        initial_round = round_index_offset - 1
+        events = [TrajectoryEvent(
+            "event-0", initial_round, initialization_kind,
+            {
+                "root_id": "A0",
+                "reused_agent_ids": sorted(agents) if initial_agents is not None else [],
+                "task_specific_results_reset": initial_agents is not None,
+                "private_memory_retained": initial_agents is not None,
+            },
+        )]
         checkpoints = [StateCheckpoint.capture(
-            "checkpoint-0-initial", None, -1, "initial", agents, matrix,
+            f"checkpoint-{round_index_offset}-initial", None, initial_round, "initial", agents, matrix,
             dependencies, None, events,
         )]
         last_checkpoint_id = checkpoints[-1].checkpoint_id
         cumulative_information_gain = 0.0
         stop_reason = "maximum_organization_rounds"
 
-        for round_index in range(self.config.maximum_organization_rounds):
+        for local_round_index in range(self.config.maximum_organization_rounds):
+            round_index = round_index_offset + local_round_index
             state_before_checkpoint_id = last_checkpoint_id
             candidate_graph, executed_parent_ids = self._prepare_parents_and_collect_candidates(
                 agents, matrix, dependencies, events, task.benchmark, round_index,
+                execute_parents=local_round_index == 0,
             )
             events.append(TrajectoryEvent(
                 f"event-{len(events)}", round_index,
-                "parent_states_initialized" if round_index == 0 else "parent_states_reused",
+                "parent_states_initialized" if local_round_index == 0 else "parent_states_reused",
                 {
                     "executed_agent_ids": executed_parent_ids,
-                    "reused_agent_ids": [] if round_index == 0 else sorted(agents),
+                    "reused_agent_ids": (
+                        sorted(agents)
+                        if initial_agents is not None or local_round_index > 0 else []
+                    ),
                     "matrix": matrix.to_dict(),
                 },
             ))
@@ -708,6 +844,54 @@ class RoyTrainingFreeEngine:
             matrix_objective=self.config.matrix_objective,
         )
 
+    def run_continual(
+        self,
+        task: BenchmarkTask,
+        prior: ContinualBenchmarkState | None,
+    ) -> tuple[TrainingFreeRun, ContinualBenchmarkState]:
+        if prior is not None and prior.benchmark != task.benchmark:
+            raise ValueError(
+                f"cannot carry {prior.benchmark} organization into {task.benchmark}"
+            )
+        runtime_fingerprint = self._continual_runtime_fingerprint()
+        if prior is not None and prior.runtime_fingerprint != runtime_fingerprint:
+            raise ValueError("continual runtime/model config changed during an episode")
+        run = self.run(
+            task,
+            initial_agents=None if prior is None else prior.agents,
+            initial_matrix=None if prior is None else prior.matrix,
+            initial_dependencies=None if prior is None else prior.lineage_dependencies,
+            round_index_offset=0 if prior is None else prior.next_round_index,
+        )
+        lineage = [
+            copy.deepcopy(item) for item in run.dependency_ledger
+            if item.relation == "derivation"
+        ]
+        next_round = max(
+            (record.round_index for record in run.rounds),
+            default=(-1 if prior is None else prior.next_round_index - 1),
+        ) + 1
+        state = ContinualBenchmarkState(
+            benchmark=task.benchmark,
+            runtime_fingerprint=runtime_fingerprint,
+            agents=copy.deepcopy(run.final_agents),
+            matrix=run.final_matrix.clone(),
+            lineage_dependencies=lineage,
+            next_round_index=next_round,
+            items_completed=(0 if prior is None else prior.items_completed) + 1,
+            task_ids=[*([] if prior is None else prior.task_ids), task.task_id],
+        )
+        return run, state
+
+    def _continual_runtime_fingerprint(self) -> str:
+        return hashlib.sha256(json.dumps({
+            "config": asdict(self.config),
+            "worker_model": self.worker_model,
+            "candidate_model": self.candidate_model,
+            "worker_endpoint": self.worker_endpoint,
+            "candidate_endpoint": self.candidate_endpoint,
+        }, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
     def run_direct(self, task: BenchmarkTask) -> SingleAgentRun:
         """Run the matched one-Agent baseline without organization search."""
         self._configure_task(task)
@@ -745,6 +929,8 @@ class RoyTrainingFreeEngine:
         events: List[TrajectoryEvent],
         benchmark: str,
         round_index: int,
+        *,
+        execute_parents: bool = False,
     ) -> tuple[CandidateGraph, List[str]]:
         nodes: Dict[str, CandidateNode] = {}
         state_dependencies = dependencies
@@ -768,9 +954,13 @@ class RoyTrainingFreeEngine:
                 ][-16:],
             }
             proposal_agent = agent
-            if round_index == 0:
-                proposal_agent = self.worker.execute_root(
-                    agent, benchmark, tool_scope="committed",
+            if execute_parents:
+                proposal_agent = (
+                    self.worker.execute_root(agent, benchmark, tool_scope="committed")
+                    if agent_id == "A0"
+                    else self.worker.execute_persistent(
+                        agent, benchmark, tool_scope="committed",
+                    )
                 )
                 executed[agent_id] = proposal_agent
             remaining_capacity = max(0, self.config.maximum_agents - len(agents))
@@ -797,6 +987,40 @@ class RoyTrainingFreeEngine:
         combined = CandidateGraph("GLOBAL", nodes, candidate_dependencies)
         combined.topological_order(set(nodes), hard_only=True)
         return combined, sorted(executed)
+
+    def _rebind_continual_agents(
+        self,
+        persistent_agents: Mapping[str, AgentState],
+        task: BenchmarkTask,
+    ) -> Dict[str, AgentState]:
+        rebound: Dict[str, AgentState] = {}
+        root_template = self._root_agent(task)
+        for agent_id, persistent in persistent_agents.items():
+            agent = copy.deepcopy(persistent)
+            if agent_id == "A0":
+                agent.objective = root_template.objective
+                agent.role = root_template.role
+            else:
+                agent.objective = (
+                    f"Apply the persistent specialization '{agent.role}' to independently solve, "
+                    "audit, or falsify the current benchmark item."
+                )
+            agent.context.original_task = task.instruction
+            agent.context.public_tests = list(task.public_tests)
+            agent.context.mandatory_inputs = []
+            agent.context.weighted_inputs = {}
+            agent.context.received_messages = []
+            agent.memory.inherited_refs = []
+            agent.tools = [tool for tool in agent.tools if tool in self.available_tools]
+            agent.result = ResultState(unresolved=[agent.objective])
+            agent.status = AgentStatus.READY
+            agent.expected_output = root_template.expected_output
+            agent.stop_condition = root_template.stop_condition
+            AgentHarness(agent, self.tool_registry, self.worker.harness_config).validate()
+            rebound[agent_id] = agent
+        if "A0" not in rebound:
+            raise ValueError("continual organization has no A0 root")
+        return rebound
 
     def _root_agent(self, task: BenchmarkTask) -> AgentState:
         objective = (
