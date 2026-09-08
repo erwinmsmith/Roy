@@ -60,6 +60,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-limit", type=int)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--test-only-resume",
+        action="store_true",
+        help="Resume only the test split using the workflow already frozen in selection.json",
+    )
     parser.add_argument("--aflow-python", type=Path)
     parser.add_argument("--human-eval-sandbox-command")
     return parser.parse_args()
@@ -386,6 +391,41 @@ def main() -> None:
         validation_rounds=args.validation_rounds,
     )
     optimizer.evaluation_utils = evaluation_utils
+
+    if args.test_only_resume:
+        if not args.resume:
+            raise ValueError("--test-only-resume requires --resume")
+        selection_path = run_root / "selection.json"
+        if not selection_path.exists():
+            raise FileNotFoundError("test-only resume requires an existing selection.json")
+        selection = json.loads(selection_path.read_text(encoding="utf-8"))
+        if selection.get("benchmark") != args.benchmark:
+            raise ValueError("frozen selection benchmark does not match --benchmark")
+        winner = int(selection["selected_round"])
+        frozen_files = dict(selection["frozen_files_sha256"])
+        if workflow_fingerprint(run_root, args.benchmark, winner) != frozen_files:
+            raise RuntimeError("frozen workflow changed before resumed test evaluation")
+        test_tasks = dataset.load(args.benchmark, "test", args.test_limit)
+        evaluation_utils.test_tasks = test_tasks
+        importlib.invalidate_caches()
+        graph_class = optimizer.graph_utils.load_graph(
+            winner, f"workspace/{args.benchmark}/workflows"
+        )
+        test_score = asyncio.run(
+            evaluation_utils.evaluate_frozen_test(
+                graph_class, winner, run_root / "final-test.jsonl"
+            )
+        )
+        if workflow_fingerprint(run_root, args.benchmark, winner) != frozen_files:
+            raise RuntimeError("frozen workflow changed during resumed test evaluation")
+        selection["test_score"] = test_score
+        selection["test_records"] = len(test_tasks)
+        selection["test_accessed"] = True
+        selection["test_resumed"] = True
+        atomic_json(selection_path, selection)
+        print(json.dumps(selection, ensure_ascii=False, sort_keys=True), flush=True)
+        return
+
     optimizer.optimize("Graph")
 
     results_path = run_root / "workspace" / args.benchmark / "workflows" / "results.json"
