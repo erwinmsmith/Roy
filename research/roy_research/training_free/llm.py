@@ -199,7 +199,11 @@ def _fixed_array(item: Mapping[str, Any], size: int) -> Dict[str, Any]:
 
 
 def _unit_number_schema() -> Dict[str, Any]:
-    return {"type": "number", "minimum": 0.0, "maximum": 1.0}
+    # The OpenAI-compatible endpoint supports constrained numeric types but not
+    # JSON Schema's minimum/maximum keywords. Runtime parsing still enforces
+    # [0, 1], so omitting those unsupported decoder hints does not weaken the
+    # accepted semantic contract.
+    return {"type": "number"}
 
 
 def _reconciliation_schema() -> Dict[str, Any]:
