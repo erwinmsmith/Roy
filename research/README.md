@@ -475,14 +475,20 @@ PYTHONPATH=research python3 -m roy_research training-free-run \
   --base-url https://api.code-soul.com/v1 \
   --api-key-env OPENAI_COMPAT_API_KEY \
   --provider-max-output-tokens 16384 \
+  --provider-context-window-tokens 32768 \
+  --provider-context-safety-tokens 1024 \
   --timeout 1800 \
-  --worker-model 'qwen3.5:9b-128k' \
-  --candidate-model 'qwen3.5:9b-128k' \
+  --worker-model 'qwen3.5:9b-32k' \
+  --candidate-model 'qwen3.5:9b-32k' \
   ...
 ```
 
 The generic provider uses the OpenAI Python SDK, preserves Roy's persistent token
-ledger and request audit, and does not forward vendor-specific `thinking` fields.
+ledger and request audit, uses strict JSON Schema for shape-critical protocol calls,
+dynamically clamps output against the configured total context window, and does not
+forward vendor-specific `thinking` fields. A transient provider retry exhaustion is
+checkpointed as retryable; `--resume` retries that task instead of treating its failed
+row as completed.
 The example output limit and request timeout reflect the currently configured
 Qwen 3.5 endpoint; set both flags to the capabilities of a different provider.
 

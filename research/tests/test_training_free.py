@@ -13,7 +13,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parents[1] / "remote"))
 from run_aflow_search_then_test import stage_workspace
 
-from roy_research.cli import _failed_task_ids, _restore_continual_state
+from roy_research.cli import _completed_task_ids, _failed_task_ids, _restore_continual_state
 from roy_research.io import write_jsonl
 from roy_research.training_free.aflow import AFlowDataset, AFlowEvaluator
 from roy_research.training_free.engine import (
@@ -1254,6 +1254,7 @@ def test_failed_task_selector_uses_only_failed_rows_and_separate_output(
         encoding="utf-8",
     )
     assert _failed_task_ids([prior], tmp_path / "retry.jsonl") == {"MATH/test/2"}
+    assert _completed_task_ids(prior) == {"MATH/test/1", "MATH/test/3"}
     with pytest.raises(ValueError, match="must differ"):
         _failed_task_ids([prior], prior)
 
@@ -1809,8 +1810,9 @@ def test_semantic_judge_uses_runtime_owned_agent_ids() -> None:
         def __init__(self) -> None:
             self.payload: Dict[str, Any] = {}
 
-        def call(self, purpose, system, payload, *, max_tokens):
+        def call(self, purpose, system, payload, *, max_tokens, response_schema=None):
             self.payload = payload
+            self.response_schema = response_schema
             return {
                 "agent_ids": "exact supplied agent_ids in the same order",
                 "directional_potential": [[0.0, 0.1], [0.8, 0.0]],
@@ -1838,6 +1840,49 @@ def test_semantic_judge_uses_runtime_owned_agent_ids() -> None:
     assert landscape.agent_ids == ["A0", "A1"]
     assert landscape.directional_potential[1][0] == 0.8
     assert "agent_ids" not in llm.payload["required_schema"]
+    assert llm.response_schema["properties"]["directional_potential"]["minItems"] == 2
+    assert llm.response_schema["properties"]["root_relations"]["properties"]["A0"]["enum"] == ["supports"]
+
+
+def test_candidate_proposer_discards_dependencies_on_unemitted_candidates() -> None:
+    class BrokenDependencyLLM:
+        def call(self, purpose, system, payload, *, max_tokens, response_schema=None):
+            self.response_schema = response_schema
+            return {
+                "candidate_dependency_graph": {
+                    "nodes": [{
+                        "candidate_id": "r0_A0_c0",
+                        "parent_id": "A0",
+                        "epistemic_operation": "specification_audit",
+                        "direction": "audit the exact domain",
+                        "why_needed": "the root may have narrowed the task",
+                        "required_inputs": [],
+                        "requested_tools": [],
+                        "expected_output": "a checked domain interpretation",
+                        "stop_condition": "every explicit qualifier is checked",
+                    }],
+                    "dependencies": [{
+                        "source": "r0_A0_c_missing",
+                        "target": "r0_A0_c0",
+                        "kind": "hard",
+                        "artifact": "missing work",
+                    }],
+                },
+            }
+
+    root = AgentState(
+        "A0", None, "solve", "solver", ContextState("task"), MemoryState("memory/A0"),
+        [], ResultState(candidate_answer="root"), AgentStatus.DONE, "answer", "done",
+    )
+    llm = BrokenDependencyLLM()
+    graph = WorkerModel(llm).propose_candidates(  # type: ignore[arg-type]
+        root, round_index=0, max_candidates=2,
+    )
+    assert list(graph.nodes) == ["r0_A0_c0"]
+    assert graph.dependencies == []
+    assert llm.response_schema["properties"]["candidate_dependency_graph"]["properties"][
+        "nodes"
+    ]["maxItems"] == 2
 
 
 def test_semantic_landscape_repairs_zero_gain_for_explicit_contradiction() -> None:

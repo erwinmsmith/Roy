@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 import time
@@ -42,6 +43,8 @@ class Completion:
 
 
 class DeepSeekClient:
+    supports_json_schema = False
+
     def __init__(
         self,
         ledger: PersistentTokenLedger,
@@ -78,6 +81,7 @@ class DeepSeekClient:
         metadata: Dict[str, Any] | None = None,
         json_mode: bool = False,
         thinking: str | None = None,
+        response_schema: Dict[str, Any] | None = None,
     ) -> Completion:
         # UTF-8 bytes are a conservative upper bound for ordinary tokenizer input
         # units; reserve before dispatch so concurrent callers cannot cross the cap.
@@ -221,6 +225,8 @@ class DeepSeekClient:
 class OpenAICompatibleClient:
     """Ledgered client for any endpoint implementing OpenAI chat completions."""
 
+    supports_json_schema = True
+
     def __init__(
         self,
         ledger: PersistentTokenLedger,
@@ -234,6 +240,8 @@ class OpenAICompatibleClient:
         retry_base_seconds: float = 2.0,
         retry_max_seconds: float = 30.0,
         max_output_tokens: int | None = None,
+        context_window_tokens: int | None = None,
+        context_safety_tokens: int = 1024,
         sdk_client: Any | None = None,
     ) -> None:
         if not model.strip():
@@ -248,6 +256,15 @@ class OpenAICompatibleClient:
             raise ValueError("provider retry delays cannot be negative")
         if max_output_tokens is not None and max_output_tokens < 1:
             raise ValueError("max_output_tokens must be positive")
+        if context_window_tokens is not None and context_window_tokens < 1:
+            raise ValueError("context_window_tokens must be positive")
+        if context_safety_tokens < 0:
+            raise ValueError("context_safety_tokens cannot be negative")
+        if (
+            context_window_tokens is not None
+            and context_safety_tokens >= context_window_tokens
+        ):
+            raise ValueError("context_safety_tokens must be smaller than context_window_tokens")
         api_key = os.environ.get(api_key_env)
         if not api_key:
             raise RuntimeError(f"{api_key_env} is not configured")
@@ -261,6 +278,8 @@ class OpenAICompatibleClient:
         self.retry_base_seconds = retry_base_seconds
         self.retry_max_seconds = retry_max_seconds
         self.max_output_tokens = max_output_tokens
+        self.context_window_tokens = context_window_tokens
+        self.context_safety_tokens = context_safety_tokens
         self.event_lock = Lock()
         self.client = sdk_client or OpenAI(
             api_key=api_key,
@@ -277,9 +296,32 @@ class OpenAICompatibleClient:
         metadata: Dict[str, Any] | None = None,
         json_mode: bool = False,
         thinking: str | None = None,
+        response_schema: Dict[str, Any] | None = None,
     ) -> Completion:
         requested_max_tokens = max_tokens
         max_tokens = min(max_tokens, self.max_output_tokens or max_tokens)
+        # The provider does not expose its tokenizer locally. UTF-8 bytes / 2 is
+        # deliberately conservative for the mostly-English prompts used by the
+        # benchmark while avoiding the unusable bytes==tokens upper bound.
+        estimated_prompt_tokens = max(
+            1,
+            math.ceil(
+                sum(len(message["content"].encode("utf-8")) for message in messages) / 2
+            ),
+        )
+        if self.context_window_tokens is not None:
+            available_output = (
+                self.context_window_tokens
+                - self.context_safety_tokens
+                - estimated_prompt_tokens
+            )
+            if available_output < 1:
+                raise ValueError(
+                    "estimated prompt exceeds the configured provider context window "
+                    f"({estimated_prompt_tokens}+{self.context_safety_tokens} >= "
+                    f"{self.context_window_tokens})"
+                )
+            max_tokens = min(max_tokens, available_output)
         prompt_reserve = max(
             1,
             sum(len(message["content"].encode("utf-8")) for message in messages) + 1024,
@@ -297,7 +339,16 @@ class OpenAICompatibleClient:
             # clients or transports that override the client's default.
             "timeout": self.timeout,
         }
-        if json_mode:
+        if response_schema is not None:
+            request_value["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": _json_schema_name(str((metadata or {}).get("purpose", "roy_response"))),
+                    "strict": True,
+                    "schema": response_schema,
+                },
+            }
+        elif json_mode:
             request_value["response_format"] = {"type": "json_object"}
         # `thinking` is a Roy execution hint. It is intentionally not forwarded
         # as a vendor-specific request field on a generic OpenAI endpoint.
@@ -331,6 +382,10 @@ class OpenAICompatibleClient:
                     "base_url": self.base_url,
                     "request": request_value,
                     "requested_max_tokens": requested_max_tokens,
+                    "applied_max_tokens": max_tokens,
+                    "estimated_prompt_tokens": estimated_prompt_tokens,
+                    "context_window_tokens": self.context_window_tokens,
+                    "context_safety_tokens": self.context_safety_tokens,
                     "requested_thinking": thinking,
                     "response": raw,
                     "reservation": reservation,
@@ -363,6 +418,10 @@ class OpenAICompatibleClient:
                     "base_url": self.base_url,
                     "request": request_value,
                     "requested_max_tokens": requested_max_tokens,
+                    "applied_max_tokens": max_tokens,
+                    "estimated_prompt_tokens": estimated_prompt_tokens,
+                    "context_window_tokens": self.context_window_tokens,
+                    "context_safety_tokens": self.context_safety_tokens,
                     "requested_thinking": thinking,
                     "reservation": reservation,
                     "latency_ms": int((time.monotonic() - started) * 1000),
@@ -411,3 +470,9 @@ class OpenAICompatibleClient:
         if self.event_log is not None:
             with self.event_lock:
                 write_jsonl(self.event_log, [event], append=self.event_log.exists())
+
+
+def _json_schema_name(value: str) -> str:
+    normalized = "".join(character if character.isalnum() else "_" for character in value)
+    normalized = normalized.strip("_") or "roy_response"
+    return normalized[:64]

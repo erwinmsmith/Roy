@@ -57,7 +57,12 @@ from .lhtb_training import LHTBProcessGRPOTrainer
 from .lhtb_value_metrics import annotate_value_traces, value_metrics
 from .live_controlled import collect_forced_full_mas, collect_live_group
 from .organization import LHTB_POLICY_INTERFACE_REVISION, RuntimeBudget
-from .providers import DeepSeekClient, OpenAICompatibleClient, ProviderCircuitOpenError
+from .providers import (
+    DeepSeekClient,
+    OpenAICompatibleClient,
+    ProviderCircuitOpenError,
+    ProviderRetryExhaustedError,
+)
 from .reporting import write_utility_svg
 from .schema import TraceRecord
 from .tau3 import build_tau3_manifest, manifest_summary, verify_tau3_root
@@ -207,8 +212,8 @@ def parser() -> argparse.ArgumentParser:
     training_free.add_argument(
         "--resume", action="store_true",
         help=(
-            "Skip task ids already present, or restore the exact completed prefix and state "
-            "for roy_continual"
+            "Skip task ids whose latest row is completed and retry failed/deferred rows, or "
+            "restore the exact completed prefix and state for roy_continual"
         ),
     )
     training_free.add_argument(
@@ -239,6 +244,17 @@ def parser() -> argparse.ArgumentParser:
     training_free.add_argument(
         "--provider-max-output-tokens", type=int,
         help="Clamp each OpenAI-compatible request to the provider's output-token limit",
+    )
+    training_free.add_argument(
+        "--provider-context-window-tokens", type=int,
+        help=(
+            "OpenAI-compatible total context window; output is dynamically clamped after a "
+            "conservative prompt-token estimate"
+        ),
+    )
+    training_free.add_argument(
+        "--provider-context-safety-tokens", type=int, default=1024,
+        help="Safety margin retained inside --provider-context-window-tokens",
     )
     training_free.add_argument("--worker-model", default="deepseek-v4-flash")
     training_free.add_argument(
@@ -606,6 +622,16 @@ def _failed_task_ids(paths: List[Path], output: Path) -> set[str]:
     return {task_id for task_id, status in latest_status.items() if status == "failed"}
 
 
+def _completed_task_ids(path: Path) -> set[str]:
+    """Return only latest completed rows so --resume replays failed/deferred work."""
+    latest_status: Dict[str, str] = {}
+    if path.exists():
+        for row in read_jsonl(path):
+            if row.get("task_id"):
+                latest_status[str(row["task_id"])] = str(row.get("run_status", ""))
+    return {task_id for task_id, status in latest_status.items() if status == "completed"}
+
+
 def _restore_continual_state(
     output: Path,
     tasks: List[Any],
@@ -657,6 +683,10 @@ def _training_free_client(
             raise ValueError(
                 "--provider-max-output-tokens is only valid with --provider openai-compatible"
             )
+        if args.provider_context_window_tokens is not None:
+            raise ValueError(
+                "--provider-context-window-tokens is only valid with --provider openai-compatible"
+            )
         return DeepSeekClient(ledger, **common)
     if not args.base_url:
         raise ValueError("--base-url is required with --provider openai-compatible")
@@ -665,6 +695,8 @@ def _training_free_client(
         base_url=args.base_url,
         api_key_env=args.api_key_env,
         max_output_tokens=args.provider_max_output_tokens,
+        context_window_tokens=args.provider_context_window_tokens,
+        context_safety_tokens=args.provider_context_safety_tokens,
         **common,
     )
 
@@ -1167,9 +1199,7 @@ def main(argv: List[str] | None = None) -> None:
             completed_task_ids = {task.task_id for task in tasks[:completed_count]}
             tasks = tasks[completed_count:]
         elif args.resume and args.output.exists():
-            completed_task_ids = {
-                str(row.get("task_id", "")) for row in read_jsonl(args.output)
-            }
+            completed_task_ids = _completed_task_ids(args.output)
             tasks = [task for task in tasks if task.task_id not in completed_task_ids]
         ledger = PersistentTokenLedger(args.ledger, args.token_limit)
         worker_client = _training_free_client(args, ledger, model=args.worker_model)
@@ -1205,6 +1235,7 @@ def main(argv: List[str] | None = None) -> None:
         if args.macos_readonly_tool_sandbox and not tool_sandbox_prefix:
             raise RuntimeError("the built-in macOS sandbox is unavailable on this host")
         append_output = args.resume and args.output.exists()
+        provider_deferred = False
         for task_index, task in enumerate(tasks):
             failed_attempts = []
             attempt_tokens = 0
@@ -1292,6 +1323,16 @@ def main(argv: List[str] | None = None) -> None:
                         # Evaluator output is deliberately not passed to this state.
                         continual_state = next_continual_state
                     break
+                except ProviderRetryExhaustedError as error:
+                    attempt_tokens += engine.audit.to_dict()["total_tokens"]
+                    failed_attempts.append({
+                        "attempt": attempt,
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                        "tokens": engine.audit.to_dict()["total_tokens"],
+                    })
+                    provider_deferred = True
+                    break
                 except ProviderCircuitOpenError:
                     # Persistent provider outages are shard-level failures. Do not
                     # turn every remaining task into a synthetic zero-score row.
@@ -1329,8 +1370,16 @@ def main(argv: List[str] | None = None) -> None:
                     "final_matrix": None,
                     "failed_attempts": failed_attempts,
                     "all_attempts_total_tokens": attempt_tokens,
-                    "evaluation": {"score": 0.0, "failure": "task_execution_failed"},
+                    "evaluation": {
+                        "score": 0.0,
+                        "failure": (
+                            "provider_temporarily_unavailable"
+                            if provider_deferred else "task_execution_failed"
+                        ),
+                    },
                 }
+                if provider_deferred:
+                    row["retryable"] = True
                 if args.arm == "roy_continual":
                     row.update({
                         "continual_sequence_index": sequence_index,
@@ -1356,6 +1405,15 @@ def main(argv: List[str] | None = None) -> None:
                 print(json.dumps({
                     "continual_episode_halted": True,
                     "reason": "a missing item transition would invalidate later path dependence",
+                }), flush=True)
+                break
+            if provider_deferred:
+                print(json.dumps({
+                    "provider_deferred": True,
+                    "reason": (
+                        "transient provider retries were exhausted; checkpoint written and "
+                        "--resume will retry this task"
+                    ),
                 }), flush=True)
                 break
         print(json.dumps({

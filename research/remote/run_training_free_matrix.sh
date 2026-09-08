@@ -65,6 +65,12 @@ if [[ "${provider}" == "openai-compatible" ]]; then
   if [[ -n "${ROY_TF_PROVIDER_MAX_OUTPUT_TOKENS:-}" ]]; then
     provider_args+=(--provider-max-output-tokens "${ROY_TF_PROVIDER_MAX_OUTPUT_TOKENS}")
   fi
+  if [[ -n "${ROY_TF_PROVIDER_CONTEXT_WINDOW_TOKENS:-}" ]]; then
+    provider_args+=(
+      --provider-context-window-tokens "${ROY_TF_PROVIDER_CONTEXT_WINDOW_TOKENS}"
+      --provider-context-safety-tokens "${ROY_TF_PROVIDER_CONTEXT_SAFETY_TOKENS:-1024}"
+    )
+  fi
 fi
 common=(
   --aflow-root "${aflow_root}"

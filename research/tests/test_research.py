@@ -368,6 +368,53 @@ class RuntimeBoundaryTests(unittest.TestCase):
             self.assertEqual(event["request"]["timeout"], 1800)
             self.assertEqual(event["base_url"], "https://example.invalid/v1")
 
+    def test_openai_compatible_client_enforces_schema_and_context_window(self) -> None:
+        class Response:
+            def model_dump(self, mode="python"):
+                return {
+                    "choices": [{"message": {"content": '{"ok":true}'}, "finish_reason": "stop"}],
+                    "usage": {
+                        "prompt_tokens": 500, "completion_tokens": 4, "total_tokens": 504,
+                    },
+                }
+
+        calls = []
+        sdk = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+            create=lambda **kwargs: calls.append(kwargs) or Response(),
+        )))
+        schema = {
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+            "additionalProperties": False,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = PersistentTokenLedger(Path(directory) / "ledger.json", limit=10_000)
+            with patch.dict(os.environ, {"TEST_OPENAI_KEY": "test-key"}, clear=True):
+                client = OpenAICompatibleClient(
+                    ledger,
+                    model="qwen-compatible",
+                    base_url="https://example.invalid/v1",
+                    api_key_env="TEST_OPENAI_KEY",
+                    max_output_tokens=16_384,
+                    context_window_tokens=2_048,
+                    context_safety_tokens=256,
+                    sdk_client=sdk,
+                )
+            client.complete(
+                [{"role": "user", "content": "x" * 2_000}],
+                max_tokens=16_384,
+                json_mode=True,
+                response_schema=schema,
+                metadata={"purpose": "semantic-information/judge"},
+            )
+        self.assertEqual(calls[0]["max_tokens"], 792)
+        response_format = calls[0]["response_format"]
+        self.assertEqual(response_format["type"], "json_schema")
+        self.assertEqual(response_format["json_schema"]["name"], "semantic_information_judge")
+        self.assertTrue(response_format["json_schema"]["strict"])
+        self.assertEqual(response_format["json_schema"]["schema"], schema)
+
 
 class LiveRolloutTests(unittest.TestCase):
     class FakeClient:

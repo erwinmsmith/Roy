@@ -39,6 +39,7 @@ class CompletionClient(Protocol):
         metadata: Dict[str, Any] | None = None,
         json_mode: bool = False,
         thinking: str | None = None,
+        response_schema: Dict[str, Any] | None = None,
     ) -> CompletionLike: ...
 
 
@@ -77,23 +78,36 @@ class JsonLLM:
         max_tokens: int,
         temperature: float = 0.0,
         thinking: str | None = "disabled",
+        response_schema: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False, sort_keys=True)},
         ]
+        completion_kwargs: Dict[str, Any] = {
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "metadata": {"purpose": purpose},
+            "json_mode": True,
+            "thinking": thinking,
+        }
+        if response_schema is not None and getattr(
+            self.client, "supports_json_schema", False,
+        ):
+            completion_kwargs["response_schema"] = response_schema
         completion = self.client.complete(
             messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            metadata={"purpose": purpose},
-            json_mode=True,
-            thinking=thinking,
+            **completion_kwargs,
         )
         self.audit.record(purpose, completion)
         if not completion.content.strip():
             retry_purpose = f"{purpose}_empty_retry"
             retry_thinking = "disabled" if thinking == "enabled" else thinking
+            retry_kwargs = dict(completion_kwargs)
+            retry_kwargs.update({
+                "metadata": {"purpose": retry_purpose},
+                "thinking": retry_thinking,
+            })
             retry = self.client.complete(
                 [
                     {
@@ -106,11 +120,7 @@ class JsonLLM:
                     },
                     {"role": "user", "content": messages[1]["content"]},
                 ],
-                max_tokens=max_tokens,
-                temperature=temperature,
-                metadata={"purpose": retry_purpose},
-                json_mode=True,
-                thinking=retry_thinking,
+                **retry_kwargs,
             )
             self.audit.record(retry_purpose, retry)
             if not retry.content.strip():
@@ -139,6 +149,11 @@ class JsonLLM:
                     ),
                 },
             }
+            retry_kwargs = dict(completion_kwargs)
+            retry_kwargs.update({
+                "metadata": {"purpose": retry_purpose},
+                "thinking": retry_thinking,
+            })
             retry = self.client.complete(
                 [
                     {
@@ -150,11 +165,7 @@ class JsonLLM:
                         "content": json.dumps(retry_payload, ensure_ascii=False, sort_keys=True),
                     },
                 ],
-                max_tokens=max_tokens,
-                temperature=temperature,
-                metadata={"purpose": retry_purpose},
-                json_mode=True,
-                thinking=retry_thinking,
+                **retry_kwargs,
             )
             self.audit.record(retry_purpose, retry)
             if not retry.content.strip():
@@ -163,6 +174,112 @@ class JsonLLM:
                     "completion tokens"
                 ) from error
             return parse_json_object(retry.content)
+
+
+def _strict_object(properties: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": dict(properties),
+        "required": list(properties),
+        "additionalProperties": False,
+    }
+
+
+def _string_array(*, maximum: int | None = None) -> Dict[str, Any]:
+    value: Dict[str, Any] = {"type": "array", "items": {"type": "string"}}
+    if maximum is not None:
+        value["maxItems"] = maximum
+    return value
+
+
+def _fixed_array(item: Mapping[str, Any], size: int) -> Dict[str, Any]:
+    return {
+        "type": "array", "items": dict(item), "minItems": size, "maxItems": size,
+    }
+
+
+def _unit_number_schema() -> Dict[str, Any]:
+    return {"type": "number", "minimum": 0.0, "maximum": 1.0}
+
+
+def _reconciliation_schema() -> Dict[str, Any]:
+    return _strict_object({
+        "candidate_answer": {"type": "string"},
+        "verdict": {"type": "string", "enum": ["consistent", "corrected", "ambiguous"]},
+        "basis": {"type": "string"},
+    })
+
+
+def _candidate_graph_schema(maximum_candidates: int) -> Dict[str, Any]:
+    node = _strict_object({
+        "candidate_id": {"type": "string"},
+        "parent_id": {"type": "string"},
+        "epistemic_operation": {
+            "type": "string",
+            "enum": [
+                "independent_reconstruction", "specification_audit",
+                "adversarial_falsification", "targeted_gap",
+            ],
+        },
+        "direction": {"type": "string"},
+        "why_needed": {"type": "string"},
+        "required_inputs": _string_array(),
+        "requested_tools": _string_array(),
+        "expected_output": {"type": "string"},
+        "stop_condition": {"type": "string"},
+    })
+    dependency = _strict_object({
+        "source": {"type": "string"},
+        "target": {"type": "string"},
+        "kind": {"type": "string", "enum": ["hard", "soft"]},
+        "artifact": {"type": "string"},
+    })
+    return _strict_object({
+        "candidate_dependency_graph": _strict_object({
+            "nodes": {
+                "type": "array", "items": node, "maxItems": maximum_candidates,
+            },
+            "dependencies": {"type": "array", "items": dependency},
+        }),
+    })
+
+
+def _semantic_landscape_schema(
+    agent_ids: List[str], precision_dimensions: int, root_id: str,
+) -> Dict[str, Any]:
+    size = len(agent_ids)
+    unit = _unit_number_schema()
+    row = _fixed_array(unit, size)
+    relations = _strict_object({
+        agent_id: ({"type": "string", "enum": ["supports"]} if agent_id == root_id else {
+            "type": "string",
+            "enum": ["supports", "contradicts", "complements", "unresolved"],
+        })
+        for agent_id in agent_ids
+    })
+    properties: Dict[str, Any] = {
+        "directional_potential": _fixed_array(row, size),
+        "redundancy": _fixed_array(row, size),
+        "conversion_fidelity": _fixed_array(unit, size),
+        "root_relations": relations,
+        "root_uncertainty": unit,
+        "calibration_summary": {"type": "string"},
+    }
+    if precision_dimensions:
+        vector = _fixed_array(unit, precision_dimensions)
+        properties.update({
+            "task_dimensions": {
+                **_fixed_array({"type": "string"}, precision_dimensions),
+            },
+            "observation_vectors": _strict_object({
+                agent_id: vector for agent_id in agent_ids
+            }),
+            "observation_noise": _strict_object({
+                agent_id: unit for agent_id in agent_ids
+            }),
+            "root_dimension_uncertainty": vector,
+        })
+    return _strict_object(properties)
 
 
 class WorkerModel:
@@ -401,10 +518,27 @@ discovering a shared mistake. Return exactly one JSON object."""
                 },
             },
             max_tokens=self.max_tokens,
+            response_schema=_candidate_graph_schema(max_candidates),
         )
-        graph = CandidateGraph.from_dict(
-            value.get("candidate_dependency_graph", {}), agent.agent_id,
-        )
+        raw_graph = dict(value.get("candidate_dependency_graph", {}))
+        raw_nodes = list(raw_graph.get("nodes", []))
+        node_ids = {
+            str(node.get("candidate_id", "")) for node in raw_nodes
+            if isinstance(node, Mapping)
+        }
+        # References to candidates that were never emitted carry no executable
+        # artifact. Remove them deterministically instead of rerunning the whole
+        # task with the same prompt and receiving the same broken reference.
+        raw_graph["dependencies"] = [
+            dependency for dependency in raw_graph.get("dependencies", [])
+            if isinstance(dependency, Mapping)
+            and str(dependency.get("target", "")) in node_ids
+            and (
+                str(dependency.get("source", "")) in node_ids
+                or str(dependency.get("source", "")) == agent.agent_id
+            )
+        ]
+        graph = CandidateGraph.from_dict(raw_graph, agent.agent_id)
         if len(graph.nodes) > max_candidates:
             raise ValueError(
                 f"Worker proposed {len(graph.nodes)} candidates; maximum is {max_candidates}"
@@ -596,6 +730,7 @@ discovering a shared mistake. Return exactly one JSON object."""
             self.RECONCILE_SYSTEM,
             payload,
             max_tokens=self.result_reconciler_max_tokens,
+            response_schema=_reconciliation_schema(),
         )
         try:
             return self._apply_reconciled_result(result, reconciled)
@@ -612,6 +747,7 @@ discovering a shared mistake. Return exactly one JSON object."""
                     "prior_contract_error": str(first_error),
                 },
                 max_tokens=max(512, self.result_reconciler_max_tokens),
+                response_schema=_reconciliation_schema(),
             )
             try:
                 return self._apply_reconciled_result(result, repaired)
@@ -1096,35 +1232,60 @@ or execute a candidate matrix."""
                     "same order as task_dimensions"
                 ),
             })
+        payload = {
+            "benchmark": benchmark,
+            "root_id": root_id,
+            "estimation_mode": (
+                "prospective_fixed_x" if prospective else "executed_state"
+            ),
+            "agent_ids": agent_ids,
+            "current_agent_states": {
+                agent_id: AgentHarness(agent).execution_view()
+                for agent_id, agent in agents.items()
+            },
+            "current_state_context": dict(state_context or {}),
+            "required_schema": required_schema,
+        }
+        response_schema = _semantic_landscape_schema(
+            agent_ids, self.precision_dimensions, root_id,
+        )
         value = self.llm.call(
             "semantic_information_judge",
             self.SYSTEM
             + (self.PRECISION_SYSTEM if self.precision_dimensions else "")
             + (self.PROSPECTIVE_SYSTEM if prospective else ""),
-            {
-                "benchmark": benchmark,
-                "root_id": root_id,
-                "estimation_mode": (
-                    "prospective_fixed_x" if prospective else "executed_state"
-                ),
-                "agent_ids": agent_ids,
-                "current_agent_states": {
-                    agent_id: AgentHarness(agent).execution_view()
-                    for agent_id, agent in agents.items()
-                },
-                "current_state_context": dict(state_context or {}),
-                "required_schema": required_schema,
-            },
+            payload,
             max_tokens=self.max_tokens,
+            response_schema=response_schema,
         )
         # Agent identity and ordering belong to the runtime contract, not the
         # model's semantic estimate. This also avoids failing an expensive task
         # when a model omits or inaccurately echoes the supplied IDs.
         value["agent_ids"] = agent_ids
-        return SemanticInformationLandscape.from_dict(
-            value, expected_agent_ids=agent_ids, root_id=root_id,
-            precision_dimensions=self.precision_dimensions,
-        )
+        try:
+            return SemanticInformationLandscape.from_dict(
+                value, expected_agent_ids=agent_ids, root_id=root_id,
+                precision_dimensions=self.precision_dimensions,
+            )
+        except (TypeError, ValueError) as first_error:
+            repaired = self.llm.call(
+                "semantic_information_judge_contract_retry",
+                self.SYSTEM
+                + (self.PRECISION_SYSTEM if self.precision_dimensions else "")
+                + (self.PROSPECTIVE_SYSTEM if prospective else "")
+                + "\nThe prior response violated the runtime contract. Regenerate every field.",
+                {
+                    **payload,
+                    "prior_contract_error": str(first_error),
+                },
+                max_tokens=self.max_tokens,
+                response_schema=response_schema,
+            )
+            repaired["agent_ids"] = agent_ids
+            return SemanticInformationLandscape.from_dict(
+                repaired, expected_agent_ids=agent_ids, root_id=root_id,
+                precision_dimensions=self.precision_dimensions,
+            )
 
 
 class ChannelizerModel:
