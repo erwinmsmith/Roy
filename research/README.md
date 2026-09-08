@@ -489,6 +489,9 @@ dynamically clamps output against the configured total context window, and does 
 forward vendor-specific `thinking` fields. A transient provider retry exhaustion is
 checkpointed as retryable; `--resume` retries that task instead of treating its failed
 row as completed.
+
+Set `ROY_TF_CONCURRENCY=3` on `run_training_free_matrix.sh` to keep at most three
+matrix jobs active while queuing the remaining benchmark/method combinations.
 The example output limit and request timeout reflect the currently configured
 Qwen 3.5 endpoint; set both flags to the capabilities of a different provider.
 

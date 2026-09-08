@@ -96,6 +96,23 @@ he_sandbox="${ROY_TF_HE_SANDBOX:-env -i PATH=/usr/bin PYTHONPATH=${aflow_root}/.
 pids_tmp="${run_root}/pids.tsv.tmp"
 : > "${pids_tmp}"
 serial="${ROY_TF_SERIAL:-false}"
+concurrency="${ROY_TF_CONCURRENCY:-0}"
+[[ "${concurrency}" =~ ^[0-9]+$ ]] || {
+  echo "ROY_TF_CONCURRENCY must be zero (unlimited) or a positive integer" >&2
+  exit 2
+}
+
+throttle() {
+  local oldest_pid
+  if [[ "${serial}" == "true" || "${concurrency}" == "0" ]]; then
+    return
+  fi
+  while (( $(jobs -pr | wc -l) >= concurrency )); do
+    oldest_pid="$(jobs -pr | head -n 1)"
+    [[ -n "${oldest_pid}" ]] || break
+    wait "${oldest_pid}" || true
+  done
+}
 
 launch() {
   local name="$1" config="$2" benchmark="$3" arm="$4" token_limit="$5"
@@ -126,6 +143,7 @@ launch() {
     fi
     printf '%s\t%s\n' "${name}" "exit=${status}" | tee -a "${pids_tmp}"
   else
+    throttle
     if [[ "${resume}" == "true" ]]; then
       nohup "${command[@]}" >> "${run_root}/${name}.log" 2>&1 &
     else
