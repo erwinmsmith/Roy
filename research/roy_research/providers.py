@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Mapping
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 
@@ -398,10 +398,23 @@ class OpenAICompatibleClient:
             except Exception as error:
                 last_error = error
                 status = error.status_code if isinstance(error, APIStatusError) else None
-                rejected_before_completion = status in {400, 401, 402, 403, 404, 422, 429}
+                provider_error = _api_error_details(error)
+                reported_usage = provider_error.get("usage")
+                charged = provider_error.get("charged")
+                rejected_before_completion = (
+                    status in {400, 401, 402, 403, 404, 422, 429}
+                    or charged is False
+                )
                 if not settled:
                     if rejected_before_completion:
                         self.ledger.release(reservation)
+                    elif isinstance(reported_usage, Mapping) and reported_usage.get(
+                        "total_tokens"
+                    ) is not None:
+                        self.ledger.settle(
+                            reservation,
+                            min(int(reported_usage["total_tokens"]), reservation),
+                        )
                     else:
                         self.ledger.settle(reservation, reservation)
                 retryable = (
@@ -432,6 +445,12 @@ class OpenAICompatibleClient:
                     "retryable": retryable,
                     "error_type": type(error).__name__,
                     "error": str(error),
+                    "provider_request_id": provider_error.get("request_id"),
+                    "provider_stage": provider_error.get("stage"),
+                    "provider_retry_after": provider_error.get("retry_after"),
+                    "provider_charged": charged,
+                    "provider_usage": reported_usage,
+                    "provider_usage_source": provider_error.get("usage_source"),
                 })
                 if status == 402:
                     raise ProviderPaymentRequiredError(
@@ -460,6 +479,12 @@ class OpenAICompatibleClient:
                 retry_after = float(value) if value is not None else 0.0
             except ValueError:
                 retry_after = 0.0
+        if retry_after <= 0:
+            value = _api_error_details(error).get("retry_after")
+            try:
+                retry_after = float(value) if value is not None else 0.0
+            except (TypeError, ValueError):
+                retry_after = 0.0
         exponential = min(
             self.retry_max_seconds,
             self.retry_base_seconds * (2 ** attempt),
@@ -476,3 +501,13 @@ def _json_schema_name(value: str) -> str:
     normalized = "".join(character if character.isalnum() else "_" for character in value)
     normalized = normalized.strip("_") or "roy_response"
     return normalized[:64]
+
+
+def _api_error_details(error: Exception) -> Dict[str, Any]:
+    if not isinstance(error, APIStatusError):
+        return {}
+    body = getattr(error, "body", None)
+    if not isinstance(body, Mapping):
+        return {}
+    nested = body.get("error", body)
+    return dict(nested) if isinstance(nested, Mapping) else {}

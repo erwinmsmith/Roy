@@ -10,6 +10,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+import httpx
+from openai import InternalServerError
 
 from roy_research.analysis import paired_bootstrap_interval
 from roy_research.baselines import evaluate_controlled_arms
@@ -414,6 +416,71 @@ class RuntimeBoundaryTests(unittest.TestCase):
         self.assertEqual(response_format["json_schema"]["name"], "semantic_information_judge")
         self.assertTrue(response_format["json_schema"]["strict"])
         self.assertEqual(response_format["json_schema"]["schema"], schema)
+
+    def test_openai_compatible_client_honors_provider_retry_and_charge_metadata(self) -> None:
+        class Response:
+            def model_dump(self, mode="python"):
+                return {
+                    "choices": [{"message": {"content": "ok"}}],
+                    "usage": {
+                        "prompt_tokens": 7, "completion_tokens": 4, "total_tokens": 11,
+                    },
+                }
+
+        provider_error = InternalServerError(
+            "unavailable",
+            response=httpx.Response(
+                503,
+                request=httpx.Request("POST", "https://example.invalid/v1/chat/completions"),
+            ),
+            body={
+                "error": {
+                    "code": "ECONNRESET",
+                    "request_id": "provider-request-1",
+                    "stage": "validation",
+                    "retryable": True,
+                    "retry_after": 10,
+                    "usage": None,
+                    "usage_source": "not_reported",
+                    "charged": False,
+                },
+            },
+        )
+        calls = []
+
+        def create(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise provider_error
+            return Response()
+
+        sdk = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = PersistentTokenLedger(Path(directory) / "ledger.json", limit=10_000)
+            events = Path(directory) / "events.jsonl"
+            with patch.dict(os.environ, {"TEST_OPENAI_KEY": "test-key"}, clear=True):
+                client = OpenAICompatibleClient(
+                    ledger,
+                    model="qwen-compatible",
+                    base_url="https://example.invalid/v1",
+                    api_key_env="TEST_OPENAI_KEY",
+                    event_log=events,
+                    max_retries=1,
+                    retry_base_seconds=0,
+                    retry_max_seconds=0,
+                    sdk_client=sdk,
+                )
+            with patch("roy_research.providers.time.sleep") as slept:
+                completion = client.complete(
+                    [{"role": "user", "content": "status"}], max_tokens=64,
+                )
+            self.assertEqual(completion.total_tokens, 11)
+            self.assertEqual(ledger.snapshot()["used"], 11)
+            slept.assert_called_once_with(10.0)
+            failed_event = json.loads(events.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(failed_event["provider_request_id"], "provider-request-1")
+            self.assertEqual(failed_event["provider_stage"], "validation")
+            self.assertFalse(failed_event["provider_charged"])
 
 
 class LiveRolloutTests(unittest.TestCase):
