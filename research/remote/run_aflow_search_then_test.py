@@ -137,8 +137,22 @@ class AuditedEvaluationUtils:
             name=self.benchmark, llm_config=_EXEC_CONFIG, dataset=self.benchmark,
         )
         previous = list(read_jsonl(output)) if resume and output.exists() else []
-        completed = {str(row["task_id"]): row for row in previous}
-        scores = [float(row.get("evaluation", {}).get("score", 0.0)) for row in previous]
+        latest: dict[str, dict[str, Any]] = {}
+        for row in previous:
+            task_id = str(row.get("task_id", ""))
+            if task_id:
+                latest[task_id] = row
+        # A provider outage can leave a failed row for every remaining test item.
+        # Failed rows are attempts, not completed work: retry them on resume and do
+        # not dilute the resumed score with superseded failures.
+        completed = {
+            task_id: row for task_id, row in latest.items()
+            if row.get("run_status") == "completed"
+        }
+        scores = [
+            float(row.get("evaluation", {}).get("score", 0.0))
+            for row in completed.values()
+        ]
         mismatches: list[dict[str, Any]] = []
         for task in tasks:
             if task.task_id in completed:
