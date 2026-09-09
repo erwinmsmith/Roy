@@ -15,6 +15,8 @@ wait_for_pid="${ROY_TF_WAIT_FOR_PID:-}"
 wait_seconds="${ROY_TF_WAIT_SECONDS:-30}"
 resume="${ROY_TF_RESUME:-false}"
 include_continual="${ROY_TF_INCLUDE_CONTINUAL:-false}"
+selected_runs="${ROY_TF_RUNS:-}"
+existing_job_pids="${ROY_TF_EXISTING_JOB_PIDS:-}"
 auto_resume="${ROY_TF_AUTO_RESUME:-false}"
 auto_resume_delay="${ROY_TF_AUTO_RESUME_DELAY_SECONDS:-60}"
 auto_resume_max_delay="${ROY_TF_AUTO_RESUME_MAX_DELAY_SECONDS:-900}"
@@ -41,6 +43,18 @@ fi
   echo "ROY_TF_INCLUDE_CONTINUAL must be true or false" >&2
   exit 2
 }
+for requested_run in ${selected_runs//,/ }; do
+  case "${requested_run}" in
+    direct-math|direct-humaneval|scalar-math|scalar-humaneval|logdet-math|logdet-humaneval|continual-logdet-math|continual-logdet-humaneval) ;;
+    *) echo "unknown ROY_TF_RUNS entry: ${requested_run}" >&2; exit 2 ;;
+  esac
+done
+for existing_pid in ${existing_job_pids}; do
+  [[ "${existing_pid}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "ROY_TF_EXISTING_JOB_PIDS must contain positive process ids" >&2
+    exit 2
+  }
+done
 [[ "${auto_resume}" == "true" || "${auto_resume}" == "false" ]] || {
   echo "ROY_TF_AUTO_RESUME must be true or false" >&2
   exit 2
@@ -146,12 +160,28 @@ throttle() {
   if [[ "${serial}" == "true" || "${concurrency}" == "0" ]]; then
     return
   fi
-  while (( $(jobs -pr | wc -l) >= concurrency )); do
+  while (( $(active_job_count) >= concurrency )); do
     # Waiting for a particular oldest PID underutilizes the pool when a newer
     # job finishes first. Poll the active job set so any free slot advances the
     # queue, while keeping this portable to Bash versions without `wait -n`.
     sleep "${throttle_poll_seconds}"
   done
+}
+
+active_job_count() {
+  local count=0 existing_pid
+  count="$(jobs -pr | wc -l)"
+  for existing_pid in ${existing_job_pids}; do
+    if kill -0 "${existing_pid}" 2>/dev/null; then
+      count=$(( count + 1 ))
+    fi
+  done
+  echo "${count}"
+}
+
+run_selected() {
+  local name="$1"
+  [[ -z "${selected_runs}" || ",${selected_runs}," == *",${name},"* ]]
 }
 
 launch() {
@@ -212,23 +242,39 @@ launch() {
   fi
 }
 
-launch direct-math research/config/training_free_v1.json MATH single_agent_direct \
-  "${ROY_TF_DIRECT_TOKEN_LIMIT:-3000000}"
-launch direct-humaneval research/config/training_free_v1.json HumanEval single_agent_direct \
-  "${ROY_TF_DIRECT_TOKEN_LIMIT:-3000000}"
-launch scalar-math research/config/training_free_v1.json MATH roy \
-  "${ROY_TF_ROY_TOKEN_LIMIT:-10000000}"
-launch scalar-humaneval research/config/training_free_v1.json HumanEval roy \
-  "${ROY_TF_ROY_TOKEN_LIMIT:-10000000}"
-launch logdet-math research/config/training_free_logdet_v1.json MATH roy \
-  "${ROY_TF_ROY_TOKEN_LIMIT:-10000000}"
-launch logdet-humaneval research/config/training_free_logdet_v1.json HumanEval roy \
-  "${ROY_TF_ROY_TOKEN_LIMIT:-10000000}"
+if run_selected direct-math; then
+  launch direct-math research/config/training_free_v1.json MATH single_agent_direct \
+    "${ROY_TF_DIRECT_TOKEN_LIMIT:-3000000}"
+fi
+if run_selected direct-humaneval; then
+  launch direct-humaneval research/config/training_free_v1.json HumanEval single_agent_direct \
+    "${ROY_TF_DIRECT_TOKEN_LIMIT:-3000000}"
+fi
+if run_selected scalar-math; then
+  launch scalar-math research/config/training_free_v1.json MATH roy \
+    "${ROY_TF_ROY_TOKEN_LIMIT:-10000000}"
+fi
+if run_selected scalar-humaneval; then
+  launch scalar-humaneval research/config/training_free_v1.json HumanEval roy \
+    "${ROY_TF_ROY_TOKEN_LIMIT:-10000000}"
+fi
+if run_selected logdet-math; then
+  launch logdet-math research/config/training_free_logdet_v1.json MATH roy \
+    "${ROY_TF_ROY_TOKEN_LIMIT:-10000000}"
+fi
+if run_selected logdet-humaneval; then
+  launch logdet-humaneval research/config/training_free_logdet_v1.json HumanEval roy \
+    "${ROY_TF_ROY_TOKEN_LIMIT:-10000000}"
+fi
 if [[ "${include_continual}" == "true" ]]; then
-  launch continual-logdet-math research/config/training_free_continual_v1.json MATH roy_continual \
-    "${ROY_TF_CONTINUAL_TOKEN_LIMIT:-100000000}"
-  launch continual-logdet-humaneval research/config/training_free_continual_v1.json HumanEval roy_continual \
-    "${ROY_TF_CONTINUAL_TOKEN_LIMIT:-100000000}"
+  if run_selected continual-logdet-math; then
+    launch continual-logdet-math research/config/training_free_continual_v1.json MATH roy_continual \
+      "${ROY_TF_CONTINUAL_TOKEN_LIMIT:-100000000}"
+  fi
+  if run_selected continual-logdet-humaneval; then
+    launch continual-logdet-humaneval research/config/training_free_continual_v1.json HumanEval roy_continual \
+      "${ROY_TF_CONTINUAL_TOKEN_LIMIT:-100000000}"
+  fi
 fi
 
 mv "${pids_tmp}" "${run_root}/pids.tsv"

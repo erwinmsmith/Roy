@@ -492,6 +492,9 @@ row as completed.
 
 Set `ROY_TF_CONCURRENCY=3` on `run_training_free_matrix.sh` to keep at most three
 matrix jobs active while queuing the remaining benchmark/method combinations.
+`ROY_TF_RUNS` can select a comma-separated subset, and
+`ROY_TF_EXISTING_JOB_PIDS` counts already-running supervisors against the same
+concurrency bound when a queue is resumed or amended.
 For a slow or intermittently unavailable endpoint, also set
 `ROY_TF_RESUME=true` and `ROY_TF_AUTO_RESUME=true`. Retry exhaustion then emits a
 dedicated temporary-failure exit code after writing the task checkpoint; a
