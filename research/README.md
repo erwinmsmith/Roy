@@ -492,6 +492,13 @@ row as completed.
 
 Set `ROY_TF_CONCURRENCY=3` on `run_training_free_matrix.sh` to keep at most three
 matrix jobs active while queuing the remaining benchmark/method combinations.
+For a slow or intermittently unavailable endpoint, also set
+`ROY_TF_RESUME=true` and `ROY_TF_AUTO_RESUME=true`. Retry exhaustion then emits a
+dedicated temporary-failure exit code after writing the task checkpoint; a
+supervisor resumes the same job after an adaptive cooldown. The cooldown resets
+when completed rows were added and doubles, up to
+`ROY_TF_AUTO_RESUME_MAX_DELAY_SECONDS`, during a sustained outage. Authentication,
+billing, schema, and other non-retryable failures still stop immediately.
 The example output limit and request timeout reflect the currently configured
 Qwen 3.5 endpoint; set both flags to the capabilities of a different provider.
 

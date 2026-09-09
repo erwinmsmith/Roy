@@ -226,6 +226,13 @@ def parser() -> argparse.ArgumentParser:
     training_free.add_argument("--max-task-attempts", type=int, default=2)
     training_free.add_argument("--provider-max-retries", type=int, default=4)
     training_free.add_argument("--provider-retry-base-seconds", type=float, default=2.0)
+    training_free.add_argument(
+        "--provider-deferred-exit-code", type=int, default=0,
+        help=(
+            "Exit with this code after checkpointing a retryable provider outage; zero "
+            "preserves the default successful exit for manual resume"
+        ),
+    )
     training_free.add_argument("--output", type=Path, required=True)
     training_free.add_argument("--ledger", type=Path, required=True)
     training_free.add_argument("--events", type=Path, required=True)
@@ -1163,6 +1170,8 @@ def main(argv: List[str] | None = None) -> None:
         })
         print(json.dumps({"output": str(args.output), "tokens": completion.total_tokens}))
     elif args.command == "training-free-run":
+        if not 0 <= args.provider_deferred_exit_code <= 255:
+            raise ValueError("--provider-deferred-exit-code must be between 0 and 255")
         config_name = (
             "training_free_continual_v1.json"
             if args.arm == "roy_continual" else "training_free_v1.json"
@@ -1422,6 +1431,8 @@ def main(argv: List[str] | None = None) -> None:
             "tasks_skipped": len(completed_task_ids),
             "ledger": ledger.snapshot(),
         }))
+        if provider_deferred and args.provider_deferred_exit_code:
+            raise SystemExit(args.provider_deferred_exit_code)
     elif args.command == "experiment":
         args.output.mkdir(parents=True, exist_ok=True)
         learned: Dict[str, Any] = {}

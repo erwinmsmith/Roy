@@ -15,6 +15,11 @@ wait_for_pid="${ROY_TF_WAIT_FOR_PID:-}"
 wait_seconds="${ROY_TF_WAIT_SECONDS:-30}"
 resume="${ROY_TF_RESUME:-false}"
 include_continual="${ROY_TF_INCLUDE_CONTINUAL:-false}"
+auto_resume="${ROY_TF_AUTO_RESUME:-false}"
+auto_resume_delay="${ROY_TF_AUTO_RESUME_DELAY_SECONDS:-60}"
+auto_resume_max_delay="${ROY_TF_AUTO_RESUME_MAX_DELAY_SECONDS:-900}"
+deferred_exit_code="${ROY_TF_PROVIDER_DEFERRED_EXIT_CODE:-75}"
+resume_runner="${roy_root}/research/remote/run_with_deferred_resume.sh"
 
 [[ "${limit}" == "all" || "${limit}" =~ ^[1-9][0-9]*$ ]] || {
   echo "LIMIT must be a positive integer or 'all'" >&2
@@ -36,6 +41,33 @@ fi
   echo "ROY_TF_INCLUDE_CONTINUAL must be true or false" >&2
   exit 2
 }
+[[ "${auto_resume}" == "true" || "${auto_resume}" == "false" ]] || {
+  echo "ROY_TF_AUTO_RESUME must be true or false" >&2
+  exit 2
+}
+if [[ "${auto_resume}" == "true" ]]; then
+  [[ "${resume}" == "true" ]] || {
+    echo "ROY_TF_AUTO_RESUME requires ROY_TF_RESUME=true" >&2
+    exit 2
+  }
+  [[ -x "${resume_runner}" ]] || {
+    echo "resumable provider runner is unavailable: ${resume_runner}" >&2
+    exit 2
+  }
+  [[ "${auto_resume_delay}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "ROY_TF_AUTO_RESUME_DELAY_SECONDS must be positive" >&2
+    exit 2
+  }
+  [[ "${auto_resume_max_delay}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "ROY_TF_AUTO_RESUME_MAX_DELAY_SECONDS must be positive" >&2
+    exit 2
+  }
+  [[ "${deferred_exit_code}" =~ ^[1-9][0-9]*$ ]] \
+    && (( deferred_exit_code <= 255 )) || {
+      echo "ROY_TF_PROVIDER_DEFERRED_EXIT_CODE must be between 1 and 255" >&2
+      exit 2
+    }
+fi
 [[ -x "${python_bin}" && -x "${aflow_python}" ]] || {
   echo "Roy and AFlow Python environments are required" >&2
   exit 2
@@ -91,6 +123,9 @@ fi
 if [[ "${resume}" == "true" ]]; then
   common+=(--resume)
 fi
+if [[ "${auto_resume}" == "true" ]]; then
+  common+=(--provider-deferred-exit-code "${deferred_exit_code}")
+fi
 math_sandbox="${ROY_TF_MATH_SANDBOX:-env -i PATH=/usr/bin:/bin setpriv --reuid=210234 --regid=210000 --clear-groups --no-new-privs}"
 he_sandbox="${ROY_TF_HE_SANDBOX:-env -i PATH=/usr/bin PYTHONPATH=${aflow_root}/.venv/lib/python3.12/site-packages:${aflow_root} setpriv --reuid=210232 --regid=210000 --clear-groups --no-new-privs}"
 pids_tmp="${run_root}/pids.tsv.tmp"
@@ -133,11 +168,25 @@ launch() {
     --output "${run_root}/${name}.jsonl" \
     --ledger "${run_root}/${name}.ledger.json" \
     --events "${run_root}/${name}.events.jsonl")
+  local -a supervised_command=("${command[@]}")
+  if [[ "${auto_resume}" == "true" ]]; then
+    supervised_command=("${resume_runner}" \
+      "${run_root}/${name}.log" \
+      "${run_root}/${name}.jsonl" \
+      "${auto_resume_delay}" \
+      "${auto_resume_max_delay}" \
+      "${deferred_exit_code}" \
+      -- "${command[@]}")
+  fi
   if [[ "${serial}" == "true" ]]; then
     printf '%s\t%s\n' "${name}" "running" | tee -a "${pids_tmp}"
     local status=0
     if [[ "${resume}" == "true" ]]; then
-      "${command[@]}" >> "${run_root}/${name}.log" 2>&1 || status=$?
+      if [[ "${auto_resume}" == "true" ]]; then
+        "${supervised_command[@]}" || status=$?
+      else
+        "${command[@]}" >> "${run_root}/${name}.log" 2>&1 || status=$?
+      fi
     else
       "${command[@]}" > "${run_root}/${name}.log" 2>&1 || status=$?
     fi
@@ -145,7 +194,12 @@ launch() {
   else
     throttle
     if [[ "${resume}" == "true" ]]; then
-      nohup "${command[@]}" >> "${run_root}/${name}.log" 2>&1 &
+      if [[ "${auto_resume}" == "true" ]]; then
+        nohup "${supervised_command[@]}" \
+          >> "${run_root}/${name}.launcher.log" 2>&1 &
+      else
+        nohup "${command[@]}" >> "${run_root}/${name}.log" 2>&1 &
+      fi
     else
       nohup "${command[@]}" > "${run_root}/${name}.log" 2>&1 &
     fi
