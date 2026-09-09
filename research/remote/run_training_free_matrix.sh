@@ -132,20 +132,25 @@ pids_tmp="${run_root}/pids.tsv.tmp"
 : > "${pids_tmp}"
 serial="${ROY_TF_SERIAL:-false}"
 concurrency="${ROY_TF_CONCURRENCY:-0}"
+throttle_poll_seconds="${ROY_TF_THROTTLE_POLL_SECONDS:-5}"
 [[ "${concurrency}" =~ ^[0-9]+$ ]] || {
   echo "ROY_TF_CONCURRENCY must be zero (unlimited) or a positive integer" >&2
   exit 2
 }
+[[ "${throttle_poll_seconds}" =~ ^[1-9][0-9]*$ ]] || {
+  echo "ROY_TF_THROTTLE_POLL_SECONDS must be positive" >&2
+  exit 2
+}
 
 throttle() {
-  local oldest_pid
   if [[ "${serial}" == "true" || "${concurrency}" == "0" ]]; then
     return
   fi
   while (( $(jobs -pr | wc -l) >= concurrency )); do
-    oldest_pid="$(jobs -pr | head -n 1)"
-    [[ -n "${oldest_pid}" ]] || break
-    wait "${oldest_pid}" || true
+    # Waiting for a particular oldest PID underutilizes the pool when a newer
+    # job finishes first. Poll the active job set so any free slot advances the
+    # queue, while keeping this portable to Bash versions without `wait -n`.
+    sleep "${throttle_poll_seconds}"
   done
 }
 
