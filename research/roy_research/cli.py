@@ -208,8 +208,12 @@ def parser() -> argparse.ArgumentParser:
         help="Total Agent count for --arm fixed_mas (including A0)",
     )
     training_free.add_argument(
-        "--fixed-topology", choices=("star_to_root",), default="star_to_root",
+        "--fixed-topology", choices=("star_to_root", "observed"), default="star_to_root",
         help="Communication topology for --arm fixed_mas",
+    )
+    training_free.add_argument(
+        "--fixed-structure-template", type=Path,
+        help="Frozen observed Roy matrix JSON, required for --fixed-topology observed",
     )
     training_free.add_argument(
         "--matrix-objective",
@@ -1191,6 +1195,23 @@ def main(argv: List[str] | None = None) -> None:
         if args.matrix_objective is not None:
             config_value["matrix_objective"] = args.matrix_objective
         config = TrainingFreeConfig(**config_value)
+        structure_template = None
+        if args.fixed_topology == "observed" or args.fixed_structure_template is not None:
+            from .training_free.observed_topology import validate_template
+
+            if args.arm != "fixed_mas" or args.fixed_topology != "observed":
+                raise ValueError("observed template requires --arm fixed_mas --fixed-topology observed")
+            if args.fixed_structure_template is None:
+                raise ValueError("--fixed-structure-template is required for observed topology")
+            structure_template = json.loads(args.fixed_structure_template.read_text())
+            validate_template(structure_template, args.fixed_agent_count)
+            if structure_template.get("benchmark") not in (None, args.benchmark):
+                raise ValueError("observed template benchmark does not match --benchmark")
+            if args.resume and args.output.exists():
+                for previous in read_jsonl(args.output):
+                    prior = previous.get("fixed_mas_protocol", {}).get("structure_template")
+                    if prior != structure_template:
+                        raise ValueError("cannot resume an observed MAS run with a changed template")
         dataset = AFlowDataset(args.aflow_root, args.manifest)
         if args.offset < 0:
             raise ValueError("--offset cannot be negative")
@@ -1285,6 +1306,7 @@ def main(argv: List[str] | None = None) -> None:
                             task,
                             agent_count=args.fixed_agent_count,
                             topology=args.fixed_topology,
+                            structure_template=structure_template,
                         )
                     elif args.arm == "roy_continual":
                         run, next_continual_state = engine.run_continual(
@@ -1388,7 +1410,7 @@ def main(argv: List[str] | None = None) -> None:
                             "training_free_continual_information_flow_search"
                             if args.arm == "roy_continual"
                             else (
-                                "fixed_mas_star"
+                                ("fixed_mas_observed" if structure_template else "fixed_mas_star")
                                 if args.arm == "fixed_mas"
                                 else "training_free_information_flow_search"
                             )
@@ -1426,6 +1448,11 @@ def main(argv: List[str] | None = None) -> None:
                         "semantic_judge_calls": 0,
                         "matrix_search": False,
                     }
+                    if structure_template:
+                        row["fixed_mas_protocol"].update({
+                            "template_id": structure_template["template_id"],
+                            "structure_template": structure_template,
+                        })
                 if args.arm == "roy_continual":
                     row.update({
                         "continual_sequence_index": sequence_index,

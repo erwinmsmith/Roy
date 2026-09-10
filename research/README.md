@@ -444,6 +444,40 @@ the fixed matrix, root-before/final answers, score delta, call/token audit, and
 the one executed structure. `summarize_mas_results.py` reports N=2/3/4 as
 separate methods instead of merging rows with the same task id.
 
+For fixed structures actually produced by Roy, extract observed topologies first:
+
+```bash
+PYTHONPATH=research python -m roy_research.training_free.observed_topology \
+  SOURCE_ROY.jsonl SOURCE_REPAIR.jsonl --output-directory TEMPLATE_DIRECTORY
+ROY_TF_FIXED_TEMPLATE_DIR=TEMPLATE_DIRECTORY \
+ROY_TF_RUNS=observed2-math,observed2-humaneval,observed3-math,observed3-humaneval,observed4-math,observed4-humaneval \
+  research/remote/run_training_free_matrix.sh RUN_ROOT MODEL all
+```
+
+The catalog distinguishes optimized-but-uncommitted frontiers, committed matrices,
+and final matrices. Pure numerical search intermediates are not included. Agent
+renaming is canonicalized with A0 fixed; exact edge directions and weights are
+preserved. The catalog counts both allocated nodes and nodes with a directed path
+to A0. For each benchmark and N=2/3/4 it selects an observed, fully root-connected
+template by distinct-task frequency, prioritizing committed then potential and
+final occurrences. Missing sizes are reported by absent template files, never
+invented or padded with dormant nodes. Selection does not read correctness or
+reference answers. Test-derived templates are explicitly marked retrospective;
+formal held-out evaluation requires templates derived exclusively from the
+optimization split and frozen before testing.
+
+Replay uses `--arm fixed_mas --fixed-topology observed --fixed-agent-count N
+--fixed-structure-template TEMPLATE.json`. It reuses N and the weighted A2A
+matrix. The current-task proposal and X realization configure fresh roles,
+context and memory for the fixed matrix slots; source-task answers, source X,
+and historical derivation lineage are not replayed. All Agents initialize their
+local result once and execute the configured number of synchronous communication
+rounds, without Selector/Judge/search. As in Roy, a length-L path needs L rounds
+to deliver a newly produced result end to end; the default remains two rounds,
+not automatic convergence. Template provenance is stored in results but only
+the matrix is sent to the role/configuration calls. Resuming with a different
+template fails before issuing model requests.
+
 An additional `roy_continual` arm treats one ordered benchmark split as one
 path-dependent episode. `A0` is created only for the first item. Later items
 retain Agent ids, parent/child lineage, roles, private long-term memory and the

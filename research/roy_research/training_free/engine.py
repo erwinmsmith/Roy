@@ -30,6 +30,7 @@ from .matrix import (
     expand_matrix,
 )
 from .tools import TaskToolRegistry, ToolAudit
+from .observed_topology import validate_template
 from .trajectory import (
     DependencyRecord,
     StateCheckpoint,
@@ -394,6 +395,7 @@ class FixedMASRun:
     call_audit: CallAudit
     tool_audit: ToolAudit
     harness_config: AgentHarnessConfig
+    structure_template: Dict[str, Any] | None = None
 
     @property
     def initial_root_answer(self) -> str:
@@ -414,12 +416,23 @@ class FixedMASRun:
             "agent_count": self.fixed_agent_count,
             "topology": self.topology,
             "communication_rounds": self.communication_rounds,
-            "edge_policy": "equal_candidate_to_root_total_inbound_capacity_one",
+            "edge_policy": (
+                "observed_directions_and_weights_unchanged" if self.structure_template
+                else "equal_candidate_to_root_total_inbound_capacity_one"
+            ),
             "execution_policy": "one_fixed_mas_per_task",
         }
+        if self.structure_template:
+            protocol.update({
+                "template_id": self.structure_template["template_id"],
+                "structure_template": self.structure_template,
+                "agent_x_policy": "configure_fresh_for_current_task",
+                "reused_fields": ["agent_count", "a2a_edge_directions", "a2a_edge_weights"],
+                "evaluation_protocol": self.structure_template.get("evaluation_protocol"),
+            })
         return {
             "schema_version": 5,
-            "method": "fixed_mas_star",
+            "method": "fixed_mas_observed" if self.structure_template else "fixed_mas_star",
             "fixed_mas_protocol": protocol,
             "task_id": self.task_id,
             "benchmark": self.benchmark,
@@ -1122,17 +1135,25 @@ class RoyTrainingFreeEngine:
         *,
         agent_count: int,
         topology: str = "star_to_root",
+        structure_template: Mapping[str, Any] | None = None,
     ) -> FixedMASRun:
         """Execute one fixed MAS without Selector, Judge, or matrix search.
 
-        Candidate-to-root weights sum to one for every N, holding aggregate
-        inbound communication capacity constant across the controlled arms.
+        Star controls share unit root inbound capacity. Observed controls keep
+        the source matrix's exact weighted topology, with freshly configured X.
         """
         if not 2 <= agent_count <= self.config.maximum_agents:
             raise ValueError(
                 f"fixed MAS agent_count must be in [2, {self.config.maximum_agents}]"
             )
-        if topology != "star_to_root":
+        template_matrix = None
+        if topology == "observed":
+            if structure_template is None:
+                raise ValueError("observed topology requires a structure template")
+            template_matrix = validate_template(structure_template, agent_count)
+            if structure_template.get("benchmark") not in (None, task.benchmark):
+                raise ValueError("observed template benchmark does not match task")
+        elif topology != "star_to_root" or structure_template is not None:
             raise ValueError(f"unsupported fixed MAS topology: {topology}")
 
         self._configure_task(task)
@@ -1151,18 +1172,30 @@ class RoyTrainingFreeEngine:
                 "fixed_agent_count": agent_count,
                 "fixed_topology": topology,
                 "adaptive_structure_search": False,
+                "fixed_information_matrix": template_matrix.to_dict() if template_matrix else None,
                 "role_requirement": (
                     "Propose complementary independent epistemic operations; each candidate "
                     "must solve, audit, or falsify the task without requiring another candidate."
                 ),
             },
         )
-        # Remove proposed inter-Agent dependencies so every N uses the same
-        # parallel-star topology rather than silently inheriting a task-specific DAG.
+        # Initialize local results without an extra task-specific dependency
+        # DAG. Subsequent communication follows only the selected fixed matrix.
         graph = CandidateGraph("GLOBAL", dict(proposed.nodes), [])
         candidate_ids = sorted(graph.nodes)
+        if "A0" in candidate_ids or len(candidate_ids) != candidate_count:
+            raise ValueError("fixed MAS proposal does not contain the required distinct candidates")
+        if template_matrix is not None:
+            # Canonical A1..An slots map to new task-local candidate IDs. No
+            # historic result, memory, prompt, or artifact enters this run.
+            matrix = InformationMatrix(["A0", *candidate_ids], template_matrix.clone().values)
+        else:
+            matrix = InformationMatrix.zero(["A0", *candidate_ids])
+            for candidate_id in candidate_ids:
+                matrix.set_weight(candidate_id, "A0", 1.0 / candidate_count)
+        matrix.validate()
         realized = self.realizer.realize(
-            "fixed-star",
+            "fixed-observed" if template_matrix else "fixed-star",
             candidate_ids,
             graph,
             {"A0": initial_root},
@@ -1175,6 +1208,11 @@ class RoyTrainingFreeEngine:
                 "fixed_agent_count": agent_count,
                 "fixed_topology": topology,
                 "independent_parallel_candidates": True,
+                "fixed_information_matrix": matrix.to_dict(),
+                "role_requirement": (
+                    "Configure initial local work from the current task, then account for each "
+                    "slot's fixed sender/receiver position in subsequent synchronous A2A rounds."
+                ),
             },
         )
         candidates = self._provisional_execute(
@@ -1185,11 +1223,6 @@ class RoyTrainingFreeEngine:
             tool_scope="committed",
         )
         agents = {"A0": copy.deepcopy(initial_root), **candidates}
-        matrix = InformationMatrix.zero(agents)
-        equal_weight = 1.0 / candidate_count
-        for candidate_id in candidate_ids:
-            matrix.set_weight(candidate_id, "A0", equal_weight)
-        matrix.validate()
         executor = A2AExecutor(
             self.worker,
             self.channelizer,
@@ -1216,6 +1249,7 @@ class RoyTrainingFreeEngine:
             call_audit=self.audit,
             tool_audit=self.tool_registry.audit,
             harness_config=self.worker.harness_config,
+            structure_template=dict(structure_template) if structure_template is not None else None,
         )
 
     def _configure_task(self, task: BenchmarkTask) -> None:

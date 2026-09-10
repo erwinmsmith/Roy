@@ -46,6 +46,12 @@ fi
 for requested_run in ${selected_runs//,/ }; do
   case "${requested_run}" in
     direct-math|direct-humaneval|scalar-math|scalar-humaneval|logdet-math|logdet-humaneval|continual-logdet-math|continual-logdet-humaneval|fixed2-math|fixed2-humaneval|fixed3-math|fixed3-humaneval|fixed4-math|fixed4-humaneval) ;;
+    observed[234]-math|observed[234]-humaneval)
+      [[ -n "${ROY_TF_FIXED_TEMPLATE_DIR:-}" && -f "${ROY_TF_FIXED_TEMPLATE_DIR}/${requested_run}.json" ]] || {
+        echo "ROY_TF_FIXED_TEMPLATE_DIR must contain ${requested_run}.json" >&2
+        exit 2
+      }
+      ;;
     *) echo "unknown ROY_TF_RUNS entry: ${requested_run}" >&2; exit 2 ;;
   esac
 done
@@ -283,6 +289,19 @@ fi
 # Fixed-N controls are opt-in so the launcher's historical empty-selection
 # behavior remains the original six-arm matrix.
 if [[ -n "${selected_runs}" ]]; then
+  for agent_count in 2 3 4; do
+    for benchmark_suffix in math humaneval; do
+      name="observed${agent_count}-${benchmark_suffix}"
+      if run_selected "${name}"; then
+        benchmark="MATH"
+        [[ "${benchmark_suffix}" == "math" ]] || benchmark="HumanEval"
+        launch "${name}" research/config/training_free_v1.json "${benchmark}" fixed_mas \
+          "${ROY_TF_FIXED_TOKEN_LIMIT:-50000000}" \
+          --fixed-agent-count "${agent_count}" --fixed-topology observed \
+          --fixed-structure-template "${ROY_TF_FIXED_TEMPLATE_DIR}/${name}.json"
+      fi
+    done
+  done
   if run_selected fixed2-math; then
     launch fixed2-math research/config/training_free_v1.json MATH fixed_mas \
       "${ROY_TF_FIXED_TOKEN_LIMIT:-10000000}" --fixed-agent-count 2

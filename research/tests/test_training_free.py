@@ -695,6 +695,29 @@ def test_fixed_mas_rejects_counts_outside_configured_agent_budget() -> None:
         engine.run_fixed_mas(task, agent_count=5)
 
 
+def test_observed_fixed_mas_reuses_chain_without_leaking_source_task_state() -> None:
+    client = ScriptedClient()
+    template = {
+        "schema_version": 1, "template_id": "observed-test-chain", "benchmark": "MATH",
+        "matrix": {"agent_ids": ["A0", "A1", "A2"],
+                   "values": [[0, 0, 0], [0, 0, 0.5], [1, 0, 0]]},
+        "examples": {"committed": {"task_id": "old-task-MUST-NOT-ENTER-PROMPT"}},
+    }
+    run = RoyTrainingFreeEngine(client).run_fixed_mas(
+        BenchmarkTask("fresh", "MATH", "pentagon", [], {"solution": "135"}),
+        agent_count=3, topology="observed", structure_template=template,
+    )
+    assert run.final_matrix.values == template["matrix"]["values"]
+    value = run.to_dict()
+    assert value["method"] == "fixed_mas_observed"
+    assert value["fixed_mas_protocol"]["template_id"] == template["template_id"]
+    calls = value["call_audit"]["calls"]
+    assert calls["receiver_update"] == 4  # Two receivers over two synchronous rounds.
+    assert "global_selector" not in calls
+    assert "semantic_information_judge" not in calls
+    assert "old-task-MUST-NOT-ENTER-PROMPT" not in json.dumps(client.calls)
+
+
 def test_roy_and_direct_use_the_identical_root_execution_request() -> None:
     task = BenchmarkTask("same-root", "MATH", "pentagon", [], {"solution": "135"})
     direct_client = ScriptedClient()
