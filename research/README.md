@@ -471,10 +471,12 @@ Replay uses `--arm fixed_mas --fixed-topology observed --fixed-agent-count N
 matrix. The current-task proposal and X realization configure fresh roles,
 context and memory for the fixed matrix slots; source-task answers, source X,
 and historical derivation lineage are not replayed. All Agents initialize their
-local result once and execute the configured number of synchronous communication
-rounds, without Selector/Judge/search. As in Roy, a length-L path needs L rounds
-to deliver a newly produced result end to end; the default remains two rounds,
-not automatic convergence. Template provenance is stored in results but only
+local result once and execute synchronous communication rounds without
+Selector/Judge/search. A length-L shortest path needs L rounds to deliver a newly
+produced result end to end. Observed replay uses the maximum of the configured
+round count and the longest shortest path into A0; both the configured and actual
+round counts are recorded so extra communication is visible in cost comparisons.
+Template provenance is stored in results but only
 the matrix is sent to the role/configuration calls. Resuming with a different
 template fails before issuing model requests.
 

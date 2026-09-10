@@ -718,6 +718,21 @@ def test_observed_fixed_mas_reuses_chain_without_leaking_source_task_state() -> 
     assert "old-task-MUST-NOT-ENTER-PROMPT" not in json.dumps(client.calls)
 
 
+def test_observed_feedback_matrix_allows_three_hop_evidence_to_reach_root() -> None:
+    template = {
+        "schema_version": 1, "template_id": "observed-feedback", "benchmark": "MATH",
+        "matrix": {"agent_ids": ["A0", "A1", "A2", "A3"],
+                   "values": [[0, 0, 0, 0], [0, 0, 0, .5], [1, 0, 0, .5], [0, 0, 2/3, 0]]},
+    }
+    run = RoyTrainingFreeEngine(ScriptedClient()).run_fixed_mas(
+        BenchmarkTask("feedback", "MATH", "pentagon", [], {"solution": "135"}),
+        agent_count=4, topology="observed", structure_template=template,
+    )
+    assert run.communication_rounds == 3
+    assert run.to_dict()["fixed_mas_protocol"]["configured_communication_rounds"] == 2
+    assert run.call_audit.to_dict()["calls"]["receiver_update"] == 9
+
+
 def test_roy_and_direct_use_the_identical_root_execution_request() -> None:
     task = BenchmarkTask("same-root", "MATH", "pentagon", [], {"solution": "135"})
     direct_client = ScriptedClient()

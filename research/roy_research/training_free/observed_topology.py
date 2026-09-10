@@ -47,6 +47,18 @@ def validate_template(template: Mapping[str, Any], agent_count: int) -> Informat
     return matrix
 
 
+def minimum_delivery_rounds(matrix: InformationMatrix) -> int:
+    """Synchronous rounds needed for every initial local result to reach A0."""
+    distance = {"A0": 0}
+    for step in range(1, len(matrix.agent_ids)):
+        new = [source for source in matrix.agent_ids if source not in distance
+               and any(matrix.weight(source, target) > 0 for target in distance)]
+        distance.update({source: step for source in new})
+    if set(distance) != set(matrix.agent_ids):
+        raise ValueError("matrix contains Agents with no directed path to A0")
+    return max(distance.values())
+
+
 def build_catalog(paths: list[Path]) -> dict[str, Any]:
     # Later supplied files are repairs/continuations. Keep only the latest
     # completed row per model, benchmark, objective and task id.

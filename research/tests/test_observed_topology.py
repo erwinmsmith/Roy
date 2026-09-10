@@ -6,7 +6,7 @@ import pytest
 
 from roy_research.io import write_jsonl
 from roy_research.training_free.observed_topology import (
-    build_catalog, canonical_matrix, validate_template,
+    build_catalog, canonical_matrix, minimum_delivery_rounds, validate_template,
 )
 
 
@@ -18,6 +18,7 @@ def test_canonicalization_preserves_root_direction_and_exact_weights():
     assert canonical_matrix(first) == canonical_matrix(relabeled)
     assert canonical_matrix(first).positive_edge_count() == 2
     assert canonical_matrix(first).total_capacity() == 1.5
+    assert minimum_delivery_rounds(canonical_matrix(first)) == 2
 
 
 def test_catalog_deduplicates_repairs_and_never_selects_by_answer_score(tmp_path):

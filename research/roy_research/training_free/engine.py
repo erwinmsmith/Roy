@@ -30,7 +30,6 @@ from .matrix import (
     expand_matrix,
 )
 from .tools import TaskToolRegistry, ToolAudit
-from .observed_topology import validate_template
 from .trajectory import (
     DependencyRecord,
     StateCheckpoint,
@@ -396,6 +395,7 @@ class FixedMASRun:
     tool_audit: ToolAudit
     harness_config: AgentHarnessConfig
     structure_template: Dict[str, Any] | None = None
+    configured_communication_rounds: int | None = None
 
     @property
     def initial_root_answer(self) -> str:
@@ -429,6 +429,8 @@ class FixedMASRun:
                 "agent_x_policy": "configure_fresh_for_current_task",
                 "reused_fields": ["agent_count", "a2a_edge_directions", "a2a_edge_weights"],
                 "evaluation_protocol": self.structure_template.get("evaluation_protocol"),
+                "configured_communication_rounds": self.configured_communication_rounds,
+                "round_policy": "max_configured_rounds_and_shortest_path_delivery_requirement",
             })
         return {
             "schema_version": 5,
@@ -1147,10 +1149,16 @@ class RoyTrainingFreeEngine:
                 f"fixed MAS agent_count must be in [2, {self.config.maximum_agents}]"
             )
         template_matrix = None
+        communication_rounds = self.config.communication_rounds
         if topology == "observed":
+            from .observed_topology import minimum_delivery_rounds, validate_template
+
             if structure_template is None:
                 raise ValueError("observed topology requires a structure template")
             template_matrix = validate_template(structure_template, agent_count)
+            communication_rounds = max(
+                communication_rounds, minimum_delivery_rounds(template_matrix),
+            )
             if structure_template.get("benchmark") not in (None, task.benchmark):
                 raise ValueError("observed template benchmark does not match task")
         elif topology != "star_to_root" or structure_template is not None:
@@ -1228,7 +1236,7 @@ class RoyTrainingFreeEngine:
             self.channelizer,
             benchmark=task.benchmark,
             inbound_token_budget=self.config.inbound_token_budget,
-            communication_rounds=self.config.communication_rounds,
+            communication_rounds=communication_rounds,
         )
         final_agents = executor.realize_once(
             agents, matrix, tool_scope="committed",
@@ -1243,13 +1251,14 @@ class RoyTrainingFreeEngine:
             final_matrix=matrix,
             fixed_agent_count=agent_count,
             topology=topology,
-            communication_rounds=self.config.communication_rounds,
+            communication_rounds=communication_rounds,
             candidate_graph=graph,
             realized_subgraph=realized,
             call_audit=self.audit,
             tool_audit=self.tool_registry.audit,
             harness_config=self.worker.harness_config,
             structure_template=dict(structure_template) if structure_template is not None else None,
+            configured_communication_rounds=self.config.communication_rounds,
         )
 
     def _configure_task(self, task: BenchmarkTask) -> None:
