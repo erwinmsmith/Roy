@@ -419,6 +419,31 @@ single-Agent baseline. It uses the same root harness, Worker model, token ceilin
 tool registry, and scorer, but never invokes candidate selection, X realization,
 channelization, an information probe, or matrix search.
 
+The matched fixed-structure controls use `--arm fixed_mas` together with
+`--fixed-agent-count 2`, `3`, or `4`. For every N, the root and N-1 candidate
+Agents use the same harness, task contract, models, tools, scorer, candidate-X
+configuration path, and communication-round setting as Roy. Candidate roles are
+configured for complementary independent epistemic operations, but the
+organization itself cannot adapt: candidates execute in parallel and send only
+to A0. Each candidate-to-root edge has weight `1/(N-1)`, so aggregate inbound
+capacity is exactly one for all N. The arm performs no Global Selector call, no
+Semantic Judge call, and no matrix search, and executes exactly one fixed MAS per
+task. This makes N=1 Direct, fixed N=2/3/4, and dynamic Roy a controlled
+accuracy-versus-token Pareto comparison rather than a post-hoc grouping of Roy
+trajectories (which would be selection-biased).
+
+The fixed controls are opt-in in the matrix launcher:
+
+```bash
+ROY_TF_RUNS=fixed2-math,fixed2-humaneval,fixed3-math,fixed3-humaneval,fixed4-math,fixed4-humaneval \
+  research/remote/run_training_free_matrix.sh RUN_ROOT MODEL all
+```
+
+Every row records `fixed_mas_protocol`, the complete configured Agent states,
+the fixed matrix, root-before/final answers, score delta, call/token audit, and
+the one executed structure. `summarize_mas_results.py` reports N=2/3/4 as
+separate methods instead of merging rows with the same task id.
+
 An additional `roy_continual` arm treats one ordered benchmark split as one
 path-dependent episode. `A0` is created only for the first item. Later items
 retain Agent ids, parent/child lineage, roles, private long-term memory and the

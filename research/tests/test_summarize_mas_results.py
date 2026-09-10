@@ -23,3 +23,25 @@ def test_summary_deduplicates_resumed_tasks_and_counts_tokens(tmp_path: Path) ->
     assert result["observed_tasks"] == 2
     assert result["accuracy"] == 0.5
     assert result["total_tokens"] == 30
+
+
+def test_summary_keeps_fixed_mas_agent_counts_as_separate_arms(tmp_path: Path) -> None:
+    path = tmp_path / "fixed.jsonl"
+    write_jsonl(path, [
+        {
+            "method": "fixed_mas_star", "worker_model": "m", "benchmark": "MATH",
+            "task_id": "1", "run_status": "completed", "evaluation": {"score": 1},
+            "fixed_mas_protocol": {"agent_count": 2}, "all_attempts_total_tokens": 20,
+        },
+        {
+            "method": "fixed_mas_star", "worker_model": "m", "benchmark": "MATH",
+            "task_id": "1", "run_status": "completed", "evaluation": {"score": 0},
+            "fixed_mas_protocol": {"agent_count": 4}, "all_attempts_total_tokens": 40,
+        },
+    ])
+
+    result = summarize([path])
+    assert [item["method"] for item in result] == [
+        "fixed_mas_star_n2", "fixed_mas_star_n4",
+    ]
+    assert [item["accuracy"] for item in result] == [1.0, 0.0]

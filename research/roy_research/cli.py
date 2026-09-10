@@ -195,11 +195,21 @@ def parser() -> argparse.ArgumentParser:
     )
     training_free.add_argument("--benchmark", choices=("MATH", "HumanEval"), required=True)
     training_free.add_argument(
-        "--arm", choices=("roy", "roy_continual", "single_agent_direct"), default="roy",
+        "--arm",
+        choices=("roy", "roy_continual", "single_agent_direct", "fixed_mas"),
+        default="roy",
         help=(
-            "Run independent Roy, one ordered benchmark-wide Roy episode, or the matched "
-            "single-Agent baseline"
+            "Run independent Roy, one ordered benchmark-wide Roy episode, the matched "
+            "single-Agent baseline, or a matched fixed-topology MAS control"
         ),
+    )
+    training_free.add_argument(
+        "--fixed-agent-count", type=int,
+        help="Total Agent count for --arm fixed_mas (including A0)",
+    )
+    training_free.add_argument(
+        "--fixed-topology", choices=("star_to_root",), default="star_to_root",
+        help="Communication topology for --arm fixed_mas",
     )
     training_free.add_argument(
         "--matrix-objective",
@@ -1186,6 +1196,15 @@ def main(argv: List[str] | None = None) -> None:
             raise ValueError("--offset cannot be negative")
         if args.max_task_attempts < 1:
             raise ValueError("--max-task-attempts must be positive")
+        if args.arm == "fixed_mas":
+            if args.fixed_agent_count is None:
+                raise ValueError("--fixed-agent-count is required with --arm fixed_mas")
+            if not 2 <= args.fixed_agent_count <= config.maximum_agents:
+                raise ValueError(
+                    "--fixed-agent-count must be between 2 and the configured maximum_agents"
+                )
+        elif args.fixed_agent_count is not None:
+            raise ValueError("--fixed-agent-count is only valid with --arm fixed_mas")
         if args.arm == "roy_continual" and args.offset != 0:
             raise ValueError("roy_continual is ordered and cannot start from --offset")
         if args.arm == "roy_continual" and args.retry_failures_from:
@@ -1261,6 +1280,12 @@ def main(argv: List[str] | None = None) -> None:
                     next_continual_state = None
                     if args.arm == "single_agent_direct":
                         run = engine.run_direct(task)
+                    elif args.arm == "fixed_mas":
+                        run = engine.run_fixed_mas(
+                            task,
+                            agent_count=args.fixed_agent_count,
+                            topology=args.fixed_topology,
+                        )
                     elif args.arm == "roy_continual":
                         run, next_continual_state = engine.run_continual(
                             task, continual_state,
@@ -1362,7 +1387,11 @@ def main(argv: List[str] | None = None) -> None:
                         else (
                             "training_free_continual_information_flow_search"
                             if args.arm == "roy_continual"
-                            else "training_free_information_flow_search"
+                            else (
+                                "fixed_mas_star"
+                                if args.arm == "fixed_mas"
+                                else "training_free_information_flow_search"
+                            )
                         )
                     ),
                     "arm": args.arm,
@@ -1389,6 +1418,14 @@ def main(argv: List[str] | None = None) -> None:
                 }
                 if provider_deferred:
                     row["retryable"] = True
+                if args.arm == "fixed_mas":
+                    row["fixed_mas_protocol"] = {
+                        "agent_count": args.fixed_agent_count,
+                        "topology": args.fixed_topology,
+                        "adaptive_derivation": False,
+                        "semantic_judge_calls": 0,
+                        "matrix_search": False,
+                    }
                 if args.arm == "roy_continual":
                     row.update({
                         "continual_sequence_index": sequence_index,

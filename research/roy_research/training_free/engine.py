@@ -378,6 +378,96 @@ class SingleAgentRun:
 
 
 @dataclass
+class FixedMASRun:
+    """Matched fixed-topology MAS control with no adaptive structure search."""
+
+    task_id: str
+    benchmark: str
+    initial_root: AgentState
+    final_agents: Dict[str, AgentState]
+    final_matrix: InformationMatrix
+    fixed_agent_count: int
+    topology: str
+    communication_rounds: int
+    candidate_graph: CandidateGraph
+    realized_subgraph: RealizedSubgraph
+    call_audit: CallAudit
+    tool_audit: ToolAudit
+    harness_config: AgentHarnessConfig
+
+    @property
+    def initial_root_answer(self) -> str:
+        return self.initial_root.result.candidate_answer
+
+    @property
+    def final_answer(self) -> str:
+        return self.final_agents["A0"].result.candidate_answer
+
+    def to_dict(self) -> Dict[str, Any]:
+        initial_matrix = InformationMatrix.zero(["A0"])
+        agents = {key: value.to_dict() for key, value in self.final_agents.items()}
+        protocol = {
+            "adaptive_derivation": False,
+            "semantic_judge_calls": 0,
+            "matrix_search": False,
+            "candidate_selector": False,
+            "agent_count": self.fixed_agent_count,
+            "topology": self.topology,
+            "communication_rounds": self.communication_rounds,
+            "edge_policy": "equal_candidate_to_root_total_inbound_capacity_one",
+            "execution_policy": "one_fixed_mas_per_task",
+        }
+        return {
+            "schema_version": 5,
+            "method": "fixed_mas_star",
+            "fixed_mas_protocol": protocol,
+            "task_id": self.task_id,
+            "benchmark": self.benchmark,
+            "initial_root_answer": self.initial_root_answer,
+            "final_answer": self.final_answer,
+            "final_agents": agents,
+            "final_matrix": self.final_matrix.to_dict(),
+            "rounds": [{
+                "round_index": 0,
+                "fixed_structure": True,
+                "candidate_graph": self.candidate_graph.subset(self.candidate_graph.nodes),
+                "candidate_calculation_list": [list(self.realized_subgraph.candidate_ids)],
+                "realized_candidate": self.realized_subgraph.to_dict(),
+                "matrix": self.final_matrix.to_dict(),
+                "executed_matrix_count": 1,
+            }],
+            "stop_reason": "fixed_structure_complete",
+            "call_audit": self.call_audit.to_dict(),
+            "tool_audit": self.tool_audit.to_dict(),
+            "checkpoints": [],
+            "dependency_ledger": [],
+            "event_ledger": [],
+            "organization_summary": {
+                "rounds": 1,
+                "fixed_agent_count": self.fixed_agent_count,
+                "fixed_topology": self.topology,
+                "candidates_proposed": self.fixed_agent_count - 1,
+                "candidate_subgraphs_realized": 1,
+                "candidate_subgraphs_rejected": 0,
+                "committed_expansions": 0,
+                "committed_reorganizations": 0,
+                "terminal_stops": 1,
+                "committed_derivation_dependencies": 0,
+            },
+            "cumulative_information_gain": 0.0,
+            "matrix_trajectory": [initial_matrix.to_dict(), self.final_matrix.to_dict()],
+            "agent_basis_trajectory": [
+                {"A0": self.initial_root.to_dict()},
+                agents,
+            ],
+            "agent_harness": {
+                "schema_version": AGENT_HARNESS_SCHEMA_VERSION,
+                "config": asdict(self.harness_config),
+            },
+        }
+
+
+@dataclass
 class ContinualBenchmarkState:
     """Persistent organization carried between items of one ordered benchmark episode."""
 
@@ -1026,6 +1116,108 @@ class RoyTrainingFreeEngine:
             harness_config=self.worker.harness_config,
         )
 
+    def run_fixed_mas(
+        self,
+        task: BenchmarkTask,
+        *,
+        agent_count: int,
+        topology: str = "star_to_root",
+    ) -> FixedMASRun:
+        """Execute one fixed MAS without Selector, Judge, or matrix search.
+
+        Candidate-to-root weights sum to one for every N, holding aggregate
+        inbound communication capacity constant across the controlled arms.
+        """
+        if not 2 <= agent_count <= self.config.maximum_agents:
+            raise ValueError(
+                f"fixed MAS agent_count must be in [2, {self.config.maximum_agents}]"
+            )
+        if topology != "star_to_root":
+            raise ValueError(f"unsupported fixed MAS topology: {topology}")
+
+        self._configure_task(task)
+        initial_root = self.worker.execute_root(
+            self._root_agent(task), task.benchmark, tool_scope="committed",
+        )
+        initial_root.status = AgentStatus.DONE
+        candidate_count = agent_count - 1
+        proposed = self.worker.propose_candidates(
+            initial_root,
+            round_index=0,
+            max_candidates=candidate_count,
+            minimum_candidates=candidate_count,
+            organization_context={
+                "control_arm": "fixed_mas",
+                "fixed_agent_count": agent_count,
+                "fixed_topology": topology,
+                "adaptive_structure_search": False,
+                "role_requirement": (
+                    "Propose complementary independent epistemic operations; each candidate "
+                    "must solve, audit, or falsify the task without requiring another candidate."
+                ),
+            },
+        )
+        # Remove proposed inter-Agent dependencies so every N uses the same
+        # parallel-star topology rather than silently inheriting a task-specific DAG.
+        graph = CandidateGraph("GLOBAL", dict(proposed.nodes), [])
+        candidate_ids = sorted(graph.nodes)
+        realized = self.realizer.realize(
+            "fixed-star",
+            candidate_ids,
+            graph,
+            {"A0": initial_root},
+            benchmark=task.benchmark,
+            original_task=task.instruction,
+            public_tests=task.public_tests,
+            available_tools=self.available_tools,
+            organization_context={
+                "control_arm": "fixed_mas",
+                "fixed_agent_count": agent_count,
+                "fixed_topology": topology,
+                "independent_parallel_candidates": True,
+            },
+        )
+        candidates = self._provisional_execute(
+            realized,
+            graph,
+            {"A0": initial_root},
+            task.benchmark,
+            tool_scope="committed",
+        )
+        agents = {"A0": copy.deepcopy(initial_root), **candidates}
+        matrix = InformationMatrix.zero(agents)
+        equal_weight = 1.0 / candidate_count
+        for candidate_id in candidate_ids:
+            matrix.set_weight(candidate_id, "A0", equal_weight)
+        matrix.validate()
+        executor = A2AExecutor(
+            self.worker,
+            self.channelizer,
+            benchmark=task.benchmark,
+            inbound_token_budget=self.config.inbound_token_budget,
+            communication_rounds=self.config.communication_rounds,
+        )
+        final_agents = executor.realize_once(
+            agents, matrix, tool_scope="committed",
+        )
+        for agent in final_agents.values():
+            agent.status = AgentStatus.DONE
+        return FixedMASRun(
+            task_id=task.task_id,
+            benchmark=task.benchmark,
+            initial_root=initial_root,
+            final_agents=final_agents,
+            final_matrix=matrix,
+            fixed_agent_count=agent_count,
+            topology=topology,
+            communication_rounds=self.config.communication_rounds,
+            candidate_graph=graph,
+            realized_subgraph=realized,
+            call_audit=self.audit,
+            tool_audit=self.tool_registry.audit,
+            harness_config=self.worker.harness_config,
+        )
+
     def _configure_task(self, task: BenchmarkTask) -> None:
         self.tool_registry = TaskToolRegistry(
             task,
@@ -1167,6 +1359,8 @@ class RoyTrainingFreeEngine:
         graph: CandidateGraph,
         existing: Mapping[str, AgentState],
         benchmark: str,
+        *,
+        tool_scope: str = "counterfactual",
     ) -> Dict[str, AgentState]:
         states = copy.deepcopy(candidate.agents)
         order = graph.topological_order(set(candidate.candidate_ids), hard_only=True)
@@ -1185,7 +1379,10 @@ class RoyTrainingFreeEngine:
                 }, ensure_ascii=False, sort_keys=True)
                 AgentHarness(agent, self.tool_registry).receive_messages([dependency_message])
             states[agent_id] = self.candidate_worker.execute_local(
-                agent, benchmark, thinking=self.config.candidate_worker_thinking,
+                agent,
+                benchmark,
+                tool_scope=tool_scope,
+                thinking=self.config.candidate_worker_thinking,
             )
         return states
 

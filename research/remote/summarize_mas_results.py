@@ -20,6 +20,10 @@ def parse_args() -> argparse.Namespace:
 
 def _key(row: Dict[str, Any]) -> Tuple[str, str, str]:
     method = str(row.get("method") or row.get("arm") or "unknown")
+    if method == "fixed_mas_star":
+        protocol = row.get("fixed_mas_protocol", {})
+        count = protocol.get("agent_count") if isinstance(protocol, dict) else None
+        method = f"fixed_mas_star_n{count}" if count is not None else method
     benchmark = str(row.get("benchmark") or "unknown")
     model = str(row.get("model") or row.get("worker_model") or "unknown")
     return model, benchmark, method

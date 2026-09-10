@@ -119,34 +119,37 @@ class ScriptedClient:
                 "candidate_ids": [candidate_id], "selection_reason": "resolves the only gap",
             }]}
         elif purpose == "candidate_x_realization":
-            candidate_id = payload["selected_candidate_subgraph"]["nodes"][0]["candidate_id"]
+            selected_nodes = payload["selected_candidate_subgraph"]["nodes"]
             value = {
                 "configuration_reasoning_summary": "Use an independent arithmetic verifier.",
                 "risks": ["may repeat the root approach"],
-                "agents": [{
-                    # Runtime binds the immutable parent from the dependency graph.
-                    "agent_id": candidate_id, "parent_id": None,
-                    "objective": "Recompute the pentagon angle sum and verify the large angle.",
-                    "role": "Independent geometry arithmetic verifier.",
-                    "context": {
-                        "original_task": payload["original_task"],
-                        "mandatory_inputs": ["A0.current_derivation"],
-                        "weighted_inputs": {"A0": 0.5}, "received_messages": [],
-                        "public_tests": [],
-                    },
-                    "memory": {
-                        "namespace": f"memory/{candidate_id}",
-                        "inherited_refs": ["A0.current_derivation"], "entries": [],
-                    },
-                    "tools": ["symbolic_math"],
-                    "result": {
-                        "candidate_answer": "", "claims": [], "evidence": [],
-                        "assumptions": [], "unresolved": ["large angle"],
-                        "reasoning_summary": "Not executed yet.", "confidence": 0,
-                    },
-                    "status": "ready", "expected_output": "verified large angle",
-                    "stop_condition": "a numeric angle is derived and checked",
-                }],
+                "agents": [
+                    {
+                        # Runtime binds the immutable parent from the dependency graph.
+                        "agent_id": node["candidate_id"], "parent_id": None,
+                        "objective": "Recompute the pentagon angle sum and verify the large angle.",
+                        "role": "Independent geometry arithmetic verifier.",
+                        "context": {
+                            "original_task": payload["original_task"],
+                            "mandatory_inputs": ["A0.current_derivation"],
+                            "weighted_inputs": {"A0": 0.5}, "received_messages": [],
+                            "public_tests": [],
+                        },
+                        "memory": {
+                            "namespace": f"memory/{node['candidate_id']}",
+                            "inherited_refs": ["A0.current_derivation"], "entries": [],
+                        },
+                        "tools": ["symbolic_math"],
+                        "result": {
+                            "candidate_answer": "", "claims": [], "evidence": [],
+                            "assumptions": [], "unresolved": ["large angle"],
+                            "reasoning_summary": "Not executed yet.", "confidence": 0,
+                        },
+                        "status": "ready", "expected_output": "verified large angle",
+                        "stop_condition": "a numeric angle is derived and checked",
+                    }
+                    for node in selected_nodes
+                ],
             }
         elif purpose == "provisional_worker":
             value = {
@@ -632,6 +635,64 @@ def test_matched_single_agent_direct_skips_all_organization_calls() -> None:
     assert value["call_audit"]["calls"] == {
         "root_worker": 1, "worker_result_reconciliation": 1,
     }
+
+
+def test_fixed_mas_executes_exact_equal_capacity_star_without_structure_search() -> None:
+    client = ScriptedClient()
+    run = RoyTrainingFreeEngine(
+        client,
+        config=TrainingFreeConfig(maximum_agents=4, communication_rounds=2),
+    ).run_fixed_mas(
+        BenchmarkTask("fixed-four", "MATH", "pentagon", [], {"solution": "135"}),
+        agent_count=4,
+    )
+    value = run.to_dict()
+
+    assert value["method"] == "fixed_mas_star"
+    assert value["fixed_mas_protocol"] == {
+        "adaptive_derivation": False,
+        "semantic_judge_calls": 0,
+        "matrix_search": False,
+        "candidate_selector": False,
+        "agent_count": 4,
+        "topology": "star_to_root",
+        "communication_rounds": 2,
+        "edge_policy": "equal_candidate_to_root_total_inbound_capacity_one",
+        "execution_policy": "one_fixed_mas_per_task",
+    }
+    assert value["initial_root_answer"] == "120"
+    assert value["final_answer"] == "135"
+    assert len(value["final_agents"]) == 4
+    assert run.final_matrix.inbound("A0") == pytest.approx(1.0)
+    assert run.final_matrix.positive_edge_count() == 3
+    candidate_ids = sorted(set(run.final_agents) - {"A0"})
+    assert all(
+        run.final_matrix.weight(candidate_id, "A0") == pytest.approx(1 / 3)
+        for candidate_id in candidate_ids
+    )
+    assert all(
+        run.final_matrix.weight(source, target) == 0
+        for source in run.final_matrix.agent_ids
+        for target in run.final_matrix.agent_ids
+        if not (source in candidate_ids and target == "A0")
+    )
+    purposes = [call["purpose"] for call in client.calls]
+    assert purposes.count("candidate_proposal") == 1
+    assert purposes.count("candidate_x_realization") == 1
+    assert purposes.count("provisional_worker") == 3
+    assert "global_selector" not in purposes
+    assert "semantic_information_judge" not in purposes
+
+
+def test_fixed_mas_rejects_counts_outside_configured_agent_budget() -> None:
+    task = BenchmarkTask("fixed-invalid", "MATH", "pentagon", [], {"solution": "135"})
+    engine = RoyTrainingFreeEngine(
+        ScriptedClient(), config=TrainingFreeConfig(maximum_agents=4),
+    )
+    with pytest.raises(ValueError, match="agent_count must be in"):
+        engine.run_fixed_mas(task, agent_count=1)
+    with pytest.raises(ValueError, match="agent_count must be in"):
+        engine.run_fixed_mas(task, agent_count=5)
 
 
 def test_roy_and_direct_use_the_identical_root_execution_request() -> None:

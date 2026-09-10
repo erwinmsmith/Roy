@@ -45,7 +45,7 @@ fi
 }
 for requested_run in ${selected_runs//,/ }; do
   case "${requested_run}" in
-    direct-math|direct-humaneval|scalar-math|scalar-humaneval|logdet-math|logdet-humaneval|continual-logdet-math|continual-logdet-humaneval) ;;
+    direct-math|direct-humaneval|scalar-math|scalar-humaneval|logdet-math|logdet-humaneval|continual-logdet-math|continual-logdet-humaneval|fixed2-math|fixed2-humaneval|fixed3-math|fixed3-humaneval|fixed4-math|fixed4-humaneval) ;;
     *) echo "unknown ROY_TF_RUNS entry: ${requested_run}" >&2; exit 2 ;;
   esac
 done
@@ -186,6 +186,8 @@ run_selected() {
 
 launch() {
   local name="$1" config="$2" benchmark="$3" arm="$4" token_limit="$5"
+  shift 5
+  local -a arm_args=("$@")
   local sandbox="${math_sandbox}"
   local -a benchmark_args=()
   if [[ "${benchmark}" == "HumanEval" ]]; then
@@ -197,6 +199,7 @@ launch() {
     --config "${roy_root}/${config}" \
     --benchmark "${benchmark}" \
     --arm "${arm}" \
+    "${arm_args[@]}" \
     --token-limit "${token_limit}" \
     --tool-sandbox-command "${sandbox}" \
     "${benchmark_args[@]}" \
@@ -274,6 +277,35 @@ if [[ "${include_continual}" == "true" ]]; then
   if run_selected continual-logdet-humaneval; then
     launch continual-logdet-humaneval research/config/training_free_continual_v1.json HumanEval roy_continual \
       "${ROY_TF_CONTINUAL_TOKEN_LIMIT:-100000000}"
+  fi
+fi
+
+# Fixed-N controls are opt-in so the launcher's historical empty-selection
+# behavior remains the original six-arm matrix.
+if [[ -n "${selected_runs}" ]]; then
+  if run_selected fixed2-math; then
+    launch fixed2-math research/config/training_free_v1.json MATH fixed_mas \
+      "${ROY_TF_FIXED_TOKEN_LIMIT:-10000000}" --fixed-agent-count 2
+  fi
+  if run_selected fixed2-humaneval; then
+    launch fixed2-humaneval research/config/training_free_v1.json HumanEval fixed_mas \
+      "${ROY_TF_FIXED_TOKEN_LIMIT:-10000000}" --fixed-agent-count 2
+  fi
+  if run_selected fixed3-math; then
+    launch fixed3-math research/config/training_free_v1.json MATH fixed_mas \
+      "${ROY_TF_FIXED_TOKEN_LIMIT:-10000000}" --fixed-agent-count 3
+  fi
+  if run_selected fixed3-humaneval; then
+    launch fixed3-humaneval research/config/training_free_v1.json HumanEval fixed_mas \
+      "${ROY_TF_FIXED_TOKEN_LIMIT:-10000000}" --fixed-agent-count 3
+  fi
+  if run_selected fixed4-math; then
+    launch fixed4-math research/config/training_free_v1.json MATH fixed_mas \
+      "${ROY_TF_FIXED_TOKEN_LIMIT:-10000000}" --fixed-agent-count 4
+  fi
+  if run_selected fixed4-humaneval; then
+    launch fixed4-humaneval research/config/training_free_v1.json HumanEval fixed_mas \
+      "${ROY_TF_FIXED_TOKEN_LIMIT:-10000000}" --fixed-agent-count 4
   fi
 fi
 
